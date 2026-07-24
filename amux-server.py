@@ -18982,6 +18982,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .map-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; min-width: 0; }
   #map-container { flex: 1; z-index: 1; background: var(--bg); }
   .map-drop-hint { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 7px 18px; border-radius: 20px; font-size: 0.8rem; z-index: 1002; pointer-events: none; display: none; white-space: nowrap; box-shadow: 0 2px 10px rgba(0,0,0,0.5); }
+  .map-pinbar { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .map-pinbar-spacer { flex: 1; }
+  .map-sort-select { font-size: 0.72rem; padding: 2px 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--card); color: var(--text); cursor: pointer; }
+  .map-pinbar-btn { font-size: 0.85rem; line-height: 1; padding: 3px 8px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--text); cursor: pointer; }
+  .map-pinbar-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .map-pin-dist { font-size: 0.68rem; color: var(--dim); font-weight: 400; white-space: nowrap; }
   .map-toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--card); border-top: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
   .map-coords { font-size: 0.71rem; color: var(--dim); font-family: monospace; margin-left: auto; }
   .map-drop-btn.dropping { background: var(--accent) !important; color: #fff !important; border-color: transparent !important; }
@@ -20085,6 +20091,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="map-search-section">
       <input type="search" id="map-search" placeholder="Search pins, notes, tags&#x2026;" oninput="_mapSearch(this.value)" autocomplete="off">
+    </div>
+    <div class="map-pinbar" id="map-pinbar">
+      <select id="map-sort" class="map-sort-select" onchange="_mapSetSort(this.value)" title="Sort pin list">
+        <option value="name">A&#x2013;Z</option>
+        <option value="distance">Nearest</option>
+        <option value="recent">Newest</option>
+      </select>
+      <span class="map-pinbar-spacer"></span>
+      <button class="map-pinbar-btn" onclick="_mapExportMenu(event)" title="Export / import pins">&#x21C5;</button>
+      <input type="file" id="map-import-file" accept=".geojson,.json,.csv" style="display:none" onchange="_mapImportFile(this)">
     </div>
     <div id="map-pin-list" class="map-pin-list"></div>
   </div>
@@ -26739,7 +26755,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.185';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.186';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -34212,12 +34228,13 @@ async function _habitsDelete(idx) {
 let _map = null;
 let _mapPins = [];
 let _mapTags = [];
-let _mapSettings = { defaultZoom: 12, defaultLat: 40.7128, defaultLng: -74.0060, sidebarOpen: true, tagMode: 'or' };
+let _mapSettings = { defaultZoom: 12, defaultLat: 40.7128, defaultLng: -74.0060, sidebarOpen: true, tagMode: 'or', sortBy: 'name' };
 let _mapGoogleKey = '';
 let _mapFilterTags = new Set();
 let _mapSearchQ = '';
 let _mapMarkers = {};
 let _mapCluster = null;
+let _mapUserLoc = null;  // {lat,lng} cached from _mapLocateMe, ref point for Nearest sort
 let _mapDropMode = false;
 let _mapMobileSidebarInited = false; // mobile: show the map (not the pin list) on first open
 let _mapServerLoaded = false; // true once we've synced from the server — guards against empty overwrites
@@ -34433,10 +34450,26 @@ function _mapSearch(q) {
 function _mapRenderPins() {
   const el = document.getElementById('map-pin-list');
   if (!el) return;
-  const visible = _mapVisiblePins();
+  const sortSel = document.getElementById('map-sort');
+  if (sortSel && sortSel.value !== _mapSettings.sortBy) sortSel.value = _mapSettings.sortBy;
+  let visible = _mapVisiblePins();
   if (visible.length === 0) {
     el.innerHTML = '<div class="map-empty">' + (_mapPins.length === 0 ? 'No pins yet.<br>Click &ldquo;+ Pin&rdquo; to add one.' : 'No pins match your filter.') + '</div>';
     return;
+  }
+  // Sort (AMUX-1865 #5). Nearest measures from your located position if you've
+  // hit "locate me", else from the current map center.
+  const sortBy = _mapSettings.sortBy || 'name';
+  let ref = null;
+  if (sortBy === 'distance') {
+    ref = _mapUserLoc || (_map ? { lat: _map.getCenter().lat, lng: _map.getCenter().lng } : null);
+  }
+  if (sortBy === 'name') {
+    visible = visible.slice().sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
+  } else if (sortBy === 'recent') {
+    visible = visible.slice().sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+  } else if (sortBy === 'distance' && ref) {
+    visible = visible.slice().sort(function(a,b){ return _mapDist(ref.lat,ref.lng,a.lat,a.lng) - _mapDist(ref.lat,ref.lng,b.lat,b.lng); });
   }
   el.innerHTML = visible.map(function(pin) {
     const color = _mapPinColor(pin);
@@ -34446,10 +34479,11 @@ function _mapRenderPins() {
     }).join('');
     const preview = pin.desc || pin.notes || '';
     const hasNotes = !!(pin.notes);
+    const distLabel = (sortBy === 'distance' && ref) ? '<span class="map-pin-dist"> \u00B7 ' + _mapFmtDist(_mapDist(ref.lat,ref.lng,pin.lat,pin.lng)) + '</span>' : '';
     return '<div class="map-pin-item" onclick="_mapFlyToPin(\x27' + pin.id + '\x27)" ondblclick="_mapOpenPinModal(\x27' + pin.id + '\x27)">' +
       '<div class="map-pin-dot" style="background:' + color + '"></div>' +
       '<div class="map-pin-info">' +
-        '<div class="map-pin-name">' + escHtml(pin.name||'Unnamed') + (hasNotes ? ' <span style="font-size:0.68rem;color:var(--dim);font-weight:400;">\uD83D\uDCDD</span>' : '') + '</div>' +
+        '<div class="map-pin-name">' + escHtml(pin.name||'Unnamed') + distLabel + (hasNotes ? ' <span style="font-size:0.68rem;color:var(--dim);font-weight:400;">\uD83D\uDCDD</span>' : '') + '</div>' +
         (tagChips ? '<div class="map-pin-tagrow">' + tagChips + '</div>' : '') +
         (preview ? '<div class="map-pin-desc">' + escHtml(preview.substring(0,80)) + (preview.length>80?'\u2026':'') + '</div>' : '') +
       '</div>' +
@@ -34533,8 +34567,157 @@ function _mapSetDefaultView() {
 function _mapLocateMe() {
   if (!navigator.geolocation) { alert('Geolocation not supported by your browser.'); return; }
   navigator.geolocation.getCurrentPosition(function(pos) {
+    _mapUserLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
     if (_map) _map.flyTo([pos.coords.latitude, pos.coords.longitude], 14);
+    if (_mapSettings.sortBy === 'distance') _mapRenderPins();  // re-rank around me
   }, function() { alert('Could not get your location.'); });
+}
+
+// Haversine distance in meters (AMUX-1865 #5).
+function _mapDist(lat1, lng1, lat2, lng2) {
+  var toRad = Math.PI / 180;
+  var dLat = (lat2 - lat1) * toRad, dLng = (lng2 - lng1) * toRad;
+  var a = Math.sin(dLat/2)*Math.sin(dLat/2) +
+    Math.cos(lat1*toRad)*Math.cos(lat2*toRad)*Math.sin(dLng/2)*Math.sin(dLng/2);
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function _mapFmtDist(m) {
+  if (!isFinite(m)) return '';
+  var mi = m / 1609.344;
+  return mi < 0.1 ? Math.round(m*3.281) + ' ft' : mi.toFixed(mi < 10 ? 1 : 0) + ' mi';
+}
+
+function _mapSetSort(v) {
+  _mapSettings.sortBy = v;
+  try { localStorage.setItem('amux_map_settings', JSON.stringify(_mapSettings)); } catch(e) {}
+  _mapSave();
+  _mapRenderPins();
+}
+
+// ── Export / import (AMUX-1865 #6) — GeoJSON + CSV for backup/share/bulk-add ──
+function _mapDownload(filename, text, mime) {
+  var blob = new Blob([text], { type: mime || 'text/plain' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+}
+
+function _mapTagNames(pin) {
+  return (pin.tags||[]).map(function(tid){ var t=_mapTags.find(function(x){return x.id===tid;}); return t?t.name:''; }).filter(Boolean);
+}
+
+function _mapExportGeoJSON() {
+  var fc = { type: 'FeatureCollection', features: _mapPins.map(function(p){
+    return { type: 'Feature',
+      geometry: { type: 'Point', coordinates: [parseFloat(p.lng), parseFloat(p.lat)] },
+      properties: { name: p.name||'', desc: p.desc||'', notes: p.notes||'', tags: _mapTagNames(p),
+        rating: p.rating, priceLevel: p.priceLevel, placeId: p.placeId } };
+  }) };
+  _mapDownload('amux-map-' + Date.now() + '.geojson', JSON.stringify(fc, null, 2), 'application/geo+json');
+}
+
+function _mapExportCSV() {
+  var q = function(s){ s = (s==null?'':String(s)); return '"' + s.replace(/"/g,'""') + '"'; };
+  var rows = [['name','lat','lng','desc','notes','tags','rating','priceLevel'].join(',')];
+  _mapPins.forEach(function(p){
+    rows.push([q(p.name), p.lat, p.lng, q(p.desc||''), q(p.notes||''), q(_mapTagNames(p).join('; ')),
+      (p.rating==null?'':p.rating), (p.priceLevel==null?'':p.priceLevel)].join(','));
+  });
+  _mapDownload('amux-map-' + Date.now() + '.csv', rows.join('\n'), 'text/csv');
+}
+
+function _mapExportMenu(ev) {
+  ev.stopPropagation();
+  var old = document.getElementById('map-export-menu'); if (old) { old.remove(); return; }
+  var menu = document.createElement('div');
+  menu.id = 'map-export-menu';
+  menu.style.cssText = 'position:fixed;z-index:3000;background:var(--card);border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,0.4);padding:4px;font-size:0.78rem;min-width:160px';
+  var mk = function(label, fn){ var b=document.createElement('button'); b.textContent=label;
+    b.style.cssText='display:block;width:100%;text-align:left;padding:7px 10px;background:transparent;border:none;color:var(--text);cursor:pointer;border-radius:5px;font-size:0.78rem';
+    b.onmouseover=function(){b.style.background='var(--hover,rgba(127,127,127,0.15))';}; b.onmouseout=function(){b.style.background='transparent';};
+    b.onclick=function(){ menu.remove(); fn(); }; return b; };
+  menu.appendChild(mk('↓ Export GeoJSON (' + _mapPins.length + ')', _mapExportGeoJSON));
+  menu.appendChild(mk('↓ Export CSV (' + _mapPins.length + ')', _mapExportCSV));
+  menu.appendChild(mk('↑ Import GeoJSON / CSV…', function(){ document.getElementById('map-import-file').click(); }));
+  var r = ev.currentTarget.getBoundingClientRect();
+  menu.style.top = (r.bottom + 4) + 'px';
+  menu.style.left = Math.max(8, r.right - 160) + 'px';
+  document.body.appendChild(menu);
+  setTimeout(function(){ document.addEventListener('click', function h(){ menu.remove(); document.removeEventListener('click', h); }); }, 0);
+}
+
+// Minimal CSV row parser (handles quoted fields + escaped quotes).
+function _mapParseCSV(text) {
+  var lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(function(l){return l.length;});
+  return lines.map(function(line){
+    var out=[], cur='', inq=false;
+    for (var i=0;i<line.length;i++){ var c=line[i];
+      if (inq){ if(c==='"'){ if(line[i+1]==='"'){cur+='"';i++;} else inq=false; } else cur+=c; }
+      else { if(c===','){out.push(cur);cur='';} else if(c==='"'){inq=true;} else cur+=c; }
+    }
+    out.push(cur); return out;
+  });
+}
+
+function _mapTagIdsFromNames(names) {
+  var ids = [];
+  names.forEach(function(nm){ nm=(nm||'').trim(); if(!nm) return;
+    var t=_mapTags.find(function(x){return x.name.toLowerCase()===nm.toLowerCase();});
+    if (t) ids.push(t.id);
+  });
+  return ids;
+}
+
+function _mapImportFile(input) {
+  var file = input.files && input.files[0]; if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e){
+    var text = e.target.result, incoming = [];
+    try {
+      if (/\.csv$/i.test(file.name)) {
+        var rows = _mapParseCSV(text);
+        var hdr = rows.shift().map(function(h){return h.trim().toLowerCase();});
+        var ix = function(n){ return hdr.indexOf(n); };
+        rows.forEach(function(r){
+          var lat=parseFloat(r[ix('lat')]), lng=parseFloat(r[ix('lng')!==-1?ix('lng'):ix('lon')]);
+          if (isNaN(lat)||isNaN(lng)) return;
+          incoming.push({ name:(r[ix('name')]||'').trim(), lat:lat, lng:lng,
+            desc:(ix('desc')!==-1?r[ix('desc')]:'')||'', notes:(ix('notes')!==-1?r[ix('notes')]:'')||'',
+            tags:(ix('tags')!==-1?(r[ix('tags')]||'').split(/[;,]/):[]) });
+        });
+      } else {
+        var gj = JSON.parse(text);
+        var feats = gj.type==='FeatureCollection' ? gj.features : (gj.type==='Feature' ? [gj] : []);
+        feats.forEach(function(f){
+          if (!f.geometry || f.geometry.type!=='Point') return;
+          var co=f.geometry.coordinates, p=f.properties||{};
+          incoming.push({ name:(p.name||'').trim(), lat:co[1], lng:co[0], desc:p.desc||'', notes:p.notes||'',
+            tags:Array.isArray(p.tags)?p.tags:[], rating:p.rating, priceLevel:p.priceLevel, placeId:p.placeId });
+        });
+      }
+    } catch(err){ showToast('Import failed: ' + err.message); input.value=''; return; }
+    // Dedup against existing pins by name + ~11m coord match
+    var added=0, skipped=0;
+    incoming.forEach(function(n){
+      if (isNaN(n.lat)||isNaN(n.lng)) { skipped++; return; }
+      var dup=_mapPins.some(function(p){ return (p.name||'').toLowerCase()===(n.name||'').toLowerCase() &&
+        Math.abs(p.lat-n.lat)<1e-4 && Math.abs(p.lng-n.lng)<1e-4; });
+      if (dup){ skipped++; return; }
+      var pin={ id:'pin_'+Date.now()+'_'+added, name:n.name||'Imported pin', lat:n.lat, lng:n.lng,
+        desc:n.desc||'', notes:n.notes||'', tags:_mapTagIdsFromNames(n.tags||[]), createdAt:Date.now() };
+      if (typeof n.rating==='number') pin.rating=n.rating;
+      if (typeof n.priceLevel==='number') pin.priceLevel=n.priceLevel;
+      if (n.placeId) pin.placeId=n.placeId;
+      _mapPins.push(pin); added++;
+    });
+    input.value='';
+    if (added){ _mapSave(); _mapRenderPins(); _mapRenderMarkers(); }
+    showToast('Imported ' + added + ' pin' + (added===1?'':'s') + (skipped?(' · ' + skipped + ' skipped (dupe/invalid)'):''));
+  };
+  reader.readAsText(file);
 }
 
 function _mapToggleDropMode() {
@@ -45403,7 +45586,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.185';
+const CACHE = 'amux-v0.9.186';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
