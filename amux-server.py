@@ -4668,6 +4668,45 @@ def _send_sms(phone: str, text: str):
         return False, f"imessage error: {str(e)[:100]}"
 
 
+# ── Internal SMS bridge (AMUX-186x, smart-business-card) ─────────────────────
+# Programmatic outbound SMS for the card funnel. This is the ONE outward-effect
+# amux uniquely owns; everything else lives in the public sidecar. Hard rules:
+#  • NOT in _PUBLIC_PREFIXES — the cloud gateway 401s it for the internet.
+#  • Caller must be loopback OR present the shared AMUX_INTERNAL_TOKEN (so the
+#    cloud-VM sidecar on the private net can reach it, nothing else can).
+#  • Inert until TWILIO_* is configured — refuses to fall back to the owner's
+#    personal iMessage for stranger-facing sends.
+#  • Daily total cap + per-number cap + short dedupe window — a form-spam loop
+#    can't run up the Twilio bill or text a victim repeatedly.
+_sms_bridge_lock = threading.Lock()
+_sms_bridge_log: dict = {"day": "", "total": 0, "per_num": {}, "recent": {}}
+
+
+def _sms_bridge_gate(to: str, text: str) -> tuple[bool, str]:
+    """Rate/dedupe gate for /api/sms. Returns (ok, reason)."""
+    import datetime as _dt
+    day = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    daily_cap = int(os.environ.get("AMUX_SMS_DAILY_CAP", "50") or "50")
+    per_num_cap = int(os.environ.get("AMUX_SMS_PER_NUMBER_CAP", "5") or "5")
+    now = time.time()
+    with _sms_bridge_lock:
+        if _sms_bridge_log["day"] != day:
+            _sms_bridge_log.update({"day": day, "total": 0, "per_num": {}, "recent": {}})
+        # dedupe: identical (to,text) within 10 min
+        key = to + "|" + text
+        if now - _sms_bridge_log["recent"].get(key, 0) < 600:
+            return False, "duplicate (same message to same number within 10 min)"
+        if _sms_bridge_log["total"] >= daily_cap:
+            return False, f"daily SMS cap reached ({daily_cap})"
+        if _sms_bridge_log["per_num"].get(to, 0) >= per_num_cap:
+            return False, f"per-number cap reached ({per_num_cap}/day for {to})"
+        # reserve
+        _sms_bridge_log["total"] += 1
+        _sms_bridge_log["per_num"][to] = _sms_bridge_log["per_num"].get(to, 0) + 1
+        _sms_bridge_log["recent"][key] = now
+    return True, ""
+
+
 _urgent_alert_last = {}  # message-hash → ts, for a light flood guard
 
 
@@ -51449,6 +51488,40 @@ return "not_found"
                     return self._json({"error": str(e)}, 500)
 
             return self._json({"error": "not found"}, 404)
+
+        # ── Internal SMS bridge (smart-business-card sidecar → Twilio) ──
+        # Localhost/secret-gated, capped, inert without TWILIO_*. See _send_sms.
+        if path == "/api/sms" and method == "POST":
+            _cip = (self.client_address[0] if self.client_address else "")
+            _loopback = _cip in ("127.0.0.1", "::1", "localhost")
+            _tok = os.environ.get("AMUX_INTERNAL_TOKEN", "")
+            _hdr_tok = self.headers.get("X-Amux-Internal-Token", "")
+            if not (_loopback or (_tok and _hdr_tok == _tok)):
+                return self._json({"error": "forbidden — /api/sms is localhost/token-only"}, 403)
+            # Refuse stranger-facing sends over the owner's personal iMessage.
+            if not (os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN")
+                    and os.environ.get("TWILIO_FROM")):
+                return self._json({"error": "SMS not configured — set TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM in server.env"}, 503)
+            body = self._read_body()
+            to = str(body.get("to", "")).strip()
+            text = str(body.get("text", "")).strip()
+            if not re.match(r"^\+?[1-9]\d{6,14}$", to):
+                return self._json({"error": "invalid 'to' — must be E.164 (e.g. +15551234567)"}, 400)
+            if not text or len(text) > 1000:
+                return self._json({"error": "'text' required, max 1000 chars"}, 400)
+            ok, reason = _sms_bridge_gate(to, text)
+            if not ok:
+                return self._json({"error": reason, "throttled": True}, 429)
+            sent, detail = _send_sms(to, text)
+            if not sent:
+                # release the reservation so a real failure doesn't burn the cap
+                with _sms_bridge_lock:
+                    _sms_bridge_log["total"] = max(0, _sms_bridge_log["total"] - 1)
+                    if to in _sms_bridge_log["per_num"]:
+                        _sms_bridge_log["per_num"][to] = max(0, _sms_bridge_log["per_num"][to] - 1)
+                return self._json({"ok": False, "error": detail}, 502)
+            slog(f"[sms-bridge] sent to {to[:4]}…{to[-2:]} via {detail}")
+            return self._json({"ok": True, "via": detail})
 
         # ── Cloud Waitlist ──
         if path == "/api/waitlist":
