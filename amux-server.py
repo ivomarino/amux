@@ -19550,6 +19550,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <option value="sonnet">sonnet</option>
             <option value="opus">opus</option>
             <option value="haiku">haiku</option>
+            <option value="claude-opus-5">claude-opus-5</option>
+            <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
             <option value="claude-fable-5">claude-fable-5</option>
             <option value="claude-opus-4-8">claude-opus-4-8</option>
             <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
@@ -21458,6 +21460,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <option value="opus">opus</option>
       <option value="sonnet">sonnet</option>
       <option value="haiku">haiku</option>
+      <option value="claude-opus-5">claude-opus-5</option>
+      <option value="claude-opus-5[1m]">claude-opus-5 [1M]</option>
       <option value="claude-fable-5">claude-fable-5</option>
       <option value="claude-opus-4-8">claude-opus-4-8</option>
       <option value="claude-opus-4-8[1m]">claude-opus-4-8 [1M]</option>
@@ -24809,6 +24813,7 @@ function editField(session, field, current, provider) {
   } else if (field === 'model') {
     const claudeModels = [
       {v:'',l:'Default'},{v:'opus',l:'opus'},{v:'sonnet',l:'sonnet'},{v:'haiku',l:'haiku'},
+      {v:'claude-opus-5',l:'claude-opus-5'},{v:'claude-opus-5[1m]',l:'claude-opus-5 [1M]'},
       {v:'claude-fable-5',l:'claude-fable-5'},
       {v:'claude-opus-4-8',l:'claude-opus-4-8'},{v:'claude-opus-4-8[1m]',l:'claude-opus-4-8 [1M]'},
       {v:'claude-opus-4-7',l:'claude-opus-4-7'},{v:'claude-opus-4-7[1m]',l:'claude-opus-4-7 [1M]'},
@@ -26821,7 +26826,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.186';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.187';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -45652,7 +45657,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.186';
+const CACHE = 'amux-v0.9.187';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
