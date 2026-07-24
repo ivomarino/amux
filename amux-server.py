@@ -5647,8 +5647,7 @@ def _snapshot_all_sessions_inner():
             if (not actions.get("restarting") and not actions.get("hibernated")
                     and (not _in_grace or _ui_stale)):
                 cfg_pl = parse_env_file(f)
-                if (cfg_pl.get("CC_AUTO_CONTINUE") in ("1", "true", "yes")
-                        and cfg_pl.get("CC_ARCHIVED") != "1"):
+                if cfg_pl.get("CC_ARCHIVED") != "1":
                     last_restart = actions.get("last_auto_restart", 0)
                     if now - last_restart > 90:
                         try:
@@ -5662,24 +5661,52 @@ def _snapshot_all_sessions_inner():
                                     ["pgrep", "-P", shell_pid],
                                     capture_output=True, text=True, timeout=5)
                                 if not r_ch.stdout.strip():
-                                    # Shell has no children — Claude is gone
-                                    slog(f"[4b] {name}: no child process under shell PID {shell_pid} — triggering OOM restart")
-                                    actions["restarting"] = True
-                                    actions["last_auto_restart"] = now
-                                    def _do_oom_restart(sname=name, _actions=actions):
-                                        time.sleep(3)
-                                        start_session(sname)
-                                        for _w in range(30):
-                                            time.sleep(1)
-                                            _o = tmux_capture(sname, 10)
-                                            if _o and _claude_ui_visible(_o):
-                                                break
-                                        _actions.pop("restarting", None)
-                                    threading.Thread(target=_do_oom_restart, daemon=True).start()
-                                    _push_alert("auto_restart", name,
-                                                f"Claude process died in '{name}' (OOM/signal) — auto-restarting")
+                                    # Shell has no children — Claude is gone. Two cases:
+                                    #  • clean shell prompt on screen = intentional /exit →
+                                    #    honor the CC_AUTO_CONTINUE opt-in (unchanged).
+                                    #  • blank/garbled pane = a CRASH (SIGKILL/OOM/silent
+                                    #    death) → self-heal REGARDLESS of the opt-in. This
+                                    #    is the hole amux-users fell through: created without
+                                    #    CC_AUTO_CONTINUE, it died and sat silently dead
+                                    #    because both restart paths required the opt-in.
+                                    _auto = cfg_pl.get("CC_AUTO_CONTINUE") in ("1", "true", "yes")
+                                    _crashed = not _at_shell_prompt(clean)
+                                    if not (_auto or _crashed):
+                                        pass  # clean /exit on a non-auto-continue session — leave it
+                                    else:
+                                        # Crash-loop cap: a session that keeps dying is a real
+                                        # problem (e.g. shared CC_DIR) — don't restart forever.
+                                        _deaths = [t for t in actions.get("crash_deaths", []) if now - t < 900]
+                                        if _crashed and not _auto and len(_deaths) >= 3:
+                                            if not actions.get("crash_gaveup"):
+                                                actions["crash_gaveup"] = now
+                                                slog(f"[4b] {name}: crashed {len(_deaths)}x/15min — NOT restarting, alerting")
+                                                _push_alert("auto_restart", name,
+                                                            f"'{name}' Claude keeps crashing ({len(_deaths)}x in 15min) — "
+                                                            f"stopped auto-restarting. Likely a shared working directory "
+                                                            f"(two sessions in one CC_DIR) — give it its own dir.")
+                                        else:
+                                            _deaths.append(now)
+                                            actions["crash_deaths"] = _deaths
+                                            actions.pop("crash_gaveup", None)
+                                            slog(f"[4b] {name}: no child under shell PID {shell_pid} "
+                                                 f"({'crash' if _crashed else 'exit'}, auto_continue={_auto}) — restarting")
+                                            actions["restarting"] = True
+                                            actions["last_auto_restart"] = now
+                                            def _do_oom_restart(sname=name, _actions=actions):
+                                                time.sleep(3)
+                                                start_session(sname)
+                                                for _w in range(30):
+                                                    time.sleep(1)
+                                                    _o = tmux_capture(sname, 10)
+                                                    if _o and _claude_ui_visible(_o):
+                                                        break
+                                                _actions.pop("restarting", None)
+                                            threading.Thread(target=_do_oom_restart, daemon=True).start()
+                                            _push_alert("auto_restart", name,
+                                                        f"Claude {'crashed' if _crashed else 'exited'} in '{name}' — auto-restarting")
                                 else:
-                                    pass  # Claude child exists — healthy
+                                    actions.pop("crash_deaths", None)  # healthy — reset crash tracker
                             else:
                                 slog(f"[4b] {name}: list-panes failed rc={r_pp.returncode}")
                         except Exception as e:
