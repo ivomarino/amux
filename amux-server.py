@@ -46182,6 +46182,15 @@ class CCHandler(BaseHTTPRequestHandler):
                     return len(data)
                 def flush(self):
                     self._raw.flush()
+                def close(self):
+                    try:
+                        tail = self._c.flush(_zlib.Z_FINISH)
+                        if tail:
+                            self._raw.write(tail)
+                    except Exception:
+                        pass
+                    if hasattr(self._raw, 'close'):
+                        self._raw.close()
             self.wfile = _GzipEventStream(self.wfile)
 
         # Cap SSE connection lifetime to avoid thread accumulation.
