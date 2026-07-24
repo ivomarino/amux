@@ -26737,7 +26737,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.183';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.184';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -34210,7 +34210,7 @@ async function _habitsDelete(idx) {
 let _map = null;
 let _mapPins = [];
 let _mapTags = [];
-let _mapSettings = { defaultZoom: 12, defaultLat: 40.7128, defaultLng: -74.0060, sidebarOpen: true };
+let _mapSettings = { defaultZoom: 12, defaultLat: 40.7128, defaultLng: -74.0060, sidebarOpen: true, tagMode: 'or' };
 let _mapGoogleKey = '';
 let _mapFilterTags = new Set();
 let _mapSearchQ = '';
@@ -34345,8 +34345,17 @@ function _mapMakeIcon(pin) {
 }
 
 function _mapVisiblePins() {
+  const andMode = _mapSettings.tagMode === 'and';
   return _mapPins.filter(function(pin) {
-    if (_mapFilterTags.size > 0 && !(pin.tags && pin.tags.some(function(t) { return _mapFilterTags.has(t); }))) return false;
+    if (_mapFilterTags.size > 0) {
+      const pt = pin.tags || [];
+      // OR: pin has ANY selected tag. AND: pin has EVERY selected tag
+      // (intersection, e.g. Girls × Coffee).
+      const match = andMode
+        ? Array.from(_mapFilterTags).every(function(t) { return pt.indexOf(t) !== -1; })
+        : pt.some(function(t) { return _mapFilterTags.has(t); });
+      if (!match) return false;
+    }
     if (_mapSearchQ) {
       const q = _mapSearchQ;
       const nameMatch = (pin.name||'').toLowerCase().includes(q);
@@ -34374,7 +34383,23 @@ function _mapRenderTags() {
       : 'color:' + tag.color + ';border-color:' + tag.color + '88;';
     html += '<button class="map-tag-chip' + (active ? ' tag-active' : '') + '" style="' + chipStyle + '" onclick="_mapFilterByTag(\x27' + tag.id + '\x27)" oncontextmenu="event.preventDefault();_mapEditTag(\x27' + tag.id + '\x27)" title="Right-click to edit">' + escHtml(tag.name) + '</button>';
   });
+  // AND/OR toggle — only meaningful (and only shown) with 2+ tags selected.
+  if (_mapFilterTags.size >= 2) {
+    const andMode = _mapSettings.tagMode === 'and';
+    html += '<button class="map-tag-chip map-tag-mode" onclick="_mapToggleTagMode()" title="' +
+      (andMode ? 'Matching pins with ALL selected tags — click for ANY' : 'Matching pins with ANY selected tag — click for ALL') +
+      '" style="font-weight:700;letter-spacing:0.5px;">' + (andMode ? 'AND' : 'OR') + '</button>';
+  }
   el.innerHTML = html;
+}
+
+function _mapToggleTagMode() {
+  _mapSettings.tagMode = (_mapSettings.tagMode === 'and') ? 'or' : 'and';
+  try { localStorage.setItem('amux_map_settings', JSON.stringify(_mapSettings)); } catch(e) {}
+  _mapSave();
+  _mapRenderTags();
+  _mapRenderPins();
+  _mapRenderMarkers();
 }
 
 function _mapFilterByTag(tagId) {
@@ -34432,9 +34457,12 @@ function _mapRenderMarkers() {
       return tag ? '<span style="display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;font-weight:500;background:' + tag.color + ';color:#fff;">' + escHtml(tag.name) + '</span>' : '';
     }).join(' ');
     const notesPreview = pin.notes ? (pin.notes.length > 150 ? pin.notes.substring(0, 150) + '\u2026' : pin.notes) : '';
+    var _photo = _mapPhotoUrl(pin.photoName, 400);
     marker.bindPopup(
       '<div style="min-width:160px;max-width:280px;font-family:inherit;font-size:13px">' +
+        (_photo ? '<img src="' + _photo + '" alt="" loading="lazy" style="width:100%;height:110px;object-fit:cover;border-radius:6px;margin-bottom:6px" onerror="this.style.display=\x27none\x27">' : '') +
         '<div style="font-weight:600;margin-bottom:4px">' + escHtml(pin.name||'Unnamed') + '</div>' +
+        _mapMetaRow(pin) +
         (pin.desc ? '<div style="font-size:12px;color:#888;margin-bottom:4px">' + escHtml(pin.desc) + '</div>' : '') +
         (notesPreview ? '<div style="font-size:11.5px;color:#aaa;margin-bottom:4px;white-space:pre-wrap;line-height:1.4;border-left:2px solid #444;padding-left:6px;">' + escHtml(notesPreview) + '</div>' : '') +
         (tagChips ? '<div style="margin-bottom:4px">' + tagChips + '</div>' : '') +
@@ -34560,6 +34588,7 @@ function _mapToggleTagCheck(label) {
 function _mapClosePinModal() {
   document.getElementById('map-pin-modal').style.display = 'none';
   _mapEditingPin = null;
+  window._mapPendingPlace = null;
   _mapExitDropMode();
 }
 
@@ -34576,8 +34605,11 @@ function _mapSavePin() {
     const pin = _mapPins.find(function(p) { return p.id === _mapEditingPin; });
     if (pin) { pin.name=name; pin.desc=desc; pin.notes=notes; pin.lat=lat; pin.lng=lng; pin.tags=tags; }
   } else {
-    _mapPins.push({ id: 'pin_'+Date.now(), name: name, desc: desc, notes: notes, lat: lat, lng: lng, tags: tags, createdAt: Date.now() });
+    var np = { id: 'pin_'+Date.now(), name: name, desc: desc, notes: notes, lat: lat, lng: lng, tags: tags, createdAt: Date.now() };
+    if (window._mapPendingPlace) { Object.assign(np, window._mapPendingPlace); }
+    _mapPins.push(np);
   }
+  window._mapPendingPlace = null;
   _mapSave(); _mapClosePinModal(); _mapRenderPins(); _mapRenderMarkers();
 }
 
@@ -34703,6 +34735,43 @@ function _mapGeoMapsUrl(lat, lon, name) {
   return 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent((name || '') + ' ' + lat + ',' + lon).trim();
 }
 
+// Extract the persistable rich-place fields from a Google search result (only
+// keys that are actually present, so pins stay lean).
+function _mapPlaceFields(r) {
+  var f = {};
+  if (typeof r.rating === 'number') f.rating = r.rating;
+  if (typeof r.rating_count === 'number') f.ratingCount = r.rating_count;
+  if (typeof r.price_level === 'number') f.priceLevel = r.price_level;
+  if (typeof r.open_now === 'boolean') f.openNow = r.open_now;
+  if (r.place_id) f.placeId = r.place_id;
+  if (r.photo_name) f.photoName = r.photo_name;
+  return f;
+}
+
+// Build a Google Places photo media URL from a stored photo resource name.
+function _mapPhotoUrl(photoName, maxW) {
+  if (!photoName || !_mapGoogleKey) return '';
+  return 'https://places.googleapis.com/v1/' + photoName + '/media?maxWidthPx=' + (maxW || 400) + '&key=' + _mapGoogleKey;
+}
+
+// One-line rich metadata badge row (rating · price · open-now) for popups.
+function _mapMetaRow(pin) {
+  var parts = [];
+  if (typeof pin.rating === 'number') {
+    parts.push('<span style="color:#f5b301;font-weight:600">★ ' + pin.rating.toFixed(1) + '</span>' +
+      (pin.ratingCount ? '<span style="color:#999"> (' + pin.ratingCount + ')</span>' : ''));
+  }
+  if (typeof pin.priceLevel === 'number') {
+    parts.push('<span style="color:#3fb950;font-weight:600">' + (pin.priceLevel === 0 ? 'Free' : '$'.repeat(pin.priceLevel)) + '</span>');
+  }
+  if (typeof pin.openNow === 'boolean') {
+    parts.push(pin.openNow
+      ? '<span style="color:#3fb950;font-weight:600">Open now</span>'
+      : '<span style="color:#f85149;font-weight:600">Closed</span>');
+  }
+  return parts.length ? '<div style="font-size:12px;margin-bottom:5px;display:flex;gap:8px;flex-wrap:wrap">' + parts.join('') + '</div>' : '';
+}
+
 function _mapGeoRenderResults(data) {
   var results = document.getElementById('map-geocoder-results');
   if (!results) return;
@@ -34758,7 +34827,7 @@ function _mapGeoQuickSave(idx) {
   var name = (r.name && r.name.length > 0) ? r.name : r.display_name.split(',')[0];
   var lat = parseFloat(r.lat), lng = parseFloat(r.lon);
   if (isNaN(lat) || isNaN(lng)) return;
-  var pin = { id: 'pin_'+Date.now(), name: name, desc: r.display_name || '', lat: lat, lng: lng, tags: [], createdAt: Date.now() };
+  var pin = Object.assign({ id: 'pin_'+Date.now(), name: name, desc: r.display_name || '', lat: lat, lng: lng, tags: [], createdAt: Date.now() }, _mapPlaceFields(r));
   _mapPins.push(pin);
   _mapSave();
   _mapRenderPins();
@@ -34775,6 +34844,8 @@ function _mapGeoSavePin(idx) {
   if (!r) return;
   var name = (r.name && r.name.length > 0) ? r.name : r.display_name.split(',')[0];
   if (window._mapGeoTempMarker) window._mapGeoTempMarker.closePopup();
+  // Stash the rich place fields; _mapSavePin merges them into the new pin.
+  window._mapPendingPlace = _mapPlaceFields(r);
   _mapOpenPinModal(null, { lat: parseFloat(r.lat), lng: parseFloat(r.lon) });
   setTimeout(function() {
     var nameEl = document.getElementById('map-pin-name');
@@ -45298,7 +45369,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.183';
+const CACHE = 'amux-v0.9.184';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -47013,25 +47084,49 @@ class CCHandler(BaseHTTPRequestHandler):
                         headers={
                             "Content-Type": "application/json",
                             "X-Goog-Api-Key": gkey,
-                            "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,places.types"
+                            "X-Goog-FieldMask": ("places.id,places.displayName,places.formattedAddress,"
+                                                 "places.location,places.types,places.rating,"
+                                                 "places.userRatingCount,places.priceLevel,"
+                                                 "places.currentOpeningHours,places.photos")
                         }
                     )
                     with _urq.urlopen(req, timeout=5, context=_ctx) as resp:
                         data = json.loads(resp.read())
+                    # priceLevel comes back as an enum string; map to a $ count
+                    _price_map = {
+                        "PRICE_LEVEL_FREE": 0, "PRICE_LEVEL_INEXPENSIVE": 1,
+                        "PRICE_LEVEL_MODERATE": 2, "PRICE_LEVEL_EXPENSIVE": 3,
+                        "PRICE_LEVEL_VERY_EXPENSIVE": 4,
+                    }
                     results = []
                     for p in data.get("places", []):
                         loc = p.get("location", {})
                         name = p.get("displayName", {}).get("text", "")
                         addr = p.get("formattedAddress", "")
                         types = p.get("types", [])
-                        results.append({
+                        photos = p.get("photos", [])
+                        r = {
                             "name": name,
                             "display_name": addr,
                             "lat": str(loc.get("latitude", 0)),
                             "lon": str(loc.get("longitude", 0)),
                             "type": types[0] if types else "",
-                            "source": "google"
-                        })
+                            "source": "google",
+                            "place_id": p.get("id", ""),
+                        }
+                        if isinstance(p.get("rating"), (int, float)):
+                            r["rating"] = p["rating"]
+                        if isinstance(p.get("userRatingCount"), int):
+                            r["rating_count"] = p["userRatingCount"]
+                        if p.get("priceLevel") in _price_map:
+                            r["price_level"] = _price_map[p["priceLevel"]]
+                        oh = p.get("currentOpeningHours")
+                        if isinstance(oh, dict) and "openNow" in oh:
+                            r["open_now"] = bool(oh["openNow"])
+                        # photo resource name → client builds the media URL with its key
+                        if photos and photos[0].get("name"):
+                            r["photo_name"] = photos[0]["name"]
+                        results.append(r)
                     return self._json(results)
                 except Exception:
                     pass  # fall through to Nominatim
