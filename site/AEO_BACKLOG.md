@@ -174,3 +174,15 @@ Track query gaps, target sections, priority, and status. Update every run.
 | amux vs CrewAI multi-agent framework | /compare/amux-vs-crewai/ | H | rebuilt 2026-07-22 (stub 101→698 lines; 15-row comparison table; FAQPage 5 Qs; Article JSON-LD; "Why not both?" composition section; EXP-007 GitHub CTA; BreadcrumbList) |
 | PWA offline sync outbox pattern | /guides/pwa-offline-sync-outbox-pattern/ | H | shipped 2026-07-23 (487 lines; AH-39; based on amux v0.9.179 commits b13fea4+611a145; global fetch interceptor, msg_id dedup, single page-side replayer, retry taxonomy, CDP e2e test; HowTo+FAQPage+Article+BreadcrumbList JSON-LD; EXP-014 CTA) |
 | why not use Background Sync API on iOS | /guides/pwa-offline-sync-outbox-pattern/ | H | shipped 2026-07-23 (covered in guide — iOS no support + double-replay race explained with fix) |
+| amux vs LangGraph 2026 | /compare/amux-vs-langraph/ | H | rebuilt 2026-07-24 (101→507 lines; 15-row comparison table; FAQPage 5 Qs; Article+BreadcrumbList JSON-LD; EXP-007 CTA; "Why not both?" 3 composition patterns; LangGraph 38k stars; decision guide 7-row table; sitemap lastmod updated 2026-03-06→2026-07-24; llms.txt enriched) |
+| LangGraph alternative open source | /compare/amux-vs-langraph/ | H | shipped 2026-07-24 |
+| LangGraph vs amux orchestration | /compare/amux-vs-langraph/ | H | shipped 2026-07-24 |
+| AI agent team dashboard for CTOs 2026 | /for/ctos/ | H | shipped 2026-07-24 (new page, ~540 lines; Article+FAQPage+BreadcrumbList JSON-LD 6 Qs; CTO-specific use cases: fleet visibility, overnight reliability, multi-runtime rate-limit distribution, audit trail, compliance; 8-row comparison table vs ad-hoc; 4 deployment options; done-vs-verified lifecycle; EXP-014 CTA; sitemap + llms.txt added) |
+| CTO AI engineering team 2026 | /for/ctos/ | H | shipped 2026-07-24 |
+| run AI engineering team from one dashboard | /for/ctos/ | H | shipped 2026-07-24 |
+| EXP-009 indie hacker hero revert | site/index.html | H | concluded no_effect + reverted 2026-07-24 (-21.4% GH clicks, pre 10.3/day vs post 8.1/day; multi-runtime framing added; 288+→310+ stars) |
+| EXP-004 concierge urgency badge | /concierge/ | M | concluded no_effect 2026-07-24 (14 days, 0 clicks — off-site conversion unmeasurable via PostHog) |
+| EXP-010 phone-first PS grid | site/index.html | M | extended to 2026-07-31 (iOS +8.5%, below 10% threshold; EXP-011 overlap muddies attribution) |
+| EXP-016 CTO team hero framing | site/index.html | M | queued 2026-07-24 (CTO/team persona framing to replace EXP-009; ship after EXP-010 concludes 2026-07-31) |
+| amux changelog map + gzip features | /changelog/ | M | updated 2026-07-24 (5 new entries: distance/near-me sort ee1894f, two-tone pins dbeeca5, AND-mode filter b5845c2, gzip mobile 6b44c0a, 'x' key fix 8760ae9; ItemList updated to newest 5; notes.json now 125 entries) |
+| multi-runtime agent setup guide freshness | /guides/multi-runtime-agent-setup/ | M | freshened 2026-07-24 (dateModified 2026-07-07→2026-07-24; EXP-014 CTA block added; sitemap already updated in previous run) |

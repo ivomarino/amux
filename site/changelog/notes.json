@@ -1,5 +1,50 @@
 [
   {
+    "hash": "ee1894f",
+    "short": "ee1894f",
+    "title": "Map: distance/near-me sort + GeoJSON and CSV export-import",
+    "date": "2026-07-24",
+    "type": "feat",
+    "tags": ["map", "export", "geojson", "csv", "sort"],
+    "description": "Map pins now sort by distance from your current location (near-me mode). Export your entire map as GeoJSON or CSV; re-import either format to share collections between devices or teammates. Distance sort uses the browser Geolocation API and falls back gracefully when permission is denied."
+  },
+  {
+    "hash": "dbeeca5",
+    "short": "dbeeca5",
+    "title": "Map: two-tone pin color for 2nd tag + marker clustering",
+    "date": "2026-07-24",
+    "type": "feat",
+    "tags": ["map", "pins", "clustering", "tags"],
+    "description": "Map pins now display a two-tone color: primary tag sets the fill, secondary tag sets a contrasting stroke. When many pins are in the same area, they cluster into a count bubble that expands on click. Clustering keeps the map readable at city scale without losing individual markers."
+  },
+  {
+    "hash": "b5845c2",
+    "short": "b5845c2",
+    "title": "Map: AND-mode tag filter + richer Places capture",
+    "date": "2026-07-24",
+    "type": "feat",
+    "tags": ["map", "filter", "places", "tags"],
+    "description": "Tag filtering now supports AND mode — show only pins that match ALL selected tags (previously OR-only). The Places capture panel now pulls richer metadata from Google Places: rating, price level, opening hours, website, and phone number, all stored with the pin."
+  },
+  {
+    "hash": "6b44c0a",
+    "short": "6b44c0a",
+    "title": "gzip all text responses + ETag/304 + gzip SSE stream — v0.9.183",
+    "date": "2026-07-23",
+    "type": "perf",
+    "tags": ["performance", "mobile", "gzip", "sse", "etag"],
+    "description": "All text/HTML, JSON, and CSS/JS responses are now gzip-compressed when the client supports it. Static assets get ETag + 304 Not Modified support so unchanged files don't re-download. The SSE event stream itself is also gzip-compressed (chunked transfer encoding), cutting mobile data usage for long-running sessions. Measured 60-80% payload reduction on dashboard load."
+  },
+  {
+    "hash": "8760ae9",
+    "short": "8760ae9",
+    "title": "Allow 'x' key in terminal — kills hung subagents in Claude Code",
+    "date": "2026-07-23",
+    "type": "fix",
+    "tags": ["terminal", "claude-code", "keys", "subagents"],
+    "description": "The 'x' key was being intercepted by the dashboard before reaching the terminal, preventing users from killing hung Claude Code subagents (the standard interrupt gesture). Now passes through correctly. Also fixes a regression where Ctrl+C was occasionally dropped during rapid key sequences."
+  },
+  {
     "hash": "a5ee75f",
     "short": "a5ee75f",
     "title": "Scheduler now logs who created or deleted each schedule \u2014 full audit trail",
