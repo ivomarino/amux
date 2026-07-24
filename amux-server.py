@@ -15328,6 +15328,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quilljs-markdown@latest/dist/quilljs-markdown-common-style.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -26737,7 +26739,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.184';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.185';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -34215,6 +34217,7 @@ let _mapGoogleKey = '';
 let _mapFilterTags = new Set();
 let _mapSearchQ = '';
 let _mapMarkers = {};
+let _mapCluster = null;
 let _mapDropMode = false;
 let _mapMobileSidebarInited = false; // mobile: show the map (not the pin list) on first open
 let _mapServerLoaded = false; // true once we've synced from the server — guards against empty overwrites
@@ -34323,17 +34326,27 @@ function _mapInit() {
   _mapRenderMarkers();
 }
 
+function _mapTagColor(tagId) {
+  const tag = _mapTags.find(function(t) { return t.id === tagId; });
+  return tag ? tag.color : '';
+}
+
 function _mapPinColor(pin) {
   if (!pin.tags || pin.tags.length === 0) return '#8b949e';
-  const tag = _mapTags.find(function(t) { return t.id === pin.tags[0]; });
-  return tag ? tag.color : '#8b949e';
+  return _mapTagColor(pin.tags[0]) || '#8b949e';
 }
 
 function _mapMakeIcon(pin) {
   const color = _mapPinColor(pin);
+  // Second tag (if any) colors the inner dot, so a Coffee+Girls pin reads as
+  // two-tone instead of hiding its secondary tag (AMUX-1865 #3).
+  const second = (pin.tags && pin.tags.length > 1) ? (_mapTagColor(pin.tags[1]) || '') : '';
+  const inner = second
+    ? '<circle cx="12" cy="12" r="5" fill="' + second + '" stroke="#fff" stroke-width="1.5"/>'
+    : '<circle cx="12" cy="12" r="4.5" fill="rgba(255,255,255,0.55)"/>';
   const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="32" viewBox="0 0 24 32">' +
     '<path d="M12 0C5.373 0 0 5.373 0 12c0 9 12 20 12 20s12-11 12-20C24 5.373 18.627 0 12 0z" fill="' + color + '" stroke="#fff" stroke-width="1.5"/>' +
-    '<circle cx="12" cy="12" r="4.5" fill="rgba(255,255,255,0.55)"/>' +
+    inner +
   '</svg>';
   return L.divIcon({
     className: '',
@@ -34447,11 +34460,25 @@ function _mapRenderPins() {
 
 function _mapRenderMarkers() {
   if (!_map) return;
-  Object.values(_mapMarkers).forEach(function(m) { m.remove(); });
+  // Clustering (AMUX-1865 #4): ~67 pins overlap heavily in Manhattan. Use a
+  // markerClusterGroup when the plugin loaded; fall back to direct markers so
+  // the map still works if the CDN is unreachable.
+  const useCluster = typeof L.markerClusterGroup === 'function';
+  if (useCluster) {
+    if (!_mapCluster) {
+      _mapCluster = L.markerClusterGroup({ maxClusterRadius: 45, spiderfyOnMaxZoom: true, showCoverageOnHover: false });
+      _map.addLayer(_mapCluster);
+    } else {
+      _mapCluster.clearLayers();
+    }
+  } else {
+    Object.values(_mapMarkers).forEach(function(m) { m.remove(); });
+  }
   _mapMarkers = {};
   _mapVisiblePins().forEach(function(pin) {
     if (isNaN(parseFloat(pin.lat)) || isNaN(parseFloat(pin.lng))) return;
-    const marker = L.marker([pin.lat, pin.lng], { icon: _mapMakeIcon(pin) }).addTo(_map);
+    const marker = L.marker([pin.lat, pin.lng], { icon: _mapMakeIcon(pin) });
+    if (useCluster) { _mapCluster.addLayer(marker); } else { marker.addTo(_map); }
     const tagChips = (pin.tags||[]).map(function(tid) {
       const tag = _mapTags.find(function(t) { return t.id === tid; });
       return tag ? '<span style="display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;font-weight:500;background:' + tag.color + ';color:#fff;">' + escHtml(tag.name) + '</span>' : '';
@@ -34477,8 +34504,14 @@ function _mapRenderMarkers() {
 function _mapFlyToPin(id) {
   const pin = _mapPins.find(function(p) { return p.id === id; });
   if (!pin || !_map) return;
-  _map.flyTo([pin.lat, pin.lng], Math.max(_map.getZoom(), 14), { duration: 0.8 });
-  setTimeout(function() { if (_mapMarkers[id]) _mapMarkers[id].openPopup(); }, 900);
+  // With clustering, the marker may be hidden inside a cluster — ask the plugin
+  // to zoom/spiderfy until it's exposed, then open its popup (AMUX-1865 #4).
+  if (_mapCluster && _mapMarkers[id] && typeof _mapCluster.zoomToShowLayer === 'function') {
+    _mapCluster.zoomToShowLayer(_mapMarkers[id], function() { _mapMarkers[id].openPopup(); });
+  } else {
+    _map.flyTo([pin.lat, pin.lng], Math.max(_map.getZoom(), 14), { duration: 0.8 });
+    setTimeout(function() { if (_mapMarkers[id]) _mapMarkers[id].openPopup(); }, 900);
+  }
   document.querySelectorAll('.map-pin-item').forEach(function(el) { el.classList.remove('active'); });
   const visible = _mapVisiblePins();
   const idx = visible.findIndex(function(p) { return p.id === id; });
@@ -45264,6 +45297,7 @@ window.addEventListener('load', _pinnedNotesRefresh);
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
 <div id="grid-view">
   <div class="grid-toolbar">
@@ -45369,7 +45403,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.184';
+const CACHE = 'amux-v0.9.185';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
