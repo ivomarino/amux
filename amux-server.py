@@ -26826,7 +26826,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.187';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.189';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -27102,8 +27102,12 @@ function _savePeekState() {
       state.splitPath = _peekSplitPath || peekSessionDir || '/';
     }
     sessionStorage.setItem('peekState', JSON.stringify(state));
+    // Also persist to localStorage (with a timestamp) so an open session peek
+    // is restored after iOS evicts the backgrounded PWA, not just a soft reload.
+    try { localStorage.setItem('amux_peek_state', JSON.stringify(Object.assign({ ts: Date.now() }, state))); } catch(e) {}
   } else {
     sessionStorage.removeItem('peekState');
+    try { localStorage.removeItem('amux_peek_state'); } catch(e) {}
   }
 }
 
@@ -34125,6 +34129,9 @@ function _chromeSave() {
 function switchView(view) {
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
   activeView = view;
+  // Persist the tab to localStorage so it survives iOS evicting the backgrounded
+  // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
+  try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
   const _svIds = ['session','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
   const _svNames = ['sessions','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
   const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex'];
@@ -40269,9 +40276,37 @@ async function _handleDeeplink(hash) {
 }
 // On page load
 _handleDeeplink(location.hash);
-// Restore peek state from sessionStorage (survives refresh)
-try {
-  const _ps = JSON.parse(sessionStorage.getItem('peekState') || 'null');
+// Restore the screen you were on — INCLUDING after iOS evicts a backgrounded
+// PWA (which wipes sessionStorage but keeps localStorage): the active tab and
+// any open session peek. Bounded to 24h so a days-later open still lands on a
+// sane default rather than a stale heavy tab.
+const _UI_RESTORE_MAX_AGE = 24 * 3600 * 1000;
+function _restoreScreen() {
+  // Must run AFTER the DOM is parsed: switchView touches #grid-view, which is
+  // defined later in the HTML than this inline script — calling it during boot
+  // (setTimeout 0) null-derefs and throws. The app never calls switchView on
+  // load (it relies on the hardcoded default tab), so ours is the first.
+  // Don't override an explicit file deeplink (#path=...).
+  const _hasDeeplink = location.hash && location.hash.startsWith('#path=');
+  // 1. Restore the tab.
+  if (!_hasDeeplink) {
+    try {
+      const _v = JSON.parse(localStorage.getItem('amux_ui_view') || 'null');
+      if (_v && _v.v && _v.v !== 'sessions' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)) {
+        try { switchView(_v.v); } catch(e) {}
+      }
+    } catch(e) {}
+  }
+  // 2. Restore an open session peek. Prefer sessionStorage (same tab session);
+  //    fall back to localStorage when we came back after an eviction.
+  let _ps = null;
+  try { _ps = JSON.parse(sessionStorage.getItem('peekState') || 'null'); } catch(e) {}
+  if (!_ps || !_ps.session) {
+    try {
+      const _lp = JSON.parse(localStorage.getItem('amux_peek_state') || 'null');
+      if (_lp && _lp.session && (Date.now() - (_lp.ts || 0) < _UI_RESTORE_MAX_AGE)) _ps = _lp;
+    } catch(e) {}
+  }
   if (_ps && _ps.session) {
     if (_ps.draft) _peekDrafts[_ps.session] = _ps.draft;   // rescued from pre-update reload
     setTimeout(() => {
@@ -40287,7 +40322,9 @@ try {
       }
     }, 200);
   }
-} catch(e) {}
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _restoreScreen);
+else _restoreScreen();
 // On hash change (e.g. paste URL into address bar while app already open — no page reload)
 window.addEventListener('hashchange', () => _handleDeeplink(location.hash));
 
@@ -45657,7 +45694,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.187';
+const CACHE = 'amux-v0.9.189';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
