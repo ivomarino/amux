@@ -15469,6 +15469,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<link id="hljs-theme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -16126,6 +16127,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent; transition: all 0.15s; }
   .file-view-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .file-overlay-body.file-raw { white-space: pre-wrap; word-break: break-word; }
+  /* Syntax-highlighted code preview (highlight.js). The theme stylesheet colors
+     .hljs; we own layout + fill. */
+  .file-overlay-body.file-code { padding: 0; }
+  .file-overlay-body.file-code .hljs-pre { margin: 0; padding: 12px 14px; overflow: auto; }
+  .file-overlay-body.file-code code.hljs { display: block; background: transparent; padding: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
+    line-height: 1.5; tab-size: 2; white-space: pre; }
   .file-overlay-body.file-image { display:flex;align-items:center;justify-content:center;background:var(--bg);white-space:normal;position:relative; }
   /* Zoomable image preview (pinch / trackpad / double-tap). */
   .img-zoom-wrap { position:absolute;inset:0;overflow:hidden;touch-action:none;display:flex;align-items:center;justify-content:center; }
@@ -21912,6 +21920,13 @@ function _applyTheme(light) {
   if (lbl) lbl.textContent = light ? 'Light mode' : 'Dark mode';
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.content = light ? '#ffffff' : '#0d1117';
+  _hljsApplyTheme(light);
+}
+// Swap the highlight.js theme stylesheet to match amux's light/dark mode.
+function _hljsApplyTheme(light) {
+  const l = document.getElementById('hljs-theme');
+  if (l) l.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/'
+    + (light ? 'github.min.css' : 'github-dark.min.css');
 }
 function toggleTheme(checked) {
   const isLight = checked !== undefined ? checked : !document.body.classList.contains('light');
@@ -26904,7 +26919,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.192';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.193';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31148,6 +31163,67 @@ function _bindReadPosFrame(iframe, path) {
 document.addEventListener('visibilitychange', () => { if (document.hidden && _readPosFlush) { try { _readPosFlush(); } catch(e) {} } });
 window.addEventListener('pagehide', () => { if (_readPosFlush) { try { _readPosFlush(); } catch(e) {} } });
 
+// Extension → highlight.js language. Names with no dot (Dockerfile, Makefile)
+// match by the whole filename.
+const _HLJS_EXT = {
+  js:'javascript', jsx:'javascript', mjs:'javascript', cjs:'javascript',
+  ts:'typescript', tsx:'typescript',
+  py:'python', rb:'ruby', go:'go', rs:'rust', java:'java', kt:'kotlin', scala:'scala',
+  c:'c', h:'c', cpp:'cpp', cc:'cpp', cxx:'cpp', hpp:'cpp', cs:'csharp', swift:'swift',
+  php:'php', sh:'bash', bash:'bash', zsh:'bash', fish:'bash',
+  yml:'yaml', yaml:'yaml', toml:'ini', ini:'ini', cfg:'ini', conf:'ini',
+  json:'json', jsonl:'json', ndjson:'json', geojson:'json',
+  xml:'xml', html:'xml', svg:'xml', vue:'xml', css:'css', scss:'scss', sass:'scss', less:'less',
+  sql:'sql', graphql:'graphql', gql:'graphql', md:'markdown', markdown:'markdown',
+  dockerfile:'dockerfile', makefile:'makefile', mk:'makefile', diff:'diff', patch:'diff',
+  lua:'lua', pl:'perl', r:'r', dart:'dart', proto:'protobuf', tf:'hcl', hcl:'hcl',
+  gradle:'gradle', groovy:'groovy', ps1:'powershell', bat:'dos',
+};
+const _HL_MAX = 600 * 1024;   // above this, skip highlight/format (perf)
+
+function _fileExtName(data) {
+  const name = (data.path || '').split('/').pop().toLowerCase();
+  return { name, ext: name.includes('.') ? name.split('.').pop() : name };
+}
+
+// Pretty-print JSON / JSONL so it's readable instead of one dense line.
+function _fileFormatJson(content, ext) {
+  try {
+    if (ext === 'json' || ext === 'geojson') return JSON.stringify(JSON.parse(content), null, 2);
+    if (ext === 'jsonl' || ext === 'ndjson') {
+      return content.split('\n').map(l => {
+        const t = l.trim(); if (!t) return '';
+        try { return JSON.stringify(JSON.parse(t), null, 2); } catch(e) { return l; }
+      }).join('\n');
+    }
+  } catch(e) {}
+  return content;
+}
+
+// Render a code/text file with highlight.js (tried-and-true). JSON/JSONL are
+// pretty-printed first. Degrades gracefully: too-large files or a missing hljs
+// (e.g. offline, CDN unreachable) fall back to plain escaped text — JSON is
+// still formatted either way.
+function _fileHighlightHTML(data) {
+  let content = data.content || '';
+  const { name, ext } = _fileExtName(data);
+  const big = content.length > _HL_MAX;
+  if (!big) content = _fileFormatJson(content, ext);
+  let inner;
+  const lang = _HLJS_EXT[ext] || _HLJS_EXT[name] || '';
+  if (!big && window.hljs) {
+    try {
+      inner = (lang && hljs.getLanguage(lang))
+        ? hljs.highlight(content, { language: lang, ignoreIllegals: true }).value
+        : hljs.highlightAuto(content).value;
+    } catch(e) { inner = esc(content); }
+  } else {
+    inner = esc(content);
+  }
+  const note = big ? '<div style="padding:4px 12px;font-size:0.7rem;color:var(--dim);">Large file — syntax highlighting skipped for performance.</div>' : '';
+  return note + '<pre class="hljs-pre"><code class="hljs">' + inner + '</code></pre>';
+}
+
 function _renderFileBody(data, mode) {
   _readPosDetach();   // flush + detach the previous file's reading-position tracker
   // Tear down any active markdown-search highlights before re-rendering
@@ -31290,9 +31366,10 @@ function _renderFileBody(data, mode) {
       } catch(e) {}
     };
   } else {
-    // plain text — preview = same as raw
-    body.className = 'file-overlay-body file-raw';
-    body.textContent = data.content;
+    // Code / plain text — syntax-highlighted preview (JSON/JSONL pretty-printed).
+    // The Raw tab still shows unformatted text (mode==='raw' above).
+    body.className = 'file-overlay-body file-code';
+    body.innerHTML = _fileHighlightHTML(data);
     _bindReadPosDiv(body, data.path);
   }
 }
@@ -45815,6 +45892,7 @@ window.addEventListener('load', _pinnedNotesRefresh);
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
@@ -45922,7 +46000,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.192';
+const CACHE = 'amux-v0.9.193';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
