@@ -15044,24 +15044,65 @@ def _gmail_latest_matching(account: str, from_addr: str = "", with_addr: str = "
     return None
 
 
-def _gmail_inbox_messages(account: str, count: int = 20, q: str = "") -> dict:
-    """Return recent messages for the unified /api/email/inbox shape, using the
-    RFC822 Message-ID header as `message_id` so it round-trips into /reply."""
+def _gmail_inbox_messages(account: str, count: int = 20, q: str = "", days: float = 0.0) -> dict:
+    """Return messages for the unified /api/email/inbox shape, using the RFC822
+    Message-ID header as `message_id` so it round-trips into /reply.
+
+    `days` is AUTHORITATIVE when set: it becomes a Gmail `after:<epoch>` filter so
+    the result covers the whole window (not just the newest `count` INBOX rows,
+    which silently truncated date-ranged scans — AMUX-1886, gtm-engine's
+    poc_radar false-zero). Paginates via pageToken up to `count` (the hard cap).
+    Returns {messages, truncated}: truncated=True means more matched the window
+    than the cap returned, so a caller can tell a real 0 from a capped slice."""
     try:
         svc = _gmail_service(account)
         if not svc:
             return {"error": "not_connected"}
-        kwargs: dict = {"userId": "me", "maxResults": min(max(count, 1), 100)}
-        if q:
-            kwargs["q"] = q
-        else:
-            kwargs["labelIds"] = ["INBOX"]
-        listed = svc.users().messages().list(**kwargs).execute().get("messages", [])
+        want = max(int(count), 1)
+        if not q:
+            # INBOX + (when a window is asked for) an authoritative date floor.
+            q = "in:inbox"
+            if days and days > 0:
+                q += f" after:{int(time.time() - days * 86400)}"
+        # Page through the full match set up to `want`; note if more remained.
+        ids: list = []
+        page_token = None
+        truncated = False
+        while len(ids) < want:
+            kwargs = {"userId": "me", "q": q, "maxResults": min(want - len(ids), 100)}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = svc.users().messages().list(**kwargs).execute()
+            ids.extend(resp.get("messages", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        if page_token and len(ids) >= want:
+            truncated = True   # the window held more than the cap returned
+        listed = ids[:want]
+        # Fetch metadata in BATCHES, not one .get() per message — 500 sequential
+        # gets took minutes and timed out (AMUX-1886). Gmail's batch endpoint does
+        # up to 100 sub-requests per round-trip; chunk at 50 to stay well under
+        # limits. Results are keyed by gmail id so order is restored afterwards.
+        by_id: dict = {}
+
+        def _collect(rid, resp, exc):
+            if exc is None and resp:
+                by_id[resp.get("id")] = resp
+
+        for i in range(0, len(listed), 50):
+            chunk = listed[i:i + 50]
+            batch = svc.new_batch_http_request(callback=_collect)
+            for m in chunk:
+                batch.add(svc.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["From", "To", "Subject", "Date", "Message-ID"]))
+            batch.execute()
         out = []
         for m in listed:
-            full = svc.users().messages().get(
-                userId="me", id=m["id"], format="metadata",
-                metadataHeaders=["From", "To", "Subject", "Date", "Message-ID"]).execute()
+            full = by_id.get(m["id"])
+            if not full:
+                continue
             h = {hd["name"].lower(): hd["value"]
                  for hd in full.get("payload", {}).get("headers", [])}
             out.append({
@@ -15076,7 +15117,7 @@ def _gmail_inbox_messages(account: str, count: int = 20, q: str = "") -> dict:
                 "read": "UNREAD" not in full.get("labelIds", []),
                 "body": full.get("snippet", ""),
             })
-        return {"messages": out}
+        return {"messages": out, "truncated": truncated}
     except Exception as e:
         slog(f"[gmail] inbox_messages {account}: {e}")
         return {"error": str(e)}
@@ -51085,17 +51126,30 @@ class CCHandler(BaseHTTPRequestHandler):
             # GET /api/email/inbox — read recent messages from Mail.app
             if method == "GET" and path == "/api/email/inbox":
                 account_filter = qs.get("account", [""])[0]
-                count = min(int(qs.get("count", ["20"])[0]), 100)
+                # Hard cap raised to 500 (was 100) and `days` is now an
+                # authoritative Gmail date filter, so date-ranged scans get the
+                # whole window instead of a silently-truncated newest-N slice
+                # (AMUX-1886). ?envelope=1 wraps the list with a truncation
+                # marker so a caller can tell a real 0 from a capped scan.
+                count = min(int(qs.get("count", ["20"])[0]), 500)
                 lookback_days = float(qs.get("days", ["7"])[0])
                 lookback_secs = max(lookback_days * 86400, 3600)
-                max_msgs = min(count, 100)
+                max_msgs = min(count, 500)
                 lookback_days_frac = lookback_secs / 86400
+                _envelope = qs.get("envelope", ["0"])[0] in ("1", "true", "yes")
+
+                def _inbox_reply(msgs, truncated):
+                    if _envelope:
+                        return self._json({"messages": msgs, "returned": len(msgs),
+                                           "truncated": bool(truncated),
+                                           "window_days": lookback_days})
+                    return self._json(msgs)
                 # Prefer Gmail API for a connected account (clean, no AppleScript).
                 if account_filter and account_filter in _gmail_connected_accounts():
-                    res = _gmail_inbox_messages(account_filter, count=count)
+                    res = _gmail_inbox_messages(account_filter, count=count, days=lookback_days)
                     if res.get("error"):
                         return self._json(res, 502)
-                    return self._json(res.get("messages", []))
+                    return _inbox_reply(res.get("messages", []), res.get("truncated"))
                 # No account filter: serve the Gmail-connected accounts via the
                 # API, in PARALLEL. The AppleScript below drives Mail.app serially
                 # across every configured account and measured ~28s here — a Gmail
@@ -51120,8 +51174,9 @@ class CCHandler(BaseHTTPRequestHandler):
                             return 0.0
 
                     _msgs: list = []
+                    _any_trunc = False
                     with ThreadPoolExecutor(max_workers=min(8, len(_connected))) as _ex:
-                        _futs = [_ex.submit(_gmail_inbox_messages, _a, count)
+                        _futs = [_ex.submit(_gmail_inbox_messages, _a, count, "", lookback_days)
                                  for _a in _connected]
                         for _f in _futs:
                             try:
@@ -51132,8 +51187,14 @@ class CCHandler(BaseHTTPRequestHandler):
                                 continue
                             if not _r.get("error"):
                                 _msgs.extend(_r.get("messages", []))
+                                if _r.get("truncated"):
+                                    _any_trunc = True
                     _msgs.sort(key=_recv_key, reverse=True)
-                    return self._json(_msgs[:count])
+                    # Merged across accounts: a per-account truncation OR hitting
+                    # the overall cap both mean the window wasn't fully covered.
+                    if len(_msgs) > count:
+                        _any_trunc = True
+                    return _inbox_reply(_msgs[:count], _any_trunc)
                 # No-account script: iterate every account's INBOX. The
                 # per-account filter case has its own dedicated script below.
                 # (Earlier this branch interpolated a stray `end if` with no
