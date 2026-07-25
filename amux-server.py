@@ -22000,29 +22000,28 @@ function _peekKickFast() {
   _peekLastChangeMs = performance.now();
   if (peekSession && !document.hidden) _schedulePeekPoll();
 }
-function _stopPeekPoll() { if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; } }
+let _peekPollGen = 0;
+function _stopPeekPoll() { _peekPollGen++; if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; } }
 let _peekLastFullMs = 0;    // when the FULL payload (history) was last fetched
 let _peekPrevStatus = '';   // peeked session's status on the previous poll tick
 const _PEEK_HISTORY_REFRESH_MS = 30000;  // fallback full-refresh cadence while open
 function _schedulePeekPoll() {
   _stopPeekPoll();
   if (!peekSession || document.hidden) return;
+  const gen = _peekPollGen;
   peekTimer = setTimeout(async () => {
     peekTimer = null;
+    if (gen !== _peekPollGen) return;
     try {
-      // History is fetched once on open and would otherwise go stale: on a
-      // long-open peek, output scrolling out of the live frame fell into a gap
-      // between frozen history and the live view. Refresh the FULL payload when
-      // the turn just ended (active→idle: the transcript grew) or every 30s as
-      // a fallback; every other tick is the ~650B/304 live poll.
       const _s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === peekSession) : null;
       const _st = (_s && _s.status) || '';
       const turnEnded = _peekPrevStatus === 'active' && _st !== 'active';
       _peekPrevStatus = _st;
       const needFull = turnEnded || (performance.now() - _peekLastFullMs > _PEEK_HISTORY_REFRESH_MS);
       await refreshPeek(!needFull);
-      _peekUpdateBranch();   // keep the dir-bar branch fresh (also catches cold-load gitInfo)
+      _peekUpdateBranch();
     } catch(e) {}
+    if (gen !== _peekPollGen) return;
     _schedulePeekPoll();
   }, _peekPollInterval());
 }
