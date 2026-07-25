@@ -16367,6 +16367,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: flex; align-items: center; gap: 4px; padding: 4px 6px;
     min-width: 0; overflow: hidden;
   }
+  /* "Downloaded on this device" badge — green ⤓ after a cached file's name. */
+  .fe-dl-badge { color: #3fb950; font-size: 0.82rem; margin-left: 5px; flex-shrink: 0; line-height: 1; }
   /* Inline folder-expand chevron (accordion). Row still navigates on click. */
   .fe-expand { background: none; border: none; color: var(--dim); cursor: pointer; padding: 0;
     width: 18px; height: 22px; flex-shrink: 0; font-size: 1.05rem; line-height: 1;
@@ -19940,6 +19942,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="fe-tb-oitem" onclick="cacheFilesDir(_filesPath);_filesOverflowClose()">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.3"/><rect x="3.5" y="1" width="5" height="3.5" rx="0.5" stroke="currentColor" stroke-width="1.2"/><rect x="2.5" y="6.5" width="8" height="4.5" rx="0.5" stroke="currentColor" stroke-width="1.2"/></svg>
           Save for offline
+        </button>
+        <button class="fe-tb-oitem" onclick="_filesClearOfflineCache();_filesOverflowClose()">
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2.5 3.5h8M5 3.5V2.5a1 1 0 011-1h1a1 1 0 011 1v1M3.5 3.5l.5 7a1 1 0 001 1h3a1 1 0 001-1l.5-7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="files-clearcache-label">Clear downloaded files</span>
         </button>
         <button class="fe-tb-oitem" onclick="loadFiles(_filesPath);_filesOverflowClose()">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M11 6.5A4.5 4.5 0 1 1 8 2.3M11 2v4H7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
@@ -26898,7 +26904,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.191';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.192';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31957,6 +31963,13 @@ function _filesOverflowToggle() {
   if (!menu) return;
   menu.classList.toggle('open');
   if (menu.classList.contains('open')) {
+    // Refresh the "Clear downloaded files" label with the live count + size.
+    _idb.cacheStats().then(s => {
+      const lbl = document.getElementById('files-clearcache-label');
+      if (lbl) lbl.textContent = s.count
+        ? `Clear downloaded files (${s.count} · ${_fmtSize(s.bytes)})`
+        : 'Clear downloaded files';
+    }).catch(()=>{});
     const close = (e) => { if (!document.getElementById('files-overflow-wrap')?.contains(e.target)) { menu.classList.remove('open'); document.removeEventListener('click', close, true); } };
     setTimeout(() => document.addEventListener('click', close, true), 0);
   }
@@ -32150,6 +32163,50 @@ function _renderFilesEntries(body, path, data, cacheTs) {
   body.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; body.classList.add('files-drop-active'); };
   body.ondragleave = () => body.classList.remove('files-drop-active');
   body.ondrop = e => { e.preventDefault(); body.classList.remove('files-drop-active'); if (e.dataTransfer.files.length) handleFilesUpload(e.dataTransfer.files); };
+  _feMarkDownloaded();   // async: flag rows whose file is downloaded on this device
+}
+
+// Add a green ⤓ badge to each file row that is DOWNLOADED (cached) on this
+// device — works online AND offline (reflects local IndexedDB, not the network),
+// so you can always see what's available offline before you lose connection.
+async function _feMarkDownloaded() {
+  try {
+    const body = document.getElementById('files-body');
+    if (!body) return;
+    const rows = body.querySelectorAll('.fe-row:not(.fe-dir)');
+    if (!rows.length) return;
+    const set = await _idb.cachedFilePaths();
+    rows.forEach(row => {
+      const has = set.has(row.dataset.path);
+      const existing = row.querySelector('.fe-dl-badge');
+      if (has && !existing) {
+        const nameCell = row.querySelector('.fe-cell-name');
+        if (nameCell) {
+          const b = document.createElement('span');
+          b.className = 'fe-dl-badge';
+          b.title = 'Downloaded on this device — available offline';
+          b.textContent = '⤓';   // ⤓
+          nameCell.appendChild(b);
+        }
+      } else if (!has && existing) {
+        existing.remove();
+      }
+    });
+  } catch(e) {}
+}
+
+// Clear all files downloaded on this device (keeps dir listings for offline nav).
+async function _filesClearOfflineCache() {
+  const s = await _idb.cacheStats();
+  if (!s.count) { showToast('No downloaded files to clear'); return; }
+  const okGo = await showConfirm(
+    `Clear ${s.count} downloaded file${s.count===1?'':'s'} (${_fmtSize(s.bytes)}) from this device?\n\n` +
+    `They'll re-download next time you open them online. Files on the server are untouched.`,
+    'Clear', true);
+  if (!okGo) return;
+  const n = await _idb.clearCachedFiles();
+  showToast('Cleared ' + n + ' downloaded file' + (n===1?'':'s'));
+  if (typeof _filesLastData !== 'undefined' && _filesLastData) _feMarkDownloaded();
 }
 function _filesSearchFilter(q) {
   const body = document.getElementById('files-body');
@@ -38834,6 +38891,37 @@ const _idb = (() => {
       cur.onerror = () => resolve(removed);
     })).catch(() => 0),
     clearFiles: () => _txw('files', os => os.clear()),
+    // Paths of files (not dir listings) cached on THIS device — for the
+    // "downloaded" indicator in the directory view.
+    cachedFilePaths: () => open().then(d => new Promise((resolve) => {
+      const tx = d.transaction('files', 'readonly');
+      const cur = tx.objectStore('files').openCursor();
+      const set = new Set();
+      cur.onsuccess = (e) => { const c = e.target.result;
+        if (c) { if (c.value.type === 'file') set.add(c.value.path); c.continue(); } else resolve(set); };
+      cur.onerror = () => resolve(set);
+    })).catch(() => new Set()),
+    // Count + byte size of downloaded file blobs (for the purge UI).
+    cacheStats: () => open().then(d => new Promise((resolve) => {
+      const tx = d.transaction('files', 'readonly');
+      const cur = tx.objectStore('files').openCursor();
+      let count = 0, bytes = 0;
+      cur.onsuccess = (e) => { const c = e.target.result;
+        if (c) { if (c.value.type === 'file') { count++; const dd = c.value.data || {};
+          bytes += ((dd.data_url||'').length + (dd.content||'').length); } c.continue(); }
+        else resolve({ count, bytes }); };
+      cur.onerror = () => resolve({ count, bytes });
+    })).catch(() => ({ count: 0, bytes: 0 })),
+    deleteFile: (path) => _txw('files', os => os.delete(path)),
+    // Purge only downloaded file blobs; keep dir listings (small, aid offline nav).
+    clearCachedFiles: () => open().then(d => new Promise((resolve) => {
+      const tx = d.transaction('files', 'readwrite');
+      const cur = tx.objectStore('files').openCursor();
+      let removed = 0;
+      cur.onsuccess = (e) => { const c = e.target.result;
+        if (c) { if (c.value.type === 'file') { c.delete(); removed++; } c.continue(); } else resolve(removed); };
+      cur.onerror = () => resolve(removed);
+    })).catch(() => 0),
   };
 })();
 
@@ -45834,7 +45922,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.191';
+const CACHE = 'amux-v0.9.192';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
