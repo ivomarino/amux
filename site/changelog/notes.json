@@ -1,5 +1,41 @@
 [
   {
+    "hash": "69131adc15ad74274d27f264e4241b108b35718b",
+    "short": "69131ad",
+    "title": "PWA screen restore: return to exactly where you left off after iOS evicts the app (v0.9.189)",
+    "date": "2026-07-25",
+    "type": "feat",
+    "tags": ["pwa", "ios", "mobile", "ux"],
+    "description": "When iOS evicts a backgrounded PWA and you return, the dashboard now restores the active tab and the open session peek panel — exactly where you left off. Previously, any iOS app eviction reset the view to the default Sessions tab with no peek open, forcing you to navigate back manually. State is persisted to sessionStorage on every change and applied before the first render on reload."
+  },
+  {
+    "hash": "49151cba46e656e11d42d1971ed9f1587e55849e",
+    "short": "49151cb",
+    "title": "Opus 5 support: claude-opus-5 and claude-opus-5[1m] added to all model pickers (v0.9.187)",
+    "date": "2026-07-25",
+    "type": "feat",
+    "tags": ["models", "opus-5", "claude", "config"],
+    "description": "Claude Opus 5 (claude-opus-5) and its 1-million-token context variant (claude-opus-5[1m]) are now available in all three model pickers: session config modal, edit-field inline picker, and new-session wizard. Opus 5 sits at the top of the list. The CLI accepts --model claude-opus-5 and routes correctly to the model class."
+  },
+  {
+    "hash": "4425fc6c83bb1f01cd364cce0cc1337c5b3871c6",
+    "short": "4425fc6",
+    "title": "Silent-crash self-heal: sessions with a dead Claude process now restart themselves, no CC_AUTO_CONTINUE required",
+    "date": "2026-07-24",
+    "type": "fix",
+    "tags": ["self-healing", "restart", "watchdog", "reliability"],
+    "description": "A Claude process killed by SIGKILL, OOM, or a crash (pane goes blank as Claude tears down its alternate-screen buffer) now self-heals unconditionally. Previously, both auto-restart paths required CC_AUTO_CONTINUE opt-in, so sessions without it sat dead forever. The watchdog now distinguishes a crash (no Claude child, pane not a clean shell prompt) from an intentional /exit (clean shell prompt) and restarts only the former. Crash-loop cap: 3 crashes in 15 minutes → stop + alert."
+  },
+  {
+    "hash": "b6cb41c5b1fc12b0f16dfe55620b77a3a56233a4",
+    "short": "b6cb41c",
+    "title": "AskUserQuestion blocking: selector-parked sessions surface the block instead of silently holding inbound messages",
+    "date": "2026-07-24",
+    "type": "fix",
+    "tags": ["coordination", "ux", "sessions", "selectors"],
+    "description": "When a session is parked at an AskUserQuestion or tool-approval selector, it can't safely receive an inter-session message (typing there + Escape would reject the pending tool). amux correctly queues the message — but previously gave no signal that the session was blocked. Now the selector head-of-line block is surfaced in the UI so you know why your message is waiting."
+  },
+  {
     "hash": "ee1894f",
     "short": "ee1894f",
     "title": "Map: distance/near-me sort + GeoJSON and CSV export-import",

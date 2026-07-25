@@ -192,7 +192,7 @@ Claude Code runs one agent per terminal. amux runs dozens — with live monitori
 - [amux vs Bolt.new](https://amux.io/compare/amux-vs-bolt-new/)
 - [amux vs Replit Agent](https://amux.io/compare/amux-vs-replit-agent/)
 - [amux vs v0 (Vercel)](https://amux.io/compare/amux-vs-v0/)
-- [amux vs AutoGen](https://amux.io/compare/amux-vs-autogen/)
+- [amux vs AutoGen (Microsoft) — runtime vs framework (2026)](https://amux.io/compare/amux-vs-autogen/): AutoGen (~60k ★, Microsoft Research) is a Python framework for programming multi-agent conversation systems — ConversableAgent, AssistantAgent, UserProxyAgent, GroupChat, AutoGen Studio. amux (313 ★, MIT) is an open-source runtime for operating AI coding agent teams (Claude Code, Codex, Gemini CLI) with self-healing watchdog, kanban, mobile dashboard, and cost tracking. Key distinction: AutoGen builds the reasoning architecture in code; amux operates the coding-agent sessions from a dashboard. AutoGen 0.2 (pyautogen) vs 0.4 (autogen-agentchat) architecture differences explained. 15-row comparison table, "Why not both?" section with 3 composition patterns (AutoGen supervisor → amux REST API → Claude Code sessions; amux as AutoGen code-execution backend; parallel AutoGen + amux monitoring), decision guide 9-row table, FAQPage JSON-LD (5 Qs). Updated July 2026.
 - [amux vs Claude Desktop](https://amux.io/compare/amux-vs-claude-desktop/)
 - [amux vs Antigravity CLI (agy)](https://amux.io/compare/amux-vs-antigravity-cli/): Antigravity CLI replaced Gemini CLI on June 18, 2026. amux runs and manages multiple agy sessions in parallel — self-healing, kanban, and mobile monitoring built in.
 
