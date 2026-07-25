@@ -26898,7 +26898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.190';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.191';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31696,9 +31696,28 @@ function _filesGetBookmarks() {
 function _filesSaveBookmarks(bm) {
   const json = JSON.stringify(bm);
   try { localStorage.setItem(_filesBmLocalKey(), json); } catch(e) {}   // fast local mirror (also offline)
-  // Persist server-side too so shortcuts follow you across every device (like files_cwd).
-  fetch(API + '/api/prefs', {method:'POST', headers:{'Content-Type':'application/json'},
+  // Persist server-side too so shortcuts follow you across every device (like
+  // files_cwd). Returned so callers can await the write before re-rendering.
+  return fetch(API + '/api/prefs', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({key: _filesBmServerKey(), value: json})}).catch(()=>{});
+}
+
+// The SERVER is the source of truth for shortcuts — so every client sees the
+// same list and no client clobbers another's. Returns the server array (also
+// refreshing the local cache); falls back to the local cache only if the
+// server is unreachable. Every mutation reads through here first so a stale
+// local cache can never overwrite server-stored shortcuts (the desktop-clobbers-
+// phone bug: adding on a fresh client dropped shortcuts saved elsewhere).
+async function _filesFetchBookmarks() {
+  try {
+    const r = await fetch(API + '/api/prefs?key=' + encodeURIComponent(_filesBmServerKey()));
+    const d = await r.json();
+    if (d && typeof d.value === 'string' && d.value) {
+      try { localStorage.setItem(_filesBmLocalKey(), d.value); } catch(e) {}
+      try { return JSON.parse(d.value); } catch(e) {}
+    }
+  } catch(e) {}
+  return _filesGetBookmarks();
 }
 
 // Pull the current scope's shortcuts from the server (cross-device), then render.
@@ -31741,12 +31760,14 @@ function _filesRenderBookmarks() {
 }
 
 // Add a specific file/folder (from the ⋯ menu) as a shortcut in the CURRENT scope.
-function _filesAddBookmarkPath(path, type) {
+async function _filesAddBookmarkPath(path, type) {
   const label = path.split('/').filter(Boolean).pop() || path;
-  const bm = _filesGetBookmarks();
+  const scope = _filesBmScope();               // guard against navigating away mid-fetch
+  const bm = await _filesFetchBookmarks();      // server = source of truth → never clobber
+  if (_filesBmScope() !== scope) return;
   if (bm.find(b => b.path === path)) { showToast('Already a shortcut'); return; }
   bm.push({ label, path, type: (type === 'dir' || type === 'directory') ? 'dir' : 'file' });
-  _filesSaveBookmarks(bm);
+  await _filesSaveBookmarks(bm);
   _filesRenderBookmarks();
   showToast(_exploreSession ? ('Shortcut added to ' + _exploreSession) : ('Shortcut added: ' + label));
 }
@@ -31864,12 +31885,19 @@ function _libOpenBook(idx) {
   openFilePreview(b.formats[0].path);   // formats are rank-sorted — most readable first
 }
 
-function _filesRemoveBookmark(idx) {
-  const bm = _filesGetBookmarks();
-  const removed = bm.splice(idx, 1);
-  _filesSaveBookmarks(bm);
+async function _filesRemoveBookmark(idx) {
+  // Resolve the target by PATH from the currently-shown list, then remove it
+  // from the SERVER list (index can drift vs the server's authoritative set).
+  const shown = _filesGetBookmarks();
+  const target = shown[idx];
+  if (!target) return;
+  const scope = _filesBmScope();
+  let bm = await _filesFetchBookmarks();
+  if (_filesBmScope() !== scope) return;
+  bm = bm.filter(b => b.path !== target.path);
+  await _filesSaveBookmarks(bm);
   _filesRenderBookmarks();
-  if (removed[0]) showToast('Removed ' + removed[0].label);
+  showToast('Removed ' + target.label);
 }
 
 // Render bookmarks on load
@@ -45806,7 +45834,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.190';
+const CACHE = 'amux-v0.9.191';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
