@@ -5248,6 +5248,31 @@ def _steer_record_history(name: str, text: str, queued_at=None, msg_id: str = ""
         pass
 
 
+_CMD_HIST_KEEP = 400  # per-session cap on the Messages history
+
+
+def _cmd_hist_record(session: str, text: str, ctype: str = "user", origin: str = "") -> None:
+    """Record a command/message sent to a session in the Messages history, tagged
+    by ORIGIN so the peek can distinguish who sent it:
+      user     — a human typed it in the dashboard
+      session  — another amux session sent it (origin = sender name)
+      schedule — a scheduled command fired it (origin = schedule title)
+      system   — amux itself (commit-guard nudge, auto-continue) (origin = what)
+    Best-effort; pruned per-session so the table stays bounded."""
+    try:
+        if not (session and text):
+            return
+        db = get_db()
+        db.execute("INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
+                   (text, ctype, session, int(time.time() * 1000), (origin or "")[:80]))
+        db.execute("DELETE FROM cmd_history WHERE session=? AND id NOT IN "
+                   "(SELECT id FROM cmd_history WHERE session=? ORDER BY ts DESC LIMIT ?)",
+                   (session, session, _CMD_HIST_KEEP))
+        db.commit()
+    except Exception:
+        pass
+
+
 # A single tmux frame that momentarily reads idle is not proof a session
 # finished — captures tear. Before delivering steering we require the session to
 # read idle *continuously* for this settle window; any active/unknown frame in
@@ -7430,6 +7455,10 @@ def _init_db():
         "ALTER TABLE schedules ADD COLUMN done_pattern TEXT",
         "ALTER TABLE schedules ADD COLUMN done_action TEXT NOT NULL DEFAULT 'disable'",
         "ALTER TABLE schedules ADD COLUMN gcal_event_id TEXT",
+        # Messages history: tag each command by WHO sent it (origin session name
+        # or schedule title), so the peek can color-code user vs inter-session vs
+        # scheduled vs system commands.
+        "ALTER TABLE cmd_history ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
         # Event triggers: wake a schedule's session when something changes (closed-loop
         # orchestration), in addition to (not instead of) the cron schedule_expr heartbeat.
         # trigger_on is a comma-separated set of event names (e.g. 'session_idle,board').
@@ -9378,6 +9407,10 @@ def _run_schedule(sched):
             if not ok:
                 status, note = "error", str(err)
                 slog(f"[sched] send failed for '{sched['title']}': {err}")
+            else:
+                # Record in the Messages history so the peek shows scheduled
+                # commands distinctly (origin = the schedule's title).
+                _cmd_hist_record(session, command, "schedule", sched.get("title") or sched.get("id") or "schedule")
     except Exception as e:
         status, note = "error", str(e)
         slog(f"[sched] exception running '{sched['title']}': {e}")
@@ -21332,6 +21365,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
     </div>
+    <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:wrap;"></div>
     <div id="peek-messages-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:10px;"></div>
   </div>
   <div id="peek-cost-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
@@ -26864,7 +26898,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.189';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.190';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30141,7 +30175,7 @@ async function _loadCmdHistoryFromServer() {
       return;
     }
     // Server is authoritative — merge and deduplicate
-    _cmdHistory = rows.reverse().map(r => ({ text: r.text, type: r.type, session: r.session, time: r.ts, id: r.id }));
+    _cmdHistory = rows.reverse().map(r => ({ text: r.text, type: r.type, session: r.session, time: r.ts, id: r.id, origin: r.origin || '' }));
     localStorage.setItem('amux_cmd_history', JSON.stringify(_cmdHistory));
     _cmdHistoryServerLoaded = true;
   } catch(e) {}
@@ -30271,15 +30305,34 @@ function _renderCmdHistoryList() {
 // ── Peek Messages tab: the message history, scoped to the open session ──
 // One entry → its card HTML (same look as the Message-history modal). Kept as a
 // standalone renderer so the tab stays independent of the modal.
+// Origin taxonomy for a Messages-history item: who sent this command.
+// Legacy rows (type 'direct'/'steering', pre-origin-column) map to 'user'.
+function _msgOrigin(e) {
+  const t = (typeof e === 'string' ? '' : (e.type || '')).toLowerCase();
+  if (t === 'session') return 'session';
+  if (t === 'schedule') return 'schedule';
+  if (t === 'system') return 'system';
+  return 'user';   // user / direct / steering / '' all = a human-entered command
+}
+const _MSG_KIND = {
+  user:     { label: 'You',       color: '#58a6ff', bg: 'rgba(88,166,255,0.14)' },
+  session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
+  schedule: { label: 'Scheduled', color: '#3fb950', bg: 'rgba(63,185,80,0.15)' },
+  system:   { label: 'System',    color: '#d29922', bg: 'rgba(210,153,34,0.15)' },
+};
 function _cmdHistItemHTML(e) {
   const text = typeof e === 'string' ? e : e.text;
-  const type = typeof e === 'string' ? '' : (e.type || '');
   const session = typeof e === 'string' ? '' : (e.session || '');
+  const origin = typeof e === 'string' ? '' : (e.origin || '');
   const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
   const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
-  const isSteer = type === 'steering';
-  const tag = type ? `<span style="display:inline-block;font-size:0.7rem;padding:1px 6px;border-radius:3px;background:${isSteer?'rgba(137,87,229,0.15)':'rgba(128,128,128,0.1)'};color:${isSteer?'var(--purple,#8957e5)':'var(--dim)'};margin-right:6px;">${isSteer?'queued':'direct'}</span>` : '';
+  const kind = _msgOrigin(e);
+  const km = _MSG_KIND[kind] || _MSG_KIND.user;
+  // Badge label carries the specific origin: "Session · mvs-infra", "Scheduled · Nightly gate".
+  const originTxt = (kind === 'session' || kind === 'schedule' || kind === 'system') && origin
+    ? ' · ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '';
+  const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;border-left:3px solid ${km.color};">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
   const meta = tag + sessTag + tsTag;
@@ -30334,11 +30387,32 @@ function _peekMessagesBadge() {
   badge.classList.toggle('has-pending', p > 0);
   _updatePendingPill();
 }
+let _peekMsgFilter = 'all';   // all | user | session | schedule | system
+function _peekMsgSetFilter(k) { _peekMsgFilter = k; _peekMessagesRender(); }
+function _peekMsgRenderChips(items) {
+  const bar = document.getElementById('peek-messages-filter');
+  if (!bar) return;
+  // Count by kind so each chip shows how many of that type exist.
+  const counts = { all: items.length, user: 0, session: 0, schedule: 0, system: 0 };
+  items.forEach(e => { counts[_msgOrigin(e)]++; });
+  const chips = [['all','All']].concat(
+    ['user','session','schedule','system']
+      .filter(k => counts[k] > 0 || _peekMsgFilter === k)
+      .map(k => [k, (_MSG_KIND[k]||{}).label || k]));
+  bar.innerHTML = chips.map(([k,lbl]) => {
+    const on = _peekMsgFilter === k;
+    const km = _MSG_KIND[k];
+    const col = km ? km.color : 'var(--accent)';
+    return `<button onclick="_peekMsgSetFilter('${k}')" style="font-size:0.7rem;font-weight:600;padding:2px 9px;border-radius:12px;cursor:pointer;border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl}${k!=='all'?' '+counts[k]:''}</button>`;
+  }).join('');
+}
 function _peekMessagesRender() {
   const list = document.getElementById('peek-messages-list');
   if (!list) return;
   const q = (document.getElementById('peek-messages-search')?.value || '').trim().toLowerCase();
   let items = _peekMessagesFor();
+  _peekMsgRenderChips(items);   // chips reflect the full (pre-filter) set's counts
+  if (_peekMsgFilter !== 'all') items = items.filter(e => _msgOrigin(e) === _peekMsgFilter);
   if (q) items = items.filter(e => (typeof e === 'string' ? e : e.text).toLowerCase().includes(q));
   // Pending (offline-queued, NOT yet on the server) shown FIRST — clearly marked,
   // cancellable, so the local client never hides unsent messages.
@@ -45732,7 +45806,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.189';
+const CACHE = 'amux-v0.9.190';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -48050,11 +48124,11 @@ class CCHandler(BaseHTTPRequestHandler):
                 db = get_db()
                 if session:
                     rows = db.execute(
-                        "SELECT id, text, type, session, ts FROM cmd_history WHERE session=? ORDER BY ts DESC LIMIT ? OFFSET ?",
+                        "SELECT id, text, type, session, ts, origin FROM cmd_history WHERE session=? ORDER BY ts DESC LIMIT ? OFFSET ?",
                         (session, limit, offset)).fetchall()
                 else:
                     rows = db.execute(
-                        "SELECT id, text, type, session, ts FROM cmd_history ORDER BY ts DESC LIMIT ? OFFSET ?",
+                        "SELECT id, text, type, session, ts, origin FROM cmd_history ORDER BY ts DESC LIMIT ? OFFSET ?",
                         (limit, offset)).fetchall()
                 return self._json([dict(r) for r in rows])
             if method == "POST" and path == "/api/history":
@@ -48062,13 +48136,13 @@ class CCHandler(BaseHTTPRequestHandler):
                 text = body.get("text", "").strip()
                 if not text:
                     return self._json({"error": "text required"}, 400)
-                htype = body.get("type", "direct")
+                htype = body.get("type", "user")
                 session = body.get("session", "")
                 ts = body.get("ts") or int(time.time() * 1000)
                 db = get_db()
                 cur = db.execute(
-                    "INSERT INTO cmd_history (text, type, session, ts) VALUES (?, ?, ?, ?)",
-                    (text, htype, session, ts))
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?, ?, ?, ?, ?)",
+                    (text, htype, session, ts, (body.get("origin") or "")[:80]))
                 db.commit()
                 return self._json({"ok": True, "id": cur.lastrowid})
             if method == "POST" and path == "/api/history/import":
@@ -53451,15 +53525,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                        "message": "duplicate retry ignored (already queued)"})
                 msg_id = _steer_enqueue(name, text)
                 # Server-side history record (atomic, device-independent) — see the
-                # /send handler. Gated on record_history; dedup above prevents doubles.
+                # /send handler. A queued human message is still 'user' origin (the
+                # queue is a delivery mechanism, not a sender). Dedup above prevents
+                # doubles.
                 if body.get("record_history"):
-                    try:
-                        _dbh = get_db()
-                        _dbh.execute("INSERT INTO cmd_history (text, type, session, ts) VALUES (?,?,?,?)",
-                                     (text, "steering", name, int(time.time() * 1000)))
-                        _dbh.commit()
-                    except Exception:
-                        pass
+                    _cmd_hist_record(name, text, "user",
+                                     self.headers.get("X-Amux-User-Email", ""))
                 return self._json({"ok": True, "id": msg_id, "message": "queued for next turn boundary"})
             return self._json({"error": "method not allowed"}, 405)
 
@@ -53525,20 +53596,18 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                     {"chars": len(text), "preview": text[:120],
                                      "human": bool(body.get("record_history"))},
                                     idem=("send:" + msg_id) if msg_id else None, source="api-send")
-                    # Record to the shared history SERVER-SIDE, atomic with the send,
-                    # so the message is in history for EVERY client even if the sending
-                    # device's own history POST never lands (flaky phone / suspended
-                    # PWA). Gated on record_history so agent-to-agent sends on this same
-                    # endpoint don't flood the human history. The msg_id dedup above
-                    # means a retried/offline-replayed send never double-records.
+                    # Record to the shared Messages history SERVER-SIDE, atomic with
+                    # the send, tagged by origin so the peek can color-code it. A human
+                    # browser send (record_history) is 'user'; an inter-session send
+                    # (origin-stamped, X-Amux-Session header) is 'session' with the
+                    # sender name — previously these were dropped from history entirely,
+                    # so the peek couldn't show what other sessions sent. _orig_text is
+                    # the clean message (without the [amux-origin:] provenance prefix).
                     if body.get("record_history"):
-                        try:
-                            _dbh = get_db()
-                            _dbh.execute("INSERT INTO cmd_history (text, type, session, ts) VALUES (?,?,?,?)",
-                                         (text, "direct", name, int(time.time() * 1000)))
-                            _dbh.commit()
-                        except Exception:
-                            pass
+                        _cmd_hist_record(name, _orig_text, "user",
+                                         self.headers.get("X-Amux-User-Email", ""))
+                    elif _origin and _origin != name:
+                        _cmd_hist_record(name, _orig_text, "session", _origin)
                 elif msg_id:
                     _send_dedup_forget(name, msg_id)
                 # 409 = session exists but is not running (user-caused, not a server error)
