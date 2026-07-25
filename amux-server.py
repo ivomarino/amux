@@ -4603,7 +4603,13 @@ _ALERT_TYPE_LABELS = {
     "steering_delivered": "steering", "uncommitted": "uncommitted", "thinking_reset": "thinking reset",
     "urgent": "URGENT", "git_orphan": "git rebase orphaned",
     "stale_cli": "stale amux CLI on PATH",
+    "selector_block": "selector blocking coordination",
 }
+# A session parked at a human-gated selector can't receive inter-session
+# messages — they queue until it resolves. Past this many seconds, surface the
+# block to the owner so the held coordination isn't silently stuck (AMUX-1882:
+# an Ethan-gated selector froze mvs-infra's READY GO to backend for ~2.5h).
+_SELECTOR_BLOCK_ALERT_SECS = 600
 
 
 def _env_set(key: str, value: str):
@@ -5847,11 +5853,44 @@ def _snapshot_all_sessions_inner():
                                 send_text(name, response)
                                 actions["last_auto_continue"] = now
                                 actions.pop("ac_waiting_since", None)
+                                actions.pop("selector_block_alerted", None)
                                 _push_alert("auto_continue", name,
                                             f"Auto-continued '{name}': sent {label}")
+                # ── 4b. Selector head-of-line-block escalation (AMUX-1882) ────
+                # A human-gated selector can't receive an inter-session message,
+                # so queued coordination sits until it resolves — silently, for
+                # as long as the human takes. Once that's held real coordination
+                # past the threshold, alert the owner (who can resolve it) with
+                # who's blocked. Once per waiting-episode; auto-continue sessions
+                # resolve in <1min and never reach the threshold.
+                _ws = actions.get("ac_waiting_since")
+                if (_ws and now - _ws > _SELECTOR_BLOCK_ALERT_SECS
+                        and not actions.get("selector_block_alerted")):
+                    with _steering_lock:
+                        _held = [m for m in _steering_queue.get(name, [])
+                                 if m.get("guard") != "commit"]
+                    if _held:
+                        _origins = []
+                        for _m in _held:
+                            _mo = re.search(r"\[amux-origin:\s*(\S+)", _m.get("text", ""))
+                            if _mo and _mo.group(1) not in _origins:
+                                _origins.append(_mo.group(1))
+                        _mins = int((now - _ws) / 60)
+                        _frm = (" from " + ", ".join(_origins[:4])) if _origins else ""
+                        actions["selector_block_alerted"] = now
+                        slog(f"[selector-block] {name}: at a selector {_mins}m, "
+                             f"holding {len(_held)} coordination msg(s){_frm}")
+                        _push_alert("selector_block", name,
+                                    f"'{name}' has sat at a user selector for {_mins}m and is "
+                                    f"holding {len(_held)} inter-session message(s){_frm}. Resolve "
+                                    f"the selector to unblock coordination.")
+                        _emit_event(name, "selector.blocking",
+                                    {"held": len(_held), "mins": _mins, "origins": _origins[:8]},
+                                    source="selector-block")
             else:
                 # Session no longer waiting — reset tracking
                 actions.pop("ac_waiting_since", None)
+                actions.pop("selector_block_alerted", None)
 
             # ── 5. Steering: deliver queued messages at turn boundary ────────
             _steer_try_deliver(name, status, output)
@@ -53505,7 +53544,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _send_dedup_forget(name, msg_id)
                 # 409 = session exists but is not running (user-caused, not a server error)
                 code = 200 if ok else (409 if msg == "not running" else 500)
-                return self._json({"ok": ok, "message": msg}, code)
+                # Structured signal (AMUX-1882): the target is parked at a
+                # human-gated selector, so this message is queued and won't
+                # deliver until it resolves. An agent sender can see this and
+                # route around instead of assuming prompt delivery.
+                _resp = {"ok": ok, "message": msg}
+                if ok and "at a selector" in msg:
+                    _resp["held_at_selector"] = True
+                return self._json(_resp, code)
             if action == "instructions":
                 # Set the per-session standing instruction and/or apply it now.
                 # Body: {"instructions": "<text>"} to save, {"apply": true} to send.
