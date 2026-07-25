@@ -17083,6 +17083,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .peek-tab-count.sched-on { background: rgba(63,185,80,0.16); color: #3fb950; border-color: rgba(63,185,80,0.34); }
   .peek-tab-count.has-pending { background: rgba(210,153,34,0.16); color: #d29922; border-color: rgba(210,153,34,0.34); }
   .peek-tab-count.sched-off { background: rgba(139,148,158,0.14); color: var(--dim); border-color: rgba(139,148,158,0.28); }
+  /* Schedules badge: two numbers — active (green) / inactive (red). */
+  .peek-tab-count .psc-on  { color: #3fb950; font-weight: 700; }
+  .peek-tab-count .psc-off { color: #f85149; font-weight: 700; }
+  .peek-tab-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
   /* Saved-messages modal: scope tabs (this session / all) + per-session badge. */
   .sm-scope-tab { flex: 1; padding: 6px 10px; font-size: 0.8rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--dim); cursor: pointer; font-family: inherit; min-height: 36px; }
   .sm-scope-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }
@@ -26401,15 +26405,22 @@ function _renderPeekIssuesKanban(items, list) {
   });
 }
 // ── Peek Schedules (scheduler tasks for this session) ────────────────────────
-// Color the Schedules tab badge: green when the session has ≥1 ACTIVE (enabled)
-// schedule, grey when it has schedules but all are inactive (paused).
+// Schedules tab badge shows TWO numbers: active (green) / inactive (red), so
+// you can see at a glance how many of this session's schedules are enabled vs
+// paused without opening the tab.
 function _peekColorSchedBadge(schedList) {
   const el = document.getElementById('peek-tab-schedules-count');
   if (!el) return;
-  const n = (schedList || []).length;
-  const anyActive = (schedList || []).some(s => s.enabled);
-  el.classList.toggle('sched-on', n > 0 && anyActive);
-  el.classList.toggle('sched-off', n > 0 && !anyActive);
+  const list = schedList || [];
+  el.classList.remove('sched-on', 'sched-off');
+  if (!list.length) { el.textContent = ''; el.classList.remove('has-count'); return; }
+  const active = list.filter(s => s.enabled).length;
+  const inactive = list.length - active;
+  el.classList.add('has-count');
+  el.innerHTML = '<span class="psc-on">' + active + '</span>'
+    + '<span class="psc-sep">/</span>'
+    + '<span class="psc-off">' + inactive + '</span>';
+  el.title = active + ' active, ' + inactive + ' inactive schedule' + (list.length === 1 ? '' : 's');
 }
 async function _peekUpdateTabCounts() {
   if (!peekSession) return;
@@ -26434,8 +26445,7 @@ async function _peekUpdateTabCounts() {
     if (peekSession !== sess) return;
     const all = await r.json();
     const sched = all.filter(s => s.session === sess && !s.deleted);
-    setCount('peek-tab-schedules-count', sched.length);
-    _peekColorSchedBadge(sched);
+    _peekColorSchedBadge(sched);   // renders active/inactive two-number badge
   } catch(e) {}
   try {
     const r = await fetch(API + '/api/notes');
@@ -26468,12 +26478,7 @@ async function _peekLoadSchedules() {
   const _paint = () => {
     _peekRenderSchedules();
     const sched = schedules.filter(s => s.session === peekSession && !s.deleted);
-    const tabCount = document.getElementById('peek-tab-schedules-count');
-    if (tabCount) {
-      if (sched.length > 0) { tabCount.textContent = sched.length; tabCount.classList.add('has-count'); }
-      else { tabCount.textContent = ''; tabCount.classList.remove('has-count'); }
-    }
-    _peekColorSchedBadge(sched);
+    _peekColorSchedBadge(sched);   // active/inactive two-number badge
   };
   try {
     await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
@@ -26919,7 +26924,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.194';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.195';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -46002,7 +46007,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.194';
+const CACHE = 'amux-v0.9.195';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
