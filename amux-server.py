@@ -26965,7 +26965,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.195';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.196';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31894,7 +31894,14 @@ async function _filesAddBookmarkPath(path, type) {
   const scope = _filesBmScope();               // guard against navigating away mid-fetch
   const bm = await _filesFetchBookmarks();      // server = source of truth → never clobber
   if (_filesBmScope() !== scope) return;
-  if (bm.find(b => b.path === path)) { showToast('Already a shortcut'); return; }
+  if (bm.find(b => b.path === path)) {
+    // Already saved server-side but the chip wasn't visible (stale render /
+    // Safari PWA). Re-render from the just-fetched server list so it SHOWS,
+    // instead of silently telling the user it exists with no chip on screen.
+    _filesRenderBookmarks();
+    showToast('Already a shortcut');
+    return;
+  }
   bm.push({ label, path, type: (type === 'dir' || type === 'directory') ? 'dir' : 'file' });
   await _filesSaveBookmarks(bm);
   _filesRenderBookmarks();
@@ -46048,7 +46055,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.195';
+const CACHE = 'amux-v0.9.196';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
