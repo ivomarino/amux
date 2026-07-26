@@ -8096,6 +8096,10 @@ def _complete_session_board_issue(session_name: str):
     return
 
 
+# Cards already declined by the irreversible-action guard (log/alert once each).
+_autopickup_danger_flagged: set = set()
+
+
 def _pickup_next_board_task(session_name: str):
     """Pick up the next queued (todo) board task for this session — OPT-IN only.
     Called when a session goes idle; moves the oldest agent todo to 'doing' and
@@ -8142,6 +8146,28 @@ def _pickup_next_board_task(session_name: str):
         if not row:
             return
         item_id, title, desc = row["id"], row["title"], row["desc"] or ""
+        # IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
+        # "do not drop without confirmation" prose, but PROSE DOES NOT BIND AN
+        # AUTOMATED READER — an agent auto-executing the card scrolls straight
+        # past the warning and does the destructive thing the warning forbade.
+        # So the CONSUMER enforces, not the card text: anything naming an
+        # unrecoverable operation is never auto-executed. It stays in todo for a
+        # human to dispatch, and the owner is told why.
+        _blob = (title + "\n" + desc).lower()
+        _danger = re.search(r"stash\s+(drop|clear)|rm\s+-[rf]{1,2}\b|push\s+(--force|-f)\b|"
+                            r"reset\s+--hard|git\s+clean\s+-[a-z]*[fd]|drop\s+table|"
+                            r"truncate\s+table|delete\s+from\s+\w+\s*;|--no-preserve-root", _blob)
+        if _danger:
+            if item_id not in _autopickup_danger_flagged:
+                _autopickup_danger_flagged.add(item_id)
+                _append_board_log(item_id, f"Auto-pickup DECLINED — names an irreversible operation "
+                                           f"({_danger.group(0).strip()}); needs a human to dispatch.")
+                slog(f"[auto-pickup] {session_name}: declined {item_id} — irreversible op "
+                     f"'{_danger.group(0).strip()}'")
+                _push_alert("task_pickup", session_name,
+                            f"'{item_id}' was NOT auto-executed: it names an irreversible operation "
+                            f"('{_danger.group(0).strip()}'). Left in todo for you to run manually.")
+            return
         now = int(time.time())
         db.execute("UPDATE issues SET status='doing', updated=? WHERE id=?", (now, item_id))
         _emit_event(session_name, "task.claimed", {"issue": item_id}, source="auto-pickup")
