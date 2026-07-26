@@ -494,6 +494,27 @@ cmd_send() {
   tname=$(tmux_name "$name")
   is_running "$name" || die "session '$name' is not running"
 
+  # ── Payload via --stdin / --file: the text NEVER transits a shell-evaluated
+  # string (AMUX-1888). Passing a message as a double-quoted argument lets the
+  # SENDER'S shell expand backticks/$() before amux ever sees it — demonstrated
+  # blast radii: garbled messages, a leaked credential, and a stray
+  # `git rebase --quit` on a SHARED checkout. Heredoc-per-call fixes it only if
+  # every caller remembers; this encodes the safe path instead.
+  #   amux send X --stdin <<'EOF' ... EOF
+  #   amux send X --file /tmp/msg.txt
+  if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then
+    local msg; msg=$(cat)
+    [[ -n "$msg" ]] || die "no message on stdin"
+    _send_via_api "$name" "$msg"; return $?
+  fi
+  if [[ "${1:-}" == "--file" ]]; then
+    local f="${2:-}"
+    [[ -n "$f" && -r "$f" ]] || die "usage: amux send <session> --file <path>"
+    local msg; msg=$(cat "$f")
+    [[ -n "$msg" ]] || die "file is empty: $f"
+    _send_via_api "$name" "$msg"; return $?
+  fi
+
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
     shift
@@ -501,22 +522,32 @@ cmd_send() {
     echo "${GREEN}sent keys${RESET} to $name"
   else
     local text="$*"
-    [[ -n "$text" ]] || die "usage: amux send <name> <text>  or  amux send <name> --keys 'C-c'"
-    # Route through the server so the message gets the SERVER-VERIFIED origin
-    # stamp (X-Amux-Session, AMUX-1768), busy-deferral, and an audit event.
-    # The old raw `tmux send-keys` path delivered ANONYMOUS text straight into
-    # the pane — no provenance, no record, could interrupt an in-flight turn —
-    # which is how the 2026-07-22 ts-gke→mvs-infra→gtm-engine misroute happened
-    # (AMUX-1818). Kept only as a loud last-resort fallback if the server is down.
-    local AMUX_API="${AMUX_API:-https://localhost:8822}"
-    local body resp rc
-    body=$(MSG="$text" python3 -c "import json,os; print(json.dumps({'text': os.environ['MSG']}))")
-    resp=$(curl -sk -m 15 -X POST -H 'Content-Type: application/json' \
-      -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-      -d "$body" "$AMUX_API/api/sessions/$name/send" 2>/dev/null) || resp=""
-    if [[ -n "$resp" ]]; then
-      rc=0
-      RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
+    [[ -n "$text" ]] || die "usage: amux send <name> <text>
+       amux send <name> --stdin <<'EOF'   # payload never touches the shell
+       amux send <name> --file <path>
+       amux send <name> --keys 'C-c'"
+    _send_via_api "$name" "$text"
+  fi
+}
+
+# Deliver a message through the server: SERVER-VERIFIED origin stamp
+# (X-Amux-Session, AMUX-1768), busy-deferral, audit event. The old raw
+# `tmux send-keys` path delivered ANONYMOUS text straight into the pane — no
+# provenance, no record, could interrupt an in-flight turn — which is how the
+# 2026-07-22 ts-gke→mvs-infra→gtm-engine misroute happened (AMUX-1818). Raw
+# tmux is kept only as a loud last-resort fallback when the server is down.
+_send_via_api() {
+  local name="$1" text="$2"
+  local tname; tname=$(tmux_name "$name")
+  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local body resp rc
+  body=$(MSG="$text" python3 -c "import json,os; print(json.dumps({'text': os.environ['MSG']}))")
+  resp=$(curl -sk -m 15 -X POST -H 'Content-Type: application/json' \
+    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -d "$body" "$AMUX_API/api/sessions/$name/send" 2>/dev/null) || resp=""
+  if [[ -n "$resp" ]]; then
+    rc=0
+    RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
 import json, os, sys
 try:
     d = json.loads(os.environ["RESP"])
@@ -528,17 +559,14 @@ if d.get("error") or d.get("ok") is False:
     sys.exit(2)
 print(f"sent to {tgt} (origin-stamped): {d.get('message', 'ok')}")
 PYEOF
-      [[ $rc -eq 0 ]] && return 0
-      [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
-    fi
-    # Server unreachable/garbled — fall back to raw tmux, but say so loudly:
-    # this delivery carries NO verified origin and NO server-side record.
-    echo "${YELLOW}warning:${RESET} amux server unreachable — falling back to raw tmux send (UNSTAMPED, unaudited)" >&2
-    tmux send-keys -t "=$tname:" -l "$text"
-    sleep 0.05
-    tmux send-keys -t "=$tname:" Enter
-    echo "${GREEN}sent${RESET} to $name (raw tmux, no origin stamp): $text"
+    [[ $rc -eq 0 ]] && return 0
+    [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
   fi
+  echo "${YELLOW}warning:${RESET} amux server unreachable — falling back to raw tmux send (UNSTAMPED, unaudited)" >&2
+  tmux send-keys -t "=$tname:" -l "$text"
+  sleep 0.05
+  tmux send-keys -t "=$tname:" Enter
+  echo "${GREEN}sent${RESET} to $name (raw tmux, no origin stamp): $text"
 }
 
 cmd_stop() {
@@ -769,11 +797,24 @@ cmd_board() {
       echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'→',d['status'])" 2>/dev/null || echo "$result"
       ;;
     add|create)
-      local title="$*"; [[ -n "$title" ]] || die "Usage: amux board add <title>"
-      local result
+      # Title via --stdin/--file keeps it out of a shell-evaluated string
+      # (AMUX-1888); the JSON body is built with json.dumps, not string
+      # interpolation, so a quote/newline/backslash in the title can't produce
+      # malformed JSON (the old `-d "{\"title\":\"$title\"}"` form did).
+      local title
+      if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then title=$(cat)
+      elif [[ "${1:-}" == "--file" ]]; then
+        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board add --file <path>"
+        title=$(cat "$2")
+      else title="$*"; fi
+      [[ -n "$title" ]] || die "Usage: amux board add <title> | --stdin | --file <path>"
+      local body result
+      body=$(T="$title" S="${AMUX_SESSION:-}" python3 -c \
+        "import json,os; print(json.dumps({'title': os.environ['T'].strip(), 'status':'todo', 'session': os.environ['S']}))")
       result=$(curl -sk -X POST \
         -H 'Content-Type: application/json' \
-        -d "{\"title\":\"$title\",\"status\":\"todo\"}" \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$body" \
         "$AMUX_API/api/board")
       echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Created',d['id'],'→',d['title'])" 2>/dev/null || echo "$result"
       ;;
