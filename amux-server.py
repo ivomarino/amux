@@ -15219,9 +15219,14 @@ def _dictation_prompt(session: str = "") -> str:
         "Preserve the speaker's wording and intent; do not paraphrase.",
     ]
     try:
-        names = [f.stem for f in CC_SESSIONS.glob("*.env")][:60]
+        names = [f.stem for f in CC_SESSIONS.glob("*.env")][:80]
         if names:
-            parts.append("Session names that may be spoken (spell them exactly): " + ", ".join(names))
+            # Speech-to-text mangles these constantly ("ts gke"/"TSGKE" → ts-gke,
+            # "MBS in for" → mvs-infra). Match phonetically, not literally.
+            parts.append(
+                "These are the user's session names — if a spoken phrase sounds like one "
+                "(letters spelled out, hyphens omitted, words run together, or a near-homophone), "
+                "replace it with the EXACT name from this list:\n" + ", ".join(sorted(names)))
     except Exception:
         pass
     if session:
