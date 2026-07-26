@@ -27188,7 +27188,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.197';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.198';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30053,6 +30053,14 @@ function _voiceToggle() {
 }
 
 async function _voiceStart() {
+  // The Gemini Live voice assistant is retired: it connected the BROWSER
+  // straight to Gemini, which required shipping the server's API key into the
+  // page (a real leak), and its model (gemini-2.0-flash-live-001) no longer
+  // exists. Dictation replaces it and keeps the key server-side.
+  showToast('Voice assistant retired — use the Dictation tab');
+  try { setPeekTab('dictation'); } catch(e) {}
+  return;
+  /* eslint-disable no-unreachable */
   const apiKey = window._GOOGLE_API_KEY;
   if (!apiKey) { showToast('Set GOOGLE_API_KEY in ~/.amux/server.env'); return; }
   const session = peekSession;
@@ -46536,7 +46544,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.197';
+const CACHE = 'amux-v0.9.198';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -47572,7 +47580,11 @@ class CCHandler(BaseHTTPRequestHandler):
                 f'<script>window._AMUX_S3_ICAL_URL={_json.dumps(_S3_CAL_URL)};'
                 f'window._AMUX_AUTH_TOKEN={_json.dumps(AUTH_TOKEN)};'
                 f'window._AMUX_HOME={_json.dumps(str(Path.home()))};'
-                f'window._GOOGLE_API_KEY={_json.dumps(os.environ.get("GOOGLE_API_KEY",""))};'
+                # NOTE: GOOGLE_API_KEY is deliberately NOT injected here. It used
+                # to ship the real key into every served page (readable by anyone
+                # who could load the dashboard — LAN/Tailscale/share links). Anything
+                # needing Gemini goes through a server-side endpoint instead
+                # (see /api/dictate), so the key never leaves this process.
                 f'window._AMUX_POSTHOG_KEY={_json.dumps(os.environ.get("POSTHOG_KEY",""))};'
                 f'window._AMUX_POSTHOG_HOST={_json.dumps(os.environ.get("POSTHOG_HOST","https://us.i.posthog.com"))};'
                 f'window._AMUX_USER_EMAIL={_json.dumps(_user_email)};'
