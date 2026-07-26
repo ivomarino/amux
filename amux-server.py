@@ -17251,6 +17251,59 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .peek-tab-count .psc-on  { color: #3fb950; font-weight: 700; }
   .peek-tab-count .psc-off { color: #f85149; font-weight: 700; }
   .peek-tab-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
+  /* ── Dictation tab ── */
+  .dict-recbar { display: flex; align-items: center; gap: 12px; padding: 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .dict-rec { width: 52px; height: 52px; min-width: 52px; border-radius: 50%; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); font-size: 1.35rem; cursor: pointer; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; transition: transform .12s, background .12s; }
+  .dict-rec:hover { border-color: var(--accent); }
+  .dict-rec.recording { background: #f85149; border-color: #f85149; color: #fff; animation: dictpulse 1.2s ease-in-out infinite; }
+  @keyframes dictpulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+  .dict-status { font-size: 0.85rem; color: var(--text); font-weight: 500; }
+  .dict-hint { font-size: 0.72rem; color: var(--dim); margin-top: 2px; }
+  .dict-total { font-size: 0.72rem; color: var(--dim); white-space: nowrap; align-self: flex-start; }
+  .dict-subtabs { display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .dict-subtab { background: none; border: none; color: var(--dim); font-size: 0.78rem; font-weight: 600;
+    padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+  .dict-subtab.active { color: var(--text); background: var(--bg); }
+  .dict-search { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px;
+    font-size: 0.76rem; color: var(--text); outline: none; max-width: 190px; }
+  .dict-body { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px 12px; }
+  .dict-empty { color: var(--dim); font-size: 0.85rem; text-align: center; padding: 34px 12px; line-height: 1.7; }
+  .dict-day { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; color: var(--dim); margin: 14px 0 6px; }
+  .dict-day:first-child { margin-top: 0; }
+  .dict-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 6px; background: var(--card); }
+  .dict-row:hover { border-color: var(--accent); }
+  .dict-time { font-size: 0.7rem; color: var(--dim); white-space: nowrap; padding-top: 2px; min-width: 58px; }
+  .dict-text { flex: 1; min-width: 0; font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .dict-aibadge { font-size: 0.64rem; color: #d29922; margin-left: 6px; white-space: nowrap; }
+  .dict-acts { display: flex; gap: 2px; flex-shrink: 0; }
+  .dict-acts button { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 0.85rem;
+    padding: 3px 5px; border-radius: 5px; min-width: 26px; min-height: 26px; }
+  .dict-acts button:hover { background: var(--bg); color: var(--text); }
+  .dict-acts button.danger:hover { color: #f85149; }
+  .dict-dictbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .dict-dicthint { flex: 1; font-size: 0.76rem; color: var(--dim); line-height: 1.5; }
+  .dict-wordrow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  .dict-word { flex: 1; min-width: 0; font-size: 0.85rem; word-break: break-word; }
+  .dict-arrow { color: var(--dim); margin: 0 2px; }
+  .dict-modal-input { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 8px 11px;
+    font-size: 0.86rem; color: var(--text); outline: none; font-family: inherit; }
+  .dict-modal-input:focus { border-color: var(--accent); }
+  .dict-modal-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  .dict-modal-row label { font-size: 0.85rem; color: var(--text); }
+  .dict-settings { font-size: 0.85rem; }
+  .dict-set-row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .dict-set-row span { color: var(--dim); }
+  .dict-sethint { font-size: 0.76rem; color: var(--dim); line-height: 1.6; margin-top: 10px; }
+  @media (max-width: 600px) {
+    .dict-row { flex-wrap: wrap; }
+    .dict-time { min-width: 0; }
+    .dict-acts button { min-width: 34px; min-height: 34px; font-size: 0.95rem; }
+    .dict-rec { width: 58px; height: 58px; min-width: 58px; }
+    .dict-search { max-width: 130px; }
+  }
   /* Saved-messages modal: scope tabs (this session / all) + per-session badge. */
   .sm-scope-tab { flex: 1; padding: 6px 10px; font-size: 0.8rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--dim); cursor: pointer; font-family: inherit; min-height: 36px; }
   .sm-scope-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 500; }
@@ -21397,6 +21450,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')">Worktree</button>
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')">Commits</button>
     <button class="peek-tab" id="peek-tab-notes" onclick="setPeekTab('notes')">Notes<span class="peek-tab-count" id="peek-tab-notes-count"></span></button>
+    <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text">Dictation</button>
   </div>
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
@@ -21457,6 +21511,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();document.getElementById('peek-file-input').click()">&#128206; Attach file</button>
             <button type="button" onclick="_peekMoreClose();openCmdHistoryModal()">&#x1F551; Message history</button>
             <button type="button" onclick="_peekMoreClose();_openSavedMessages()">&#128190; Saved messages</button>
+            <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#127908; Dictation</button>
           </div>
         </div>
         <div class="send-split"><button class="btn primary send-split-main" onpointerdown="event.preventDefault();_tapTraceEv('pointerdown')" onpointerup="_tapTraceEv('pointerup');_btnFire(event, sendPeekCmd)" onpointercancel="_tapTraceEv('pointercancel')" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, sendPeekCmd)" onclick="_tapTraceEv('click');_btnFire(event, sendPeekCmd)">Send</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
@@ -21549,6 +21604,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:wrap;"></div>
     <div id="peek-messages-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:10px;"></div>
+  </div>
+  <!-- Dictation: speak → clean text. Audio goes to the amux server, which calls
+       Gemini; the API key never reaches this page. -->
+  <div id="peek-dictation-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
+    <div class="dict-recbar">
+      <button id="dict-rec-btn" class="dict-rec" onclick="_dictToggleRec()" title="Hold to dictate (or click to start/stop)">&#127908;</button>
+      <div style="flex:1;min-width:0;">
+        <div id="dict-rec-status" class="dict-status">Tap the mic to dictate</div>
+        <div id="dict-rec-hint" class="dict-hint">Cleaned text lands in the composer for review &mdash; nothing is sent automatically.</div>
+      </div>
+      <span id="dict-total-words" class="dict-total"></span>
+    </div>
+    <div class="dict-subtabs">
+      <button class="dict-subtab active" id="dict-subtab-history" onclick="_dictSetSub('history')">History</button>
+      <button class="dict-subtab" id="dict-subtab-dict" onclick="_dictSetSub('dict')">Dictionary</button>
+      <button class="dict-subtab" id="dict-subtab-settings" onclick="_dictSetSub('settings')">Settings</button>
+      <span style="flex:1;"></span>
+      <input type="search" id="dict-search" class="dict-search" placeholder="Search&hellip;" oninput="_dictRenderHistory()">
+    </div>
+    <div id="dict-body" class="dict-body"></div>
   </div>
   <div id="peek-cost-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
@@ -22840,6 +22915,27 @@ function showAlert(msg) {
     btns.innerHTML = `<button class="btn primary" onclick="_modalClose(true)">OK</button>`;
     document.getElementById('modal-backdrop').classList.add('open');
   });
+}
+// Modal with arbitrary form HTML (reuses the shared modal chrome). Resolves
+// true on confirm, false on cancel — read your inputs before awaiting resolve.
+function showFormModal(title, innerHTML, confirmLabel = 'Save') {
+  return new Promise(resolve => {
+    _modalResolve = resolve;
+    document.getElementById('modal-msg').innerHTML =
+      '<div style="font-weight:700;font-size:0.95rem;margin-bottom:12px;">' + esc(title) + '</div>' + innerHTML;
+    document.getElementById('modal-btns').innerHTML =
+      `<button class="btn primary" onclick="_modalClose(true)">${esc(confirmLabel)}</button>` +
+      `<button class="btn" onclick="_modalClose(false)">Cancel</button>`;
+    document.getElementById('modal-backdrop').classList.add('open');
+  });
+}
+// Single-line prompt on the same chrome. Resolves the string, or null if cancelled.
+async function showPrompt(msg, placeholder = '') {
+  const ok = await showFormModal(msg,
+    '<input id="modal-prompt-input" class="dict-modal-input" placeholder="' + esc(placeholder) + '" style="width:100%">',
+    'OK');
+  if (!ok) return null;
+  return (document.getElementById('modal-prompt-input')?.value || '').trim();
 }
 
 // ── Bulk actions modal ──
@@ -25750,6 +25846,10 @@ function setPeekTab(tab) {
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
   document.getElementById('peek-tab-schedules').classList.toggle('active', tab === 'schedules');
   document.getElementById('peek-tab-notes').classList.toggle('active', tab === 'notes');
+  document.getElementById('peek-tab-dictation').classList.toggle('active', tab === 'dictation');
+  const dictPanel = document.getElementById('peek-dictation-panel');
+  if (tab === 'dictation') { dictPanel.classList.add('active'); _dictLoad(); }
+  else { dictPanel.classList.remove('active'); if (_dictRecording) _dictStopRec(); }
   document.getElementById('peek-terminal-panel').style.display = tab === 'terminal' ? '' : 'none';
   document.getElementById('peek-split-wrap').style.display = tab === 'terminal' ? '' : 'none';
   const transcript = document.getElementById('peek-transcript-panel');
@@ -27088,7 +27188,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.196';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.197';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30629,6 +30729,264 @@ async function _peekMessagesLoad() {
   _peekMessagesRender();                       // paint from local cache instantly
   try { await _loadCmdHistoryFromServer(); } catch(e) {}   // refresh (cross-device)
   _peekMessagesRender();
+}
+
+// ── Dictation tab ───────────────────────────────────────────────────────────
+// Speak → clean text. Audio is POSTed to the amux server, which calls Gemini
+// with amux context (session names + your vocabulary) — the API key never
+// reaches this page. Result lands in the composer for review, never auto-sent.
+let _dictRecording = false, _dictRecorder = null, _dictChunks = [], _dictStream = null;
+let _dictStartedAt = 0, _dictSub = 'history';
+let _dictItems = [], _dictWords = [], _dictTotalWords = 0, _dictCfg = null;
+
+async function _dictLoad() {
+  try {
+    const [h, d, c] = await Promise.all([
+      fetch(API + '/api/dictation/history?session=' + encodeURIComponent(peekSession || ''), { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/dictation/config', { headers: _authHeaders() }).then(r => r.json()),
+    ]);
+    _dictItems = h.items || []; _dictTotalWords = h.total_words || 0;
+    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {};
+  } catch(e) {}
+  const tw = document.getElementById('dict-total-words');
+  if (tw) tw.textContent = _dictTotalWords ? _dictTotalWords.toLocaleString() + ' words' : '';
+  _dictRender();
+}
+function _dictSetSub(s) {
+  _dictSub = s;
+  ['history','dict','settings'].forEach(k => document.getElementById('dict-subtab-' + k)?.classList.toggle('active', k === s));
+  const srch = document.getElementById('dict-search');
+  if (srch) srch.style.display = s === 'history' ? '' : 'none';
+  _dictRender();
+}
+function _dictRender() {
+  if (_dictSub === 'history') _dictRenderHistory();
+  else if (_dictSub === 'dict') _dictRenderDict();
+  else _dictRenderSettings();
+}
+
+// ── Recording ──
+function _dictToggleRec() { if (_dictRecording) _dictStopRec(); else _dictStartRec(); }
+async function _dictStartRec() {
+  if (_dictRecording) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
+  try {
+    _dictStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch(e) { showToast('Microphone access denied'); return; }
+  // Safari/iOS produce mp4; Chrome/Firefox webm. Let the browser pick what it
+  // supports and tell the server the real mime so Gemini decodes it.
+  let mime = '';
+  for (const m of ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/aac']) {
+    if (window.MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) { mime = m; break; }
+  }
+  try { _dictRecorder = mime ? new MediaRecorder(_dictStream, { mimeType: mime }) : new MediaRecorder(_dictStream); }
+  catch(e) { _dictRecorder = new MediaRecorder(_dictStream); }
+  _dictChunks = [];
+  _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) _dictChunks.push(e.data); };
+  _dictRecorder.onstop = () => _dictUpload();
+  _dictRecorder.start();
+  _dictRecording = true; _dictStartedAt = Date.now();
+  document.getElementById('dict-rec-btn')?.classList.add('recording');
+  _dictTick();
+}
+function _dictTick() {
+  if (!_dictRecording) return;
+  const s = Math.floor((Date.now() - _dictStartedAt) / 1000);
+  _dictStatus('Listening… ' + Math.floor(s/60) + ':' + String(s%60).padStart(2,'0') + ' — tap to stop');
+  setTimeout(_dictTick, 500);
+}
+function _dictStopRec() {
+  if (!_dictRecording) return;
+  _dictRecording = false;
+  document.getElementById('dict-rec-btn')?.classList.remove('recording');
+  try { _dictRecorder && _dictRecorder.state !== 'inactive' && _dictRecorder.stop(); } catch(e) {}
+  try { (_dictStream?.getTracks() || []).forEach(t => t.stop()); } catch(e) {}
+}
+function _dictStatus(t) { const el = document.getElementById('dict-rec-status'); if (el) el.textContent = t; }
+
+async function _dictUpload() {
+  const ms = Date.now() - _dictStartedAt;
+  if (!_dictChunks.length) { _dictStatus('Nothing recorded'); return; }
+  const blob = new Blob(_dictChunks, { type: _dictChunks[0].type || 'audio/webm' });
+  _dictChunks = [];
+  if (blob.size < 1200) { _dictStatus('Too short — hold a bit longer'); return; }
+  _dictStatus('Transcribing…');
+  const b64 = await new Promise(res => { const r = new FileReader();
+    r.onloadend = () => res(String(r.result).split(',')[1] || ''); r.readAsDataURL(blob); });
+  try {
+    const r = await fetch(API + '/api/dictate', { method: 'POST',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ audio: b64, mime: (blob.type || 'audio/webm').split(';')[0], session: peekSession || '', dur_ms: ms }) });
+    const d = await r.json();
+    if (d.error) { _dictStatus('Failed: ' + d.error); return; }
+    _dictStatus('Added to the composer — review, then send');
+    _dictInsert(d.text);
+    _dictLoad();
+  } catch(e) { _dictStatus('Failed: ' + e.message); }
+}
+
+// Put text in the composer (append, don't clobber) — never auto-send.
+function _dictInsert(text) {
+  const inp = document.getElementById('peek-cmd-input');
+  if (!inp) { navigator.clipboard?.writeText(text); showToast('Copied (composer not open)'); return; }
+  inp.value = inp.value && inp.value.trim() ? (inp.value.replace(/\s+$/,'') + ' ' + text) : text;
+  inp.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// ── History ──
+function _dictRenderHistory() {
+  const body = document.getElementById('dict-body');
+  if (!body) return;
+  const q = (document.getElementById('dict-search')?.value || '').trim().toLowerCase();
+  const items = q ? _dictItems.filter(i => (i.text||'').toLowerCase().includes(q)) : _dictItems;
+  if (!items.length) {
+    body.innerHTML = '<div class="dict-empty">' + (q ? 'No matches.' :
+      'No dictations yet.<br><span style="font-size:0.78rem">Tap the mic above and start talking.</span>') + '</div>';
+    return;
+  }
+  // Group by day, newest first (matches the reference UI).
+  let html = '', lastDay = '';
+  for (const it of items) {
+    const d = new Date(it.ts);
+    const day = d.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' }).toUpperCase();
+    if (day !== lastDay) { html += '<div class="dict-day">' + day + '</div>'; lastDay = day; }
+    const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    html += '<div class="dict-row" id="dict-row-' + it.id + '">'
+      + '<div class="dict-time">' + time + '</div>'
+      + '<div class="dict-text">' + esc(it.text || '')
+      + (it.ai_edited ? '<span class="dict-aibadge" title="AI-edited">&#10024; AI</span>' : '') + '</div>'
+      + '<div class="dict-acts">'
+      + '<button title="Copy" onclick="_dictCopy(' + it.id + ')">&#128203;</button>'
+      + '<button title="Insert into composer" onclick="_dictInsertId(' + it.id + ')">&#8629;</button>'
+      + '<button title="AI edit" onclick="_dictAiEdit(' + it.id + ')">&#10024;</button>'
+      + (it.ai_edited ? '<button title="Undo AI edit" onclick="_dictUndo(' + it.id + ')">&#8630;</button>' : '')
+      + '<button title="Delete" class="danger" onclick="_dictDelete(' + it.id + ')">&#128465;</button>'
+      + '</div></div>';
+  }
+  body.innerHTML = html;
+}
+function _dictById(id) { return _dictItems.find(i => i.id === id); }
+function _dictCopy(id) { const it = _dictById(id); if (it) { navigator.clipboard?.writeText(it.text); showToast('Copied'); } }
+function _dictInsertId(id) { const it = _dictById(id); if (it) { _dictInsert(it.text); showToast('Added to composer'); } }
+async function _dictAiEdit(id) {
+  const instruction = await showPrompt('How should the AI edit this?', 'e.g. make it formal / shorter / bullet points');
+  if (instruction === null) return;
+  showToast('Editing…');
+  const r = await fetch(API + '/api/dictation/history/' + id + '/edit', { method: 'POST',
+    headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ instruction }) });
+  const d = await r.json();
+  if (d.error) { showToast('Edit failed: ' + d.error); return; }
+  showToast('AI edit applied'); _dictLoad();
+}
+async function _dictUndo(id) {
+  const r = await fetch(API + '/api/dictation/history/' + id + '/edit', { method: 'POST',
+    headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ undo: true }) });
+  const d = await r.json();
+  if (d.error) { showToast('Undo failed'); return; }
+  showToast('Reverted to the original'); _dictLoad();
+}
+async function _dictDelete(id) {
+  if (!(await showConfirm('Delete this transcription?', 'Delete', true))) return;
+  await fetch(API + '/api/dictation/history/' + id, { method: 'DELETE', headers: _authHeaders() });
+  _dictLoad();
+}
+
+// ── Dictionary ──
+function _dictRenderDict() {
+  const body = document.getElementById('dict-body');
+  if (!body) return;
+  let html = '<div class="dict-dictbar"><span class="dict-dicthint">Terms and names amux should always spell correctly '
+    + 'in your dictation.</span><button class="btn primary" onclick="_dictAddWord()">Add new</button></div>';
+  if (!_dictWords.length) {
+    html += '<div class="dict-empty">No words yet.<br><span style="font-size:0.78rem">Add jargon, session names, '
+      + 'people — or fix a misspelling the model keeps making.</span></div>';
+  } else {
+    html += _dictWords.map(w => '<div class="dict-wordrow">'
+      + '<div class="dict-word">' + esc(w.word)
+      + (w.correct ? ' <span class="dict-arrow">&rarr;</span> <b>' + esc(w.correct) + '</b>' : '')
+      + '</div><div class="dict-acts">'
+      + '<button title="Edit" onclick="_dictEditWord(' + w.id + ')">&#9998;</button>'
+      + '<button title="Delete" class="danger" onclick="_dictDelWord(' + w.id + ')">&#128465;</button>'
+      + '</div></div>').join('');
+  }
+  body.innerHTML = html;
+}
+async function _dictAddWord(existing) {
+  const w = existing || null;
+  const isFix = w ? !!w.correct : false;
+  const html = '<div class="dict-modal-row"><label>Correct a misspelling</label>'
+    + '<input type="checkbox" id="dictm-fix" ' + (isFix ? 'checked' : '') + ' onchange="_dictModalToggle()"></div>'
+    + '<div id="dictm-single" style="' + (isFix ? 'display:none' : '') + '">'
+    + '<input id="dictm-word" class="dict-modal-input" placeholder="Add a new word" value="' + (w && !isFix ? esc(w.word) : '') + '"></div>'
+    + '<div id="dictm-pair" style="' + (isFix ? '' : 'display:none') + ';display:' + (isFix ? 'flex' : 'none') + ';gap:8px;align-items:center;">'
+    + '<input id="dictm-mis" class="dict-modal-input" placeholder="Misspelling" value="' + (w && isFix ? esc(w.word) : '') + '">'
+    + '<span style="color:var(--dim)">&rarr;</span>'
+    + '<input id="dictm-cor" class="dict-modal-input" placeholder="Correct spelling" value="' + (w && isFix ? esc(w.correct) : '') + '"></div>';
+  const ok = await showFormModal(w ? 'Edit vocabulary' : 'Add to vocabulary', html, w ? 'Save' : 'Add word');
+  if (!ok) return;
+  const fix = document.getElementById('dictm-fix')?.checked;
+  const word = fix ? (document.getElementById('dictm-mis')?.value || '').trim() : (document.getElementById('dictm-word')?.value || '').trim();
+  const correct = fix ? (document.getElementById('dictm-cor')?.value || '').trim() : '';
+  if (!word || (fix && !correct)) { showToast('Fill in both fields'); return; }
+  if (w) {
+    await fetch(API + '/api/dictation/dict/' + w.id, { method: 'PATCH',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ word, correct }) });
+  } else {
+    await fetch(API + '/api/dictation/dict', { method: 'POST',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ word, correct }) });
+  }
+  showToast(w ? 'Updated' : 'Added to vocabulary'); _dictLoad();
+}
+function _dictModalToggle() {
+  const fix = document.getElementById('dictm-fix')?.checked;
+  const s = document.getElementById('dictm-single'), p = document.getElementById('dictm-pair');
+  if (s) s.style.display = fix ? 'none' : '';
+  if (p) p.style.display = fix ? 'flex' : 'none';
+}
+function _dictEditWord(id) { const w = _dictWords.find(x => x.id === id); if (w) _dictAddWord(w); }
+async function _dictDelWord(id) {
+  await fetch(API + '/api/dictation/dict/' + id, { method: 'DELETE', headers: _authHeaders() });
+  _dictLoad();
+}
+
+// ── Settings (BYO key) ──
+function _dictRenderSettings() {
+  const body = document.getElementById('dict-body');
+  if (!body) return;
+  const c = _dictCfg || {};
+  const using = c.source === 'byo' ? 'your own Gemini key'
+    : c.source === 'server' ? "this amux server's Gemini key" : 'nothing configured';
+  body.innerHTML =
+    '<div class="dict-settings">'
+    + '<div class="dict-set-row"><b>Transcription</b><span>' + esc(c.model || '') + '</span></div>'
+    + '<div class="dict-set-row"><b>Currently using</b><span>' + using + '</span></div>'
+    + '<div class="dict-sethint">Bring your own Gemini API key (optional). If set, amux uses it instead of the '
+    + 'server\'s key. It is stored on the amux server and is <b>never sent back to any browser</b>. '
+    + 'Get one at <span style="color:var(--accent)">aistudio.google.com/apikey</span>.</div>'
+    + '<div style="display:flex;gap:8px;margin-top:8px;">'
+    + '<input id="dict-key-input" class="dict-modal-input" type="password" placeholder="'
+    + (c.source === 'byo' ? 'Key set — enter a new one to replace' : 'Paste your Gemini API key') + '" style="flex:1">'
+    + '<button class="btn primary" onclick="_dictSaveKey()">Save</button>'
+    + (c.source === 'byo' ? '<button class="btn" onclick="_dictClearKey()">Remove</button>' : '')
+    + '</div>'
+    + '<div class="dict-sethint" style="margin-top:14px;">Audio never touches this page’s JavaScript beyond the '
+    + 'recording itself — it is uploaded to your amux server, which calls Gemini and returns only text.</div>'
+    + '</div>';
+}
+async function _dictSaveKey() {
+  const k = (document.getElementById('dict-key-input')?.value || '').trim();
+  if (!k) { showToast('Paste a key first'); return; }
+  const r = await fetch(API + '/api/dictation/config', { method: 'POST',
+    headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ key: k }) });
+  const d = await r.json();
+  if (d.error) { showToast('Could not save key'); return; }
+  showToast('Using your Gemini key'); _dictLoad();
+}
+async function _dictClearKey() {
+  await fetch(API + '/api/dictation/config', { method: 'POST',
+    headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ key: '' }) });
+  showToast('Reverted to the server key'); _dictLoad();
 }
 
 // Peek Cost tab: this session's token/cost breakdown by task (reuses _costRender)
@@ -46178,7 +46536,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.196';
+const CACHE = 'amux-v0.9.197';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
