@@ -52543,6 +52543,43 @@ end tell
                 except Exception as e:
                     return self._json({"error": str(e)}, 500)
 
+            # GET /api/email/log?days=N&limit=N&session=X — the send-audit ledger
+            # (AMUX-1897, Ethan 2026-07-26: "amux logs all email use"). Reads
+            # ~/.amux/logs/email-sent.jsonl (written by _email_log on every
+            # send/reply). One API call answers "who sent X and when" — no shell
+            # forensics. session filter matches the X-Amux-Session stamp;
+            # session=unattributed returns records sent without the header.
+            if method == "GET" and path == "/api/email/log":
+                qs = parse_qs(urlparse(self.path).query)
+                days = int(qs.get("days", ["7"])[0])
+                limit = min(int(qs.get("limit", ["50"])[0]), 500)
+                sess_f = (qs.get("session", [""])[0]).strip()
+                import datetime as _dt
+                cutoff = (_dt.datetime.now(_dt.timezone.utc)
+                          - _dt.timedelta(days=days)).isoformat()
+                out = []
+                try:
+                    with open(EMAIL_SEND_LOG) as _f:
+                        for line in _f:
+                            try:
+                                rec = json.loads(line)
+                            except Exception:
+                                continue
+                            if rec.get("ts", "") < cutoff:
+                                continue
+                            rsess = rec.get("session") or "unattributed"
+                            if sess_f and not (
+                                rsess == sess_f
+                                or (sess_f == "unattributed" and rsess == "unattributed")
+                            ):
+                                continue
+                            rec["session"] = rsess
+                            out.append(rec)
+                except FileNotFoundError:
+                    pass
+                out = out[-limit:][::-1]
+                return self._json({"count": len(out), "days": days, "log": out})
+
             # GET /api/email/search?q=...&account=...&limit=...&days=...&mailbox=...
             if method == "GET" and path == "/api/email/search":
                 qs = parse_qs(urlparse(self.path).query)
