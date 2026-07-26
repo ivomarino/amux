@@ -10710,6 +10710,50 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
 _orphan_git_alerted: dict[str, float] = {}  # checkout dir -> last alert ts
 
 
+_orphan_stash_alerted: dict = {}
+
+
+def _check_orphaned_autostash(wd: str, now: float):
+    """Detect ORPHANED `autostash` stash entries — the aftermath of the rebase
+    orphan above (AMUX-1887). When a `pull --rebase --autostash` is interrupted
+    and the rebase is later quit/finished, git does NOT restore the autostash:
+    it silently stays in the stash list and the work looks lost. The rebase dir
+    is gone by then, so _check_orphaned_git_state can't see it.
+
+    Only `autostash` entries are flagged — a deliberate `git stash push` is the
+    user's own bookmark, not silent data loss. Alert-only: never drop or apply,
+    because on a SHARED checkout the stash may belong to another session (and a
+    partial apply drops paths). Deduped per (dir, entry-count) for 24h."""
+    try:
+        r = subprocess.run(["git", "-C", wd, "stash", "list", "--format=%gd|%cr|%s"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            _orphan_stash_alerted.pop(wd, None)
+            return
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        auto = [l for l in lines if "autostash" in l.split("|")[-1].lower()]
+        if not auto:
+            _orphan_stash_alerted.pop(wd, None)
+            return
+        # Don't nag on the same situation: key on (autostash count, total count).
+        sig = (len(auto), len(lines))
+        prev = _orphan_stash_alerted.get(wd)
+        if prev and prev[0] == sig and now - prev[1] < 24 * 3600:
+            return
+        _orphan_stash_alerted[wd] = (sig, now)
+        oldest = auto[-1].split("|")[1] if len(auto[-1].split("|")) > 2 else "?"
+        msg = (f"{wd}: {len(auto)} orphaned `autostash` stash entr"
+               f"{'y' if len(auto)==1 else 'ies'} (oldest {oldest}) — an interrupted "
+               f"`pull --rebase --autostash` never restored them, so that work is sitting "
+               f"in the stash list unnoticed. {len(lines)} stashes total. "
+               f"Inspect: `git -C {wd} stash list` then `git stash show -p stash@{{N}}`. "
+               f"On a shared checkout each session should clear only its OWN.")
+        slog(f"[git-stash] {msg}")
+        _push_alert("git_orphan", "", msg)
+    except Exception:
+        pass
+
+
 def _check_orphaned_git_state():
     """Detect ORPHANED rebase state in any session checkout: .git/rebase-merge
     (or rebase-apply) untouched for >15 min. An interrupted `pull --rebase
@@ -10743,6 +10787,7 @@ def _check_orphaned_git_state():
                     break
             if not state:
                 _orphan_git_alerted.pop(wd, None)
+                _check_orphaned_autostash(wd, now)
                 continue
             sub, mtime = state
             if now - mtime < 900:  # <15 min old — plausibly a live rebase
