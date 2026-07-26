@@ -14,20 +14,22 @@
 ## Running Experiments
 
 ### EXP-001 — Hero CTA button copy
-- **Status:** `running`
+- **Status:** `concluded: inconclusive`
 - **Started:** 2026-07-07
-- **Change:** "View on GitHub" → "⭐ Star on GitHub" (both hero CTA instances in index.html, `replace_all`)
+- **Concluded:** 2026-07-26
+- **Change:** "View on GitHub" → "⭐ Star on GitHub" (both hero CTA instances in index.html, `replace_all`). **Change kept — no evidence of harm.**
 - **Hypothesis:** More action-oriented, emoji-prefixed star CTA increases GitHub star click-through by 20%+
 - **KPI:** GitHub star clicks (PostHog autocapture on github.com/mixpeek/amux link)
-- **Measure after:** 2026-07-14 (7 days minimum)
+- **Score (2026-07-26):** Cannot score. PostHog only activated 2026-07-09 (phc_ key); EXP-001 started 2026-07-07 — zero pre-period baseline exists. No valid pre/post comparison possible. Star CTA copy kept permanently.
 
 ### EXP-002 — iOS CTA sticky mobile bottom bar
-- **Status:** `running`
+- **Status:** `concluded: inconclusive`
 - **Started:** 2026-07-08
-- **Change:** Added sticky fixed bottom bar on mobile (≤600px) with App Store CTA; iOS nav link hidden on mobile. Implemented in site.js (CSS injection + DOM append). PostHog event: `exp002_ios_sticky_tap`.
+- **Concluded:** 2026-07-26
+- **Change:** Added sticky fixed bottom bar on mobile (≤600px) with App Store CTA; iOS nav link hidden on mobile. Implemented in site.js. PostHog event: `exp002_ios_sticky_tap`. **Sticky bar kept — UX improvement with no evidence of harm.**
 - **Hypothesis:** Moving "iOS app" from nav to a sticky mobile-only bottom bar increases iOS App Store taps on mobile by 30%+
 - **KPI:** iOS downloads (PostHog `exp002_ios_sticky_tap` event + App Store link clicks)
-- **Measure after:** 2026-07-15 (7 days minimum)
+- **Score (2026-07-26):** Cannot score. PostHog activated 2026-07-09; EXP-002 started 2026-07-08 — no pre-period data. The exp002_ios_sticky_tap event has accumulated 17 taps total as of 2026-07-25 but without a comparable pre-period baseline these cannot be attributed to the sticky bar. Sticky bar kept permanently.
 
 ---
 
@@ -37,27 +39,28 @@
 - **Hypothesis:** "View on GitHub" → "⭐ Star on GitHub" increases star click-through by 20%+
 - **Page:** `/` (homepage hero)
 - **KPI:** GitHub star clicks
-- **Status:** `running` — started 2026-07-07
-- **Implementation:** Changed both "View on GitHub" instances to "⭐ Star on GitHub" in site/index.html
+- **Status:** `concluded: inconclusive` — concluded 2026-07-26
+- **Implementation:** Changed both "View on GitHub" instances to "⭐ Star on GitHub" in site/index.html. **Change kept.**
 - **Effort:** XS (1 line edit)
 
 ### EXP-002 — iOS CTA sticky mobile bottom bar
 - **Hypothesis:** Moving "iOS app" from nav to a sticky mobile-only bottom bar increases iOS taps on mobile by 30%+
 - **Page:** All pages (site.js — injected globally)
 - **KPI:** iOS downloads
-- **Status:** `running` — started 2026-07-08
-- **Implementation:** site.js injects CSS (fixed bottom bar, body padding-bottom, hide nav iOS link on ≤600px) and appends DOM element. PostHog custom event `exp002_ios_sticky_tap` on tap. Respects `env(safe-area-inset-bottom)` for iOS notch.
+- **Status:** `concluded: inconclusive` — concluded 2026-07-26
+- **Implementation:** site.js injects CSS (fixed bottom bar, body padding-bottom, hide nav iOS link on ≤600px) and appends DOM element. PostHog custom event `exp002_ios_sticky_tap` on tap. **Sticky bar kept.**
 - **Effort:** S (site.js injection)
 
 ### EXP-003 — Homepage hero social proof line
 - **Hypothesis:** Adding a concrete social proof line under the lede increases GitHub clicks and concierge signups by anchoring the "288+ developers" stat
 - **Page:** `/` (index.html hero)
 - **KPI:** GitHub stars + cloud signups
-- **Status:** `running`
+- **Status:** `concluded: inconclusive`
 - **Started:** 2026-07-09
-- **Change:** Added `<p class="social-proof">Trusted by 288+ developers shipping overnight with AI agents — open source on GitHub</p>` below the .lede paragraph. Star count is hardcoded to 288 (current as of 2026-07-09). Text links to GitHub repo.
+- **Concluded:** 2026-07-26
+- **Change:** Added `<p class="social-proof">Trusted by 288+ developers shipping overnight with AI agents — open source on GitHub</p>` below the .lede paragraph. Star count is hardcoded to 288 (current as of 2026-07-09). Text links to GitHub repo. **Social proof paragraph kept.**
 - **Implementation:** Added social-proof paragraph + CSS in index.html
-- **Measure after:** 2026-07-16 (7 days minimum)
+- **Score (2026-07-26):** Cannot score. PostHog activated 2026-07-09 same day as EXP-003 start — zero pre-period baseline. No valid pre/post test is possible. Social proof paragraph kept (harmless, provides context for new visitors).
 
 ### EXP-004 — Concierge CTA urgency
 - **Hypothesis:** Adding scarcity to the concierge CTA ("3 onboarding slots open this month") increases cloud signup clicks by 25%+
@@ -101,7 +104,7 @@
 - **Result:** Pre-period (2026-07-10–12, 3 days): 10 iOS clicks = 3.3/day. Post-period (2026-07-13–21, 9 days): 27 iOS clicks = 3.0/day. Change = -9%. However, the pre-period is only 3 days (PostHog live since 2026-07-09, experiment started 2026-07-13) — insufficient to draw a conclusion. No meaningful signal either way. The badge change is harmless — keeping it in place.
 - **KPI:** iOS downloads (App Store link clicks)
 
-**Upcoming score windows:** EXP-010 → 2026-07-31 (extended) · EXP-012 → 2026-07-28 · EXP-014 → 2026-07-27 · EXP-015 → 2026-07-29 · EXP-016 → 2026-07-31. **EXP-004 concluded no_effect (2026-07-24). EXP-009 concluded no_effect + reverted (2026-07-24). EXP-005 concluded inconclusive (2026-07-25 — no valid baseline). EXP-011 concluded win +12.3% (2026-07-25).**
+**Upcoming score windows:** EXP-014 → 2026-07-27 · EXP-012 → 2026-07-28 · EXP-015 → 2026-07-29 · EXP-010 → 2026-07-31 (extended) · EXP-016 → ship after EXP-010 concludes (2026-07-31) · EXP-017 → ship after EXP-012 scored (2026-07-28). **Recently concluded: EXP-001 inconclusive, EXP-002 inconclusive, EXP-003 inconclusive (all 2026-07-26 — no valid baseline, pre-dated PostHog). EXP-005 inconclusive, EXP-011 win +12.3% (both 2026-07-25). EXP-004 no_effect, EXP-009 no_effect + reverted (both 2026-07-24).**
 
 ### EXP-006 — GitHub README → iOS CTA
 - **Hypothesis:** Adding an official App Store badge to the README increases iOS installs from GitHub traffic
@@ -231,6 +234,9 @@
 | EXP-013 — GitHub CTA on best-ai-model-for-coding guide | 2026-07-12 | 2026-07-20 | 162 PVs, 0 KPI clicks (bot/crawler traffic confirmed) | no_effect |
 | EXP-005 — Star History chart on homepage | 2026-07-11 | 2026-07-25 | No valid pre-period baseline after 14-day post window (PostHog activated 1 day before experiment). 5 simultaneous experiments made attribution impossible. Chart kept. | inconclusive |
 | EXP-011 — Plan strip row in homepage PS grid | 2026-07-18 | 2026-07-25 | **+12.3%** homepage GH clicks (pre 8.1/day vs post 9.1/day, 7 days each). EXP-009 confound likely underestimates the true effect. **Change kept permanently.** | **win** |
+| EXP-001 — Hero CTA button copy | 2026-07-07 | 2026-07-26 | No valid pre-period baseline — PostHog activated 2026-07-09, experiment started 2026-07-07. Change kept ("⭐ Star on GitHub"). | inconclusive |
+| EXP-002 — iOS CTA sticky mobile bottom bar | 2026-07-08 | 2026-07-26 | No valid pre-period baseline — PostHog activated 2026-07-09, experiment started 2026-07-08. Sticky bar kept (17 taps logged, harmless UX improvement). | inconclusive |
+| EXP-003 — Homepage hero social proof line | 2026-07-09 | 2026-07-26 | No valid pre-period baseline — experiment started same day PostHog activated. Social proof paragraph kept. | inconclusive |
 
 ---
 
@@ -258,6 +264,7 @@ _Updated by SCHED-149 Job 9 after each run with PostHog data and experiment resu
 | 2026-07-22 | PostHog 14-day data: homepage 711 PVs / 109 GH clicks (15.3% CVR); best-ai-agent-multiplexers-2026 253 PVs / 39 GH clicks (15.4% CVR — consistently best guide, matches homepage rate); measuring-ai-coding-agent-roi 80 PVs (up from 28 → 57 → 80 in 3 days — freshening compounding fast); ai-agent-sandboxing 128 PVs / 1 GH click; claude-code-headless 185 PVs / 2 GH clicks (1.1% CVR — biggest gap, EXP-007 CTA buried at line 650). EXP-008 SCORED inconclusive — `person.properties.theme_preference` null for all events (super property doesn't propagate to person properties; event-level `properties.theme_preference` is the correct field). EXP-009 trending negative: pre 8.86/day vs post 7.83/day = -11.6% (score tomorrow at 7-day window). | EXP-008 scored inconclusive (measurement issue — person vs event property namespace). EXP-015 shipped: top-of-page green CTA on claude-code-headless above TOC, exp015_headless_topofpage_cta_click. ai-coding-finops: EXP-014 CTA added + dateModified 2026-05-26 → 2026-07-22. New guide: /guides/claude-code-rate-limits/ (targeting "Claude Code rate limit" error queries). Changelog: 5 new entries (pending messages ⏳, click-to-insert, git staged guard, scheduler audit, mental model Commits+Proxies). |
 | 2026-07-24 | **EXP-004 CONCLUDED no_effect**: 14-day run, 0 concierge CTA clicks — root cause is off-site conversion (Calendly/email). PostHog can't measure it. Badge kept, experiment closed. **EXP-009 CONCLUDED no_effect + REVERTED**: Full 8-day window scored -21.4% homepage GH clicks (pre 10.3/day vs post 8.1/day). "Indie hackers" persona framing definitively negative — narrowed perceived audience. Reverted .lede to multi-runtime framing + updated star count 288+ → 310+. **EXP-010 extended to 2026-07-31**: iOS +8.5% (below 10% threshold, EXP-011 overlap muddies attribution — need 14-day post window). **EXP-016 queued**: CTO/team persona framing to replace the reverted EXP-009 — ship after EXP-010 concludes. GitHub stars: 310. New pages: /compare/amux-vs-langraph/ rebuilt from 101-line stub to full 500-line compare page (38k stars LangGraph framing, 15-row table, FAQPage/Article/BreadcrumbList JSON-LD, EXP-007 CTA). /for/ctos/ created (new CTO persona page targeting "AI agent team dashboard" + "CTO AI engineering team"). Changelog: 5 new entries (map distance/near-me sort, two-tone pins, AND-mode filter, gzip mobile perf, 'x' key fix). | EXP-004 marked concluded no_effect. EXP-009 marked concluded no_effect + reverted in site/index.html. EXP-016 queued. New pages committed: amux-vs-langraph + for/ctos + changelog + sitemap + llms.txt. |
 | 2026-07-25 | **EXP-011 CONCLUDED win +12.3%**: Plan strip row in homepage PS grid (started 2026-07-18). Pre (Jul 11–17) homepage GH clicks: 8.1/day. Post (Jul 18–24): 9.1/day. Delta: **+12.3%** — first conclusive win above 10% threshold. Plan strip row kept permanently. EXP-009 confound (negative effect throughout window) likely means true EXP-011 effect is higher than +12.3%. **EXP-005 CONCLUDED inconclusive**: No valid pre-period baseline after 14-day extension — PostHog had 1 usable pre-data point. Star history chart kept in place. Homepage GitHub KPI state: 221 total clicks across all pages last 14d (homepage 121 = 55%, multiplexers guide 50 = 23%). iOS clicks: 51 total last 14d, 17 from exp002 sticky bar. GitHub stars: 313. | EXP-011 and EXP-005 marked concluded. EXP-017 added to backlog (best-multiplexers callout on compare index). New pages: /compare/amux-vs-autogen/ rebuilt from 105-line stub to 490-line full compare page (AutoGen 60k ★, Microsoft Research; 15-row table; "Why not both?" 3 patterns; FAQPage 5 Qs; Article+BreadcrumbList JSON-LD). /guides/best-ai-agent-multiplexers-2026/ freshened (dateModified 2026-07-25, Opus 5 mention). /guides/mobile-management-pwa/ freshened (iOS PWA state restore section added, v0.9.189). Changelog: 4 new entries (iOS PWA restore, Opus 5, self-heal, head-of-line block). |
+| 2026-07-26 | **EXP-001/002/003 CONCLUDED inconclusive**: All three experiments pre-date or match PostHog activation (2026-07-09) — no valid pre-period baseline possible. All changes kept in place (star CTA copy, sticky iOS bar, social proof paragraph — none show evidence of harm). PostHog 14-day KPI state (from yesterday's run): 215 total GitHub clicks, homepage 123 (57%), best-ai-agent-multiplexers-2026 52 (24%), pricing 14, best-claude-code-session-managers-2026 5 (new entrant, 5 GH clicks first appearance), getting-started 4, ai-agent-orchestration-2026 4, claude-code-headless 4. iOS: 3–6/day, steady. GitHub stars: 313. No experiments due today (EXP-014 → tomorrow 2026-07-27, EXP-012 → 2026-07-28). | EXP-001, EXP-002, EXP-003 marked concluded inconclusive + added to Concluded table. New page: /guides/voice-dictation-ai-agents/ (new, 450+ lines targeting "voice dictation AI agents", "dictate to Claude Code from phone" — first AEO page on voice control for AI coding agents; HowTo + FAQPage + Article JSON-LD, 6 FAQ questions). /guides/ai-agent-orchestration-2026/ freshened (dateModified 2026-05-25 → 2026-07-26, July 2026 badge, EXP-014 CTA, voice dictation mention in intro, voice guide in further reading). Changelog: 6 new entries (dictation v0.9.197, dictation mobile v0.9.199, Messages color-coding v0.9.190, Files syntax-highlight v0.9.193, Files offline-download v0.9.192, Schedules badge v0.9.195). |
 
 ---
 
