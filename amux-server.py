@@ -6549,6 +6549,31 @@ CREATE TABLE IF NOT EXISTS cmd_history (
     ts       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cmd_history_ts ON cmd_history(ts DESC);
+-- ── Dictation (voice → text) ────────────────────────────────────────────────
+-- Every transcription is kept so it can be re-copied, AI-edited, undone
+-- (raw_text is the untouched model output; text is what's shown/edited) or
+-- retried. `session` scopes it to the peek tab it was dictated in.
+CREATE TABLE IF NOT EXISTS dictation_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    session   TEXT NOT NULL DEFAULT '',
+    ts        INTEGER NOT NULL,
+    text      TEXT NOT NULL,
+    raw_text  TEXT NOT NULL DEFAULT '',
+    prev_text TEXT NOT NULL DEFAULT '',   -- pre-AI-edit copy, for "Undo AI edit"
+    ai_edited INTEGER NOT NULL DEFAULT 0,
+    words     INTEGER NOT NULL DEFAULT 0,
+    dur_ms    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_dictation_ts ON dictation_history(ts DESC);
+-- Personal vocabulary: either a plain term the model should spell correctly
+-- (word, correct='') or an explicit misspelling→correct mapping.
+CREATE TABLE IF NOT EXISTS dictation_dict (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    word     TEXT NOT NULL,
+    correct  TEXT NOT NULL DEFAULT '',
+    created  INTEGER NOT NULL,
+    UNIQUE(word, correct)
+);
 CREATE TABLE IF NOT EXISTS steering_queue (
     id          TEXT PRIMARY KEY,
     session     TEXT NOT NULL,
@@ -15139,6 +15164,104 @@ def _gmail_list_labels(account: str) -> list:
     except Exception as e:
         slog(f"[gmail] list_labels {account}: {e}")
         return []
+
+
+# ── Dictation: voice → clean text (Gemini), server-side only ────────────────
+# SECURITY: the API key NEVER reaches a browser. Audio is uploaded to amux, amux
+# calls Gemini, only text comes back. A user may bring their own key (stored
+# write-only in prefs — readable by the server, never returned to a client);
+# otherwise the server's GOOGLE_API_KEY is used.
+_DICTATION_MODEL = os.environ.get("AMUX_DICTATION_MODEL", "gemini-2.5-flash")
+_DICTATION_MAX_BYTES = 25 * 1024 * 1024   # ~25MB of audio per clip
+
+
+def _dictation_key() -> tuple:
+    """(key, source). BYO key from prefs wins; else the server's env key."""
+    try:
+        row = get_db().execute("SELECT value FROM prefs WHERE key='dictation_gemini_key'").fetchone()
+        if row and (row["value"] or "").strip():
+            return row["value"].strip(), "byo"
+    except Exception:
+        pass
+    return os.environ.get("GOOGLE_API_KEY", "").strip(), "server"
+
+
+def _dictation_vocab() -> str:
+    """Personal vocabulary as prompt context: plain terms to spell correctly and
+    explicit misspelling→correct mappings."""
+    try:
+        rows = get_db().execute(
+            "SELECT word, correct FROM dictation_dict ORDER BY created DESC LIMIT 300").fetchall()
+    except Exception:
+        return ""
+    terms, fixes = [], []
+    for r in rows:
+        if (r["correct"] or "").strip():
+            fixes.append(f'"{r["word"]}" → "{r["correct"]}"')
+        else:
+            terms.append(r["word"])
+    out = []
+    if terms:
+        out.append("Spell these terms EXACTLY as written: " + ", ".join(terms))
+    if fixes:
+        out.append("Always apply these corrections: " + "; ".join(fixes))
+    return "\n".join(out)
+
+
+def _dictation_prompt(session: str = "") -> str:
+    """System prompt: transcribe + clean, with amux-specific context (session
+    names are the #1 thing speech-to-text mangles) and the user's vocabulary."""
+    parts = [
+        "You transcribe voice dictation for amux, a terminal session manager.",
+        "Transcribe the audio, then clean it up: remove filler words (um, uh, like),",
+        "fix punctuation and capitalization, and correct obvious speech-to-text errors.",
+        "Do NOT answer, summarize, or add commentary — output ONLY the cleaned transcription.",
+        "Preserve the speaker's wording and intent; do not paraphrase.",
+    ]
+    try:
+        names = [f.stem for f in CC_SESSIONS.glob("*.env")][:60]
+        if names:
+            parts.append("Session names that may be spoken (spell them exactly): " + ", ".join(names))
+    except Exception:
+        pass
+    if session:
+        parts.append(f'The user is dictating into session "{session}".')
+    vocab = _dictation_vocab()
+    if vocab:
+        parts.append(vocab)
+    return "\n".join(parts)
+
+
+def _gemini_generate(key: str, parts: list, timeout: int = 90) -> tuple:
+    """POST to Gemini generateContent. Returns (text, error)."""
+    import urllib.request, urllib.error, ssl as _ssl
+    # Verified TLS via certifi when available (the framework Python here has no
+    # usable system CA bundle — same pattern as /api/map/search).
+    try:
+        import certifi as _cf
+        _ctx = _ssl.create_default_context(cafile=_cf.where())
+    except Exception:
+        _ctx = _ssl.create_default_context()
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{_DICTATION_MODEL}:generateContent?key={key}")
+    body = json.dumps({"contents": [{"parts": parts}]}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout, context=_ctx).read())
+        cands = d.get("candidates") or []
+        if not cands:
+            return "", "no transcription returned (audio may be silent)"
+        segs = cands[0].get("content", {}).get("parts", [])
+        return "".join(s.get("text", "") for s in segs).strip(), ""
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read()).get("error", {}).get("message", "")[:200]
+        except Exception:
+            pass
+        return "", f"gemini {e.code}: {detail or 'request failed'}"
+    except Exception as e:
+        return "", f"gemini error: {str(e)[:200]}"
 
 
 _SHARE_CSS = """
@@ -50975,6 +51098,151 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json(result)
 
             return self._json({"error": "not found"}, 404)
+
+        # ── /api/dictation/* — voice dictation (Gemini, server-side key) ─────
+        if path.startswith("/api/dictation") or path == "/api/dictate":
+            db = get_db()
+
+            # POST /api/dictate — audio in, cleaned transcription out.
+            if method == "POST" and path == "/api/dictate":
+                body = self._read_body()
+                b64 = (body.get("audio") or "").strip()
+                if not b64:
+                    return self._json({"error": "audio required"}, 400)
+                if len(b64) > _DICTATION_MAX_BYTES * 4 // 3:
+                    return self._json({"error": "audio too large (max ~25MB)"}, 413)
+                key, src = _dictation_key()
+                if not key:
+                    return self._json({"error": "no Gemini key configured — add your own key in the "
+                                                "Dictation tab, or set GOOGLE_API_KEY in server.env"}, 503)
+                mime = (body.get("mime") or "audio/webm").split(";")[0]
+                session = (body.get("session") or "").strip()[:64]
+                t0 = time.time()
+                text, err = _gemini_generate(key, [
+                    {"text": _dictation_prompt(session) + "\n\nTranscribe and clean this dictation:"},
+                    {"inline_data": {"mime_type": mime, "data": b64}},
+                ])
+                if err:
+                    slog(f"[dictation] {src} key failed: {err}")
+                    return self._json({"error": err}, 502)
+                dur_ms = int(body.get("dur_ms") or 0)
+                words = len([w for w in text.split() if w.strip()])
+                cur = db.execute(
+                    "INSERT INTO dictation_history (session, ts, text, raw_text, words, dur_ms) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (session, int(time.time() * 1000), text, text, words, dur_ms))
+                db.commit()
+                slog(f"[dictation] {words}w in {time.time()-t0:.1f}s ({src} key)")
+                return self._json({"id": cur.lastrowid, "text": text, "words": words})
+
+            # GET /api/dictation/history?session=&limit=
+            if method == "GET" and path == "/api/dictation/history":
+                sess = qs.get("session", [""])[0]
+                limit = min(int(qs.get("limit", ["200"])[0]), 500)
+                if sess:
+                    rows = db.execute(
+                        "SELECT id, session, ts, text, raw_text, prev_text, ai_edited, words, dur_ms "
+                        "FROM dictation_history WHERE session=? ORDER BY ts DESC LIMIT ?",
+                        (sess, limit)).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT id, session, ts, text, raw_text, prev_text, ai_edited, words, dur_ms "
+                        "FROM dictation_history ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+                total = db.execute("SELECT COALESCE(SUM(words),0) w FROM dictation_history").fetchone()["w"]
+                return self._json({"items": [dict(r) for r in rows], "total_words": total})
+
+            # DELETE /api/dictation/history/<id>
+            m_dh = re.match(r"^/api/dictation/history/(\d+)$", path)
+            if m_dh and method == "DELETE":
+                db.execute("DELETE FROM dictation_history WHERE id=?", (m_dh.group(1),))
+                db.commit()
+                return self._json({"ok": True})
+
+            # POST /api/dictation/history/<id>/edit — AI-edit or undo
+            m_de = re.match(r"^/api/dictation/history/(\d+)/edit$", path)
+            if m_de and method == "POST":
+                rid = m_de.group(1)
+                body = self._read_body()
+                row = db.execute("SELECT * FROM dictation_history WHERE id=?", (rid,)).fetchone()
+                if not row:
+                    return self._json({"error": "not found"}, 404)
+                if body.get("undo"):
+                    prev = row["prev_text"] or row["raw_text"]
+                    db.execute("UPDATE dictation_history SET text=?, ai_edited=0, prev_text='' WHERE id=?",
+                               (prev, rid))
+                    db.commit()
+                    return self._json({"ok": True, "text": prev, "ai_edited": 0})
+                instruction = (body.get("instruction") or "Fix grammar and make it clearer.").strip()[:500]
+                key, _src = _dictation_key()
+                if not key:
+                    return self._json({"error": "no Gemini key configured"}, 503)
+                text, err = _gemini_generate(key, [{"text":
+                    "Edit this dictated text per the instruction. Output ONLY the edited text, "
+                    "no commentary.\n\nInstruction: " + instruction + "\n\nText: " + row["text"]}])
+                if err:
+                    return self._json({"error": err}, 502)
+                db.execute("UPDATE dictation_history SET text=?, prev_text=?, ai_edited=1 WHERE id=?",
+                           (text, row["text"], rid))
+                db.commit()
+                return self._json({"ok": True, "text": text, "ai_edited": 1})
+
+            # GET/POST /api/dictation/dict — personal vocabulary
+            if path == "/api/dictation/dict":
+                if method == "GET":
+                    rows = db.execute(
+                        "SELECT id, word, correct, created FROM dictation_dict ORDER BY created DESC").fetchall()
+                    return self._json([dict(r) for r in rows])
+                if method == "POST":
+                    body = self._read_body()
+                    word = (body.get("word") or "").strip()[:120]
+                    correct = (body.get("correct") or "").strip()[:120]
+                    if not word:
+                        return self._json({"error": "word required"}, 400)
+                    try:
+                        cur = db.execute(
+                            "INSERT INTO dictation_dict (word, correct, created) VALUES (?,?,?)",
+                            (word, correct, int(time.time())))
+                        db.commit()
+                        return self._json({"ok": True, "id": cur.lastrowid}, 201)
+                    except sqlite3.IntegrityError:
+                        return self._json({"ok": True, "already": True})
+
+            # PATCH/DELETE /api/dictation/dict/<id>
+            m_dd = re.match(r"^/api/dictation/dict/(\d+)$", path)
+            if m_dd:
+                did = m_dd.group(1)
+                if method == "DELETE":
+                    db.execute("DELETE FROM dictation_dict WHERE id=?", (did,))
+                    db.commit()
+                    return self._json({"ok": True})
+                if method == "PATCH":
+                    body = self._read_body()
+                    db.execute("UPDATE dictation_dict SET word=?, correct=? WHERE id=?",
+                               ((body.get("word") or "").strip()[:120],
+                                (body.get("correct") or "").strip()[:120], did))
+                    db.commit()
+                    return self._json({"ok": True})
+
+            # GET/POST /api/dictation/config — BYO key status / set (WRITE-ONLY:
+            # the key itself is never returned to any client).
+            if path == "/api/dictation/config":
+                if method == "GET":
+                    _k, src = _dictation_key()
+                    return self._json({"configured": bool(_k), "source": src if _k else "none",
+                                       "model": _DICTATION_MODEL})
+                if method == "POST":
+                    body = self._read_body()
+                    k = (body.get("key") or "").strip()
+                    if k:
+                        db.execute("INSERT INTO prefs (key, value) VALUES ('dictation_gemini_key', ?) "
+                                   "ON CONFLICT(key) DO UPDATE SET value=?", (k, k))
+                    else:
+                        db.execute("DELETE FROM prefs WHERE key='dictation_gemini_key'")
+                    db.commit()
+                    _k2, src2 = _dictation_key()
+                    return self._json({"ok": True, "configured": bool(_k2), "source": src2 if _k2 else "none"})
+
+            return self._json({"error": "dictation route not found"}, 404)
 
         # ── /api/tts — ElevenLabs text-to-speech ─────────────────────────────
         if path.startswith("/api/tts"):
