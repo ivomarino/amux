@@ -484,7 +484,33 @@ cmd_peek() {
   echo "${BOLD}── end ──${RESET}"
 }
 
+_send_usage() {
+  cat <<USAGE
+${BOLD}amux send${RESET} — send a message to a session
+
+  amux send <session> --stdin        read the message from stdin ${GREEN}(preferred)${RESET}
+  amux send <session> --file <path>  read the message from a file
+  amux send <session> <text>         inline text (see the warning below)
+  amux send <session> --keys 'C-c'   send a raw key sequence
+
+${BOLD}Why --stdin is preferred${RESET}
+  With inline text your SHELL evaluates the string before amux ever sees it, so
+  \`backticks\` and \$(...) inside the message are EXECUTED, not sent. That has
+  garbled messages, leaked a credential, and fired a stray git command on a
+  shared checkout. --stdin/--file pass the bytes through untouched.
+
+  amux send api --stdin <<'EOF'
+  fix the auth bug — see \`git log -1\` and \$(date) stay literal
+  EOF
+USAGE
+}
+
 cmd_send() {
+  # --help must not be parsed as a session name (it used to error with
+  # "session '--help' not found", so the safe form was undiscoverable).
+  case "${1:-}" in
+    --help|-h|help) _send_usage; return 0 ;;
+  esac
   local name
   name=$(resolve_session "${1:-}")
   shift
@@ -522,10 +548,16 @@ cmd_send() {
     echo "${GREEN}sent keys${RESET} to $name"
   else
     local text="$*"
-    [[ -n "$text" ]] || die "usage: amux send <name> <text>
-       amux send <name> --stdin <<'EOF'   # payload never touches the shell
-       amux send <name> --file <path>
-       amux send <name> --keys 'C-c'"
+    [[ -n "$text" ]] || { _send_usage; return 1; }
+    # NUDGE ON USE, not content: by the time we see $text the shell has already
+    # expanded it, so a warning about backticks is too late to be evidence. What
+    # we CAN observe is the risky USAGE SHAPE — long or multi-line payloads are
+    # where code/quotes/substitutions live. Warns to stderr, never blocks: this
+    # is the only encoding available for callers who never read --help.
+    if [[ ${#text} -gt 280 || "$text" == *$'\n'* ]]; then
+      echo "${YELLOW}note:${RESET} long/multi-line payload sent as a shell argument — your shell already" >&2
+      echo "      expanded any \`backticks\`/\$(...) in it. Prefer: amux send $name --stdin <<'EOF'" >&2
+    fi
     _send_via_api "$name" "$text"
   fi
 }
@@ -1116,7 +1148,14 @@ ${BOLD}Session management:${RESET}
 ${BOLD}Interaction:${RESET}
   amux attach <name>             Attach to a running session (detach: Ctrl-b d)
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
-  amux send <name> <text>        Send text + Enter to a session
+  amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
+                                 ${DIM}amux send api --stdin <<'EOF'${RESET}
+                                 ${DIM}  fix the auth bug in login.ts${RESET}
+                                 ${DIM}EOF${RESET}
+  amux send <name> --file <path> Send a message read from a file
+  amux send <name> <text>        Send inline text. ${DIM}Your SHELL expands \`backticks\`${RESET}
+                                 ${DIM}and \$(...) BEFORE amux sees them — use --stdin for${RESET}
+                                 ${DIM}anything long, multi-line, or containing code.${RESET}
   amux send <name> --keys 'C-c'  Send raw key sequence (e.g., Ctrl-C)
 
 ${BOLD}Info:${RESET}
