@@ -17256,6 +17256,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .peek-tab-count .psc-on  { color: #3fb950; font-weight: 700; }
   .peek-tab-count .psc-off { color: #f85149; font-weight: 700; }
   .peek-tab-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
+  /* ── Dictation: compact recording popup (above the composer) ── */
+  .dict-popup { display: none; position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 60;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+    box-shadow: 0 10px 34px rgba(0,0,0,0.45); min-width: 250px; }
+  .dict-popup.open { display: block; }
+  .dict-popup-wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 40px; margin-bottom: 8px; }
+  .dict-popup-wave .dict-bar { width: 4px; height: 100%; border-radius: 2px; background: var(--accent);
+    transform: scaleY(0.12); transition: transform .07s linear; will-change: transform; }
+  .dict-popup-meta { display: flex; align-items: center; gap: 7px; font-size: 0.76rem; color: var(--dim); margin-bottom: 10px; }
+  .dict-popup-dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; flex-shrink: 0;
+    animation: dictblink 1.1s ease-in-out infinite; }
+  @keyframes dictblink { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .dict-popup-status { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+  .dict-popup-btns { display: flex; gap: 6px; justify-content: flex-end; }
+  .dict-popup-btns .btn { font-size: 0.76rem; padding: 5px 12px; }
   /* ── Dictation tab ── */
   .dict-recbar { display: flex; align-items: center; gap: 12px; padding: 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .dict-rec { width: 52px; height: 52px; min-width: 52px; border-radius: 50%; border: 1px solid var(--border);
@@ -17266,7 +17281,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @keyframes dictpulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   .dict-status { font-size: 0.85rem; color: var(--text); font-weight: 500; }
   .dict-hint { font-size: 0.72rem; color: var(--dim); margin-top: 2px; }
-  .dict-total { font-size: 0.72rem; color: var(--dim); white-space: nowrap; align-self: flex-start; }
+  .dict-total { font-size: 0.72rem; color: var(--dim); white-space: nowrap; align-self: flex-start; text-align: right; }
+  .dict-pending { display: block; color: #d29922; margin-top: 2px; }
   .dict-subtabs { display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .dict-subtab { background: none; border: none; color: var(--dim); font-size: 0.78rem; font-weight: 600;
     padding: 4px 10px; border-radius: 6px; cursor: pointer; }
@@ -21516,7 +21532,27 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();document.getElementById('peek-file-input').click()">&#128206; Attach file</button>
             <button type="button" onclick="_peekMoreClose();openCmdHistoryModal()">&#x1F551; Message history</button>
             <button type="button" onclick="_peekMoreClose();_openSavedMessages()">&#128190; Saved messages</button>
-            <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#127908; Dictation</button>
+            <button type="button" onclick="_peekMoreClose();_dictOpenPopup()">&#127908; Dictate</button>
+            <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
+          </div>
+          <!-- Compact recording popup: live volume bars + timer, right above the
+               composer. Stop → transcribe → text lands in the input. -->
+          <div class="dict-popup" id="dict-popup">
+            <div class="dict-popup-wave" id="dict-wave">
+              <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+              <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+              <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+              <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+            </div>
+            <div class="dict-popup-meta">
+              <span class="dict-popup-dot"></span>
+              <span id="dict-popup-time">0:00</span>
+              <span id="dict-popup-status" class="dict-popup-status">Listening…</span>
+            </div>
+            <div class="dict-popup-btns">
+              <button class="btn" onclick="_dictClosePopup(true)" title="Discard">Cancel</button>
+              <button class="btn primary" onclick="_dictStopRec()" title="Stop and transcribe">Done</button>
+            </div>
           </div>
         </div>
         <div class="send-split"><button class="btn primary send-split-main" onpointerdown="event.preventDefault();_tapTraceEv('pointerdown')" onpointerup="_tapTraceEv('pointerup');_btnFire(event, sendPeekCmd)" onpointercancel="_tapTraceEv('pointercancel')" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, sendPeekCmd)" onclick="_tapTraceEv('click');_btnFire(event, sendPeekCmd)">Send</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
@@ -21619,7 +21655,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div id="dict-rec-status" class="dict-status">Tap the mic to dictate</div>
         <div id="dict-rec-hint" class="dict-hint">Cleaned text lands in the composer for review &mdash; nothing is sent automatically.</div>
       </div>
-      <span id="dict-total-words" class="dict-total"></span>
+      <span class="dict-total"><span id="dict-total-words"></span><span id="dict-pending" class="dict-pending"></span></span>
     </div>
     <div class="dict-subtabs">
       <button class="dict-subtab active" id="dict-subtab-history" onclick="_dictSetSub('history')">History</button>
@@ -27193,7 +27229,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.198';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.199';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30764,6 +30800,7 @@ async function _dictLoad() {
   } catch(e) {}
   const tw = document.getElementById('dict-total-words');
   if (tw) tw.textContent = _dictTotalWords ? _dictTotalWords.toLocaleString() + ' words' : '';
+  _dictPendingBadge();
   _dictRender();
 }
 function _dictSetSub(s) {
@@ -30780,33 +30817,99 @@ function _dictRender() {
 }
 
 // ── Recording ──
+// BANDWIDTH: speech is encoded at 16kbps mono opus. The browser default is
+// ~128kbps (>1MB/min); 16kbps is ~120KB/min — ~9x less — and transcribes
+// identically (measured). Uploads are RAW BINARY, not base64 (another 33%
+// saved), so a minute of dictation is ~120KB even on a bad connection.
+const _DICT_BITRATE = 16000;
+let _dictAudioCtx = null, _dictAnalyser = null, _dictRafId = 0, _dictPopupOpen = false;
+
 function _dictToggleRec() { if (_dictRecording) _dictStopRec(); else _dictStartRec(); }
+
+// Compact recording popup with a live volume waveform — the feedback surface
+// when you start dictation from the composer's ⋯ menu.
+function _dictOpenPopup() {
+  const pop = document.getElementById('dict-popup');
+  if (!pop) return;
+  _dictPopupOpen = true;
+  pop.classList.add('open');
+  _dictStartRec();
+}
+function _dictClosePopup(cancel) {
+  const pop = document.getElementById('dict-popup');
+  if (pop) pop.classList.remove('open');
+  _dictPopupOpen = false;
+  if (cancel && _dictRecording) { _dictCancelled = true; _dictStopRec(); }
+}
+let _dictCancelled = false;
+
 async function _dictStartRec() {
   if (_dictRecording) return;
   if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
+  _dictCancelled = false;
   try {
-    _dictStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-  } catch(e) { showToast('Microphone access denied'); return; }
-  // Safari/iOS produce mp4; Chrome/Firefox webm. Let the browser pick what it
-  // supports and tell the server the real mime so Gemini decodes it.
+    _dictStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } } });
+  } catch(e) { showToast('Microphone access denied'); _dictClosePopup(false); return; }
+  // Safari/iOS produce mp4; Chrome/Firefox webm/opus. Pick what's supported and
+  // tell the server the real mime so Gemini decodes it.
   let mime = '';
-  for (const m of ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/aac']) {
+  for (const m of ['audio/webm;codecs=opus','audio/ogg;codecs=opus','audio/webm','audio/mp4','audio/aac']) {
     if (window.MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) { mime = m; break; }
   }
-  try { _dictRecorder = mime ? new MediaRecorder(_dictStream, { mimeType: mime }) : new MediaRecorder(_dictStream); }
-  catch(e) { _dictRecorder = new MediaRecorder(_dictStream); }
+  const opts = { audioBitsPerSecond: _DICT_BITRATE };
+  if (mime) opts.mimeType = mime;
+  try { _dictRecorder = new MediaRecorder(_dictStream, opts); }
+  catch(e) { try { _dictRecorder = new MediaRecorder(_dictStream); } catch(e2) { showToast('Recorder unavailable'); return; } }
   _dictChunks = [];
   _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) _dictChunks.push(e.data); };
-  _dictRecorder.onstop = () => _dictUpload();
+  _dictRecorder.onstop = () => { _dictStopMeter(); if (_dictCancelled) { _dictChunks = []; _dictStatus('Cancelled'); } else _dictUpload(); };
   _dictRecorder.start();
   _dictRecording = true; _dictStartedAt = Date.now();
   document.getElementById('dict-rec-btn')?.classList.add('recording');
+  _dictStartMeter();
   _dictTick();
+}
+
+// Live volume bars from an AnalyserNode — real feedback that the mic is hearing you.
+function _dictStartMeter() {
+  try {
+    _dictAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = _dictAudioCtx.createMediaStreamSource(_dictStream);
+    _dictAnalyser = _dictAudioCtx.createAnalyser();
+    _dictAnalyser.fftSize = 256; _dictAnalyser.smoothingTimeConstant = 0.75;
+    src.connect(_dictAnalyser);
+  } catch(e) { return; }
+  const data = new Uint8Array(_dictAnalyser.frequencyBinCount);
+  const bars = Array.from(document.querySelectorAll('#dict-wave .dict-bar'));
+  const draw = () => {
+    if (!_dictRecording || !_dictAnalyser) return;
+    _dictAnalyser.getByteFrequencyData(data);
+    const n = bars.length || 1;
+    const per = Math.floor(data.length / n) || 1;
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let j = 0; j < per; j++) sum += data[i * per + j] || 0;
+      const level = Math.min(1, (sum / per) / 140);
+      bars[i].style.transform = 'scaleY(' + Math.max(0.12, level).toFixed(3) + ')';
+    }
+    _dictRafId = requestAnimationFrame(draw);
+  };
+  draw();
+}
+function _dictStopMeter() {
+  if (_dictRafId) cancelAnimationFrame(_dictRafId);
+  _dictRafId = 0; _dictAnalyser = null;
+  try { _dictAudioCtx && _dictAudioCtx.close(); } catch(e) {}
+  _dictAudioCtx = null;
+  document.querySelectorAll('#dict-wave .dict-bar').forEach(b => b.style.transform = 'scaleY(0.12)');
 }
 function _dictTick() {
   if (!_dictRecording) return;
   const s = Math.floor((Date.now() - _dictStartedAt) / 1000);
-  _dictStatus('Listening… ' + Math.floor(s/60) + ':' + String(s%60).padStart(2,'0') + ' — tap to stop');
+  const clock = Math.floor(s/60) + ':' + String(s%60).padStart(2,'0');
+  _dictStatus('Listening… ' + clock + ' — tap to stop');
+  const t = document.getElementById('dict-popup-time'); if (t) t.textContent = clock;
   setTimeout(_dictTick, 500);
 }
 function _dictStopRec() {
@@ -30816,28 +30919,86 @@ function _dictStopRec() {
   try { _dictRecorder && _dictRecorder.state !== 'inactive' && _dictRecorder.stop(); } catch(e) {}
   try { (_dictStream?.getTracks() || []).forEach(t => t.stop()); } catch(e) {}
 }
-function _dictStatus(t) { const el = document.getElementById('dict-rec-status'); if (el) el.textContent = t; }
+function _dictStatus(t) {
+  const el = document.getElementById('dict-rec-status'); if (el) el.textContent = t;
+  const p = document.getElementById('dict-popup-status'); if (p) p.textContent = t.replace(/ — tap to stop$/, '');
+}
+function _dictKB(b) { return b < 1024 ? b + ' B' : (b/1024).toFixed(b < 102400 ? 1 : 0) + ' KB'; }
 
 async function _dictUpload() {
   const ms = Date.now() - _dictStartedAt;
-  if (!_dictChunks.length) { _dictStatus('Nothing recorded'); return; }
+  if (!_dictChunks.length) { _dictStatus('Nothing recorded'); _dictClosePopup(false); return; }
   const blob = new Blob(_dictChunks, { type: _dictChunks[0].type || 'audio/webm' });
   _dictChunks = [];
-  if (blob.size < 1200) { _dictStatus('Too short — hold a bit longer'); return; }
-  _dictStatus('Transcribing…');
-  const b64 = await new Promise(res => { const r = new FileReader();
-    r.onloadend = () => res(String(r.result).split(',')[1] || ''); r.readAsDataURL(blob); });
-  try {
-    const r = await fetch(API + '/api/dictate', { method: 'POST',
-      headers: _authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ audio: b64, mime: (blob.type || 'audio/webm').split(';')[0], session: peekSession || '', dur_ms: ms }) });
-    const d = await r.json();
-    if (d.error) { _dictStatus('Failed: ' + d.error); return; }
-    _dictStatus('Added to the composer — review, then send');
-    _dictInsert(d.text);
-    _dictLoad();
-  } catch(e) { _dictStatus('Failed: ' + e.message); }
+  if (blob.size < 1200) { _dictStatus('Too short — hold a bit longer'); _dictClosePopup(false); return; }
+  const mime = (blob.type || 'audio/webm').split(';')[0];
+  // Offline / no signal: keep the recording and send it when we're back, rather
+  // than losing what you just said.
+  if (typeof online !== 'undefined' && !online) {
+    await _dictQueueOffline(blob, mime, ms);
+    _dictStatus('Saved — will send when you\'re back online');
+    _dictClosePopup(false);
+    return;
+  }
+  _dictStatus('Transcribing… (' + _dictKB(blob.size) + ')');
+  const okText = await _dictSend(blob, mime, ms, true);
+  if (okText !== null) _dictClosePopup(false);
 }
+
+// One upload attempt with a timeout; on a network failure the clip is queued
+// rather than dropped. Returns the text, or null on failure.
+async function _dictSend(blob, mime, ms, interactive) {
+  const url = API + '/api/dictate?session=' + encodeURIComponent(peekSession || '')
+    + '&dur_ms=' + ms + '&mime=' + encodeURIComponent(mime);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 120000);   // slow links need room
+  try {
+    const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime }),
+                                 body: blob, signal: ctl.signal });
+    clearTimeout(timer);
+    const d = await r.json();
+    if (d.error) { if (interactive) _dictStatus('Failed: ' + d.error); return null; }
+    if (interactive) { _dictStatus('Added to the composer — review, then send'); _dictInsert(d.text); }
+    if (_peekTab === 'dictation') _dictLoad();
+    return d.text;
+  } catch(e) {
+    clearTimeout(timer);
+    await _dictQueueOffline(blob, mime, ms);
+    if (interactive) _dictStatus('No connection — saved, will retry automatically');
+    return null;
+  }
+}
+
+// Pending recordings live in IndexedDB (blobs can't go in localStorage), so a
+// dictation taken with no signal survives a reload and flushes on reconnect.
+async function _dictQueueOffline(blob, mime, ms) {
+  try {
+    const q = (await _idb.get('dict_pending')) || [];
+    q.push({ blob, mime, ms, ts: Date.now(), session: peekSession || '' });
+    await _idb.set('dict_pending', q.slice(-20));
+    _dictPendingBadge();
+  } catch(e) {}
+}
+async function _dictFlushOffline() {
+  let q = [];
+  try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
+  if (!q.length || (typeof online !== 'undefined' && !online)) return;
+  const keep = [];
+  for (const item of q) {
+    const txt = await _dictSend(item.blob, item.mime, item.ms, false);
+    if (txt === null) keep.push(item);
+  }
+  try { await _idb.set('dict_pending', keep); } catch(e) {}
+  const sent = q.length - keep.length;
+  if (sent) { showToast(sent + ' queued dictation' + (sent===1?'':'s') + ' transcribed'); if (_peekTab === 'dictation') _dictLoad(); }
+  _dictPendingBadge();
+}
+async function _dictPendingBadge() {
+  let n = 0;
+  try { n = ((await _idb.get('dict_pending')) || []).length; } catch(e) {}
+  const el = document.getElementById('dict-pending'); if (el) el.textContent = n ? n + ' pending upload' + (n===1?'':'s') : '';
+}
+window.addEventListener('online', () => { setTimeout(_dictFlushOffline, 1500); });
 
 // Put text in the composer (append, don't clobber) — never auto-send.
 function _dictInsert(text) {
@@ -46549,7 +46710,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.198';
+const CACHE = 'amux-v0.9.199';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -51480,18 +51641,35 @@ class CCHandler(BaseHTTPRequestHandler):
 
             # POST /api/dictate — audio in, cleaned transcription out.
             if method == "POST" and path == "/api/dictate":
-                body = self._read_body()
-                b64 = (body.get("audio") or "").strip()
-                if not b64:
-                    return self._json({"error": "audio required"}, 400)
-                if len(b64) > _DICTATION_MAX_BYTES * 4 // 3:
-                    return self._json({"error": "audio too large (max ~25MB)"}, 413)
+                # RAW BINARY is the preferred upload (?session=&dur_ms=&mime=):
+                # base64 costs 33% more bytes, which matters on a phone with bad
+                # signal. JSON {audio: base64} still works for other callers.
+                ctype = (self.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+                session = (qs.get("session", [""])[0] or "").strip()[:64]
+                _dur_q = int(qs.get("dur_ms", ["0"])[0] or 0)
+                if ctype and ctype != "application/json":
+                    _len = int(self.headers.get("Content-Length", 0) or 0)
+                    if _len > _DICTATION_MAX_BYTES:
+                        return self._json({"error": "audio too large (max 25MB)"}, 413)
+                    _raw = self.rfile.read(_len) if _len else b""
+                    if not _raw:
+                        return self._json({"error": "audio required"}, 400)
+                    b64 = base64.b64encode(_raw).decode()
+                    mime = (qs.get("mime", [ctype])[0] or ctype).split(";")[0]
+                    body = {"dur_ms": _dur_q}
+                else:
+                    body = self._read_body()
+                    b64 = (body.get("audio") or "").strip()
+                    if not b64:
+                        return self._json({"error": "audio required"}, 400)
+                    if len(b64) > _DICTATION_MAX_BYTES * 4 // 3:
+                        return self._json({"error": "audio too large (max ~25MB)"}, 413)
+                    mime = (body.get("mime") or "audio/webm").split(";")[0]
+                    session = (body.get("session") or session).strip()[:64]
                 key, src = _dictation_key()
                 if not key:
                     return self._json({"error": "no Gemini key configured — add your own key in the "
                                                 "Dictation tab, or set GOOGLE_API_KEY in server.env"}, 503)
-                mime = (body.get("mime") or "audio/webm").split(";")[0]
-                session = (body.get("session") or "").strip()[:64]
                 t0 = time.time()
                 text, err = _gemini_generate(key, [
                     {"text": _dictation_prompt(session) + "\n\nTranscribe and clean this dictation:"},
