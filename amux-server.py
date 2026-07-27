@@ -6,6 +6,8 @@
 # ═══════════════════════════════════════════
 
 import base64
+import difflib
+import importlib.util
 import json
 import os
 import re
@@ -15677,6 +15679,251 @@ def _dictation_prompt(session: str = "") -> str:
     if vocab:
         parts.append(vocab)
     return "\n".join(parts)
+
+
+# ── Local transcription (Whisper) ───────────────────────────────────────────
+# Presence-detected, never build-flagged: if the module and the weights are on
+# this box, dictation runs locally; otherwise it falls through to Gemini. Same
+# file, same code, both deployments (single-codebase rule).
+#
+# Measured on this host (Intel, CPU, 5.8s clip): base transcribes in ~1.1s vs
+# ~12.5s for the Gemini round trip. Whisper alone is USELESS for amux though —
+# it renders ts-gke as "T-S-G-K-E", mvs-infra as "MBS Infra", mixpeek as
+# "Mixbeak" (0/7 session names across the benchmark). _dictation_fix_names below
+# is what makes the local path usable; together they scored 7/7 names at ~1.06s.
+_WHISPER_MODEL_NAME = os.environ.get("AMUX_WHISPER_MODEL", "base").strip()
+_whisper_proc = None
+_whisper_lock = threading.Lock()
+_whisper_failed = False
+_whisper_py_cached = None
+
+_WHISPER_WORKER = r"""
+import sys, json, os
+try:
+    import torch; torch.set_num_threads(max(2, min(6, (os.cpu_count() or 4) - 2)))
+    import whisper
+    m = whisper.load_model(os.environ["AMUX_WHISPER_MODEL"], device="cpu")
+except Exception as e:
+    print(json.dumps({"fatal": str(e)[:200]}), flush=True); sys.exit(1)
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    path = line.strip()
+    if not path: continue
+    try:
+        r = m.transcribe(path, fp16=False, language="en")
+        print(json.dumps({"text": (r.get("text") or "").strip()}), flush=True)
+    except Exception as e:
+        print(json.dumps({"error": str(e)[:200]}), flush=True)
+"""
+
+
+def _whisper_weights_path(name: str):
+    """Local weights file, or None. Checked BEFORE anything loads a model: a
+    missing model makes openai-whisper reach out to download, which hung for
+    ~300s on this host — exactly wrong for a feature whose point is working with
+    no uplink."""
+    p = Path(os.path.expanduser("~/.cache/whisper")) / f"{name}.pt"
+    return p if p.exists() else None
+
+
+def _whisper_python():
+    """An interpreter that can `import whisper`, or None.
+
+    The server's own interpreter often isn't it — here the server runs 3.12
+    (torch, no whisper) while whisper lives in 3.11. Rather than installing into
+    a machine that runs 24/7, find the interpreter that already has it. Presence
+    detection, so the same file behaves correctly wherever it runs."""
+    global _whisper_py_cached
+    if _whisper_py_cached is not None:
+        return _whisper_py_cached or None
+    cands = [os.environ.get("AMUX_WHISPER_PYTHON", "").strip(), sys.executable]
+    cands += [shutil.which(c) for c in ("python3.11", "python3.12", "python3.13", "python3")]
+    for c in cands:
+        if not c or not os.path.exists(c):
+            continue
+        try:
+            r = subprocess.run([c, "-c", "import importlib.util as u,sys;"
+                                         "sys.exit(0 if u.find_spec('whisper') and u.find_spec('torch') else 1)"],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0:
+                _whisper_py_cached = c
+                return c
+        except Exception:
+            continue
+    _whisper_py_cached = ""
+    return None
+
+
+def _whisper_available() -> bool:
+    if not _WHISPER_MODEL_NAME or _WHISPER_MODEL_NAME.lower() in ("off", "none", "0"):
+        return False
+    if _whisper_failed:
+        return False
+    if _whisper_weights_path(_WHISPER_MODEL_NAME) is None:
+        return False
+    return _whisper_python() is not None
+
+
+def _whisper_start():
+    """Spawn the warm worker. Loading the model costs 0.6-2.6s; paying it per
+    request would erase most of the latency win this path exists for, so the
+    process is kept alive with the model resident."""
+    global _whisper_proc, _whisper_failed
+    py = _whisper_python()
+    if not py:
+        return None
+    env = dict(os.environ, AMUX_WHISPER_MODEL=_WHISPER_MODEL_NAME, PYTHONUNBUFFERED="1")
+    try:
+        pr = subprocess.Popen([py, "-u", "-c", _WHISPER_WORKER], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, env=env)
+        line = pr.stdout.readline()
+        if not line or '"ready"' not in line:
+            try: pr.kill()
+            except Exception: pass
+            _whisper_failed = True
+            slog(f"[dictation] whisper worker failed to start: {line.strip()[:160]}")
+            return None
+        _whisper_proc = pr
+        slog(f"[dictation] whisper '{_WHISPER_MODEL_NAME}' warm via {py}")
+        return pr
+    except Exception as e:
+        _whisper_failed = True
+        slog(f"[dictation] whisper worker spawn failed: {e}")
+        return None
+
+
+def _whisper_transcribe(raw: bytes, mime: str) -> tuple:
+    """(text, err) from the warm local worker."""
+    global _whisper_proc
+    import tempfile
+    ext = {"audio/webm": ".webm", "audio/ogg": ".ogg", "audio/mp4": ".mp4",
+           "audio/aac": ".aac", "audio/wav": ".wav", "audio/x-wav": ".wav",
+           "audio/mpeg": ".mp3"}.get((mime or "").lower(), ".webm")
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(raw); tmp = f.name
+        with _whisper_lock:
+            pr = _whisper_proc
+            if pr is None or pr.poll() is not None:   # never started, or died
+                pr = _whisper_start()
+            if pr is None:
+                return "", "local transcription unavailable"
+            pr.stdin.write(tmp + "\n"); pr.stdin.flush()
+            line = pr.stdout.readline()
+        if not line:
+            _whisper_proc = None
+            return "", "local worker died"
+        d = json.loads(line)
+        return (d.get("text") or ""), (d.get("error") or d.get("fatal") or "")
+    except Exception as e:
+        _whisper_proc = None
+        return "", str(e)[:200]
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+
+# ── Session-name recovery for locally-transcribed text ──────────────────────
+# Speech-to-text mangles session names constantly and they are the one token you
+# actually paste. A deterministic pass fixes them with no network, which is what
+# makes the offline path worth having.
+_DN_STOP = set("""a an and are as ask at be but by can do for from get go had has have
+he her him his how i if in is it its me my no not of on or our out ping put say see
+she so tell than that the then there they this to try up us was we what when where
+which who why will with you your""".split())
+_DN_SUB = [("ph","f"),("ck","k"),("qu","k"),("x","ks"),("z","s"),("v","f"),("b","p"),
+           ("d","t"),("g","k"),("ee","i"),("ea","i"),("ai","a"),("y","i"),("c","k")]
+
+
+def _dn_norm(x: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", x.lower())
+
+
+def _dn_phon(x: str) -> str:
+    x = _dn_norm(x)
+    for a, b in _DN_SUB:
+        x = x.replace(a, b)
+    x = re.sub(r"(.)\1+", r"\1", x)
+    return re.sub(r"[aeiou]", "", x)
+
+
+def _dn_score(cn, cp, nn, np_) -> float:
+    """Literal ratio with a phonetic alternative. The phonetic score is ALWAYS
+    considered, not only when the literal one is weak — scoring one span with the
+    boost and another without made them incomparable, and the guard that protects
+    a span's leading word silently stopped firing (it ate "tell")."""
+    r = difflib.SequenceMatcher(None, cn, nn).ratio()
+    rp = difflib.SequenceMatcher(None, cp, np_).ratio()
+    return max(r, rp * 0.97) if rp >= 0.9 else r
+
+
+def _dn_targets() -> list:
+    names = []
+    try:
+        names = [f.stem for f in CC_SESSIONS.glob("*.env")]
+    except Exception:
+        pass
+    try:
+        for r in get_db().execute("SELECT word, correct FROM dictation_dict LIMIT 300"):
+            w = (r["correct"] or r["word"] or "").strip()
+            if w:
+                names.append(w)
+    except Exception:
+        pass
+    seen, out = set(), []
+    for n in names:
+        if n and n.lower() not in seen and len(_dn_norm(n)) >= 4:
+            seen.add(n.lower()); out.append((n, _dn_norm(n), _dn_phon(n)))
+    return out
+
+
+def _dictation_fix_names(text: str, thresh: float = 0.86) -> str:
+    """Map spoken session names back onto their exact spelling."""
+    if not text:
+        return text
+    targets = _dn_targets()
+    if not targets:
+        return text
+    words, out, i = text.split(), [], 0
+    while i < len(words):
+        best = None
+        for span in (4, 3, 2, 1):
+            if i + span > len(words):
+                continue
+            chunk = " ".join(words[i:i + span])
+            core = re.sub(r"^[^\w]+|[^\w.,!?]+$", "", chunk)
+            trail = chunk[len(core):]
+            cn, cp = _dn_norm(core), _dn_phon(core)
+            if len(cn) < 4:
+                continue
+            toks = [t for t in re.split(r"[^a-z0-9]+", core.lower()) if t]
+            # One ordinary word inside the span means we are about to delete it.
+            # Dropping a real word is worse than leaving a name unresolved,
+            # because it is invisible in the result.
+            if any(t in _DN_STOP for t in toks):
+                continue
+            for name, nn, np_ in targets:
+                if abs(len(cn) - len(nn)) > max(4, len(nn) * 0.35):
+                    continue
+                r = _dn_score(cn, cp, nn, np_)
+                if r < thresh:
+                    continue
+                if span > 1:
+                    inner = " ".join(words[i + 1:i + span])
+                    # The leading word must EARN its place: if dropping it matches
+                    # this name as well or better, it was never part of the name.
+                    if _dn_score(_dn_norm(inner), _dn_phon(inner), nn, np_) >= r:
+                        continue
+                if best is None or r > best[0] + 1e-9 or (abs(r - best[0]) < 1e-9 and span > best[2]):
+                    best = (r, name, span, trail)
+        if best:
+            out.append(best[1] + best[3]); i += best[2]
+        else:
+            out.append(words[i]); i += 1
+    return " ".join(out)
 
 
 def _gemini_generate(key: str, parts: list, timeout: int = 90) -> tuple:
@@ -52410,18 +52657,37 @@ class CCHandler(BaseHTTPRequestHandler):
                         return self._json({"error": "audio too large (max ~25MB)"}, 413)
                     mime = (body.get("mime") or "audio/webm").split(";")[0]
                     session = (body.get("session") or session).strip()[:64]
-                key, src = _dictation_key()
-                if not key:
-                    return self._json({"error": "no Gemini key configured — add your own key in the "
-                                                "Dictation tab, or set GOOGLE_API_KEY in server.env"}, 503)
                 t0 = time.time()
-                text, err = _gemini_generate(key, [
-                    {"text": _dictation_prompt(session) + "\n\nTranscribe and clean this dictation:"},
-                    {"inline_data": {"mime_type": mime, "data": b64}},
-                ])
-                if err:
-                    slog(f"[dictation] {src} key failed: {err}")
-                    return self._json({"error": err}, 502)
+                text, err, engine = "", "", ""
+                # LOCAL FIRST. ~1.1s vs ~12.5s for the Gemini round trip, works
+                # with the uplink dead, and needs no key or quota. Whisper's raw
+                # output mangles every session name, so the deterministic pass is
+                # not optional — it is what makes this path usable (0/7 -> 7/7
+                # names in the benchmark, at the same latency).
+                if _whisper_available():
+                    _raw_audio = base64.b64decode(b64)
+                    text, err = _whisper_transcribe(_raw_audio, mime)
+                    if text:
+                        text = _dictation_fix_names(text)
+                        engine = "whisper"
+                    else:
+                        slog(f"[dictation] local transcribe failed ({err}) — trying Gemini")
+                # Gemini is now the FALLBACK (and the polish path via AI-edit),
+                # not the single point of failure it used to be.
+                if not text:
+                    key, src = _dictation_key()
+                    if not key:
+                        return self._json({"error": err or "no transcription available — install a local "
+                                                    "Whisper model, add your own Gemini key in the "
+                                                    "Dictation tab, or set GOOGLE_API_KEY in server.env"}, 503)
+                    text, err = _gemini_generate(key, [
+                        {"text": _dictation_prompt(session) + "\n\nTranscribe and clean this dictation:"},
+                        {"inline_data": {"mime_type": mime, "data": b64}},
+                    ])
+                    if err:
+                        slog(f"[dictation] {src} key failed: {err}")
+                        return self._json({"error": err}, 502)
+                    engine = "gemini"
                 dur_ms = int(body.get("dur_ms") or 0)
                 words = len([w for w in text.split() if w.strip()])
                 cur = db.execute(
@@ -52429,8 +52695,9 @@ class CCHandler(BaseHTTPRequestHandler):
                     "VALUES (?,?,?,?,?,?)",
                     (session, int(time.time() * 1000), text, text, words, dur_ms))
                 db.commit()
-                slog(f"[dictation] {words}w in {time.time()-t0:.1f}s ({src} key)")
-                return self._json({"id": cur.lastrowid, "text": text, "words": words})
+                slog(f"[dictation] {words}w in {time.time()-t0:.1f}s via {engine}")
+                return self._json({"id": cur.lastrowid, "text": text, "words": words,
+                                   "engine": engine, "secs": round(time.time() - t0, 2)})
 
             # GET /api/dictation/history?session=&limit=
             if method == "GET" and path == "/api/dictation/history":
@@ -52526,7 +52793,10 @@ class CCHandler(BaseHTTPRequestHandler):
                 if method == "GET":
                     _k, src = _dictation_key()
                     return self._json({"configured": bool(_k), "source": src if _k else "none",
-                                       "model": _DICTATION_MODEL})
+                                       "model": _DICTATION_MODEL,
+                                       "local": _whisper_available(),
+                                       "local_model": _WHISPER_MODEL_NAME if _whisper_available() else "",
+                                       "engine": "whisper" if _whisper_available() else "gemini"})
                 if method == "POST":
                     body = self._read_body()
                     k = (body.get("key") or "").strip()
