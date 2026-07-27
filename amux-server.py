@@ -8104,6 +8104,11 @@ _VAGUE_INPUTS = {
 _task_summary_last: dict = {}   # session -> monotonic ts of last label call
 _TASK_SUMMARY_MIN_GAP = float(os.environ.get("AMUX_TASK_LABEL_GAP_SECS", "600"))
 
+# Auto-labels that open with a negation read as an owner directive on the board.
+# Imperatives are fine (a task legitimately says "Disable Rate Throttling"); a
+# PROHIBITION is the shape an agent complies with without re-deriving it.
+_PROHIBITIVE_LABEL_RE = re.compile(r"^\s*(no|never|don'?t|do\s+not)\b", re.IGNORECASE)
+
 
 def _summarize_task_bg(session_name: str, text: str):
     """Summarize a message into a 3-word task label via `claude -p`, then auto-create a board issue.
@@ -8145,6 +8150,14 @@ def _summarize_task_bg(session_name: str, text: str):
                 capture_output=True, text=True, timeout=60,
             )
             summary = result.stdout.strip().rstrip(".") if result.returncode == 0 else ""
+            # A 3-word label that opens with a NEGATION reads as an owner directive
+            # once it is sitting on the board ("No Personal Posts"), and the board
+            # outlives the message it was derived from. Imperatives are left alone —
+            # "Disable Rate Throttling" is what a real task looks like — but a
+            # prohibition is the shape agents obey without re-deriving, so it gets
+            # marked as a subject line instead of a command.
+            if summary and _PROHIBITIVE_LABEL_RE.match(summary):
+                summary = "Re: " + summary
             if summary:
                 _update_meta(session_name, task_summary=summary)
                 _auto_create_board_issue(session_name, summary, text)
@@ -55208,7 +55221,20 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if ok:
                     _update_meta(name, last_send=int(time.time()), last_send_text=text[:200])
                     _session_prev_status[name] = "active"  # seed for idle detection
-                    _summarize_task_bg(name, _orig_text)  # summarize the message, not the origin prefix
+                    # HUMAN sends only. A typed prompt IS the session's task, so
+                    # labelling it and opening a card is the intended feature. An
+                    # INTER-SESSION message is correspondence, not a task, and running
+                    # one through a 3-word labeller produced a card titled "No Personal
+                    # Posts" sitting in DOING on the recipient's own session — derived
+                    # from a message saying the OPPOSITE (media-assets reporting their
+                    # lane posts nothing personal). Nobody had asked for anything.
+                    # The asymmetry is what makes it dangerous: a garbled title on an
+                    # informational card is noise, but one that reads as a PROHIBITION
+                    # is load-bearing, because agents comply with prohibitions without
+                    # re-deriving them — and the board outlives the conversation that
+                    # would have corrected it (social-media, 2026-07-27).
+                    if not _defer_busy:
+                        _summarize_task_bg(name, _orig_text)  # the human's prompt
                     if not str(msg).startswith("queued"):   # steering enqueue emits message.queued itself
                         _emit_event(name, "message.sent",
                                     {"chars": len(text), "preview": text[:120],
