@@ -11772,12 +11772,22 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \\
   $AMUX_URL/api/board/TASK-ID
 ```
 
-### Notes vs board issues — when to use each
+### Where a document belongs — REPO FILE first, note only for scratch
 
-**Use notes** (`/api/notes`) for: documents, write-ups, research, drafts, reference material, anything meant to be *read* by a human.
-**Use board issues** (`/api/board`) for: tasks, todos, bugs, action items, anything meant to be *done* or *tracked*.
+**Default: write it as a file in the repo you are working in, and commit it.** Design
+docs, write-ups, research, runbooks, reports, analyses, plans — these belong in the
+codebase next to the work they describe, where they are git-versioned, reviewable, and
+survive amux itself.
 
-> Rule of thumb: "create a note about X" → `/api/notes`. "create a task/issue/todo for X" → `/api/board`.
+**Use notes** (`/api/notes`) ONLY for personal scratch: a throwaway draft, a clipboard,
+something with no repo to live in. Notes are stored under `~/.amux/notes` and are **NOT
+git-versioned** — a work doc saved there is invisible to review and lost on a restore.
+
+**Use board issues** (`/api/board`) for: tasks, todos, bugs, action items — anything
+meant to be *done* or *tracked*.
+
+> Rule of thumb: "write a doc about X" → a committed file in the repo. "jot down X" →
+> `/api/notes`. "create a task/issue/todo for X" → `/api/board`.
 
 ```bash
 # List all notes
