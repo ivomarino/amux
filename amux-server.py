@@ -4650,6 +4650,7 @@ _ALERT_TYPE_LABELS = {
     "urgent": "URGENT", "git_orphan": "git rebase orphaned",
     "stale_cli": "stale amux CLI on PATH",
     "selector_block": "selector blocking coordination",
+    "session_gated": "session stopped at a model gate",
 }
 # A session parked at a human-gated selector can't receive inter-session
 # messages — they queue until it resolves. Past this many seconds, surface the
