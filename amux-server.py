@@ -3961,10 +3961,30 @@ _MODEL_CREDIT_LIMIT_RE = re.compile(
     r"/usage-credits\b|switch\s+models?\s+with\s+/model",
     re.IGNORECASE,
 )
+# The MENU-style variant of the same gate, shipped later:
+#     Fable 5 now uses usage credits
+#     Fable 5 runs on usage credits, purchased separately from your plan.
+#     You don't have usage credits yet.
+#       1. Set up usage credits on claude.ai
+#     ❯ 2. Switch to Opus 5 (1M context) and continue
+#     Enter to confirm · Esc to cancel
+# It carries NEITHER anchor above (no "/usage-credits", no "switch models with
+# /model"), so _MODEL_CREDIT_LIMIT_RE missed it entirely and two sessions sat
+# wedged with credit_limited=False — invisible to the badge and to the one-tap
+# model-switch bulk action (gtm-media-assets + gtm-videos, 2026-07-27; same
+# class as AMUX-1272 / AMUX-1256). Anchor on the numbered menu OPTION line,
+# which only exists in a live render — the prose alone shows up whenever a
+# session merely discusses the gate (this file does). Callers additionally
+# require it in the live region's tail.
+_MODEL_CREDIT_MENU_RE = re.compile(
+    r"^\s*\d+\.\s*set\s+up\s+usage\s+credits",
+    re.IGNORECASE | re.MULTILINE,
+)
 # Pull the model name out for display ("Fable 5", "Opus", ...). Best-effort.
 _MODEL_CREDIT_NAME_RE = re.compile(
-    r"reached\s+your\s+([A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?)\s+limit",
-    re.IGNORECASE,
+    r"reached\s+your\s+([A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?)\s+limit"
+    r"|^\s*([A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?)\s+now\s+uses\s+usage\s+credits",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Permissive fallback: any bare HH:MM (optionally with AM/PM) in the
@@ -4326,9 +4346,16 @@ def _rate_limit_auto_respond():
             # Both weekly and session-limit banners are menu-less and keep their
             # banner on screen until reset — group them as "banner" limits.
             is_banner = is_weekly or is_session_banner
-            # Per-model credit limit: menu-less, no reset time, NOT auto-resumable.
+            # Per-model credit limit: no reset time, NOT auto-resumable. Two
+            # renders: the menu-less banner (_MODEL_CREDIT_LIMIT_RE) and the
+            # newer "now uses usage credits" MENU. The menu's option line is
+            # only tested against the live region's TAIL — the surrounding prose
+            # appears in ordinary transcript whenever a session discusses the
+            # gate, and flagging on that would wedge-label a healthy session.
+            _live_tail = "\n".join([l for l in live.splitlines() if l.strip()][-10:])
             is_credit = (matched_idx < 0 and not is_banner
-                         and bool(_MODEL_CREDIT_LIMIT_RE.search(live)))
+                         and bool(_MODEL_CREDIT_LIMIT_RE.search(live)
+                                  or _MODEL_CREDIT_MENU_RE.search(_live_tail)))
             if matched_idx < 0 and not is_banner and not is_credit:
                 # No live rate-limit UI. A real banner cap keeps its banner on
                 # screen until reset, so a session flagged from a banner without a
@@ -4357,7 +4384,8 @@ def _rate_limit_auto_respond():
                 # rate_limit_reset_at, so leaving it unset keeps auto-resume from
                 # firing a useless "continue". Record the model name for the UI.
                 m = _MODEL_CREDIT_NAME_RE.search(live)
-                actions["rate_limit_model_name"] = (m.group(1).strip() if m else "")
+                actions["rate_limit_model_name"] = (
+                    (m.group(1) or m.group(2) or "").strip() if m else "")
                 actions["rate_limit_last_event_ts"] = int(now)
                 actions.pop("rate_limit_reset_at", None)
                 actions.pop("rate_limit_reset_at_fallback", None)
@@ -5912,6 +5940,30 @@ def _snapshot_all_sessions_inner():
                         _emit_event(name, "selector.blocking",
                                     {"held": len(_held), "mins": _mins, "origins": _origins[:8]},
                                     source="selector-block")
+                    elif actions.get("rate_limit_credits"):
+                        # ── 4c. HARD GATE with an empty queue ────────────────
+                        # The branch above only fires when something is queued
+                        # BEHIND the selector. A per-model credit gate has no
+                        # reset time and no auto-resume, so a session that hit
+                        # it between messages just stops — queue empty, status
+                        # 'waiting', nobody notified. That is exactly how
+                        # gtm-media-assets and gtm-videos sat 80m+ at the
+                        # "Fable 5 now uses usage credits" modal while a
+                        # delivered message went unworked (2026-07-27), and how
+                        # AMUX-1272 / AMUX-1256 played out before it. Alert on
+                        # the gate itself, not on who's blocked behind it.
+                        _mins = int((now - _ws) / 60)
+                        _mdl = actions.get("rate_limit_model_name") or "the current model"
+                        actions["selector_block_alerted"] = now
+                        slog(f"[gate] {name}: hard model/credit gate for {_mins}m "
+                             f"(model={_mdl!r}) — needs a model switch or credits")
+                        _push_alert("session_gated", name,
+                                    f"'{name}' has been stopped {_mins}m at a {_mdl} "
+                                    f"usage-credits gate. It won't self-resolve — switch "
+                                    f"models or top up credits to unblock the lane.")
+                        _emit_event(name, "session.gated",
+                                    {"mins": _mins, "model": _mdl, "kind": "credits"},
+                                    source="gate-watch")
             else:
                 # Session no longer waiting — reset tracking
                 actions.pop("ac_waiting_since", None)
@@ -11247,6 +11299,14 @@ def list_sessions() -> list:
             # NOT auto-resume; surfaced in bulk actions for a one-tap switch.
             "credit_limited": bool(_aa.get("rate_limit_credits")),
             "credit_limit_model": _aa.get("rate_limit_model_name", ""),
+            # When the current 'waiting' episode began (0 = not waiting). A
+            # session parked at a selector does no work and nothing surfaced
+            # that: the AMUX-1882 escalation only fires when messages are
+            # QUEUED behind it, so a gate with an empty queue stayed invisible
+            # indefinitely (gtm-media-assets + gtm-videos sat 80m+ at the
+            # usage-credits modal, 2026-07-27). Exporting the timestamp lets
+            # the card badge a long wait without any push-alert noise.
+            "waiting_since": int(_aa.get("ac_waiting_since", 0) or 0),
             "tags": [t.strip() for t in cfg.get("CC_TAGS", "").split(",") if t.strip()],
             "flags": cfg.get("CC_FLAGS", ""),
             "creator": cfg.get("CC_CREATOR", ""),
