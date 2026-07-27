@@ -11593,6 +11593,114 @@ _MEM_MARKER = "<!-- amux:session-memory -->"
 _MEM_TOPIC_FILE = "amux-api.md"
 # The documented MEMORY.md index-entry shape: "- [Title](file.md) — hook".
 _MEM_ENTRY_RE = re.compile(r"^\s*[-*]\s*\[[^\]]+\]\([^)]+\.md\)")
+# Archive store for index entries that no longer fit the read ceiling, and the
+# budget the composed index is held to. Read limits are the CLIENT's (200 lines /
+# ~17.5KB), so amux cannot raise them — it can only decide WHICH entries survive.
+_MEM_ARCHIVE_FILE = "memory-archive.md"
+_MEM_MAX_LINES = int(os.environ.get("AMUX_MEMORY_MAX_LINES", "185"))
+_MEM_MAX_BYTES = int(os.environ.get("AMUX_MEMORY_MAX_BYTES", "16800"))
+# Floor on how small a fold may leave the index — an index worth scanning.
+_MEM_KEEP_NEWEST = int(os.environ.get("AMUX_MEMORY_KEEP_NEWEST", "40"))
+
+
+def _fold_memory_overflow(name: str, session_content: str) -> str:
+    """Hold a session's index under the read ceiling by ARCHIVING its oldest
+    entries, and return the trimmed index.
+
+    The index outgrows the ceiling by entry COUNT, not verbosity: at ~118 bytes
+    per entry, 154 entries cannot fit 17.5KB no matter how hard they are
+    compressed, and over-compressing fails SILENTLY — an entry trimmed to "peek
+    reads" still looks like an entry but no longer discriminates (social-media,
+    2026-07-27, who reported this rather than grinding out another bad trim).
+
+    So entries move instead of shrinking. Oldest first, because the client
+    truncates from the BOTTOM — the newest memories are the ones currently being
+    dropped, which is exactly backwards. Nothing is deleted: overflow lands in a
+    sibling archive store that the index points at, so a session can still read
+    it deliberately.
+    """
+    lines = session_content.splitlines()
+    entry_idx = [i for i, l in enumerate(lines) if _MEM_ENTRY_RE.match(l)]
+
+    ptr = f"- [Archived memories]({_MEM_ARCHIVE_FILE}) — older entries folded out of this index to fit the read ceiling; read it when the index has no answer."
+    # Budget the pointer line UP FRONT. Measuring the kept lines alone stopped the
+    # fold ~150B short of the ceiling, then appending the pointer put the result
+    # back over it — a fold that reported success and didn't achieve the goal.
+    _res_b = _MEM_MAX_BYTES - (len(ptr.encode()) + 1)
+    _res_l = _MEM_MAX_LINES - 1
+
+    def over(ls):
+        body = "\n".join(ls)
+        return len(ls) > _res_l or len(body.encode()) > _res_b
+
+    if not over(lines) or not entry_idx:
+        return session_content
+
+    archived, keep = [], list(lines)
+    # Oldest entries sit nearest the top; peel them off until we fit. Never go
+    # below _MEM_KEEP_NEWEST — a fold that ate the index would be the same
+    # silent-erasure failure in a different costume.
+    floor = min(len(entry_idx), _MEM_KEEP_NEWEST)
+    for i in entry_idx[:-floor] if floor else entry_idx:
+        if not over([l for l in keep if l is not None]):
+            break
+        archived.append(lines[i])
+        keep[i] = None
+    kept = [l for l in keep if l is not None]
+    # Entry-folding cannot fix a store whose bulk is PROSE rather than index
+    # entries. If we hit the floor and are still over, archiving dozens of
+    # entries buys nothing — revert and say so, instead of churning them out of
+    # sight for no gain and reporting success.
+    if over(kept):
+        slog(f"[memory] {name}: over the index ceiling and entry-folding cannot fix it "
+             f"({len(lines)} lines, {len(session_content.encode())}B, only {len(entry_idx)} "
+             f"index entries) — the bulk is prose, needs manual attention")
+        return session_content
+
+    # Drop headings orphaned by the fold (no entry before the next heading/EOF).
+    out, n = [], len(kept)
+    for i, l in enumerate(kept):
+        if l.lstrip().startswith("#"):
+            has = False
+            for j in range(i + 1, n):
+                if kept[j].lstrip().startswith("#"):
+                    break
+                if _MEM_ENTRY_RE.match(kept[j]):
+                    has = True
+                    break
+            if not has:
+                continue
+        out.append(l)
+
+    if not archived:
+        return session_content
+
+    # Append to the archive store, deduped, so successive folds accumulate.
+    # FAIL SAFE: if the archive cannot be written, keep the index over-budget
+    # rather than returning a trimmed one. An over-long index loses its tail to
+    # the reader; a trim with no archive loses those entries permanently, and the
+    # whole point of folding is that nothing is deleted.
+    store = CC_MEMORY / f"{name}.archive.md"
+    try:
+        prev = store.read_text(errors="replace") if store.exists() else ""
+        fresh = [a for a in archived if a.strip() not in prev]
+        if fresh:
+            store.write_text((prev.rstrip() + "\n" + "\n".join(fresh)).strip() + "\n")
+    except Exception as e:
+        slog(f"[memory] {name}: archive write FAILED ({e}) — leaving index intact")
+        return session_content
+    body = "\n".join(out).strip()
+    if _MEM_ARCHIVE_FILE not in body:
+        body = ptr + "\n" + body
+    # A fold that doesn't shrink the index isn't a fold. Just over the budget, the
+    # pointer line can cost more than the single entry it displaces, leaving the
+    # index BIGGER and one entry further away — so only keep the result if it
+    # actually helped.
+    if len(body.encode()) >= len(session_content.strip().encode()):
+        return session_content
+    slog(f"[memory] {name}: folded {len(archived)} entry(ies) into {store.name} "
+         f"to fit the index ceiling")
+    return body + "\n"
 
 GLOBAL_MEMORY_DEFAULT = """\
 # Shared Context
@@ -12183,6 +12291,17 @@ def _write_claude_memory(name: str, work_dir: str):
     session_file = CC_MEMORY / f"{name}.md"
     global_content = _GLOBAL_MEM_FILE.read_text(errors="replace") if _GLOBAL_MEM_FILE.exists() else ""
     session_content = session_file.read_text(errors="replace") if session_file.exists() else ""
+    # Fold before composing, and persist the fold to the STORE. The store is the
+    # source of truth: _capture_claude_memory_changes copies MEMORY.md's
+    # below-marker section back over it, so trimming only the composed file would
+    # make the next capture delete the archived entries for good.
+    folded = _fold_memory_overflow(name, session_content)
+    if folded.strip() != session_content.strip():
+        try:
+            session_file.write_text(folded)
+            session_content = folded
+        except Exception:
+            pass
     composed = _compose_memory(global_content, session_content)
     claude_mem_dir = CLAUDE_HOME / "projects" / pname / "memory"
     claude_mem_file = claude_mem_dir / "MEMORY.md"
@@ -12193,6 +12312,11 @@ def _write_claude_memory(name: str, work_dir: str):
         # propagates the same way inlining used to.
         if global_content.strip():
             (claude_mem_dir / _MEM_TOPIC_FILE).write_text(global_content.strip() + "\n")
+        # Materialise the archive next to MEMORY.md so the index's pointer to it
+        # resolves — an archive the session cannot open is the same as deleting it.
+        _arch = CC_MEMORY / f"{name}.archive.md"
+        if _arch.exists():
+            (claude_mem_dir / _MEM_ARCHIVE_FILE).write_text(_arch.read_text(errors="replace"))
         if claude_mem_file.is_symlink():
             claude_mem_file.unlink()
         claude_mem_file.write_text(composed)
