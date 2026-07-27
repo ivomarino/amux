@@ -3980,6 +3980,11 @@ _MODEL_CREDIT_MENU_RE = re.compile(
     r"^\s*\d+\.\s*set\s+up\s+usage\s+credits",
     re.IGNORECASE | re.MULTILINE,
 )
+# The modal's prose lines, used only as corroboration for the option line above.
+_MODEL_CREDIT_BANNER_RE = re.compile(
+    r"(?:uses|runs\s+on|have)\s+usage\s+credits",
+    re.IGNORECASE,
+)
 # Pull the model name out for display ("Fable 5", "Opus", ...). Best-effort.
 _MODEL_CREDIT_NAME_RE = re.compile(
     r"reached\s+your\s+([A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?)\s+limit"
@@ -4352,10 +4357,23 @@ def _rate_limit_auto_respond():
             # only tested against the live region's TAIL — the surrounding prose
             # appears in ordinary transcript whenever a session discusses the
             # gate, and flagging on that would wedge-label a healthy session.
-            _live_tail = "\n".join([l for l in live.splitlines() if l.strip()][-10:])
+            # Position, not just phrasing, is what makes the menu render real.
+            # _live_limit_region cuts at the highlighted "❯ 2. Switch to <model>
+            # and continue" row, so in a LIVE modal the "1. Set up usage credits"
+            # option is the region's LAST line — always. A looser tail-window
+            # check flagged a healthy session within minutes of shipping
+            # (social-media, whose screen happened to be showing a message that
+            # QUOTED this modal while we were debugging it). A false credit flag
+            # is not cosmetic: it would sweep that session into the model-switch
+            # bulk action. Require the exact position, corroborated by the
+            # banner prose just above it.
+            _live_ne = [l for l in live.splitlines() if l.strip()]
+            _is_menu_gate = bool(
+                _live_ne
+                and _MODEL_CREDIT_MENU_RE.search(_live_ne[-1])
+                and _MODEL_CREDIT_BANNER_RE.search("\n".join(_live_ne[-6:])))
             is_credit = (matched_idx < 0 and not is_banner
-                         and bool(_MODEL_CREDIT_LIMIT_RE.search(live)
-                                  or _MODEL_CREDIT_MENU_RE.search(_live_tail)))
+                         and bool(_MODEL_CREDIT_LIMIT_RE.search(live) or _is_menu_gate))
             if matched_idx < 0 and not is_banner and not is_credit:
                 # No live rate-limit UI. A real banner cap keeps its banner on
                 # screen until reset, so a session flagged from a banner without a
