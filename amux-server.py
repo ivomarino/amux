@@ -14814,6 +14814,8 @@ _GMAIL_DEFAULT_CLIENT = None  # Must supply ~/.amux/gmail-oauth-client.json
 
 # Pending OAuth flows: state → (account, flow)
 _gmail_pending: dict = {}
+_gmail_creds_fail: dict = {}  # account → timestamp of last refresh failure (negative cache)
+_GMAIL_CREDS_FAIL_TTL = 300   # skip refresh retries for 5 min after a failure
 
 _GMAIL_REDIRECT_URI = "http://localhost:8822/api/gmail/callback"
 
@@ -14840,6 +14842,9 @@ def _gmail_token_path(account: str) -> Path:
 
 def _gmail_load_creds(account: str):
     """Load and auto-refresh OAuth credentials for an account. Returns Credentials or None."""
+    fail_ts = _gmail_creds_fail.get(account, 0)
+    if fail_ts and time.time() - fail_ts < _GMAIL_CREDS_FAIL_TTL:
+        return None
     p = _gmail_token_path(account)
     if not p.exists():
         return None
@@ -14859,6 +14864,7 @@ def _gmail_load_creds(account: str):
         if not creds.valid:
             if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
+                _gmail_creds_fail.pop(account, None)
                 p.write_text(json.dumps({
                     "token": creds.token, "refresh_token": creds.refresh_token,
                     "token_uri": creds.token_uri, "client_id": creds.client_id,
@@ -14868,6 +14874,7 @@ def _gmail_load_creds(account: str):
                 return None
         return creds
     except Exception as e:
+        _gmail_creds_fail[account] = time.time()
         slog(f"[gmail] load_creds {account}: {e}")
         return None
 
