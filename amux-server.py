@@ -11575,6 +11575,11 @@ def _live_conv_id(name: str, work_dir: str = "") -> str:
 
 _GLOBAL_MEM_FILE = CC_MEMORY / "_global.md"
 _MEM_MARKER = "<!-- amux:session-memory -->"
+# Topic file holding the shared amux-API block, written beside MEMORY.md. Keeps
+# ~239 lines of call shapes OUT of a 200-line-limited index (see _compose_memory).
+_MEM_TOPIC_FILE = "amux-api.md"
+# The documented MEMORY.md index-entry shape: "- [Title](file.md) — hook".
+_MEM_ENTRY_RE = re.compile(r"^\s*[-*]\s*\[[^\]]+\]\([^)]+\.md\)")
 
 GLOBAL_MEMORY_DEFAULT = """\
 # Shared Context
@@ -12067,10 +12072,27 @@ if CC_SESSIONS.is_dir():
 
 
 def _compose_memory(global_content: str, session_content: str) -> str:
-    """Compose global + session memory into a single MEMORY.md for Claude."""
+    """Compose the MEMORY.md index: a POINTER to shared context, then session memory.
+
+    The shared block used to be inlined above the marker. It is ~239 lines, and
+    MEMORY.md is read with a 200-line limit — so the preamble alone overran the
+    limit and everything below it was silently dropped, newest entries first
+    (they sort to the bottom). Measured across the fleet before this change: 201
+    of 215 indexes over the limit, 197 of them over on the preamble ALONE, median
+    file 241 lines of which 240 was preamble. Sessions were re-trimming it by
+    hand and _write_claude_memory put it straight back on the next send.
+
+    So the shared block now lives in its own topic file and the index carries one
+    line pointing at it — which is what an index is for, and what the memory
+    contract asks of every other entry.
+    """
     parts = []
     if global_content.strip():
-        parts.append(global_content.strip())
+        # No heading: the session's own index below supplies one, and emitting a
+        # second "# Shared Context" above it just reads as a duplicate.
+        parts.append(f"- [amux inter-session API]({_MEM_TOPIC_FILE}) — "
+                     f"sessions/peek/send, board, notes, CRM, browser, Drive. Read it when you "
+                     f"need the call shapes; it is also in ~/.claude/CLAUDE.md.")
     parts.append(_MEM_MARKER)
     if session_content.strip():
         parts.append(session_content.strip())
@@ -12087,7 +12109,36 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
     try:
         content = claude_mem_file.read_text(errors="replace")
         if _MEM_MARKER in content:
-            session_part = content.split(_MEM_MARKER, 1)[1].strip()
+            _above, session_part = content.split(_MEM_MARKER, 1)
+            session_part = session_part.strip()
+            # RESCUE index entries written ABOVE the marker. Only the part below
+            # was ever captured, so anything a session added above it was
+            # discarded on the next send — silent, and now load-bearing, because
+            # this rewrite replaces the whole preamble. Two projects hold real
+            # entries up there ("- [Hike benchmark: Cutthroat Pass](...)",
+            # "- [Sessions & board](...)"), written by sessions that had already
+            # done this topic-file split by hand.
+            #
+            # Match on the documented index-entry SHAPE ("- [Title](file.md)"),
+            # never on position: most above-marker drift is a STALE COPY of the
+            # shared block (41 projects still carry an old screenshot recipe),
+            # and rescuing that would seed junk into 41 session memories.
+            _gl = set()
+            if _GLOBAL_MEM_FILE.exists():
+                _gl = {l.strip() for l in _GLOBAL_MEM_FILE.read_text(errors="replace").splitlines()}
+            _orphans = [l.rstrip() for l in _above.splitlines()
+                        if _MEM_ENTRY_RE.match(l) and l.strip() not in _gl
+                        and l.strip() not in session_part]
+            if _orphans:
+                # Full fidelity backup beside MEMORY.md: the shape filter is a
+                # judgement call, so keep the original recoverable rather than
+                # trusting it.
+                try:
+                    (claude_mem_file.parent / "MEMORY.preamble-backup.md").write_text(
+                        _above.rstrip() + "\n")
+                except Exception:
+                    pass
+                session_part = ("\n".join(_orphans) + "\n\n" + session_part).strip()
         else:
             session_part = content.strip()
         if session_part:
@@ -12109,6 +12160,11 @@ def _write_claude_memory(name: str, work_dir: str):
     claude_mem_file = claude_mem_dir / "MEMORY.md"
     try:
         claude_mem_dir.mkdir(parents=True, exist_ok=True)
+        # The shared block the index now points at. Written beside MEMORY.md so
+        # the pointer resolves, and rewritten each time so an edit to _global.md
+        # propagates the same way inlining used to.
+        if global_content.strip():
+            (claude_mem_dir / _MEM_TOPIC_FILE).write_text(global_content.strip() + "\n")
         if claude_mem_file.is_symlink():
             claude_mem_file.unlink()
         claude_mem_file.write_text(composed)
