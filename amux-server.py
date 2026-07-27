@@ -17327,6 +17327,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .peek-tab-count .psc-on  { color: #3fb950; font-weight: 700; }
   .peek-tab-count .psc-off { color: #f85149; font-weight: 700; }
   .peek-tab-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
+  /* Session card: scrollback cached on this device (readable with no signal). */
+  .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
   /* ── Dictation: compact recording popup (above the composer) ── */
   .dict-popup { display: none; position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 60;
     background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
@@ -19882,6 +19884,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <button onclick="_wtRestart();closeSettings();" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-size:0.82rem;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
             <span style="font-size:1rem;">?</span> Walkthrough
           </button>
+        </div>
+        <div class="settings-sep"></div>
+        <div class="settings-section">
+          <div class="settings-section-label">Offline</div>
+          <div id="offline-cache-info" style="font-size:0.78rem;color:var(--dim);margin-bottom:6px;line-height:1.5;"></div>
+          <button onclick="_offlinePrefetch(true)" style="width:100%;padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:0.8rem;font-weight:600;cursor:pointer;">
+            &#x2B07; Save all sessions for offline
+          </button>
+          <div id="offline-sync-status" style="display:none;font-size:0.74rem;color:var(--accent);margin-top:5px;"></div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -24198,13 +24209,14 @@ function render() {
     const schedOn = _schedMine.filter(sc => sc.enabled).length;
     const schedOff = _schedMine.length - schedOn;
     const taskStale = _taskStaleAge(s);
+    const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
     return `
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${esc(s.name)}</div>
+          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
@@ -27300,11 +27312,123 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.199';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.200';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
 // instead of painting a silent EMPTY terminal.
+// ── Offline peek cache ──────────────────────────────────────────────────────
+// Keeps a scrollback snapshot of EVERY running session on-device so the whole
+// fleet is reviewable with no connectivity — not just sessions you happened to
+// open. Two things make this affordable on a phone:
+//   • /peek supports ETag → 304 in 0 bytes, so re-syncing unchanged sessions is
+//     free; only the first sync pays (~36KB gzipped each).
+//   • We cache the SCROLLBACK only (lines=N), not the full history blob, which
+//     is the bulk of a peek payload.
+// The index lives in IDB under 'peek_index': { name: {etag, time, bytes} }.
+const _PEEK_CACHE_LINES = 200;
+const _PEEK_CACHE_TAIL = 40000;      // per-session scrollback tail kept on-device (~40KB)
+const _PEEK_CACHE_MAX = 80;          // cap entries so IDB can't grow unbounded
+let _peekIndex = {};                 // name -> {etag, time, bytes}
+let _prefetchRunning = false, _prefetchAbort = false;
+
+async function _peekIndexLoad() {
+  try { _peekIndex = (await _idb.get('peek_index')) || {}; } catch(e) { _peekIndex = {}; }
+  return _peekIndex;
+}
+function _peekIndexSave() { try { _idb.set('peek_index', _peekIndex); } catch(e) {} }
+
+// Is this link good enough to prefetch ~1.7MB unprompted? Manual runs bypass.
+function _linkIsCheap() {
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!c) return true;                       // unknown — assume fine
+  if (c.saveData) return false;              // user asked us not to
+  return !/(^|-)(2g|slow-2g|3g)$/.test(c.effectiveType || '');
+}
+
+// Priority: what you'd actually want offline, in order — sessions doing work
+// now, then ones you recently looked at, then the rest.
+function _prefetchOrder() {
+  const running = (sessions || []).filter(s => s.running);
+  const recent = new Set([peekSession, _lastPeekedSession].filter(Boolean));
+  const rank = s => (s.status === 'active' || s.status === 'waiting' ? 0 : recent.has(s.name) ? 1 : 2);
+  return running.sort((a, b) => rank(a) - rank(b) || (b.last_activity || 0) - (a.last_activity || 0));
+}
+
+// Sync every running session's scrollback. Unchanged sessions cost 0 bytes
+// (304). Throttled so a weak link isn't hit with 49 parallel requests.
+async function _offlinePrefetch(manual) {
+  if (_prefetchRunning) return;
+  if (typeof online !== 'undefined' && !online) { if (manual) showToast('Offline — connect to sync'); return; }
+  if (!manual && !_linkIsCheap()) return;    // never auto-blast on 2g/3g/saveData
+  _prefetchRunning = true; _prefetchAbort = false;
+  await _peekIndexLoad();
+  const list = _prefetchOrder();
+  let fetched = 0, unchanged = 0, bytes = 0, done = 0;
+  const CONC = manual ? 4 : 2;
+  const report = () => { if (manual) _offlineSyncStatus(
+    `Saving for offline… ${done}/${list.length} (${fetched} new, ${unchanged} unchanged)`); };
+  const worker = async () => {
+    while (list.length && !_prefetchAbort) {
+      const s = list.shift();
+      try {
+        const prev = _peekIndex[s.name];
+        const h = _authHeaders();
+        if (prev && prev.etag) h['If-None-Match'] = prev.etag;
+        const r = await fetch(API + '/api/sessions/' + encodeURIComponent(s.name)
+                              + '/peek?lines=' + _PEEK_CACHE_LINES, { headers: h });
+        if (r.status === 304) { unchanged++; _peekIndex[s.name] = { ...prev, time: Date.now() }; }
+        else if (r.ok) {
+          const d = await r.json();
+          const out = d.output || '';
+          // "What's scrollable, not the full log": `output` alone is just the
+          // current frame (~1KB) — useless for review. The scrollback lives in
+          // `history` (~119KB/session), which IS the full log. So keep the TAIL:
+          // the most recent _PEEK_CACHE_TAIL chars, trimmed at a line boundary
+          // so the top isn't a half-line. The server already sent the whole
+          // thing, so trimming costs nothing in transfer and bounds storage.
+          let hist = d.history || '';
+          if (hist.length > _PEEK_CACHE_TAIL) {
+            hist = hist.slice(-_PEEK_CACHE_TAIL);
+            const nl = hist.indexOf('\n');
+            if (nl > 0 && nl < 2000) hist = hist.slice(nl + 1);
+          }
+          await _idb.set('peek_' + s.name, { output: out, history: hist, time: Date.now(), offline: true });
+          const sz = out.length + hist.length;
+          _peekIndex[s.name] = { etag: r.headers.get('ETag') || '', time: Date.now(), bytes: sz };
+          fetched++; bytes += sz;
+        }
+      } catch(e) { /* skip this one; a dropped link shouldn't kill the pass */ }
+      done++; report();
+    }
+  };
+  await Promise.all(Array.from({ length: CONC }, worker));
+  // Evict stopped/vanished sessions and trim to the cap (oldest first).
+  const live = new Set((sessions || []).filter(s => s.running).map(s => s.name));
+  for (const name of Object.keys(_peekIndex)) {
+    if (!live.has(name)) { try { _idb.del('peek_' + name); } catch(e) {} delete _peekIndex[name]; }
+  }
+  const names = Object.keys(_peekIndex).sort((a,b) => (_peekIndex[b].time||0) - (_peekIndex[a].time||0));
+  for (const n of names.slice(_PEEK_CACHE_MAX)) { try { _idb.del('peek_' + n); } catch(e) {} delete _peekIndex[n]; }
+  _peekIndexSave();
+  _prefetchRunning = false;
+  if (manual) {
+    _offlineSyncStatus('');
+    showToast(`Offline ready: ${Object.keys(_peekIndex).length} sessions` +
+              (fetched ? ` · ${(bytes/1024).toFixed(0)}KB new` : ' · already current'));
+  }
+  render();   // repaint cached badges
+}
+function _offlineSyncStatus(t) {
+  const el = document.getElementById('offline-sync-status');
+  if (el) { el.textContent = t; el.style.display = t ? '' : 'none'; }
+}
+function _offlineCacheInfo() {
+  const n = Object.keys(_peekIndex).length;
+  const kb = Object.values(_peekIndex).reduce((a, v) => a + (v.bytes || 0), 0) / 1024;
+  return { n, kb };
+}
+
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
@@ -40122,6 +40246,15 @@ _idb.get('drafts').then(val => {
     render();
   }
 });
+// Offline peek cache: load the index at boot so cached badges paint immediately,
+// then top up on a good link. Re-syncs are ~free (304s), so this is cheap.
+_peekIndexLoad().then(() => {
+  try { render(); } catch(e) {}
+  setTimeout(() => { try { _offlinePrefetch(false); } catch(e) {} }, 8000);
+});
+setInterval(() => { try { _offlinePrefetch(false); } catch(e) {} }, 10 * 60 * 1000);
+window.addEventListener('online', () => setTimeout(() => { try { _offlinePrefetch(false); } catch(e) {} }, 4000));
+
 _idb.get('offline_queue').then(val => {
   if (val && !offlineQueue.length && val.length) {
     offlineQueue = val;
@@ -40764,6 +40897,15 @@ function switchServer(idx) {
 }
 
 // ═══════ SETTINGS DROPDOWN ═══════
+function _offlineInfoRefresh() {
+  const el = document.getElementById('offline-cache-info');
+  if (!el) return;
+  const { n, kb } = _offlineCacheInfo();
+  const running = (sessions || []).filter(s => s.running).length;
+  el.innerHTML = n
+    ? `<b>${n}</b> of ${running} running sessions saved (${kb.toFixed(0)} KB).<br>Re-syncing is free for unchanged sessions.`
+    : `Nothing saved yet. Saves each session's visible scrollback so you can review the fleet with no connection.`;
+}
 function toggleSettings() {
   const menu = document.getElementById('settings-menu');
   const open = menu.classList.toggle('open');
@@ -46781,7 +46923,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.199';
+const CACHE = 'amux-v0.9.200';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
