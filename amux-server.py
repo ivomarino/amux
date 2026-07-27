@@ -4658,6 +4658,39 @@ _ALERT_TYPE_LABELS = {
 _SELECTOR_BLOCK_ALERT_SECS = 600
 
 
+def _waiting_since_from_events(name: str, now: float) -> float:
+    """When the session's CURRENT waiting episode began, per the durable log.
+
+    Falls back to `now` unless the newest recorded status transition is
+    session.waiting — i.e. nothing has moved the session since. Without this the
+    stall clock lives only in memory and resets on every server reload, so a
+    long-wedged session reads as freshly waiting and never crosses the alert
+    threshold (this server execv-reloads on every save).
+    """
+    try:
+        db = get_db()
+        # Last time the session actually MOVED. Anything after this is one
+        # unbroken waiting episode.
+        _mv = db.execute(
+            "SELECT MAX(ts) AS ts FROM session_events WHERE session=? AND type IN "
+            "('session.working','session.idle','session.started')", (name,)).fetchone()
+        last_move = float((_mv["ts"] if _mv else 0) or 0)
+        # EARLIEST waiting since then — not the latest. A server reload clears
+        # _session_prev_status and the send path re-seeds it to "active", so a
+        # session that never moved can log a second, spurious session.waiting;
+        # taking the newest row would credit it with a fresh clock and hide a
+        # long wedge (gtm-media-assets logged one at 02:34 while waiting since
+        # 02:11).
+        _w = db.execute(
+            "SELECT MIN(ts) AS ts FROM session_events WHERE session=? AND "
+            "type='session.waiting' AND ts > ?", (name, last_move)).fetchone()
+        ts = float((_w["ts"] if _w else 0) or 0)
+    except Exception:
+        return now
+    # Guard against a clock-skewed or absurdly old row seeding a bogus age.
+    return ts if 0 < ts <= now else now
+
+
 def _env_set(key: str, value: str):
     """Upsert KEY=value in ~/.amux/server.env and apply it live to os.environ."""
     lines = _server_env_file.read_text().splitlines() if _server_env_file.exists() else []
@@ -5890,8 +5923,14 @@ def _snapshot_all_sessions_inner():
 
             if status == "waiting" and not actions.get("restarting"):
                 if "ac_waiting_since" not in actions:
-                    # First snapshot seeing this session waiting — remember it
-                    actions["ac_waiting_since"] = now
+                    # First snapshot seeing this session waiting. _session_auto_actions
+                    # is in-memory, so a plain `now` restarts the stall clock on every
+                    # server reload — and this server reloads on every file save, which
+                    # made a session wedged for hours report "waiting 0 min" and reset
+                    # the alert threshold each time. Recover the true start from the
+                    # durable event log instead: if the newest status transition on
+                    # record is session.waiting, the session has been waiting since it.
+                    actions["ac_waiting_since"] = _waiting_since_from_events(name, now)
                 else:
                     # Still waiting on a subsequent snapshot — check opt-in flag
                     cfg_ac = parse_env_file(f)
