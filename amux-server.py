@@ -24306,7 +24306,7 @@ function render() {
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || !online) ? `<div class="card-header-meta">
           ${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
-          ${s.status === 'waiting' ? '<span class="status-badge waiting">needs input</span>' : ''}
+          ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)">${esc(s.credit_limit_model || 'model')} limit</span>` : ''}
@@ -24564,6 +24564,22 @@ function _fmtResetTime(epoch) {
   const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   if (d.toDateString() === new Date().toDateString()) return time;
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + time;
+}
+
+// How long a session has been parked at a selector, once that's long enough to
+// mean "stalled" rather than "the human is mid-thought". This is the BACKSTOP
+// for the wedge class: a regex only catches gate renders we already know about
+// (the "Fable 5 now uses usage credits" MENU shipped without either anchor the
+// credit-limit pattern looked for, and two lanes sat dead for 80m+ with nothing
+// surfaced). A clock needs no pattern, so the NEXT unrecognized gate still shows
+// up here. Suppressed when a limit badge already names the cause.
+const _STALL_MINS = 15;
+function _stalledFor(s) {
+  if (!s.waiting_since || s.credit_limited || s.rate_limited_until) return '';
+  const mins = Math.floor((Date.now() / 1000 - s.waiting_since) / 60);
+  if (mins < _STALL_MINS) return '';
+  const label = mins >= 120 ? Math.floor(mins / 60) + 'h' : mins + 'm';
+  return `<span class="status-badge rate-limited" title="Parked at a prompt for ${label} — no work is happening in this lane">stalled ${label}</span>`;
 }
 
 // ═══════ GIT BRANCH AWARENESS ═══════
@@ -27372,7 +27388,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.200';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.201';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -46983,7 +46999,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.200';
+const CACHE = 'amux-v0.9.201';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55019,6 +55035,24 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 _resp = {"ok": ok, "message": msg}
                 if ok and "at a selector" in msg:
                     _resp["held_at_selector"] = True
+                # A HARD GATE (per-model credit limit) is worse than a selector:
+                # it has no reset time and no auto-resume, so the recipient will
+                # not act on this message — or anything else — until a human
+                # switches models or tops up credits. Reporting a bare "sent"
+                # there is a true statement that reads as a false success (the
+                # social-media report, 2026-07-27: message delivered at 02:11:46,
+                # gate hit 2s later, nothing ever worked it). Say so in the
+                # response so an agent sender can route around it.
+                _gate = _session_auto_actions.get(name, {})
+                if ok and _gate.get("rate_limit_credits"):
+                    _gmdl = _gate.get("rate_limit_model_name") or "its model"
+                    _resp["recipient_gated"] = True
+                    _resp["gate_kind"] = "credits"
+                    _resp["gate_model"] = _gmdl
+                    _resp["message"] = (
+                        f"{msg} — WARNING: {name} is stopped at a {_gmdl} usage-credits "
+                        f"gate and will not act on this until a human switches models "
+                        f"or tops up credits")
                 return self._json(_resp, code)
             if action == "instructions":
                 # Set the per-session standing instruction and/or apply it now.
