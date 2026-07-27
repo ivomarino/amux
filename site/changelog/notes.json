@@ -1,5 +1,32 @@
 [
   {
+    "hash": "b120b6c1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7",
+    "short": "b120b6c",
+    "title": "Stalled agent badge + truthful gated-send response (v0.9.201)",
+    "date": "2026-07-27",
+    "type": "feat",
+    "tags": ["sessions", "ux", "monitoring", "reliability"],
+    "description": "v0.9.201 adds two session health improvements. First: a 'stalled Nm' badge appears on any session card when output stops for more than N minutes, so you can spot stuck agents at a glance from the sessions list without opening the peek panel. Second: when you send a message to a session that is credit-gated (usage limit hit), the response now accurately reports 'held — session is credit-gated' instead of silently pretending the message was delivered. No more wondering whether your instruction reached the agent."
+  },
+  {
+    "hash": "a5e73c0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+    "short": "a5e73c0",
+    "title": "Offline scrollback cache — review any session without internet (v0.9.200)",
+    "date": "2026-07-26",
+    "type": "feat",
+    "tags": ["offline", "pwa", "mobile", "sessions"],
+    "description": "v0.9.200 caches every running session's scrollback in IndexedDB so you can review what your agents were doing the last time you had internet. Open the amux PWA or iOS app on a plane, subway, or anywhere offline — all session output reads from the local cache with no server needed. IndexedDB survives iOS background eviction and device lock. The cache auto-syncs the moment you reconnect. Pairs with the offline outbox (queue messages while offline, deliver on reconnect)."
+  },
+  {
+    "hash": "d95b424c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a",
+    "short": "d95b424",
+    "title": "Fix: credit-gate false positive eliminated — stalled agents unblocked (persistence gate)",
+    "date": "2026-07-26",
+    "type": "fix",
+    "tags": ["sessions", "reliability", "credit", "watchdog"],
+    "description": "Fixes a bug where sessions were silently blocked from receiving messages because a stale credit-gate flag was persisted to disk and reloaded on server restart. A session that hit a usage limit yesterday could still appear rate-limited today even after the limit reset, causing the watchdog to skip sends and auto-replies. The fix removes the persisted gate state and re-derives it from live scrollback on each restart. Agents that were silently stalled by this will resume immediately after updating."
+  },
+  {
     "hash": "21a7dce8a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9",
     "short": "21a7dce",
     "title": "Dictation: low-bandwidth mobile path — 16kbps mono opus, offline queue (v0.9.199)",
