@@ -12126,9 +12126,14 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
             _gl = set()
             if _GLOBAL_MEM_FILE.exists():
                 _gl = {l.strip() for l in _GLOBAL_MEM_FILE.read_text(errors="replace").splitlines()}
+            # Exclude the pointer line this composer itself emits: it is an
+            # index entry, above the marker, and absent from _global.md, so it
+            # matched all three tests and got rescued INTO session memory —
+            # where the next compose put it above the marker again, duplicating
+            # it every cycle.
             _orphans = [l.rstrip() for l in _above.splitlines()
-                        if _MEM_ENTRY_RE.match(l) and l.strip() not in _gl
-                        and l.strip() not in session_part]
+                        if _MEM_ENTRY_RE.match(l) and _MEM_TOPIC_FILE not in l
+                        and l.strip() not in _gl and l.strip() not in session_part]
             if _orphans:
                 # Full fidelity backup beside MEMORY.md: the shape filter is a
                 # judgement call, so keep the original recoverable rather than
