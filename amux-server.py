@@ -11595,10 +11595,20 @@ You are session **$AMUX_SESSION** (env var). API base: **$AMUX_URL** (use `curl 
 curl -sk $AMUX_URL/api/sessions | python3 -c "import json,sys; [print(s['name'], s.get('status',''), '-', s.get('desc','')) for s in json.load(sys.stdin)]"
 ```
 
-### Peek at another session's output
+### Peek at another session — read `history`, NOT `output`
 ```bash
-curl -sk "$AMUX_URL/api/sessions/OTHER/peek?lines=100" | python3 -c "import json,sys; print(json.load(sys.stdin).get('output',''))"
+curl -sk "$AMUX_URL/api/sessions/OTHER/peek?lines=600" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('history') or d.get('output',''))"
 ```
+
+`output` is only the **current terminal frame**. A full-screen prompt (a usage-credits
+modal, the resume picker, `/model`) CLEARS the screen, so everything the session was
+doing drops off-viewport and `output` collapses to a handful of lines. Reading `output`
+and concluding "it never happened" is a real failure mode. The response also returns
+`output_is_viewport_only`, `output_lines`, `history_lines` and a `hint` — if
+`history_lines` is much larger than `output_lines`, you are looking at a sliver.
+
+**Never conclude "absent" from a peek that returned few lines.** Check `history_lines`
+first, and cross-check `GET /api/sessions/<n>` before reporting anything as lost.
 
 ### Send a message to another session
 ```bash
