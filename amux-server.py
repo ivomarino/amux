@@ -3961,6 +3961,15 @@ _MODEL_CREDIT_LIMIT_RE = re.compile(
     r"/usage-credits\b|switch\s+models?\s+with\s+/model",
     re.IGNORECASE,
 )
+# Required alongside the fragment above: the banner always STATES the limit
+# ("You've reached your Fable 5 limit"). Prose that merely cites "/usage-credits"
+# — a commit message, a code comment, a relayed report — carries no such
+# statement, and citing the fragment alone used to be enough to flag a healthy
+# session.
+_MODEL_CREDIT_LIMIT_CTX_RE = re.compile(
+    r"reached\s+your\s+[A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?\s+limit",
+    re.IGNORECASE,
+)
 # The MENU-style variant of the same gate, shipped later:
 #     Fable 5 now uses usage credits
 #     Fable 5 runs on usage credits, purchased separately from your plan.
@@ -4372,8 +4381,35 @@ def _rate_limit_auto_respond():
                 _live_ne
                 and _MODEL_CREDIT_MENU_RE.search(_live_ne[-1])
                 and _MODEL_CREDIT_BANNER_RE.search("\n".join(_live_ne[-6:])))
-            is_credit = (matched_idx < 0 and not is_banner
-                         and bool(_MODEL_CREDIT_LIMIT_RE.search(live) or _is_menu_gate))
+            # The BANNER variant needs the same positional discipline. It used to
+            # be searched across the whole live region, so the literal string
+            # "/usage-credits" anywhere in a transcript flagged the session —
+            # which fires hardest on exactly the sessions discussing the gate: it
+            # transiently flagged THIS session while it was implementing the
+            # detector, and any session relaying a report about it. That warning
+            # then rides out on every send to the target, so a false FAILURE gets
+            # asserted to other agents (social-media, 2026-07-27). Claude Code
+            # renders the banner as the last transcript content before the input
+            # box, so the region's final few lines are where a live one is.
+            _is_banner_gate = bool(
+                _MODEL_CREDIT_LIMIT_RE.search("\n".join(_live_ne[-5:]))
+                and _MODEL_CREDIT_LIMIT_CTX_RE.search("\n".join(_live_ne[-5:])))
+            _credit_raw = (matched_idx < 0 and not is_banner
+                           and (_is_banner_gate or _is_menu_gate))
+            # PERSISTENCE GATE. No regex fully separates "this session is gated"
+            # from "this session is displaying text about the gate" — the source
+            # file documenting these very patterns matches them, so any session
+            # reading it trips the check. But the two differ in TIME: a real gate
+            # holds the screen until a human clears it, while quoted text scrolls
+            # away. Require the match on two consecutive scans. That is what
+            # makes the flag trustworthy enough to assert to other agents on the
+            # send path, where a false positive tells a sender its message is
+            # undeliverable when it was in fact delivered (social-media,
+            # 2026-07-27). Costs one scan interval of detection latency.
+            _st = _session_auto_actions.setdefault(name, {})
+            _credit_prev = bool(_st.get("credit_raw_prev"))
+            _st["credit_raw_prev"] = _credit_raw
+            is_credit = _credit_raw and _credit_prev
             if matched_idx < 0 and not is_banner and not is_credit:
                 # No live rate-limit UI. A real banner cap keeps its banner on
                 # screen until reset, so a session flagged from a banner without a
@@ -4401,7 +4437,9 @@ def _rate_limit_auto_respond():
                 # No reset time exists for a credit limit; auto-resume keys off
                 # rate_limit_reset_at, so leaving it unset keeps auto-resume from
                 # firing a useless "continue". Record the model name for the UI.
-                m = _MODEL_CREDIT_NAME_RE.search(live)
+                # Same tail restriction: a model name lifted from prose higher up
+                # would mislabel the badge even when the gate itself is real.
+                m = _MODEL_CREDIT_NAME_RE.search("\n".join(_live_ne[-6:]))
                 actions["rate_limit_model_name"] = (
                     (m.group(1) or m.group(2) or "").strip() if m else "")
                 actions["rate_limit_last_event_ts"] = int(now)
@@ -55131,14 +55169,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 # response so an agent sender can route around it.
                 _gate = _session_auto_actions.get(name, {})
                 if ok and _gate.get("rate_limit_credits"):
-                    _gmdl = _gate.get("rate_limit_model_name") or "its model"
+                    _gmdl = (_gate.get("rate_limit_model_name") or "").strip()
                     _resp["recipient_gated"] = True
                     _resp["gate_kind"] = "credits"
                     _resp["gate_model"] = _gmdl
+                    _gwhat = f"a {_gmdl} usage-credits gate" if _gmdl else "a usage-credits gate"
                     _resp["message"] = (
-                        f"{msg} — WARNING: {name} is stopped at a {_gmdl} usage-credits "
-                        f"gate and will not act on this until a human switches models "
-                        f"or tops up credits")
+                        f"{msg} — WARNING: {name} is stopped at {_gwhat} and will not act "
+                        f"on this until a human switches models or tops up credits")
                 return self._json(_resp, code)
             if action == "instructions":
                 # Set the per-session standing instruction and/or apply it now.
