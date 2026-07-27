@@ -54599,6 +54599,34 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                             "history": _collapse_blank_runs(transcript) if transcript else "",
                             "live": _live_out,
                             "output": _out_compat}
+                    # `output` is the CURRENT TERMINAL FRAME — never scrollback.
+                    # That is easy to forget and expensive when you do: a
+                    # full-screen prompt (usage-credits modal, resume picker,
+                    # /model) clears the screen, so everything the session was
+                    # doing moves off-viewport and `output` collapses to the
+                    # modal. A reader following the documented `peek -> output`
+                    # recipe then sees an empty-looking session at exactly the
+                    # moment they're trying to work out why it's stuck, and
+                    # "not in the viewport" reads as "never happened" —
+                    # social-media concluded a delivered message had been
+                    # swallowed that way (2026-07-27).
+                    #
+                    # There is no reliable heuristic for "a modal cleared the
+                    # screen": in alt-screen mode EVERY session's capture is one
+                    # viewport (~35 lines), gated or not. So state the
+                    # structural fact instead of guessing at the cause — always
+                    # true, and it's the sentence that would have stopped the
+                    # bad diagnosis.
+                    _ol = len([l for l in (_out_compat or "").splitlines() if l.strip()])
+                    _hl = len([l for l in (resp["history"] or "").splitlines() if l.strip()])
+                    resp["output_lines"] = _ol
+                    resp["history_lines"] = _hl
+                    resp["output_is_viewport_only"] = True
+                    if _hl > _ol + 20:
+                        resp["hint"] = (f"`output` is only the current terminal frame ({_ol} line(s)) — "
+                                        f"a full-screen prompt can push all of a session's work "
+                                        f"off-viewport. Read `history` ({_hl} lines) for what it was "
+                                        f"actually doing.")
                     _peek_cache[name] = (now, lines, resp)
                     return self._json_etag(resp)
                 # Normal screen: show capture directly, save log in background.
