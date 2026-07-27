@@ -17734,6 +17734,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dict-search { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px;
     font-size: 0.76rem; color: var(--text); outline: none; max-width: 190px; }
   .dict-body { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px 12px; }
+
+  /* Pending dictation clips — 44px touch targets, readable on a 375px screen. */
+  .dict-item-pending { border-left:3px solid var(--accent,#4a9eff); background:rgba(74,158,255,0.05); }
+  .dict-item-head { display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap; }
+  .dict-state { font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.03em; }
+  .dict-state-failed { color:#ff6b6b; }
+  .dict-state-sending { color:var(--accent,#4a9eff); }
+  .dict-state-offline, .dict-state-pending { color:var(--dim,#888); }
+  .dict-err { font-size:0.75rem; color:#ff6b6b; margin:0.25rem 0; word-break:break-word; }
+  .dict-actions { display:flex; gap:0.4rem; margin-top:0.45rem; flex-wrap:wrap; }
+  .dict-actions .btn.small { min-height:44px; min-width:44px; padding:0 0.75rem; font-size:0.8rem; }
+  @media (max-width: 600px) { .dict-actions .btn.small { flex:1 1 auto; } }
   .dict-empty { color: var(--dim); font-size: 0.85rem; text-align: center; padding: 34px 12px; line-height: 1.7; }
   .dict-day { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; color: var(--dim); margin: 14px 0 6px; }
   .dict-day:first-child { margin-top: 0; }
@@ -22117,7 +22129,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="flex:1;"></span>
       <input type="search" id="dict-search" class="dict-search" placeholder="Search&hellip;" oninput="_dictRenderHistory()">
     </div>
-    <div id="dict-body" class="dict-body"></div>
+    <div id="dict-outbox-strip"></div>
+      <div id="dict-body" class="dict-body"></div>
   </div>
   <div id="peek-cost-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
@@ -27699,7 +27712,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.201';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.202';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31404,6 +31417,8 @@ function _dictRender() {
 // identically (measured). Uploads are RAW BINARY, not base64 (another 33%
 // saved), so a minute of dictation is ~120KB even on a bad connection.
 const _DICT_BITRATE = 16000;
+const _DICT_WARM_MS = 45000;   // how long the mic stays warm between takes
+let _dictWarmTimer = 0;
 let _dictAudioCtx = null, _dictAnalyser = null, _dictRafId = 0, _dictPopupOpen = false;
 
 function _dictToggleRec() { if (_dictRecording) _dictStopRec(); else _dictStartRec(); }
@@ -31429,10 +31444,18 @@ async function _dictStartRec() {
   if (_dictRecording) return;
   if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
   _dictCancelled = false;
-  try {
-    _dictStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } } });
-  } catch(e) { showToast('Microphone access denied'); _dictClosePopup(false); return; }
+  // Reuse a still-live stream. getUserMedia costs ~200-800ms on a phone, and the
+  // popup opens BEFORE the recorder is armed — so the first word of a quick
+  // dictation was being clipped. Holding the mic briefly between takes makes a
+  // follow-up recording start on the same tap.
+  if (!_dictStream || !_dictStream.active || !(_dictStream.getAudioTracks()[0] || {}).enabled) {
+    _dictStatus('Starting mic…');
+    try {
+      _dictStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } } });
+    } catch(e) { showToast('Microphone access denied'); _dictClosePopup(false); return; }
+  }
+  if (_dictWarmTimer) { clearTimeout(_dictWarmTimer); _dictWarmTimer = 0; }
   // Safari/iOS produce mp4; Chrome/Firefox webm/opus. Pick what's supported and
   // tell the server the real mime so Gemini decodes it.
   let mime = '';
@@ -31499,13 +31522,56 @@ function _dictStopRec() {
   _dictRecording = false;
   document.getElementById('dict-rec-btn')?.classList.remove('recording');
   try { _dictRecorder && _dictRecorder.state !== 'inactive' && _dictRecorder.stop(); } catch(e) {}
-  try { (_dictStream?.getTracks() || []).forEach(t => t.stop()); } catch(e) {}
+  // Keep the mic warm for a short window so a follow-up take is instant, then
+  // release it — an indefinitely open mic leaves the browser's recording
+  // indicator lit, which is alarming and not worth the saved millisecond.
+  if (_dictWarmTimer) clearTimeout(_dictWarmTimer);
+  _dictWarmTimer = setTimeout(() => {
+    try { (_dictStream?.getTracks() || []).forEach(t => t.stop()); } catch(e) {}
+    _dictStream = null; _dictWarmTimer = 0;
+  }, _DICT_WARM_MS);
 }
 function _dictStatus(t) {
   const el = document.getElementById('dict-rec-status'); if (el) el.textContent = t;
   const p = document.getElementById('dict-popup-status'); if (p) p.textContent = t.replace(/ — tap to stop$/, '');
 }
 function _dictKB(b) { return b < 1024 ? b + ' B' : (b/1024).toFixed(b < 102400 ? 1 : 0) + ' KB'; }
+
+// ── Dictation outbox ────────────────────────────────────────────────────────
+// Every recording is persisted BEFORE the first upload attempt and removed only
+// once it has actually been transcribed. Previously the clip was kept only when
+// the NETWORK failed — a server-side error (Gemini hiccup, quota, bad key) hit
+// `return null` and the audio was gone, which is the failure you actually hit on
+// a phone. Recording again is the one thing you can't do: the thought is spent.
+const _DICT_OUTBOX_MAX = 25;   // ring buffer; oldest fall off first
+const _DICT_KEEP_DONE  = 6;    // transcribed clips kept so a bad transcript can be re-run
+const _DICT_MAX_AUTO   = 6;    // give up auto-retrying after this many; manual Retry still works
+
+async function _dictOutbox() { try { return (await _idb.get('dict_pending')) || []; } catch(e) { return []; } }
+async function _dictOutboxSet(q) {
+  try { await _idb.set('dict_pending', q.slice(-_DICT_OUTBOX_MAX)); } catch(e) {}
+  _dictPendingBadge();
+}
+async function _dictOutboxAdd(blob, mime, ms) {
+  const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const q = await _dictOutbox();
+  q.push({ id, blob, mime, ms, ts: Date.now(), session: peekSession || '',
+           state: 'pending', attempts: 0, last: 0, error: '', text: '' });
+  await _dictOutboxSet(q);
+  return id;
+}
+async function _dictOutboxPatch(id, patch) {
+  const q = await _dictOutbox();
+  const i = q.findIndex(x => x.id === id);
+  if (i < 0) return;
+  q[i] = Object.assign(q[i], patch);
+  await _dictOutboxSet(q);
+}
+async function _dictOutboxDel(id) {
+  const q = await _dictOutbox();
+  await _dictOutboxSet(q.filter(x => x.id !== id));
+  if (_peekTab === 'dictation') _dictRender();
+}
 
 async function _dictUpload() {
   const ms = Date.now() - _dictStartedAt;
@@ -31514,73 +31580,144 @@ async function _dictUpload() {
   _dictChunks = [];
   if (blob.size < 1200) { _dictStatus('Too short — hold a bit longer'); _dictClosePopup(false); return; }
   const mime = (blob.type || 'audio/webm').split(';')[0];
-  // Offline / no signal: keep the recording and send it when we're back, rather
-  // than losing what you just said.
+  const id = await _dictOutboxAdd(blob, mime, ms);   // safe on disk before anything can fail
   if (typeof online !== 'undefined' && !online) {
-    await _dictQueueOffline(blob, mime, ms);
-    _dictStatus('Saved — will send when you\'re back online');
+    await _dictOutboxPatch(id, { state: 'offline', error: 'no connection' });
+    _dictStatus('Saved — sends when you\'re back online');
     _dictClosePopup(false);
+    if (_peekTab === 'dictation') _dictRender();
     return;
   }
-  _dictStatus('Transcribing… (' + _dictKB(blob.size) + ')');
-  const okText = await _dictSend(blob, mime, ms, true);
-  if (okText !== null) _dictClosePopup(false);
+  const txt = await _dictTrySend(id, true);
+  if (txt !== null) _dictClosePopup(false);
 }
 
-// One upload attempt with a timeout; on a network failure the clip is queued
-// rather than dropped. Returns the text, or null on failure.
-async function _dictSend(blob, mime, ms, interactive) {
-  const url = API + '/api/dictate?session=' + encodeURIComponent(peekSession || '')
-    + '&dur_ms=' + ms + '&mime=' + encodeURIComponent(mime);
+// One attempt against a stored clip. Never discards audio: a failure of ANY kind
+// leaves the item in the outbox with its error, so Retry re-sends the same
+// recording instead of asking you to say it again.
+async function _dictTrySend(id, interactive) {
+  const q = await _dictOutbox();
+  const it = q.find(x => x.id === id);
+  if (!it || !it.blob) return null;
+  if (typeof online !== 'undefined' && !online) {
+    await _dictOutboxPatch(id, { state: 'offline', error: 'no connection' });
+    return null;
+  }
+  await _dictOutboxPatch(id, { state: 'sending' });
+  if (interactive) _dictStatus('Transcribing… (' + _dictKB(it.blob.size) + ')');
+  if (_peekTab === 'dictation') _dictRender();
+  const url = API + '/api/dictate?session=' + encodeURIComponent(it.session || peekSession || '')
+    + '&dur_ms=' + (it.ms || 0) + '&mime=' + encodeURIComponent(it.mime || 'audio/webm');
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 120000);   // slow links need room
   try {
-    const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime }),
-                                 body: blob, signal: ctl.signal });
+    const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': it.mime || 'audio/webm' }),
+                                 body: it.blob, signal: ctl.signal });
     clearTimeout(timer);
     const d = await r.json();
-    if (d.error) { if (interactive) _dictStatus('Failed: ' + d.error); return null; }
+    if (d.error) throw new Error(d.error);
+    await _dictOutboxPatch(id, { state: 'done', text: d.text || '', error: '', last: Date.now() });
+    await _dictPruneDone();
     if (interactive) { _dictStatus('Added to the composer — review, then send'); _dictInsert(d.text); }
     if (_peekTab === 'dictation') _dictLoad();
     return d.text;
   } catch(e) {
     clearTimeout(timer);
-    await _dictQueueOffline(blob, mime, ms);
-    if (interactive) _dictStatus('No connection — saved, will retry automatically');
+    const msg = String((e && e.message) || 'failed').slice(0, 140);
+    await _dictOutboxPatch(id, { state: 'failed', attempts: (it.attempts || 0) + 1,
+                                 last: Date.now(), error: msg });
+    if (interactive) _dictStatus('Kept — tap Retry. (' + msg.slice(0, 60) + ')');
+    if (_peekTab === 'dictation') _dictRender();
     return null;
   }
 }
 
-// Pending recordings live in IndexedDB (blobs can't go in localStorage), so a
-// dictation taken with no signal survives a reload and flushes on reconnect.
-async function _dictQueueOffline(blob, mime, ms) {
-  try {
-    const q = (await _idb.get('dict_pending')) || [];
-    q.push({ blob, mime, ms, ts: Date.now(), session: peekSession || '' });
-    await _idb.set('dict_pending', q.slice(-20));
-    _dictPendingBadge();
-  } catch(e) {}
+// Transcribed clips linger briefly so a wrong transcript can be re-run on the
+// SAME audio — the "retry" that used to be impossible because we threw the
+// recording away the moment it succeeded.
+async function _dictPruneDone() {
+  const q = await _dictOutbox();
+  const done = q.filter(x => x.state === 'done');
+  if (done.length <= _DICT_KEEP_DONE) return;
+  const drop = new Set(done.slice(0, done.length - _DICT_KEEP_DONE).map(x => x.id));
+  await _dictOutboxSet(q.filter(x => !drop.has(x.id)));
 }
+
+// Exponential backoff so a hard failure (bad key, no quota) doesn't hammer the
+// endpoint on every reconnect, while a flaky link still recovers quickly.
+function _dictReady(it) {
+  if (it.state === 'done' || it.state === 'sending') return false;
+  if ((it.attempts || 0) >= _DICT_MAX_AUTO) return false;
+  const wait = Math.min(300000, 4000 * Math.pow(2, it.attempts || 0));
+  return Date.now() - (it.last || 0) > wait;
+}
+let _dictFlushing = false;
 async function _dictFlushOffline() {
+  if (_dictFlushing) return;
+  if (typeof online !== 'undefined' && !online) return;
+  _dictFlushing = true;
+  try {
+    let sent = 0;
+    for (const it of (await _dictOutbox())) {
+      if (!_dictReady(it)) continue;
+      if (await _dictTrySend(it.id, false) !== null) sent++;
+    }
+    if (sent) {
+      showToast(sent + ' queued dictation' + (sent === 1 ? '' : 's') + ' transcribed');
+      if (_peekTab === 'dictation') _dictLoad();
+    }
+  } finally { _dictFlushing = false; }
+}
+async function _dictRetry(id) { await _dictOutboxPatch(id, { attempts: 0, last: 0 }); await _dictTrySend(id, true); }
+
+// Play the stored audio back. You asked for it to feel like a recording — so the
+// clip is a thing you can hear before deciding to retry or bin it.
+async function _dictPlay(id) {
+  const it = (await _dictOutbox()).find(x => x.id === id);
+  if (!it || !it.blob) return;
+  try {
+    if (window._dictAudioEl) { try { _dictAudioEl.pause(); URL.revokeObjectURL(_dictAudioEl.src); } catch(e) {} }
+    window._dictAudioEl = new Audio(URL.createObjectURL(it.blob));
+    _dictAudioEl.play();
+  } catch(e) { showToast('Playback failed'); }
+}
+
+async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
-  if (!q.length || (typeof online !== 'undefined' && !online)) return;
-  const keep = [];
-  for (const item of q) {
-    const txt = await _dictSend(item.blob, item.mime, item.ms, false);
-    if (txt === null) keep.push(item);
+  const n = q.filter(x => x.state !== 'done').length;
+  const el = document.getElementById('dict-pending');
+  if (el) el.textContent = n ? n + ' pending' : '';
+  const dot = document.getElementById('dict-outbox-dot');
+  if (dot) dot.textContent = n ? String(n) : '';
+}
+
+// Outbox strip above the history list: every clip that hasn't landed yet, with
+// the error that stopped it and one tap to re-send the same audio.
+function _dictOutboxHTML(q) {
+  const live = q.filter(x => x.state !== 'done');
+  if (!live.length) return '';
+  let h = '<div class="dict-day">PENDING</div>';
+  for (const it of live.slice().reverse()) {
+    const secs = Math.round((it.ms || 0) / 1000);
+    const label = { sending: 'Sending…', offline: 'Waiting for connection', failed: 'Failed', pending: 'Queued' }[it.state] || it.state;
+    const err = it.error ? '<div class="dict-err">' + esc(it.error) + '</div>' : '';
+    const attempts = (it.attempts || 0) > 1 ? ' · ' + it.attempts + ' tries' : '';
+    h += '<div class="dict-item dict-item-pending">'
+      +  '<div class="dict-item-head"><span class="dict-state dict-state-' + esc(it.state) + '">' + label + '</span>'
+      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB((it.blob && it.blob.size) || 0) + attempts + '</span></div>'
+      +  err
+      +  '<div class="dict-actions">'
+      +    '<button class="btn small" onclick="_dictPlay(\'' + it.id + '\')">▶ Play</button>'
+      +    '<button class="btn small primary" onclick="_dictRetry(\'' + it.id + '\')">Retry</button>'
+      +    '<button class="btn small" onclick="_dictOutboxDel(\'' + it.id + '\')">Delete</button>'
+      +  '</div></div>';
   }
-  try { await _idb.set('dict_pending', keep); } catch(e) {}
-  const sent = q.length - keep.length;
-  if (sent) { showToast(sent + ' queued dictation' + (sent===1?'':'s') + ' transcribed'); if (_peekTab === 'dictation') _dictLoad(); }
-  _dictPendingBadge();
+  return h;
 }
-async function _dictPendingBadge() {
-  let n = 0;
-  try { n = ((await _idb.get('dict_pending')) || []).length; } catch(e) {}
-  const el = document.getElementById('dict-pending'); if (el) el.textContent = n ? n + ' pending upload' + (n===1?'':'s') : '';
-}
+
 window.addEventListener('online', () => { setTimeout(_dictFlushOffline, 1500); });
+setInterval(() => { if (typeof online === 'undefined' || online) _dictFlushOffline(); }, 45000);
 
 // Put text in the composer (append, don't clobber) — never auto-send.
 function _dictInsert(text) {
@@ -31594,6 +31731,13 @@ function _dictInsert(text) {
 function _dictRenderHistory() {
   const body = document.getElementById('dict-body');
   if (!body) return;
+  // Pending clips render first and out-of-band: they are the ones needing a
+  // decision (retry / play / bin), and they must show even when history is empty.
+  _dictOutbox().then(ob => {
+    const strip = _dictOutboxHTML(ob);
+    const host = document.getElementById('dict-outbox-strip');
+    if (host) host.innerHTML = strip;
+  });
   const q = (document.getElementById('dict-search')?.value || '').trim().toLowerCase();
   const items = q ? _dictItems.filter(i => (i.text||'').toLowerCase().includes(q)) : _dictItems;
   if (!items.length) {
@@ -47310,7 +47454,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.201';
+const CACHE = 'amux-v0.9.202';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
