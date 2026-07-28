@@ -20638,6 +20638,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             &#x2B07; Save all sessions for offline
           </button>
           <div id="offline-sync-status" style="display:none;font-size:0.74rem;color:var(--accent);margin-top:5px;"></div>
+          <div id="offline-cache-settings"></div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -28085,7 +28086,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.214';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.215';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -28101,7 +28102,45 @@ let _peekScrollLockY = 0;
 // The index lives in IDB under 'peek_index': { name: {etag, time, bytes} }.
 const _PEEK_CACHE_LINES = 200;
 const _PEEK_CACHE_TAIL = 40000;      // per-session scrollback tail kept on-device (~40KB)
-const _PEEK_CACHE_MAX = 80;          // cap entries so IDB can't grow unbounded
+// Offline cache cap (FIFO — oldest-touched entries evicted first). Saved
+// SERVER-side via /api/prefs so the limit follows you across devices instead of
+// each phone quietly keeping its own. _PEEK_CACHE_MAX stays as the fallback
+// until the pref loads, so a slow prefs fetch can never mean "unbounded".
+const _PEEK_CACHE_MAX = 80;
+let _offlineCap = _PEEK_CACHE_MAX;
+const _OFFLINE_CAP_CHOICES = [10, 25, 50, 80, 150, 300];
+async function _offlineCapLoad() {
+  try {
+    const d = await (await fetch(API + '/api/prefs?key=offline_cache_cap')).json();
+    const n = parseInt(d && d.value, 10);
+    if (n > 0) _offlineCap = n;
+  } catch(e) {}
+  return _offlineCap;
+}
+async function _offlineCapSet(n) {
+  n = parseInt(n, 10);
+  if (!(n > 0)) return;
+  _offlineCap = n;
+  try {
+    await fetch(API + '/api/prefs', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ key: 'offline_cache_cap', value: String(n) }) });
+  } catch(e) {}
+  await _offlineTrimToCap();      // shrinking the cap must evict NOW, not next sync
+  _offlineInfoRefresh();
+  showToast('Offline cache limit: ' + n + ' sessions');
+}
+// FIFO eviction by last-touched time. Shared by the post-sync prune and the
+// settings change, so both use one definition of "oldest".
+async function _offlineTrimToCap() {
+  await _peekIndexLoad();
+  const names = Object.keys(_peekIndex).sort((a, b) => (_peekIndex[b].time||0) - (_peekIndex[a].time||0));
+  for (const n of names.slice(_offlineCap)) {
+    try { _idb.del('peek_' + n); } catch(e) {}
+    try { _idb.del('file_' + n); } catch(e) {}
+    delete _peekIndex[n];
+  }
+  _peekIndexSave();
+}
 let _peekIndex = {};                 // name -> {etag, time, bytes}
 let _prefetchRunning = false, _prefetchAbort = false;
 
@@ -28182,7 +28221,7 @@ async function _offlinePrefetch(manual) {
     if (!live.has(name)) { try { _idb.del('peek_' + name); } catch(e) {} delete _peekIndex[name]; }
   }
   const names = Object.keys(_peekIndex).sort((a,b) => (_peekIndex[b].time||0) - (_peekIndex[a].time||0));
-  for (const n of names.slice(_PEEK_CACHE_MAX)) { try { _idb.del('peek_' + n); } catch(e) {} delete _peekIndex[n]; }
+  for (const n of names.slice(_offlineCap)) { try { _idb.del('peek_' + n); } catch(e) {} delete _peekIndex[n]; }
   _peekIndexSave();
   _prefetchRunning = false;
   if (manual) {
@@ -33514,7 +33553,10 @@ async function openFilePreview(path) {
     // evicts anything not opened in 30 days. Streaming media (video/audio) has
     // no data_url/content so it's naturally skipped — it can't live in IDB.
     const _payload = (data.data_url ? data.data_url.length : 0) + (data.content ? data.content.length : 0);
-    if (_payload > 0 && _payload <= _FILE_CACHE_MAX) _idb.setFile(path, { type: 'file', data });
+    if (_payload > 0 && _payload <= _FILE_CACHE_MAX) {
+      await _idb.setFile(path, { type: 'file', data });
+      _offlineBudgetEnforce();     // throttled FIFO trim to the server-saved cap
+    }
   } catch(e) {
     // Offline: try IDB cache
     const cached = await _idb.getFile(path);
@@ -34350,6 +34392,43 @@ const _CACHEABLE_TEXT_EXTS = new Set([
 const _CACHEABLE_IMG_EXTS = new Set(['.png','.jpg','.jpeg','.gif','.webp','.svg','.bmp','.ico']);
 const _FILE_CACHE_MAX = 25 * 1024 * 1024;   // per-file offline-cache cap (protects IndexedDB)
 const _FILE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // evict files not opened in 30 days
+// Byte size of a cached entry. data_url is base64 (~1 byte per char) and
+// content is text; both are close enough for a storage budget, and being
+// approximate is fine — the budget only needs to bound growth, not audit it.
+function _idbEntryBytes(r) {
+  const d = (r && r.data) || {};
+  return (d.data_url ? d.data_url.length : 0) + (d.content ? d.content.length : 0)
+       + (d.entries ? JSON.stringify(d.entries).length : 0);
+}
+// Total offline storage budget, saved SERVER-side so it follows you across
+// devices. Default 200MB: generous on a phone, far under the ~1GB a PWA can
+// claim, and small enough that a runaway cache is capped rather than eating
+// the device. Applied FIFO by last-opened.
+const _OFFLINE_MB_DEFAULT = 200;
+const _OFFLINE_MB_CHOICES = [50, 100, 200, 500, 1000];
+let _offlineMB = _OFFLINE_MB_DEFAULT;
+async function _offlineMBLoad() {
+  try {
+    const d = await (await fetch(API + '/api/prefs?key=offline_cache_mb')).json();
+    const n = parseInt(d && d.value, 10);
+    if (n > 0) _offlineMB = n;
+  } catch(e) {}
+  return _offlineMB;
+}
+async function _offlineMBSet(n) {
+  n = parseInt(n, 10);
+  if (!(n > 0)) return;
+  _offlineMB = n;
+  try {
+    await fetch(API + '/api/prefs', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ key: 'offline_cache_mb', value: String(n) }) });
+  } catch(e) {}
+  // Lowering the limit must evict NOW. A cap that only applies to future writes
+  // is not a cap — the device stays full until something happens to age out.
+  const res = await _idb.trimFilesToBytes(_offlineMB * 1024 * 1024);
+  _offlineInfoRefresh();
+  showToast('Offline limit ' + n + ' MB' + (res.removed ? ' — evicted ' + res.removed + ' file(s)' : ''));
+}
 const _SKIP_CACHE_DIRS = new Set(['.git','node_modules','__pycache__','.next','.nuxt','dist','build','.venv','venv','.tox','.mypy_cache','target','vendor']);
 
 async function cacheFilesDir(rootPath, maxDepth = 2) {
@@ -41203,6 +41282,41 @@ const _idb = (() => {
       cur.onerror = () => resolve(removed);
     })).catch(() => 0),
     clearFiles: () => _txw('files', os => os.clear()),
+    // Total bytes held in the files store, and a FIFO trim to a byte budget.
+    // Age-based pruning alone cannot bound SIZE: one 25MB file opened yesterday
+    // survives a 30-day cutoff, and a phone can fill up long before anything
+    // ages out. Eviction is oldest-LAST-OPENED first, so the files you actually
+    // read on the phone are the ones that survive.
+    filesBytes: () => open().then(d => new Promise((resolve) => {
+      const tx = d.transaction('files', 'readonly');
+      const cur = tx.objectStore('files').openCursor();
+      let total = 0;
+      cur.onsuccess = (e) => {
+        const c = e.target.result;
+        if (c) { total += _idbEntryBytes(c.value); c.continue(); } else resolve(total);
+      };
+      cur.onerror = () => resolve(total);
+    })).catch(() => 0),
+    trimFilesToBytes: (budget) => open().then(d => new Promise((resolve) => {
+      const tx = d.transaction('files', 'readwrite');
+      const req = tx.objectStore('files').getAll();
+      req.onsuccess = () => {
+        const rows = (req.result || []).map(r => ({ path: r.path, ts: r.ts || 0, b: _idbEntryBytes(r) }));
+        let total = rows.reduce((a, r) => a + r.b, 0);
+        if (total <= budget) { resolve({ removed: 0, bytes: total }); return; }
+        rows.sort((a, b) => a.ts - b.ts);          // oldest-opened first
+        const tx2 = d.transaction('files', 'readwrite');
+        const os2 = tx2.objectStore('files');
+        let removed = 0;
+        for (const r of rows) {
+          if (total <= budget) break;
+          os2.delete(r.path); total -= r.b; removed++;
+        }
+        tx2.oncomplete = () => resolve({ removed, bytes: total });
+        tx2.onerror = () => resolve({ removed, bytes: total });
+      };
+      req.onerror = () => resolve({ removed: 0, bytes: 0 });
+    })).catch(() => ({ removed: 0, bytes: 0 })),
     // Paths of files (not dir listings) cached on THIS device — for the
     // "downloaded" indicator in the directory view.
     cachedFilePaths: () => open().then(d => new Promise((resolve) => {
@@ -41238,6 +41352,8 @@ const _idb = (() => {
 })();
 
 // Expire offline-cached files not opened in the last 30 days (LRU by last-open ts).
+_offlineMBLoad().then(() => _idb.trimFilesToBytes(_offlineMB * 1024 * 1024)).catch(() => {});
+_offlineCapLoad().catch(() => {});
 _idb.pruneFiles(_FILE_CACHE_TTL_MS).then(n => {
   if (n) console.log('[files] evicted ' + n + ' offline file(s) not opened in 30 days');
 });
@@ -41516,6 +41632,40 @@ window.addEventListener('resize', _chromeUpdateOffsets);
 window.addEventListener('orientationchange', () => setTimeout(_chromeUpdateOffsets, 100));
 
 // Register service worker for offline asset caching
+// ── Offline capability diagnostics ─────────────────────────────────────────
+let _swFailure = null;
+// Ask the server which origin can actually host a service worker, then say so
+// in plain language. Silence here is what produced "offline mode still doesn't
+// work" with no way to find out why: the PWA had been installed from an origin
+// whose self-signed cert makes SW registration impossible, so it could never
+// cache, and on a cellular connection that origin is not even reachable.
+async function _swOfferGoodOrigin() {
+  let info = null;
+  try { info = await (await fetch(API + '/api/offline-origin')).json(); } catch(e) {}
+  const here = location.origin;
+  const good = info && info.good_origin;
+  const bar = document.createElement('div');
+  bar.id = 'sw-fail-bar';
+  bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9999;'
+    + 'background:#7a2d2d;color:#fff;font-size:0.78rem;line-height:1.45;'
+    + 'padding:12px 14px calc(12px + env(safe-area-inset-bottom));'
+    + 'display:flex;gap:10px;align-items:flex-start;';
+  const msg = (good && good !== here)
+    ? 'Offline mode is OFF. This PWA was installed from <b>' + esc(here) + '</b>, whose '
+      + 'self-signed certificate blocks the service worker — so nothing can be cached, '
+      + 'and on cellular this address is unreachable. Open <b>' + esc(good) + '</b> and '
+      + 're-add it to your home screen.'
+    : 'Offline mode is OFF — the service worker could not install'
+      + (info && info.why ? ': ' + esc(info.why) : '.');
+  bar.innerHTML = '<div style="flex:1;min-width:0;">' + msg + '</div>'
+    + (good && good !== here
+        ? '<button onclick="location.href=' + JSON.stringify(good) + '" style="flex-shrink:0;min-height:44px;padding:0 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.5);background:transparent;color:#fff;font-weight:600;cursor:pointer;">Open</button>'
+        : '')
+    + '<button onclick="this.parentNode.remove()" style="flex-shrink:0;min-height:44px;min-width:44px;border:none;background:transparent;color:#fff;font-size:1.1rem;cursor:pointer;">&#215;</button>';
+  const attach = () => document.body && document.body.appendChild(bar);
+  if (document.body) attach(); else document.addEventListener('DOMContentLoaded', attach);
+}
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
     // Store full page HTML in localStorage as fallback if iOS evicts SW cache
@@ -41540,7 +41690,22 @@ if ('serviceWorker' in navigator) {
     } catch (e) {}
     location.reload();
   });
-  }).catch(() => {});
+  }).catch(err => {
+    // NEVER swallow this. A failed registration is the difference between a
+    // working PWA and a BLANK SCREEN offline, and it used to fail silently:
+    // no SW, no cache, nothing to serve a cold offline navigation, and no
+    // indication anything was wrong.
+    //
+    // The usual cause is TLS. A browser refuses to fetch /sw.js over a
+    // self-signed certificate even though localhost/LAN counts as a secure
+    // context — so amux reached at https://localhost:8822 or a raw LAN IP can
+    // NEVER cache anything, while the same server reached at its Tailscale
+    // hostname (real Let's Encrypt cert) works fully.
+    _swFailure = { name: err && err.name, message: String(err && err.message || err) };
+    try { localStorage.setItem('amux_sw_error', JSON.stringify(_swFailure)); } catch(e) {}
+    console.warn('[amux] service worker registration FAILED — offline mode is unavailable:', err);
+    _swOfferGoodOrigin();
+  });
 
   // A PWA kept in the foreground never re-checks the SW, so it can run stale
   // code for days. Nudge an update check on every foreground/network return
@@ -42229,19 +42394,58 @@ function switchServer(idx) {
 }
 
 // ═══════ SETTINGS DROPDOWN ═══════
-function _offlineInfoRefresh() {
+// Trimming on every file write would run a full-store scan per open. Throttled
+// to once per 20s — the budget is a bound on growth, not a hard real-time gate.
+let _offlineTrimAt = 0;
+async function _offlineBudgetEnforce() {
+  const now = Date.now();
+  if (now - _offlineTrimAt < 20000) return;
+  _offlineTrimAt = now;
+  try { await _idb.trimFilesToBytes(_offlineMB * 1024 * 1024); } catch(e) {}
+  _offlineInfoRefresh();
+}
+async function _offlineInfoRefresh() {
   const el = document.getElementById('offline-cache-info');
   if (!el) return;
   const { n, kb } = _offlineCacheInfo();
   const running = (sessions || []).filter(s => s.running).length;
-  el.innerHTML = n
-    ? `<b>${n}</b> of ${running} running sessions saved (${kb.toFixed(0)} KB).<br>Re-syncing is free for unchanged sessions.`
-    : `Nothing saved yet. Saves each session's visible scrollback so you can review the fleet with no connection.`;
+  let fileMB = 0;
+  try { fileMB = (await _idb.filesBytes()) / 1048576; } catch(e) {}
+  const used = (kb / 1024) + fileMB;
+  const pct = Math.min(100, Math.round(100 * used / Math.max(1, _offlineMB)));
+  el.innerHTML =
+    `<b>${n}</b> of ${running} running sessions saved · files ${fileMB.toFixed(1)} MB<br>`
+    + `<span style="display:inline-block;width:100%;height:4px;background:rgba(139,148,158,0.25);border-radius:2px;margin:4px 0;">`
+    + `<span style="display:block;width:${pct}%;height:100%;background:${pct>90?'#f85149':'var(--accent)'};border-radius:2px;"></span></span>`
+    + `${used.toFixed(1)} of ${_offlineMB} MB used (${pct}%). Oldest-opened evicted first.`;
+}
+// Settings controls for the offline caps. Both persist to /api/prefs, so the
+// limits follow you to every device instead of each phone keeping its own.
+function _offlineSettingsHTML() {
+  const mb = _OFFLINE_MB_CHOICES.map(v =>
+    `<option value="${v}"${v === _offlineMB ? ' selected' : ''}>${v >= 1000 ? (v/1000)+' GB' : v+' MB'}</option>`).join('');
+  const cap = _OFFLINE_CAP_CHOICES.map(v =>
+    `<option value="${v}"${v === _offlineCap ? ' selected' : ''}>${v} sessions</option>`).join('');
+  const sel = 'min-height:44px;padding:6px 10px;background:var(--bg);border:1px solid var(--border);'
+            + 'border-radius:6px;color:var(--text);font-size:0.82rem;';
+  return '<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;">'
+    + `<label style="display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:0.78rem;color:var(--dim);">`
+    + `Storage limit<select style="${sel}" onchange="_offlineMBSet(this.value)">${mb}</select></label>`
+    + `<label style="display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:0.78rem;color:var(--dim);">`
+    + `Scrollback limit<select style="${sel}" onchange="_offlineCapSet(this.value)">${cap}</select></label>`
+    + '</div>';
 }
 function toggleSettings() {
   const menu = document.getElementById('settings-menu');
   const open = menu.classList.toggle('open');
   if (open) {
+    // Load the server-saved caps before painting, so the selects show the real
+    // values rather than defaults that then silently change under the user.
+    Promise.all([_offlineMBLoad(), _offlineCapLoad()]).then(() => {
+      const host = document.getElementById('offline-cache-settings');
+      if (host) host.innerHTML = _offlineSettingsHTML();
+      _offlineInfoRefresh();
+    }).catch(() => {});
     _renderInstanceSwitcher();
     loadDefaultModel();
     const zd = document.getElementById('zoom-level-display');
@@ -48269,7 +48473,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.214';
+const CACHE = 'amux-v0.9.215';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -50515,6 +50719,32 @@ class CCHandler(BaseHTTPRequestHandler):
                                    "truncated": truncated, "ms": ms})
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
+
+        # GET /api/offline-origin — which origin can actually run a service
+        # worker. A browser refuses to fetch /sw.js over a self-signed cert, so
+        # amux reached at https://localhost:8822 or a raw LAN IP can never cache
+        # anything and goes BLANK offline; the same server at its Tailscale
+        # hostname has a real Let's Encrypt cert and works fully. The client
+        # cannot determine this itself — only the server knows which cert it is
+        # actually serving — so it asks.
+        if method == "GET" and path == "/api/offline-origin":
+            ts = ""
+            try:
+                ts = _get_tailscale_hostname()
+            except Exception:
+                ts = ""
+            good = f"https://{ts}:{_AMUX_SELF_PORT}" if ts else ""
+            return self._json({
+                "tailscale_hostname": ts,
+                "good_origin": good,
+                "trusted_cert": bool(ts),
+                "why": ("Service workers refuse to install over a self-signed certificate. "
+                        "Install the PWA from this origin so offline mode can cache."
+                        if good else
+                        "No Tailscale hostname found, so amux only has a self-signed cert. "
+                        "Service workers will not install and offline mode cannot work. "
+                        "Install Tailscale, or run `mkcert` and restart amux."),
+            })
 
         # GET /api/prefs — read all prefs (or ?key=X for one)
         if method == "GET" and path == "/api/prefs":
