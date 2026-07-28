@@ -8405,6 +8405,31 @@ _DEFAULT_STATUSES = [
     {"id": "discarded", "label": "Discarded"},
 ]
 
+# ── Status synonyms ─────────────────────────────────────────────────────────
+# Eight distinct status values were live on the board: the canonical seven plus
+# `in_review` (2 items) and `resolved` (1). Nothing rejected them on write, and
+# the board's column bucketer files anything it does not recognise under To Do —
+# so a card reading "resolved" displayed as "To Do", and every status-specific
+# server rule (the one-doing cap, the clean-tree check, the gate) skipped it
+# because it never string-matched. Normalise on write; the client aliases the
+# same map on read so existing rows display correctly without a migration
+# rewriting cards other sessions own.
+#
+# ONLY true synonyms belong here. `blocked` is deliberately absent: mapping it
+# to `doing` would assert something false, which is worse than not recognising it.
+_STATUS_ALIASES = {
+    "in_review": "review", "inreview": "review", "in review": "review",
+    "resolved": "done", "complete": "done", "completed": "done", "closed": "done",
+    "wip": "doing", "in_progress": "doing", "inprogress": "doing",
+}
+
+
+def _status_canon(s) -> str:
+    """Map a status synonym to its canonical id; unknown values pass through."""
+    k = str(s or "todo").strip().lower()
+    return _STATUS_ALIASES.get(k, k)
+
+
 # ── Item types & type-derived gates (AMUX-1713) ─────────────────────────────
 # The gate is GOOD — it enforces done != verified in code rather than etiquette.
 # But it was applied UNIFORMLY: closing an escalation that self-resolved (no code
@@ -28005,7 +28030,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.205';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.206';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38043,7 +38068,24 @@ function _bqAgeMatch(vals, epochSecs) {
   });
 }
 
-const _BQ_CLOSED = new Set(['done', 'verified', 'discarded', 'resolved']);
+// Legacy/synonym statuses. Eight distinct values were in use — including
+// `in_review` alongside `review` and `resolved` alongside `done` — and the
+// column bucketer's fallback silently filed anything it did not recognise
+// under To Do. A card reading "resolved" displayed as "To Do" is a lie, and
+// the same fallback would swallow any future stray. Aliasing at read time
+// fixes the display without mutating rows another session owns; the server
+// normalises on write so new strays cannot accumulate.
+// Only true synonyms belong here. `blocked` is NOT an alias for `doing` — a
+// mapping that asserts something false is worse than an unrecognised status.
+const _STATUS_ALIAS = { in_review: 'review', inreview: 'review', 'in review': 'review',
+                        resolved: 'done', complete: 'done', completed: 'done', closed: 'done',
+                        wip: 'doing', in_progress: 'doing', inprogress: 'doing' };
+function _statusCanon(s) {
+  const k = String(s || 'todo').trim().toLowerCase();
+  return _STATUS_ALIAS[k] || k;
+}
+
+const _BQ_CLOSED = new Set(['done', 'verified', 'discarded']);
 const _BQ_ROT_DAYS = 7;
 
 // Session state indexed by name, so every card can be judged against the
@@ -38055,7 +38097,7 @@ function _bqSessionIndex() {
 }
 
 function _bqIs(item, val, ix) {
-  const st = (item.status || '').toLowerCase();
+  const st = _statusCanon(item.status);
   const sess = item.session ? ix[item.session] : null;
   const idleDays = sess && sess.last_activity
     ? (Date.now() / 1000 - sess.last_activity) / 86400 : Infinity;
@@ -38093,7 +38135,9 @@ function _bqMatch(item, ast, ix) {
   for (const { key, vals, neg } of ast.terms) {
     let hit;
     switch (key) {
-      case 'status':   hit = vals.includes((item.status || '').toLowerCase()); break;
+      // Aliased both sides, so `status:resolved` and `status:done` both find a
+      // legacy `resolved` card rather than one of them silently missing it.
+      case 'status':   hit = vals.map(_statusCanon).includes(_statusCanon(item.status)); break;
       case 'session':  hit = vals.includes('none') ? !item.session
                              : vals.includes((item.session || '').toLowerCase()); break;
       case 'shepherd': hit = vals.includes((item.shepherd || '').toLowerCase()); break;
@@ -38485,7 +38529,7 @@ function renderBoard() {
   const cols = {};
   boardStatuses.forEach(s => { cols[s.id] = []; });
   visible.forEach(item => {
-    const s = item.status || 'todo';
+    const s = _statusCanon(item.status);
     if (cols[s] !== undefined) cols[s].push(item);
     else { cols['todo'] = cols['todo'] || []; cols['todo'].push(item); }
   });
@@ -48011,7 +48055,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.205';
+const CACHE = 'amux-v0.9.206';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -51536,7 +51580,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 prefix = _prefix_from_session(session)
                 item_id = _next_issue_id(prefix)
                 now = int(time.time())
-                status = body.get("status", "todo")
+                status = _status_canon(body.get("status", "todo"))
                 due = body.get("due", "").strip() or None
                 due_time = body.get("due_time", "").strip() or None
                 # Creator attribution, AMUX-1812 recipe: the body value is a
@@ -51764,6 +51808,13 @@ class CCHandler(BaseHTTPRequestHandler):
                 if method == "PATCH":
                     body = self._read_body()
                     now = int(time.time())
+                    # Canonicalise BEFORE anything reads it, so the one-doing cap,
+                    # the clean-tree check, the gate and the write all see the same
+                    # value. A caller sending 'in_review' or 'resolved' otherwise
+                    # slipped past every status-specific rule below and landed a row
+                    # the board could only display by silently filing it under To Do.
+                    if isinstance(body.get("status"), str):
+                        body["status"] = _status_canon(body["status"])
                     # Snapshot the prior session+status so we can detect transitions
                     prior = db.execute(
                         "SELECT session, status, owner_type FROM issues WHERE id = ?", (bid,)
