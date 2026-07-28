@@ -22359,7 +22359,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <button class="peek-attach-btn" id="peek-more-btn" title="Attach / history" onclick="_togglePeekMore(event)">&#x22EE;</button>
           <div class="peek-more-menu" id="peek-more-menu">
             <button type="button" onclick="_peekMoreClose();document.getElementById('peek-file-input').click()">&#128206; Attach file</button>
-            <button type="button" onclick="_peekMoreClose();openCmdHistoryModal()">&#x1F551; Message history</button>
+            <button type="button" onclick="_peekMoreClose();openCmdHistoryModal(peekSession||'')">&#x1F551; Message history</button>
             <button type="button" onclick="_peekMoreClose();_openSavedMessages()">&#128190; Saved messages</button>
             <button type="button" onclick="_peekMoreClose();_dictOpenPopup()">&#127908; Dictate</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
@@ -28086,7 +28086,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.215';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.217';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31566,18 +31566,27 @@ function cmdHistoryAdd(text, opts) {
 
 function cmdHistoryReset() { _cmdHistoryIdx = -1; }
 
-function openCmdHistoryModal() {
+function openCmdHistoryModal(scopeSession) {
   const m = document.getElementById('cmd-history-modal');
   if (!m) return;
   m.classList.add('active');
   const s = document.getElementById('cmd-history-search');
   if (s) { s.value = ''; setTimeout(() => s.focus(), 50); }
-  // Opens ACROSS EVERY SESSION, even when reached from a session's peek. The
-  // old behaviour pre-scoped to peekSession, so "Message history" silently
-  // meant "this session's history" and there was no obvious way to see the
-  // fleet. Session scoping is still one dropdown away; the default is the
-  // whole picture.
-  const _ctx = '';
+  // Scope follows the ENTRY POINT, explicitly rather than by reading whatever
+  // peekSession happens to hold:
+  //   from inside a peek  -> pre-select that session (this modal's only entry
+  //                          point today is the peek's more-menu, and the
+  //                          question there is about THIS session)
+  //   called with ''      -> all sessions, no filter
+  // Passing it in avoids the stale-`peekSession` bug the fleet-wide Messages
+  // tab had, where a closed peek still scoped a global view.
+  const _ctx = (scopeSession != null)
+    ? scopeSession
+    : ((typeof peekSession !== 'undefined' && peekSession) || '');
+  // Drop the previous open's window/counts — they were fetched for a different
+  // scope, and reusing them would show one session's rows under another's
+  // heading until the refetch lands.
+  _cmdHistRows = null; _cmdHistCounts = null;
   _populateCmdHistorySessions(_ctx);
   _renderCmdHistoryList();
   // History is server-side, but this page only pulled it once at load — a
@@ -31592,9 +31601,13 @@ function openCmdHistoryModal() {
 function _populateCmdHistorySessions(presetSession) {
   const sel = document.getElementById('cmd-history-session-filter');
   if (!sel) return;
-  // Opening from a session (presetSession) scopes the filter to it; a plain
-  // re-populate (no arg, e.g. the async reload) keeps the current choice.
-  const desired = (presetSession != null && presetSession !== '') ? presetSession : sel.value;
+  // Three distinct intents, and '' must mean the SECOND one, not the third:
+  //   'name'        -> scope to that session
+  //   ''            -> explicitly ALL sessions (clear any previous scope)
+  //   null/undefined-> plain re-populate, keep whatever is chosen
+  // Lumping '' in with "keep current" meant opening the modal unscoped after
+  // having opened it from a peek left the old session still selected.
+  const desired = (presetSession != null) ? presetSession : sel.value;
   const names = [...new Set(_cmdHistory.map(e => typeof e === 'string' ? '' : (e.session || '')).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b));
   sel.innerHTML = '<option value="">All sessions</option>' + names.map(n => {
@@ -36498,7 +36511,13 @@ function switchView(view) {
   if (view === 'habits') _habitsLoad();
   if (view === 'skills') _skillsTabLoad();
   if (view === 'sql') _sqlInit();
-  if (view === 'messages') _messagesLoad(true, (typeof peekSession !== 'undefined' && peekSession) || _lastPeekedSession);
+  // The Messages TAB is a fleet-wide view reached from the main session list —
+  // it opens unfiltered. It used to inherit `peekSession || _lastPeekedSession`,
+  // so tapping Messages showed one session's history scoped by whichever peek
+  // you happened to open last, with no indication that a filter was applied.
+  // Per-session scoping lives on the peek's own Messages tab and on the
+  // "Message history" modal reached from inside a peek.
+  if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
@@ -48473,7 +48492,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.215';
+const CACHE = 'amux-v0.9.217';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
