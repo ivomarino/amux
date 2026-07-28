@@ -28086,7 +28086,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.217';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.218';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -48492,7 +48492,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.217';
+const CACHE = 'amux-v0.9.218';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -48568,18 +48568,31 @@ self.addEventListener('fetch', e => {
   // Hash fragments (#path=...) are client-side only — SW sees bare '/' regardless
   if (url.pathname === '/') {
     const canonical = new Request('/', { headers: { 'Accept': 'text/html' } });
+    // STALE-WHILE-REVALIDATE, not network-first. The shell is ~1.6MB of inline
+    // HTML/CSS/JS; network-first meant every single load blocked on that full
+    // download before rendering a pixel, even holding a byte-identical cached
+    // copy — measured transferSize 1679111 on a WARM load, which is what
+    // produced a "Loading amux..." wait on a local app.
+    //
+    // Cached shell is served IMMEDIATELY and the update is fetched in the
+    // background. Staleness is bounded: CACHE is versioned with APP_VER, so a
+    // real deploy installs a new SW, whose activate wipes the old cache and
+    // whose install re-fetches '/' fresh, then controllerchange reloads. The
+    // worst case is being one load behind within a single version.
     e.respondWith(
-      fetch(canonical).then(response => {
-        const clone = response.clone();
-        if (response.ok) caches.open(CACHE).then(c => c.put(canonical, clone));
-        return response;
-      }).catch(() =>
-        caches.open(CACHE).then(c => c.match(canonical)).then(cached =>
-          cached || new Response('Offline — please reload when connected', {
-            status: 503, headers: { 'Content-Type': 'text/plain' }
-          })
-        )
-      )
+      caches.open(CACHE).then(c => c.match(canonical).then(cached => {
+        const net = fetch(canonical).then(response => {
+          if (response.ok) c.put(canonical, response.clone());
+          return response;
+        }).catch(() => null);
+        if (cached) {
+          e.waitUntil(net);   // keep the SW alive for the background refresh
+          return cached;
+        }
+        return net.then(r => r || new Response('Offline — please reload when connected', {
+          status: 503, headers: { 'Content-Type': 'text/plain' }
+        }));
+      }))
     );
     return;
   }
