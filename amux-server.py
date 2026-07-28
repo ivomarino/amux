@@ -19218,6 +19218,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .board-views { display: flex; gap: 6px; flex-wrap: nowrap; padding: 8px 0 4px; align-items: center;
                  overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .board-views::-webkit-scrollbar { display: none; }
+  /* Message-kind filter chips (peek Messages tab + Message history modal).
+     One shared class so the two surfaces cannot drift apart. Measured at 19px
+     tall in WebKit before this existed — well under the 44px touch minimum, on
+     the control that is now the primary way to read history on a phone. */
+  .msg-kind-chip {
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.72rem; font-weight: 600; white-space: nowrap;
+    padding: 4px 11px; min-height: 26px; border-radius: 13px; cursor: pointer;
+  }
+  @media (max-width: 600px) {
+    /* 44px tall AND 44px of tappable width, so a short label like "All" is
+       still a full target rather than a sliver. */
+    .msg-kind-chip { min-height: 44px; min-width: 44px; padding: 4px 10px;
+                     font-size: 0.74rem; border-radius: 22px; flex: 0 0 auto; }
+  }
   .board-view-chip {
     display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
     font-size: 0.72rem; padding: 5px 10px; border-radius: 999px; cursor: pointer;
@@ -22456,7 +22471,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
     </div>
-    <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:wrap;"></div>
+    <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;"></div>
     <div id="peek-messages-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:10px;"></div>
   </div>
   <!-- Dictation: speak → clean text. Audio goes to the amux server, which calls
@@ -28070,7 +28085,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.211';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.214';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31603,8 +31618,7 @@ function _cmdHistRenderChips(items) {
     const km = _MSG_KIND[k];
     const col = km ? km.color : 'var(--accent)';
     // 30px min-height keeps these tappable in the PWA without ballooning the row.
-    return '<button onclick="_cmdHistSetKind(\u0027' + k + '\u0027)" style="font-size:0.72rem;font-weight:600;'
-      + 'padding:5px 11px;min-height:30px;border-radius:12px;cursor:pointer;white-space:nowrap;'
+    return '<button class="msg-kind-chip" onclick="_cmdHistSetKind(\u0027' + k + '\u0027)" style="'
       + 'border:1px solid ' + (on ? col : 'var(--border)') + ';'
       + 'background:' + (on ? (km ? km.bg : 'rgba(88,166,255,0.14)') : 'transparent') + ';'
       + 'color:' + (on ? col : 'var(--dim)') + ';">' + lbl + ' ' + counts[k] + '</button>';
@@ -31797,7 +31811,7 @@ function _peekMsgRenderChips(items) {
     const on = _peekMsgFilter === k;
     const km = _MSG_KIND[k];
     const col = km ? km.color : 'var(--accent)';
-    return `<button onclick="_peekMsgSetFilter('${k}')" style="font-size:0.7rem;font-weight:600;padding:2px 9px;border-radius:12px;cursor:pointer;border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl} ${counts[k]}</button>`;
+    return `<button class="msg-kind-chip" onclick="_peekMsgSetFilter('${k}')" style="border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl} ${counts[k]}</button>`;
   }).join('');
 }
 function _peekMessagesRender() {
@@ -42784,12 +42798,26 @@ toggleSettings = function() {
 // Deep-link: #path=/some/path (or ?path= for backwards compat)
 // Hash-based routing works in PWA mode — SW never strips fragments, no iOS query-param loss
 async function _handleDeeplink(hash) {
-  // #peek=<session> — open a session's peek directly (shareable links; also
-  // lets headless/simulator test rigs land in a peek without tap automation).
+  // #peek=<session>[&tab=<tab>] — open a session's peek directly, optionally on
+  // a specific tab (shareable links; also lets headless/simulator test rigs land
+  // exactly where they need to without tap automation, which is how the PWA gets
+  // verified on a real iOS WebKit rather than a desktop approximation).
   if (hash && hash.startsWith('#peek=')) {
-    const target = decodeURIComponent(hash.slice(6));
+    const raw = hash.slice(6);
+    const amp = raw.indexOf('&');
+    const target = decodeURIComponent(amp < 0 ? raw : raw.slice(0, amp));
+    let tab = '';
+    if (amp >= 0) {
+      const m = raw.slice(amp + 1).match(/(?:^|&)tab=([^&]+)/);
+      if (m) tab = decodeURIComponent(m[1]);
+    }
     const tryOpen = (attempt) => {
-      if (typeof sessions !== 'undefined' && sessions.some(s => s.name === target)) { openPeek(target); return; }
+      if (typeof sessions !== 'undefined' && sessions.some(s => s.name === target)) {
+        openPeek(target);
+        // Let openPeek finish its own async setup before switching tabs.
+        if (tab) setTimeout(() => { try { setPeekTab(tab); } catch(e) {} }, 350);
+        return;
+      }
       if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
     };
     tryOpen(0);
@@ -48241,7 +48269,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.211';
+const CACHE = 'amux-v0.9.214';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
