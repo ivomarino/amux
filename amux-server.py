@@ -22187,13 +22187,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')">Steering<span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')">Schedules<span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session">Messages<span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
-    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task">Cost</button>
+    <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text">Dictation<span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')">Board<span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
-    <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)">Transcript</button>
-    <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')">Worktree</button>
-    <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')">Commits</button>
     <button class="peek-tab" id="peek-tab-notes" onclick="setPeekTab('notes')">Notes<span class="peek-tab-count" id="peek-tab-notes-count"></span></button>
-    <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text">Dictation</button>
+    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task">Cost</button>
+    <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)">Transcript</button>
+    <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')">Commits</button>
+    <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')">Worktree</button>
   </div>
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
@@ -27500,6 +27500,14 @@ async function _peekUpdateTabCounts() {
     const n = all.filter(x => x.path && x.path.startsWith(folder)).length;
     setCount('peek-tab-notes-count', n);
   } catch(e) {}
+  try {
+    const r = await fetch(API + '/api/dictation/history?count=1&session=' + encodeURIComponent(sess),
+                          { headers: _authHeaders() });
+    if (peekSession !== sess) return;
+    const d = await r.json();
+    _dictCount = d.count || 0;
+  } catch(e) { _dictCount = 0; }
+  _dictPendingBadge();   // reads the outbox, then paints the combined badge
 }
 
 let _peekSchedSearch = '';
@@ -27969,7 +27977,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.202';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.203';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -28174,9 +28182,11 @@ function openPeek(name, opts) {
   updatePeekStatus();
   document.getElementById('peek-body').innerHTML = '<div class="peek-loading"><div class="peek-spin-lg"></div><span>Loading latest…</span></div>';
   // Reset tab badges; will be repopulated by _peekUpdateTabCounts
-  ['peek-tab-steering-count','peek-tab-issues-count','peek-tab-schedules-count','peek-tab-notes-count'].forEach(id => {
+  _dictCount = 0;   // stale count from the previous session must not linger
+  ['peek-tab-steering-count','peek-tab-issues-count','peek-tab-schedules-count','peek-tab-notes-count',
+   'peek-tab-dictation-count'].forEach(id => {
     const el = document.getElementById(id);
-    if (el) { el.textContent = ''; el.classList.remove('has-count', 'sched-on', 'sched-off'); }
+    if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
   loadPeekCommitGuard(name);
@@ -31639,6 +31649,7 @@ async function _peekMessagesLoad() {
 let _dictRecording = false, _dictRecorder = null, _dictChunks = [], _dictStream = null;
 let _dictStartedAt = 0, _dictSub = 'history';
 let _dictItems = [], _dictWords = [], _dictTotalWords = 0, _dictCfg = null;
+let _dictCount = 0;   // history rows for peekSession — drives the tab badge without opening the tab
 
 async function _dictLoad() {
   try {
@@ -31649,6 +31660,7 @@ async function _dictLoad() {
     ]);
     _dictItems = h.items || []; _dictTotalWords = h.total_words || 0;
     _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {};
+    _dictCount = _dictItems.length;
   } catch(e) {}
   const tw = document.getElementById('dict-total-words');
   if (tw) tw.textContent = _dictTotalWords ? _dictTotalWords.toLocaleString() + ' words' : '';
@@ -31947,6 +31959,22 @@ async function _dictPendingBadge() {
   if (el) el.textContent = n ? n + ' pending' : '';
   const dot = document.getElementById('dict-outbox-dot');
   if (dot) dot.textContent = n ? String(n) : '';
+  _dictTabBadge(n);
+}
+
+// Peek tab badge: this session's dictation count, plus any clips still in the
+// outbox — the same two things the tab itself renders. Outbox is device-global
+// (a clip recorded for another session still needs sending), so it is NOT
+// scoped to peekSession; that would undercount what you see on open.
+// Mirrors _peekMessagesBadge's "n+p" format and amber has-pending style.
+function _dictTabBadge(pending) {
+  const badge = document.getElementById('peek-tab-dictation-count');
+  if (!badge) return;
+  const n = _dictCount || 0;
+  const p = pending || 0;
+  badge.textContent = p ? (n + '+' + p) : (n ? String(n) : '');
+  badge.classList.toggle('has-count', (n + p) > 0);
+  badge.classList.toggle('has-pending', p > 0);
 }
 
 // Outbox strip above the history list: every clip that hasn't landed yet, with
@@ -47711,7 +47739,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.202';
+const CACHE = 'amux-v0.9.203';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -52713,6 +52741,16 @@ class CCHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/api/dictation/history":
                 sess = qs.get("session", [""])[0]
                 limit = min(int(qs.get("limit", ["200"])[0]), 500)
+                # count=1 → just the number, for the peek tab badge. Pulling 200
+                # rows of transcript text to render a single integer is wasteful
+                # on a phone; this is one indexed COUNT.
+                if qs.get("count"):
+                    if sess:
+                        n = db.execute("SELECT COUNT(*) c FROM dictation_history WHERE session=?",
+                                       (sess,)).fetchone()["c"]
+                    else:
+                        n = db.execute("SELECT COUNT(*) c FROM dictation_history").fetchone()["c"]
+                    return self._json({"count": n})
                 if sess:
                     rows = db.execute(
                         "SELECT id, session, ts, text, raw_text, prev_text, ai_edited, words, dur_ms "
