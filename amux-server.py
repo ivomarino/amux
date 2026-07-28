@@ -8405,6 +8405,45 @@ _DEFAULT_STATUSES = [
     {"id": "discarded", "label": "Discarded"},
 ]
 
+# ── Message kinds ───────────────────────────────────────────────────────────
+# Every message that reaches a session is exactly one of THREE things, and the
+# distinction is the only one that matters when reading history: did a human ask
+# for this, did another session, or did a clock?
+#
+#   human     — a person typed it. Covers `direct` (sent straight through) and
+#               `steering` (queued while the session was busy). Both are the
+#               same authority; only the delivery path differs, which is why
+#               `queued` is a delivery flag and NOT a fourth kind.
+#   session   — inter-session correspondence. `origin` is the SENDING session,
+#               stamped server-side (AMUX-1768) so it cannot be forged in text.
+#   schedule  — fired by the scheduler. `origin` is the schedule title.
+#
+# The raw `type` column carries five historical values (direct/steering/user/
+# session/schedule) and is kept as-is so nothing is rewritten; `kind` is derived
+# on read. Storing five and displaying three is what let the history modal badge
+# a session message as "direct".
+_MSG_KINDS = ("human", "session", "schedule")
+_MSG_KIND_OF = {
+    "direct": "human", "steering": "human", "user": "human", "": "human",
+    "session": "session",
+    "schedule": "schedule",
+}
+
+
+def _msg_kind(mtype) -> str:
+    """Canonical kind for a cmd_history row type. Unknown types read as human —
+    a message whose provenance we cannot establish is treated as if a person
+    sent it, because that is the reading that gets it looked at rather than
+    filtered away."""
+    return _MSG_KIND_OF.get(str(mtype or "").strip().lower(), "human")
+
+
+def _msg_is_queued(mtype) -> bool:
+    """True for a human message that was queued as steering rather than sent
+    straight through. A delivery detail, not a kind."""
+    return str(mtype or "").strip().lower() == "steering"
+
+
 # ── Status synonyms ─────────────────────────────────────────────────────────
 # Eight distinct status values were live on the board: the canonical seven plus
 # `in_review` (2 items) and `resolved` (1). Nothing rejected them on write, and
@@ -22767,11 +22806,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input type="search" id="cmd-history-search" placeholder="Search past messages..."
         oninput="_renderCmdHistoryList()"
         style="flex:1;min-width:0;box-sizing:border-box;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;outline:none;">
-      <select id="cmd-history-session-filter" onchange="_renderCmdHistoryList()" title="Filter by session"
+      <select id="cmd-history-session-filter" onchange="_cmdHistRows=null;_cmdHistCounts=null;_renderCmdHistoryList();_cmdHistFetch()" title="Filter by session"
         style="flex-shrink:0;max-width:200px;box-sizing:border-box;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;outline:none;cursor:pointer;">
         <option value="">All sessions</option>
       </select>
     </div>
+    <div id="cmd-history-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:10px;align-items:center;scrollbar-width:none;"></div>
     <div id="cmd-history-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>
   </div>
 </div>
@@ -28030,7 +28070,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.206';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.211';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31478,9 +31518,12 @@ function openCmdHistoryModal() {
   m.classList.add('active');
   const s = document.getElementById('cmd-history-search');
   if (s) { s.value = ''; setTimeout(() => s.focus(), 50); }
-  // Opened from a session's peek (the "Message history" button lives in the peek
-  // more-menu, so peekSession is set) → pre-scope the filter to that session.
-  const _ctx = (typeof peekSession !== 'undefined' && peekSession) ? peekSession : '';
+  // Opens ACROSS EVERY SESSION, even when reached from a session's peek. The
+  // old behaviour pre-scoped to peekSession, so "Message history" silently
+  // meant "this session's history" and there was no obvious way to see the
+  // fleet. Session scoping is still one dropdown away; the default is the
+  // whole picture.
+  const _ctx = '';
   _populateCmdHistorySessions(_ctx);
   _renderCmdHistoryList();
   // History is server-side, but this page only pulled it once at load — a
@@ -31489,6 +31532,7 @@ function openCmdHistoryModal() {
   _loadCmdHistoryFromServer().then(() => {
     _populateCmdHistorySessions(_ctx);
     _renderCmdHistoryList();
+    _cmdHistFetch();      // kind-scoped window + true per-kind totals
   });
 }
 function _populateCmdHistorySessions(presetSession) {
@@ -31509,18 +31553,82 @@ function closeCmdHistoryModal() {
   const m = document.getElementById('cmd-history-modal');
   if (m) m.classList.remove('active');
 }
+// Defaults to HUMAN across ALL sessions: opening Message history, the question
+// is "what have I asked the fleet to do", and human messages are the minority
+// on the sessions that matter most (mixpeek-orchestrator alone has 395 inbound
+// session messages). Kind chips are rendered from the same _MSG_KIND_ORDER the
+// peek tab uses, so the two surfaces cannot drift apart.
+let _cmdHistKind = 'human';   // all | human | session | schedule
+let _cmdHistRows = null;      // server window for the CURRENT kind+session, or null
+// Ask the server for the slice we are showing. Filtering the shared 500-row
+// global cache client-side meant "Human across every session" showed 48 rows
+// out of 2783 — the human messages had been crowded out of the window by
+// session and schedule traffic before the filter ever ran.
+let _cmdHistCounts = null;    // true per-kind totals from the server
+async function _cmdHistFetch() {
+  const sess = document.getElementById('cmd-history-session-filter')?.value || '';
+  const qsess = sess ? '&session=' + encodeURIComponent(sess) : '';
+  let u = API + '/api/history?limit=500' + qsess;
+  if (_cmdHistKind !== 'all') u += '&kind=' + encodeURIComponent(_cmdHistKind);
+  try {
+    const [r, rc] = await Promise.all([
+      fetch(u, { headers: _authHeaders() }),
+      fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() }),
+    ]);
+    if (r.ok) {
+      const rows = (await r.json()).map(x => ({ text: x.text, type: x.type, session: x.session,
+        time: x.ts, id: x.id, origin: x.origin || '', kind: x.kind, queued: x.queued }));
+      _cmdHistRows = _mergeUnechoed(rows.reverse(), sess);
+    }
+    if (rc.ok) _cmdHistCounts = await rc.json();
+  } catch(e) { /* keep whatever we had; render falls back to the shared cache */ }
+  _renderCmdHistoryList();
+}
+function _cmdHistSetKind(k) { _cmdHistKind = k; _renderCmdHistoryList(); _cmdHistFetch(); }
+function _cmdHistRenderChips(items) {
+  const bar = document.getElementById('cmd-history-filter');
+  if (!bar) return;
+  // Server totals when we have them; local tally only as a pre-fetch placeholder.
+  let counts;
+  if (_cmdHistCounts) {
+    counts = { all: _cmdHistCounts.all || 0, human: _cmdHistCounts.human || 0,
+               session: _cmdHistCounts.session || 0, schedule: _cmdHistCounts.schedule || 0 };
+  } else {
+    counts = { all: items.length, human: 0, session: 0, schedule: 0 };
+    items.forEach(e => { counts[_msgKind(e)]++; });
+  }
+  const chips = [['all','All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
+  bar.innerHTML = chips.map(([k, lbl]) => {
+    const on = _cmdHistKind === k;
+    const km = _MSG_KIND[k];
+    const col = km ? km.color : 'var(--accent)';
+    // 30px min-height keeps these tappable in the PWA without ballooning the row.
+    return '<button onclick="_cmdHistSetKind(\u0027' + k + '\u0027)" style="font-size:0.72rem;font-weight:600;'
+      + 'padding:5px 11px;min-height:30px;border-radius:12px;cursor:pointer;white-space:nowrap;'
+      + 'border:1px solid ' + (on ? col : 'var(--border)') + ';'
+      + 'background:' + (on ? (km ? km.bg : 'rgba(88,166,255,0.14)') : 'transparent') + ';'
+      + 'color:' + (on ? col : 'var(--dim)') + ';">' + lbl + ' ' + counts[k] + '</button>';
+  }).join('');
+}
 function _renderCmdHistoryList() {
   const list = document.getElementById('cmd-history-list');
   if (!list) return;
   const q = (document.getElementById('cmd-history-search')?.value || '').trim().toLowerCase();
   const sessFilter = document.getElementById('cmd-history-session-filter')?.value || '';
-  const items = _cmdHistory.slice().reverse();
+  // Server window when loaded (already kind- and session-scoped); otherwise the
+  // shared global cache, so the modal paints instantly on open.
+  const items = (_cmdHistRows || _cmdHistory).slice().reverse();
   let filtered = items;
   if (sessFilter) filtered = filtered.filter(e => (typeof e === 'string' ? '' : (e.session || '')) === sessFilter);
+  _cmdHistRenderChips(filtered);
+  if (_cmdHistKind !== 'all') filtered = filtered.filter(e => _msgKind(e) === _cmdHistKind);
   if (q) filtered = filtered.filter(e => { const t = typeof e === 'string' ? e : e.text; return t.toLowerCase().includes(q); });
   if (!filtered.length) {
+    const kLbl = (_MSG_KIND[_cmdHistKind] || {}).label;
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">'
-      + (q || sessFilter ? 'No matches.' : 'No history yet.') + '</div>';
+      + (q ? 'No matches.'
+           : kLbl ? 'No ' + kLbl.toLowerCase() + ' messages'+ (sessFilter ? ' for ' + sessFilter : '') + '.'
+                  : (sessFilter ? 'No messages for ' + sessFilter + '.' : 'No history yet.')) + '</div>';
     return;
   }
   list.innerHTML = filtered.map(e => {
@@ -31530,10 +31638,18 @@ function _renderCmdHistoryList() {
     const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
     const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
-    const tagColor = type === 'steering' ? 'var(--purple,#8957e5)' : 'var(--dim)';
-    const tagBg = type === 'steering' ? 'rgba(137,87,229,0.15)' : 'rgba(128,128,128,0.1)';
-    const tagLabel = type === 'steering' ? 'queued' : 'direct';
-    const meta = (type ? '<span style="display:inline-block;font-size:0.7rem;padding:1px 6px;border-radius:3px;background:' + tagBg + ';color:' + tagColor + ';margin-right:6px;">' + tagLabel + '</span>' : '')
+    // Was: `type === 'steering' ? 'queued' : 'direct'` — which badged every
+    // session-to-session AND every scheduled message as "direct", i.e. as
+    // something you had typed. Same kind + origin the peek tab shows.
+    const kind = _msgKind(e);
+    const km = _MSG_KIND[kind] || _MSG_KIND.human;
+    const origin = typeof e === 'string' ? '' : (e.origin || '');
+    const tagSuffix = kind === 'human'
+      ? (_msgQueued(e) ? ' · queued' : ' · direct')
+      : (origin ? ' · ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,28) : '');
+    const meta = '<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 6px;border-radius:3px;background:'
+      + km.bg + ';color:' + km.color + ';margin-right:6px;border-left:3px solid ' + km.color + ';">'
+      + km.label + tagSuffix + '</span>'
       + (session ? '<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">' + session.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</span>' : '')
       + (ts ? '<span style="color:var(--dim);font-size:0.7rem;">' + ts + '</span>' : '');
     const locSess = (session || peekSession || '').replace(/\u0027/g, '');
@@ -31559,21 +31675,33 @@ function _renderCmdHistoryList() {
 // ── Peek Messages tab: the message history, scoped to the open session ──
 // One entry → its card HTML (same look as the Message-history modal). Kept as a
 // standalone renderer so the tab stays independent of the modal.
-// Origin taxonomy for a Messages-history item: who sent this command.
-// Legacy rows (type 'direct'/'steering', pre-origin-column) map to 'user'.
-function _msgOrigin(e) {
+// THREE kinds, matching the server's _msg_kind exactly. The stored `type`
+// column has five historical values; collapsing them here (and only here) is
+// what keeps every surface agreeing. The server now ships `kind` on each row —
+// prefer it, and fall back to deriving locally for rows cached before this
+// version or pushed optimistically by cmdHistoryAdd before the server echoes.
+function _msgKind(e) {
+  if (e && typeof e === 'object' && e.kind) return e.kind;
   const t = (typeof e === 'string' ? '' : (e.type || '')).toLowerCase();
   if (t === 'session') return 'session';
   if (t === 'schedule') return 'schedule';
-  if (t === 'system') return 'system';
-  return 'user';   // user / direct / steering / '' all = a human-entered command
+  return 'human';   // direct / steering / user / '' — all a person typing
+}
+// Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
+// same person, same authority, one just waited for the session to free up.
+function _msgQueued(e) {
+  if (e && typeof e === 'object' && typeof e.queued === 'boolean') return e.queued;
+  return (typeof e === 'string' ? '' : (e.type || '')).toLowerCase() === 'steering';
 }
 const _MSG_KIND = {
-  user:     { label: 'You',       color: '#58a6ff', bg: 'rgba(88,166,255,0.14)' },
+  human:    { label: 'Human',     color: '#58a6ff', bg: 'rgba(88,166,255,0.14)' },
   session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
   schedule: { label: 'Scheduled', color: '#3fb950', bg: 'rgba(63,185,80,0.15)' },
-  system:   { label: 'System',    color: '#d29922', bg: 'rgba(210,153,34,0.15)' },
 };
+const _MSG_KIND_ORDER = ['human', 'session', 'schedule'];
+// Back-compat shim: _msgOrigin was the old 4-way classifier. Anything still
+// calling it gets the canonical kind.
+function _msgOrigin(e) { return _msgKind(e); }
 function _cmdHistItemHTML(e) {
   const text = typeof e === 'string' ? e : e.text;
   const session = typeof e === 'string' ? '' : (e.session || '');
@@ -31581,11 +31709,14 @@ function _cmdHistItemHTML(e) {
   const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
   const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
-  const kind = _msgOrigin(e);
-  const km = _MSG_KIND[kind] || _MSG_KIND.user;
-  // Badge label carries the specific origin: "Session · mvs-infra", "Scheduled · Nightly gate".
-  const originTxt = (kind === 'session' || kind === 'schedule' || kind === 'system') && origin
-    ? ' · ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '';
+  const kind = _msgKind(e);
+  const km = _MSG_KIND[kind] || _MSG_KIND.human;
+  // Badge carries the specific origin: "Session · mvs-infra", "Scheduled · Nightly gate".
+  // For a human message the origin is you, so instead we surface the delivery
+  // path — "Human · queued" vs plain "Human".
+  const originTxt = kind === 'human'
+    ? (_msgQueued(e) ? ' &middot; queued' : ' &middot; direct')
+    : (origin ? ' &middot; ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '');
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;border-left:3px solid ${km.color};">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
@@ -31597,6 +31728,9 @@ function _cmdHistItemHTML(e) {
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
+  // Prefer the session-scoped server window; fall back to slicing the shared
+  // global cache until it lands (or if the fetch failed).
+  if (_peekMsgRows && _peekMsgRowsFor === peekSession) return _peekMsgRows.slice().reverse();
   return _cmdHistory.slice().reverse().filter(e => (typeof e === 'string' ? '' : (e.session || '')) === peekSession);
 }
 // Offline-queued sends/steers for a session that have NOT reached the server yet.
@@ -31641,23 +31775,29 @@ function _peekMessagesBadge() {
   badge.classList.toggle('has-pending', p > 0);
   _updatePendingPill();
 }
-let _peekMsgFilter = 'all';   // all | user | session | schedule | system
+// Defaults to human. Opening a session's Messages tab, the question is almost
+// always "what did I ask this session to do" — inter-session chatter and
+// scheduler fire-and-forget are an order of magnitude noisier (1463 session +
+// 753 schedule vs 2784 human across the fleet, but concentrated on a handful
+// of sessions where they bury everything you typed).
+let _peekMsgFilter = 'human';   // all | human | session | schedule
 function _peekMsgSetFilter(k) { _peekMsgFilter = k; _peekMessagesRender(); }
 function _peekMsgRenderChips(items) {
   const bar = document.getElementById('peek-messages-filter');
   if (!bar) return;
   // Count by kind so each chip shows how many of that type exist.
-  const counts = { all: items.length, user: 0, session: 0, schedule: 0, system: 0 };
-  items.forEach(e => { counts[_msgOrigin(e)]++; });
+  const counts = { all: items.length, human: 0, session: 0, schedule: 0 };
+  items.forEach(e => { counts[_msgKind(e)]++; });
+  // Every kind chip is ALWAYS shown, even at zero. Hiding empty ones made the
+  // filter row change shape as you moved between sessions, and an absent chip
+  // reads as "this kind does not exist" rather than "none here".
   const chips = [['all','All']].concat(
-    ['user','session','schedule','system']
-      .filter(k => counts[k] > 0 || _peekMsgFilter === k)
-      .map(k => [k, (_MSG_KIND[k]||{}).label || k]));
+    _MSG_KIND_ORDER.map(k => [k, (_MSG_KIND[k]||{}).label || k]));
   bar.innerHTML = chips.map(([k,lbl]) => {
     const on = _peekMsgFilter === k;
     const km = _MSG_KIND[k];
     const col = km ? km.color : 'var(--accent)';
-    return `<button onclick="_peekMsgSetFilter('${k}')" style="font-size:0.7rem;font-weight:600;padding:2px 9px;border-radius:12px;cursor:pointer;border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl}${k!=='all'?' '+counts[k]:''}</button>`;
+    return `<button onclick="_peekMsgSetFilter('${k}')" style="font-size:0.7rem;font-weight:600;padding:2px 9px;border-radius:12px;cursor:pointer;border:1px solid ${on?col:'var(--border)'};background:${on?(km?km.bg:'rgba(88,166,255,0.14)'):'transparent'};color:${on?col:'var(--dim)'};">${lbl} ${counts[k]}</button>`;
   }).join('');
 }
 function _peekMessagesRender() {
@@ -31666,11 +31806,14 @@ function _peekMessagesRender() {
   const q = (document.getElementById('peek-messages-search')?.value || '').trim().toLowerCase();
   let items = _peekMessagesFor();
   _peekMsgRenderChips(items);   // chips reflect the full (pre-filter) set's counts
-  if (_peekMsgFilter !== 'all') items = items.filter(e => _msgOrigin(e) === _peekMsgFilter);
+  if (_peekMsgFilter !== 'all') items = items.filter(e => _msgKind(e) === _peekMsgFilter);
   if (q) items = items.filter(e => (typeof e === 'string' ? e : e.text).toLowerCase().includes(q));
   // Pending (offline-queued, NOT yet on the server) shown FIRST — clearly marked,
-  // cancellable, so the local client never hides unsent messages.
-  let pending = _pendingSendsFor(peekSession);
+  // cancellable, so the local client never hides unsent messages. These are
+  // always YOURS, so they belong to the human filter and must disappear under
+  // session/schedule — otherwise a "Scheduled" view shows a message you typed.
+  const _showPending = (_peekMsgFilter === 'all' || _peekMsgFilter === 'human');
+  let pending = _showPending ? _pendingSendsFor(peekSession) : [];
   if (q) pending = pending.filter(p => p.text.toLowerCase().includes(q));
   const pendingHTML = pending.map(p => {
     const ts = p.ts ? new Date(p.ts).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
@@ -31685,13 +31828,56 @@ function _peekMessagesRender() {
   const cnt = document.getElementById('peek-messages-count');
   if (cnt) cnt.textContent = (pending.length ? pending.length + ' pending · ' : '') + items.length + (items.length === 1 ? ' message' : ' messages');
   const histHTML = items.length ? items.map(_cmdHistItemHTML).join('') : '';
+  // Empty state must name the active filter. "No messages sent to this session
+  // yet" is false when you are simply looking at the Scheduled slice of a
+  // session that has plenty of human messages.
+  const _fLbl = (_MSG_KIND[_peekMsgFilter] || {}).label;
+  const _empty = q ? 'No matches.'
+    : (_fLbl ? 'No ' + _fLbl.toLowerCase() + ' messages for this session.'
+             : 'No messages sent to this session yet.');
   list.innerHTML = (pendingHTML + histHTML)
-    || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${q ? 'No matches.' : 'No messages sent to this session yet.'}</div>`;
+    || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`;
   _peekMessagesBadge();
 }
+// The shared _cmdHistory cache is a GLOBAL 500-row window, and on a busy fleet
+// ~90% of it is session + schedule traffic (measured: 452 of 500). Filtering
+// that down to one session's human messages left almost nothing — the peek tab
+// for mixpeek-orchestrator showed "Human 0" while the session had plenty.
+// Fetch a SESSION-SCOPED window instead, so each session gets its own 500.
+let _peekMsgRows = null;      // server rows for peekSession, or null = not loaded
+let _peekMsgRowsFor = '';     // which session _peekMsgRows belongs to
+
+// Local entries that the server has not echoed yet (no id) must survive the
+// swap to server-scoped rows, or a message you just sent vanishes until the
+// next poll — the "sent from phone, missing on desktop" class of bug.
+function _mergeUnechoed(serverRows, session) {
+  const seen = new Set(serverRows.map(r => (r.text || '') + '|' + (r.session || '')));
+  const local = _cmdHistory.filter(e => typeof e !== 'string' && !e.id
+    && (!session || (e.session || '') === session)
+    && !seen.has((e.text || '') + '|' + (e.session || '')));
+  return serverRows.concat(local).sort((a, b) => (a.time || a.ts || 0) - (b.time || b.ts || 0));
+}
+
+async function _peekMsgFetch(session) {
+  const r = await fetch(API + '/api/history?limit=500&session=' + encodeURIComponent(session),
+                        { headers: _authHeaders() });
+  if (!r.ok) throw new Error('history ' + r.status);
+  const rows = (await r.json()).map(x => ({ text: x.text, type: x.type, session: x.session,
+    time: x.ts, id: x.id, origin: x.origin || '', kind: x.kind, queued: x.queued }));
+  return _mergeUnechoed(rows.reverse(), session);
+}
+
 async function _peekMessagesLoad() {
+  const sess = peekSession;
+  if (_peekMsgRowsFor !== sess) { _peekMsgRows = null; _peekMsgRowsFor = sess; }
   _peekMessagesRender();                       // paint from local cache instantly
-  try { await _loadCmdHistoryFromServer(); } catch(e) {}   // refresh (cross-device)
+  try {
+    const rows = await _peekMsgFetch(sess);
+    if (peekSession !== sess) return;          // user moved on mid-flight
+    _peekMsgRows = rows;
+  } catch(e) {
+    try { await _loadCmdHistoryFromServer(); } catch(e2) {}   // fall back to the shared cache
+  }
   _peekMessagesRender();
 }
 
@@ -48055,7 +48241,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.206';
+const CACHE = 'amux-v0.9.211';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -50374,16 +50560,60 @@ class CCHandler(BaseHTTPRequestHandler):
                 limit = int(qs.get("limit", ["500"])[0])
                 offset = int(qs.get("offset", ["0"])[0])
                 session = qs.get("session", [""])[0]
+                # ?kind=human|session|schedule (comma-separated). Filtering is
+                # done here rather than client-side so the kind means the same
+                # thing to every consumer — the CLI, a future digest, and the
+                # dashboard all read one definition instead of re-deriving it.
+                want = [k.strip().lower() for k in (qs.get("kind", [""])[0] or "").split(",") if k.strip()]
+                want = [k for k in want if k in _MSG_KINDS]
                 db = get_db()
+                # ?counts=1 → totals per kind (respecting ?session=), ignoring
+                # limit. The UI fetches a kind-filtered WINDOW for the list but
+                # must label its chips with true totals; counting the window
+                # would make every unselected chip read 0.
+                if qs.get("counts"):
+                    if session:
+                        rows = db.execute("SELECT type, COUNT(*) c FROM cmd_history WHERE session=? GROUP BY type",
+                                          (session,)).fetchall()
+                    else:
+                        rows = db.execute("SELECT type, COUNT(*) c FROM cmd_history GROUP BY type").fetchall()
+                    out = {k: 0 for k in _MSG_KINDS}
+                    for r in rows:
+                        out[_msg_kind(r["type"])] += r["c"]
+                    out["all"] = sum(out[k] for k in _MSG_KINDS)
+                    return self._json(out)
+                # The kind filter MUST be in SQL, not applied to rows the LIMIT
+                # already returned. Filtering after the limit meant kind=human
+                # fetched the newest 500 rows and handed back the 48 that
+                # happened to be human — the exact crowding this was meant to
+                # fix, moved server-side. `human` is expressed as NOT the other
+                # two so unknown/legacy types land there, matching _msg_kind's
+                # fallback exactly.
+                where, params = [], []
                 if session:
-                    rows = db.execute(
-                        "SELECT id, text, type, session, ts, origin FROM cmd_history WHERE session=? ORDER BY ts DESC LIMIT ? OFFSET ?",
-                        (session, limit, offset)).fetchall()
-                else:
-                    rows = db.execute(
-                        "SELECT id, text, type, session, ts, origin FROM cmd_history ORDER BY ts DESC LIMIT ? OFFSET ?",
-                        (limit, offset)).fetchall()
-                return self._json([dict(r) for r in rows])
+                    where.append("session=?")
+                    params.append(session)
+                if want:
+                    ors = []
+                    for k in want:
+                        if k == "human":
+                            ors.append("type NOT IN ('session','schedule')")
+                        else:
+                            ors.append("type=?")
+                            params.append(k)
+                    where.append("(" + " OR ".join(ors) + ")")
+                sql = "SELECT id, text, type, session, ts, origin FROM cmd_history"
+                if where:
+                    sql += " WHERE " + " AND ".join(where)
+                sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+                rows = db.execute(sql, tuple(params) + (limit, offset)).fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["kind"] = _msg_kind(d.get("type"))
+                    d["queued"] = _msg_is_queued(d.get("type"))
+                    out.append(d)
+                return self._json(out)
             if method == "POST" and path == "/api/history":
                 body = self._read_body()
                 text = body.get("text", "").strip()
