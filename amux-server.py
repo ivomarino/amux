@@ -19149,6 +19149,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .new-status-input:focus { border-color: var(--accent); }
   .board-filters { display: flex; gap: 6px; flex-wrap: nowrap; padding: 6px 0 8px; align-items: center; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .board-filters::-webkit-scrollbar { display: none; }
+  /* Saved-view chips. Horizontally scrollable so 8 views don't wrap the board
+     off-screen on a 375px phone; scrollbar hidden to match .board-filters. */
+  .board-views { display: flex; gap: 6px; flex-wrap: nowrap; padding: 8px 0 4px; align-items: center;
+                 overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .board-views::-webkit-scrollbar { display: none; }
+  .board-view-chip {
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+    font-size: 0.72rem; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+    background: var(--card); color: var(--text); border: 1px solid var(--border);
+  }
+  .board-view-chip:hover { border-color: var(--dim); }
+  .board-view-chip.active { background: rgba(88,166,255,0.15); color: var(--accent); border-color: rgba(88,166,255,0.45); }
+  .board-view-chip.empty { color: var(--dim); }
+  .board-view-chip.add { color: var(--dim); border-style: dashed; }
+  .board-view-chip .bvc-n { font-size: 0.66rem; padding: 0 5px; border-radius: 999px;
+                            background: rgba(139,148,158,0.18); color: var(--dim); }
+  .board-view-chip.active .bvc-n { background: rgba(88,166,255,0.22); color: var(--accent); }
+  .board-view-chip .bvc-x { opacity: 0.35; padding: 0 2px; font-size: 0.7rem; }
+  .board-view-chip .bvc-x:hover { opacity: 1; color: #f85149; }
+  @media (max-width: 600px) {
+    /* 44px touch target without making the chips visually huge: the padding is
+       vertical breathing room, the row keeps its compact look. */
+    .board-view-chip { min-height: 34px; padding: 8px 12px; font-size: 0.74rem; }
+    .board-view-chip .bvc-x { padding: 0 6px; font-size: 0.8rem; }
+    .board-views { padding: 8px 0 6px; }
+  }
   .board-filter-label { font-size: 0.68rem; color: var(--dim); white-space: nowrap; }
   .board-filter-chip {
     font-size: 0.72rem; padding: 3px 10px; border-radius: 12px;
@@ -20794,8 +20820,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="board-view" style="display:none;">
   <div class="board-toolbar">
     <div class="board-search-wrap" style="flex:1;">
-      <input id="board-search" class="search-input" type="text" placeholder="Search board..." oninput="boardSearchQuery=this.value.toLowerCase();renderBoard()">
-      <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';renderBoard()">&#x2715;</button>
+      <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -session:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';renderBoard()">
+      <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';_boardActiveView='';renderBoard()">&#x2715;</button>
     </div>
     <button class="btn primary board-new-btn" onclick="openBoardAdd('todo')"><span class="board-new-label">+ New issue</span><span class="board-new-icon">+</span></button>
     <div class="board-owner-toggle">
@@ -20807,6 +20833,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
   </div>
+  <div class="board-views" id="board-views"></div>
   <div class="board-filters" id="board-filters"></div>
   <div class="board-columns" id="board-columns"></div>
 </div>
@@ -27978,7 +28005,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.203';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.205';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -35944,7 +35971,20 @@ let boardViewMode = localStorage.getItem('amux_board_view') || 'session';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
-let _collapsedCols = new Set(JSON.parse(localStorage.getItem('amux_col_collapsed') || '[]'));
+// First visit collapses the archive columns. backlog + todo are 1082 of 1553
+// items — they are the reason the ~64 in-flight cards are invisible. Collapsed
+// still shows the count and expands in one tap, and the seed is written
+// immediately so any later toggle is the user's and is never re-seeded.
+let _collapsedCols;
+{
+  const _cc = localStorage.getItem('amux_col_collapsed');
+  if (_cc === null) {
+    _collapsedCols = new Set(['backlog', 'todo']);
+    try { localStorage.setItem('amux_col_collapsed', JSON.stringify([..._collapsedCols])); } catch(e) {}
+  } else {
+    _collapsedCols = new Set(JSON.parse(_cc || '[]'));
+  }
+}
 let _boardColPages = {};  // tracks how many cards to show per column (lazy load)
 
 function _boardShowMore(colId, pageSize) {
@@ -37788,7 +37828,11 @@ async function toggleSchedEnabled(id, enabled) {
   _peekRefreshSchedIfActive();
 }
 
+let _boardViewsLoaded = false;
 async function fetchBoard() {
+  // Saved views sync via /api/prefs so a view made on the desktop is on the
+  // phone. Fetched once, not on every board poll.
+  if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
   try {
     const [r, rs, rsg] = await Promise.all([
       fetch(API + '/api/board'),
@@ -37957,9 +38001,229 @@ function _beTagKeydown(e, prefix) {
   }
 }
 
+// ── Board query language (Linear/Jira-style) ───────────────────────────────
+// A query is whitespace-separated terms. `key:value` is a filter; anything else
+// is free text matched against title/desc/id/session/tags. Prefix '-' to negate.
+// Comma-separate for OR *within* a key; keys AND across:
+//     status:doing,review -session:amux is:rotting "exact phrase"
+//
+// The `is:` facets are the point of this: they are DERIVED from live session
+// state, not stored on the card. A card cannot tell you its session went dark
+// 30 days ago — the join can. Nothing here writes; a view is a question.
+const _BQ_KEYS = ['status','session','owner','type','tag','id','is','updated','created','shepherd','creator'];
+
+function _bqParse(q) {
+  const terms = [], text = [];
+  // Split on whitespace but keep "quoted phrases" intact.
+  const parts = (q || '').match(/-?(?:[a-z_]+:)?"[^"]*"|\S+/gi) || [];
+  for (let raw of parts) {
+    let neg = false;
+    if (raw[0] === '-') { neg = true; raw = raw.slice(1); }
+    const m = raw.match(/^([a-z_]+):(.*)$/i);
+    if (m && _BQ_KEYS.includes(m[1].toLowerCase())) {
+      const vals = m[2].replace(/^"|"$/g, '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+      if (vals.length) terms.push({ key: m[1].toLowerCase(), vals, neg });
+    } else {
+      const t = raw.replace(/^"|"$/g, '').toLowerCase();
+      if (t) text.push({ t, neg });
+    }
+  }
+  return { terms, text };
+}
+
+// Duration filters: updated:>7d  created:<3d  updated:>36h
+function _bqAgeMatch(vals, epochSecs) {
+  if (!epochSecs) return false;
+  const ageDays = (Date.now() / 1000 - (epochSecs > 1e11 ? epochSecs / 1000 : epochSecs)) / 86400;
+  return vals.some(v => {
+    const m = v.match(/^([<>])(\d+)([dhw])$/);
+    if (!m) return false;
+    const n = parseInt(m[2], 10) * (m[3] === 'h' ? 1 / 24 : m[3] === 'w' ? 7 : 1);
+    return m[1] === '>' ? ageDays > n : ageDays < n;
+  });
+}
+
+const _BQ_CLOSED = new Set(['done', 'verified', 'discarded', 'resolved']);
+const _BQ_ROT_DAYS = 7;
+
+// Session state indexed by name, so every card can be judged against the
+// session that owns it in O(1) rather than a scan per card per keystroke.
+function _bqSessionIndex() {
+  const ix = {};
+  (typeof sessions !== 'undefined' ? sessions : []).forEach(s => { ix[s.name] = s; });
+  return ix;
+}
+
+function _bqIs(item, val, ix) {
+  const st = (item.status || '').toLowerCase();
+  const sess = item.session ? ix[item.session] : null;
+  const idleDays = sess && sess.last_activity
+    ? (Date.now() / 1000 - sess.last_activity) / 86400 : Infinity;
+  switch (val) {
+    case 'open':     return !_BQ_CLOSED.has(st);
+    case 'closed':   return _BQ_CLOSED.has(st);
+    case 'active':   return st === 'doing' || st === 'review';
+    case 'stale':    return !!item.stale;
+    // Rotting = claimed in-flight by a REAL session that has not moved in a
+    // week. Deliberately excludes ownerless cards: those are is:orphan, and
+    // folding them in here made "Rotting" mostly mean "unowned", which is a
+    // different problem with a different fix.
+    case 'rotting':  return (st === 'doing' || st === 'review') && !!sess && idleDays > _BQ_ROT_DAYS;
+    case 'working':  return !!sess && sess.status === 'active';
+    case 'waiting':  return !!sess && sess.status === 'waiting';
+    case 'gated':    return !!sess && !!(sess.credit_limited || sess.rate_limited_until);
+    case 'offline':  return !!item.session && (!sess || !sess.running);
+    case 'orphan':   return !item.session || !ix[item.session];
+    case 'pinned':   return !!item.pinned;
+    case 'overdue':  return !!item.due && (item.due * (item.due > 1e11 ? 0.001 : 1)) < Date.now() / 1000;
+    case 'folded':   return ((item.desc || '').match(/New task:/g) || []).length > 0;
+    default:         return false;
+  }
+}
+
+function _bqMatch(item, ast, ix) {
+  for (const { t, neg } of ast.text) {
+    const hit = (item.title || '').toLowerCase().includes(t)
+      || (item.desc || '').toLowerCase().includes(t)
+      || (item.id || '').toLowerCase().includes(t)
+      || (item.session || '').toLowerCase().includes(t)
+      || (item.tags || []).some(x => x.toLowerCase().includes(t));
+    if (hit === neg) return false;
+  }
+  for (const { key, vals, neg } of ast.terms) {
+    let hit;
+    switch (key) {
+      case 'status':   hit = vals.includes((item.status || '').toLowerCase()); break;
+      case 'session':  hit = vals.includes('none') ? !item.session
+                             : vals.includes((item.session || '').toLowerCase()); break;
+      case 'shepherd': hit = vals.includes((item.shepherd || '').toLowerCase()); break;
+      case 'creator':  hit = vals.includes((item.creator || '').toLowerCase()); break;
+      case 'owner':    hit = vals.includes(item.owner_type === 'agent' ? 'agent' : 'human'); break;
+      case 'type':     hit = vals.includes((item.type || 'code').toLowerCase()); break;
+      case 'tag':      hit = (item.tags || []).some(t => vals.includes(t.toLowerCase())); break;
+      case 'id':       hit = vals.includes((item.id || '').toLowerCase()); break;
+      case 'is':       hit = vals.some(v => _bqIs(item, v, ix)); break;
+      case 'updated':  hit = _bqAgeMatch(vals, item.updated); break;
+      case 'created':  hit = _bqAgeMatch(vals, item.created); break;
+      default:         hit = true;
+    }
+    if (hit === neg) return false;
+  }
+  return true;
+}
+
+function _bqFilter(items, q) {
+  const s = (q || '').trim();
+  if (!s) return items;
+  const ast = _bqParse(s);
+  if (!ast.terms.length && !ast.text.length) return items;
+  const ix = _bqSessionIndex();
+  return items.filter(i => _bqMatch(i, ast, ix));
+}
+
+// ── Saved views ────────────────────────────────────────────────────────────
+// Built-ins answer the three questions you actually have when you open the
+// board: what is moving, what is stuck on me, what has rotted. They are code,
+// not data, so they cannot be deleted or drift. User views sync via /api/prefs
+// so a view saved on the desktop is there on the phone.
+const _BOARD_BUILTIN_VIEWS = [
+  { id: '_working',  name: 'Working now', q: 'is:working is:open',        hint: 'Cards whose session is running right now' },
+  { id: '_needsyou', name: 'Needs you',   q: 'is:waiting,gated is:open',  hint: 'Session is blocked at a prompt or a model gate' },
+  { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+' },
+  { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no session can execute it' },
+  { id: '_mine',     name: 'Mine',        q: 'owner:human is:open',       hint: 'Your own issues, not the agent cards' },
+];
+let _boardViews = [];        // user-saved: [{id,name,q}]
+let _boardActiveView = '';   // id of the applied view, '' = none
+
+function _boardViewsLoad() {
+  return fetch(API + '/api/prefs?key=board_views')
+    .then(r => r.json())
+    .then(d => {
+      try { _boardViews = JSON.parse(d.value || '[]') || []; } catch(e) { _boardViews = []; }
+      if (!Array.isArray(_boardViews)) _boardViews = [];
+    })
+    .catch(() => { _boardViews = []; });
+}
+function _boardViewsSave() {
+  return fetch(API + '/api/prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: 'board_views', value: JSON.stringify(_boardViews) }) }).catch(() => {});
+}
+function _boardApplyView(id) {
+  const v = _BOARD_BUILTIN_VIEWS.concat(_boardViews).find(x => x.id === id);
+  _boardActiveView = (_boardActiveView === id) ? '' : id;   // tap again to clear
+  const box = document.getElementById('board-search');
+  const q = _boardActiveView ? (v ? v.q : '') : '';
+  if (box) box.value = q;
+  boardSearchQuery = q;
+  renderBoard();
+}
+async function _boardSaveCurrentView() {
+  const q = ((document.getElementById('board-search') || {}).value || '').trim();
+  if (!q) { showToast('Nothing to save — type a query first'); return; }
+  // Not window.prompt(): a blocking dialog in a PWA is a dead end on iOS.
+  const ok = await showFormModal('Save view',
+    '<input id="bv-name" class="search-input" type="text" placeholder="View name" maxlength="32" style="width:100%;box-sizing:border-box">'
+    + '<div style="margin-top:8px;font-size:0.74rem;color:var(--dim);word-break:break-all"><code>' + esc(q) + '</code></div>');
+  const name = ((document.getElementById('bv-name') || {}).value || '').trim();
+  if (!ok || !name) return;
+  _boardViews.push({ id: 'v' + Date.now().toString(36), name: name.slice(0, 32), q });
+  await _boardViewsSave();
+  renderBoard();
+  showToast('View saved');
+}
+function _boardDeleteView(id, ev) {
+  if (ev) ev.stopPropagation();
+  _boardViews = _boardViews.filter(v => v.id !== id);
+  if (_boardActiveView === id) { _boardActiveView = ''; boardSearchQuery = '';
+    const b = document.getElementById('board-search'); if (b) b.value = ''; }
+  _boardViewsSave().then(renderBoard);
+}
+// Live count per view, so a chip reads "Rotting 43" and you can see the shape
+// of the fleet without applying anything.
+function _boardViewCount(q) {
+  try { return _bqFilter(boardItems.filter(i => !i.deleted), q).length; } catch(e) { return 0; }
+}
+function _boardRenderViews() {
+  const el = document.getElementById('board-views');
+  if (!el) return;
+  let h = '';
+  _BOARD_BUILTIN_VIEWS.forEach(v => {
+    const n = _boardViewCount(v.q);
+    const on = _boardActiveView === v.id;
+    h += '<button class="board-view-chip' + (on ? ' active' : '') + (n ? '' : ' empty') + '"'
+      +  ' title="' + esc(v.hint) + ' — ' + esc(v.q) + '"'
+      +  ' onclick="_boardApplyView(\'' + v.id + '\')">' + esc(v.name)
+      +  (n ? '<span class="bvc-n">' + n + '</span>' : '') + '</button>';
+  });
+  _boardViews.forEach(v => {
+    const n = _boardViewCount(v.q);
+    const on = _boardActiveView === v.id;
+    h += '<button class="board-view-chip saved' + (on ? ' active' : '') + '"'
+      +  ' title="' + esc(v.q) + '" onclick="_boardApplyView(\'' + v.id + '\')">' + esc(v.name)
+      +  (n ? '<span class="bvc-n">' + n + '</span>' : '')
+      +  '<span class="bvc-x" onclick="_boardDeleteView(\'' + v.id + '\',event)" title="Delete view">&#x2715;</span></button>';
+  });
+  h += '<button class="board-view-chip add" onclick="_boardSaveCurrentView()" title="Save the current query as a view">+ Save view</button>';
+  h += '<button class="board-view-chip add" onclick="_boardQueryHelp()" title="Query syntax">?</button>';
+  el.innerHTML = h;
+}
+function _boardQueryHelp() {
+  showFormModal('Board query syntax',
+    '<div style="font-size:0.8rem;line-height:1.6">'
+    + '<p style="margin:0 0 8px;color:var(--dim)">Terms are AND-ed. Comma-separate to OR within a key. Prefix <code>-</code> to negate. Quote phrases.</p>'
+    + '<p style="margin:0 0 4px"><b>Fields</b><br><code>status: session: owner: type: tag: id: shepherd: creator:</code></p>'
+    + '<p style="margin:0 0 4px"><b>Derived</b> (joined against live session state)<br>'
+    + '<code>is:open is:closed is:stale is:rotting is:working is:waiting is:gated is:offline is:orphan is:pinned is:overdue is:folded</code></p>'
+    + '<p style="margin:0 0 4px"><b>Age</b><br><code>updated:&gt;7d created:&lt;3d updated:&gt;36h</code></p>'
+    + '<p style="margin:8px 0 0;color:var(--dim)">Example: <code>status:doing -session:none updated:&gt;14d</code></p>'
+    + '</div>', 'Close');
+}
+
 function renderBoardFilters() {
   const el = document.getElementById('board-filters');
   if (!el) return;
+  _boardRenderViews();
   const allTags = [...new Set(boardItems.flatMap(i => i.tags || []))].sort();
   const allSessions = [...new Set(boardItems.map(i => i.session).filter(Boolean))].sort();
   let html = '';
@@ -38193,19 +38457,20 @@ function renderBoard() {
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
   if (boA) boA.classList.toggle('active', boardOwnerFilter === 'agent');
 
-  let visible = boardItems.filter(i => boardOwnerFilter === 'agent' ? i.owner_type === 'agent' : i.owner_type !== 'agent');
+  // A non-empty query REPLACES the Human/Sessions toggle rather than stacking
+  // with it. Stacking made the chip counts lie: "Rotting 5" rendered 0 cards,
+  // because all 5 are agent-owned and the toggle defaults to Human. The count
+  // is computed over the same unfiltered set, so a chip that says 5 must show
+  // 5. The toggle is the browse default; the query is the filter.
+  const _qActive = !!(boardSearchQuery || '').trim();
+  let visible = _qActive ? boardItems.slice()
+    : boardItems.filter(i => boardOwnerFilter === 'agent' ? i.owner_type === 'agent' : i.owner_type !== 'agent');
   if (boardFilterTag) visible = visible.filter(i => (i.tags || []).includes(boardFilterTag));
   if (boardFilterSession) visible = visible.filter(i => i.session === boardFilterSession);
-  if (boardSearchQuery) {
-    const q = boardSearchQuery;
-    visible = visible.filter(i =>
-      (i.title || '').toLowerCase().includes(q) ||
-      (i.desc || '').toLowerCase().includes(q) ||
-      (i.id || '').toLowerCase().includes(q) ||
-      (i.session || '').toLowerCase().includes(q) ||
-      (i.tags || []).some(t => t.toLowerCase().includes(q))
-    );
-  }
+  // Structured query: key:value facets, -negation, quoted phrases, and is:
+  // facets derived from live session state. Bare words still substring-match,
+  // so the old search behaviour is a strict subset of this.
+  visible = _bqFilter(visible, boardSearchQuery);
 
   if (boardViewMode === 'session') {
     container.classList.remove('board-columns');
@@ -47746,7 +48011,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.203';
+const CACHE = 'amux-v0.9.205';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
