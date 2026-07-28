@@ -1,5 +1,32 @@
 [
   {
+    "hash": "9f3a9b601418c96c61ecdb544fe0f8d79ef6fffb",
+    "short": "9f3a9b6",
+    "title": "Session tabs sorted by frequency — find your active sessions instantly",
+    "date": "2026-07-28",
+    "type": "feat",
+    "tags": ["sessions", "ux", "peek", "dictation"],
+    "description": "The peek panel's tab order now reflects how often you actually reach for each tab. High-frequency live tabs (Terminal, Steering, Messages, Dictation) move to the front; lower-frequency reference tabs (Transcript, Worktree, Commits) move to the back. New order: Terminal, Steering, Schedules, Messages, Dictation, Board, Notes, Cost, Transcript, Commits, Worktree. The Dictation tab also gets a badge when you're recording, so you can see which sessions are actively receiving voice input at a glance."
+  },
+  {
+    "hash": "279d8eb5c0091b47a7da386eb02e262e2197c826",
+    "short": "279d8eb",
+    "title": "Local Whisper dictation — 12× faster, works fully offline",
+    "date": "2026-07-27",
+    "type": "feat",
+    "tags": ["dictation", "offline", "mobile", "voice"],
+    "description": "amux's voice dictation now runs local Whisper transcription on-device instead of sending audio to a cloud API. The result is a 12× speed improvement (measured on 4 realistic amux dictations) and full offline capability — dictate to your agents on a plane, in a dead zone, or anywhere without internet. Deterministic session name recovery replaces the previous probabilistic match, eliminating misrouted messages. The fallback to cloud Whisper is still available for devices that prefer it."
+  },
+  {
+    "hash": "6355f152953bfa9fd7fe55e9812f75ba9d00fb9e",
+    "short": "6355f15",
+    "title": "Persistent dictation outbox — never lose a voice message again (v0.9.202)",
+    "date": "2026-07-27",
+    "type": "feat",
+    "tags": ["dictation", "reliability", "mobile", "offline"],
+    "description": "v0.9.202 fixes the most painful dictation failure: a server-side error (Gemini hiccup, quota limit, bad API key) previously caused the recorded audio to be silently discarded. Re-recording was the only option. Now, every recorded audio clip is saved to a persistent outbox before transmission. If the send fails for any reason — network drop, server error, quota — the clip stays in the outbox and you can retry the exact same take. No re-recording, no lost messages."
+  },
+  {
     "hash": "b120b6c1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7",
     "short": "b120b6c",
     "title": "Stalled agent badge + truthful gated-send response (v0.9.201)",
