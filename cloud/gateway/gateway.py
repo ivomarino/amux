@@ -2226,8 +2226,38 @@ class Handler(BaseHTTPRequestHandler):
                             print(f"[referral] {email} referred by {referrer['id']} via code {ref_cookie}", flush=True)
                         except sqlite3.IntegrityError:
                             pass  # already referred
+            # ── Auto-accept a pending invite addressed to this email ──────────
+            # Clerk's ticket flow does not reliably land the user on
+            # /invite/<token> after signup (verified: Clerk marked the
+            # invitation accepted while our org invite stayed unused, so the
+            # user got a personal workspace instead of the one provisioned for
+            # them). Matching on the invited address makes acceptance
+            # independent of wherever Clerk chooses to redirect. Only invites
+            # explicitly issued to this exact address are ever accepted.
+            auto_org = None
+            if email:
+                inv = db.execute(
+                    "SELECT token, org_id, role FROM org_invites "
+                    "WHERE lower(email)=? AND used_at IS NULL AND expires_at > ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (email.strip().lower(), now)).fetchone()
+                if inv:
+                    try:
+                        with _db_lock:
+                            db.execute("UPDATE org_invites SET used_at=?, used_by=? WHERE token=?",
+                                       (now, user_id, inv["token"]))
+                            db.execute(
+                                "INSERT OR IGNORE INTO org_memberships (org_id, user_id, role, joined_at) "
+                                "VALUES (?,?,?,?)",
+                                (inv["org_id"], user_id, inv["role"] or "member", now))
+                            db.commit()
+                        auto_org = inv["org_id"]
+                        print(f"[invite] auto-accepted {email} into {auto_org} at login", flush=True)
+                    except Exception as e:
+                        print(f"[invite] auto-accept failed for {email}: {e}", flush=True)
+
             cookie_val = _make_cookie(user_id)
-            resp_body = json.dumps({"ok": True}).encode()
+            resp_body = json.dumps({"ok": True, "org_id": auto_org}).encode()
             sec = self._secure_cookie_flags()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2235,6 +2265,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie",
                 f"amux_session={cookie_val}; HttpOnly{sec}; SameSite=Lax; "
                 f"Max-Age={COOKIE_MAX_AGE}; Path=/")
+            if auto_org:
+                self.send_header("Set-Cookie",
+                    f"amux_org={auto_org}; HttpOnly{sec}; SameSite=Lax; Path=/")
             if ref_cookie:
                 self.send_header("Set-Cookie",
                     f"amux_ref=; Path=/; Max-Age=0; HttpOnly{sec}; SameSite=Lax")
