@@ -269,16 +269,36 @@ def verify(org, sessions, settle=90):
             bad(f"{name}: peek failed ({code})")
             continue
         text = d.get("history") or d.get("output") or ""
-        if len(text.strip()) < 40:
-            bad(f"{name}: no meaningful output ({len(text)} chars) — "
-                f"likely no Claude auth in this workspace")
+        # The terminal echoes the prompt, so any expectation drawn from the
+        # prompt's own vocabulary matched itself — 'tier' and 'factor' both
+        # "passed" while the agent was actually erroring. Strip the prompt and
+        # the schedule commands before asserting, so a match means the AGENT
+        # said it.
+        haystack = text
+        for echoed in [s.get("prompt", "")] + [sc.get("command", "") for sc in s.get("schedules", [])]:
+            if echoed:
+                haystack = haystack.replace(echoed, " ")
+        if "API Error" in text or "api error" in text.lower():
+            bad(f"{name}: session shows an API error — agent could not reach Claude")
             continue
-        ok(f"{name}: produced {len(text)} chars of output")
+        if len(haystack.strip()) < 40:
+            bad(f"{name}: no agent output beyond the echoed prompt "
+                f"({len(haystack)} chars) — check Claude auth in this workspace")
+            continue
+        ok(f"{name}: produced {len(haystack)} chars of agent output")
         for needle in s.get("expect", []):
-            if needle.lower() in text.lower():
+            if needle.lower() in haystack.lower():
                 ok(f"{name}: found expected '{needle}'")
             else:
-                bad(f"{name}: expected '{needle}' not in output")
+                bad(f"{name}: expected '{needle}' not in agent output")
+        # Prefer file evidence when the plan declares it — a written artifact is
+        # far stronger than terminal text.
+        for f in s.get("expect_files", []):
+            code2, d2 = gw_json("GET", f"/api/fs/read?path={urllib.parse.quote(f)}", org=org)
+            body2 = d2.get("content", "") if isinstance(d2, dict) else str(d2)
+            (ok if code2 == 200 and len(body2) > 20 else bad)(
+                f"{name}: artifact {f} ({len(body2)} bytes)" if code2 == 200
+                else f"{name}: artifact {f} missing ({code2})")
 
 
 def spend_report(org):
