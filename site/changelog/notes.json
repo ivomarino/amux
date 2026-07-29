@@ -1,5 +1,59 @@
 [
   {
+    "hash": "d6116f61fd1655ce689a013dfc889cb49274ff5e",
+    "short": "d6116f6",
+    "title": "Messages tab now filters by kind — human, session, or schedule",
+    "date": "2026-07-28",
+    "type": "feat",
+    "tags": ["messages", "ux", "filter", "fleet"],
+    "description": "The three-kind message filter (human / session / schedule) that was already available in the peek panel is now also on the standalone Messages tab. Filter to only see messages you sent, only inter-agent relays, or only scheduled triggers — or view all three together. Useful on the Messages tab when reviewing what happened overnight across a large fleet."
+  },
+  {
+    "hash": "90c5f75cda9f541ed589b9ffd550b23687be7f91",
+    "short": "90c5f75",
+    "title": "Browser profiles — create and use named auth sessions for automation",
+    "date": "2026-07-28",
+    "type": "feat",
+    "tags": ["browser", "profiles", "automation", "authentication"],
+    "description": "The Browser tab now shows all your saved browser profiles and lets you create new ones directly from the UI. Each profile stores its own cookie jar and authentication state, so AI browser automation tasks start already logged in — no re-entering credentials on every run. Create a 'stripe' profile, a 'github-work' profile, a 'client-acme' profile, and launch different agents with different identities simultaneously. Profiles persist across server restarts in ~/.amux/browser-profiles/."
+  },
+  {
+    "hash": "b6781b578e4cb63c2e172be41fa21478ee9827e6",
+    "short": "b6781b5",
+    "title": "Copy path button in file preview — one click to copy a file's bare path",
+    "date": "2026-07-28",
+    "type": "feat",
+    "tags": ["files", "ux", "clipboard"],
+    "description": "The file preview overlay now has a dedicated 'Path' button next to 'Copy' and 'Link'. Clicking it copies the file's bare relative path to clipboard — useful when you want to reference a file in a steering message, a script, or another tool without the full deep-link URL. The underlying clipboard + toast logic was refactored into a shared helper so both Path and Link use the same fallback and toast behavior. Contributed by @Dygreens in PR #64."
+  },
+  {
+    "hash": "51d8c454b4dd9649297ad699b5c7b11fb4de39a7",
+    "short": "51d8c45",
+    "title": "MKV and HEVC video files now play in the Files tab",
+    "date": "2026-07-28",
+    "type": "fix",
+    "tags": ["files", "video", "transcoding", "media"],
+    "description": "MKV files (including HEVC/H.265 codec) were showing 'Format not supported by this browser' instead of playing. The bug was a one-liner: the video player was extracting the file extension from the API URL path (/api/file/raw) instead of from the 'path=' query parameter — so ext was always 'raw', bypassing the ffmpeg transcoding path. Fixed. MKV files now correctly route through the background MP4 prepare job with progress indicator, and fall back to live-transcode for desktop browsers when the cache is empty."
+  },
+  {
+    "hash": "aff3025febf5814899a0c94de5de452684bde02d",
+    "short": "aff3025",
+    "title": "Service worker caches the app shell — 1.6 MB saved on every reload",
+    "date": "2026-07-28",
+    "type": "perf",
+    "tags": ["performance", "offline", "pwa", "mobile"],
+    "description": "The amux dashboard's app shell (HTML, CSS, JS) was being re-fetched from the server on every page load — 1.6 MB of network traffic per visit. The service worker now caches the shell on first install and serves it from cache on subsequent loads. Result: sub-100ms dashboard loads on repeat visits, even on slow mobile connections. The service worker also now correctly installs over the self-signed TLS certificate used for localhost development."
+  },
+  {
+    "hash": "43483bddc980c82b5efe1f096b04a2c92ad11c46",
+    "short": "43483bd",
+    "title": "Fix: browser profile picker crash and localStorage quota error",
+    "date": "2026-07-28",
+    "type": "fix",
+    "tags": ["browser", "profiles", "crash", "stability"],
+    "description": "Two bugs in the browser profiles UI were fixed: (1) opening the browser tab with no profiles created caused a crash in the profile picker dropdown; (2) saving a large browser session state to localStorage was throwing a quota exceeded error, which could silently prevent profile saves. The profile picker now gracefully renders an empty state, and profile data is no longer stored in localStorage (moved to server-side storage via ~/.amux/browser-profiles/)."
+  },
+  {
     "hash": "9f3a9b601418c96c61ecdb544fe0f8d79ef6fffb",
     "short": "9f3a9b6",
     "title": "Session tabs sorted by frequency — find your active sessions instantly",
