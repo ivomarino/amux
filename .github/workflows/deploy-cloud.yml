@@ -45,17 +45,22 @@ jobs:
           # the HOST. The gateway process reads them; user containers never receive
           # them. Values are piped over stdin so they never appear in a command line
           # or in the workflow log.
-          if [ -n "${{ secrets.STRIPE_SECRET_KEY }}" ]; then
-            printf '%s' "${{ secrets.STRIPE_SECRET_KEY }}" | ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
-              'read -r V; touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env;
-               if grep -q "^STRIPE_SECRET_KEY=" /etc/amux/gateway.env; then
-                 grep -v "^STRIPE_SECRET_KEY=" /etc/amux/gateway.env > /etc/amux/.ge.tmp
+          sync_secret() {
+            NAME="$1"; VAL="$2"
+            [ -z "$VAL" ] && { echo "$NAME: not set in repo secrets — skipped"; return; }
+            printf '%s' "$VAL" | ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
+              "read -r V; N='$NAME'; touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env;
+               if grep -q \"^\$N=\" /etc/amux/gateway.env; then
+                 grep -v \"^\$N=\" /etc/amux/gateway.env > /etc/amux/.ge.tmp
                  mv /etc/amux/.ge.tmp /etc/amux/gateway.env
                  chmod 600 /etc/amux/gateway.env
                fi
-               printf "STRIPE_SECRET_KEY=%s\n" "$V" >> /etc/amux/gateway.env
-               echo "STRIPE_SECRET_KEY updated (${#V} chars, value not shown)"'
-          fi
+               printf '%s=%s\n' \"\$N\" \"\$V\" >> /etc/amux/gateway.env
+               echo \"\$N updated (\${#V} chars, value not shown)\""
+          }
+          sync_secret STRIPE_SECRET_KEY "${{ secrets.STRIPE_SECRET_KEY }}"
+          sync_secret ANTHROPIC_API_KEY "${{ secrets.ANTHROPIC_API_KEY }}"
+          sync_secret STRIPE_PLATFORM_FEE_PRICE_ID "${{ secrets.STRIPE_PLATFORM_FEE_PRICE_ID }}"
 
       - name: Deploy gateway.py
         run: |
