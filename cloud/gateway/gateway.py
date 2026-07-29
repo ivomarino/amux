@@ -1184,8 +1184,15 @@ def _handle_anthropic_proxy(handler, path, qs):
     url = "https://api.anthropic.com/" + upstream
     if qs:
         url += "?" + qs
-    skip = {"host", "content-length", "authorization", "x-api-key", "cookie", "connection"}
+    # accept-encoding is dropped so upstream replies uncompressed. We rewrite the
+    # response headers (stripping content-encoding), so forwarding a gzip request
+    # produced compressed bytes labelled as plain JSON — the client then failed
+    # with "API Error: Failed to parse JSON". Requesting identity keeps the body
+    # and the headers we emit consistent.
+    skip = {"host", "content-length", "authorization", "x-api-key", "cookie",
+            "connection", "accept-encoding"}
     fwd = {k: v for k, v in handler.headers.items() if k.lower() not in skip}
+    fwd["accept-encoding"] = "identity"
     fwd["x-api-key"] = ANTHROPIC_API_KEY
     fwd.setdefault("anthropic-version", "2023-06-01")
     req = urllib.request.Request(url, data=body, method=handler.command, headers=fwd)
