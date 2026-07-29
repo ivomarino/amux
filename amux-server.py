@@ -21682,11 +21682,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="search-wrap" style="flex:1;min-width:180px;">
       <input class="search-input" id="msgs-search" type="text" placeholder="Search messages..." autocomplete="off" oninput="_messagesRender()">
     </div>
-    <select id="msgs-session-filter" onchange="_messagesRender()" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
+    <select id="msgs-session-filter" onchange="_msgsCounts=null;_messagesLoad(true,this.value)" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
       <option value="">All sessions</option>
     </select>
     <span id="msgs-count" style="font-size:0.75rem;color:var(--dim);white-space:nowrap;"></span>
-    <button class="btn" onclick="_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;">&#x21BB;</button>
+  </div>
+  <div id="msgs-kind-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:10px;flex-shrink:0;align-items:center;">
+    <button class="btn" onclick="_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
   <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
   <div style="flex-shrink:0;padding-top:8px;text-align:center;">
@@ -28199,7 +28201,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.222';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.223';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44957,8 +44959,18 @@ let _msgsDone = false;
 async function _messagesLoad(reset, presetSession) {
   if (reset !== false) { _msgsData = []; _msgsOffset = 0; _msgsDone = false; }
   try {
-    const r = await fetch(API + '/api/history?limit=' + _MSGS_PAGE + '&offset=' + _msgsOffset);
+    // Kind-scoped at the SERVER. Filtering a mixed page client-side is what
+    // showed 48 human messages out of 6547 — the human rows never made it into
+    // the window. ?counts=1 supplies true per-kind totals for the chips, which
+    // a tally of the fetched page cannot (every unselected chip would read 0).
+    const _sf = document.getElementById('msgs-session-filter')?.value || '';
+    let _u = API + '/api/history?limit=' + _MSGS_PAGE + '&offset=' + _msgsOffset;
+    if (_msgsKind !== 'all') _u += '&kind=' + encodeURIComponent(_msgsKind);
+    if (_sf) _u += '&session=' + encodeURIComponent(_sf);
+    const r = await fetch(_u);
     const rows = await r.json();
+    fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
+      .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
     _msgsData = _msgsData.concat(rows);
     _msgsOffset += rows.length;
@@ -45000,26 +45012,70 @@ function _msgLocate(session, encText) {
   openPeek(session, { query: snippet });
 }
 
+// Same three kinds, same order, same chip class as the peek Messages tab and
+// the history modal — one definition so the three surfaces cannot drift.
+// Defaults to human for the same reason: on a busy fleet, inter-session and
+// scheduler traffic outnumber what you typed by roughly 3:1 and bury it.
+let _msgsKind = 'human';        // all | human | session | schedule
+let _msgsCounts = null;         // true per-kind totals from the server
+function _msgsSetKind(k) {
+  _msgsKind = k;
+  _messagesLoad(true, document.getElementById('msgs-session-filter')?.value || '');
+}
+function _msgsRenderChips() {
+  const bar = document.getElementById('msgs-kind-filter');
+  if (!bar) return;
+  const c = _msgsCounts || { all: _msgsData.length, human: 0, session: 0, schedule: 0 };
+  if (!_msgsCounts) _msgsData.forEach(m => { c[_msgKind(m)] = (c[_msgKind(m)] || 0) + 1; });
+  const chips = [['all', 'All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
+  const refresh = '<button class="btn" onclick="_messagesLoad(true)" title="Refresh" '
+    + 'style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">\u21BB</button>';
+  bar.innerHTML = refresh + chips.map(([k, lbl]) => {
+    const on = _msgsKind === k;
+    const km = _MSG_KIND[k];
+    const col = km ? km.color : 'var(--accent)';
+    return '<button class="msg-kind-chip" onclick="_msgsSetKind(\'' + k + '\')" style="'
+      + 'border:1px solid ' + (on ? col : 'var(--border)') + ';'
+      + 'background:' + (on ? (km ? km.bg : 'rgba(88,166,255,0.14)') : 'transparent') + ';'
+      + 'color:' + (on ? col : 'var(--dim)') + ';">' + lbl + ' ' + (c[k] || 0) + '</button>';
+  }).join('');
+}
+
 function _messagesRender() {
   const list = document.getElementById('msgs-list');
   if (!list) return;
   const q = (document.getElementById('msgs-search')?.value || '').trim().toLowerCase();
   const sessF = document.getElementById('msgs-session-filter')?.value || '';
+  _msgsRenderChips();
   let rows = _msgsData;
   if (sessF) rows = rows.filter(m => (m.session || '') === sessF);
+  // No client-side kind filter: the fetch is already kind-scoped, so the page
+  // is 500 rows OF THAT KIND rather than 500 mixed rows filtered down to a
+  // handful — the same crowding that showed 48 human messages out of 6547.
+  if (_msgsKind !== 'all') rows = rows.filter(m => _msgKind(m) === _msgsKind);
   if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q) || (m.session || '').toLowerCase().includes(q));
   const count = document.getElementById('msgs-count');
   if (count) count.textContent = rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)');
   const more = document.getElementById('msgs-more-btn');
   if (more) more.style.display = _msgsDone ? 'none' : '';
   if (!rows.length) {
-    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">' + (q || sessF ? 'No matches.' : 'No messages yet.') + '</div>';
+    const kl = (_MSG_KIND[_msgsKind] || {}).label;
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">'
+      + (q ? 'No matches.'
+           : kl ? 'No ' + kl.toLowerCase() + ' messages' + (sessF ? ' for ' + esc(sessF) : '') + '.'
+                : (sessF ? 'No messages for ' + esc(sessF) + '.' : 'No messages yet.')) + '</div>';
     return;
   }
   list.innerHTML = rows.map(m => {
     const enc = encodeURIComponent(m.text || '').replace(/'/g, '%27');
     const sess = m.session || '';
-    const tag = m.type === 'steering' ? '<span class="msg-tag steering">queued</span>' : '';
+    // Was queued-only, so a session or scheduled message carried no marker at
+    // all here. Same badge the other two surfaces show.
+    const _k = _msgKind(m), _km = _MSG_KIND[_k] || _MSG_KIND.human;
+    const _sfx = _k === 'human' ? (_msgQueued(m) ? ' \u00B7 queued' : ' \u00B7 direct')
+                                : (m.origin ? ' \u00B7 ' + esc(String(m.origin).slice(0, 26)) : '');
+    const tag = '<span class="msg-tag" style="background:' + _km.bg + ';color:' + _km.color
+      + ';font-weight:600;border-left:3px solid ' + _km.color + ';">' + _km.label + _sfx + '</span>';
     return '<div class="msg-row" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
       '<div class="msg-main">' +
         '<div class="msg-meta">' +
@@ -48653,7 +48709,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.222';
+const CACHE = 'amux-v0.9.223';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
