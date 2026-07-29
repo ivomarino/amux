@@ -28375,7 +28375,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.226';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.228';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31753,8 +31753,8 @@ function slashAcKeydown(e) {
   if (!el.classList.contains('open')) {
     // Enter inserts a newline (standard textarea) — do NOT send. Send is the Send
     // button or Cmd/Ctrl+Enter (handled just above). Arrows still browse history.
-    if (e.key === 'ArrowUp' && inp.selectionStart === 0) { e.preventDefault(); cmdHistoryUp(inp); return; }
-    if (e.key === 'ArrowDown' && _cmdHistoryIdx !== -1) { e.preventDefault(); cmdHistoryDown(inp); return; }
+    if (e.key === 'ArrowUp' && inp.selectionStart === 0) { e.preventDefault(); cmdHistoryUp(inp, peekSession); return; }
+    if (e.key === 'ArrowDown' && _cmdHistoryIdx !== -1) { e.preventDefault(); cmdHistoryDown(inp, peekSession); return; }
     return;
   }
   const atMode = !!el._atItems;
@@ -32837,19 +32837,60 @@ function _msgOpenInsert(sess, encText) {
   }, 500);
 }
 
-function cmdHistoryUp(inp) {
-  if (!_cmdHistory.length) return;
-  if (_cmdHistoryIdx === -1) { _cmdHistoryDraft = inp.value; _cmdHistoryIdx = _cmdHistory.length - 1; }
+// Up-arrow recall is YOUR prompts to THIS session, nothing else. It used to
+// index the raw global _cmdHistory, so pressing up in one session's composer
+// cycled through other sessions' inter-session mail and scheduler payloads —
+// none of which you ever typed and none of which you would want to re-send.
+let _cmdRecallSess = null;    // session the cached list belongs to
+let _cmdRecallItems = [];     // that session's human messages, oldest -> newest
+
+function _cmdRecallBuild(session) {
+  const out = [];
+  for (const e of _cmdHistory) {
+    // Legacy string rows carry no session or kind, so they cannot be attributed
+    // and are skipped rather than shown under an arbitrary session.
+    if (typeof e === 'string') continue;
+    if ((e.session || '') !== session) continue;
+    if (_msgKind(e) !== 'human') continue;
+    // Strip a captured '\u276F' prompt glyph. Claude Code's prompt marker
+    // sometimes lands in history alongside the same text without it, which made
+    // recall show the identical prompt twice in a row. Only that glyph is
+    // removed, never a leading '>' a person may have typed as a quote.
+    const t = (e.text || '').replace(/^\u276F\s*/, '').trim();
+    if (!t) continue;
+    if (out.length && out[out.length - 1] === t) continue;   // collapse repeats
+    out.push(t);
+  }
+  return out;
+}
+
+// Rebuilt whenever recall STARTS (idx === -1) so anything just sent is present,
+// and whenever the session changes so the index can never point into another
+// session's list.
+function _cmdRecallEnsure(session) {
+  if (_cmdHistoryIdx === -1 || _cmdRecallSess !== session) {
+    _cmdRecallSess = session;
+    _cmdRecallItems = _cmdRecallBuild(session);
+  }
+  return _cmdRecallItems;
+}
+
+function cmdHistoryUp(inp, session) {
+  const sess = session || (typeof peekSession !== 'undefined' ? peekSession : '') || '';
+  const list = _cmdRecallEnsure(sess);
+  if (!list.length) return;
+  if (_cmdHistoryIdx === -1) { _cmdHistoryDraft = inp.value; _cmdHistoryIdx = list.length - 1; }
   else if (_cmdHistoryIdx > 0) { _cmdHistoryIdx--; }
-  const e = _cmdHistory[_cmdHistoryIdx];
-  inp.value = typeof e === 'string' ? e : e.text;
+  inp.value = list[_cmdHistoryIdx] || '';
   autoGrow(inp);
   requestAnimationFrame(() => { inp.selectionStart = inp.selectionEnd = inp.value.length; });
 }
 
-function cmdHistoryDown(inp) {
+function cmdHistoryDown(inp, session) {
   if (_cmdHistoryIdx === -1) return;
-  if (_cmdHistoryIdx < _cmdHistory.length - 1) { _cmdHistoryIdx++; const e = _cmdHistory[_cmdHistoryIdx]; inp.value = typeof e === 'string' ? e : e.text; }
+  const sess = session || (typeof peekSession !== 'undefined' ? peekSession : '') || '';
+  const list = _cmdRecallEnsure(sess);
+  if (_cmdHistoryIdx < list.length - 1) { _cmdHistoryIdx++; inp.value = list[_cmdHistoryIdx] || ''; }
   else { _cmdHistoryIdx = -1; inp.value = _cmdHistoryDraft; }
   autoGrow(inp);
   requestAnimationFrame(() => { inp.selectionStart = inp.selectionEnd = inp.value.length; });
@@ -32941,8 +32982,8 @@ function cardSlashAcKeydown(name, e) {
   if (!el || !el.classList.contains('open')) {
     // Enter inserts a newline (standard textarea) — do NOT send. Send is the Send
     // button or Cmd/Ctrl+Enter (handled just above). Arrows still browse history.
-    if (e.key === 'ArrowUp' && inp && inp.selectionStart === 0) { e.preventDefault(); cmdHistoryUp(inp); return; }
-    if (e.key === 'ArrowDown' && _cmdHistoryIdx !== -1) { e.preventDefault(); if (inp) cmdHistoryDown(inp); return; }
+    if (e.key === 'ArrowUp' && inp && inp.selectionStart === 0) { e.preventDefault(); cmdHistoryUp(inp, name); return; }
+    if (e.key === 'ArrowDown' && _cmdHistoryIdx !== -1) { e.preventDefault(); if (inp) cmdHistoryDown(inp, name); return; }
     return;
   }
   const atMode = !!el._atItems;
@@ -41457,9 +41498,9 @@ function gpSendKeydown(name, e) {
     const hasSelection = inp && inp.selectionStart !== inp.selectionEnd;
     if (!hasSelection) { e.preventDefault(); gpDoKeys(name, 'C-c'); }
   } else if (e.key === 'ArrowUp' && inp && inp.selectionStart === 0) {
-    e.preventDefault(); cmdHistoryUp(inp);
+    e.preventDefault(); cmdHistoryUp(inp, name);
   } else if (e.key === 'ArrowDown' && _cmdHistoryIdx !== -1) {
-    e.preventDefault(); cmdHistoryDown(inp);
+    e.preventDefault(); cmdHistoryDown(inp, name);
   }
 }
 
@@ -48901,7 +48942,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.226';
+const CACHE = 'amux-v0.9.228';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
