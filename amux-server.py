@@ -20759,6 +20759,23 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <span style="font-size:1rem;">?</span> Walkthrough
           </button>
         </div>
+        <!-- Cloud trial/billing card — populated only when the gateway answers
+             /api/stripe/status (cloud). Self-hosted leaves it hidden. -->
+        <div class="settings-section" id="settings-cloud-plan" style="display:none;padding:10px 14px;">
+          <div class="settings-section-label">Plan</div>
+          <div id="cloud-plan-body" style="font-size:0.8rem;color:var(--dim);line-height:1.5;"></div>
+          <div id="cloud-plan-meter" style="height:6px;border-radius:4px;background:var(--border);margin:8px 0 6px;overflow:hidden;display:none;">
+            <div id="cloud-plan-meter-fill" style="height:100%;width:0;background:var(--accent);border-radius:4px;transition:width .3s;"></div>
+          </div>
+          <button id="cloud-plan-btn" onclick="_upgradeCheckout('monthly')"
+            style="width:100%;min-height:44px;padding:9px 12px;border-radius:8px;border:none;background:#7c6fcd;color:#fff;font-size:0.82rem;font-weight:600;cursor:pointer;display:none;">
+            Upgrade
+          </button>
+          <button id="cloud-plan-manage" onclick="_cloudBillingPortal()"
+            style="width:100%;min-height:44px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:0.82rem;font-weight:600;cursor:pointer;display:none;">
+            Manage billing
+          </button>
+        </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
           <div class="settings-section-label">Offline</div>
@@ -23279,6 +23296,63 @@ function _showUpgradeModal(d) {
       '<div id="upgrade-modal-err" style="color:#f87171;font-size:0.8rem;min-height:1.1em;"></div>' +
     '</div>';
   document.body.appendChild(wrap);
+}
+
+// Cloud plan card in Settings. /api/stripe/status only exists on the cloud
+// gateway, so a failed fetch (self-hosted) simply leaves the card hidden.
+async function _loadCloudPlan() {
+  try {
+    const r = await fetch('/api/stripe/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d || !d.plan) return;
+    const sec = document.getElementById('settings-cloud-plan');
+    const body = document.getElementById('cloud-plan-body');
+    const btn = document.getElementById('cloud-plan-btn');
+    const manage = document.getElementById('cloud-plan-manage');
+    const meter = document.getElementById('cloud-plan-meter');
+    const fill = document.getElementById('cloud-plan-meter-fill');
+    if (!sec) return;
+    sec.style.display = '';
+    const lines = [];
+    if (d.plan === 'pro') {
+      lines.push('<span style="color:#3fb950;font-weight:600;">Pro</span> — unlimited sessions');
+    } else {
+      lines.push('<span style="font-weight:600;color:var(--text);">Trial</span>');
+      if (d.trial_ends_at) {
+        const days = Math.max(0, Math.ceil((d.trial_ends_at * 1000 - Date.now()) / 86400000));
+        lines.push(days + ' day' + (days === 1 ? '' : 's') + ' left');
+      }
+      if (d.budget_usd != null) {
+        const spent = Number(d.spend_usd || 0), cap = Number(d.budget_usd);
+        const pct = cap > 0 ? Math.min(100, (spent / cap) * 100) : 0;
+        lines.push('$' + spent.toFixed(2) + ' of $' + cap.toFixed(2) + ' agent usage');
+        if (meter && fill) {
+          meter.style.display = '';
+          fill.style.width = pct + '%';
+          fill.style.background = pct >= 100 ? 'var(--red)' : (pct >= 60 ? '#f0b429' : 'var(--accent)');
+        }
+      }
+    }
+    body.innerHTML = lines.join(' &middot; ');
+    if (d.plan === 'pro' || d.has_billing) {
+      if (manage) manage.style.display = '';
+    }
+    if (d.plan !== 'pro' && d.stripe_configured) {
+      btn.style.display = '';
+      btn.textContent = (d.budget_usd != null && Number(d.spend_usd || 0) >= Number(d.budget_usd))
+        ? 'Budget used up — upgrade' : 'Upgrade';
+    }
+  } catch(e) { /* self-hosted: no cloud gateway, card stays hidden */ }
+}
+
+async function _cloudBillingPortal() {
+  try {
+    const r = await fetch('/api/stripe/portal', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json();
+    if (d.url) location.href = d.url;
+  } catch(e) {}
 }
 
 async function _upgradeCheckout(billing) {
@@ -42699,6 +42773,7 @@ function toggleSettings() {
       _offlineInfoRefresh();
     }).catch(() => {});
     _renderInstanceSwitcher();
+    _loadCloudPlan();
     loadDefaultModel();
     const zd = document.getElementById('zoom-level-display');
     if (zd) zd.textContent = _zoomLevel + '%';

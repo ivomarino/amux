@@ -1079,28 +1079,47 @@ def _clerk_send_invitation(email, redirect_url, notify=True):
     except Exception as e:
         return False, str(e)
 
+BUDGET_POLL_SECONDS  = int(os.environ.get("BUDGET_POLL_SECONDS", "30"))
+BUDGET_NEAR_FRACTION = float(os.environ.get("BUDGET_NEAR_FRACTION", "0.6"))
+
+
+def _enforce_budget(db, org_row, spend):
+    """Stop every session once spend crosses the cap. Returns True if enforced."""
+    budget = org_row["budget_usd"]
+    if budget is None or org_row["plan"] == "pro" or spend < budget:
+        return False
+    stopped = _stop_org_sessions(org_row["port"])
+    print(f"[budget] org {org_row['id']} over cap (${spend:.2f} >= ${budget:.2f}) "
+          f"— stopped sessions: {stopped}", flush=True)
+    return True
+
+
 def _budget_poller():
-    """Every 2 minutes: refresh cached spend for budget-capped orgs and stop
-    sessions the moment a cap is crossed (running agents burn tokens unattended)."""
+    """Refresh cached spend for budget-capped orgs and stop sessions the moment a
+    cap is crossed — running agents burn tokens whether or not anyone is watching.
+
+    Orgs near their cap are checked every cycle; the rest every 4th cycle, so the
+    common case stays cheap while the expensive case (about to overspend) is tight.
+    Worst-case overshoot is one cycle of burn instead of one coarse poll interval."""
+    cycle = 0
     while True:
-        time.sleep(120)
+        time.sleep(BUDGET_POLL_SECONDS)
+        cycle += 1
         try:
             db = get_db()
             rows = db.execute(
-                "SELECT id, port, budget_usd, spend_usd FROM orgs "
+                "SELECT id, port, budget_usd, spend_usd, plan FROM orgs "
                 "WHERE budget_usd IS NOT NULL AND plan != 'pro' AND port IS NOT NULL"
             ).fetchall()
             for r in rows:
+                near = (r["spend_usd"] or 0) >= (r["budget_usd"] or 0) * BUDGET_NEAR_FRACTION
+                if not near and cycle % 4 != 0:
+                    continue
                 if not container_running(r["id"]):
                     continue
                 spend = _refresh_org_spend(db, r["id"], r["port"])
-                if spend is None:
-                    continue
-                if spend >= r["budget_usd"]:
-                    was_under = (r["spend_usd"] or 0) < r["budget_usd"]
-                    stopped = _stop_org_sessions(r["port"])
-                    if was_under or stopped:
-                        print(f"[budget] org {r['id']} over cap (${spend:.2f} >= ${r['budget_usd']:.2f}) — stopped sessions: {stopped}", flush=True)
+                if spend is not None:
+                    _enforce_budget(db, r, spend)
         except Exception as e:
             print(f"[budget] poller error: {e}", flush=True)
 
@@ -2502,10 +2521,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stripe/status" and self.command == "GET":
             target_org = _active_org_id()
-            org_row = db.execute("SELECT plan, stripe_customer_id, trial_ends_at FROM orgs WHERE id=?", (target_org,)).fetchone()
+            org_row = db.execute(
+                "SELECT plan, stripe_customer_id, trial_ends_at, budget_usd, spend_usd "
+                "FROM orgs WHERE id=?", (target_org,)).fetchone()
             now_ts = int(time.time())
             trial_ends = org_row["trial_ends_at"] if org_row else None
             in_trial = bool(trial_ends and trial_ends > now_ts)
+            budget = org_row["budget_usd"] if org_row else None
+            spend = (org_row["spend_usd"] or 0) if org_row else 0
             return self._json({
                 "plan": org_row["plan"] if org_row else "free",
                 "has_billing": bool(org_row and org_row["stripe_customer_id"]),
@@ -2514,6 +2537,12 @@ class Handler(BaseHTTPRequestHandler):
                 "in_trial": in_trial,
                 "trial_days": TRIAL_DAYS,
                 "has_annual": bool(STRIPE_ANNUAL_PRICE_ID),
+                "has_platform_fee": bool(STRIPE_PLATFORM_FEE_PRICE_ID),
+                "budget_usd": budget,
+                "spend_usd": round(spend, 4),
+                "budget_remaining_usd": (round(max(0.0, budget - spend), 4)
+                                         if budget is not None else None),
+                "is_admin": is_admin,
                 "org_id": target_org,
             })
 
@@ -2860,7 +2889,7 @@ class Handler(BaseHTTPRequestHandler):
         # ── Determine target container via active org ─────────────────────────
         active_org = _active_org_id()
         org_data = db.execute(
-            "SELECT id, port, plan, trial_ends_at, budget_usd, spend_usd FROM orgs WHERE id=?",
+            "SELECT id, port, plan, trial_ends_at, budget_usd, spend_usd, spend_checked_at FROM orgs WHERE id=?",
             (active_org,)).fetchone()
         if not org_data or not org_data["port"]:
             return self._json({"error": "workspace not found"}, 404)
@@ -2879,6 +2908,22 @@ class Handler(BaseHTTPRequestHandler):
                     if "text/html" in accept or not path.startswith("/api/"):
                         return self._html(_UPGRADE_HTML)
                     return self._json({"error": "trial_expired", "upgrade_url": "/upgrade"}, 402)
+
+        # ── Budget freshness: re-read spend inline when close to the cap ─────
+        # The poller alone leaves a window where an org can burn past its cap
+        # between cycles. Once an org is near the cap, refresh synchronously
+        # (one loopback call) so the gate below decides on current numbers.
+        if (org_data["budget_usd"] and org_data["plan"] != "pro" and not is_admin
+                and (org_data["spend_usd"] or 0) >= org_data["budget_usd"] * BUDGET_NEAR_FRACTION
+                and now - (org_data["spend_checked_at"] or 0) >= 20
+                and container_running(target_org_id)):
+            _fresh = _refresh_org_spend(db, target_org_id, target_port)
+            if _fresh is not None:
+                if _enforce_budget(db, org_data, _fresh):
+                    pass  # sessions stopped; the gate below serves the upgrade path
+                org_data = db.execute(
+                    "SELECT id, port, plan, trial_ends_at, budget_usd, spend_usd, spend_checked_at FROM orgs WHERE id=?",
+                    (target_org_id,)).fetchone()
 
         # ── Hard gate: budget-capped trials that used up their spend ─────────
         if (org_data["budget_usd"] is not None and org_data["plan"] != "pro"
