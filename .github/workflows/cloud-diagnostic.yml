@@ -1,0 +1,70 @@
+name: Cloud diagnostic (read-only)
+
+# Sessions have no working SSH to the cloud host (the local amux_cloud key is
+# rejected; gcloud needs an interactive reauth), but CI holds a working key.
+# This runs a fixed, read-only set of checks and prints ONLY booleans and
+# counts — never a secret value.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H 34.121.177.76 >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Read-only checks
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'bash -s' << 'ENDSSH'
+            set +x
+            set -a; . /etc/amux/gateway.env; set +a
+
+            echo "=== gateway config (presence only, no values) ==="
+            for v in ANTHROPIC_API_KEY STRIPE_SECRET_KEY STRIPE_PRO_PRICE_ID \
+                     STRIPE_ANNUAL_PRICE_ID STRIPE_PLATFORM_FEE_PRICE_ID ADMIN_EMAILS; do
+              if [ -n "${!v}" ]; then echo "  $v: SET (${#v} name, value hidden)"; else echo "  $v: (empty)"; fi
+            done
+            echo "  ADMIN_EMAILS value: ${ADMIN_EMAILS}"
+
+            echo
+            echo "=== Stripe: is anyone actually paying? ==="
+            if [ -z "$STRIPE_SECRET_KEY" ]; then
+              echo "  no key configured"
+            else
+              for ep in "subscriptions?status=all&limit=100" "customers?limit=100" "charges?limit=100"; do
+                name="${ep%%\?*}"
+                body=$(curl -s -u "$STRIPE_SECRET_KEY:" "https://api.stripe.com/v1/$ep")
+                count=$(printf '%s' "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('data',[])) if 'data' in d else 'ERROR: '+str(d.get('error',{}).get('message','?')))" 2>/dev/null || echo "parse-error")
+                echo "  $name: $count"
+                if [ "$name" = "subscriptions" ]; then
+                  printf '%s' "$body" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for s in d.get('data',[]):
+    print('     sub', s.get('id'), s.get('status'), 'cust', s.get('customer'))
+" 2>/dev/null || true
+                fi
+                if [ "$name" = "charges" ]; then
+                  printf '%s' "$body" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+tot=sum(c.get('amount',0) for c in d.get('data',[]) if c.get('paid'))
+print('     paid charges total: \$%.2f' % (tot/100.0))
+" 2>/dev/null || true
+                fi
+              done
+            fi
+
+            echo
+            echo "=== container / disk snapshot ==="
+            echo "  running amux containers: $(docker ps --filter name=amux-user- -q | wc -l)"
+            echo "  user data dirs: $(ls -1 /var/amux/users 2>/dev/null | wc -l)"
+            df -h /var 2>/dev/null | tail -1 | awk '{print "  /var usage: "$5" of "$2}'
+          ENDSSH
