@@ -4128,28 +4128,56 @@ _MODEL_CREDIT_LIMIT_CTX_RE = re.compile(
 # a known reset), a 5xx is server-side and immediately retryable — so the correct
 # bulk action really is "send continue", which is what was asked for.
 _API_ERROR_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
+# Anchored form: the marker line must START with the error (after the ⏺ glyph),
+# which is how Claude Code emits it. Used for the decision; the loose form above
+# is only used to COUNT occurrences once the decision is made.
+_API_ERROR_START_RE = re.compile(r"^(?:⏺\s*)?API Error:\s*(5\d\d)\b", re.IGNORECASE)
 
 
-def _api_error_state(live_nonempty: list) -> tuple:
-    """(code, consecutive_count) for a live API error, or ('', 0).
+def _api_error_state(clean: str) -> tuple:
+    """(code, occurrences) when a transient API error is the session's CURRENT
+    state, else ('', 0).
 
-    Position-anchored the same way the credit gate is: the error must be in the
-    TAIL of the live region, because a session merely quoting the string (this
-    file does) would otherwise flag itself — the exact false positive that told a
-    sender its message was undeliverable when it had been delivered
-    (social-media, 2026-07-27). The count is how many times it repeats in the
-    visible tail, which distinguishes one blip from a wedged retry loop.
+    Takes the whole clean capture, NOT _live_limit_region's slice. That slice
+    keeps only what follows the last activity marker — and '⏺ API Error: 529'
+    IS an activity marker, so the region excluded the very line being looked
+    for. Measured on roadtrip while it was visibly erroring: the live viewport
+    held 4 non-empty lines (prompt box + status bar) and the slice held none of
+    the error. Claude Code prints its transcript to normal scrollback and keeps
+    only the input box live, so anything transcript-shaped must be read from the
+    capture tail.
+
+    The anchor is structural rather than a window size: drop the input box and
+    everything below it, then take the LAST activity-marker line. On a 5xx,
+    Claude Code prints the error and stops, so that last marker IS the error. If
+    the session produced any output afterwards, the last marker is that output
+    instead and nothing is flagged — which is what keeps a session that merely
+    QUOTES the string (this file does) from flagging itself, the same false
+    positive that once told a sender its delivered message had failed
+    (social-media, 2026-07-27).
     """
-    if not live_nonempty:
+    lines = [l.rstrip() for l in clean.splitlines()[-60:]]
+    box = -1
+    for i, l in enumerate(lines):
+        if l.strip()[:1] == "❯":
+            box = i          # last ❯ wins; earlier ones are echoed user messages
+    region = lines[:box] if box >= 0 else lines
+    last_marker = ""
+    for l in region:
+        if _LIMIT_ACTIVITY_RE.match(l.strip()):
+            last_marker = l.strip()
+    if not last_marker:
         return "", 0
-    tail = "\n".join(live_nonempty[-6:])
-    m = _API_ERROR_RE.search(tail)
+    # Must BEGIN with the error, not merely contain it. A session explaining the
+    # error ('⏺ It looks for "API Error: 529 Overloaded" in the tail') is also a
+    # marker line sitting above a prompt, and a `search` flagged it — verified as
+    # a false positive before this anchor was added. Claude Code emits the error
+    # as the entire line, so requiring the start separates the two cleanly.
+    m = _API_ERROR_START_RE.match(last_marker)
     if not m:
         return "", 0
-    # Count across a wider window so a loop is visible, but only AFTER the tail
-    # match has established that the error is the session's current state.
-    wide = "\n".join(live_nonempty[-60:])
-    return m.group(1), len(_API_ERROR_RE.findall(wide))
+    # Occurrences across the captured tail: one blip vs a wedged retry loop.
+    return m.group(1), len(_API_ERROR_RE.findall("\n".join(lines)))
 
 
 _MODEL_CREDIT_MENU_RE = re.compile(
@@ -4583,7 +4611,7 @@ def _rate_limit_auto_respond():
             # `continue` below — a session showing ONLY an API error has no
             # rate-limit UI at all and would otherwise bail out before the
             # actions dict is written.
-            _api_code, _api_n = _api_error_state(_live_ne)
+            _api_code, _api_n = _api_error_state(clean)
             _api_prev = _st.get("api_err_prev") or ""
             _st["api_err_prev"] = _api_code
             if _api_code and _api_prev == _api_code:
@@ -28493,7 +28521,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.230';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.231';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49081,7 +49109,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.230';
+const CACHE = 'amux-v0.9.231';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
