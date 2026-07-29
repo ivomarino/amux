@@ -1214,6 +1214,118 @@ def _bu_list_profiles() -> list:
 _PROFILES_REGISTRY = CC_HOME / "playwright-auth" / "profiles.json"
 _registry_lock = threading.Lock()
 
+_PW_AUTH_DIR = CC_HOME / "playwright-auth"
+_PW_PROFILES_DIR = _PW_AUTH_DIR / "profiles"
+
+
+def _bu_pw_profile_dirs() -> list:
+    """Named Playwright persistent-context profiles that exist on disk.
+
+    These are the ones an agent actually launches with
+    launchPersistentContext(playwright-auth/profiles/<name>). 'default' is the
+    bare playwright-auth/profile directory and is surfaced under that name.
+    """
+    out = []
+    try:
+        if _PW_PROFILES_DIR.is_dir():
+            out = [p.name for p in _PW_PROFILES_DIR.iterdir()
+                   if p.is_dir() and not p.name.startswith(".")]
+    except Exception:
+        out = []
+    try:
+        if (_PW_AUTH_DIR / "profile").is_dir():
+            out.append("default")
+    except Exception:
+        pass
+    return sorted(set(out))
+
+
+def _bu_profile_dir(name: str):
+    """Absolute path for a profile name ('default' maps to the bare dir)."""
+    n = (name or "").strip()
+    if not n or n == "default":
+        return _PW_AUTH_DIR / "profile"
+    return _PW_PROFILES_DIR / n
+
+
+def _bu_profile_size_mb(name: str) -> float:
+    """Rough on-disk size. Cheap enough for a listing: Chrome profiles are a few
+    hundred files, and the number is what tells you a profile is real and
+    logged in versus an empty directory left behind by a crashed run."""
+    try:
+        d = _bu_profile_dir(name)
+        if not d.is_dir():
+            return 0.0
+        total = 0
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+            if total > 400 * 1024 * 1024:   # stop early; exact size is not the point
+                break
+        return round(total / 1048576.0, 1)
+    except Exception:
+        return 0.0
+
+
+# Headed sign-in window for a NAMED profile. `amux playwright-auth capture`
+# only ever wrote the single default profile, so there was no supported way to
+# create a named one and log into it — which is why 35 profiles existed on disk
+# with an empty registry: every one was made by hand in a throwaway script.
+#
+# Runs detached so the HTTP request returns immediately; the window stays open
+# until the person closes it, and closing the context is what flushes cookies
+# and localStorage to disk. cwd is the repo so `require('playwright')` resolves.
+_PW_SIGNIN_JS = r"""
+const { chromium } = require('playwright');
+const dir = process.argv[2], url = process.argv[3] || 'about:blank';
+(async () => {
+  const ctx = await chromium.launchPersistentContext(dir, {
+    headless: false,
+    ignoreHTTPSErrors: true,
+    viewport: null,
+    args: ['--no-first-run', '--no-default-browser-check'],
+  });
+  const page = ctx.pages()[0] || await ctx.newPage();
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
+  // Resolve when the user closes the window. Persistent context writes its
+  // storage on close, so this is the moment the login becomes reusable.
+  await new Promise(res => ctx.on('close', res));
+  process.exit(0);
+})().catch(e => { console.error(String(e)); process.exit(1); });
+"""
+
+
+def _bu_profile_signin(name: str, url: str) -> dict:
+    """Open a headed browser under `name` so a human can sign in."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", (name or "").strip())[:48]
+    if not safe:
+        return {"error": "profile name required"}
+    d = _bu_profile_dir(safe)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return {"error": f"could not create profile dir: {e}"}
+    script = TLS_DIR.parent / "pw-signin.cjs"
+    try:
+        script.write_text(_PW_SIGNIN_JS)
+    except Exception as e:
+        return {"error": f"could not write launcher: {e}"}
+    try:
+        subprocess.Popen(
+            ["node", str(script), str(d), url or "about:blank"],
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return {"error": f"could not launch browser: {e}"}
+    return {"ok": True, "profile": safe, "dir": str(d), "url": url,
+            "next": "Sign in, then CLOSE the browser window — closing is what saves the session."}
+
+
 def _bu_registry_load() -> dict:
     try:
         if _PROFILES_REGISTRY.exists():
@@ -28086,7 +28198,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.218';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.220';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44337,7 +44449,9 @@ function _playVideoUrl(url, title) {
   // MKV/AVI can't play natively — prepare a seekable MP4 server-side and play
   // that. The old live-transcode pipe (no Content-Length, no ranges) never
   // starts on iOS AVPlayer; a prepared cached mp4 streams + seeks everywhere.
-  const ext = url.split('?')[0].split('.').pop().toLowerCase();
+  // Extract extension from the path query param (url is /api/file/raw?path=..., not the filename).
+  const _vpSrcPath = (() => { try { return new URL(url, location.origin).searchParams.get('path') || url; } catch(e) { return url; } })();
+  const ext = _vpSrcPath.split('.').pop().toLowerCase();
   const needsTranscode = ['mkv', 'avi'].includes(ext);
   v._vpUrl = url;
   if (needsTranscode) {
@@ -48492,7 +48606,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.218';
+const CACHE = 'amux-v0.9.220';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55728,15 +55842,63 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # URL via /start or /navigate auto-loads the matching profile — a
             # caller need only pass a URL and it lands already-logged-in.
             # Also returns `chrome_profiles`: the real local Chrome sub-profiles.
-            if method == "GET" and path == "/api/browser/profiles":
+            # POST /api/browser/profile/create {"name":"...","url":"https://..."}
+            # Creates a named profile and opens a headed window on it to sign in.
+            if method == "POST" and path == "/api/browser/profile/create":
+                body = self._read_body()
+                r = _bu_profile_signin(body.get("name", ""), (body.get("url") or "").strip())
+                if r.get("error"):
+                    return self._json(r, 400)
+                host = ""
+                try:
+                    host = urlparse(body.get("url") or "").hostname or ""
+                except Exception:
+                    host = ""
+                if host:
+                    # Register the intended domain up front so auto-select can
+                    # find this profile even if the person forgets to hit Save.
+                    _bu_registry_register(r["profile"], host, (body.get("label") or "").strip())
+                return self._json(r)
+
+            # DELETE /api/browser/profile/<name> — remove a profile directory.
+            m_bp = re.match(r"^/api/browser/profile/([A-Za-z0-9._-]+)$", path)
+            if m_bp and method == "DELETE":
+                nm = m_bp.group(1)
+                if nm == "default":
+                    return self._json({"error": "refusing to delete the default profile"}, 400)
+                d = _bu_profile_dir(nm)
+                if not d.is_dir():
+                    return self._json({"error": "no such profile"}, 404)
+                try:
+                    shutil.rmtree(d)
+                except Exception as e:
+                    return self._json({"error": str(e)}, 500)
                 reg = _bu_registry_load()
-                profiles = [
-                    {"name": n,
-                     "domains": (m.get("domains") or []) if isinstance(m, dict) else [],
-                     "label": (m.get("label") or "") if isinstance(m, dict) else "",
-                     "updated": (m.get("updated") or 0) if isinstance(m, dict) else 0}
-                    for n, m in sorted(reg.items())
-                ]
+                if nm in reg:
+                    reg.pop(nm, None)
+                    _bu_registry_save(reg)
+                return self._json({"ok": True, "deleted": nm})
+
+            if method == "GET" and path == "/api/browser/profiles":
+                # A profile DIRECTORY that exists on disk IS a profile. Listing
+                # only registry entries meant the picker showed nothing while 35+
+                # real logged-in profiles sat in playwright-auth/profiles — you
+                # could not select a profile the UI refused to admit existed.
+                # The registry adds metadata (domains/label); it is not the
+                # source of truth for existence.
+                reg = _bu_registry_load()
+                names = set(reg.keys()) | set(_bu_pw_profile_dirs())
+                profiles = []
+                for n in sorted(names):
+                    m = reg.get(n) if isinstance(reg.get(n), dict) else {}
+                    profiles.append({
+                        "name": n,
+                        "domains": (m.get("domains") or []),
+                        "label": (m.get("label") or ""),
+                        "updated": (m.get("updated") or 0),
+                        "registered": n in reg,
+                        "size_mb": _bu_profile_size_mb(n),
+                    })
                 return self._json({
                     "profiles": profiles,
                     "registry": reg,
