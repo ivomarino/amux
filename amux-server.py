@@ -1326,6 +1326,21 @@ def _bu_profile_signin(name: str, url: str) -> dict:
             "next": "Sign in, then CLOSE the browser window — closing is what saves the session."}
 
 
+_bu_chrome_cache = {"ts": 0.0, "v": []}
+
+
+def _bu_list_profiles_cached() -> list:
+    """`browser-use profile list` is a subprocess with a 10s timeout, run on
+    every profiles fetch. The set of real Chrome profiles changes rarely, so
+    cache it for a minute rather than gating the picker on a process spawn."""
+    now = time.time()
+    if now - _bu_chrome_cache["ts"] < 60 and _bu_chrome_cache["v"]:
+        return _bu_chrome_cache["v"]
+    v = _bu_list_profiles()
+    _bu_chrome_cache.update({"ts": now, "v": v})
+    return v
+
+
 def _bu_registry_load() -> dict:
     try:
         if _PROFILES_REGISTRY.exists():
@@ -21770,6 +21785,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     #browser-view .bw-btn.active { background:var(--accent);color:#fff;border-color:var(--accent); }
     #browser-view .bw-in { font-size:0.82rem;padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-family:inherit; }
     #browser-view .bw-row { display:flex;align-items:center;gap:6px;padding:0 8px 8px;flex-wrap:wrap; }
+    /* switchView shows this view with display:flex. Its children are stacked
+       toolbar strips, so without an explicit column direction all four .bw-row
+       strips became side-by-side columns 690px tall — controls scattered across
+       the page with the URL bar, Save and Run agent in three different places.
+       Column direction restores the intended stack and keeps flex so the
+       screenshot area can still take the remaining height. */
+    #browser-view { flex-direction: column; }
     #bw-elements-panel .bw-el { padding:4px 8px;border-bottom:1px solid var(--border);cursor:pointer;font-size:0.74rem;display:flex;gap:6px;align-items:baseline; }
     #bw-elements-panel .bw-el:hover { background:var(--surface); }
     #bw-elements-panel .bw-el .idx { color:var(--accent);font-family:monospace;font-weight:600;min-width:34px; }
@@ -28201,7 +28223,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.223';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.224';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -36606,7 +36628,9 @@ function switchView(view) {
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
   const _svIds = ['session','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
   const _svNames = ['sessions','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
-  const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex'];
+  // MUST stay index-aligned with _svIds/_svNames above (19 entries). It had 18,
+  // so 'graph' ran off the end and took the '' fallback by accident.
+  const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex','flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -48709,7 +48733,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.223';
+const CACHE = 'amux-v0.9.224';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55991,21 +56015,29 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 # source of truth for existence.
                 reg = _bu_registry_load()
                 names = set(reg.keys()) | set(_bu_pw_profile_dirs())
+                # Sizes are OPT-IN. Walking 38 profile directories (one is
+                # 565MB) took 2.9s per call, and the picker fetches this on
+                # every switch to the Browser tab — slow enough that the
+                # dropdown was still empty when a user looked at it. The name
+                # list is what the picker needs; sizes are for management UI.
+                want_sizes = bool(qs.get("sizes"))
                 profiles = []
                 for n in sorted(names):
                     m = reg.get(n) if isinstance(reg.get(n), dict) else {}
-                    profiles.append({
+                    e = {
                         "name": n,
                         "domains": (m.get("domains") or []),
                         "label": (m.get("label") or ""),
                         "updated": (m.get("updated") or 0),
                         "registered": n in reg,
-                        "size_mb": _bu_profile_size_mb(n),
-                    })
+                    }
+                    if want_sizes:
+                        e["size_mb"] = _bu_profile_size_mb(n)
+                    profiles.append(e)
                 return self._json({
                     "profiles": profiles,
                     "registry": reg,
-                    "chrome_profiles": _bu_list_profiles(),
+                    "chrome_profiles": _bu_list_profiles_cached(),
                 })
 
             # POST /api/browser/start  {"url":"...","session":"...","profile":"...","fresh":false}
