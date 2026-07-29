@@ -28223,7 +28223,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.224';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.226';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42571,20 +42571,32 @@ async function _offlineBudgetEnforce() {
   try { await _idb.trimFilesToBytes(_offlineMB * 1024 * 1024); } catch(e) {}
   _offlineInfoRefresh();
 }
+// Byte formatting uses the shared _fmtBytes defined below.
 async function _offlineInfoRefresh() {
   const el = document.getElementById('offline-cache-info');
   if (!el) return;
   const { n, kb } = _offlineCacheInfo();
   const running = (sessions || []).filter(s => s.running).length;
-  let fileMB = 0;
-  try { fileMB = (await _idb.filesBytes()) / 1048576; } catch(e) {}
-  const used = (kb / 1024) + fileMB;
-  const pct = Math.min(100, Math.round(100 * used / Math.max(1, _offlineMB)));
+  // cacheStats() counts FILES only (not dir listings) and is the same number
+  // the purge UI reports, so the two cannot disagree. filesBytes() stays for the
+  // budget trim, which must account for dir listings too since they take space.
+  let fc = { count: 0, bytes: 0 };
+  try { fc = await _idb.cacheStats(); } catch(e) {}
+  let totalBytes = kb * 1024;
+  try { totalBytes = kb * 1024 + await _idb.filesBytes(); } catch(e) { totalBytes = kb * 1024 + fc.bytes; }
+  const budget = _offlineMB * 1048576;
+  const pct = Math.min(100, Math.round(100 * totalBytes / Math.max(1, budget)));
+  // Say what populates the file cache when it is empty, so 0 reads as "nothing
+  // opened here yet" rather than "this is broken".
+  const filesTxt = fc.count
+    ? `${fc.count} file${fc.count === 1 ? '' : 's'} · ${_fmtBytes(fc.bytes)}`
+    : 'no files yet — files you open are saved automatically';
   el.innerHTML =
-    `<b>${n}</b> of ${running} running sessions saved · files ${fileMB.toFixed(1)} MB<br>`
+    `<b>${n}</b> of ${running} running sessions saved (${_fmtBytes(kb * 1024)})<br>`
+    + `Files: ${filesTxt}<br>`
     + `<span style="display:inline-block;width:100%;height:4px;background:rgba(139,148,158,0.25);border-radius:2px;margin:4px 0;">`
     + `<span style="display:block;width:${pct}%;height:100%;background:${pct>90?'#f85149':'var(--accent)'};border-radius:2px;"></span></span>`
-    + `${used.toFixed(1)} of ${_offlineMB} MB used (${pct}%). Oldest-opened evicted first.`;
+    + `${_fmtBytes(totalBytes)} of ${_offlineMB} MB used (${pct}%). Oldest-opened evicted first.`;
 }
 // Settings controls for the offline caps. Both persist to /api/prefs, so the
 // limits follow you to every device instead of each phone keeping its own.
@@ -48733,7 +48745,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.224';
+const CACHE = 'amux-v0.9.226';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
