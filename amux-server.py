@@ -54954,6 +54954,7 @@ return output
                         "to": [a for _n, a in _eu2.getaddresses([_h.get("to", "") or ""]) if a],
                         "cc": [a for _n, a in _eu2.getaddresses([_h.get("cc", "") or ""]) if a],
                         "date": _h.get("date", ""), "account": _acct, "via": "gmail",
+                        "reply_to": _h.get("reply-to", ""),
                         "in_reply_to": _h.get("in-reply-to", ""),
                         "references": _h.get("references", ""),
                         "thread_id": _full.get("threadId", ""),
