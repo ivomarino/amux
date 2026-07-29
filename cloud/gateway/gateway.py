@@ -1040,11 +1040,19 @@ def _refresh_org_spend(db, org_id, port):
     if not isinstance(data, dict):
         return None
     spend = float(data.get("total_cost") or 0)
+    # MONOTONIC: never lower a recorded spend. Two meters feed this column — the
+    # proxy (exact, per request) and this transcript rollup (approximate, and 0
+    # when Claude's JSONL is not where the ledger looks). A plain assignment let
+    # the poller erase real proxy-metered spend back to $0, which silently
+    # disabled the budget cap. Taking the max means neither source can undo the
+    # other, and enforcement only ever cares about crossing the threshold.
     with _db_lock:
-        db.execute("UPDATE orgs SET spend_usd=?, spend_checked_at=? WHERE id=?",
-                   (spend, int(time.time()), org_id))
+        db.execute(
+            "UPDATE orgs SET spend_usd = MAX(COALESCE(spend_usd, 0), ?), spend_checked_at=? WHERE id=?",
+            (spend, int(time.time()), org_id))
         db.commit()
-    return spend
+        row = db.execute("SELECT spend_usd FROM orgs WHERE id=?", (org_id,)).fetchone()
+    return float(row["spend_usd"] or 0) if row else spend
 
 def _stop_org_sessions(port):
     """Stop every session in a container. Budget enforcement must halt token burn
