@@ -19557,6 +19557,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .gp-chip:hover { background: var(--hover); color: var(--text); }
   .gp-chip.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* Pane open but its session stopped — still closable, visibly stale. */
+  .gp-chip.gp-dead { opacity: 0.55; text-decoration: line-through; }
   .ws-profile-chip {
     display: inline-flex; align-items: center; gap: 3px;
     padding: 3px 8px; border-radius: 10px; font-size: 0.73rem; cursor: pointer;
@@ -28375,7 +28377,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.228';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.229';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40779,9 +40781,30 @@ function exitGridMode() {
 function _renderGridChips() {
   const el = document.getElementById('grid-chips');
   if (!el) return;
-  el.innerHTML = (sessions || []).map(s => {
-    const on = !!_gridPanes[s.name];
-    return '<button class="gp-chip' + (on ? ' on' : '') + '" onclick="toggleGridPane(\'' + s.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'") + '\')">' + esc(s.name) + '</button>';
+  // Was: every entry in `sessions`, unfiltered and unsorted — 101 chips, 49 of
+  // them for sessions that are NOT running. Tapping one of those opens a dead
+  // pane, and with no ordering the row reshuffled as activity changed, so the
+  // chip you wanted moved between visits.
+  //
+  // Show what can actually be paned: running sessions, plus any session you
+  // already have open (a pane whose session stopped must stay closable from
+  // here). Order is deliberate and stable — open panes first, then working,
+  // then needs-input, then by most recent activity.
+  const open = _gridPanes || {};
+  const rank = s => (open[s.name] ? 0 : s.status === 'active' ? 1 : s.status === 'waiting' ? 2 : 3);
+  const list = (sessions || [])
+    .filter(s => s.running || open[s.name])
+    .sort((a, b) => rank(a) - rank(b)
+                 || (b.last_activity || 0) - (a.last_activity || 0)
+                 || a.name.localeCompare(b.name));
+  el.innerHTML = list.map(s => {
+    const on = !!open[s.name];
+    const dead = !s.running && on;   // pane open but the session went away
+    const esc_ = s.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+    const title = dead ? ' title="Session is not running — pane is stale"'
+                       : (s.status ? ' title="' + esc(s.status) + '"' : '');
+    return '<button class="gp-chip' + (on ? ' on' : '') + (dead ? ' gp-dead' : '') + '"'
+      + title + ' onclick="toggleGridPane(\'' + esc_ + '\')">' + esc(s.name) + '</button>';
   }).join('');
 }
 
@@ -48942,7 +48965,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.228';
+const CACHE = 'amux-v0.9.229';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
