@@ -1067,8 +1067,10 @@ def _clerk_send_invitation(email, redirect_url, notify=True):
     }).encode()
     req = urllib.request.Request(
         "https://api.clerk.com/v1/invitations", data=body, method="POST",
+        # UA required: Cloudflare blocks urllib's default agent (error 1010)
         headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}",
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 "User-Agent": "amux-gateway/1.0"})
     try:
         resp = urllib.request.urlopen(req, timeout=10)
         return True, json.loads(resp.read()).get("id", "")
@@ -1283,7 +1285,9 @@ def _clerk_get_email(user_id):
     try:
         req = urllib.request.Request(
             f"https://api.clerk.com/v1/users/{user_id}",
-            headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
+            # UA required: Cloudflare blocks urllib's default agent (error 1010)
+            headers={"Authorization": f"Bearer {CLERK_SECRET_KEY}",
+                     "User-Agent": "amux-gateway/1.0"}
         )
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read())

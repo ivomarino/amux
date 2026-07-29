@@ -240,7 +240,14 @@ def main():
         # ── 6. God mode: admin (non-member) enters the same workspace ──
         step("God mode — admin enters the workspace without membership")
         god_cookies = {"amux_session": make_cookie(imposter_uid), "amux_org": org_id}
-        code, body, _ = gw("GET", "/api/sessions", cookies=god_cookies, e2e=True)
+        # First hit may 503 while the org container wakes; poll like a browser would
+        deadline = time.time() + 120
+        code = 0
+        while time.time() < deadline:
+            code, body, _ = gw("GET", "/api/sessions", cookies=god_cookies, e2e=True)
+            if code == 200:
+                break
+            time.sleep(5)
         if code == 200:
             ok("Admin (e2e tier) reached the org container via amux_org cookie")
         else:
@@ -268,7 +275,9 @@ def main():
         else:
             fail(f"Expected 402 budget_exceeded, got {code}: {body[:200]}")
         code, body, _ = gw("GET", "/", cookies=user_cookies, accept="text/html")
-        if code == 200 and "trial budget" in body:
+        # 'agent usage this trial' only appears on the gateway's budget page —
+        # the dashboard itself contains modal copy, so match a page-unique string
+        if code == 200 and "agent usage this trial" in body:
             ok("HTML request served the budget upgrade page")
         else:
             fail(f"Budget upgrade page not served (code {code})")
