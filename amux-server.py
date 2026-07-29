@@ -55173,14 +55173,23 @@ return "not_found"
             # has_api_key: True only if a valid-looking key exists in server.env.
             # We do NOT count Docker-injected env vars — those should not exist for cloud.
             has_key_in_env = False
+            has_proxy = False
             if _server_env_file.exists():
+                _base, _tok = "", ""
                 for _l in _server_env_file.read_text().splitlines():
                     _l = _l.strip()
                     if _l.startswith("ANTHROPIC_API_KEY="):
                         _val = _l[len("ANTHROPIC_API_KEY="):].strip()
                         if _val and not _is_placeholder_api_key(_val):
                             has_key_in_env = True
-                        break
+                    elif _l.startswith("ANTHROPIC_BASE_URL="):
+                        _base = _l[len("ANTHROPIC_BASE_URL="):].strip()
+                    elif _l.startswith("ANTHROPIC_AUTH_TOKEN="):
+                        _tok = _l[len("ANTHROPIC_AUTH_TOKEN="):].strip()
+                # A managed upstream (amux cloud's Anthropic proxy) is fully
+                # configured auth — the workspace can talk to Claude without the
+                # user ever holding a key, so do NOT prompt them for one.
+                has_proxy = bool(_base and _tok)
             # Also check for OAuth login in ~/.claude.json
             has_oauth = False
             try:
@@ -55192,8 +55201,9 @@ return "not_found"
             # Include cached key validation result
             key_valid, key_error = _api_key_status.get("valid", None), _api_key_status.get("error", "")
             return self._json({"email": email, "is_cloud": bool(email),
-                               "has_api_key": has_key_in_env or has_oauth,
+                               "has_api_key": has_key_in_env or has_oauth or has_proxy,
                                "has_oauth": has_oauth,
+                               "managed_upstream": has_proxy,
                                "key_valid": key_valid, "key_error": key_error})
 
         # ── Layout presets ────────────────────────────────────────────────────
@@ -58363,8 +58373,12 @@ def _validate_api_key() -> tuple[bool, str]:
 
     Returns (is_valid, error_message). Skips validation if OAuth or custom API base is configured.
     """
-    # Skip if custom API base is configured (third-party provider)
-    if os.environ.get("ANTHROPIC_API_BASE", "").strip():
+    # Skip if a custom API base is configured — a third-party provider, or amux
+    # cloud's Anthropic proxy, which authenticates with ANTHROPIC_AUTH_TOKEN and
+    # holds the real key host-side. There is no local key to validate, and
+    # reporting "no_api_key" would nag a correctly configured workspace.
+    if (os.environ.get("ANTHROPIC_API_BASE", "").strip()
+            or os.environ.get("ANTHROPIC_BASE_URL", "").strip()):
         return True, ""
     # Skip if OAuth is present — key isn't needed
     try:

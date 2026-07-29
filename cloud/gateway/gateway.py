@@ -2997,7 +2997,11 @@ class Handler(BaseHTTPRequestHandler):
             budget = float(budget) if budget is not None else None
             org_name = (body.get("name") or "").strip() or f"{invitee} (trial)"
             notify = body.get("notify", True)
-            prov_key = (body.get("api_key") or ANTHROPIC_API_KEY or "").strip() or None
+            # Only store an EXPLICITLY supplied per-org key. The house key must
+            # never be copied into an org row — provisioned workspaces reach
+            # Anthropic through the gateway proxy, which keeps the real key on
+            # the host where a trial user with shell access cannot read it.
+            prov_key = (body.get("api_key") or "").strip() or None
             org_id = "org_" + _sec.token_hex(8)
             trial_end = now + trial_days * 86400
             with _db_lock:
@@ -3037,6 +3041,11 @@ class Handler(BaseHTTPRequestHandler):
                 "clerk_invitation_sent": bool(sent),
                 "clerk_detail": "" if sent else clerk_detail,
                 "api_key_provisioned": bool(prov_key),
+                # How this workspace will talk to Claude. "proxy" = gateway holds
+                # the key; "org_key" = an explicit per-org key was supplied;
+                # "none" = the user must bring their own (house key unset).
+                "claude_auth": ("org_key" if prov_key
+                                else ("proxy" if ANTHROPIC_API_KEY else "none")),
             }, 201)
 
         # ── Admin: list all orgs with trial/budget/spend state ────────────────
