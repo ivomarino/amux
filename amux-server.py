@@ -4116,6 +4116,42 @@ _MODEL_CREDIT_LIMIT_CTX_RE = re.compile(
 # which only exists in a live render — the prose alone shows up whenever a
 # session merely discusses the gate (this file does). Callers additionally
 # require it in the live region's tail.
+# ── Transient API errors (529 Overloaded / 5xx) ──────────────────────────────
+# Claude Code prints these inline and then just STOPS, leaving the session at a
+# prompt. amux saw status=idle with every limit flag false, so a session looping
+# on 529 was indistinguishable from one that had finished its work — six sessions
+# were in that state when this was found, primis having burned SEVEN consecutive
+# attempts (including a manual "continue") with no badge, no alert, and no place
+# in Bulk actions.
+#
+# Unlike a credit limit (needs a model switch) or a weekly cap (needs to wait for
+# a known reset), a 5xx is server-side and immediately retryable — so the correct
+# bulk action really is "send continue", which is what was asked for.
+_API_ERROR_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
+
+
+def _api_error_state(live_nonempty: list) -> tuple:
+    """(code, consecutive_count) for a live API error, or ('', 0).
+
+    Position-anchored the same way the credit gate is: the error must be in the
+    TAIL of the live region, because a session merely quoting the string (this
+    file does) would otherwise flag itself — the exact false positive that told a
+    sender its message was undeliverable when it had been delivered
+    (social-media, 2026-07-27). The count is how many times it repeats in the
+    visible tail, which distinguishes one blip from a wedged retry loop.
+    """
+    if not live_nonempty:
+        return "", 0
+    tail = "\n".join(live_nonempty[-6:])
+    m = _API_ERROR_RE.search(tail)
+    if not m:
+        return "", 0
+    # Count across a wider window so a loop is visible, but only AFTER the tail
+    # match has established that the error is the session's current state.
+    wide = "\n".join(live_nonempty[-60:])
+    return m.group(1), len(_API_ERROR_RE.findall(wide))
+
+
 _MODEL_CREDIT_MENU_RE = re.compile(
     r"^\s*\d+\.\s*set\s+up\s+usage\s+credits",
     re.IGNORECASE | re.MULTILINE,
@@ -4541,6 +4577,29 @@ def _rate_limit_auto_respond():
             _credit_prev = bool(_st.get("credit_raw_prev"))
             _st["credit_raw_prev"] = _credit_raw
             is_credit = _credit_raw and _credit_prev
+            # Transient API error (529/5xx). Same two-scan persistence gate as the
+            # credit gate, for the same reason: text about the error must not read
+            # as the error. Recorded on _st (not `actions`) so it survives the
+            # `continue` below — a session showing ONLY an API error has no
+            # rate-limit UI at all and would otherwise bail out before the
+            # actions dict is written.
+            _api_code, _api_n = _api_error_state(_live_ne)
+            _api_prev = _st.get("api_err_prev") or ""
+            _st["api_err_prev"] = _api_code
+            if _api_code and _api_prev == _api_code:
+                if not _st.get("api_error"):
+                    slog(f"[api-error] session={name} API Error {_api_code} "
+                         f"x{_api_n} on live screen — flagged retryable")
+                _st["api_error"] = True
+                _st["api_error_code"] = _api_code
+                _st["api_error_count"] = _api_n
+            elif not _api_code and _st.get("api_error"):
+                # Cleared as soon as it scrolls off: a 5xx is transient, and a
+                # stale flag would keep a working session in Bulk actions.
+                _st.pop("api_error", None)
+                _st.pop("api_error_code", None)
+                _st.pop("api_error_count", None)
+                slog(f"[api-error] session={name} API error cleared")
             if matched_idx < 0 and not is_banner and not is_credit:
                 # No live rate-limit UI. A real banner cap keeps its banner on
                 # screen until reset, so a session flagged from a banner without a
@@ -11619,6 +11678,12 @@ def list_sessions() -> list:
             # usage-credits modal, 2026-07-27). Exporting the timestamp lets
             # the card badge a long wait without any push-alert noise.
             "waiting_since": int(_aa.get("ac_waiting_since", 0) or 0),
+            # Transient API error (529 Overloaded / 5xx). Retryable NOW — no reset
+            # time to wait for and no model to switch — so the UI groups it with
+            # the other blocked states but offers "continue" as the fix.
+            "api_error": bool(_aa.get("api_error")),
+            "api_error_code": str(_aa.get("api_error_code") or ""),
+            "api_error_count": int(_aa.get("api_error_count") or 0),
             "tags": [t.strip() for t in cfg.get("CC_TAGS", "").split(",") if t.strip()],
             "flags": cfg.get("CC_FLAGS", ""),
             "creator": cfg.get("CC_CREATOR", ""),
@@ -24117,6 +24182,11 @@ function openBulkActions() {
   const now = Date.now() / 1000;
   const limited = sessions.filter(s => s.rate_limited_until && s.rate_limited_until > now);
   const creditLimited = sessions.filter(s => s.credit_limited);
+  // Transient API errors (529 Overloaded / 5xx). Retryable immediately — no reset
+  // to wait for, no model to switch — so "continue" IS the fix. These were
+  // invisible before: Claude Code prints the error and stops at a prompt, so the
+  // session read as plain idle and never appeared here.
+  const apiErr = sessions.filter(s => s.api_error);
   // Group by behavior, not by the weekly/non-weekly flag: any usage-cap banner
   // (weekly OR 5-hour session limit) auto-resumes at its reset time, so it needs
   // no action. Everything else is a transient/API rate-limit where sending
@@ -24162,12 +24232,33 @@ function openBulkActions() {
     html += `</div>`;
     html += `</div>`;
   }
+  if (apiErr.length) {
+    const codes = [...new Set(apiErr.map(s => s.api_error_code).filter(Boolean))].join('/');
+    const looping = apiErr.filter(s => (s.api_error_count || 0) > 1);
+    html += `<div style="padding:12px 14px;border:1px solid var(--border);border-radius:10px;margin-bottom:10px;">`;
+    html += `<div style="font-weight:600;font-size:0.9rem;margin-bottom:8px;">&#x26A0;&#xFE0F; API error${codes ? ' ' + esc(codes) : ''} &mdash; server-side</div>`;
+    html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:12px;">`
+      + `${apiErr.length} session${apiErr.length>1?'s':''} stopped on a transient API error (Overloaded / 5xx). `
+      + `There is no reset time and no model to switch &mdash; it is retryable now, so "continue" is the fix. `
+      + (looping.length ? `<b>${looping.length}</b> ${looping.length>1?'are':'is'} in a retry loop and will keep failing until the upstream recovers. ` : '')
+      + `Check <a href="https://status.claude.com" target="_blank" rel="noopener" style="color:var(--accent);">status.claude.com</a> if it persists.</div>`;
+    html += `<div style="display:flex;flex-direction:column;gap:4px;margin-bottom:14px;max-height:180px;overflow-y:auto;">`;
+    apiErr.forEach(s => {
+      html += `<div style="display:flex;align-items:center;gap:8px;font-size:0.8rem;">`
+        + `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;">${esc(s.name)}</span>`
+        + `<span style="color:var(--dim);">${esc(s.api_error_code || '5xx')}${(s.api_error_count||0) > 1 ? ' &times;' + s.api_error_count : ''}</span>`
+        + `</div>`;
+    });
+    html += `</div>`;
+    html += `<button class="btn primary" style="width:100%;" onclick="bulkSendContinueApiErr()">Send "continue" to ${apiErr.length} session${apiErr.length>1?'s':''}</button>`;
+    html += `</div>`;
+  }
   // Bottom: one button to resume every LIMITED session at once (rate + credit).
   // Replaces the old all-idle broadcast — there's no reason to nudge sessions
   // that are idle because they finished; the useful bulk action is resuming
   // the ones that actually got stuck.
   const _seen = new Set();
-  const allLimited = [...transient, ...capped, ...creditLimited]
+  const allLimited = [...transient, ...capped, ...creditLimited, ...apiErr]
     .filter(s => !_seen.has(s.name) && _seen.add(s.name));
   const _n = allLimited.length;
   if (_n) {
@@ -24249,6 +24340,30 @@ async function bulkSendContinue(cappedOnly) {
     } catch(e) {}
   }
   showToast(`Sent "continue" to ${sent} session${sent>1?'s':''}`);
+}
+
+// Retry every session stopped on a transient API error. Sent through the normal
+// /send path so each message is origin-stamped and audited like any other —
+// nothing about a bulk retry should bypass provenance.
+async function bulkSendContinueApiErr() {
+  const matched = sessions.filter(s => s.api_error);
+  if (!matched.length) { closeBulkActions(); return; }
+  closeBulkActions();
+  let sent = 0, failed = 0;
+  for (const s of matched) {
+    try {
+      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/send', {
+        method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
+        body: JSON.stringify({text: 'continue'})
+      });
+      const d = await r.json().catch(() => ({}));
+      // Count what the SERVER accepted, not what we attempted — a bulk action
+      // that reports its own optimism is the same lie as the raw-tmux fallback.
+      if (r.ok && !d.error) sent++; else failed++;
+    } catch(e) { failed++; }
+  }
+  showToast(`Sent "continue" to ${sent} session${sent === 1 ? '' : 's'}`
+    + (failed ? ` — ${failed} failed` : ''));
 }
 
 async function showSessionInfo(name) {
@@ -25291,6 +25406,7 @@ function render() {
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)">${esc(s.credit_limit_model || 'model')} limit</span>` : ''}
+          ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
           ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
           ${s.tokens ? `<span class="token-count">${fmtTokens(s.tokens)}</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
@@ -28377,7 +28493,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.229';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.230';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -48965,7 +49081,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.229';
+const CACHE = 'amux-v0.9.230';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
