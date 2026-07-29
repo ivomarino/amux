@@ -142,17 +142,23 @@ def upload_docs(org, docs):
         path = doc["path"]
         directory, _, fname = path.rpartition("/")
         directory = directory or "/root"
-        content = doc.get("content", "")
+        # content_file is read as BYTES so real artifacts (a customer's .xlsx)
+        # survive the upload intact; inline content stays text.
         if "content_file" in doc:
-            content = open(doc["content_file"]).read()
+            blob = open(doc["content_file"], "rb").read()
+            ctype_part = "application/octet-stream"
+        else:
+            blob = doc.get("content", "").encode()
+            ctype_part = "text/plain"
         gw("POST", "/api/fs/mkdir", body={"path": directory}, org=org)
         b = "----amux" + uuid.uuid4().hex
         payload = b"".join([
             f"--{b}\r\nContent-Disposition: form-data; name=\"dir\"\r\n\r\n{directory}\r\n".encode(),
             (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n"
-             f"Content-Type: text/plain\r\n\r\n").encode() + content.encode() + b"\r\n",
+             f"Content-Type: {ctype_part}\r\n\r\n").encode() + blob + b"\r\n",
             f"--{b}--\r\n".encode(),
         ])
+        content = blob
         code, resp = gw("POST", "/api/fs/upload", org=org, raw=payload,
                         ctype=f"multipart/form-data; boundary={b}")
         if code == 200:
