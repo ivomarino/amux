@@ -21795,6 +21795,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn primary" onclick="_bwGo()">Go</button>
     <button id="bw-live-btn" class="bw-btn" onclick="_bwToggleLive()" title="Live auto-refresh">&#9658; Live</button>
     <button class="bw-btn" onclick="_bwScreenshot()" title="Snapshot">&#128247;</button>
+    <button class="bw-btn" onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
     <button class="bw-btn" onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
   </div>
   <!-- Status / logged-in indicator -->
@@ -28198,7 +28199,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.220';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.221';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47956,6 +47957,39 @@ async function _bwClearInspect() {
 }
 
 // ── Save profile: register current site to a profile (deliverable #1 UI) ──
+// Create a named profile and open a REAL headed window on it to sign in.
+// Scripted login is not a general solution: recreation.gov answers
+// /api/accounts/login/v2/ with {"error":"additional challenge required"} and a
+// reCAPTCHA — many sites do. A human completing the challenge once in a real
+// window is the only thing that works, and closing the window is what flushes
+// the session to the profile for the API to reuse.
+async function _bwNewProfile() {
+  const url = (document.getElementById('bw-url').value || '').trim();
+  const suggested = (() => {
+    try { return new URL(url).hostname.replace(/^www\./,'').split('.')[0]; } catch(e) { return ''; }
+  })();
+  const ok = await showFormModal('New browser profile',
+    '<input id="bwp-name" class="bw-in" style="width:100%;box-sizing:border-box" placeholder="Profile name (e.g. recreation-gov)" value="' + esc(suggested) + '">'
+    + '<input id="bwp-url" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:8px" placeholder="Sign-in URL" value="' + esc(url) + '">'
+    + '<div style="margin-top:10px;font-size:0.76rem;color:var(--dim);line-height:1.5">'
+    + 'A real browser window opens. Sign in there — including any CAPTCHA or 2FA — then <b>close the window</b>. '
+    + 'Closing is what saves the session. The profile is then usable from the browser API.</div>', 'Open sign-in');
+  const name = (document.getElementById('bwp-name') || {}).value || '';
+  const surl = (document.getElementById('bwp-url') || {}).value || '';
+  if (!ok || !name.trim()) return;
+  try {
+    const r = await fetch('/api/browser/profile/create', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim(), url: surl.trim() }) });
+    const d = await r.json();
+    if (d.error) { showToast('Profile: ' + d.error); return; }
+    showToast('Signing-in window open — close it when done');
+    await _bwLoadProfiles();
+    const sel = document.getElementById('bw-profile');
+    if (sel) sel.value = d.profile;
+  } catch(e) { showToast('Could not create profile'); }
+}
+
 async function _bwSaveProfile() {
   const suggested = _bwActiveProfile || '';
   const name = prompt('Register the current site to which profile?\n(Logging in under this profile persists automatically.)', suggested);
@@ -48606,7 +48640,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.220';
+const CACHE = 'amux-v0.9.221';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
