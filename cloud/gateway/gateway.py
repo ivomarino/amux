@@ -3113,10 +3113,18 @@ class Handler(BaseHTTPRequestHandler):
             wrote = _write_proxy_env(oid)
             reloaded = False
             if wrote:
-                r = subprocess.run(
-                    ["docker", "exec", f"amux-user-{oid}", "touch", "/app/amux-server.py"],
-                    capture_output=True)
+                # server.env is read into the process environment at startup, and
+                # amux-server.py is bind-mounted read-only so it cannot be touched
+                # from inside. Restart the container so the new credentials reach
+                # the process — and therefore the tmux panes agents run in.
+                r = subprocess.run(["docker", "restart", f"amux-user-{oid}"],
+                                   capture_output=True, timeout=90)
                 reloaded = r.returncode == 0
+                if reloaded:
+                    for _ in range(30):
+                        time.sleep(2)
+                        if container_healthy(oid):
+                            break
             return self._json({"ok": True, "proxy_env_written": wrote,
                                "server_reloaded": reloaded,
                                "mode": "proxy" if wrote else ("org_key" if _resolve_api_key(db, oid) else "none"),

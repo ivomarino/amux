@@ -6999,12 +6999,20 @@ def _init_claude_config():
     import json as _json
     import pathlib as _pathlib
 
+    # A managed upstream (amux cloud's Anthropic proxy) authenticates with
+    # ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN and deliberately has NO
+    # ANTHROPIC_API_KEY. Returning early on that left claude to show its
+    # first-run theme wizard and folder-trust dialog, so a correctly
+    # authenticated cloud session sat at an interactive prompt forever.
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    _auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    _base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    cred = api_key or (_auth_token if _base_url else "")
+    if not cred:
         return
 
-    # claude uses the last 20 chars of the key as its identifier
-    key_hash = api_key[-20:]
+    # claude uses the last 20 chars of the credential as its identifier
+    key_hash = cred[-20:]
 
     claude_json = _pathlib.Path.home() / ".claude.json"
     cfg = {}
