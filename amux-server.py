@@ -2221,7 +2221,8 @@ _event_log_lock = threading.Lock()
 _req_tl = threading.local()  # per-request enrichment (set by handlers, read by _route)
 
 def _emit_http_event(etype: str, action: str, target: str = "", session: str = "",
-                     detail: str = "", status: int = 200, ip: str = "") -> None:
+                     detail: str = "", status: int = 200, ip: str = "",
+                     actor: str = "") -> None:
     # Don't emit semantic events (e.g. message-sent, started) for failed requests.
     # Downgrade to a plain http event so they don't spam the event log as false positives.
     if status >= 400 and etype != "http":
@@ -2237,6 +2238,7 @@ def _emit_http_event(etype: str, action: str, target: str = "", session: str = "
             "detail": detail,
             "status": status,
             "ip": ip,
+            "actor": actor,
         })
 
 def _classify_request(method: str, path: str) -> tuple:
@@ -23225,6 +23227,74 @@ async function toggleAutoResume(checked) {
 
 // ═══════ STATE & GLOBALS ═══════
 const API = '';
+
+// ═══════ Cloud upgrade modal (402 from the gateway) ═══════
+// The cloud gateway answers 402 with {error: 'budget_exceeded'|'trial_expired'}
+// when a trial hits its spend cap or expiry. Surface one upgrade modal instead
+// of letting every poll fail silently. Self-hosted servers never emit 402.
+let _upgradeModalShown = false;
+(function() {
+  const _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    return _origFetch.call(this, url, opts).then(resp => {
+      try {
+        if (resp.status === 402 && !_upgradeModalShown && typeof url === 'string' && url.indexOf('/api/') !== -1) {
+          resp.clone().json().then(d => {
+            if (d && (d.error === 'budget_exceeded' || d.error === 'trial_expired')) {
+              _showUpgradeModal(d);
+            }
+          }).catch(() => {});
+        }
+      } catch(e) {}
+      return resp;
+    });
+  };
+})();
+
+function _showUpgradeModal(d) {
+  if (_upgradeModalShown) return;
+  _upgradeModalShown = true;
+  const isBudget = d.error === 'budget_exceeded';
+  const spent = (d.spend_usd != null) ? Number(d.spend_usd).toFixed(2) : null;
+  const budget = (d.budget_usd != null) ? Number(d.budget_usd).toFixed(2) : null;
+  const wrap = document.createElement('div');
+  wrap.id = 'upgrade-modal';
+  wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(5,5,10,0.88);display:flex;align-items:center;justify-content:center;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));';
+  wrap.innerHTML =
+    '<div style="background:#14142a;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90vh;overflow-y:auto;">' +
+      '<div style="font-size:1.15rem;font-weight:700;margin-bottom:6px;">' +
+        (isBudget ? 'Your trial budget is used up' : 'Your trial has ended') + '</div>' +
+      (isBudget && spent ? '<div style="color:#f0b429;font-size:1.05rem;font-weight:600;margin-bottom:10px;">$' + spent + ' of $' + budget + ' used</div>' : '') +
+      '<div style="color:#999;font-size:0.86rem;margin-bottom:16px;line-height:1.5;">Your workspace and sessions are safe. Upgrade to keep your agents running.</div>' +
+      '<div style="background:#0f0f22;border:1px solid #2a2a4a;border-radius:10px;padding:14px 16px;text-align:left;margin-bottom:18px;">' +
+        '<div style="color:#c4b5fd;font-size:0.82rem;font-weight:600;margin-bottom:8px;">What you get when you upgrade</div>' +
+        ['Your sessions made production-grade, with our team onboarding you',
+         'A dedicated, isolated machine for your workloads',
+         'Support and maintenance from the amux team',
+         'Ongoing workflow creation, tuning, and teaching'].map(f =>
+          '<div style="color:#aaa;font-size:0.8rem;padding:3px 0 3px 20px;position:relative;"><span style="position:absolute;left:2px;color:#3fb950;font-weight:700;">✓</span>' + f + '</div>').join('') +
+      '</div>' +
+      '<button onclick="_upgradeCheckout(\'monthly\')" style="display:block;width:100%;min-height:44px;background:#7c6fcd;color:#fff;border:none;border-radius:9px;padding:12px;font-size:0.92rem;font-weight:600;cursor:pointer;margin-bottom:8px;">Upgrade — monthly</button>' +
+      '<button onclick="_upgradeCheckout(\'annual\')" style="display:block;width:100%;min-height:44px;background:#26263e;color:#e5e5e5;border:1px solid #3a3a5c;border-radius:9px;padding:12px;font-size:0.92rem;font-weight:600;cursor:pointer;margin-bottom:8px;">Upgrade — annual (save 17%)</button>' +
+      '<div id="upgrade-modal-err" style="color:#f87171;font-size:0.8rem;min-height:1.1em;"></div>' +
+    '</div>';
+  document.body.appendChild(wrap);
+}
+
+async function _upgradeCheckout(billing) {
+  try {
+    const r = await fetch('/api/stripe/checkout', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ billing: billing, platform_fee: true })
+    });
+    const d = await r.json();
+    if (d.url) { location.href = d.url; return; }
+    document.getElementById('upgrade-modal-err').textContent = d.error || 'Checkout failed';
+  } catch(e) {
+    document.getElementById('upgrade-modal-err').textContent = 'Connection error';
+  }
+}
+
 let sessions = [];
 let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
@@ -37746,7 +37816,8 @@ async function fetchLogs() {
     if (!r.ok) return;
     const d = await r.json();
     const fetched = (d.events || []).map(e => ({
-      ...e, type: e.type || e.category, target: e.target || e.detail, ip: e.ip || e.actor,
+      ...e, type: e.type || e.category, target: e.target || e.detail, ip: e.ip || '',
+      actor: e.actor || '',
       status: e.level === 'error' ? 500 : (e.status || 200),
     }));
     // Merge: keep SSE-accumulated events that are newer than what the API returned,
@@ -37820,6 +37891,7 @@ function renderActivity() {
       (e.detail||'').toLowerCase().includes(q) ||
       (e.target||'').toLowerCase().includes(q) ||
       (e.session||'').toLowerCase().includes(q) ||
+      (e.actor||'').toLowerCase().includes(q) ||
       e.action.toLowerCase().includes(q) ||
       e.type.toLowerCase().includes(q)
     );
@@ -37845,6 +37917,7 @@ function renderActivity() {
       const ac = isErr ? 'var(--red)' : (_LOG_ACTION_COLOR[evt.action] || tc.color);
       const title = _evtTitle(evt);
       const meta = [];
+      if (evt.actor) meta.push('<span style="color:var(--purple,#a78bfa)" title="who did this">by ' + escHtml(evt.actor) + '</span>');
       if (evt.session) meta.push('<span style="color:var(--accent)">' + escHtml(evt.session) + '</span>');
       if (evt.ip && evt.ip !== '127.0.0.1' && evt.ip !== '::1') meta.push(escHtml(evt.ip));
       if (isErr) meta.push('<span style="color:var(--red)">HTTP ' + evt.status + '</span>');
@@ -49566,7 +49639,12 @@ class CCHandler(BaseHTTPRequestHandler):
                     session  = tl.get("session", session)
                     detail   = tl.get("detail",  "")
                     _req_tl.event = None
-                _emit_http_event(etype, action, target, session, detail, self._resp_status, ip)
+                # Attribution: which principal acted. An agent session's verified
+                # header wins; a cloud human is the gateway-stamped email. Never
+                # trust body claims here (AMUX-1768 provenance principle).
+                actor = (self.headers.get("X-Amux-Session", "").strip()
+                         or self.headers.get("X-Amux-User-Email", "").strip())
+                _emit_http_event(etype, action, target, session, detail, self._resp_status, ip, actor)
 
     def _check_auth(self, method: str, path: str) -> bool:
         """Return True if request is authorized. Sends 401 and returns False if not."""
