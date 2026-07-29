@@ -3097,6 +3097,31 @@ class Handler(BaseHTTPRequestHandler):
                 db.commit()
             return self._json({"ok": True})
 
+        # ── Admin: re-apply Claude auth to a RUNNING container ────────────────
+        # Proxy env is written at container start, so an org booted before the
+        # house key existed sits at Claude's login prompt forever. This rewrites
+        # server.env and reloads the in-container server so it takes effect
+        # without destroying the workspace.
+        _adm_auth_m = re.match(r"^/api/gateway/admin/orgs/([^/]+)/refresh-auth$", path)
+        if _adm_auth_m and self.command == "POST":
+            if not is_admin:
+                return self._json({"error": "forbidden"}, 403)
+            oid = _adm_auth_m.group(1)
+            org_row = db.execute("SELECT id FROM orgs WHERE id=?", (oid,)).fetchone()
+            if not org_row:
+                return self._json({"error": "org not found"}, 404)
+            wrote = _write_proxy_env(oid)
+            reloaded = False
+            if wrote:
+                r = subprocess.run(
+                    ["docker", "exec", f"amux-user-{oid}", "touch", "/app/amux-server.py"],
+                    capture_output=True)
+                reloaded = r.returncode == 0
+            return self._json({"ok": True, "proxy_env_written": wrote,
+                               "server_reloaded": reloaded,
+                               "mode": "proxy" if wrote else ("org_key" if _resolve_api_key(db, oid) else "none"),
+                               "note": "restart sessions so agents inherit the new environment"})
+
         # ── Admin: force a spend refresh (and enforce) for one org ────────────
         _adm_spend_m = re.match(r"^/api/gateway/admin/orgs/([^/]+)/refresh-spend$", path)
         if _adm_spend_m and self.command == "POST":
