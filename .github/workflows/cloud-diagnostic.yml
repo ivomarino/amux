@@ -57,6 +57,24 @@ jobs:
             rm -f /tmp/s.json
           fi
           echo
+          echo "=== R2 durability check (is deleted-user data replicated?) ==="
+          R2_ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          docker run --rm -e AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$R2_SECRET_KEY" \
+            amazon/aws-cli:latest s3 ls "s3://amux-cloud-users/users/" --endpoint-url "$R2_ENDPOINT" 2>/dev/null > /tmp/r2.txt || echo "  (R2 list failed)"
+          echo "  user prefixes in R2: $(grep -c PRE /tmp/r2.txt 2>/dev/null || echo 0)"
+          echo "  local user dirs:     $(ls -1 /var/amux/users 2>/dev/null | wc -l)"
+          echo "  docker volumes:      $(docker volume ls -q --filter name=amux-data- | wc -l)"
+          echo "  --- sample: do specific deleted users still have R2 data? ---"
+          for u in user_3DxAm4JszaWopB72SiE9XUc3N0R user_3FnDdHiNQa29v2cqjo87RFKjF2F user_3H698w6MZJcZWQadp9e6FtErkv7; do
+            n=$(docker run --rm -e AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$R2_SECRET_KEY" \
+                  amazon/aws-cli:latest s3 ls "s3://amux-cloud-users/users/$u/" --recursive --endpoint-url "$R2_ENDPOINT" 2>/dev/null | wc -l)
+            sz=$(du -sh /var/amux/users/$u 2>/dev/null | cut -f1)
+            echo "    $u: R2 objects=$n  local=${sz:-none}"
+          done
+          echo "  total R2 size under users/:"
+          docker run --rm -e AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$R2_SECRET_KEY" \
+            amazon/aws-cli:latest s3 ls "s3://amux-cloud-users/users/" --recursive --summarize --endpoint-url "$R2_ENDPOINT" 2>/dev/null | tail -2 | sed 's/^/    /'
+          echo
           echo "=== containers / disk ==="
           echo "  running amux containers: $(docker ps --filter name=amux-user- -q | wc -l)"
           echo "  user data dirs: $(ls -1 /var/amux/users 2>/dev/null | wc -l)"
