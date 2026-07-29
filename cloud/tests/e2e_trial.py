@@ -14,7 +14,7 @@ Env vars required:
 Usage:
   python3 cloud/tests/e2e_trial.py [--gateway https://cloud.amux.io]
 """
-import argparse, hashlib, hmac, json, os, sys, time, urllib.request, urllib.error
+import argparse, hashlib, hmac, json, os, sys, time, urllib.request, urllib.error, urllib.parse
 
 GATEWAY = os.environ.get("E2E_GATEWAY", "https://cloud.amux.io")
 CLERK_SECRET = os.environ.get("CLERK_SECRET_KEY", "")
@@ -68,9 +68,30 @@ def clerk_api(method, path, body=None):
         raise RuntimeError(f"Clerk API {method} {path} → {e.code}: {e.read().decode()}")
 
 
+def _user_emails(u):
+    return {a.get("email_address", "").strip().lower()
+            for a in (u.get("email_addresses") or [])}
+
+
 def clerk_find_user(email):
-    data = clerk_api("GET", f"/users?email_address[]={email}&limit=1")
-    return data[0] if data else None
+    """Look up a user by email. Must use ?email_address= — Clerk silently
+    ignores ?email_address[]= and returns every user, which previously caused
+    real accounts to be deleted. Results are re-verified before being returned."""
+    data = clerk_api("GET", f"/users?email_address={urllib.parse.quote(email)}&limit=5")
+    if not isinstance(data, list):
+        return None
+    for u in data:
+        if email.strip().lower() in _user_emails(u):
+            return u
+    return None
+
+
+def clerk_delete_user_checked(user_id, expect_email):
+    """Delete only after confirming the account carries expect_email."""
+    u = clerk_api("GET", f"/users/{user_id}")
+    if expect_email.strip().lower() not in _user_emails(u):
+        raise RuntimeError(f"REFUSING to delete {user_id}: not {expect_email}")
+    return clerk_api("DELETE", f"/users/{user_id}")
 
 
 def clerk_create_user(email, password):
@@ -87,7 +108,7 @@ def clerk_create_user(email, password):
             if "form_identifier_exists" in str(e) and attempt < 2:
                 stale = clerk_find_user(email)
                 if stale:
-                    clerk_api("DELETE", f"/users/{stale['id']}")
+                    clerk_delete_user_checked(stale["id"], email)
                 time.sleep(2)
             else:
                 raise
@@ -319,7 +340,7 @@ def main():
                 warn(f"cleanup {uid} returned {code}")
         if trial_user:
             try:
-                clerk_api("DELETE", f"/users/{trial_user['id']}")
+                clerk_delete_user_checked(trial_user["id"], TRIAL_EMAIL)
                 ok(f"Clerk user {trial_user['id']} deleted")
             except Exception as e:
                 warn(f"Clerk user delete failed: {e}")
