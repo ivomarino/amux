@@ -32,6 +32,11 @@ jobs:
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
             'touch /opt/amux-cloud/app/amux-server.py && echo "amux-server.py deployed"'
 
+      - name: Ensure admin emails configured (idempotent)
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
+            'grep -q "^ADMIN_EMAILS=" /etc/amux/gateway.env || echo "ADMIN_EMAILS=ethan@mixpeek.com,esteininger21@gmail.com" >> /etc/amux/gateway.env'
+
       - name: Deploy gateway.py
         run: |
           rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/gateway.py \
