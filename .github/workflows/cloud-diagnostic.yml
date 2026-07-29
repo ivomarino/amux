@@ -35,14 +35,26 @@ jobs:
           if [ -z "$STRIPE_SECRET_KEY" ]; then
             echo "  no key configured"
           else
-            for ep in subscriptions customers charges invoices; do
-              q="limit=100"; [ "$ep" = "subscriptions" ] && q="status=all&limit=100"
-              curl -s -u "$STRIPE_SECRET_KEY:" "https://api.stripe.com/v1/$ep?$q" > /tmp/s.json
-              python3 -c "import json;d=json.load(open('/tmp/s.json'));print('  $ep:', len(d['data']) if 'data' in d else 'ERROR '+str(d.get('error',{}).get('message','?')))"
-            done
-            curl -s -u "$STRIPE_SECRET_KEY:" "https://api.stripe.com/v1/charges?limit=100" > /tmp/c.json
-            python3 -c "import json;d=json.load(open('/tmp/c.json'));c=d.get('data',[]);print('  total paid: \$%.2f across %d charge(s)'%(sum(x['amount'] for x in c if x.get('paid'))/100.0,len(c)))"
-            rm -f /tmp/s.json /tmp/c.json
+            curl -s -u "$STRIPE_SECRET_KEY:" "https://api.stripe.com/v1/subscriptions?status=all&limit=100&expand[]=data.customer" > /tmp/s.json
+            AMUX_PRICES="$STRIPE_PRO_PRICE_ID,$STRIPE_ANNUAL_PRICE_ID" python3 - <<'PYEOF'
+          import json, os
+          prices = {p for p in os.environ.get("AMUX_PRICES","").split(",") if p}
+          subs = json.load(open("/tmp/s.json")).get("data", [])
+          print(f"  total subscriptions on this Stripe account: {len(subs)}")
+          amux = []
+          for s in subs:
+              items = [i.get("price", {}).get("id") for i in s.get("items", {}).get("data", [])]
+              if prices & set(items):
+                  amux.append(s)
+          print(f"  subscriptions using an amux price id: {len(amux)}")
+          for s in amux:
+              c = s.get("customer") or {}
+              em = c.get("email") if isinstance(c, dict) else c
+              print(f"     {s.get('id')} status={s.get('status')} email={em}")
+          if not amux:
+              print("  -> NOBODY has ever subscribed to amux; the rest belong to other Mixpeek products.")
+          PYEOF
+            rm -f /tmp/s.json
           fi
           echo
           echo "=== containers / disk ==="
