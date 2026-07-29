@@ -222,11 +222,18 @@ def main():
         gw("GET", "/api/stripe/status", cookies=user_cookies)
         code, body, hdrs = gw("POST", f"/api/gateway/invite/{invite_token}/accept",
                               cookies=user_cookies)
-        set_cookie = hdrs.get("Set-Cookie", "")
-        if code == 302 and f"amux_org={org_id}" in set_cookie:
-            ok("Accept succeeded — amux_org cookie set to the provisioned org")
+        # urllib follows the 302 (same as the smoke test's logout step), so assert
+        # the outcome instead: the user must now be a member of the org.
+        if code not in (200, 302):
+            fail(f"Accept returned {code}: {body[:200]}")
         else:
-            fail(f"Accept returned {code}, Set-Cookie: {set_cookie[:120]}")
+            code, body, _ = gw("GET", "/api/gateway/admin/orgs", cookies=admin_cookies, e2e=True)
+            orgs = {o["id"]: o for o in json.loads(body).get("orgs", [])} if code == 200 else {}
+            members = [m["user_id"] for m in orgs.get(org_id, {}).get("members", [])]
+            if trial_user["id"] in members:
+                ok("Accept succeeded — invited user is a member of the provisioned org")
+            else:
+                fail(f"Invited user not in org members: {members}")
         user_cookies["amux_org"] = org_id
 
         # ── 5. Container starts; user lands in the org workspace ──
