@@ -28199,7 +28199,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.221';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.222';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38291,7 +38291,7 @@ async function fetchBoard() {
     if (itemsChanged || statusesChanged) {
       lastBoardJSON = j;
       boardItems = data;
-      localStorage.setItem('amux_board_cache', j);
+      _cacheBoardJSON(j);
       renderBoard();
     }
   } catch(e) {
@@ -39642,7 +39642,7 @@ async function boardDetailDelete() {
 
 function saveBoardCache() {
   lastBoardJSON = JSON.stringify(boardItems);
-  localStorage.setItem('amux_board_cache', lastBoardJSON);
+  _cacheBoardJSON(lastBoardJSON);
 }
 
 async function addBoardItem(title, desc, status, session, tags, due, ownerType, dueTime, gate) {
@@ -41307,6 +41307,15 @@ if (_cachedInit) {
   try { sessions = JSON.parse(_cachedInit); } catch(e) {}
 }
 // Load cached board from localStorage (fast, synchronous)
+// The board payload is multi-MB (3.16MB measured) and localStorage caps around
+// 5MB. An unguarded setItem threw QuotaExceededError that propagated out and
+// killed the SSE parse and the board fetch wrapping it — observed live in the
+// console. The cache is an optimisation: a failed write must be silent, drop
+// the stale entry, and never poison the caller.
+function _cacheBoardJSON(j) {
+  try { _cacheBoardJSON(j); }
+  catch (e) { try { localStorage.removeItem('amux_board_cache'); } catch (e2) {} }
+}
 const _cachedBoard = localStorage.getItem('amux_board_cache');
 if (_cachedBoard) {
   try { boardItems = JSON.parse(_cachedBoard); lastBoardJSON = _cachedBoard; } catch(e) {}
@@ -41506,7 +41515,7 @@ if (!boardItems.length) {
       boardItems = items.filter(i => !i.deleted);
       const j = JSON.stringify(boardItems);
       lastBoardJSON = j;
-      localStorage.setItem('amux_board_cache', j);
+      _cacheBoardJSON(j);
       if (activeView === 'board') renderBoard();
       else if (activeView === 'calendar') renderCalendar();
     }
@@ -41534,7 +41543,7 @@ async function _runDeltaSync() {
       });
       const j = JSON.stringify(boardItems);
       lastBoardJSON = j;
-      localStorage.setItem('amux_board_cache', j);
+      _cacheBoardJSON(j);
       _idb.applyIssueDelta(data.issues);
     }
     if (data.statuses && data.statuses.length) {
@@ -41604,7 +41613,7 @@ function connectSSE() {
         if (j !== lastBoardJSON) {
           lastBoardJSON = j;
           boardItems = msg.payload;
-          localStorage.setItem('amux_board_cache', j);
+          _cacheBoardJSON(j);
           // Mirror to IDB for full offline durability (iOS-safe)
           _idb.applyIssueDelta(msg.payload);
           _idb.set('last_sync_ts', Math.floor(Date.now() / 1000));
@@ -47664,10 +47673,14 @@ let _bwShotInFlight = false;   // debounce: skip a screenshot while one is runni
 let _bwAgentCtl = null;        // AbortController for the running agent task
 
 async function _bwInit() {
-  if (!_bwInited) {
-    _bwInited = true;
-    await _bwLoadProfiles();
-  }
+  // Reload the profile list on EVERY switch to the tab, not once per page load.
+  // The old one-shot guard set _bwInited before the fetch resolved and swallowed
+  // its failure, so a call that lost a race during startup ("Failed to fetch")
+  // left the picker permanently empty with no retry — the API had 38 profiles
+  // and the dropdown showed only "Auto profile". It is one small GET; a stale
+  // picker costs far more than re-fetching it.
+  _bwInited = true;
+  await _bwLoadProfiles();
 }
 
 async function _bwLoadProfiles() {
@@ -48640,7 +48653,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.221';
+const CACHE = 'amux-v0.9.222';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
