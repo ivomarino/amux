@@ -39,6 +39,8 @@ PORT_BASE     = 9000
 COOKIE_MAX_AGE = 86400 * 7  # 7 days
 # Signup is open — no passcode required
 ADMIN_EMAILS    = set(e.strip() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip())
+# Public origin containers use to reach the Anthropic proxy on this gateway.
+PROXY_PUBLIC_BASE = os.environ.get("AMUX_PROXY_BASE", "https://cloud.amux.io")
 GATEWAY_LOG     = "/var/log/amux-gateway.log"
 
 # ── Starting HTML (shown while container boots) ──────────────────────────────
@@ -1094,6 +1096,181 @@ def _enforce_budget(db, org_row, spend):
     return True
 
 
+def _org_proxy_token(org_id):
+    """Deterministic per-org token for the Anthropic proxy. Derived from
+    COOKIE_SECRET so it needs no storage and rotates with the secret."""
+    return hmac.new(COOKIE_SECRET.encode(), f"anthropic-proxy:{org_id}".encode(),
+                    hashlib.sha256).hexdigest()[:40]
+
+
+def _org_for_proxy_token(db, token):
+    """Reverse a proxy token to its org. Linear over orgs, which is fine at this
+    scale and avoids storing a second credential."""
+    for r in db.execute("SELECT id, port, plan, budget_usd, spend_usd FROM orgs").fetchall():
+        if hmac.compare_digest(_org_proxy_token(r["id"]), token):
+            return r
+    return None
+
+
+_PROXY_PRICES = {  # USD per 1M tokens (input, cache_write, cache_read, output)
+    "opus":   (15.0, 18.75, 1.50, 75.0),
+    "sonnet": (3.0,  3.75,  0.30, 15.0),
+    "haiku":  (0.80, 1.00,  0.08, 4.0),
+}
+
+
+def _proxy_cost_usd(model, usage):
+    m = (model or "").lower()
+    tier = "opus" if "opus" in m else ("haiku" if "haiku" in m else "sonnet")
+    pi, pcw, pcr, po = _PROXY_PRICES[tier]
+    return ((usage.get("input_tokens", 0) or 0) * pi
+            + (usage.get("cache_creation_input_tokens", 0) or 0) * pcw
+            + (usage.get("cache_read_input_tokens", 0) or 0) * pcr
+            + (usage.get("output_tokens", 0) or 0) * po) / 1_000_000.0
+
+
+def _record_proxy_spend(org_id, cost):
+    """Add a request's cost to the org's running spend. This is exact and
+    immediate — no transcript parsing, no polling lag."""
+    if cost <= 0:
+        return
+    try:
+        db = get_db()
+        with _db_lock:
+            db.execute("UPDATE orgs SET spend_usd = COALESCE(spend_usd,0) + ?, spend_checked_at=? WHERE id=?",
+                       (cost, int(time.time()), org_id))
+            db.commit()
+    except Exception as e:
+        print(f"[proxy] spend record failed for {org_id}: {e}", flush=True)
+
+
+def _handle_anthropic_proxy(handler, path, qs):
+    """Forward /anthropic/<token>/<upstream path> to api.anthropic.com with the
+    house key injected server-side.
+
+    Containers get ANTHROPIC_BASE_URL pointed here plus a per-org token, so the
+    real key never exists inside a workspace a trial user can read. Every reply
+    is metered, so the budget is enforced per request rather than on a poll.
+    """
+    rest = path[len("/anthropic/"):]
+    token, _, upstream = rest.partition("/")
+    if not token:
+        return handler._json({"error": "missing proxy token"}, 401)
+    db = get_db()
+    org = _org_for_proxy_token(db, token)
+    if not org:
+        return handler._json({"error": "invalid proxy token"}, 403)
+    if not ANTHROPIC_API_KEY:
+        return handler._json({"type": "error", "error": {"type": "api_error",
+                              "message": "amux cloud has no upstream API key configured"}}, 503)
+    # Budget gate — refuse before spending anything more.
+    if (org["budget_usd"] is not None and org["plan"] != "pro"
+            and (org["spend_usd"] or 0) >= org["budget_usd"]):
+        return handler._json({"type": "error", "error": {"type": "budget_exceeded",
+                              "message": f"amux trial budget exhausted "
+                                         f"(${org['spend_usd']:.2f} of ${org['budget_usd']:.2f}). "
+                                         f"Upgrade at https://cloud.amux.io to continue."}}, 402)
+
+    length = int(handler.headers.get("Content-Length", 0))
+    body = handler.rfile.read(length) if length else None
+    url = "https://api.anthropic.com/" + upstream
+    if qs:
+        url += "?" + qs
+    skip = {"host", "content-length", "authorization", "x-api-key", "cookie", "connection"}
+    fwd = {k: v for k, v in handler.headers.items() if k.lower() not in skip}
+    fwd["x-api-key"] = ANTHROPIC_API_KEY
+    fwd.setdefault("anthropic-version", "2023-06-01")
+    req = urllib.request.Request(url, data=body, method=handler.command, headers=fwd)
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        handler.send_response(e.code)
+        handler.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+    except Exception as e:
+        return handler._json({"type": "error",
+                              "error": {"type": "api_error", "message": str(e)}}, 502)
+
+    ctype = resp.headers.get("Content-Type", "")
+    handler.send_response(resp.status)
+    for k, v in resp.headers.items():
+        if k.lower() not in ("transfer-encoding", "content-encoding", "connection", "content-length"):
+            handler.send_header(k, v)
+    is_stream = "text/event-stream" in ctype
+    model_seen, usage_acc = "", {}
+    if is_stream:
+        handler.end_headers()
+        buf = b""
+        try:
+            while True:
+                chunk = resp.read(1024)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+                buf += chunk
+                # Meter from the SSE frames without disturbing the byte stream.
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.startswith(b"data: "):
+                        continue
+                    try:
+                        ev = json.loads(line[6:].decode())
+                    except Exception:
+                        continue
+                    if ev.get("type") == "message_start":
+                        msg = ev.get("message", {})
+                        model_seen = msg.get("model", model_seen)
+                        for k, v in (msg.get("usage") or {}).items():
+                            if isinstance(v, int):
+                                usage_acc[k] = usage_acc.get(k, 0) + v
+                    elif ev.get("type") == "message_delta":
+                        for k, v in (ev.get("usage") or {}).items():
+                            if isinstance(v, int):
+                                usage_acc[k] = usage_acc.get(k, 0) + v
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    else:
+        payload = resp.read()
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        try:
+            d = json.loads(payload)
+            model_seen = d.get("model", "")
+            usage_acc = d.get("usage") or {}
+        except Exception:
+            pass
+
+    if usage_acc:
+        cost = _proxy_cost_usd(model_seen, usage_acc)
+        _record_proxy_spend(org["id"], cost)
+        # Crossing the cap mid-conversation stops the fleet immediately rather
+        # than waiting for the next poll.
+        try:
+            fresh = get_db().execute(
+                "SELECT id, port, plan, budget_usd, spend_usd FROM orgs WHERE id=?",
+                (org["id"],)).fetchone()
+            if (fresh and fresh["budget_usd"] is not None and fresh["plan"] != "pro"
+                    and (fresh["spend_usd"] or 0) >= fresh["budget_usd"]):
+                threading.Thread(target=_stop_org_sessions, args=(fresh["port"],),
+                                 daemon=True).start()
+                print(f"[proxy] org {org['id']} hit cap "
+                      f"(${fresh['spend_usd']:.2f}/${fresh['budget_usd']:.2f}) — stopping sessions", flush=True)
+        except Exception:
+            pass
+
+
 def _budget_poller():
     """Refresh cached spend for budget-capped orgs and stop sessions the moment a
     cap is crossed — running agents burn tokens whether or not anyone is watching.
@@ -1144,13 +1321,43 @@ def _ensure_container_starting(user_id, port):
                 _starting_containers.discard(user_id)
     threading.Thread(target=_run, daemon=True).start()
 
+def _write_proxy_env(user_id):
+    """Point the container's Claude Code at our proxy instead of handing it a key.
+
+    ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN are all Claude Code needs; the
+    token only works through our gateway, is scoped to this one org, and is
+    worthless if a trial user copies it out. The real key stays on the host.
+    """
+    if not ANTHROPIC_API_KEY:
+        return False
+    base = f"{PROXY_PUBLIC_BASE}/anthropic/{_org_proxy_token(user_id)}"
+    vol = f"amux-data-{user_id}"
+    script = (
+        'ENV=/root/.amux/server.env; touch "$ENV"; '
+        'grep -v -e "^ANTHROPIC_BASE_URL=" -e "^ANTHROPIC_AUTH_TOKEN=" -e "^ANTHROPIC_API_KEY=" '
+        '  "$ENV" > "$ENV.tmp" 2>/dev/null || true; mv "$ENV.tmp" "$ENV"; '
+        'printf "ANTHROPIC_BASE_URL=%s\\nANTHROPIC_AUTH_TOKEN=%s\\n" "$1" "$2" >> "$ENV"'
+    )
+    try:
+        subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{vol}:/root/.amux", "alpine:latest",
+             "sh", "-c", script, "--", base, _org_proxy_token(user_id)],
+            capture_output=True, timeout=30)
+        return True
+    except Exception as e:
+        print(f"[proxy] failed to write proxy env for {user_id}: {e}", flush=True)
+        return False
+
+
 def start_container(user_id, port):
     _write_compose(user_id, port)
     _restore_user_files(user_id)
-    # Inject API key into server.env before starting — own org or shared org
+    # Preferred path: route through our proxy so no key lands in the container.
+    _proxied = _write_proxy_env(user_id)
+    # Fallback (self-supplied or per-org key) only when there is no house key.
     try:
         db = get_db()
-        api_key = _resolve_api_key(db, user_id)
+        api_key = None if _proxied else _resolve_api_key(db, user_id)
         if api_key:
             vol = f"amux-data-{user_id}"
             subprocess.run(
@@ -1784,6 +1991,13 @@ class Handler(BaseHTTPRequestHandler):
         if _sub_tid:
             _tunnel_serve_public(self, _sub_tid, path, qs)
             return
+
+        # ── Anthropic proxy: /anthropic/<org-token>/… (token-authed) ──
+        # Bearer-free by design: the caller proves identity with the per-org
+        # token in the path, and the house key is injected here so it never
+        # exists inside a user container.
+        if path.startswith("/anthropic/"):
+            return _handle_anthropic_proxy(self, path, qs)
 
         # ── amux tunnel: /t/<tid>/… (public) + /tunnel/* (token-authed) ──
         if path.startswith("/t/") or path.startswith("/tunnel/"):
