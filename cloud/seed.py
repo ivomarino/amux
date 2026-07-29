@@ -168,6 +168,10 @@ def create_sessions(org, sessions):
                 "provider": s.get("provider", "claude")}
         if s.get("dir"):
             body["dir"] = s["dir"]
+        # Tags become the session-list filter chips — the "tabs" across categories
+        # of work, so a fleet of sessions stays navigable as it grows.
+        if s.get("tags"):
+            body["tags"] = s["tags"]
         code, resp = gw("POST", "/api/sessions", body=body, org=org, timeout=120)
         if code in (200, 201):
             ok(f"session '{s['name']}' ({body['provider']})")
@@ -200,12 +204,31 @@ def create_schedules(org, sessions):
     return out
 
 
-def create_board(org, items):
+def create_board_columns(org, labels):
+    """Add a board column per category of work, so the kanban mirrors how the
+    prospect actually thinks about their pipeline rather than generic todo/doing.
+    Returns {label: status_id} for placing items into them."""
+    mapping = {}
+    for label in labels:
+        code, d = gw_json("POST", "/api/board/statuses", body={"label": label}, org=org)
+        if code in (200, 201) and isinstance(d, dict) and d.get("id"):
+            mapping[label] = d["id"]
+            ok(f"board column '{label}' → {d['id']}")
+        else:
+            bad(f"board column '{label}' failed: {code} {str(d)[:120]}")
+    return mapping
+
+
+def create_board(org, items, columns=None):
+    columns = columns or {}
     for it in items:
-        code, _ = gw("POST", "/api/board",
-                     body={"title": it["title"], "desc": it.get("desc", ""),
-                           "status": it.get("status", "todo")}, org=org)
-        (ok if code in (200, 201) else bad)(f"board item '{it['title'][:48]}'")
+        # A plan may target a column by its human label; fall back to a raw status.
+        status = columns.get(it.get("column", ""), it.get("status", "todo"))
+        body = {"title": it["title"], "desc": it.get("desc", ""), "status": status}
+        if it.get("tags"):
+            body["tags"] = it["tags"]
+        code, _ = gw("POST", "/api/board", body=body, org=org)
+        (ok if code in (200, 201) else bad)(f"board item '{it['title'][:44]}' → {status}")
 
 
 def run_once(org, sessions, schedules):
@@ -336,9 +359,13 @@ def main():
     if plan.get("docs"):
         step("Upload context docs")
         upload_docs(org, plan["docs"])
+    columns = {}
+    if plan.get("board_columns"):
+        step("Create work-category columns")
+        columns = create_board_columns(org, plan["board_columns"])
     if plan.get("board"):
         step("Seed board")
-        create_board(org, plan["board"])
+        create_board(org, plan["board"], columns)
 
     step("Create sessions")
     sessions = create_sessions(org, plan.get("sessions", []))
