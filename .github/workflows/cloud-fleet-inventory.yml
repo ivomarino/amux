@@ -1,0 +1,52 @@
+name: Cloud fleet inventory (what every workspace actually contains)
+
+# One view of every provisioned workspace: which org, which sessions tmux really
+# has, how much scrollback each session carries, and how many board items and
+# files exist. Answers "does this POC environment have real work in it?" from
+# ground truth rather than from the provisioning script's own report.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H 34.121.177.76 >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Inventory every workspace
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'bash -s' <<'ENDSSH'
+            for C in $(docker ps --filter name=amux-user- --format '{{.Names}}' | sort); do
+              ORG="${C#amux-user-}"
+              echo "=============================================================="
+              echo "container: $C"
+              docker inspect "$C" --format '  up={{.State.Running}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' 2>/dev/null
+              echo "  -- tmux sessions (ground truth) + scrollback lines each:"
+              docker exec "$C" sh -lc '
+                tmux list-sessions -F "#{session_name}" 2>/dev/null | while read s; do
+                  n=$(tmux capture-pane -p -S - -t "$s" 2>/dev/null | grep -c .)
+                  printf "     %-42s %6s non-blank lines\n" "$s" "$n"
+                done
+                [ -z "$(tmux list-sessions 2>/dev/null)" ] && echo "     (none)"
+              ' 2>&1
+              echo "  -- board items by status:"
+              docker exec "$C" sh -lc 'curl -s localhost:8822/api/board' 2>/dev/null \
+                | python3 -c "import json,sys,collections
+try:
+    d=json.load(sys.stdin)
+    c=collections.Counter(i.get('status','?') for i in d)
+    print('    ', dict(c) if c else 'EMPTY')
+except Exception as e: print('     unreadable:', e)" 2>&1
+              echo "  -- workspace files:"
+              docker exec "$C" sh -lc 'find /root -maxdepth 3 -type f \
+                 -not -path "*/.amux/*" -not -path "*/.cache/*" -not -path "*/.config/*" \
+                 -not -path "*/.npm/*" 2>/dev/null | head -12' 2>&1 | sed 's/^/     /'
+            done
+          ENDSSH
