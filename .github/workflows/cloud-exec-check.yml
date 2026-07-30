@@ -31,6 +31,14 @@ jobs:
             C="amux-user-${ORG}"
             echo "container: $C"
             docker ps --filter "name=$C" --format '  id={{.ID}} status={{.Status}} image={{.Image}}'
+            # Why a workspace went away matters as much as that it did: an
+            # OOM kill and a crash look identical from inside the container,
+            # and "server unreachable" was being read as "nothing persisted".
+            docker inspect "$C" --format '  restarts={{.RestartCount}} oom_killed={{.State.OOMKilled}} exit={{.State.ExitCode}}' 2>/dev/null
+            echo "  host memory:"
+            free -m 2>/dev/null | sed 's/^/    /'
+            echo "  recent host OOM kills:"
+            dmesg -T 2>/dev/null | grep -i "killed process\|out of memory" | tail -5 | sed 's/^/    /' || echo "    (dmesg unavailable)"
             echo
             echo "=== tmux list-sessions (ground truth) ==="
             docker exec "$C" tmux list-sessions 2>&1 | sed 's/^/  /'
