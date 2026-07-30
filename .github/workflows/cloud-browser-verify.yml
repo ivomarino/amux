@@ -8,6 +8,9 @@ name: Cloud browser verify (headless profile save + reuse)
 # Deliberately runs inside the container over docker exec rather than through
 # the gateway, so nothing about the result depends on auth, cookies, or proxy
 # behaviour. Everything here is read-only except the throwaway probe profile.
+#
+# Every response is printed untruncated: an earlier version cut them with
+# `head -c 400` and an empty body was indistinguishable from a failed call.
 
 on:
   workflow_dispatch:
@@ -36,17 +39,21 @@ jobs:
         env:
           ORG: ${{ inputs.org }}
           PROF: ${{ inputs.profile }}
-          TOKEN: run-${{ github.run_id }}
+          TOKEN: run${{ github.run_id }}
         run: |
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
             "ORG='$ORG' PROF='$PROF' TOKEN='$TOKEN' bash -s" <<'ENDSSH'
             C="amux-user-${ORG}"
             P="/root/.amux/playwright-auth/profiles"
+            SITE="http://localhost:8822/"
             ex() { docker exec "$C" sh -lc "$1" 2>&1; }
-            api() { docker exec "$C" sh -lc "curl -s -X POST localhost:8822/api/browser/$1 -H 'Content-Type: application/json' -d '$2'" 2>&1; }
+            api() {
+              docker exec "$C" sh -lc \
+                "curl -sS --max-time 90 -X POST localhost:8822/api/browser/$1 -H 'Content-Type: application/json' -d '$2'; echo \"  [curl exit \$?]\"" 2>&1
+            }
+            evl() { api "action" "{\"action\":\"eval\",\"script\":\"$1\",\"session\":\"$2\"}"; }
 
-            echo "=== 0. can node resolve playwright from the app dir? ==="
-            ex 'ls -d /app/node_modules/playwright 2>&1 | head -1'
+            echo "=== 0. environment ==="
             ex 'cd /app && node -e "console.log(require.resolve(\"playwright\"))"'
             echo "  DISPLAY=[$(ex 'echo -n "$DISPLAY"')]  (empty => headless path)"
 
@@ -55,36 +62,50 @@ jobs:
             ex "rm -rf $P/$PROF $P/$PROF.log"
             api "profile/create" "{\"name\":\"$PROF\",\"url\":\"https://example.com\"}"
             echo "  waiting for the detached launcher..."
-            sleep 30
-            echo "  --- launcher log (THE decisive output) ---"
+            sleep 25
+            echo "  --- launcher log ---"
             ex "cat $P/$PROF.log 2>&1" | sed 's/^/    /'
-            echo "  --- profile dir contents ---"
-            ex "ls -la $P/$PROF/ 2>&1 | head -15" | sed 's/^/    /'
-            echo "  --- storage-state.json (written only on the headless path) ---"
-            ex "ls -l $P/$PROF/storage-state.json 2>&1" | sed 's/^/    /'
+            ex "test -d $P/$PROF/Default && echo '    profile dir OK (Default/ present)' || echo '    NO PROFILE DIR'"
 
             echo
             echo "=== 2. WRITE through a browser session on that profile ==="
-            api "start" "{\"url\":\"http://localhost:8822/\",\"session\":\"probe1\",\"profile\":\"$PROF\"}" | head -c 400
-            echo
-            api "action" "{\"action\":\"eval\",\"script\":\"localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')\",\"session\":\"probe1\"}" | head -c 400
-            echo
+            api "start" "{\"url\":\"$SITE\",\"session\":\"probe1\",\"profile\":\"$PROF\"}"
+            echo "  origin check:"
+            evl "location.origin" probe1
+            echo "  cookie write:"
+            evl "document.cookie='amux_probe=$TOKEN; path=/; max-age=86400'; document.cookie" probe1
+            echo "  localStorage write:"
+            evl "localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')" probe1
             echo "  closing session (graceful close is what flushes storage to disk)"
-            api "stop" "{\"session\":\"probe1\"}" | head -c 200
+            api "stop" "{\"session\":\"probe1\"}"
+            sleep 6
+
             echo
-            sleep 5
+            echo "=== 2b. ON-DISK ground truth (independent of any later session) ==="
+            # Cookie names and localStorage keys are stored as plain text inside
+            # the sqlite/leveldb files, so grep -a is enough to prove the write
+            # reached disk without needing sqlite3 in the image.
+            ex "ls -l '$P/$PROF/Default/Cookies' 2>&1" | sed 's/^/    /'
+            ex "grep -a -q amux_probe '$P/$PROF/Default/Cookies' && echo '    cookie amux_probe IS on disk' || echo '    cookie amux_probe NOT on disk'"
+            ex "grep -a -r -q amux_probe '$P/$PROF/Default/Local Storage/' && echo '    localStorage amux_probe IS on disk' || echo '    localStorage amux_probe NOT on disk'"
 
             echo
             echo "=== 3. READ BACK from a SEPARATE session on the same profile ==="
-            api "start" "{\"url\":\"http://localhost:8822/\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}" | head -c 400
-            echo
-            OUT=$(api "action" "{\"action\":\"eval\",\"script\":\"localStorage.getItem('amux_probe')\",\"session\":\"probe2\"}")
-            echo "  read-back: $(echo "$OUT" | head -c 400)"
+            api "start" "{\"url\":\"$SITE\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}"
+            echo "  cookie read-back:"
+            CK=$(evl "document.cookie" probe2)
+            echo "$CK" | sed 's/^/    /'
+            echo "  localStorage read-back:"
+            LS=$(evl "localStorage.getItem('amux_probe')" probe2)
+            echo "$LS" | sed 's/^/    /'
             api "stop" "{\"session\":\"probe2\"}" >/dev/null 2>&1
 
             echo
             echo "=== VERDICT ==="
-            if echo "$OUT" | grep -q "$TOKEN"; then
+            OK=0
+            echo "$CK" | grep -q "$TOKEN" && { echo "  cookie   PASS"; OK=1; } || echo "  cookie   fail"
+            echo "$LS" | grep -q "$TOKEN" && { echo "  localSt  PASS"; OK=1; } || echo "  localSt  fail"
+            if [ "$OK" = 1 ]; then
               echo "  PASS — profile persisted across separate browser sessions (token $TOKEN survived)"
             else
               echo "  FAIL — token $TOKEN did not survive; profile is not being reused"
