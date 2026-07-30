@@ -16822,7 +16822,6 @@ async function loadNotes() {
   try {
     const r = await fetch(API + '/notes');
     const notes = await r.json();
-    el.innerHTML = notes.map(n => '<a class="note-link" onclick="viewNote(\'' + n.path + '\')">' + n.path + '</a>').join('');
   } catch(e) { el.innerHTML = 'Error loading notes'; }
 }
 loadInfo(); startPoll();
@@ -28683,111 +28682,24 @@ let _peekNotesLoading = false;
 let _peekNotesMode = 'preview';
 let _peekNotesSidebarOpen = true;
 let _peekNotesRawContent = '';
-function _peekNotesGetEditor() { return document.getElementById('peek-notes-editor'); }
 
 
 
-function _peekNotesApplySidebarState() {
-  const panel = document.getElementById('peek-notes-panel');
-  const sidebar = document.getElementById('peek-notes-sidebar');
-  if (!panel || !sidebar) return;
-  if (_peekNotesSidebarOpen) {
-    sidebar.classList.remove('collapsed');
-    panel.classList.remove('sidebar-collapsed');
-  } else {
-    sidebar.classList.add('collapsed');
-    panel.classList.add('sidebar-collapsed');
-  }
-}
 
 
 
-function _peekNotesShowEmpty() {
-  document.getElementById('peek-notes-empty-state').style.display = '';
-  document.getElementById('peek-notes-mode-tabs').style.display = 'none';
-  document.getElementById('peek-notes-editor-wrap').style.display = 'none';
-  document.getElementById('peek-notes-preview').classList.remove('active');
-  document.getElementById('peek-notes-preview').style.display = 'none';
-  document.getElementById('peek-notes-title').value = '';
-}
-
-function _peekNotesInitQuill() {
-  // no-op — textarea needs no init
-}
 
 
 
-function _peekNotesSaveDebounce() {
-  if (_peekNotesSaveTimer) clearTimeout(_peekNotesSaveTimer);
-  _peekNotesSaveTimer = setTimeout(_peekNotesSave, 400);
-}
 
 
-function _peekNotesTitleChange() {
-  const editor = _peekNotesGetEditor();
-  if (!_peekNotesActive || !editor) return;
-  const newTitle = document.getElementById('peek-notes-title').value;
-  _peekNotesActive.title = newTitle;
-  const lines = editor.value.split('\n');
-  if (lines[0] && lines[0].match(/^#\s/)) { lines[0] = '# ' + newTitle; }
-  else { lines.unshift('# ' + newTitle); }
-  editor.value = lines.join('\n');
-  const activeEl = document.querySelector('#peek-notes-list .notes-list-item.active');
-  if (activeEl) { const s = activeEl.querySelector('.nli-title'); if (s) s.textContent = newTitle || _peekNotesActive.path.replace(/\.md$/, ''); }
-  const entry = _peekNotesAll.find(n => n.path === _peekNotesActive.path);
-  if (entry) entry.name = newTitle || entry.path.replace(/\.md$/, '');
-  _peekNotesSaveDebounce();
-}
 
 
-function _peekNotesSwitchMode(mode) {
-  _peekNotesMode = mode;
-  document.getElementById('peek-notes-tab-edit').classList.toggle('active', mode === 'edit');
-  document.getElementById('peek-notes-tab-preview').classList.toggle('active', mode === 'preview');
-  const editorWrap = document.getElementById('peek-notes-editor-wrap');
-  const preview = document.getElementById('peek-notes-preview');
-  if (mode === 'preview') {
-    const editor = _peekNotesGetEditor();
-    const content = editor ? editor.value : _peekNotesRawContent;
-    preview.innerHTML = renderMarkdown(content) || '<span style="color:var(--dim);font-size:0.85rem;">Empty note</span>';
-    preview.classList.add('md-content');
-    preview.style.display = '';
-    preview.classList.add('active');
-    editorWrap.style.display = 'none';
-  } else {
-    preview.classList.remove('active');
-    preview.style.display = 'none';
-    editorWrap.style.display = 'flex';
-  }
-}
 
 
-function _peekNotesUpdatePinBtn() {
-  const btn = document.getElementById('peek-notes-pin-btn');
-  if (!btn) return;
-  const entry = _peekNotesAll.find(n => n.path === _peekNotesActive?.path);
-  btn.classList.toggle('pinned', !!entry?.pinned);
-  btn.style.color = entry?.pinned ? 'var(--accent)' : '';
-}
 
-function _peekNotesSearchFilter(q) {
-  if (!q.trim()) { _peekNotesRenderList(_peekNotesAll); return; }
-  const lq = q.toLowerCase();
-  _peekNotesRenderList(_peekNotesAll.filter(n =>
-    (n.name || '').toLowerCase().includes(lq) || n.path.toLowerCase().includes(lq)
-  ));
-}
 
-function _peekNotesReset() {
-  if (_peekNotesSaveTimer) { clearTimeout(_peekNotesSaveTimer); _peekNotesSaveTimer = null; _peekNotesSave(); }
-  _peekNotesActive = null;
-  _peekNotesAll = [];
-  _peekNotesSidebarOpen = true;
-  _peekNotesApplySidebarState();
-  _peekNotesShowEmpty();
-  const list = document.getElementById('peek-notes-list');
-  if (list) list.innerHTML = '';
-}
+
 
 function peekMemoryTab(tab) {
   document.getElementById('pm-tab-edit').classList.toggle('active', tab === 'edit');
@@ -28909,7 +28821,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.255';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.256';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -29282,7 +29194,6 @@ function copyPeekContent() {
 
 function closePeek() {
   // Reset peek notes
-  _peekNotesReset();
   // Fold the fullscreen composer (if open) back into the input, and close menus,
   // so the draft below captures whatever was being typed.
   const _fs = document.getElementById('peek-input-fs');
@@ -41478,7 +41389,6 @@ function _gridRestoreLayout() {
       if (!item.id) return;
       const notePath = _notePathFromId(item.id);
       if (notePath) {
-        wsAddNotePane(notePath, item.x, item.y, item.w, item.h);
       } else if (item.id.startsWith('ws-term:')) {
         wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
       } else if ((sessions || []).find(s => s.name === item.id)) {
@@ -41558,7 +41468,6 @@ function wsClearWorkspace() {
   Object.keys(_gridPanes).slice().forEach(n => removeGridPane(n));
   Object.keys(_notePanes).slice().forEach(nid => {
     const path = _notePathFromId(nid);
-    if (path) wsRemoveNotePane(path);
   });
   Object.keys(_wsTerm).slice().forEach(pid => wsRemoveTermPane(pid));
 }
@@ -41569,13 +41478,11 @@ function wsLoadProfile(name) {
   if (!layout) return;
   // Clear current panes (sessions + notes)
   Object.keys(_gridPanes).forEach(n => removeGridPane(n));
-  Object.keys(_notePanes).slice().forEach(nid => { const p = _notePathFromId(nid); if (p) wsRemoveNotePane(p); });
   // Load profile panes
   layout.forEach(item => {
     if (!item.id) return;
     const notePath = _notePathFromId(item.id);
     if (notePath) {
-      wsAddNotePane(notePath, item.x, item.y, item.w, item.h);
     } else if (item.id.startsWith('ws-term:')) {
       wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
     } else if ((sessions || []).find(s => s.name === item.id)) {
@@ -41719,9 +41626,6 @@ function _noteIdFromPath(path) {
   return 'note:' + path;
 }
 
-function _notePathFromId(id) {
-  return id.startsWith('note:') ? id.slice(5) : null;
-}
 
 
 function _wsCloseNoteMenu(e) {
@@ -41730,70 +41634,11 @@ function _wsCloseNoteMenu(e) {
 }
 
 
-function wsAddNotePane(path, x, y, w, h) {
-  if (!_grid) return;
-  const nid = _noteIdFromPath(path);
-  if (_notePanes[nid]) return;
-  const sid = _gpSafeId(nid);
-  const title = path.replace(/\.md$/, '').split('/').pop();
-  const safePath = path.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-
-  const content =
-    '<div class="gp-header" style="background:var(--card);">' +
-      '<span style="font-size:0.75rem;margin-right:4px;">&#x1F4DD;</span>' +
-      '<span class="gp-title" id="' + sid + '-title">' + esc(title) + '</span>' +
-      _gpSizeButtons() +
-      '<button class="gp-peek-btn" onclick="wsOpenNoteInTab(\'' + safePath + '\');event.stopPropagation();" title="Open in Notes tab">&#x2197;</button>' +
-      '<button class="gp-close" onclick="wsRemoveNotePane(\'' + safePath + '\')">&#x2715;</button>' +
-    '</div>' +
-    '<div class="gp-note-body" id="' + sid + '-body">' +
-      '<textarea id="' + sid + '-editor" class="notes-editor-textarea" style="width:100%;height:100%;border:none;outline:none;resize:none;background:var(--bg);color:var(--text);font-family:\'SF Mono\',\'Fira Code\',\'Consolas\',monospace;font-size:0.85rem;line-height:1.6;padding:8px 12px;" placeholder="Write your note…"></textarea>' +
-    '</div>' +
-    '<div class="gp-note-status" id="' + sid + '-status"></div>';
-
-  const widget = _grid.addWidget({ id: nid, x, y, w: w || 4, h: h || 7, content });
-  _notePanes[nid] = { widget, path, saveTimer: null };
-
-  setTimeout(() => _initNotePaneQuill(nid), 50);
-  _gridSaveLayout();
-}
-
-function _initNotePaneQuill(nid) {
-  const pane = _notePanes[nid];
-  if (!pane) return;
-  const sid = _gpSafeId(nid);
-  const editorEl = document.getElementById(sid + '-editor');
-  if (!editorEl) return;
-  _loadNotePaneContent(nid);
-  editorEl.addEventListener('input', () => {
-    const h1m = editorEl.value.match(/^#\s+(.+)$/m);
-    if (h1m) {
-      const titleEl = document.getElementById(sid + '-title');
-      if (titleEl) titleEl.textContent = h1m[1] || 'Untitled';
-    }
-    if (pane.saveTimer) clearTimeout(pane.saveTimer);
-    pane.saveTimer = setTimeout(() => _saveNotePaneContent(nid), 800);
-  });
-}
 
 
 
-function wsRemoveNotePane(path) {
-  const nid = _noteIdFromPath(path);
-  const pane = _notePanes[nid];
-  if (!pane || !_grid) return;
-  // Flush pending save
-  if (pane.saveTimer) { clearTimeout(pane.saveTimer); _saveNotePaneContent(nid); }
-  try { _grid.removeWidget(pane.widget); } catch(e) {}
-  delete _notePanes[nid];
-  _gridSaveLayout();
-}
 
-function wsOpenNoteInTab(path) {
-  // Switch to notes tab and open this note
-  switchView('notes');
-  setTimeout(() => _notesOpen(path), 200);
-}
+
 
 // ── Workspace Terminal Panes ───────────────────────────────────────────────────
 let _wsTerm = {}; // pid → {widget, term, fit, poll, ptyId}
@@ -46574,7 +46419,6 @@ async function _notesFolderConfirm(name) {
   _notesFolderCreating = false;
   if (!name) { _notesRenderList(_notesCurrentNotes); return; }
   _notesFolderSetOpen(name, true);
-  await _notesNew(name);
 }
 function _notesFolderInputKey(e) {
   if (e.key === 'Enter') { e.preventDefault(); _notesFolderConfirm(e.target.value); }
@@ -46585,7 +46429,6 @@ function _notesFolderInputKey(e) {
 document.addEventListener('keydown', e => {
   if (activeView !== 'notes') return;
   const mod = e.metaKey || e.ctrlKey;
-  if (mod && e.key === 'n' && !e.shiftKey) { e.preventDefault(); _notesNew(); }
   if (mod && e.key === 's') { e.preventDefault(); if (_notesSaveTimer) { clearTimeout(_notesSaveTimer); _notesSaveTimer = null; } _notesSave(); }
   if (mod && e.key === 'p') { e.preventDefault(); _notesQuickOpen(); }
 });
@@ -46599,54 +46442,10 @@ function _notesQuickOpen() {
 // ── Notes drag-and-drop ──
 let _notesDraggingPath = null;
 
-function _notesDragStart(e, el) {
-  _notesDraggingPath = el.dataset.path;
-  e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', _notesDraggingPath);
-  el.classList.add('notes-item-dragging');
-  document.body.classList.add('notes-dragging');
-  // Show root-drop zone only if note is inside a folder
-  const isInFolder = _notesDraggingPath && _notesDraggingPath.includes('/');
-  const rootDrop = document.getElementById('notes-root-drop');
-  if (rootDrop) rootDrop.style.display = isInFolder ? '' : 'none';
-}
-function _notesDragEnd(e) {
-  _notesDraggingPath = null;
-  document.body.classList.remove('notes-dragging');
-  document.querySelectorAll('.notes-item-dragging').forEach(el => el.classList.remove('notes-item-dragging'));
-  document.querySelectorAll('.notes-drop-target').forEach(el => el.classList.remove('notes-drop-target'));
-  const rootDrop = document.getElementById('notes-root-drop');
-  if (rootDrop) rootDrop.style.display = 'none';
-}
-function _notesDragOverFolder(e, el) {
-  if (!_notesDraggingPath) return;
-  const folder = el.dataset.folder;  // full path, e.g. "Self/Therapy"
-  // Don't highlight if the note already lives directly in this folder
-  const parent = _notesDraggingPath.split('/').slice(0, -1).join('/');
-  if (parent === folder) return;
-  e.preventDefault(); e.dataTransfer.dropEffect = 'move';
-  el.classList.add('notes-drop-target');
-}
 function _notesDragOverRoot(e, el) {
   if (!_notesDraggingPath || !_notesDraggingPath.includes('/')) return;
   e.preventDefault(); e.dataTransfer.dropEffect = 'move';
   el.classList.add('notes-drop-target');
-}
-function _notesDragLeave(e, el) {
-  if (!e.relatedTarget || !el.contains(e.relatedTarget)) el.classList.remove('notes-drop-target');
-}
-async function _notesDropOnFolder(e, el) {
-  e.preventDefault();
-  el.classList.remove('notes-drop-target');
-  const path = e.dataTransfer.getData('text/plain') || _notesDraggingPath;
-  const folder = el.dataset.folder;  // full path, e.g. "Self/Therapy"
-  if (!path || !folder) return;
-  const parts = path.split('/');
-  const parent = parts.slice(0, -1).join('/');
-  if (parent === folder) return; // already there
-  const filename = parts[parts.length - 1];
-  const newPath = folder + '/' + filename;
-  await _notesMoveNote(path, newPath);
 }
 async function _notesDropOnRoot(e, el) {
   e.preventDefault();
@@ -49072,7 +48871,6 @@ async function _jrnlSaveConfig() {
       <button id="ws-save-ok" class="btn" onclick="wsSaveProfileConfirm()" style="display:none;font-size:0.75rem;padding:4px 10px;background:var(--green);color:#fff;border-color:var(--green);">&#x2713;</button>
     </div>
     <div class="ws-note-dropdown" id="ws-note-dropdown">
-      <button class="ws-preset-btn" onclick="wsToggleNoteMenu()" title="Add a note pane">&#x1F4DD; Note</button>
       <div class="ws-note-menu" id="ws-note-menu"></div>
     </div>
     <button class="ws-preset-btn" onclick="wsAddTermPane()" title="Add an interactive terminal pane">&gt;_ Term</button>
@@ -49164,7 +48962,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.255';
+const CACHE = 'amux-v0.9.256';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
