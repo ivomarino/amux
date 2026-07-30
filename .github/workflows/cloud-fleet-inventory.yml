@@ -38,12 +38,8 @@ jobs:
               ' 2>&1
               echo "  -- board items by status:"
               docker exec "$C" sh -lc 'curl -s localhost:8822/api/board' 2>/dev/null \
-                | python3 -c "import json,sys,collections
-try:
-    d=json.load(sys.stdin)
-    c=collections.Counter(i.get('status','?') for i in d)
-    print('    ', dict(c) if c else 'EMPTY')
-except Exception as e: print('     unreadable:', e)" 2>&1
+                | tr ',' '\n' | grep -o '"status": *"[a-z]*"' | sort | uniq -c \
+                | sed 's/^/     /' || echo "     EMPTY"
               echo "  -- workspace files:"
               docker exec "$C" sh -lc 'find /root -maxdepth 3 -type f \
                  -not -path "*/.amux/*" -not -path "*/.cache/*" -not -path "*/.config/*" \
