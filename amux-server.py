@@ -19512,6 +19512,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tab-ico { display: inline-block; margin-right: 5px; opacity: 0.85; font-size: 0.95em; }
   .tab-lbl { display: inline; }
   body.tabs-icons .tab-lbl { display: none; }
+  /* Text-only: drop the glyph but keep the count badge — see note above. */
+  body.tabs-text .tab-ico { display: none; }
   body.tabs-icons .tab-ico { margin-right: 0; font-size: 1.15em; opacity: 1; }
   /* Icon-only tabs must stay thumb-sized, not shrink to the glyph's width. */
   body.tabs-icons .tab-bar > button,
@@ -21295,6 +21297,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
               <span class="theme-track"><span class="theme-thumb"></span></span>
             </label>
           </div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;gap:8px;">
+            <span style="font-size:0.85rem;">Tabs</span>
+            <select id="tabs-display-select" onchange="_tabsDisplaySet(this.value)"
+              style="min-height:44px;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.82rem;">
+              <option value="both">Icons and text</option>
+              <option value="icons">Icons only</option>
+              <option value="text">Text only</option>
+            </select>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Counts stay visible in every mode</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:8px;">
             <span style="font-size:0.85rem;">Zoom</span>
             <div style="display:flex;align-items:center;gap:6px;">
@@ -26338,6 +26350,7 @@ const ALL_TABS = [
   { id: 'cost',          label: 'Cost' },
   { id: 'torrents',      label: 'Torrents' },
   { id: 'terminal',      label: 'Terminal' },
+  { id: 'mcp',           label: 'MCP' },
 ];
 
 let hiddenTabs = (function() {
@@ -28939,7 +28952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.244';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.245';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43575,34 +43588,51 @@ async function _mcpDelete(name) {
 // Icon-only tabs. Persisted to /api/prefs rather than localStorage so the
 // choice follows you to the phone, where the space actually matters — a
 // per-device setting would mean setting it again on every client.
-let _tabsIconsOnly = false;
-function _tabsIconsApply() {
-  document.body.classList.toggle('tabs-icons', !!_tabsIconsOnly);
+const _TABS_MODES = ['both', 'icons', 'text'];
+const _TABS_LABEL = { both: 'Icons and text', icons: 'Icons only', text: 'Text only' };
+let _tabsDisplay = 'both';
+function _tabsDisplayApply() {
+  document.body.classList.toggle('tabs-icons', _tabsDisplay === 'icons');
+  document.body.classList.toggle('tabs-text',  _tabsDisplay === 'text');
+  const sel = document.getElementById('tabs-display-select');
+  if (sel && sel.value !== _tabsDisplay) sel.value = _tabsDisplay;
   const b = document.getElementById('tabs-icons-toggle');
   if (b) {
-    b.textContent = _tabsIconsOnly ? '⇲' : '⇱';
-    b.title = _tabsIconsOnly ? 'Show tab labels' : 'Icons only (hide labels)';
+    // The header button cycles; Settings is the canonical control. Both write
+    // the same pref, so they cannot disagree.
+    b.textContent = _tabsDisplay === 'icons' ? '⇲' : _tabsDisplay === 'text' ? 'A' : '⇱';
+    b.title = 'Tabs: ' + _TABS_LABEL[_tabsDisplay] + ' (click to cycle)';
   }
 }
-async function _tabsIconsLoad() {
+async function _tabsDisplayLoad() {
   try {
-    const r = await fetch(API + '/api/prefs?key=tabs_icons_only');
+    const r = await fetch(API + '/api/prefs?key=tabs_display');
     const d = await r.json();
-    _tabsIconsOnly = String((d && d.value) || '') === '1';
-  } catch (e) {}
-  _tabsIconsApply();
+    let v = String((d && d.value) || '');
+    // Migrate the earlier boolean pref rather than silently resetting anyone
+    // who had already chosen icons-only.
+    if (!_TABS_MODES.includes(v)) {
+      const old = await (await fetch(API + '/api/prefs?key=tabs_icons_only')).json().catch(() => ({}));
+      v = String((old && old.value) || '') === '1' ? 'icons' : 'both';
+    }
+    _tabsDisplay = _TABS_MODES.includes(v) ? v : 'both';
+  } catch (e) { _tabsDisplay = 'both'; }
+  _tabsDisplayApply();
 }
-async function toggleTabsIcons() {
-  _tabsIconsOnly = !_tabsIconsOnly;
-  _tabsIconsApply();
+async function _tabsDisplaySet(mode) {
+  _tabsDisplay = _TABS_MODES.includes(mode) ? mode : 'both';
+  _tabsDisplayApply();
   try {
     await fetch(API + '/api/prefs', { method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ key: 'tabs_icons_only', value: _tabsIconsOnly ? '1' : '0' }) });
+      body: JSON.stringify({ key: 'tabs_display', value: _tabsDisplay }) });
   } catch (e) {}
-  if (typeof showToast === 'function') showToast(_tabsIconsOnly ? 'Tabs: icons only' : 'Tabs: icons + labels');
+  if (typeof showToast === 'function') showToast('Tabs: ' + _TABS_LABEL[_tabsDisplay]);
 }
-if (document.body) _tabsIconsLoad();
-else document.addEventListener('DOMContentLoaded', _tabsIconsLoad);
+function toggleTabsIcons() {   // header button: cycle both -> icons -> text
+  _tabsDisplaySet(_TABS_MODES[(_TABS_MODES.indexOf(_tabsDisplay) + 1) % _TABS_MODES.length]);
+}
+if (document.body) _tabsDisplayLoad();
+else document.addEventListener('DOMContentLoaded', _tabsDisplayLoad);
 
 function _offlineSettingsHTML() {
   const mb = _OFFLINE_MB_CHOICES.map(v =>
@@ -49750,7 +49780,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.244';
+const CACHE = 'amux-v0.9.245';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
