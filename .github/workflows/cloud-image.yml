@@ -61,6 +61,9 @@ jobs:
         run: |
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'bash -s' <<'ENDSSH'
             set -e
+            # the image now carries Chrome; reclaim old layers first or the
+            # host runs out of space mid-extract
+            docker image prune -af >/dev/null 2>&1 || true
             docker pull ghcr.io/mixpeek/amux:latest
             for d in /var/amux/users/*/; do
               id=$(basename "$d")

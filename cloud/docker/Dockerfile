@@ -31,7 +31,6 @@ WORKDIR /app
 # storage-state/profile rather than popping a window. This is a DEPLOYMENT
 # concern only — amux-server.py is byte-identical to local.
 RUN npm install playwright \
-    && npx playwright install --with-deps chromium \
     && npx playwright install --with-deps chrome \
     && node -e "require('playwright'); console.log('playwright resolves from /app')"
 
@@ -43,8 +42,7 @@ RUN npm install playwright \
 # preset subcommands amux drives, so an unpinned install builds fine and
 # then fails at runtime — exactly the class of break this file now guards.
 RUN pip install --no-cache-dir 'browser-use==0.12.2' playwright \
-    && python -m playwright install chromium \
-    && test -x /usr/local/bin/browser-use \
+        && test -x /usr/local/bin/browser-use \
     && browser-use --help 2>&1 | grep -q -- "--json" \
     && echo "browser-use 0.12.2 verified at build time (--json present)"
 
