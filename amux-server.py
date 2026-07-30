@@ -1240,9 +1240,27 @@ def _bu_call_raw(args: list, timeout_s: int = 30, session: str = "amux") -> dict
 _CDP_SCRIPT = str(Path(__file__).resolve().parent / "skills" / "chrome-cdp" / "scripts" / "cdp.mjs")
 _live_targets: dict = {}   # amux browser-session name -> CDP target-id prefix
 
+def _cdp_local_only() -> bool:
+    """CDP drives the USER'S OWN Chrome on their machine. A hosted container has
+    no such Chrome, and pointing it at one would mean reaching a browser that is
+    not the caller's — so the live backend is local-only.
+
+    Detected from capability, not an IS_CLOUD flag: a hosted deployment is the
+    one with no DISPLAY (headless linux box), and AMUX_BROWSER_HEADLESS forces
+    it explicitly. Local macOS/desktop keeps CDP exactly as it is today."""
+    if os.environ.get("AMUX_BROWSER_HEADLESS") == "1":
+        return True
+    return sys.platform.startswith("linux") and not os.environ.get("DISPLAY")
+
+
 def _cdp_call(args: list, timeout_s: int = 30) -> dict:
     """Logging wrapper over the live-Chrome CDP call. See _bu_call for why the
     wrap is at this level rather than at the API handlers."""
+    if _cdp_local_only():
+        return {"error": "live-Chrome (CDP) is local-only — this deployment has no "
+                         "desktop Chrome to attach to. Use a Playwright profile "
+                         "instead: POST /api/browser/profile/create then /api/browser/start "
+                         "with that profile."}
     verb = (args[0] if args else "") or ""
     tid = str(args[1]) if len(args) > 1 else ""
     t0 = time.time()
@@ -1422,8 +1440,13 @@ _PW_SIGNIN_JS = r"""
 const { chromium } = require('playwright');
 const dir = process.argv[2], url = process.argv[3] || 'about:blank';
 (async () => {
+  // Headless when no display is available (cloud) — the SAME persistent-context
+  // path either way, so a profile captured in one mode is reusable in the other.
+  // Capability-driven, never an IS_CLOUD branch: DISPLAY present => headed.
+  const headless = process.env.AMUX_BROWSER_HEADLESS === '1'
+    || (!process.env.DISPLAY && process.platform === 'linux');
   const ctx = await chromium.launchPersistentContext(dir, {
-    headless: false,
+    headless,
     ignoreHTTPSErrors: true,
     viewport: null,
     args: ['--no-first-run', '--no-default-browser-check'],
@@ -1432,6 +1455,14 @@ const dir = process.argv[2], url = process.argv[3] || 'about:blank';
   try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
   // Resolve when the user closes the window. Persistent context writes its
   // storage on close, so this is the moment the login becomes reusable.
+  if (headless) {
+    // No window for a human to close, so the close-to-save handshake cannot
+    // apply. Persist immediately: this is what makes a cloud profile reusable.
+    await ctx.storageState({ path: require('path').join(dir, 'storage-state.json') });
+    await ctx.close();
+    console.log(JSON.stringify({ ok: true, headless: true, dir }));
+    process.exit(0);
+  }
   await new Promise(res => ctx.on('close', res));
   process.exit(0);
 })().catch(e => { console.error(String(e)); process.exit(1); });
