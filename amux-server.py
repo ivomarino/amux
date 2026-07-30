@@ -8583,6 +8583,41 @@ def _summarize_task_bg(session_name: str, text: str):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _is_same_task(issue_id: str, title: str, prompt_text: str) -> bool:
+    """True if this prompt is a REPEAT of what `issue_id` already tracks.
+
+    The whole point of splitting cards is that a distinct task gets its own
+    card; the whole point of keeping folding is that a re-sent or lightly
+    re-worded instruction should not spawn a near-duplicate. Compares against
+    the card's title and everything already folded into it, on a word-overlap
+    ratio — deliberately crude, because the failure modes are asymmetric: a
+    missed fold costs one extra card you can discard, a wrong fold silently
+    buries a real task inside another card, which is the bug being fixed."""
+    try:
+        row = get_db().execute("SELECT title, desc FROM issues WHERE id=?", (issue_id,)).fetchone()
+        if not row:
+            return False
+        def words(s):
+            return {w for w in re.findall(r"[a-z0-9]{4,}", (s or "").lower())}
+        incoming = words(title) | words(prompt_text[:300])
+        if not incoming:
+            return True          # nothing to distinguish it by — fold, do not spawn noise
+        # Compare against the title and each folded entry separately: a card with
+        # 40 folds accumulates enough vocabulary to match almost anything if the
+        # whole desc is treated as one bag of words.
+        cands = [row["title"] or ""]
+        cands += re.findall(r"New task:\s*(.+)", row["desc"] or "")
+        for c in cands:
+            cw = words(c)
+            if not cw:
+                continue
+            if len(incoming & cw) / len(incoming) >= 0.6:
+                return True
+        return False
+    except Exception:
+        return True              # on error, preserve today's behaviour rather than spawning
+
+
 def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
     """Create or update a board issue for a session task. If the session already has an
     active (non-done/discarded) issue, update its title instead of creating a duplicate.
@@ -8602,15 +8637,36 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             (session_name,)
         ).fetchone()
         now = int(time.time())
-        if existing:
-            # An active agent card already exists for this session — LOG the new
-            # prompt against it, but NEVER overwrite its title or flip its status.
-            # (2026-07-06) Auto-retitling with a haiku summary + auto-moving to
-            # 'doing' on every inbound message clobbered manually-managed cards
-            # (orch MO-2952/2963 incident) — and it's the same footgun the codebase
-            # already forbids in _complete_session_board_issue: a status/title
-            # change must be a deliberate act, never a side effect of run-state.
+        if existing and _is_same_task(existing["id"], title, prompt_text):
+            # A genuine REPEAT of the task this card already tracks — fold it, so a
+            # re-sent or re-phrased instruction does not spawn a near-duplicate.
+            # Still never overwrites the title or flips the status: auto-retitling
+            # on every inbound message clobbered manually-managed cards
+            # (MO-2952/2963 incident, 2026-07-06), and a status/title change must
+            # be a deliberate act, never a side effect of run-state.
             _append_board_log(existing["id"], f"New task: {prompt_text[:200]}")
+            return
+        if existing:
+            # A DISTINCT task arrived while another card is open. Folding it into
+            # that card is what turned cards into session journals: 421 cards
+            # carried folded tasks and MO-2963 reached 451, at which point it is
+            # not a task at all — nothing is done or not-done, so no gate can
+            # govern it. Give the new work its own card instead.
+            #
+            # It lands in 'todo', NOT 'doing': the session already has something
+            # in flight, and auto-starting a second one would break WIP-1 and make
+            # "what is being worked on" untrue. Creating a card cannot clobber the
+            # existing one, so the incident this replaces stays fixed.
+            prefix = _prefix_from_session(session_name)
+            item_id = _next_issue_id(prefix)
+            db.execute(
+                """INSERT INTO issues (id, title, desc, status, session, creator, created, updated, owner_type)
+                   VALUES (?, ?, ?, 'todo', ?, 'amux', ?, ?, 'agent')""",
+                (item_id, title, f"**Prompt:** {prompt_text[:300]}", session_name, now, now),
+            )
+            db.commit()
+            _board_changed()
+            slog(f"[board] {session_name}: new task -> {item_id} (queued alongside {existing['id']})")
             return
         # Create new issue
         prefix = _prefix_from_session(session_name)
@@ -29010,7 +29066,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.248';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.249';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49838,7 +49894,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.248';
+const CACHE = 'amux-v0.9.249';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
