@@ -29010,7 +29010,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.247';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.248';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49838,7 +49838,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.247';
+const CACHE = 'amux-v0.9.248';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53932,6 +53932,22 @@ class CCHandler(BaseHTTPRequestHandler):
                             gate_item["gate"] = ([str(x).strip() for x in _g if str(x).strip()]
                                                  if isinstance(_g, list) else [])
                         eff_gate = _effective_gate(gate_item, new_status)
+                        # The contract advertises force as "logged" in two places and
+                        # NOTHING logged it — the one escape hatch from the gate system
+                        # was the one action leaving no trace, while claiming otherwise.
+                        # An unauditable bypass that says it is audited is worse than an
+                        # honest one, because it is trusted.
+                        if eff_gate and body.get("force"):
+                            _ilog("board", "gate_force",
+                                  actor=_sched_mutation_by(self.headers, self.client_address, body),
+                                  target=bid, ok=True,
+                                  detail={"from": gate_item.get("status"),
+                                          "to": new_status,
+                                          "type": gate_item.get("type") or "code",
+                                          "bypassed_gate": eff_gate,
+                                          "title": (gate_item.get("title") or "")[:120]})
+                            slog(f"[board] GATE FORCED {bid} -> {new_status} "
+                                 f"(bypassed {len(eff_gate)} criteria)")
                         if eff_gate and not body.get("force"):
                             # AMUX-1719: gate_checked must actually MATCH the effective
                             # gate. It used to be `isinstance(..., list)` — so
@@ -53999,6 +54015,25 @@ class CCHandler(BaseHTTPRequestHandler):
                             slog(f"[board-gate] {bid} {prior['status']}->{new_status} "
                                  f"acknowledged (force={bool(body.get('force'))}, "
                                  f"checked={len(_chk) if isinstance(_chk, list) else 0}/{len(eff_gate)})")
+                    # An unrecognised type silently inherits the CODE gate ("Implemented
+                    # and merged", "Tests / lint pass"). Seven live cards typed
+                    # 'decision'/'bug' were sitting behind a merge gate they can never
+                    # honestly satisfy — which is precisely the situation that pushes a
+                    # session to force or to ack something false. Reject it at the door
+                    # and name the valid set, rather than accepting it and mis-gating.
+                    if "type" in body:
+                        _t = str(body.get("type") or "").strip().lower()
+                        if _t and _t not in _ITEM_TYPES:
+                            return self._json({
+                                "error": f"unknown type {_t!r}",
+                                "valid_types": list(_ITEM_TYPES),
+                                "why": ("The gate is DERIVED from type. An unknown type would "
+                                        "silently fall back to the strictest (code) gate, which "
+                                        "non-code work cannot satisfy without asserting a merge "
+                                        "that never happened."),
+                            }, 400)
+                        if _t:
+                            body["type"] = _t
                     set_clauses, params = [], []
                     for k in ("title", "desc", "status", "session", "shepherd", "type", "due", "due_time", "owner_type", "pinned", "pos"):
                         if k in body:
