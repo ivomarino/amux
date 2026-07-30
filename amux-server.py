@@ -19725,6 +19725,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .board-search-wrap {
     position: relative; margin-bottom: 4px;
   }
+  /* The peek Board tab reuses .board-search-wrap, but its panel is a flex
+     COLUMN while the global board's header is a flex ROW. The mobile rule
+     below sets `flex: 1 1 100%` so the search takes a full line in that row —
+     in a column that means "grow to fill", and the wrap ate 603px of a 695px
+     panel, starving the issue list to height:0. Six cards rendered into a box
+     with no height, so the tab counted "6 issues" and showed nothing.
+     Never grows here, in either axis. */
+  #peek-issues-panel .board-search-wrap { flex: 0 0 auto !important; }
+
+  /* Board controls at phone width. At 390px the row was cramming a scope
+     button, a count, two view toggles and "+ New issue" onto one line, so the
+     count and the button each wrapped to two lines and the toggles were pushed
+     to the screen edge. Give the count its own line and let the buttons sit on
+     one row at full tap size. */
+  @media (max-width: 600px) {
+    #peek-issues-panel .peek-tasks-add {
+      flex-wrap: wrap; row-gap: 6px; align-items: center;
+    }
+    #peek-issues-panel .peek-tasks-add > .board-view-toggle { order: 1; }
+    #peek-issues-panel #piv-scope { order: 2; min-height: 44px; white-space: nowrap; }
+    #peek-issues-panel .peek-tasks-add > .btn.primary {
+      order: 3; margin-left: auto; min-height: 44px; white-space: nowrap;
+    }
+    /* Count last and full-width: it is the one item that can wrap harmlessly. */
+    #peek-issues-panel #peek-issues-count {
+      order: 4; flex: 1 0 100%; text-align: left; margin: 0;
+    }
+    #peek-issues-panel .board-view-toggle .bv-btn { min-width: 44px; min-height: 44px; }
+  }
   .board-search-wrap .search-input { width: 100%; box-sizing: border-box; }
   .board-search-wrap .search-clear { display: none; }
   .board-search-wrap:has(.search-input:not(:placeholder-shown)) .search-clear { display: flex; }
@@ -29197,7 +29226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.250';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.251';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50025,7 +50054,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.250';
+const CACHE = 'amux-v0.9.251';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
