@@ -20870,7 +20870,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div id="cloud-plan-meter" style="height:6px;border-radius:4px;background:var(--border);margin:8px 0 6px;overflow:hidden;display:none;">
             <div id="cloud-plan-meter-fill" style="height:100%;width:0;background:var(--accent);border-radius:4px;transition:width .3s;"></div>
           </div>
-          <button id="cloud-plan-btn" onclick="_upgradeCheckout('monthly')"
+          <button id="cloud-plan-btn" onclick="_upgradeCheckout('platform')"
             style="width:100%;min-height:44px;padding:9px 12px;border-radius:8px;border:none;background:#7c6fcd;color:#fff;font-size:0.82rem;font-weight:600;cursor:pointer;display:none;">
             Upgrade
           </button>
@@ -23394,8 +23394,9 @@ function _showUpgradeModal(d) {
          'Ongoing workflow creation, tuning, and teaching'].map(f =>
           '<div style="color:#aaa;font-size:0.8rem;padding:3px 0 3px 20px;position:relative;"><span style="position:absolute;left:2px;color:#3fb950;font-weight:700;">✓</span>' + f + '</div>').join('') +
       '</div>' +
-      '<button onclick="_upgradeCheckout(\'monthly\')" style="display:block;width:100%;min-height:44px;background:#7c6fcd;color:#fff;border:none;border-radius:9px;padding:12px;font-size:0.92rem;font-weight:600;cursor:pointer;margin-bottom:8px;">Upgrade — monthly</button>' +
-      '<button onclick="_upgradeCheckout(\'annual\')" style="display:block;width:100%;min-height:44px;background:#26263e;color:#e5e5e5;border:1px solid #3a3a5c;border-radius:9px;padding:12px;font-size:0.92rem;font-weight:600;cursor:pointer;margin-bottom:8px;">Upgrade — annual (save 17%)</button>' +
+      '<div style="font-size:1.15rem;font-weight:700;color:#c4b5fd;margin-bottom:2px;">$5,000/month</div>' +
+      '<div style="color:#888;font-size:0.76rem;margin-bottom:14px;">amux Platform · includes implementation &amp; enablement</div>' +
+      '<button onclick="_upgradeCheckout(\'platform\')" style="display:block;width:100%;min-height:44px;background:#7c6fcd;color:#fff;border:none;border-radius:9px;padding:12px;font-size:0.92rem;font-weight:600;cursor:pointer;margin-bottom:8px;">Talk to us &amp; get started</button>' +
       '<div id="upgrade-modal-err" style="color:#f87171;font-size:0.8rem;min-height:1.1em;"></div>' +
     '</div>';
   document.body.appendChild(wrap);
@@ -23444,7 +23445,7 @@ async function _loadCloudPlan() {
     if (d.plan !== 'pro' && d.stripe_configured) {
       btn.style.display = '';
       btn.textContent = (d.budget_usd != null && Number(d.spend_usd || 0) >= Number(d.budget_usd))
-        ? 'Budget used up — upgrade' : 'Upgrade';
+        ? 'Budget used up — $5,000/mo plan' : 'Upgrade — $5,000/mo';
     }
   } catch(e) { /* self-hosted: no cloud gateway, card stays hidden */ }
 }

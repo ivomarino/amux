@@ -25,6 +25,7 @@ STRIPE_WEBHOOK_SECRET   = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRO_PRICE_ID     = os.environ.get("STRIPE_PRO_PRICE_ID", "")      # monthly
 STRIPE_ANNUAL_PRICE_ID  = os.environ.get("STRIPE_ANNUAL_PRICE_ID", "")   # annual
 STRIPE_PLATFORM_FEE_PRICE_ID = os.environ.get("STRIPE_PLATFORM_FEE_PRICE_ID", "")  # one-time onboarding fee
+STRIPE_PLATFORM_PRICE_ID = os.environ.get("STRIPE_PLATFORM_PRICE_ID", "")          # $5k/mo platform plan (the only plan shown)
 TRIAL_DAYS              = int(os.environ.get("TRIAL_DAYS", "7"))
 TRIAL_BUDGET_USD        = float(os.environ.get("TRIAL_BUDGET_USD", "5"))  # default spend cap for provisioned trials
 REFERRAL_BONUS_DAYS     = int(os.environ.get("REFERRAL_BONUS_DAYS", "7"))
@@ -448,17 +449,14 @@ _UPGRADE_HTML = """<!DOCTYPE html>
     <h1>Your free trial has ended</h1>
     <p>Subscribe to keep using your workspace. All your sessions and data are safe.</p>
     <div class="plans">
-      <div class="plan">
-        <h3>Pro Monthly</h3>
-        <div class="price">$20/month</div>
-        <div class="features">Unlimited sessions &middot; No idle timeout &middot; Team workspaces</div>
-        <button class="btn" onclick="checkout('monthly')">Subscribe monthly</button>
-      </div>
       <div class="plan featured">
-        <h3>Pro Annual <span class="save">save 17%</span></h3>
-        <div class="price">$200/year ($16.67/mo)</div>
-        <div class="features">Unlimited sessions &middot; No idle timeout &middot; Team workspaces</div>
-        <button class="btn" onclick="checkout('annual')">Subscribe annually</button>
+        <h3>amux Platform</h3>
+        <div class="price">$5,000/month</div>
+        <div class="features">
+          Production-grade sessions &middot; Dedicated isolated machine<br>
+          Support &amp; maintenance &middot; Ongoing workflow creation and teaching
+        </div>
+        <button class="btn" onclick="checkout('platform')">Talk to us &amp; get started</button>
       </div>
     </div>
     <div id="error"></div>
@@ -538,9 +536,12 @@ _BUDGET_HTML = """<!DOCTYPE html>
         <li>Ongoing workflow creation, tuning, and teaching</li>
       </ul>
     </div>
-    <button class="btn" onclick="checkout('monthly')">Upgrade — platform fee + monthly</button>
-    <button class="btn alt" onclick="checkout('annual')">Upgrade — platform fee + annual (save 17%)</button>
-    <div class="fee-note">One-time onboarding platform fee, then the subscription. Cancel the subscription anytime.</div>
+    <div class="meter" style="margin-bottom:18px;">
+      <div class="nums">$5,000/month</div>
+      <div class="lbl">amux Platform</div>
+    </div>
+    <button class="btn" onclick="checkout('platform')">Talk to us &amp; get started</button>
+    <div class="fee-note">Includes a one-time implementation &amp; enablement engagement.</div>
     <div id="error"></div>
     <div class="logout"><a href="/api/cloud-logout">Log out</a></div>
   </div>
@@ -2719,7 +2720,20 @@ class Handler(BaseHTTPRequestHandler):
             target_org = body.get("org_id", "") or _active_org_id()
             if not _has_role(target_org, "owner", "admin"):
                 return self._json({"error": "must be owner or admin to manage billing"}, 403)
-            price_id = STRIPE_ANNUAL_PRICE_ID if billing == "annual" and STRIPE_ANNUAL_PRICE_ID else STRIPE_PRO_PRICE_ID
+            # The UI now offers only the $5k platform plan, but monthly/annual
+            # stay wired so existing links and any backend flow keep working.
+            # STRIPE_PLATFORM_PRICE_ID MUST point at the real $5k price — if it
+            # is unset we refuse rather than quietly charging the $20 plan to
+            # someone who was shown $5,000.
+            if billing == "platform":
+                if not STRIPE_PLATFORM_PRICE_ID:
+                    return self._json({"error": "The $5,000 platform plan is not configured yet — "
+                                                "please contact hello@amux.io and we'll get you set up."}, 503)
+                price_id = STRIPE_PLATFORM_PRICE_ID
+            elif billing == "annual" and STRIPE_ANNUAL_PRICE_ID:
+                price_id = STRIPE_ANNUAL_PRICE_ID
+            else:
+                price_id = STRIPE_PRO_PRICE_ID
             import stripe
             stripe.api_key = STRIPE_SECRET_KEY
             base = self._base_url()
