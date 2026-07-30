@@ -17850,6 +17850,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .log-search-btn .log-search-label { display: none; }
     .search-input { min-width: 0; }
     .search-input:focus { }
+    /* The clear "x" renders as a 20px dot, which is well under the 44px touch
+       minimum. Expand the HIT area with a pseudo-element instead of the box, so
+       the target is thumb-sized without turning the dot into a grey blob. */
+    .search-clear::before {
+      content: ''; position: absolute; left: 50%; top: 50%;
+      width: 44px; height: 44px; transform: translate(-50%, -50%);
+    }
     .header-row { gap: 4px; flex-wrap: nowrap; }
     .header-row h1 { font-size: 1.1rem; flex-shrink: 0; }
     .header-row > div { gap: 6px !important; flex-shrink: 1; min-width: 0; }
@@ -22754,6 +22761,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this session's issues and all sessions'">This session</button>
       <span id="peek-issues-count" style="flex:1;font-size:0.82rem;color:var(--dim);align-self:center;"></span>
       <button class="btn primary" style="font-size:0.8rem;padding:5px 12px;" onclick="openBoardAdd('backlog')">+ New issue</button>
+    </div>
+    <!-- Same query language as the global board (_bqFilter), so is:rotting /
+         status:doing / -tag:x behave identically on both surfaces. Scoped by the
+         session filter above, not by a separate code path. -->
+    <div class="board-search-wrap" style="padding:0 10px 6px;">
+      <input id="peek-issues-search" class="search-input" type="text"
+             placeholder="Search or filter: is:rotting, status:doing, -session:none"
+             autocapitalize="off" autocorrect="off" spellcheck="false"
+             oninput="_peekIssuesQuery=this.value;renderPeekIssues()">
+      <button class="search-clear" style="right:16px;"
+              onclick="document.getElementById('peek-issues-search').value='';_peekIssuesQuery='';renderPeekIssues()">&#x2715;</button>
     </div>
     <div class="peek-tasks-list" id="peek-issues-list"></div>
   </div>
@@ -27858,6 +27876,9 @@ function peekGitOpenPR() {
 let _peekIssuesView = localStorage.getItem('amux_peek_issues_view') || 'list';
 let _peekIssuesAllSessions = localStorage.getItem('amux_peek_issues_all') === '1';
 let _peekIssuesSortables = [];
+// Deliberately NOT persisted: a search is a transient lens, and a stale query
+// restored on the next peek looks like an empty board.
+let _peekIssuesQuery = '';
 
 function setPeekIssuesView(mode) {
   _peekIssuesView = mode;
@@ -27877,8 +27898,14 @@ function renderPeekIssues() {
   const list = document.getElementById('peek-issues-list');
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
-  const items = (boardItems || []).filter(i => !i.deleted && (allScope || i.session === peekSession));
-  count.textContent = items.length ? items.length + ' issue' + (items.length === 1 ? '' : 's') + (allScope ? ' · all sessions' : '') : '';
+  const scoped = (boardItems || []).filter(i => !i.deleted && (allScope || i.session === peekSession));
+  // Scope first, then query — so "3 of 12" counts within the session you are
+  // looking at, not against the whole board.
+  const items = _bqFilter(scoped, _peekIssuesQuery);
+  const _q = (_peekIssuesQuery || '').trim();
+  count.textContent = !scoped.length ? ''
+    : _q ? items.length + ' of ' + scoped.length + (allScope ? ' · all sessions' : '')
+         : scoped.length + ' issue' + (scoped.length === 1 ? '' : 's') + (allScope ? ' · all sessions' : '');
   // Scope toggle label/active state
   const scopeBtn = document.getElementById('piv-scope');
   if (scopeBtn) {
@@ -27902,8 +27929,11 @@ function renderPeekIssues() {
   list.classList.toggle('peek-issues-kanban', _peekIssuesView === 'kanban');
 
   if (!items.length) {
+    // "No matches" and "no issues" are different facts — saying the board is
+    // empty when a query simply matched nothing sends you looking for a bug.
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 4px;">' +
-      (allScope ? 'No issues on the board yet.' : 'No issues for this session yet.') + '</div>';
+      (_q ? 'No issues match <b>' + esc(_q) + '</b>' + (scoped.length ? ' (' + scoped.length + ' hidden)' : '')
+          : allScope ? 'No issues on the board yet.' : 'No issues for this session yet.') + '</div>';
     return;
   }
 
@@ -28555,7 +28585,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.233';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.234';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49165,7 +49195,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.233';
+const CACHE = 'amux-v0.9.234';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
