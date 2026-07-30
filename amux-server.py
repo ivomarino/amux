@@ -1495,9 +1495,18 @@ def _bu_profile_signin(name: str, url: str) -> dict:
     except Exception as e:
         return {"error": f"could not write launcher: {e}"}
     try:
+        # Node resolves require() from the SCRIPT's directory, not cwd — the
+        # launcher lives in ~/.amux while playwright is installed beside
+        # amux-server.py, so cwd alone gave MODULE_NOT_FOUND and the profile was
+        # never created. NODE_PATH makes the resolution explicit and works
+        # wherever the two happen to sit.
+        _app = Path(__file__).resolve().parent
+        _env = dict(os.environ)
+        _env["NODE_PATH"] = os.pathsep.join(
+            x for x in [str(_app / "node_modules"), _env.get("NODE_PATH", "")] if x)
         subprocess.Popen(
             ["node", str(script), str(d), url or "about:blank"],
-            cwd=str(Path(__file__).resolve().parent),
+            cwd=str(_app), env=_env,
             stdout=open(str(d.parent / f"{safe}.log"), "ab"),
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -21657,7 +21666,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
   <button id="tab-logs" onclick="switchView('logs')"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span></button>
   <button id="tab-grid" onclick="enterGridMode()"><span class="tab-ico">▣</span><span class="tab-lbl">Workspace</span></button>
-  <button id="tab-notes" onclick="switchView('notes')"><span class="tab-ico">✎</span><span class="tab-lbl">Notes</span></button>
   <button id="tab-messages" onclick="switchView('messages')"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span></button>
   <button id="tab-skills" onclick="switchView('skills')"><span class="tab-ico">⚙</span><span class="tab-lbl">Skills</span></button>
   <button id="tab-crm" onclick="switchView('crm')"><span class="tab-ico">👤</span><span class="tab-lbl">People</span></button>
@@ -21973,69 +21981,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 
 
 <!-- Notes view -->
-<div id="notes-view" style="display:none;flex-direction:row;overflow:hidden;">
-  <!-- Sidebar -->
-  <div class="notes-sidebar" id="notes-sidebar">
-    <div class="notes-sidebar-header">
-      <span style="font-weight:600;font-size:0.85rem;">Notes</span>
-      <div class="notes-sidebar-actions">
-        <button class="notes-new-btn" onclick="_notesNew()" title="New note"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
-        <button class="notes-new-btn" onclick="_notesNewFolder()" title="New folder"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg></button>
-        <button class="notes-new-btn" id="notes-collapse-all-btn" onclick="_notesCollapseAllFolders()" title="Collapse all folders"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 9 8 5 12 9"/><polyline points="4 19 8 15 12 19"/><line x1="16" y1="7" x2="20" y2="7"/><line x1="16" y1="17" x2="20" y2="17"/></svg></button>
-        <button class="notes-toggle-btn" onclick="_notesToggleSidebar()" title="Collapse sidebar"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
-      </div>
-    </div>
-    <div class="notes-search-wrap">
-      <input id="notes-search" type="search" placeholder="Search notes…" oninput="_notesSearchFilter(this.value)" style="width:100%;box-sizing:border-box;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;outline:none;">
-    </div>
-    <div id="notes-list" class="notes-list"></div>
-    <div class="notes-trash-section" id="notes-trash-section" style="display:none;">
-      <div class="notes-trash-header" onclick="_notesTrashToggle()">
-        <span class="notes-trash-chevron" id="notes-trash-chevron">&#x25B6;</span>
-        <span>Trash</span>
-        <span id="notes-trash-count" style="margin-left:auto;font-size:0.7rem;"></span>
-      </div>
-      <div class="notes-trash-body" id="notes-trash-body" style="display:none;"></div>
-    </div>
-    <div class="notes-source-indicator" id="notes-source-indicator" onclick="toggleSettings()" title="Notes sync folder — click to open Settings">
-      <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>
-      <span id="notes-source-name">…</span>
-    </div>
-  </div>
-  <!-- Editor pane -->
-  <div class="notes-editor-pane" id="notes-editor-pane">
-    <div class="notes-editor-header">
-      <button class="notes-expand-btn" onclick="_notesToggleSidebar()" title="Show notes list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
-      <input id="notes-title" type="text" placeholder="Note title…" class="notes-title-input" oninput="_notesTitleChange()" onblur="_notesSaveDebounce()">
-      <div style="display:flex;gap:6px;align-items:center;">
-        <span id="notes-session-badge" style="display:none;font-size:0.7rem;padding:3px 8px;border-radius:10px;background:rgba(88,166,255,0.12);color:var(--accent);cursor:pointer;border:1px solid rgba(88,166,255,0.3);" title="Open this session"></span>
-        <span id="notes-save-status" style="font-size:0.72rem;color:var(--dim);"></span>
-        <button id="notes-pin-btn" class="notes-pin-btn" onclick="_notesTogglePinActive()" title="Pin to top"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg></button>
-        <button class="notes-delete-btn" onclick="_notesDelete()" title="Delete note"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>
-      </div>
-    </div>
-    <div class="notes-mode-tabs" id="notes-mode-tabs" style="display:none;">
-      <button class="notes-mode-tab" id="notes-tab-edit" onclick="_notesSwitchMode('edit')">Edit</button>
-      <button class="notes-mode-tab active" id="notes-tab-preview" onclick="_notesSwitchMode('preview')">Preview</button>
-      <div id="notes-preview-search" style="display:none;margin-left:auto;display:none;align-items:center;gap:4px;">
-        <input id="notes-preview-search-input" type="text" placeholder="Search in preview..." oninput="_notesPreviewSearch(this.value)" onkeydown="if(event.key==='Enter'){event.preventDefault();event.shiftKey?_notesPreviewSearchNav(-1):_notesPreviewSearchNav(1);}" style="font-size:0.75rem;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);width:160px;outline:none;">
-        <span id="notes-preview-search-count" style="font-size:0.68rem;color:var(--dim);min-width:36px;text-align:center;"></span>
-        <button onclick="_notesPreviewSearchNav(-1)" style="background:none;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:pointer;color:var(--fg);font-size:0.7rem;" title="Previous (Shift+Enter)">&#x25B2;</button>
-        <button onclick="_notesPreviewSearchNav(1)" style="background:none;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:pointer;color:var(--fg);font-size:0.7rem;" title="Next (Enter)">&#x25BC;</button>
-        <button onclick="_notesPreviewSearchClear()" style="background:none;border:none;cursor:pointer;color:var(--dim);font-size:0.85rem;padding:0 2px;" title="Close">&times;</button>
-      </div>
-    </div>
-    <div class="notes-editor-wrap" id="notes-editor-wrap" style="display:none;">
-      <textarea id="notes-editor" class="notes-editor-textarea" placeholder="Start writing markdown..." oninput="_notesSaveDebounce()"></textarea>
-    </div>
-    <div class="notes-preview" id="notes-preview"></div>
-    <div class="notes-empty-state" id="notes-empty-state">
-      <div style="font-size:2rem;margin-bottom:8px;">📝</div>
-      <div style="color:var(--dim);font-size:0.85rem;">Select a note or create a new one</div>
-      <button class="btn" onclick="_notesNew()" style="margin-top:12px;font-size:0.8rem;">+ New Note</button>
-    </div>
-  </div>
-</div>
 
 <!-- CRM / People view -->
 <div id="crm-view" style="display:none;">
@@ -23126,7 +23071,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
-    <button class="peek-tab" id="peek-tab-notes" onclick="setPeekTab('notes')"><span class="tab-ico">✎</span><span class="tab-lbl">Notes</span><span class="peek-tab-count" id="peek-tab-notes-count"></span></button>
     <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
@@ -23443,47 +23387,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </details>
   </div>
   <!-- Notes panel -->
-  <div id="peek-notes-panel" class="peek-tasks-panel" style="flex-direction:row;padding:0;gap:0;overflow:hidden;">
-    <!-- Sidebar -->
-    <div class="notes-sidebar" id="peek-notes-sidebar">
-      <div class="notes-sidebar-header">
-        <span style="font-weight:600;font-size:0.85rem;">Notes</span>
-        <div class="notes-sidebar-actions">
-          <button class="notes-new-btn" onclick="_peekNotesNew()" title="New note"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
-          <button class="notes-toggle-btn" onclick="_peekNotesToggleSidebar()" title="Collapse sidebar"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
-        </div>
-      </div>
-      <div class="notes-search-wrap">
-        <input id="peek-notes-search" type="search" placeholder="Search notes…" oninput="_peekNotesSearchFilter(this.value)" style="width:100%;box-sizing:border-box;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem;outline:none;">
-      </div>
-      <div id="peek-notes-list" class="notes-list"></div>
-    </div>
-    <!-- Editor pane -->
-    <div class="notes-editor-pane" id="peek-notes-editor-pane">
-      <div class="notes-editor-header">
-        <button class="notes-expand-btn" onclick="_peekNotesToggleSidebar()" title="Show notes list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
-        <input id="peek-notes-title" type="text" placeholder="Note title…" class="notes-title-input" oninput="_peekNotesTitleChange()" onblur="_peekNotesSaveDebounce()">
-        <div style="display:flex;gap:6px;align-items:center;">
-          <span id="peek-notes-save-status" style="font-size:0.72rem;color:var(--dim);"></span>
-          <button id="peek-notes-pin-btn" class="notes-pin-btn" onclick="_peekNotesTogglePin()" title="Pin to top"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg></button>
-          <button class="notes-delete-btn" onclick="_peekNotesDelete()" title="Delete note"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>
-        </div>
-      </div>
-      <div class="notes-mode-tabs" id="peek-notes-mode-tabs" style="display:none;">
-        <button class="notes-mode-tab" id="peek-notes-tab-edit" onclick="_peekNotesSwitchMode('edit')">Edit</button>
-        <button class="notes-mode-tab active" id="peek-notes-tab-preview" onclick="_peekNotesSwitchMode('preview')">Preview</button>
-      </div>
-      <div class="notes-editor-wrap" id="peek-notes-editor-wrap" style="display:none;">
-        <textarea id="peek-notes-editor" class="notes-editor-textarea" placeholder="Start writing markdown..." oninput="_peekNotesSaveDebounce()"></textarea>
-      </div>
-      <div class="notes-preview" id="peek-notes-preview"></div>
-      <div class="notes-empty-state" id="peek-notes-empty-state">
-        <div style="font-size:2rem;margin-bottom:8px;">📝</div>
-        <div style="color:var(--dim);font-size:0.85rem;">Select a note or create a new one</div>
-        <button class="btn" onclick="_peekNotesNew()" style="margin-top:12px;font-size:0.8rem;">+ New Note</button>
-      </div>
-    </div>
-  </div>
 </div>
 
 <!-- Edit modal -->
@@ -26595,7 +26498,6 @@ const ALL_TABS = [
   { id: 'logs',          label: 'Logs' },
   { id: 'browser',       label: 'Browser' },
   { id: 'grid',          label: 'Workspace' },
-  { id: 'notes',         label: 'Notes' },
   { id: 'messages',      label: 'Messages' },
   { id: 'skills',        label: 'Skills' },
   { id: 'crm',           label: 'People' },
@@ -37684,11 +37586,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph','mcp'];
-  const _svNames = ['sessions','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph','mcp'];
+  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
   // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex','flex','flex'];
+  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -51868,149 +51770,6 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json(results)
             except Exception:
                 return self._json([])
-
-        # Notes API (/api/notes)
-        if method == "POST" and path.startswith("/api/notes/") and path.endswith("/pin"):
-            note_rel = path[len("/api/notes/"):-len("/pin")]
-            if not note_rel.endswith(".md"):
-                note_rel += ".md"
-            pins = set()
-            if CC_NOTES_PINS.exists():
-                try: pins = set(json.loads(CC_NOTES_PINS.read_text()))
-                except Exception: pass
-            if note_rel in pins:
-                pins.discard(note_rel); pinned = False
-            else:
-                pins.add(note_rel); pinned = True
-            CC_NOTES_PINS.write_text(json.dumps(list(pins)))
-            return self._json({"ok": True, "pinned": pinned})
-
-        if method == "GET" and path == "/api/notes":
-            pins = set()
-            if CC_NOTES_PINS.exists():
-                try: pins = set(json.loads(CC_NOTES_PINS.read_text()))
-                except Exception: pass
-            notes = []
-            if CC_NOTES.exists():
-                for f in sorted((p for p in CC_NOTES.rglob("*.md") if ".trash" not in p.parts), key=lambda p: -p.stat().st_mtime):
-                    rel = str(f.relative_to(CC_NOTES))
-                    stat = f.stat()
-                    try:
-                        with open(f, "rb") as _fh: chunk = _fh.read(512).decode("utf-8", errors="replace")
-                        import re as _re
-                        m_html = _re.search(r'<h1[^>]*>(.*?)</h1>', chunk, _re.IGNORECASE)
-                        if m_html:
-                            h1 = _re.sub(r'<[^>]+>', '', m_html.group(1)).strip()
-                        else:
-                            first_line = chunk.split('\n')[0].strip()
-                            h1 = first_line[2:].strip() if first_line.startswith("# ") else ""
-                    except Exception:
-                        h1 = ""
-                    name = h1 or f.stem
-                    notes.append({"path": rel, "name": name, "size": stat.st_size,
-                                  "updated": int(stat.st_mtime), "pinned": rel in pins})
-            notes.sort(key=lambda n: (0 if n["pinned"] else 1, -n["updated"]))
-            return self._json(notes)
-
-        if method == "GET" and path == "/api/notes-source":
-            # Where notes are read/written from — drives the notes-tab source
-            # indicator. Set via AMUX_NOTES_DIR in ~/.amux/server.env.
-            d = str(CC_NOTES)
-            custom = bool(os.environ.get("AMUX_NOTES_DIR"))
-            return self._json({
-                "dir": d,
-                "name": CC_NOTES.name or d,
-                "exists": CC_NOTES.is_dir(),
-                "custom": custom,
-                "env_var": "AMUX_NOTES_DIR",
-            })
-
-        if method == "GET" and path == "/api/notes/trash":
-            trash_dir = CC_NOTES_TRASH
-            items = []
-            if trash_dir.exists():
-                for f in sorted(trash_dir.glob("*.md"), key=lambda p: -p.stat().st_mtime):
-                    items.append({"name": f.stem, "file": f.name, "updated": int(f.stat().st_mtime)})
-            return self._json(items)
-
-        if method == "POST" and path.startswith("/api/notes/trash/") and path.endswith("/restore"):
-            fname = path[len("/api/notes/trash/"):-len("/restore")]
-            src = _safe_note_path(fname, CC_NOTES_TRASH)
-            if not src:
-                return self._json({"error": "invalid"}, 400)
-            if not src.exists():
-                return self._json({"error": "not found"}, 404)
-            dst = CC_NOTES / fname
-            if dst.exists():
-                stem, ext = src.stem, src.suffix
-                i = 1
-                while (CC_NOTES / f"{stem}-{i}{ext}").exists(): i += 1
-                dst = CC_NOTES / f"{stem}-{i}{ext}"
-            src.rename(dst)
-            return self._json({"ok": True, "path": str(dst.relative_to(CC_NOTES))})
-
-        if method == "DELETE" and path.startswith("/api/notes/trash/"):
-            fname = path[len("/api/notes/trash/"):]
-            f = _safe_note_path(fname, CC_NOTES_TRASH)
-            if not f:
-                return self._json({"error": "invalid"}, 400)
-            if f.exists(): f.unlink()
-            return self._json({"ok": True})
-
-        if path.startswith("/api/notes/"):
-            note_rel = path[len("/api/notes/"):]
-            if not note_rel.endswith(".md"):
-                note_rel += ".md"
-            note_path = _safe_note_path(note_rel)
-            if not note_path:
-                return self._json({"error": "invalid path"}, 400)
-            if method == "GET":
-                if note_path.exists():
-                    return self._json({"content": note_path.read_text(errors="replace"), "path": note_rel})
-                return self._json({"error": "not found"}, 404)
-            if method == "POST":
-                global _notes_version
-                body = self._read_body()
-                content = body.get("content", "")
-                note_path.parent.mkdir(parents=True, exist_ok=True)
-                note_path.write_text(content)
-                _notes_version += 1
-                return self._json({"ok": True, "path": note_rel})
-            if method == "PATCH":
-                body = self._read_body()
-                new_rel = body.get("move_to", "").strip()
-                if not new_rel.endswith(".md"):
-                    new_rel += ".md"
-                new_path = _safe_note_path(new_rel)
-                if not new_path:
-                    return self._json({"error": "invalid"}, 400)
-                if new_path != note_path and note_path.exists():
-                    new_path.parent.mkdir(parents=True, exist_ok=True)
-                    note_path.rename(new_path)
-                    if CC_NOTES_PINS.exists():
-                        try:
-                            pins = set(json.loads(CC_NOTES_PINS.read_text()))
-                            if note_rel in pins:
-                                pins.discard(note_rel)
-                                pins.add(new_rel)
-                                CC_NOTES_PINS.write_text(json.dumps(list(pins)))
-                        except Exception: pass
-                    _notes_version += 1
-                return self._json({"ok": True, "path": new_rel})
-            if method == "DELETE":
-                if note_path.exists():
-                    trash_dir = CC_NOTES_TRASH
-                    trash_dir.mkdir(parents=True, exist_ok=True)
-                    dest = trash_dir / note_path.name
-                    if dest.exists():
-                        stem, ext = note_path.stem, note_path.suffix
-                        i = 1
-                        while (trash_dir / f"{stem}-{i}{ext}").exists():
-                            i += 1
-                        dest = trash_dir / f"{stem}-{i}{ext}"
-                    note_path.rename(dest)
-                _notes_version += 1
-                return self._json({"ok": True})
 
         # GET /api/skills — list skills from SQLite
         if method == "GET" and path == "/api/skills":
