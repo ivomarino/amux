@@ -69,6 +69,16 @@ CC_MAP = CC_HOME / "map.json"
 CC_NOTIFICATIONS = CC_HOME / "notifications.json"
 CC_HABITS = CC_HOME / "habits.json"
 CC_TRANSCRIPTS = CC_HOME / "transcripts"  # per-session JSONL backups
+# The MCP registry every session is launched against. Deliberately at the USER
+# level, not in the repo: the repo copy is a shipped default, and a registry you
+# edit from the UI must not produce repo diffs or leak server URLs/tokens into a
+# public checkout. Seeded from the repo copy on first run.
+CC_MCP_REGISTRY = CC_HOME / "mcp.json"
+# Global credential env, sourced into EVERY session shell. Distinct from
+# server.env, which configures the amux server process itself — this one is for
+# the agents and the stdio MCP servers they spawn, so ${VAR} in mcp.json
+# resolves the same way in every lane instead of per-session shell setup.
+CC_AMUX_ENV = CC_HOME / "amux.env"
 
 # The served client version (the JS `const APP_VER` below) parsed once at boot —
 # pushed in SSE pings so long-lived clients detect they're stale and self-reload.
