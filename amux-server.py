@@ -9919,20 +9919,33 @@ def _run_schedule(sched, source: str = "cron"):
             else:
                 note = (r.stdout or "")[:500] or None
         else:
-            ok, err = send_text(session, command, defer_if_busy=True)
+            # An off-cadence fire is prefixed with WHY, in the delivered text itself.
+            # Recording it only in cmd_history.origin was not enough: a session lives
+            # in its terminal, and there a manual tap was still byte-identical to the
+            # 9am cron fire, so "read the tag" meant "poll an endpoint you have no
+            # reason to poll" (AMUX-1998 follow-up). Cron fires are left untouched —
+            # they are the overwhelming majority and nothing about them is ambiguous.
+            delivered = command
+            if source and source != "cron":
+                if source.startswith("manual:"):
+                    _who = source.split(":", 1)[1] or "someone"
+                    _why = (f"[amux] Run-now, triggered by {_who} just now — NOT the scheduled fire. "
+                            f"Treat this as an active ask for a fresh look, not a duplicate to decline.")
+                else:
+                    _why = f"[amux] Off-cadence fire ({source}) — not the scheduled cron fire."
+                delivered = f"{_why}\n\n{command}"
+            ok, err = send_text(session, delivered, defer_if_busy=True)
             if not ok:
                 status, note = "error", str(err)
                 slog(f"[sched] send failed for '{sched['title']}': {err}")
             else:
                 # Record in the Messages history so the peek shows scheduled
-                # commands distinctly (origin = the schedule's title). Off-cadence
-                # fires carry their reason, so the RECEIVING session can tell a
-                # hand-pressed re-run from the scheduler double-firing without
-                # opening the runs list (AMUX-1998).
+                # commands distinctly (origin = the schedule's title). Store the
+                # DELIVERED text, so history is what the session actually got.
                 _origin = sched.get("title") or sched.get("id") or "schedule"
                 if source and source != "cron":
                     _origin = f"{_origin} [{source}]"
-                _cmd_hist_record(session, command, "schedule", _origin)
+                _cmd_hist_record(session, delivered, "schedule", _origin)
     except Exception as e:
         status, note = "error", str(e)
         slog(f"[sched] exception running '{sched['title']}': {e}")
@@ -28542,7 +28555,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.232';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.233';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49152,7 +49165,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.232';
+const CACHE = 'amux-v0.9.233';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
