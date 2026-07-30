@@ -32,6 +32,7 @@ WORKDIR /app
 # concern only — amux-server.py is byte-identical to local.
 RUN npm install playwright \
     && npx playwright install --with-deps chromium \
+    && npx playwright install --with-deps chrome \
     && node -e "require('playwright'); console.log('playwright resolves from /app')"
 
 # The Browser tab drives browser-use (python console script at
@@ -46,6 +47,12 @@ RUN pip install --no-cache-dir 'browser-use==0.12.2' playwright \
     && test -x /usr/local/bin/browser-use \
     && browser-use --help 2>&1 | grep -q -- "--json" \
     && echo "browser-use 0.12.2 verified at build time (--json present)"
+
+# browser-use 0.12.2 looks for real Chrome, not Chromium — locally that is
+# the desktop install. Assert a chrome binary exists so this cannot ship
+# half-working again.
+RUN (which google-chrome || which google-chrome-stable || ls /root/.cache/ms-playwright/chrome-*/chrome-linux*/chrome) \
+    && echo "chrome binary verified at build time"
 
 COPY amux-server.py .
 
