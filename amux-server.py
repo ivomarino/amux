@@ -28585,7 +28585,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.234';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.236';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42282,6 +42282,19 @@ async function _swOfferGoodOrigin() {
   if (document.body) attach(); else document.addEventListener('DOMContentLoaded', attach);
 }
 
+// Ask for durable storage as early as possible. The localStorage HTML fallback
+// below guards against the SW cache being evicted, but localStorage is evicted
+// by the same sweep — on iOS both go after ~7 days without a visit, taking the
+// queued messages and peek scrollback with them. persist() is the only thing
+// that actually exempts the origin, and it is free to call on every load.
+// Declared HERE, above the call: these are top-level `let`s, so leaving them
+// beside their functions further down put this call in the temporal dead zone —
+// it threw ReferenceError inside an async fn, which becomes a silently swallowed
+// unhandled rejection, and the startup request never actually ran.
+let _storagePersisted = null;      // null = not asked yet
+let _storageEstimate = null;       // {usage, quota} from the browser, not our cap
+_storagePersistEnsure();
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => {
     // Store full page HTML in localStorage as fallback if iOS evicts SW cache
@@ -43021,6 +43034,29 @@ async function _offlineBudgetEnforce() {
   _offlineInfoRefresh();
 }
 // Byte formatting uses the shared _fmtBytes defined below.
+// Browsers evict IndexedDB + Cache Storage on their own schedule unless the
+// origin is marked PERSISTENT. iOS clears a non-persistent origin after ~7 days
+// without a visit, and Chrome drops "best-effort" origins under storage
+// pressure. Either one silently takes the queued messages and the peek
+// scrollback with it — the cache looks fine right up until the restart where it
+// is gone. Ask once, cache the answer, and report it honestly rather than
+// assuming the request was granted.
+async function _storagePersistEnsure() {
+  try {
+    if (!navigator.storage || !navigator.storage.persist) { _storagePersisted = false; return false; }
+    _storagePersisted = await navigator.storage.persisted()
+      ? true
+      : await navigator.storage.persist();
+    return _storagePersisted;
+  } catch (e) { _storagePersisted = false; return false; }
+}
+async function _storageEstimateRefresh() {
+  try {
+    if (navigator.storage && navigator.storage.estimate) _storageEstimate = await navigator.storage.estimate();
+  } catch (e) { _storageEstimate = null; }
+  return _storageEstimate;
+}
+
 async function _offlineInfoRefresh() {
   const el = document.getElementById('offline-cache-info');
   if (!el) return;
@@ -43040,12 +43076,31 @@ async function _offlineInfoRefresh() {
   const filesTxt = fc.count
     ? `${fc.count} file${fc.count === 1 ? '' : 's'} · ${_fmtBytes(fc.bytes)}`
     : 'no files yet — files you open are saved automatically';
+  // Our MB cap is a soft budget; the BROWSER's quota is the hard one. Showing
+  // only ours would read as "you have 500 MB" on a device that will hand out 50.
+  if (_storagePersisted === null) await _storagePersistEnsure();
+  await _storageEstimateRefresh();
+  let durability;
+  if (_storagePersisted) {
+    durability = `<span style="color:var(--green,#4ade80);">&#x1F512; Protected from eviction</span>`
+               + ` — survives restarts and idle time.`;
+  } else {
+    durability = `<span style="color:var(--yellow,#d29922);">&#x26A0; Best-effort storage</span>`
+               + ` — the browser may clear this when idle or low on space`
+               + (window.matchMedia('(display-mode: standalone)').matches
+                   ? `.` : `. Add amux to your Home Screen to make it durable.`);
+  }
+  const quota = _storageEstimate && _storageEstimate.quota
+    ? `<br>Browser grant: ${_fmtBytes(_storageEstimate.usage || 0)} of ${_fmtBytes(_storageEstimate.quota)}`
+    : '';
   el.innerHTML =
     `<b>${n}</b> of ${running} running sessions saved (${_fmtBytes(kb * 1024)})<br>`
     + `Files: ${filesTxt}<br>`
     + `<span style="display:inline-block;width:100%;height:4px;background:rgba(139,148,158,0.25);border-radius:2px;margin:4px 0;">`
     + `<span style="display:block;width:${pct}%;height:100%;background:${pct>90?'#f85149':'var(--accent)'};border-radius:2px;"></span></span>`
-    + `${_fmtBytes(totalBytes)} of ${_offlineMB} MB used (${pct}%). Oldest-opened evicted first.`;
+    + `${_fmtBytes(totalBytes)} of ${_offlineMB} MB used (${pct}%). Oldest-opened evicted first.`
+    + quota
+    + `<br>${durability}`;
 }
 // Settings controls for the offline caps. Both persist to /api/prefs, so the
 // limits follow you to every device instead of each phone keeping its own.
@@ -49195,7 +49250,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.234';
+const CACHE = 'amux-v0.9.236';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
