@@ -62,50 +62,11 @@ CC_MEMORY = CC_HOME / "memory"
 CC_BOARD_DIR = CC_HOME / "board"
 CC_UPLOADS = CC_HOME / "uploads"
 CC_BLOCKED_SESSIONS = CC_HOME / "blocked-sessions.txt"
-CC_NOTES = Path(os.environ.get("AMUX_NOTES_DIR", "")) if os.environ.get("AMUX_NOTES_DIR") else CC_HOME / "notes"
-CC_NOTES_PINS = CC_HOME / "notes" / ".pins.json"
-CC_NOTES_TRASH = CC_HOME / "notes" / ".trash"
 CC_MAP = CC_HOME / "map.json"
 CC_NOTIFICATIONS = CC_HOME / "notifications.json"
 CC_HABITS = CC_HOME / "habits.json"
 CC_TRANSCRIPTS = CC_HOME / "transcripts"  # per-session JSONL backups
-# The MCP registry every session is launched against. Deliberately at the USER
-# level, not in the repo: the repo copy is a shipped default, and a registry you
-# edit from the UI must not produce repo diffs or leak server URLs/tokens into a
-# public checkout. Seeded from the repo copy on first run.
-CC_MCP_REGISTRY = CC_HOME / "mcp.json"
-# Global credential env, sourced into EVERY session shell. Distinct from
-# server.env, which configures the amux server process itself — this one is for
-# the agents and the stdio MCP servers they spawn, so ${VAR} in mcp.json
-# resolves the same way in every lane instead of per-session shell setup.
-CC_AMUX_ENV = CC_HOME / "amux.env"
 
-# The served client version (the JS `const APP_VER` below) parsed once at boot —
-# pushed in SSE pings so long-lived clients detect they're stale and self-reload.
-try:
-    _APP_VER_PY = (re.search(r"const APP_VER = '([0-9.]+)'",
-                             open(__file__, encoding="utf-8", errors="replace").read()) or [None]).group(1)
-except Exception:
-    _APP_VER_PY = ""
-CC_GMAIL = CC_HOME / "gmail-tokens"        # per-account Gmail OAuth tokens
-CC_BRANDING = CC_HOME / "branding"         # white-label assets (icon, logo)
-CC_JOURNAL_MEDIA = CC_HOME / "journal-media"  # journal photo/media files
-CC_CHANNELS = CC_HOME / "channels"            # pairwise session-to-session message threads (jsonl)
-TEMPLATES_DIR = Path(__file__).parent / "templates"
-
-def _safe_note_path(note_rel: str, base: Path = None) -> Path | None:
-    """Resolve a note relative path and verify it stays within the notes directory.
-    Returns the resolved Path if safe, or None if traversal detected."""
-    if base is None:
-        base = CC_NOTES
-    if not note_rel or note_rel.startswith("/"):
-        return None
-    candidate = (base / note_rel).resolve()
-    try:
-        candidate.relative_to(base.resolve())
-    except ValueError:
-        return None  # traversal detected
-    return candidate
 
 def _path_is_within(path: Path, base: Path) -> bool:
     """Return True when path resolves inside base, not just under a string prefix."""
@@ -156,6 +117,29 @@ def _is_path_allowed(p: Path) -> bool:
     except ValueError:
         pass
     return True
+# The MCP registry every session is launched against. Deliberately at the USER
+# level, not in the repo: the repo copy is a shipped default, and a registry you
+# edit from the UI must not produce repo diffs or leak server URLs/tokens into a
+# public checkout. Seeded from the repo copy on first run.
+CC_MCP_REGISTRY = CC_HOME / "mcp.json"
+# Global credential env, sourced into EVERY session shell. Distinct from
+# server.env, which configures the amux server process itself — this one is for
+# the agents and the stdio MCP servers they spawn, so ${VAR} in mcp.json
+# resolves the same way in every lane instead of per-session shell setup.
+CC_AMUX_ENV = CC_HOME / "amux.env"
+
+# The served client version (the JS `const APP_VER` below) parsed once at boot —
+# pushed in SSE pings so long-lived clients detect they're stale and self-reload.
+try:
+    _APP_VER_PY = (re.search(r"const APP_VER = '([0-9.]+)'",
+                             open(__file__, encoding="utf-8", errors="replace").read()) or [None]).group(1)
+except Exception:
+    _APP_VER_PY = ""
+CC_GMAIL = CC_HOME / "gmail-tokens"        # per-account Gmail OAuth tokens
+CC_BRANDING = CC_HOME / "branding"         # white-label assets (icon, logo)
+CC_JOURNAL_MEDIA = CC_HOME / "journal-media"  # journal photo/media files
+CC_CHANNELS = CC_HOME / "channels"            # pairwise session-to-session message threads (jsonl)
+TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
 # ── Ebook → self-contained HTML (pure stdlib) ────────────────────────────────
@@ -791,8 +775,6 @@ CC_LOGS.mkdir(parents=True, exist_ok=True)
 CC_MEMORY.mkdir(parents=True, exist_ok=True)
 CC_BOARD_DIR.mkdir(parents=True, exist_ok=True)
 CC_UPLOADS.mkdir(parents=True, exist_ok=True)
-CC_NOTES.mkdir(parents=True, exist_ok=True)
-CC_NOTES_PINS.parent.mkdir(parents=True, exist_ok=True)
 CC_TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
 CC_GMAIL.mkdir(parents=True, exist_ok=True)
 CC_BRANDING.mkdir(parents=True, exist_ok=True)
@@ -2497,7 +2479,6 @@ def _classify_request(method: str, path: str) -> tuple:
 
 # Auto-recovery state
 _sse_alerts: list = []           # ring buffer of alert dicts pushed to all SSE clients
-_notes_version: int = 0             # bumped on any notes write; triggers SSE invalidation
 _crm_version: int = 0               # bumped on any CRM write; triggers SSE invalidation
 _journal_version: int = 0           # bumped on any journal write; triggers SSE invalidation
 _sse_alert_lock = threading.Lock()
@@ -12489,38 +12470,23 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \\
   $AMUX_URL/api/board/TASK-ID
 ```
 
-### Where a document belongs — REPO FILE first, note only for scratch
+### Where a document belongs — a REPO FILE, or the board
 
 **Default: write it as a file in the repo you are working in, and commit it.** Design
 docs, write-ups, research, runbooks, reports, analyses, plans — these belong in the
 codebase next to the work they describe, where they are git-versioned, reviewable, and
 survive amux itself.
 
-**Use notes** (`/api/notes`) ONLY for personal scratch: a throwaway draft, a clipboard,
-something with no repo to live in. Notes are stored under `~/.amux/notes` and are **NOT
-git-versioned** — a work doc saved there is invisible to review and lost on a restore.
+**For anything outside a repo**, write a real file and use the Files view. amux notes
+were removed (2026-07-30): they were only ever a thin view over a directory, so a file
+is the same thing without a second API to keep in sync. If a path is configured as a
+notes vault it is browsable under Files like any other directory.
 
 **Use board issues** (`/api/board`) for: tasks, todos, bugs, action items — anything
-meant to be *done* or *tracked*.
+meant to be *done* or *tracked*. This is the source of truth for work.
 
-> Rule of thumb: "write a doc about X" → a committed file in the repo. "jot down X" →
-> `/api/notes`. "create a task/issue/todo for X" → `/api/board`.
-
-```bash
-# List all notes
-curl -sk $AMUX_URL/api/notes
-
-# Read a note
-curl -sk $AMUX_URL/api/notes/my-note
-
-# Create or update a note (content is plain text or Quill HTML)
-curl -sk -X POST -H 'Content-Type: application/json' \\
-  -d '{"content":"# Title\\n\\nBody text here"}' \\
-  $AMUX_URL/api/notes/my-note
-
-# Delete a note (moves to trash)
-curl -sk -X DELETE $AMUX_URL/api/notes/my-note
-```
+> Rule of thumb: "write a doc about X" → a committed file in the repo. "create a
+> task/issue/todo for X" → `/api/board`. There is no third place.
 
 ### Google Drive — use the API, not Chrome MCP
 
@@ -16858,11 +16824,6 @@ async function loadNotes() {
     const notes = await r.json();
     el.innerHTML = notes.map(n => '<a class="note-link" onclick="viewNote(\'' + n.path + '\')">' + n.path + '</a>').join('');
   } catch(e) { el.innerHTML = 'Error loading notes'; }
-}
-async function viewNote(p) {
-  document.getElementById('notes-list').style.display = 'none';
-  const nc = document.getElementById('note-content'); nc.style.display = 'block'; nc.textContent = 'Loading\u2026';
-  try { const r = await fetch(API + '/note/' + encodeURIComponent(p)); const d = await r.json(); nc.textContent = d.content || '(empty)'; } catch(e) { nc.textContent = 'Error'; }
 }
 loadInfo(); startPoll();
 """
@@ -27763,7 +27724,6 @@ function setPeekTab(tab) {
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
   document.getElementById('peek-tab-schedules').classList.toggle('active', tab === 'schedules');
-  document.getElementById('peek-tab-notes').classList.toggle('active', tab === 'notes');
   document.getElementById('peek-tab-dictation').classList.toggle('active', tab === 'dictation');
   const dictPanel = document.getElementById('peek-dictation-panel');
   if (tab === 'dictation') { dictPanel.classList.add('active'); _dictLoad(); }
@@ -27797,9 +27757,6 @@ function setPeekTab(tab) {
   const scheds = document.getElementById('peek-schedules-panel');
   if (tab === 'schedules') { scheds.classList.add('active'); _peekLoadSchedules(); }
   else { scheds.classList.remove('active'); }
-  const notes = document.getElementById('peek-notes-panel');
-  if (tab === 'notes') { notes.classList.add('active'); _peekNotesLoad(); }
-  else { notes.classList.remove('active'); }
 }
 
 // ── Standing instructions (autonomy config) ──
@@ -28644,14 +28601,6 @@ async function _peekUpdateTabCounts() {
     _peekColorSchedBadge(sched);   // renders active/inactive two-number badge
   } catch(e) {}
   try {
-    const r = await fetch(API + '/api/notes');
-    if (peekSession !== sess) return;
-    const all = await r.json();
-    const folder = '_sessions/' + sess + '/';
-    const n = all.filter(x => x.path && x.path.startsWith(folder)).length;
-    setCount('peek-tab-notes-count', n);
-  } catch(e) {}
-  try {
     const r = await fetch(API + '/api/dictation/history?count=1&session=' + encodeURIComponent(sess),
                           { headers: _authHeaders() });
     if (peekSession !== sess) return;
@@ -28736,14 +28685,7 @@ let _peekNotesSidebarOpen = true;
 let _peekNotesRawContent = '';
 function _peekNotesGetEditor() { return document.getElementById('peek-notes-editor'); }
 
-function _peekNotesFolder() {
-  return '_sessions/' + peekSession;
-}
 
-function _peekNotesToggleSidebar() {
-  _peekNotesSidebarOpen = !_peekNotesSidebarOpen;
-  _peekNotesApplySidebarState();
-}
 
 function _peekNotesApplySidebarState() {
   const panel = document.getElementById('peek-notes-panel');
@@ -28758,56 +28700,7 @@ function _peekNotesApplySidebarState() {
   }
 }
 
-async function _peekNotesLoad() {
-  const list = document.getElementById('peek-notes-list');
-  if (!peekSession) return;
-  list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 8px;">Loading…</div>';
-  const _render = (all) => {
-    const folder = _peekNotesFolder() + '/';
-    _peekNotesAll = all.filter(n => n.path.startsWith(folder));
-    _peekNotesRenderList(_peekNotesAll);
-    const tabCount = document.getElementById('peek-tab-notes-count');
-    if (tabCount) {
-      if (_peekNotesAll.length > 0) { tabCount.textContent = _peekNotesAll.length; tabCount.classList.add('has-count'); }
-      else { tabCount.textContent = ''; tabCount.classList.remove('has-count'); }
-    }
-    if (!_peekNotesActive && _peekNotesAll.length) _peekNotesOpen(_peekNotesAll[0].path);
-    if (!_peekNotesAll.length) _peekNotesShowEmpty();
-  };
-  try {
-    const r = await fetch(API + '/api/notes');
-    const all = await r.json();
-    if (Array.isArray(all)) _idb.set('notes_all', all);   // cache for offline reads
-    _render(all);
-  } catch(e) {
-    const cached = await _idb.get('notes_all');   // offline fallback
-    if (Array.isArray(cached)) _render(cached);
-    else list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 8px;">Failed to load notes.</div>';
-  }
-}
 
-function _peekNotesRenderList(notes) {
-  const el = document.getElementById('peek-notes-list');
-  if (!notes.length) {
-    el.innerHTML = '<div style="color:var(--dim);font-size:0.82rem;padding:12px 8px;">No notes yet</div>';
-    return;
-  }
-  el.innerHTML = notes.map(n => {
-    const active = _peekNotesActive && _peekNotesActive.path === n.path ? ' active' : '';
-    const pinned = n.pinned ? ' pinned' : '';
-    const dt = n.updated ? new Date(n.updated * 1000).toLocaleDateString() : '';
-    const stem = n.path.replace(/\.md$/, '').split('/').pop();
-    const rawName = n.name || stem;
-    const displayName = /^untitled(-\d+)?$/.test(rawName) ? 'Untitled' : rawName;
-    return `<div class="notes-list-item${active}${pinned}" data-path="${esc(n.path)}"
-      onclick="_peekNotesOpen(this.dataset.path)" style="display:flex;align-items:center;gap:4px;">
-      <div style="flex:1;min-width:0;">
-        <div class="nli-title">${esc(displayName)}</div>
-        <div class="nli-date">${dt}</div>
-      </div>
-    </div>`;
-  }).join('');
-}
 
 function _peekNotesShowEmpty() {
   document.getElementById('peek-notes-empty-state').style.display = '';
@@ -28822,90 +28715,13 @@ function _peekNotesInitQuill() {
   // no-op — textarea needs no init
 }
 
-async function _peekNotesOpen(path) {
-  if (path === _peekNotesActive?.path) return;
-  if (_peekNotesSaveTimer) { clearTimeout(_peekNotesSaveTimer); _peekNotesSaveTimer = null; _peekNotesSave(); }
-  _peekNotesInitQuill();
-  // Highlight in sidebar
-  document.querySelectorAll('#peek-notes-list .notes-list-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.path === path);
-  });
-  document.getElementById('peek-notes-save-status').textContent = '';
-  const urlPath = path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
-  try {
-    const r = await fetch(API + '/api/notes/' + urlPath);
-    if (!r.ok) throw new Error('not ok');
-    const data = await r.json();
-    _peekNotesActive = { path: data.path };
-    _peekNotesRawContent = data.content || '';
-    const h1md = _peekNotesRawContent.match(/^#\s+(.+)$/m);
-    const titleFromContent = h1md ? h1md[1] : '';
-    const titleFromPath = path.replace(/\.md$/, '').split('/').pop();
-    _peekNotesActive.title = titleFromContent || titleFromPath;
-    document.getElementById('peek-notes-title').value = _peekNotesActive.title;
-    const listEntry = _peekNotesAll.find(n => n.path === data.path);
-    if (listEntry) listEntry.name = _peekNotesActive.title;
-    const editor = _peekNotesGetEditor();
-    if (editor) { _peekNotesLoading = true; editor.value = _peekNotesRawContent; setTimeout(() => { _peekNotesLoading = false; }, 0); }
-    document.getElementById('peek-notes-empty-state').style.display = 'none';
-    document.getElementById('peek-notes-mode-tabs').style.display = 'flex';
-    _peekNotesSwitchMode('preview');
-    _peekNotesUpdatePinBtn();
-    // On mobile, collapse sidebar after selecting
-    if (window.innerWidth <= 600 && _peekNotesSidebarOpen) {
-      _peekNotesSidebarOpen = false;
-      _peekNotesApplySidebarState();
-    }
-  } catch(e) {
-    showToast('Failed to load note');
-  }
-}
 
-async function _peekNotesNew() {
-  if (_peekNotesSaveTimer) { clearTimeout(_peekNotesSaveTimer); _peekNotesSaveTimer = null; _peekNotesSave(); }
-  const folder = _peekNotesFolder();
-  const existing = new Set(_peekNotesAll.map(n => n.path));
-  let filename = folder + '/untitled.md';
-  let displayName = 'Untitled';
-  if (existing.has(filename)) {
-    let i = 1;
-    while (existing.has(folder + '/untitled-' + i + '.md')) i++;
-    filename = folder + '/untitled-' + i + '.md';
-    displayName = 'Untitled ' + i;
-  }
-  const urlPath = filename.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
-  await apiCall(API + '/api/notes/' + urlPath, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ content: '# ' + displayName + '\n' })
-  });
-  _peekNotesAll.unshift({ path: filename, name: displayName, updated: Math.floor(Date.now() / 1000), pinned: false, size: 0 });
-  _peekNotesRenderList(_peekNotesAll);
-  _peekNotesActive = null; // force open
-  await _peekNotesOpen(filename);
-  const ti = document.getElementById('peek-notes-title');
-  if (ti) { ti.focus(); ti.select(); }
-  _peekUpdateTabCounts();
-}
 
 function _peekNotesSaveDebounce() {
   if (_peekNotesSaveTimer) clearTimeout(_peekNotesSaveTimer);
   _peekNotesSaveTimer = setTimeout(_peekNotesSave, 400);
 }
 
-async function _peekNotesSave() {
-  const editor = _peekNotesGetEditor();
-  if (!_peekNotesActive || !editor) return;
-  const content = editor.value;
-  _peekNotesRawContent = content;
-  const pathKey = _peekNotesActive.path.replace(/\.md$/, '');
-  const statusEl = document.getElementById('peek-notes-save-status');
-  const result = await apiCall(API + '/api/notes/' + pathKey.split('/').map(encodeURIComponent).join('/'), {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ content })
-  });
-  if (!result) { statusEl.textContent = '◐ Offline'; }
-  else { statusEl.textContent = '✓ Saved'; setTimeout(() => { if (statusEl.textContent === '✓ Saved') statusEl.textContent = ''; }, 2000); }
-}
 
 function _peekNotesTitleChange() {
   const editor = _peekNotesGetEditor();
@@ -28923,29 +28739,6 @@ function _peekNotesTitleChange() {
   _peekNotesSaveDebounce();
 }
 
-async function _peekNotesDelete() {
-  if (!_peekNotesActive) return;
-  const btn = document.querySelector('#peek-notes-panel .notes-delete-btn');
-  if (btn && !btn.classList.contains('confirming')) {
-    btn.classList.add('confirming');
-    btn.textContent = 'Delete?';
-    setTimeout(() => { btn.classList.remove('confirming'); btn.innerHTML = _TRASH_SVG; }, 3000);
-    return;
-  }
-  if (btn) { btn.classList.remove('confirming'); btn.innerHTML = _TRASH_SVG; }
-  const pathKey = _peekNotesActive.path.replace(/\.md$/, '');
-  _peekNotesAll = _peekNotesAll.filter(n => n.path !== _peekNotesActive.path);
-  document.querySelector('#peek-notes-list .notes-list-item[data-path="' + _peekNotesActive.path + '"]')?.remove();
-  _peekNotesActive = null;
-  await apiCall(API + '/api/notes/' + pathKey.split('/').map(encodeURIComponent).join('/'), { method: 'DELETE' });
-  if (_peekNotesAll.length > 0) {
-    _peekNotesOpen(_peekNotesAll[0].path);
-  } else {
-    _peekNotesShowEmpty();
-    _peekNotesRenderList([]);
-  }
-  _peekUpdateTabCounts();
-}
 
 function _peekNotesSwitchMode(mode) {
   _peekNotesMode = mode;
@@ -28968,18 +28761,6 @@ function _peekNotesSwitchMode(mode) {
   }
 }
 
-async function _peekNotesTogglePin() {
-  if (!_peekNotesActive) return;
-  const pathKey = _peekNotesActive.path.replace(/\.md$/, '');
-  const r = await apiCall(API + '/api/notes/' + pathKey.split('/').map(encodeURIComponent).join('/') + '/pin', { method: 'POST' });
-  if (r) {
-    const entry = _peekNotesAll.find(n => n.path === _peekNotesActive.path);
-    if (entry) entry.pinned = r.pinned;
-    _peekNotesUpdatePinBtn();
-    _peekNotesAll.sort((a, b) => (a.pinned === b.pinned ? 0 : a.pinned ? -1 : 1) || (b.updated - a.updated));
-    _peekNotesRenderList(_peekNotesAll);
-  }
-}
 
 function _peekNotesUpdatePinBtn() {
   const btn = document.getElementById('peek-notes-pin-btn');
@@ -29128,7 +28909,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.251';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.255';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -29375,7 +29156,7 @@ function openPeek(name, opts) {
   document.getElementById('peek-body').innerHTML = '<div class="peek-loading"><div class="peek-spin-lg"></div><span>Loading latest…</span></div>';
   // Reset tab badges; will be repopulated by _peekUpdateTabCounts
   _dictCount = 0;   // stale count from the previous session must not linger
-  ['peek-tab-steering-count','peek-tab-issues-count','peek-tab-schedules-count','peek-tab-notes-count',
+  ['peek-tab-steering-count','peek-tab-issues-count','peek-tab-schedules-count',
    'peek-tab-dictation-count'].forEach(id => {
     const el = document.getElementById(id);
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
@@ -41942,50 +41723,12 @@ function _notePathFromId(id) {
   return id.startsWith('note:') ? id.slice(5) : null;
 }
 
-async function wsToggleNoteMenu() {
-  const menu = document.getElementById('ws-note-menu');
-  if (menu.classList.contains('open')) { menu.classList.remove('open'); return; }
-  // Fetch notes list
-  let notes = [];
-  try {
-    notes = await fetch(API + '/api/notes').then(r => r.json());
-  } catch(e) {
-    // Try cache
-    try { notes = JSON.parse(localStorage.getItem('amux_notes_cache') || '[]'); } catch(e2) {}
-  }
-  let html = '<button class="ws-note-menu-new" onclick="wsAddNewNotePane()">+ New note</button>';
-  notes.forEach(n => {
-    const p = n.path || n.name;
-    const title = n.name || p.replace(/\.md$/, '').split('/').pop();
-    const nid = _noteIdFromPath(p);
-    const already = !!_notePanes[nid];
-    html += '<button onclick="wsAddNotePane(\'' + p.replace(/'/g, "\\'") + '\')"' +
-      (already ? ' style="opacity:0.4;" disabled' : '') + '>' + esc(title) + '</button>';
-  });
-  menu.innerHTML = html;
-  menu.classList.add('open');
-  // Close on outside click
-  setTimeout(() => document.addEventListener('click', _wsCloseNoteMenu, { once: true }), 0);
-}
 
 function _wsCloseNoteMenu(e) {
   const menu = document.getElementById('ws-note-menu');
   if (menu) menu.classList.remove('open');
 }
 
-async function wsAddNewNotePane() {
-  document.getElementById('ws-note-menu')?.classList.remove('open');
-  // Create a new note via API
-  const ts = Date.now();
-  const slug = 'note-' + ts;
-  try {
-    await fetch(API + '/api/notes/' + slug, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ content: '# Untitled\n' })
-    });
-  } catch(e) {}
-  wsAddNotePane(slug + '.md');
-}
 
 function wsAddNotePane(path, x, y, w, h) {
   if (!_grid) return;
@@ -42033,56 +41776,7 @@ function _initNotePaneQuill(nid) {
   });
 }
 
-async function _loadNotePaneContent(nid) {
-  const pane = _notePanes[nid];
-  if (!pane) return;
-  const sid = _gpSafeId(nid);
-  const statusEl = document.getElementById(sid + '-status');
-  const editorEl = document.getElementById(sid + '-editor');
-  if (!editorEl) return;
-  const pathKey = pane.path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
 
-  let data;
-  try {
-    data = await fetch(API + '/api/notes/' + pathKey).then(r => r.json());
-    _idb.set('amux_note_' + pane.path, JSON.stringify(data));
-  } catch(e) {
-    try {
-      const cached = await _idb.get('amux_note_' + pane.path);
-      if (cached) data = JSON.parse(cached);
-    } catch(e2) {}
-  }
-  if (!data) { if (statusEl) statusEl.textContent = 'Could not load note'; return; }
-
-  editorEl.value = data.content || '';
-  const h1m = (data.content || '').match(/^#\s+(.+)$/m);
-  if (h1m) {
-    const titleEl = document.getElementById(sid + '-title');
-    if (titleEl) titleEl.textContent = h1m[1] || 'Untitled';
-  }
-}
-
-async function _saveNotePaneContent(nid) {
-  const pane = _notePanes[nid];
-  if (!pane) return;
-  const sid = _gpSafeId(nid);
-  const statusEl = document.getElementById(sid + '-status');
-  const editorEl = document.getElementById(sid + '-editor');
-  if (!editorEl) return;
-  const content = editorEl.value;
-  const pathKey = pane.path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
-
-  const result = await apiCall(API + '/api/notes/' + pathKey, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ content })
-  });
-  if (statusEl) {
-    statusEl.textContent = result ? '\u2713 Saved' : 'Queued';
-    setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 1500);
-  }
-  // Update IDB cache
-  _idb.set('amux_note_' + pane.path, JSON.stringify({ path: pane.path, content }));
-}
 
 function wsRemoveNotePane(path) {
   const nid = _noteIdFromPath(path);
@@ -42688,7 +42382,6 @@ function connectSSE() {
           if (key === 'notes') {
             if (activeView === 'notes') { _notesLoad(); _notesReloadActive(); }
             else _notesDirty = true;
-            _pinnedNotesRefresh();
           } else if (key === 'crm') {
             if (activeView === 'crm') _crmLoad();
             else _crmDirty = true;
@@ -43863,7 +43556,6 @@ function toggleSettings() {
     // Render connections
     _renderInstanceSwitcher();
     // Populate the notes-folder row
-    _notesLoadSource();
     loadCommitGuard();
     loadTaskGuard();
     loadAlertConfig();
@@ -46488,26 +46180,6 @@ async function _sqlRun() {
 let _notesActive = null; // { path, title }
 let _notesTrashOpen = false;
 
-async function _notesTrashLoad() {
-  const r = await fetch(API + '/api/notes/trash');
-  if (!r.ok) return;
-  const items = await r.json();
-  const section = document.getElementById('notes-trash-section');
-  const count = document.getElementById('notes-trash-count');
-  const body = document.getElementById('notes-trash-body');
-  if (!items.length) { section.style.display = 'none'; return; }
-  section.style.display = '';
-  count.textContent = items.length;
-  body.innerHTML = items.map(it => {
-    const dt = it.updated ? new Date(it.updated * 1000).toLocaleDateString() : '';
-    return `<div class="notes-trash-item">
-      <span class="notes-trash-item-name" title="${esc(it.name)}">${esc(it.name)}</span>
-      <span style="font-size:0.68rem;color:var(--dim);margin-right:4px;">${dt}</span>
-      <button class="notes-trash-restore" onclick="_notesTrashRestore('${esc(it.file)}')" title="Restore">Restore</button>
-      <button class="notes-trash-del" onclick="_notesTrashDelete('${esc(it.file)}')" title="Delete permanently">&#x2715;</button>
-    </div>`;
-  }).join('');
-}
 
 function _notesTrashToggle() {
   _notesTrashOpen = !_notesTrashOpen;
@@ -46515,15 +46187,7 @@ function _notesTrashToggle() {
   document.getElementById('notes-trash-body').style.display = _notesTrashOpen ? '' : 'none';
 }
 
-async function _notesTrashRestore(file) {
-  const r = await apiCall(API + '/api/notes/trash/' + encodeURIComponent(file) + '/restore', { method: 'POST' });
-  if (r && r.ok) { await _notesLoad(); await _notesTrashLoad(); }
-}
 
-async function _notesTrashDelete(file) {
-  await apiCall(API + '/api/notes/trash/' + encodeURIComponent(file), { method: 'DELETE' });
-  await _notesTrashLoad();
-}
 let _notesSaveTimer = null;
 let _notesAllNotes = [];
 let _notesSidebarOpen = localStorage.getItem('amux_notes_sidebar') !== 'closed';
@@ -46573,34 +46237,6 @@ function _notesPreviewBindTapToEdit(container) {
 }
 
 // Swipe-from-left-edge to open the notes sidebar on mobile (Bear/Apple Notes pattern)
-function _notesBindSwipeGestures() {
-  const view = document.getElementById('notes-view');
-  if (!view || view._swipeBound) return;
-  view._swipeBound = true;
-  let startX = 0, startY = 0, tracking = false;
-  view.addEventListener('touchstart', (e) => {
-    if (window.innerWidth > 600) return;
-    const t = e.touches[0];
-    // Only start tracking if touch begins near left edge OR sidebar is currently open (to close)
-    const sidebar = document.getElementById('notes-sidebar');
-    const sidebarOpen = sidebar && !sidebar.classList.contains('collapsed');
-    if (t.clientX < 24 || sidebarOpen) {
-      startX = t.clientX; startY = t.clientY; tracking = true;
-    }
-  }, { passive: true });
-  view.addEventListener('touchend', (e) => {
-    if (!tracking) return;
-    tracking = false;
-    const t = e.changedTouches[0];
-    const dx = t.clientX - startX;
-    const dy = Math.abs(t.clientY - startY);
-    if (dy > 50) return; // mostly vertical = scroll, ignore
-    const sidebar = document.getElementById('notes-sidebar');
-    const sidebarOpen = sidebar && !sidebar.classList.contains('collapsed');
-    if (dx > 60 && !sidebarOpen) _notesToggleSidebar();
-    else if (dx < -60 && sidebarOpen) _notesToggleSidebar();
-  }, { passive: true });
-}
 
 // ── Teleprompter ──
 let _tp = { running: false, y: 0, wpm: 150, size: 48, mirror: false, lastT: 0, raf: null, toolbarTimer: null };
@@ -46880,115 +46516,12 @@ function _notesPreviewSearchClear() {
   if (countEl) countEl.textContent = '';
 }
 
-function _notesToggleSidebar() {
-  _notesSidebarOpen = !_notesSidebarOpen;
-  localStorage.setItem('amux_notes_sidebar', _notesSidebarOpen ? 'open' : 'closed');
-  _notesApplySidebarState();
-}
 
-function _notesApplySidebarState() {
-  const view = document.getElementById('notes-view');
-  const sidebar = document.getElementById('notes-sidebar');
-  if (!view || !sidebar) return;
-  if (_notesSidebarOpen) {
-    sidebar.classList.remove('collapsed');
-    view.classList.remove('sidebar-collapsed');
-  } else {
-    sidebar.classList.add('collapsed');
-    view.classList.add('sidebar-collapsed');
-  }
-}
 
 let _notesEditorReady = false;
-function _notesInitQuill() {
-  if (_notesEditorReady) return;
-  const editor = _notesGetEditor();
-  if (!editor) return;
-  _notesEditorReady = true;
-  editor.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      const start = editor.selectionStart;
-      const end = editor.selectionEnd;
-      editor.value = editor.value.substring(0, start) + '  ' + editor.value.substring(end);
-      editor.selectionStart = editor.selectionEnd = start + 2;
-      _notesSaveDebounce();
-    }
-  });
-}
 
 let _notesSourceInfo = null;
-async function _notesLoadSource() {
-  try {
-    const r = await fetch(API + '/api/notes-source');
-    const s = await r.json();
-    _notesSourceInfo = s;
-    const nameEl = document.getElementById('notes-source-name');
-    const ind = document.getElementById('notes-source-indicator');
-    if (nameEl) nameEl.textContent = s.name || s.dir;
-    if (ind) {
-      ind.title = (s.exists ? 'Notes sync folder: ' : 'Folder NOT found: ') + s.dir + ' — click to open Settings';
-      ind.style.color = s.exists ? '' : 'var(--danger, #f85149)';
-    }
-    // Mirror into Settings → Notes section if present
-    const setEl = document.getElementById('settings-notes-dir');
-    if (setEl) setEl.textContent = s.dir;
-    const setStatus = document.getElementById('settings-notes-status');
-    if (setStatus) setStatus.textContent = s.exists ? (s.custom ? 'Custom folder (AMUX_NOTES_DIR)' : 'Default folder') : 'Folder not found';
-  } catch(e) {}
-}
 
-async function _notesLoad() {
-  // SWR: render from cache INSTANTLY (synchronous localStorage), then revalidate
-  const cachedRaw = localStorage.getItem('amux_notes_cache');
-  let cached = null;
-  if (cachedRaw) {
-    try { cached = JSON.parse(cachedRaw); } catch(e) {}
-  }
-  let openedFromCache = false;
-  if (cached && cached.length) {
-    _notesAllNotes = cached;
-    _notesRenderList(_notesAllNotes);
-    // Open last-viewed note immediately from cache (cache-first)
-    if (!_notesActive) {
-      const lastPath = localStorage.getItem('amux_last_note');
-      const lastNote = lastPath && _notesAllNotes.find(n => n.path === lastPath);
-      _notesOpen(lastNote ? lastNote.path : _notesAllNotes[0].path); // fire and forget
-      openedFromCache = true;
-    }
-  }
-  // Revalidate in background
-  let fresh;
-  try {
-    const r = await fetch(API + '/api/notes');
-    fresh = await r.json();
-    localStorage.setItem('amux_notes_cache', JSON.stringify(fresh));
-    _idb.set('amux_notes_cache', JSON.stringify(fresh));
-  } catch(e) {
-    // Offline and no cache — try IDB
-    if (!cached) {
-      const idbVal = await _idb.get('amux_notes_cache').catch(() => null);
-      if (idbVal) { localStorage.setItem('amux_notes_cache', idbVal); fresh = JSON.parse(idbVal); }
-    }
-    if (!fresh && !cached) { _notesShowEmpty(); return; }
-    if (!fresh) return; // already rendered from cache
-  }
-  // Preserve local titles — client may be ahead of server (unsaved debounce)
-  if (_notesAllNotes.length) {
-    const localTitles = new Map(_notesAllNotes.map(n => [n.path, n.name]));
-    for (const n of fresh) { if (localTitles.has(n.path)) n.name = localTitles.get(n.path); }
-  }
-  _notesAllNotes = fresh;
-  _notesRenderList(_notesAllNotes);
-  _notesTrashLoad();
-  if (!_notesActive && _notesAllNotes.length === 0) {
-    _notesShowEmpty();
-  } else if (!_notesActive && !openedFromCache && _notesAllNotes.length > 0) {
-    const lastPath = localStorage.getItem('amux_last_note');
-    const lastNote = lastPath && _notesAllNotes.find(n => n.path === lastPath);
-    await _notesOpen(lastNote ? lastNote.path : _notesAllNotes[0].path);
-  }
-}
 
 let _notesCurrentNotes = [];
 let _notesFolderCreating = false;
@@ -46996,12 +46529,6 @@ let _notesFolderCreating = false;
 function _notesFolderOpen(name) {
   try { return JSON.parse(localStorage.getItem('amux_notes_folders') || '{}')[name] !== false; }
   catch { return true; }
-}
-function _notesFolderToggle(name) {
-  const state = JSON.parse(localStorage.getItem('amux_notes_folders') || '{}');
-  state[name] = !_notesFolderOpen(name);
-  localStorage.setItem('amux_notes_folders', JSON.stringify(state));
-  _notesRenderList(_notesCurrentNotes);
 }
 function _notesFolderSetOpen(name, open) {
   const state = JSON.parse(localStorage.getItem('amux_notes_folders') || '{}');
@@ -47067,7 +46594,6 @@ function _notesQuickOpen() {
   const q = prompt('Open note:');
   if (!q) return;
   const match = _notesAllNotes.find(n => n.name.toLowerCase().includes(q.toLowerCase()) || n.path.toLowerCase().includes(q.toLowerCase()));
-  if (match) _notesOpen(match.path);
 }
 
 // ── Notes drag-and-drop ──
@@ -47130,39 +46656,6 @@ async function _notesDropOnRoot(e, el) {
   const filename = path.split('/').pop();
   await _notesMoveNote(path, filename);
 }
-async function _notesMoveNote(oldPath, newPath) {
-  if (oldPath === newPath) return;
-  // Resolve name collision
-  const existing = new Set(_notesAllNotes.map(n => n.path));
-  if (existing.has(newPath)) {
-    const base = newPath.replace(/\.md$/, '');
-    let i = 1;
-    while (existing.has(`${base}-${i}.md`)) i++;
-    newPath = `${base}-${i}.md`;
-  }
-  const urlOld = oldPath.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
-  const r = await apiCall(API + '/api/notes/' + urlOld, {
-    method: 'PATCH', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ move_to: newPath.replace(/\.md$/, '') })
-  });
-  if (!r || !r.ok) return;
-  // Update in-memory list
-  const entry = _notesAllNotes.find(n => n.path === oldPath);
-  if (entry) entry.path = newPath;
-  if (_notesActive?.path === oldPath) _notesActive.path = newPath;
-  localStorage.setItem('amux_last_note', newPath);
-  // Open the destination folder (and its ancestors) so the moved note shows
-  if (newPath.includes('/')) {
-    const parts = newPath.split('/');
-    let pre = '';
-    for (let i = 0; i < parts.length - 1; i++) {
-      pre = pre ? pre + '/' + parts[i] : parts[i];
-      _notesFolderSetOpen(pre, true);
-    }
-  }
-  _notesRenderList(_notesCurrentNotes.map(n => n.path === oldPath ? {...n, path: newPath} : n));
-  _notesAllNotes = _notesCurrentNotes; // keep in sync
-}
 function _notesItemHtml(n, depth) {
   const active = _notesActive && _notesActive.path === n.path ? ' active' : '';
   const pinned = n.pinned ? ' pinned' : '';
@@ -47181,32 +46674,6 @@ function _notesItemHtml(n, depth) {
       <div class="nli-date">${dt}</div>
     </div>
   </div>`;
-}
-function _notesRenderList(notes) {
-  _notesCurrentNotes = notes;
-  const el = document.getElementById('notes-list');
-  // Build a recursive tree so nested folders (e.g. Self/Therapy/Notes) render
-  // as a real hierarchy. Each node: { dirs: {name:node}, files: [note] }.
-  const root = { dirs: {}, files: [] };
-  for (const n of notes) {
-    const parts = n.path.split('/');
-    let node = root;
-    for (let i = 0; i < parts.length - 1; i++) {
-      node.dirs[parts[i]] = node.dirs[parts[i]] || { dirs: {}, files: [] };
-      node = node.dirs[parts[i]];
-    }
-    node.files.push(n);
-  }
-  let html = '';
-  if (_notesFolderCreating) {
-    html += `<div class="notes-folder-new-wrap"><input id="notes-folder-input" class="notes-folder-input" type="text" placeholder="Folder name…" onkeydown="_notesFolderInputKey(event)" onblur="setTimeout(_notesFolderCancel,150)" autocomplete="off"></div>`;
-  }
-  html += _notesRenderFolders(root.dirs, '', 0);
-  // Root drop zone (only visible while dragging a note that's inside a folder)
-  html += `<div class="notes-root-drop" id="notes-root-drop"
-    ondragover="_notesDragOverRoot(event,this)" ondragleave="_notesDragLeave(event,this)" ondrop="_notesDropOnRoot(event,this)"></div>`;
-  html += root.files.map(n => _notesItemHtml(n, 0)).join('');
-  el.innerHTML = html || (!_notesFolderCreating ? '<div class="notes-list-empty">No notes yet</div>' : '');
 }
 
 // Count all notes within a tree node (including nested folders)
@@ -47275,7 +46742,6 @@ function _notesRenderContent(data) {
   document.getElementById('notes-title').value = _notesActive.title;
   const listEntry = _notesAllNotes.find(n => n.path === data.path);
   if (listEntry) listEntry.name = _notesActive.title;
-  _notesInitQuill();
   const editor = _notesGetEditor();
   if (editor) {
     _notesLoadingContent = true;
@@ -47306,140 +46772,11 @@ function _notesUpdateSessionBadge(path) {
   }
 }
 
-async function _notesOpen(path) {
-  if (path === _notesActive?.path) return; // already open
-  // Fire pending save in background — don't block switching
-  if (_notesSaveTimer) {
-    clearTimeout(_notesSaveTimer);
-    _notesSaveTimer = null;
-    _notesSave(); // intentionally not awaited
-  }
-  // Cancel any in-flight open request (rapid sidebar clicks)
-  if (_notesOpenAbort) _notesOpenAbort.abort();
-  _notesOpenAbort = new AbortController();
-  const signal = _notesOpenAbort.signal;
-
-  // Optimistic: highlight clicked item instantly
-  document.querySelectorAll('#notes-list .notes-list-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.path === path);
-  });
-  document.getElementById('notes-save-status').textContent = '';
-
-  const noteCacheKey = 'amux_note_' + path;
-
-  // CACHE-FIRST: try to render from IDB synchronously-ish before network
-  // This gives Obsidian-like instant switching even on flaky connections
-  let rendered = false;
-  try {
-    const cached = await _idb.get(noteCacheKey);
-    if (cached && !signal.aborted) {
-      const data = JSON.parse(cached);
-      _notesRenderContent(data);
-      rendered = true;
-      // On mobile, collapse sidebar immediately after cache render
-      if (window.innerWidth <= 600 && _notesSidebarOpen) {
-        _notesSidebarOpen = false;
-        _notesApplySidebarState();
-      }
-    }
-  } catch(e) {}
-
-  // Revalidate from network (SWR)
-  let data;
-  try {
-    const r = await fetch(API + '/api/notes/' + path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/'), { signal });
-    if (!r.ok) throw new Error('not ok');
-    data = await r.json();
-    _idb.set(noteCacheKey, JSON.stringify(data));
-  } catch(e) {
-    if (e.name === 'AbortError') return;
-    if (!rendered) { return; } // already logged; nothing to render
-    return; // cache already displayed, silently fail revalidation
-  }
-
-  if (rendered) {
-    const editor = _notesGetEditor();
-    const serverContent = data.content || '';
-    if (editor && editor.value === serverContent) {
-      _notesActive.path = data.path;
-      return;
-    }
-    if (editor && document.activeElement === editor) return;
-  }
-
-  _notesRenderContent(data);
-  if (!rendered && window.innerWidth <= 600 && _notesSidebarOpen) {
-    _notesSidebarOpen = false;
-    _notesApplySidebarState();
-  }
-}
 
 // Reload the currently-open note's content from disk (e.g. after an external
 // edit in Obsidian). Unlike _notesOpen, this refreshes the SAME open note.
 // Guarded so it never clobbers unsaved local edits or in-progress typing.
-async function _notesReloadActive() {
-  if (!_notesActive) return;
-  if (_notesSaveTimer) return;                                  // pending local save
-  const editor = _notesGetEditor();
-  if (editor && document.activeElement === editor) return;      // user is typing in body
-  const titleInp = document.getElementById('notes-title');
-  if (titleInp && document.activeElement === titleInp) return;  // editing the title
-  const path = _notesActive.path;
-  let data;
-  try {
-    const r = await fetch(API + '/api/notes/' + path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/'));
-    if (!r.ok) return;
-    data = await r.json();
-  } catch(e) { return; }
-  if (!_notesActive || _notesActive.path !== path) return;      // switched away mid-fetch
-  const serverContent = data.content || '';
-  if (editor && editor.value === serverContent) return;         // unchanged — nothing to do
-  _idb.set('amux_note_' + path, JSON.stringify(data));
-  _notesRawContent = serverContent;
-  if (editor) {
-    _notesLoadingContent = true;
-    editor.value = serverContent;
-    setTimeout(() => { _notesLoadingContent = false; }, 0);
-  }
-  const h1md = serverContent.match(/^#\s+(.+)$/m);
-  if (h1md) {
-    _notesActive.title = h1md[1];
-    if (titleInp) titleInp.value = _notesActive.title;
-    const listEntry = _notesAllNotes.find(n => n.path === path);
-    if (listEntry) { listEntry.name = _notesActive.title; _notesRenderList(_notesAllNotes); }
-  }
-  if (_notesMode === 'preview') _notesSwitchMode('preview');    // re-render preview from new content
-  const st = document.getElementById('notes-save-status');
-  if (st) { st.textContent = 'Updated from disk'; setTimeout(() => { if (st.textContent === 'Updated from disk') st.textContent = ''; }, 2500); }
-}
 
-async function _notesNew(folder) {
-  // Flush pending save in background before creating (captures path+content synchronously)
-  if (_notesSaveTimer) { clearTimeout(_notesSaveTimer); _notesSaveTimer = null; _notesSave(); }
-  const prefix = folder ? folder + '/' : '';
-  // Pick unique "untitled" / "untitled-1" / ... filename
-  const existing = new Set(_notesAllNotes.map(n => n.path));
-  let filename = prefix + 'untitled.md';
-  let displayName = 'Untitled';
-  if (existing.has(filename)) {
-    let i = 1;
-    while (existing.has(`${prefix}untitled-${i}.md`)) i++;
-    filename = `${prefix}untitled-${i}.md`;
-    displayName = `Untitled ${i}`;
-  }
-  const urlPath = filename.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/');
-  await apiCall(API + '/api/notes/' + urlPath, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ content: '# ' + displayName + '\n' })
-  });
-  // Insert at top of list without re-fetching
-  _notesAllNotes.unshift({ path: filename, name: displayName, updated: Math.floor(Date.now() / 1000), pinned: false, size: 0 });
-  _notesRenderList(_notesAllNotes);
-  await _notesOpen(filename);
-  const titleEl = document.getElementById('notes-title');
-  titleEl.focus();
-  titleEl.select();
-}
 
 function _notesTitleChange() {
   const editor = _notesGetEditor();
@@ -47468,81 +46805,8 @@ function _notesSaveDebounce() {
   _notesSaveTimer = setTimeout(_notesSave, 400);
 }
 
-async function _notesSave() {
-  const editor = _notesGetEditor();
-  if (!_notesActive || !editor) return;
-  const content = editor.value;
-  _notesRawContent = content;
-  const pathKey = _notesActive.path.replace(/\.md$/, '');
-  const statusEl = document.getElementById('notes-save-status');
-  const activePath = _notesActive.path;
-  // OPTIMISTIC: write to IDB FIRST so local state is always durable
-  // (survives reload even if network/queue hasn't drained yet)
-  _idb.set('amux_note_' + activePath, JSON.stringify({ path: activePath, content }));
-  const result = await apiCall(API + '/api/notes/' + pathKey.split('/').map(encodeURIComponent).join('/'), {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ content })
-  });
-  if (!result) {
-    statusEl.textContent = '◐ Offline';
-    statusEl.title = 'Saved locally, will sync when online';
-    return;
-  }
-  statusEl.textContent = '✓';
-  statusEl.title = 'Saved';
-  setTimeout(() => { statusEl.textContent = ''; statusEl.title = ''; }, 1500);
-  // Update in-memory list and patch the DOM item in place (no full re-render)
-  const saved = _notesAllNotes.find(n => n.path === _notesActive.path);
-  if (saved) {
-    saved.updated = Math.floor(Date.now() / 1000);
-    saved.name = _notesActive.title || saved.name;
-    const dt = new Date(saved.updated * 1000).toLocaleDateString();
-    const item = document.querySelector(`#notes-list [data-path="${CSS.escape(saved.path)}"]`);
-    if (item) {
-      const dateEl = item.querySelector('.nli-date');
-      if (dateEl) dateEl.textContent = dt;
-      const titleEl = item.querySelector('.nli-title');
-      if (titleEl) titleEl.textContent = saved.name;
-    }
-  }
-}
 
 const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
-async function _notesDelete() {
-  if (!_notesActive) return;
-  const btn = document.querySelector('.notes-delete-btn');
-  if (btn && !btn.classList.contains('confirming')) {
-    btn.classList.add('confirming');
-    btn.textContent = 'Delete?';
-    const reset = () => {
-      btn.classList.remove('confirming');
-      btn.innerHTML = _TRASH_SVG;
-    };
-    const tid = setTimeout(reset, 3000);
-    btn._resetTimer = tid;
-    return;
-  }
-  if (btn) {
-    clearTimeout(btn._resetTimer);
-    btn.classList.remove('confirming');
-    btn.innerHTML = _TRASH_SVG;
-  }
-  const pathKey = _notesActive.path.replace(/\.md$/, '');
-  if (localStorage.getItem('amux_last_note') === _notesActive.path) localStorage.removeItem('amux_last_note');
-  _idb.del('amux_note_' + _notesActive.path);
-  _notesAllNotes = _notesAllNotes.filter(n => n.path !== _notesActive.path);
-  localStorage.setItem('amux_notes_cache', JSON.stringify(_notesAllNotes));
-  document.querySelector(`#notes-list .notes-list-item[data-path="${_notesActive.path}"]`)?.remove();
-  _notesActive = null;
-  await apiCall(API + '/api/notes/' + pathKey.split('/').map(encodeURIComponent).join('/'), { method: 'DELETE' });
-  _notesTrashLoad();
-  if (_notesAllNotes.length > 0) {
-    await _notesOpen(_notesAllNotes[0].path);
-  } else {
-    _notesShowEmpty();
-    await _notesLoad();
-  }
-}
 
 function _notesShowEmpty() {
   document.getElementById('notes-empty-state').style.display = 'flex';
@@ -47556,7 +46820,6 @@ function _notesShowEmpty() {
   // On mobile, show sidebar when no note is open
   if (window.innerWidth <= 600 && !_notesSidebarOpen) {
     _notesSidebarOpen = true;
-    _notesApplySidebarState();
   }
 }
 
@@ -47572,63 +46835,9 @@ async function _notesTogglePinActive() {
   if (!_notesActive) return;
   await _notesTogglePin(_notesActive.path);
 }
-async function _notesTogglePin(path) {
-  const r = await apiCall(API + '/api/notes/' + path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/') + '/pin', { method: 'POST' });
-  if (!r) return;
-  const d = await r.json();
-  const entry = _notesAllNotes.find(n => n.path === path);
-  if (entry) entry.pinned = d.pinned;
-  // Re-sort: pinned first, then by updated desc
-  _notesAllNotes.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.updated - a.updated);
-  _notesRenderList(_notesAllNotes);
-  _notesUpdatePinBtn();
-  _pinnedNotesRefresh();
-}
 
 // ── Pinned notes on home screen ──────────────────────────────────────────────
 let _pinnedNotesCache = [];
-async function _pinnedNotesRefresh() {
-  const container = document.getElementById('pinned-notes-home');
-  if (!container) return;
-  try {
-    const r = await fetch(API + '/api/notes');
-    const all = await r.json();
-    const pinned = all.filter(n => n.pinned);
-    if (!pinned.length) { container.innerHTML = ''; _pinnedNotesCache = []; return; }
-    const contents = await Promise.all(pinned.map(async n => {
-      try {
-        const cr = await fetch(API + '/api/notes/' + n.path.replace(/\.md$/, '').split('/').map(encodeURIComponent).join('/'));
-        const d = await cr.json();
-        return { ...n, content: d.content || '' };
-      } catch { return { ...n, content: '' }; }
-    }));
-    _pinnedNotesCache = contents;
-    _pinnedNotesRender();
-  } catch(e) { console.error('pinned notes:', e); }
-}
-function _pinnedNotesRender() {
-  const container = document.getElementById('pinned-notes-home');
-  if (!container) return;
-  if (!_pinnedNotesCache.length) { container.innerHTML = ''; return; }
-  container.innerHTML = _pinnedNotesCache.map(n => {
-    const isHtml = /<[a-z][\s\S]*>/i.test(n.content);
-    const body = isHtml ? _sanitizeHtml(n.content) : renderMarkdown(n.content);
-    return `<div class="pinned-note-card" onclick="_pinnedNoteOpen('${esc(n.path)}')" data-path="${esc(n.path)}">
-      <div class="pinned-note-header">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
-        <span class="pinned-note-title">${esc(n.name)}</span>
-        <button class="pinned-note-unpin" onclick="event.stopPropagation();_pinnedNoteUnpin('${esc(n.path)}')" title="Unpin from home">
-          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-      </div>
-      <div class="pinned-note-body md-content">${body}</div>
-    </div>`;
-  }).join('');
-}
-function _pinnedNoteOpen(path) {
-  switchView('notes');
-  setTimeout(() => _notesOpen(path), 100);
-}
 async function _pinnedNoteUnpin(path) {
   await _notesTogglePin(path);
 }
@@ -49834,7 +49043,6 @@ async function _jrnlSaveConfig() {
   document.getElementById('jrnl-config-overlay')?.remove();
   _jrnlRenderEditor();
 }
-window.addEventListener('load', _pinnedNotesRefresh);
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
@@ -49956,7 +49164,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.251';
+const CACHE = 'amux-v0.9.255';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -50591,7 +49799,6 @@ class CCHandler(BaseHTTPRequestHandler):
         heartbeat_counter = 0
         log_cursor = len(_event_log)  # start from current position
         alert_cursor = len(_sse_alerts)  # start from current position
-        last_notes_version = _notes_version
         last_crm_version   = _crm_version
         last_journal_version = _journal_version
 
@@ -50673,11 +49880,8 @@ class CCHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {json.dumps({'type': 'alerts', 'payload': new_alerts})}\n\n".encode())
                     self.wfile.flush()
 
-                # Invalidation signals for notes and CRM — lightweight, no payload
+                # Invalidation signals for CRM/journal — lightweight, no payload
                 invalidated = []
-                if _notes_version != last_notes_version:
-                    last_notes_version = _notes_version
-                    invalidated.append("notes")
                 if _crm_version != last_crm_version:
                     last_crm_version = _crm_version
                     invalidated.append("crm")
@@ -51261,25 +50465,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     pass
                 return self._json(items)
 
-            if method == "GET" and action == "notes" and "notes" in perms:
-                if not CC_NOTES.is_dir():
-                    return self._json([])
-                notes = []
-                for f in sorted(CC_NOTES.glob("**/*.md")):
-                    rel = str(f.relative_to(CC_NOTES))
-                    notes.append({"path": rel, "size": f.stat().st_size})
-                return self._json(notes)
-
-            if method == "GET" and action.startswith("note/") and "notes" in perms:
-                note_rel = action[len("note/"):]
-                if not note_rel.endswith(".md"):
-                    note_rel += ".md"
-                note_path = _safe_note_path(note_rel)
-                if not note_path:
-                    return self._json({"error": "invalid path"}, 400)
-                if note_path.exists():
-                    return self._json({"content": note_path.read_text(errors="replace"), "path": note_rel})
-                return self._json({"error": "not found"}, 404)
+            return self._json({"error": "not found"}, 404)
 
             return self._json({"error": "not found"}, 404)
 
@@ -59453,47 +58639,6 @@ def _watch_server_env():
             slog(f"[env-reload] error: {e}")
 
 
-def _watch_notes_dir():
-    """Poll CC_NOTES for filesystem changes (Obsidian edits, new files, deletions).
-
-    Bumps _notes_version so SSE pushes an invalidation to all clients.
-    """
-    global _notes_version
-    prev_snapshot: dict[str, float] = {}
-    while True:
-        time.sleep(4)
-        try:
-            if not CC_NOTES.is_dir():
-                continue
-            snapshot = {}
-            for f in CC_NOTES.rglob("*.md"):
-                if ".trash" in f.parts:
-                    continue
-                try:
-                    snapshot[str(f)] = f.stat().st_mtime
-                except OSError:
-                    pass
-            if prev_snapshot and snapshot != prev_snapshot:
-                _notes_version += 1
-            prev_snapshot = snapshot
-        except Exception:
-            pass
-
-
-# Obvious placeholder/template values that are not real API keys. Lets us avoid
-# treating a templated env file (e.g. ANTHROPIC_API_KEY=changeme) as configured,
-# which would otherwise suppress the onboarding prompt.
-_PLACEHOLDER_API_KEYS = frozenset({
-    "changeme", "change-me", "change_me",
-    "your-api-key", "your_api_key", "your-key", "yourkey",
-    "your_key_here", "your-key-here", "your-api-key-here",
-    "placeholder", "dummy", "example", "sample",
-    "test", "test-key", "testkey",
-    "replace-me", "replace_me",
-    "xxx", "xxxx",
-    "sk-ant-xxx", "sk-ant-your-key", "sk-ant-example", "sk-ant-placeholder",
-})
-
 
 def _is_placeholder_api_key(val: str) -> bool:
     """Return True if ``val`` is an obvious placeholder/template, not a real key."""
@@ -60260,7 +59405,6 @@ def main():
     # Watch server.env for key changes (catches gateway pushes, manual edits)
     threading.Thread(target=_watch_server_env, daemon=True).start()
     # Watch notes directory for external edits (Obsidian, other editors)
-    threading.Thread(target=_watch_notes_dir, daemon=True).start()
     # Install the commit-stamping hook into all existing session repos
     threading.Thread(target=_install_hooks_all_sessions, daemon=True).start()
 
