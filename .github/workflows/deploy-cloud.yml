@@ -37,6 +37,7 @@ jobs:
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 '
             grep -q "^ADMIN_EMAILS=" /etc/amux/gateway.env || echo "ADMIN_EMAILS=ethan@mixpeek.com,esteininger21@gmail.com" >> /etc/amux/gateway.env
             grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "hello@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=hello@amux.io,/" /etc/amux/gateway.env
+            grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "qa-godmode@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=qa-godmode@amux.io,/" /etc/amux/gateway.env
             echo "admin emails now: $(grep ^ADMIN_EMAILS= /etc/amux/gateway.env)"'
 
       - name: Sync gateway secrets from repo secrets (host-only, never in a container)
