@@ -34,6 +34,15 @@ RUN npm install playwright \
     && npx playwright install --with-deps chromium \
     && node -e "require('playwright'); console.log('playwright resolves from /app')"
 
+# The Browser tab drives browser-use (python console script at
+# /usr/local/bin/browser-use), with playwright underneath — the node package
+# alone is not enough. Verify both entrypoints exist at build time so this
+# capability cannot ship broken the way the claude CLI did.
+RUN pip install --no-cache-dir browser-use playwright \
+    && python -m playwright install chromium \
+    && test -x /usr/local/bin/browser-use \
+    && echo "browser-use verified at build time"
+
 COPY amux-server.py .
 
 ENV AMUX_PORT=8822
