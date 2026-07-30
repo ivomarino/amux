@@ -1,0 +1,93 @@
+name: Cloud browser verify (headless profile save + reuse)
+
+# Ground-truth proof that browser automation works in a cloud container with NO
+# display: a profile can be created, written into, and READ BACK by a later,
+# separate browser session. Reuse is the part that matters — a profile that
+# saves but doesn't reload is indistinguishable from no profile at all.
+#
+# Deliberately runs inside the container over docker exec rather than through
+# the gateway, so nothing about the result depends on auth, cookies, or proxy
+# behaviour. Everything here is read-only except the throwaway probe profile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      org:
+        description: 'org id (container amux-user-<org>)'
+        required: true
+      profile:
+        description: 'throwaway probe profile name'
+        required: false
+        default: 'pvprobe'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H 34.121.177.76 >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Verify headless profile create / save / reuse
+        env:
+          ORG: ${{ inputs.org }}
+          PROF: ${{ inputs.profile }}
+          TOKEN: run-${{ github.run_id }}
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
+            "ORG='$ORG' PROF='$PROF' TOKEN='$TOKEN' bash -s" <<'ENDSSH'
+            C="amux-user-${ORG}"
+            P="/root/.amux/playwright-auth/profiles"
+            ex() { docker exec "$C" sh -lc "$1" 2>&1; }
+            api() { docker exec "$C" sh -lc "curl -s -X POST localhost:8822/api/browser/$1 -H 'Content-Type: application/json' -d '$2'" 2>&1; }
+
+            echo "=== 0. can node resolve playwright from the app dir? ==="
+            ex 'ls -d /app/node_modules/playwright 2>&1 | head -1'
+            ex 'cd /app && node -e "console.log(require.resolve(\"playwright\"))"'
+            echo "  DISPLAY=[$(ex 'echo -n "$DISPLAY"')]  (empty => headless path)"
+
+            echo
+            echo "=== 1. create profile via the UI's own endpoint ==="
+            ex "rm -rf $P/$PROF $P/$PROF.log"
+            api "profile/create" "{\"name\":\"$PROF\",\"url\":\"https://example.com\"}"
+            echo "  waiting for the detached launcher..."
+            sleep 30
+            echo "  --- launcher log (THE decisive output) ---"
+            ex "cat $P/$PROF.log 2>&1" | sed 's/^/    /'
+            echo "  --- profile dir contents ---"
+            ex "ls -la $P/$PROF/ 2>&1 | head -15" | sed 's/^/    /'
+            echo "  --- storage-state.json (written only on the headless path) ---"
+            ex "ls -l $P/$PROF/storage-state.json 2>&1" | sed 's/^/    /'
+
+            echo
+            echo "=== 2. WRITE through a browser session on that profile ==="
+            api "start" "{\"url\":\"http://localhost:8822/\",\"session\":\"probe1\",\"profile\":\"$PROF\"}" | head -c 400
+            echo
+            api "action" "{\"action\":\"eval\",\"script\":\"localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')\",\"session\":\"probe1\"}" | head -c 400
+            echo
+            echo "  closing session (graceful close is what flushes storage to disk)"
+            api "stop" "{\"session\":\"probe1\"}" | head -c 200
+            echo
+            sleep 5
+
+            echo
+            echo "=== 3. READ BACK from a SEPARATE session on the same profile ==="
+            api "start" "{\"url\":\"http://localhost:8822/\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}" | head -c 400
+            echo
+            OUT=$(api "action" "{\"action\":\"eval\",\"script\":\"localStorage.getItem('amux_probe')\",\"session\":\"probe2\"}")
+            echo "  read-back: $(echo "$OUT" | head -c 400)"
+            api "stop" "{\"session\":\"probe2\"}" >/dev/null 2>&1
+
+            echo
+            echo "=== VERDICT ==="
+            if echo "$OUT" | grep -q "$TOKEN"; then
+              echo "  PASS — profile persisted across separate browser sessions (token $TOKEN survived)"
+            else
+              echo "  FAIL — token $TOKEN did not survive; profile is not being reused"
+              exit 1
+            fi
+          ENDSSH

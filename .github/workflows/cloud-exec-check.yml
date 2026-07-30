@@ -47,7 +47,10 @@ jobs:
             echo "=== browser profiles (ground truth) ==="
             docker exec "$C" sh -lc 'ls -la /root/.amux/playwright-auth/profiles/ 2>&1 | head -20' | sed 's/^/  /'
             echo "  --- launcher logs ---"
-            docker exec "$C" sh -lc 'for f in /root/.amux/playwright-auth/profiles/*.log; do echo "== $f"; tail -12 "$f"; done 2>&1 | head -40' | sed 's/^/  /'
+            # NOT truncated: a global `head` here once cut the dump off before
+            # the one log that mattered, and a matching byte count on two files
+            # got read as "same failure" when neither had actually been shown.
+            docker exec "$C" sh -lc 'for f in /root/.amux/playwright-auth/profiles/*.log; do echo "== $f"; tail -25 "$f"; done 2>&1' | sed 's/^/  /'
             echo "  --- chrome present? ---"
             docker exec "$C" sh -lc 'ls /root/.cache/ms-playwright/ 2>&1; which google-chrome google-chrome-stable 2>&1' | sed 's/^/  /'
             echo
