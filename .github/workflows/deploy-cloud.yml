@@ -61,6 +61,7 @@ jobs:
           sync_secret STRIPE_SECRET_KEY "${{ secrets.STRIPE_SECRET_KEY }}"
           sync_secret ANTHROPIC_API_KEY "${{ secrets.ANTHROPIC_API_KEY }}"
           sync_secret STRIPE_PLATFORM_FEE_PRICE_ID "${{ secrets.STRIPE_PLATFORM_FEE_PRICE_ID }}"
+          sync_secret STRIPE_PLATFORM_PRICE_ID "${{ secrets.STRIPE_PLATFORM_PRICE_ID }}"
 
       - name: Deploy gateway.py
         run: |
