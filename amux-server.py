@@ -22681,7 +22681,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Type a message or drop a file..."
             autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true"
             enterkeyhint="enter" style="width:100%;"
-            oninput="autoGrow(this);slashAcUpdate();cmdHistoryReset()" onkeydown="slashAcKeydown(event)"
+            oninput="autoGrow(this);slashAcUpdate();cmdHistoryReset();_draftSaveDebounced(peekSession,this.value)" onkeydown="slashAcKeydown(event)"
             onbeforeinput="slashAcBeforeInput(event)"
             onpaste="handlePeekPaste(event)"></textarea>
           <button type="button" class="peek-input-expand" id="peek-input-expand" title="Expand to full screen" onclick="_expandPeekInput()">&#x26F6;</button>
@@ -25373,6 +25373,16 @@ function stripProviderYoloFlags(flags) {
 // re-focusing it makes iOS Safari yank the scroll back to it on every poll
 // (the "search results scroll back" bug). Skipping the no-op focus avoids that.
 function _restoreCardFocus(focusedId, savedInputs) {
+  // Rehydrate persisted composer drafts on every render path. Done HERE rather
+  // than at each of render()'s exits because it has six of them, and the one
+  // that gets missed is the one that eats your text. _draftRestore is a no-op
+  // for a composer that already has content or is focused, so a re-render
+  // mid-type never rewinds you.
+  try {
+    document.querySelectorAll('#cards textarea.send-input').forEach(inp => {
+      if ((inp.id || '').startsWith('input-')) _draftRestore(inp, inp.id.slice(6));
+    });
+  } catch (e) {}
   if (!focusedId) return;
   const inp = document.getElementById(focusedId);
   if (!inp || document.activeElement === inp) return;
@@ -25568,7 +25578,7 @@ function render() {
           <textarea class="send-input" id="input-${s.name}" rows="1"
             placeholder="Send to ${esc(s.name)}..." autocomplete="off" autocorrect="on"
             autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"
-            oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset()"
+            oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
             onkeydown="cardSlashAcKeydown('${s.name}',event)"
             onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
           <button class="btn primary" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">Send</button>
@@ -27180,6 +27190,63 @@ async function gitPush(name, e) {
     showToast(`Deploy error: ${e.message}`);
   }
 }
+// ── Composer drafts ────────────────────────────────────────────────────────
+// Unsent text used to die on any reload, and the client force-reloads itself
+// whenever the server's APP_VER moves — so every deploy silently ate whatever
+// you were half-way through typing. Drafts are per-session and local, so they
+// survive a server restart, a client restart, and the version-change reload.
+// localStorage (not IDB): a draft is a few hundred bytes, and the synchronous
+// write is what makes the pagehide flush below reliable.
+const _DRAFT_PREFIX = 'amux_draft_';
+const _DRAFT_MAX_AGE = 14 * 86400 * 1000;
+let _draftTimers = {};
+function _draftKey(session) { return _DRAFT_PREFIX + (session || '__peek__'); }
+function _draftSave(session, text) {
+  try {
+    const k = _draftKey(session);
+    if (!text || !text.trim()) localStorage.removeItem(k);
+    else localStorage.setItem(k, JSON.stringify({ t: text, ts: Date.now() }));
+  } catch (e) {}   // quota/private-mode: a lost draft must never break sending
+}
+function _draftSaveDebounced(session, text) {
+  clearTimeout(_draftTimers[session || '_']);
+  _draftTimers[session || '_'] = setTimeout(() => _draftSave(session, text), 250);
+}
+function _draftGet(session) {
+  try {
+    const raw = localStorage.getItem(_draftKey(session));
+    if (!raw) return '';
+    const d = JSON.parse(raw);
+    // Age out rather than restoring something you typed two weeks ago into a
+    // conversation that has long since moved on.
+    if (!d || !d.t || (Date.now() - (d.ts || 0)) > _DRAFT_MAX_AGE) {
+      localStorage.removeItem(_draftKey(session)); return '';
+    }
+    return d.t;
+  } catch (e) { return ''; }
+}
+function _draftClear(session) {
+  clearTimeout(_draftTimers[session || '_']);
+  try { localStorage.removeItem(_draftKey(session)); } catch (e) {}
+}
+// Restore into a composer that has just been (re)rendered. Never clobbers text
+// the user is actively typing — a re-render mid-type must not rewind them.
+function _draftRestore(inp, session) {
+  if (!inp || inp.value || document.activeElement === inp) return;
+  const d = _draftGet(session);
+  if (d) { inp.value = d; try { autoGrow(inp); } catch (e) {} }
+}
+// The 250ms debounce can lose the final keystrokes to a reload or a tab kill.
+// pagehide fires on both, including iOS bfcache suspends, so flush synchronously.
+['pagehide', 'visibilitychange'].forEach(ev => window.addEventListener(ev, () => {
+  if (ev === 'visibilitychange' && document.visibilityState !== 'hidden') return;
+  document.querySelectorAll('textarea.send-input').forEach(inp => {
+    const id = inp.id || '';
+    if (id === 'peek-cmd-input') _draftSave(typeof peekSession !== 'undefined' ? peekSession : '', inp.value);
+    else if (id.startsWith('input-')) _draftSave(id.slice(6), inp.value);
+  });
+}));
+
 async function sendFromInput(name) {
   const inp = document.getElementById('input-' + name);
   if (!inp) return;
@@ -27201,6 +27268,7 @@ async function sendFromInput(name) {
   }
   cmdHistoryAdd(text);
   inp.value = '';
+  _draftClear(name);          // it left the composer — a restored copy would be a ghost
   inp.style.height = 'auto';
   await doSend(name, _expandAtMentions(text));
   inp.style.borderColor = 'var(--green)';
@@ -28622,7 +28690,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.237';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.238';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -28848,7 +28916,10 @@ function openPeek(name, opts) {
     searchInp.value = prefillQuery;
     document.getElementById('peek-search-wrap').classList.toggle('has-value', !!prefillQuery);
   }
-  const draft = _peekDrafts[name] || '';
+  // _peekDrafts survives peek close/open but dies with the page. Fall back to
+  // the persisted copy so a reload (including the version-change auto-reload)
+  // does not eat what you were typing.
+  const draft = _peekDrafts[name] || _draftGet(name) || '';
   const cmdInp = document.getElementById('peek-cmd-input');
   cmdInp.value = draft;
   autoGrow(cmdInp);
@@ -29009,6 +29080,7 @@ function closePeek() {
     const val = inp ? inp.value : '';
     if (val.trim()) _peekDrafts[peekSession] = val;
     else delete _peekDrafts[peekSession];
+    _draftSave(peekSession, val);   // mirror to storage so it outlives the page
   }
   peekSession = null;
   peekSearchQuery = '';
@@ -29044,6 +29116,13 @@ let _peekSplitPath = null;
 function _savePeekState() {
   if (peekSession) {
     const state = { session: peekSession };
+    // The restore path has always read _ps.draft, but nothing ever WROTE it —
+    // so the "rescued from pre-update reload" branch was dead code and every
+    // version-change reload dropped the composer text on the floor.
+    try {
+      const _ci = document.getElementById('peek-cmd-input');
+      if (_ci && _ci.value.trim()) state.draft = _ci.value;
+    } catch (e) {}
     const wrap = document.getElementById('peek-split-wrap');
     if (wrap && wrap.classList.contains('split-active')) {
       state.split = true;
@@ -30601,6 +30680,7 @@ async function sendPeekCmd() {
     inp.value = '';
     inp.style.height = 'auto';
     delete _peekDrafts[peekSession];
+    _draftClear(peekSession);
     await steerSession(peekSession, text);
     return;
   }
@@ -30624,6 +30704,7 @@ async function sendPeekCmd() {
     inp.value = '';
     inp.style.height = 'auto';
     delete _peekDrafts[peekSession];
+    _draftClear(peekSession);
     clearPeekFiles();
     channelOpen(peekSession, routed.target, routed.message);
     return;
@@ -30632,6 +30713,7 @@ async function sendPeekCmd() {
   inp.value = '';
   inp.style.height = 'auto';
   delete _peekDrafts[peekSession];
+  _draftClear(peekSession);
   clearPeekFiles();
 
   // @mentions in the middle of a message stay as text + API hints (Claude can reach them).
@@ -49301,7 +49383,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.237';
+const CACHE = 'amux-v0.9.238';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
