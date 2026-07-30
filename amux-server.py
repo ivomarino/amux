@@ -13338,6 +13338,33 @@ def _install_hooks_all_sessions() -> None:
         pass
 
 
+def _mcp_registry_path():
+    """Path to the MCP registry every session launches against, seeding it on
+    first use from the repo's shipped mcp.json.
+
+    Before this, `--mcp-config` was only passed when CC_MCP=="chrome", and no
+    session had CC_MCP set at all — so the repo's six-server mcp.json was
+    loaded by exactly nothing. MCP is the extension point that lets amux get
+    more capable as models get better at tool use, which it cannot do if no
+    agent is ever handed a server. Returns None if there is nothing to pass, so
+    a missing/corrupt registry degrades to today's behaviour instead of
+    breaking session start."""
+    try:
+        if not CC_MCP_REGISTRY.exists():
+            seed = Path(__file__).parent / "mcp.json"
+            if not seed.exists():
+                return None
+            CC_MCP_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+            CC_MCP_REGISTRY.write_text(seed.read_text())
+            slog(f"[mcp] seeded registry at {CC_MCP_REGISTRY} from {seed}")
+        # Never hand the agent a file that will make its launch fail.
+        srv = json.loads(CC_MCP_REGISTRY.read_text()).get("mcpServers") or {}
+        return CC_MCP_REGISTRY if srv else None
+    except Exception as e:
+        slog(f"[mcp] registry unusable ({e}) — launching without --mcp-config")
+        return None
+
+
 def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False) -> tuple[bool, str]:
     """Start a session headless (no attach). Returns (success, message)."""
     if not _VALID_SESSION_NAME_RE.match(name):
@@ -13557,9 +13584,18 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 cmd += f" {session_flag}"
             if extra_flags:
                 cmd += f" {_shell_quote_flags(extra_flags)}"
-            # Inject --mcp-config based on CC_MCP setting (chrome or empty)
+            # Every session gets the shared MCP registry unless it opts OUT with
+            # CC_MCP=off. Opt-out rather than opt-in: an extension point nobody
+            # is enrolled in is the state we just came from, where six
+            # configured servers reached zero of 101 sessions.
             mcp_val = cfg.get("CC_MCP", "").strip().lower()
             mcp_dir = CC_HOME  # ~/.amux
+            if mcp_val not in ("off", "none", "0"):
+                _reg = _mcp_registry_path()
+                if _reg:
+                    cmd += f" --mcp-config {shlex.quote(str(_reg))}"
+            # Legacy: CC_MCP=chrome pre-dates the registry. Still honoured, but
+            # only when the file exists AND is not already the registry itself.
             if mcp_val == "chrome":
                 mcp_chrome = mcp_dir / "mcp-chrome.json"
                 if mcp_chrome.exists():
@@ -13593,6 +13629,13 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 if rc.exists():
                     shell_rc += f"source {rc} 2>/dev/null; cd {shlex.quote(work_dir)}; "
                     break
+            # Global agent credentials, sourced AFTER the shell profile so amux's
+            # values win. This is what makes ${VAR} in the MCP registry resolve
+            # identically in every lane — otherwise each session depends on
+            # whatever its own shell happened to export, which is how one lane
+            # gets a working server and the next silently gets an unauthed one.
+            if CC_AMUX_ENV.exists():
+                shell_rc += f"set -a; source {shlex.quote(str(CC_AMUX_ENV))} 2>/dev/null; set +a; "
             else:
                 shell_rc += f"cd {shlex.quote(work_dir)}; "
             if provider not in ("codex", "gemini") and _has_oauth:
@@ -28700,7 +28743,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.238';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.239';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49393,7 +49436,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.238';
+const CACHE = 'amux-v0.9.239';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
