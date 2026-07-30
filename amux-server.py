@@ -27490,6 +27490,25 @@ function _draftGet(session) {
 function _draftClear(session) {
   clearTimeout(_draftTimers[session || '_']);
   try { localStorage.removeItem(_draftKey(session)); } catch (e) {}
+  // A draft lives in THREE places, and clearing one is how a sent message came
+  // back: _savePeekState() keeps its own copy under peekState/amux_peek_state
+  // so the composer survives the version-change reload. Clearing only
+  // amux_draft_* left those copies behind, the restore path reinjected one on
+  // the next load, and the message got sent a SECOND time to a real session.
+  // Whatever writes a draft has to be matched here, or the resend comes back.
+  try {
+    [[sessionStorage, 'peekState'], [localStorage, 'amux_peek_state']].forEach(([store, key]) => {
+      const raw = store.getItem(key);
+      if (!raw) return;
+      const st = JSON.parse(raw);
+      // Only drop the draft for the session being cleared — clearing another
+      // lane's unsent text would be the same bug pointed the other way.
+      if (st && st.draft && (!session || st.session === session)) {
+        delete st.draft;
+        store.setItem(key, JSON.stringify(st));
+      }
+    });
+  } catch (e) {}
 }
 // Restore into a composer that has just been (re)rendered. Never clobbers text
 // the user is actively typing — a re-render mid-type must not rewind them.
@@ -28952,7 +28971,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.245';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.246';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49780,7 +49799,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.245';
+const CACHE = 'amux-v0.9.246';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
