@@ -21421,6 +21421,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
+  <button id="tab-mcp" onclick="switchView('mcp')"><span class="tab-ico">&#x2B21;</span><span class="tab-lbl">MCP</span></button>
 </div>
 <div class="tab-customize-wrap">
   <button class="tab-customize-btn" id="tabs-icons-toggle" onclick="event.stopPropagation();toggleTabsIcons()" title="Icons only (hide labels)">&#x21F1;</button>
@@ -22463,6 +22464,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="habits-view" style="display:none;flex-direction:column;align-items:center;padding:12px;overflow-y:auto;-webkit-overflow-scrolling:touch;">
   <div id="habits-container" style="width:100%;max-width:480px;"></div>
   <button onclick="_habitsAdd()" style="margin-top:12px;background:var(--accent);color:#000;border:none;border-radius:50%;width:48px;height:48px;font-size:1.5rem;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:transform 0.15s;" onmousedown="this.style.transform='scale(0.9)'" onmouseup="this.style.transform=''" ontouchstart="this.style.transform='scale(0.9)'" ontouchend="this.style.transform=''">+</button>
+</div>
+
+<div id="mcp-view" style="display:none;flex-direction:column;flex:1;min-height:0;padding:12px 16px;gap:10px;overflow:auto;">
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <strong style="font-size:0.95rem;">MCP servers</strong>
+    <span id="mcp-sub" style="font-size:0.75rem;color:var(--dim);flex:1;min-width:0;"></span>
+    <button class="btn" style="min-height:44px;" onclick="_mcpRefresh()">Refresh</button>
+    <button class="btn primary" style="min-height:44px;" onclick="_mcpImport()">+ Import</button>
+  </div>
+  <div id="mcp-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+  <div id="mcp-env" style="font-size:0.78rem;color:var(--dim);border-top:1px solid var(--border);padding-top:10px;"></div>
 </div>
 
 <div id="skills-view" style="display:none;flex-direction:column;flex:1;min-height:0;padding:12px 16px;">
@@ -28927,7 +28939,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.243';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.244';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -37385,11 +37397,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
-  const _svNames = ['sessions','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph'];
-  // MUST stay index-aligned with _svIds/_svNames above (19 entries). It had 18,
-  // so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex','flex'];
+  const _svIds = ['session','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph','mcp'];
+  const _svNames = ['sessions','board','calendar','scheduler','files','proxies','logs','notes','messages','skills','crm','sql','map','metrics','cost','torrents','terminal','browser','graph','mcp'];
+  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
+  // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
+  const _svDisplay = ['','','flex','','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','flex','','flex','flex','flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -37408,6 +37420,7 @@ function switchView(view) {
   if (view === 'journal') _journalInit();
   if (view === 'habits') _habitsLoad();
   if (view === 'skills') _skillsTabLoad();
+  if (view === 'mcp') _mcpRefresh();
   if (view === 'sql') _sqlInit();
   // The Messages TAB is a fleet-wide view reached from the main session list —
   // it opens unfiltered. It used to inherit `peekSession || _lastPeekedSession`,
@@ -43474,6 +43487,91 @@ async function _offlineInfoRefresh() {
 }
 // Settings controls for the offline caps. Both persist to /api/prefs, so the
 // limits follow you to every device instead of each phone keeping its own.
+// ── MCP tab ────────────────────────────────────────────────────────────────
+// The list leads with READY vs missing-credentials, not with the server name.
+// "Configured" was never the useful fact: six servers sat in mcp.json for
+// months while four of them could not authenticate and one was reaching no
+// session at all, and nothing in the UI would have told you.
+let _mcpData = null;
+async function _mcpRefresh() {
+  const list = document.getElementById('mcp-list');
+  if (!list) return;
+  list.innerHTML = '<div style="color:var(--dim);font-size:0.82rem;">Loading…</div>';
+  try {
+    const r = await fetch(API + '/api/mcp');
+    _mcpData = await r.json();
+  } catch (e) {
+    list.innerHTML = '<div style="color:var(--red);font-size:0.82rem;">Could not read the registry.</div>';
+    return;
+  }
+  const d = _mcpData || {};
+  if (d.error) {
+    list.innerHTML = '<div style="color:var(--red);font-size:0.82rem;">' + esc(d.error) + '</div>';
+    return;
+  }
+  const servers = d.servers || [];
+  const ready = servers.filter(s => s.ready).length;
+  const sub = document.getElementById('mcp-sub');
+  if (sub) sub.textContent = servers.length
+    ? `${ready} of ${servers.length} ready · every session gets these unless CC_MCP=off`
+    : 'No servers configured.';
+  list.innerHTML = servers.map(s => {
+    const badge = s.ready
+      ? '<span style="color:var(--green,#4ade80);font-size:0.7rem;">&#x25CF; ready</span>'
+      : '<span style="color:var(--yellow,#d29922);font-size:0.7rem;">&#x25CF; needs credentials</span>';
+    const miss = s.missing && s.missing.length
+      ? `<div style="font-size:0.7rem;color:var(--yellow,#d29922);margin-top:3px;">missing: ${esc(s.missing.join(', '))} — add to ${esc(d.env_file || 'amux.env')}</div>`
+      : '';
+    return `<div style="border:1px solid var(--border);border-radius:8px;padding:9px 11px;display:flex;flex-direction:column;gap:2px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <strong style="font-size:0.85rem;">${esc(s.name)}</strong>
+        <span style="font-size:0.68rem;color:var(--dim);border:1px solid var(--border);border-radius:4px;padding:0 4px;">${esc(s.type)}</span>
+        ${badge}
+        <span style="flex:1;"></span>
+        <button class="btn" style="min-height:44px;min-width:44px;font-size:0.72rem;" onclick="_mcpDelete('${esc(s.name)}')">Remove</button>
+      </div>
+      <div style="font-size:0.72rem;color:var(--dim);word-break:break-all;">${esc(s.url || s.command || '')}</div>
+      ${miss}
+    </div>`;
+  }).join('') || '<div style="color:var(--dim);font-size:0.82rem;">No servers yet — Import one to get started.</div>';
+  const envEl = document.getElementById('mcp-env');
+  if (envEl) {
+    envEl.innerHTML = `Credentials file: <code>${esc(d.env_file || '')}</code> `
+      + (d.env_exists ? `(${(d.env_keys || []).length} key${(d.env_keys||[]).length===1?'':'s'} defined)` : '<b>not created</b>')
+      + `<br>Registry: <code>${esc(d.path || '')}</code>`
+      + `<br><span style="opacity:0.8;">Running sessions keep the registry they started with — restart a session to pick up changes.</span>`;
+  }
+}
+async function _mcpImport() {
+  // Accepts a single {"name":{...}} or a full {"mcpServers":{...}} blob, because
+  // that is what people actually have on the clipboard from a server's README.
+  showFormModal('Import MCP server',
+    `<div style="font-size:0.78rem;color:var(--dim);margin-bottom:6px;">Paste a server config. Either <code>{"mcpServers":{...}}</code> or a single <code>{"name":{...}}</code>.</div>
+     <textarea id="mcp-json" class="send-input" rows="8" spellcheck="false"
+       style="width:100%;font-family:'SF Mono',monospace;font-size:0.76rem;"
+       placeholder='{"mcpServers":{"deepwiki":{"type":"http","url":"https://mcp.deepwiki.com/mcp"}}}'></textarea>`,
+    'Import', async () => {
+      const raw = (document.getElementById('mcp-json') || {}).value || '';
+      let parsed;
+      try { parsed = JSON.parse(raw); }
+      catch (e) { showToast('Not valid JSON: ' + e.message); return false; }
+      const r = await fetch(API + '/api/mcp', { method: 'POST',
+        headers: {'Content-Type':'application/json'}, body: JSON.stringify({ bulk: parsed }) });
+      const d = await r.json();
+      if (d.error) { showToast(d.error); return false; }
+      showToast('Imported: ' + (d.added || []).join(', '));
+      _mcpRefresh();
+    });
+}
+async function _mcpDelete(name) {
+  if (!confirm('Remove MCP server "' + name + '" from the registry?')) return;
+  const r = await fetch(API + '/api/mcp/' + encodeURIComponent(name), { method: 'DELETE' });
+  const d = await r.json();
+  if (d.error) { showToast(d.error); return; }
+  showToast('Removed ' + name);
+  _mcpRefresh();
+}
+
 // Icon-only tabs. Persisted to /api/prefs rather than localStorage so the
 // choice follows you to the phone, where the space actually matters — a
 // per-device setting would mean setting it again on every client.
@@ -49652,7 +49750,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.243';
+const CACHE = 'amux-v0.9.244';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
