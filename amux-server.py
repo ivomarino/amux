@@ -24050,7 +24050,11 @@ function _schedulePeekPoll() {
     _schedulePeekPoll();
   }, _peekPollInterval());
 }
-const _peekDrafts = {};  // session name → command text
+// Composer drafts live in ONE place: _draftGet/_draftSave, keyed by session.
+// There used to be three stores (this in-memory map, the peekState snapshot's
+// own `draft` field, and amux_draft_*). Clearing on send hit one of them and the
+// others put the text back, which is how an already-sent message reappeared and
+// got sent twice. One store cannot disagree with itself.
 
 // ═══════ ZOOM ═══════
 const ZOOM_STEPS = [50, 60, 70, 75, 80, 85, 90, 95, 100, 110, 120, 130, 150, 175, 200];
@@ -27593,7 +27597,10 @@ function _draftSave(session, text) {
 }
 function _draftSaveDebounced(session, text) {
   clearTimeout(_draftTimers[session || '_']);
-  _draftTimers[session || '_'] = setTimeout(() => _draftSave(session, text), 250);
+  _draftTimers[session || '_'] = setTimeout(() => {
+    _draftSave(session, text);
+    _draftSyncInputs(session, text);   // keep the other view in step as you type
+  }, 250);
 }
 function _draftGet(session) {
   try {
@@ -27611,24 +27618,27 @@ function _draftGet(session) {
 function _draftClear(session) {
   clearTimeout(_draftTimers[session || '_']);
   try { localStorage.removeItem(_draftKey(session)); } catch (e) {}
-  // A draft lives in THREE places, and clearing one is how a sent message came
-  // back: _savePeekState() keeps its own copy under peekState/amux_peek_state
-  // so the composer survives the version-change reload. Clearing only
-  // amux_draft_* left those copies behind, the restore path reinjected one on
-  // the next load, and the message got sent a SECOND time to a real session.
-  // Whatever writes a draft has to be matched here, or the resend comes back.
+  // One store, so one removal. This used to have to chase two more copies
+  // (an in-memory map and the peekState snapshot's own `draft` field), and
+  // missing either put an already-sent message back in the box.
+  _draftSyncInputs(session, '');
+}
+
+// Push a session's draft into EVERY composer showing that session right now:
+// the card in the session list and the peek box are two views of one value, so
+// typing in one and opening the other must not lose or duplicate anything.
+function _draftSyncInputs(session, text) {
   try {
-    [[sessionStorage, 'peekState'], [localStorage, 'amux_peek_state']].forEach(([store, key]) => {
-      const raw = store.getItem(key);
-      if (!raw) return;
-      const st = JSON.parse(raw);
-      // Only drop the draft for the session being cleared — clearing another
-      // lane's unsent text would be the same bug pointed the other way.
-      if (st && st.draft && (!session || st.session === session)) {
-        delete st.draft;
-        store.setItem(key, JSON.stringify(st));
+    const card = document.getElementById('input-' + session);
+    if (card && card.value !== text && document.activeElement !== card) {
+      card.value = text; try { autoGrow(card); } catch (e) {}
+    }
+    if (typeof peekSession !== 'undefined' && peekSession === session) {
+      const pk = document.getElementById('peek-cmd-input');
+      if (pk && pk.value !== text && document.activeElement !== pk) {
+        pk.value = text; try { autoGrow(pk); } catch (e) {}
       }
-    });
+    }
   } catch (e) {}
 }
 // Restore into a composer that has just been (re)rendered. Never clobbers text
@@ -28825,7 +28835,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.256';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.257';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -29051,10 +29061,9 @@ function openPeek(name, opts) {
     searchInp.value = prefillQuery;
     document.getElementById('peek-search-wrap').classList.toggle('has-value', !!prefillQuery);
   }
-  // _peekDrafts survives peek close/open but dies with the page. Fall back to
-  // the persisted copy so a reload (including the version-change auto-reload)
-  // does not eat what you were typing.
-  const draft = _peekDrafts[name] || _draftGet(name) || '';
+  // Same draft the session-list card composer uses. Start typing in one, open
+  // the other, and the text is already there.
+  const draft = _draftGet(name) || '';
   const cmdInp = document.getElementById('peek-cmd-input');
   cmdInp.value = draft;
   autoGrow(cmdInp);
@@ -29212,9 +29221,7 @@ function closePeek() {
   if (peekSession) {
     const inp = document.getElementById('peek-cmd-input');
     const val = inp ? inp.value : '';
-    if (val.trim()) _peekDrafts[peekSession] = val;
-    else delete _peekDrafts[peekSession];
-    _draftSave(peekSession, val);   // mirror to storage so it outlives the page
+    _draftSave(peekSession, val);
   }
   peekSession = null;
   peekSearchQuery = '';
@@ -29250,13 +29257,6 @@ let _peekSplitPath = null;
 function _savePeekState() {
   if (peekSession) {
     const state = { session: peekSession };
-    // The restore path has always read _ps.draft, but nothing ever WROTE it —
-    // so the "rescued from pre-update reload" branch was dead code and every
-    // version-change reload dropped the composer text on the floor.
-    try {
-      const _ci = document.getElementById('peek-cmd-input');
-      if (_ci && _ci.value.trim()) state.draft = _ci.value;
-    } catch (e) {}
     const wrap = document.getElementById('peek-split-wrap');
     if (wrap && wrap.classList.contains('split-active')) {
       state.split = true;
@@ -30813,7 +30813,6 @@ async function sendPeekCmd() {
     cmdHistoryAdd(text, {type:'steering'});
     inp.value = '';
     inp.style.height = 'auto';
-    delete _peekDrafts[peekSession];
     _draftClear(peekSession);
     await steerSession(peekSession, text);
     return;
@@ -30837,7 +30836,6 @@ async function sendPeekCmd() {
   if (routed && routed.target !== peekSession) {
     inp.value = '';
     inp.style.height = 'auto';
-    delete _peekDrafts[peekSession];
     _draftClear(peekSession);
     clearPeekFiles();
     channelOpen(peekSession, routed.target, routed.message);
@@ -30846,7 +30844,6 @@ async function sendPeekCmd() {
 
   inp.value = '';
   inp.style.height = 'auto';
-  delete _peekDrafts[peekSession];
   _draftClear(peekSession);
   clearPeekFiles();
 
@@ -44015,7 +44012,6 @@ function _restoreScreen() {
     } catch(e) {}
   }
   if (_ps && _ps.session) {
-    if (_ps.draft) _peekDrafts[_ps.session] = _ps.draft;   // rescued from pre-update reload
     setTimeout(() => {
       openPeek(_ps.session);
       if (_ps.split && window.innerWidth > 600) {
@@ -48989,7 +48985,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.256';
+const CACHE = 'amux-v0.9.257';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
