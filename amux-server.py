@@ -28906,7 +28906,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.257';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.260';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -35714,27 +35714,63 @@ function _exploreSearchFilter(q) {
   _renderExploreEntries(body, path, data, cacheTs);
 }
 
-// Swipe right to close file preview
+// Swipe right to close file preview.
+//
+// Must never hijack a PINCH. This tracked touches[0] unconditionally, so during
+// a two-finger zoom the first finger's outward drift read as a dismiss swipe and
+// the image viewer closed as you tried to zoom into it. A second finger, or an
+// already-zoomed viewport, means the user is doing something the browser owns —
+// get out of the way rather than compete for the gesture.
 (function() {
   const el = document.getElementById('file-overlay');
+  // Tuned deliberately high. The old values (move at 10px, close at 80px, no
+  // direction test) fired during pinch-zoom and during ordinary vertical
+  // scrolling that drifted sideways, so the viewer appeared to exit by itself.
+  const _SWIPE_MIN = 24;      // px before any visual follow starts
+  const _SWIPE_CLOSE = 120;   // px of horizontal travel required to dismiss
+  const _SWIPE_RATIO = 2;     // dx must be >= 2x dy: clearly sideways, not diagonal
   let sx = 0, sy = 0, tracking = false;
+  const _cancel = () => {
+    if (!tracking) return;
+    tracking = false;
+    el.style.transform = ''; el.style.transition = '';
+  };
+  // True while the page is pinch-zoomed: panning a zoomed image is a pan, not a
+  // dismiss, and closing the viewer under it loses the user's zoom.
+  const _zoomed = () => {
+    try { return !!(window.visualViewport && window.visualViewport.scale > 1.01); }
+    catch (e) { return false; }
+  };
   el.addEventListener('touchstart', e => {
+    if (e.touches.length > 1 || _zoomed()) { _cancel(); return; }
     sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true;
     el.style.transition = 'none';
   }, {passive: true});
   el.addEventListener('touchmove', e => {
+    // A second finger landing MID-gesture is the common case: the pinch starts
+    // as one touch, so the guard above passes and only this one catches it.
+    if (e.touches.length > 1 || _zoomed()) { _cancel(); return; }
     if (!tracking) return;
     const dx = e.touches[0].clientX - sx;
-    const dy = Math.abs(e.touches[0].clientY - sy);
-    if (dy > 30 && dx < 30) { tracking = false; el.style.transform = ''; el.style.transition = ''; return; }
-    if (dx > 10) el.style.transform = 'translateX(' + dx + 'px)';
+    const dyRaw = e.touches[0].clientY - sy;
+    const dy = Math.abs(dyRaw);
+    if (dy > 30 && dx < 30) { _cancel(); return; }
+    // Require the motion to be clearly HORIZONTAL before it looks like a
+    // dismiss. Zooming and ordinary scrolling both drift sideways a little, and
+    // reacting to that is what made the viewer feel like it closed on its own.
+    if (dx < _SWIPE_MIN || dx < dy * _SWIPE_RATIO) return;
+    el.style.transform = 'translateX(' + (dx - _SWIPE_MIN) + 'px)';
   }, {passive: true});
   el.addEventListener('touchend', e => {
     if (!tracking) { el.style.transition = ''; return; }
+    // Fingers still down means a pinch is still in progress; this gesture is
+    // not ours to complete.
+    if (e.touches && e.touches.length > 0) { _cancel(); return; }
     tracking = false;
     const dx = e.changedTouches[0].clientX - sx;
     el.style.transition = 'transform 0.25s cubic-bezier(.4,0,.2,1)';
-    if (dx > 80) {
+    const dyEnd = Math.abs(e.changedTouches[0].clientY - sy);
+    if (dx > _SWIPE_CLOSE && dx > dyEnd * _SWIPE_RATIO) {
       el.style.transform = 'translateX(100%)';
       setTimeout(() => { closeFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
     } else {
@@ -49056,7 +49092,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.257';
+const CACHE = 'amux-v0.9.260';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
