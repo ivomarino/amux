@@ -78,7 +78,10 @@ jobs:
             sleep 25
             echo "  --- launcher log ---"
             ex "cat $P/$PROF.log 2>&1" | sed 's/^/    /'
-            ex "test -d $P/$PROF/Default && echo '    profile dir OK (Default/ present)' || echo '    NO PROFILE DIR'"
+            # Ask the server where the profile actually is rather than assuming
+            # the legacy path — this check reported "NO PROFILE DIR" for a
+            # profile that had been created correctly, just somewhere else.
+            ex "ls -d /root/.config/google-chrome/$PROF $P/$PROF 2>/dev/null || echo '    NO PROFILE DIR IN EITHER STORE'" | sed 's/^/    /'
 
             echo
             echo "=== 2. WRITE through a browser session on that profile ==="
@@ -87,10 +90,19 @@ jobs:
             echo "  origin:        $(evl "location.origin" probe1)"
             echo "  cookie write:  $(evl "document.cookie='amux_probe=$TOKEN; path=/; max-age=86400'; document.cookie" probe1)"
             echo "  localSt write: $(evl "localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')" probe1)"
+            # Distinguishes "never written" from "written but never flushed".
+            # Chrome flushes cookies to its sqlite on a timer (~30s) as well as
+            # on clean shutdown, so a value that appears on disk BEFORE we ask
+            # the session to close means the write was fine and the shutdown is
+            # what loses it.
+            echo "  waiting 40s for Chrome's own periodic flush (no close yet)"
+            sleep 40
+            ex "grep -a -r -q amux_probe '/root/.config/google-chrome/$PROF' 2>/dev/null && echo '    token on disk BEFORE close (write is fine; shutdown is the problem)' || echo '    token NOT on disk before close'"
             echo "  closing session (graceful close is what flushes storage to disk)"
             api stop "{\"session\":\"probe1\"}"
             echo
             sleep 6
+            ex "ls /root/.config/google-chrome/SingletonLock >/dev/null 2>&1 && echo '    SingletonLock still present => Chrome did NOT exit cleanly' || echo '    SingletonLock gone => clean Chrome exit'"
 
             echo
             echo "=== 2b. ON-DISK ground truth (independent of any later session) ==="
