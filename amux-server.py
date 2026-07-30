@@ -7862,6 +7862,12 @@ def _init_db():
         # they were overwhelmingly cron, and 'cron' is the claim least likely to
         # invent attribution that was never recorded.
         "ALTER TABLE schedule_runs ADD COLUMN source TEXT NOT NULL DEFAULT 'cron'",
+        # Archiving a session must take its cards with it. Kept SEPARATE from
+        # `deleted` on purpose: deleted means gone, archived means "this lane is
+        # closed but the work is still readable". Cards carrying real findings
+        # (cost analysis, pricing, root causes) should survive their session
+        # being put away, just not clutter the live board.
+        "ALTER TABLE issues ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -8955,6 +8961,7 @@ def _load_board(done_limit: int = 100) -> list:
                i.due, i.due_time, i.created, i.updated, i.owner_type,
                COALESCE(i.pinned, 0) AS pinned,
                COALESCE(i.pos, 0) AS pos,
+               COALESCE(i.archived, 0) AS archived,
                i.gate,
                GROUP_CONCAT(t.tag) AS tags_csv"""
     if done_limit > 0:
@@ -14090,7 +14097,34 @@ def archive_session(name: str) -> tuple[bool, str]:
     cfg = parse_env_file(f)
     cfg["CC_ARCHIVED"] = "1"
     _write_env(f, cfg)
+    _archive_session_issues(name, 1)
     return True, "archived"
+
+
+def _archive_session_issues(name: str, flag: int) -> int:
+    """Flip the archived bit on every one of a session's cards, both ways.
+
+    A card outlives the lane that owned it, so archiving a session and leaving
+    its cards on the live board produces exactly the rot the board triage keeps
+    finding: open cards nobody can execute, because the session they name no
+    longer exists. Waking the session flips them back rather than leaving the
+    lane live with an invisible backlog. Closed cards are included — otherwise
+    un-archiving would silently resurrect only part of the history."""
+    try:
+        db = get_db()
+        cur = db.execute(
+            "UPDATE issues SET archived=?, updated=? WHERE session=? AND deleted IS NULL AND archived!=?",
+            (flag, int(time.time()), name, flag),
+        )
+        db.commit()
+        n = cur.rowcount or 0
+        if n:
+            slog(f"[board] {'archived' if flag else 'un-archived'} {n} card(s) for session '{name}'")
+            _board_changed()
+        return n
+    except Exception as e:
+        slog(f"[board] issue archive cascade failed for '{name}': {e}")
+        return 0
 
 
 def wake_session(name: str) -> tuple[bool, str]:
@@ -14103,6 +14137,7 @@ def wake_session(name: str) -> tuple[bool, str]:
     cfg = parse_env_file(f)
     cfg.pop("CC_ARCHIVED", None)
     _write_env(f, cfg)
+    _archive_session_issues(name, 0)
     return start_session(name)
 
 
@@ -27898,7 +27933,9 @@ function renderPeekIssues() {
   const list = document.getElementById('peek-issues-list');
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
-  const scoped = (boardItems || []).filter(i => !i.deleted && (allScope || i.session === peekSession));
+  const scoped = _bqHideArchived(
+    (boardItems || []).filter(i => !i.deleted && (allScope || i.session === peekSession)),
+    _peekIssuesQuery);
   // Scope first, then query — so "3 of 12" counts within the session you are
   // looking at, not against the whole board.
   const items = _bqFilter(scoped, _peekIssuesQuery);
@@ -28585,7 +28622,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.236';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.237';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38981,6 +39018,7 @@ function _bqIs(item, val, ix) {
     case 'gated':    return !!sess && !!(sess.credit_limited || sess.rate_limited_until);
     case 'offline':  return !!item.session && (!sess || !sess.running);
     case 'orphan':   return !item.session || !ix[item.session];
+    case 'archived': return !!item.archived;
     case 'pinned':   return !!item.pinned;
     case 'overdue':  return !!item.due && (item.due * (item.due > 1e11 ? 0.001 : 1)) < Date.now() / 1000;
     case 'folded':   return ((item.desc || '').match(/New task:/g) || []).length > 0;
@@ -39021,6 +39059,17 @@ function _bqMatch(item, ast, ix) {
   return true;
 }
 
+// Archived cards are hidden everywhere UNLESS the query explicitly asks for
+// them. Implemented as a query-aware default rather than a separate toggle so
+// there is ONE place that decides visibility — a second mechanism is how the
+// owner-filter and the query ended up disagreeing and rendering lying counts.
+function _bqWantsArchived(q) {
+  return /(^|\s)-?is:(\S*,)?archived\b/i.test(String(q || ''));
+}
+function _bqHideArchived(items, q) {
+  return _bqWantsArchived(q) ? items : items.filter(i => !i.archived);
+}
+
 function _bqFilter(items, q) {
   const s = (q || '').trim();
   if (!s) return items;
@@ -39041,6 +39090,7 @@ const _BOARD_BUILTIN_VIEWS = [
   { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+' },
   { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no session can execute it' },
   { id: '_mine',     name: 'Mine',        q: 'owner:human is:open',       hint: 'Your own issues, not the agent cards' },
+  { id: '_archived', name: 'Archived',    q: 'is:archived',               hint: 'Cards belonging to archived sessions' },
 ];
 let _boardViews = [];        // user-saved: [{id,name,q}]
 let _boardActiveView = '';   // id of the applied view, '' = none
@@ -39379,6 +39429,7 @@ function renderBoard() {
   // Structured query: key:value facets, -negation, quoted phrases, and is:
   // facets derived from live session state. Bare words still substring-match,
   // so the old search behaviour is a strict subset of this.
+  visible = _bqHideArchived(visible, boardSearchQuery);
   visible = _bqFilter(visible, boardSearchQuery);
 
   if (boardViewMode === 'session') {
@@ -49250,7 +49301,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.236';
+const CACHE = 'amux-v0.9.237';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
