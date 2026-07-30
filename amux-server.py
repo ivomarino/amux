@@ -19505,6 +19505,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stat-card-label { font-size: 0.69rem; color: var(--dim); margin-bottom: 5px; }
   .stat-card-value { font-size: 1.5rem; font-weight: 700; color: var(--text); }
 
+  /* Tab icons. Default is icon + label; body.tabs-icons hides the labels to
+     buy back horizontal space once you know what the glyphs mean. The COUNT
+     badge deliberately survives icon-only mode -- an unread count is the one
+     thing you cannot infer from an icon. */
+  .tab-ico { display: inline-block; margin-right: 5px; opacity: 0.85; font-size: 0.95em; }
+  .tab-lbl { display: inline; }
+  body.tabs-icons .tab-lbl { display: none; }
+  body.tabs-icons .tab-ico { margin-right: 0; font-size: 1.15em; opacity: 1; }
+  /* Icon-only tabs must stay thumb-sized, not shrink to the glyph's width. */
+  body.tabs-icons .tab-bar > button,
+  body.tabs-icons .peek-tab { min-width: 40px; text-align: center; }
+  @media (max-width: 600px) {
+    body.tabs-icons .tab-bar > button,
+    body.tabs-icons .peek-tab { min-width: 44px; min-height: 44px; }
+  }
+
   /* Board */
   .board-search-wrap {
     position: relative; margin-bottom: 4px;
@@ -21386,27 +21402,28 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div class="tab-bar-outer">
 <div class="tab-bar">
-  <button id="tab-sessions" class="active" onclick="switchView('sessions')">Sessions</button>
-  <button id="tab-board" onclick="switchView('board')">Board</button>
-  <button id="tab-calendar" onclick="switchView('calendar')">Calendar</button>
-  <button id="tab-scheduler" onclick="switchView('scheduler')">Scheduler</button>
-  <button id="tab-files" onclick="switchView('files')">Files</button>
-  <button id="tab-proxies" onclick="switchView('proxies')">Proxies</button>
-  <button id="tab-logs" onclick="switchView('logs')">Logs</button>
-  <button id="tab-grid" onclick="enterGridMode()">Workspace</button>
-  <button id="tab-notes" onclick="switchView('notes')">Notes</button>
-  <button id="tab-messages" onclick="switchView('messages')">Messages</button>
-  <button id="tab-skills" onclick="switchView('skills')">Skills</button>
-  <button id="tab-crm" onclick="switchView('crm')">People</button>
-  <button id="tab-sql" onclick="switchView('sql')">Database</button>
-  <button id="tab-map" onclick="switchView('map')">Map</button>
-  <button id="tab-metrics" onclick="switchView('metrics')">Metrics</button>
-  <button id="tab-cost" onclick="switchView('cost')">Cost</button>
-  <button id="tab-torrents" onclick="switchView('torrents')">Torrents</button>
-  <button id="tab-terminal" onclick="switchView('terminal')">Terminal</button>
-  <button id="tab-browser" onclick="switchView('browser')">Browser</button>
+  <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Sessions</span></button>
+  <button id="tab-board" onclick="switchView('board')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span></button>
+  <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
+  <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
+  <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
+  <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
+  <button id="tab-logs" onclick="switchView('logs')"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span></button>
+  <button id="tab-grid" onclick="enterGridMode()"><span class="tab-ico">▣</span><span class="tab-lbl">Workspace</span></button>
+  <button id="tab-notes" onclick="switchView('notes')"><span class="tab-ico">✎</span><span class="tab-lbl">Notes</span></button>
+  <button id="tab-messages" onclick="switchView('messages')"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span></button>
+  <button id="tab-skills" onclick="switchView('skills')"><span class="tab-ico">⚙</span><span class="tab-lbl">Skills</span></button>
+  <button id="tab-crm" onclick="switchView('crm')"><span class="tab-ico">👤</span><span class="tab-lbl">People</span></button>
+  <button id="tab-sql" onclick="switchView('sql')"><span class="tab-ico">⛁</span><span class="tab-lbl">Database</span></button>
+  <button id="tab-map" onclick="switchView('map')"><span class="tab-ico">◈</span><span class="tab-lbl">Map</span></button>
+  <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
+  <button id="tab-cost" onclick="switchView('cost')"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
+  <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
+  <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
+  <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
 </div>
 <div class="tab-customize-wrap">
+  <button class="tab-customize-btn" id="tabs-icons-toggle" onclick="event.stopPropagation();toggleTabsIcons()" title="Icons only (hide labels)">&#x21F1;</button>
   <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
   <div class="tab-customizer-menu" id="tab-customizer-menu" style="display:none;"></div>
 </div>
@@ -22844,17 +22861,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <!-- Tab bar -->
   <div class="peek-tabs">
-    <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')">Terminal</button>
-    <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')">Steering<span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
-    <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')">Schedules<span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
-    <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session">Messages<span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
-    <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text">Dictation<span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
-    <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')">Board<span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
-    <button class="peek-tab" id="peek-tab-notes" onclick="setPeekTab('notes')">Notes<span class="peek-tab-count" id="peek-tab-notes-count"></span></button>
-    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task">Cost</button>
-    <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)">Transcript</button>
-    <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')">Commits</button>
-    <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')">Worktree</button>
+    <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
+    <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
+    <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
+    <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
+    <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
+    <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
+    <button class="peek-tab" id="peek-tab-notes" onclick="setPeekTab('notes')"><span class="tab-ico">✎</span><span class="tab-lbl">Notes</span><span class="peek-tab-count" id="peek-tab-notes-count"></span></button>
+    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
+    <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
+    <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
+    <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
   </div>
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
@@ -28910,7 +28927,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.241';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.243';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43457,6 +43474,38 @@ async function _offlineInfoRefresh() {
 }
 // Settings controls for the offline caps. Both persist to /api/prefs, so the
 // limits follow you to every device instead of each phone keeping its own.
+// Icon-only tabs. Persisted to /api/prefs rather than localStorage so the
+// choice follows you to the phone, where the space actually matters — a
+// per-device setting would mean setting it again on every client.
+let _tabsIconsOnly = false;
+function _tabsIconsApply() {
+  document.body.classList.toggle('tabs-icons', !!_tabsIconsOnly);
+  const b = document.getElementById('tabs-icons-toggle');
+  if (b) {
+    b.textContent = _tabsIconsOnly ? '⇲' : '⇱';
+    b.title = _tabsIconsOnly ? 'Show tab labels' : 'Icons only (hide labels)';
+  }
+}
+async function _tabsIconsLoad() {
+  try {
+    const r = await fetch(API + '/api/prefs?key=tabs_icons_only');
+    const d = await r.json();
+    _tabsIconsOnly = String((d && d.value) || '') === '1';
+  } catch (e) {}
+  _tabsIconsApply();
+}
+async function toggleTabsIcons() {
+  _tabsIconsOnly = !_tabsIconsOnly;
+  _tabsIconsApply();
+  try {
+    await fetch(API + '/api/prefs', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ key: 'tabs_icons_only', value: _tabsIconsOnly ? '1' : '0' }) });
+  } catch (e) {}
+  if (typeof showToast === 'function') showToast(_tabsIconsOnly ? 'Tabs: icons only' : 'Tabs: icons + labels');
+}
+if (document.body) _tabsIconsLoad();
+else document.addEventListener('DOMContentLoaded', _tabsIconsLoad);
+
 function _offlineSettingsHTML() {
   const mb = _OFFLINE_MB_CHOICES.map(v =>
     `<option value="${v}"${v === _offlineMB ? ' selected' : ''}>${v >= 1000 ? (v/1000)+' GB' : v+' MB'}</option>`).join('');
@@ -49603,7 +49652,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.241';
+const CACHE = 'amux-v0.9.243';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
