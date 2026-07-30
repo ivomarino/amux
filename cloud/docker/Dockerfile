@@ -23,6 +23,17 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN claude --version && echo "claude CLI verified at build time"
 
 WORKDIR /app
+
+# Browser automation. amux launches Playwright via `require('playwright')` with
+# cwd=/app, so the node package must resolve from HERE (not -g), and Chromium
+# plus its OS libs must be present. Cloud has no display, so this is the
+# headless engine; an interactive sign-in is handled by importing a saved
+# storage-state/profile rather than popping a window. This is a DEPLOYMENT
+# concern only — amux-server.py is byte-identical to local.
+RUN npm install playwright \
+    && npx playwright install --with-deps chromium \
+    && node -e "require('playwright'); console.log('playwright resolves from /app')"
+
 COPY amux-server.py .
 
 ENV AMUX_PORT=8822
