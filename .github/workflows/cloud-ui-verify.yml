@@ -71,10 +71,14 @@ jobs:
             echo
             echo "=== VERDICT ==="
             MISS=0
+            # tmux names carry the amux- prefix; the dashboard displays the bare
+            # name. Comparing the raw strings marked every correctly-rendered
+            # session as MISSING — a red verdict on a working UI.
             for s in $SESS; do
+              disp="${s#amux-}"
               case "$TXT" in
-                *"$s"*) echo "  visible: $s" ;;
-                *)      echo "  MISSING FROM UI: $s"; MISS=1 ;;
+                *"$disp"*) echo "  visible: $disp" ;;
+                *)         echo "  MISSING FROM UI: $disp (tmux: $s)"; MISS=1 ;;
               esac
             done
             if [ -z "$SESS" ]; then
