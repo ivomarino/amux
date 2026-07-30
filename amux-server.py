@@ -38634,29 +38634,37 @@ async function toggleSchedEnabled(id, enabled) {
 }
 
 let _boardViewsLoaded = false;
+let _boardEtag = null;
 async function fetchBoard() {
   // Saved views sync via /api/prefs so a view made on the desktop is on the
   // phone. Fetched once, not on every board poll.
   if (!_boardViewsLoaded) { _boardViewsLoaded = true; await _boardViewsLoad(); }
   try {
+    const boardHeaders = {};
+    if (_boardEtag) boardHeaders['If-None-Match'] = _boardEtag;
     const [r, rs, rsg] = await Promise.all([
-      fetch(API + '/api/board'),
+      fetch(API + '/api/board', _boardEtag ? { headers: boardHeaders } : undefined),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
-    const data = await r.json();
     const statusData = await rs.json();
     try { const sgData = await rsg.json(); if (sgData && typeof sgData === 'object') sessionGates = sgData; } catch(e) {}
     consecutiveFailures = 0;
     if (!online) setOnline(true);
     const sj = JSON.stringify(statusData);
-    const j = JSON.stringify(data);
     const statusesChanged = sj !== lastStatusesJSON;
-    const itemsChanged = j !== lastBoardJSON;
     if (statusesChanged) {
       lastStatusesJSON = sj;
       boardStatuses = statusData;
     }
+    if (r.status === 304) {
+      if (statusesChanged) renderBoard();
+      return;
+    }
+    _boardEtag = r.headers.get('ETag') || null;
+    const data = await r.json();
+    const j = JSON.stringify(data);
+    const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
       lastBoardJSON = j;
       boardItems = data;
