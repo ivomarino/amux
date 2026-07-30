@@ -97,12 +97,31 @@ jobs:
             # Cookie names and localStorage keys are plain text inside the
             # sqlite/leveldb files, so grep -a proves the write reached disk
             # without needing sqlite3 in the image.
-            ex "ls -l '$P/$PROF/Default/Cookies' 2>&1" | sed 's/^/    /'
-            ex "grep -a -q amux_probe '$P/$PROF/Default/Cookies' 2>/dev/null && echo '    cookie amux_probe IS on disk' || echo '    cookie amux_probe NOT on disk'"
-            ex "grep -a -r -q amux_probe '$P/$PROF/Default/Local Storage/' 2>/dev/null && echo '    localStorage amux_probe IS on disk' || echo '    localStorage amux_probe NOT on disk'"
+            #
+            # Checks BOTH candidate stores. amux creates profiles with Playwright
+            # under playwright-auth/profiles/<name>, while browser-use's
+            # `-b real --profile <name>` resolves to <chrome-user-data-dir>/<name>.
+            # If the bytes land in the second, create-path and use-path are not
+            # the same directory and a UI login can never take effect.
+            for D in "$P/$PROF" "/root/.config/google-chrome/$PROF"; do
+              echo "  -- $D"
+              ex "test -d '$D' && echo '     exists' || echo '     ABSENT'"
+              ex "grep -a -q amux_probe '$D/Default/Cookies' 2>/dev/null || grep -a -q amux_probe '$D/Cookies' 2>/dev/null && echo '     cookie amux_probe IS here' || echo '     cookie amux_probe not here'"
+              ex "grep -a -r -q amux_probe '$D' 2>/dev/null && echo '     token IS somewhere under this dir' || echo '     token not under this dir'"
+            done
+            echo "  -- chrome user-data-dir contents:"
+            ex "ls /root/.config/google-chrome/ 2>&1 | head -10" | sed 's/^/     /'
 
             echo
             echo "=== 3. READ BACK from a SEPARATE session on the same profile ==="
+            # The shared amux-server.py mount means a deploy can execv-restart the
+            # server mid-run; an unreachable port then reads as "nothing
+            # persisted". Wait for it to answer before drawing any conclusion.
+            for i in $(seq 1 30); do
+              ex "curl -sf -o /dev/null --max-time 3 localhost:8822/api/sessions" >/dev/null 2>&1 && break
+              sleep 2
+            done
+            ex "curl -sf -o /dev/null --max-time 3 localhost:8822/api/sessions && echo '  server is up' || echo '  SERVER STILL DOWN — result below is not meaningful'"
             api start "{\"url\":\"$SITE\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}"
             echo
             CK=$(evl "document.cookie" probe2)
