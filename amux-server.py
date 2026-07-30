@@ -22398,6 +22398,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </style>
   <!-- Nav row -->
   <div class="bw-row" style="padding-top:8px;">
+    <select id="bw-backend" class="bw-in" style="min-width:104px;display:none;" onchange="_bwOnBackend()" title="How to run the browser — Playwright profiles, or your own Chrome over CDP">
+      <option value="">Playwright</option>
+      <option value="live">My Chrome</option>
+    </select>
     <select id="bw-profile" class="bw-in" style="min-width:120px;" title="Profile — 'Auto' matches the URL to a logged-in profile">
       <option value="">Auto profile</option>
     </select>
@@ -48017,7 +48021,28 @@ async function _bwLoadProfiles() {
       sel.appendChild(o);
     });
     if (cur) sel.value = cur;
+    // Backend picker only appears where there is a real choice. A hosted
+    // container has no Chrome of the user's to drive, so CDP is not offered
+    // there rather than offered and always failing.
+    const bs = document.getElementById('bw-backend');
+    if (bs) bs.style.display = (d.backends || []).includes('live') ? '' : 'none';
   } catch(e) {}
+}
+
+function _bwBackend() {
+  const el = document.getElementById('bw-backend');
+  return (el && el.style.display !== 'none') ? el.value : '';
+}
+
+function _bwOnBackend() {
+  // Live Chrome drives the user's own browser, which brings its own logins —
+  // a profile would be meaningless, so grey it out instead of silently
+  // ignoring whatever is selected.
+  const live = _bwBackend() === 'live';
+  const p = document.getElementById('bw-profile');
+  if (p) { p.disabled = live; p.style.opacity = live ? 0.45 : 1; }
+  _bwStatus(live ? 'Live: your own Chrome (first use of a tab needs the "Allow debugging?" click)'
+                 : 'Playwright: isolated, profile-backed browser');
 }
 
 function _bwStatus(msg) {
@@ -48046,7 +48071,9 @@ async function _bwGo() {
   _bwStatus('Loading…');
   try {
     const body = { url, session: _bwSession };
-    if (profile) body.profile = profile;   // empty = auto-select by URL
+    const backend = _bwBackend();
+    if (backend) body.backend = backend;
+    else if (profile) body.profile = profile;   // empty = auto-select by URL
     const r = await fetch('/api/browser/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const d = await r.json();
     if (d.error) { _bwStatus('Error: ' + d.error); return; }
@@ -56326,6 +56353,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     "profiles": profiles,
                     "registry": reg,
                     "chrome_profiles": _bu_list_profiles_cached(),
+                    # Which execution backends this deployment can actually
+                    # offer. The picker hides "My Chrome" where CDP cannot work
+                    # (hosted container, no display) instead of showing an
+                    # option that always fails.
+                    "backends": (["playwright"] if _cdp_local_only()
+                                 else ["playwright", "live"]),
                 })
 
             # POST /api/browser/start  {"url":"...","session":"...","profile":"...","fresh":false}
