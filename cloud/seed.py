@@ -190,6 +190,45 @@ def create_sessions(org, sessions):
     return made
 
 
+DEFAULT_SCAFFOLD = ("hello-world", "amux-helper")
+
+
+def remove_scaffold(org, seeded):
+    """Drop the first-run scaffold sessions once real ones exist.
+
+    Every cloud container gets a 'hello-world' session at /root/dev on boot —
+    sensible for a self-serve signup, wrong for a curated prospect workspace
+    where it is the first thing they see and belongs to nothing in the plan.
+    Only ever removes the known scaffold names, and only when the plan actually
+    seeded sessions of its own.
+    """
+    if not seeded:
+        return
+    code, body = gw("GET", "/api/sessions", org=org)
+    if code != 200:
+        return
+    try:
+        existing = {s["name"] for s in json.loads(body)}
+    except Exception:
+        return
+    for name in DEFAULT_SCAFFOLD:
+        if name in existing:
+            # ARCHIVE, not delete: deleting a session is guarded to human
+            # dashboard actions on purpose, and archiving is reversible while
+            # still keeping the workspace clean for a prospect.
+            c, _ = gw("POST", f"/api/sessions/{name}/archive", org=org, timeout=120)
+            if c in (200, 202, 204):
+                ok(f"archived scaffold session '{name}'")
+            elif c == 403:
+                # Archiving/deleting a session is deliberately restricted to a
+                # human acting in the dashboard (guard: _session_destructive_allowed).
+                # Do NOT weaken that for cosmetics — surface it instead.
+                warn(f"'{name}' still visible — archiving needs a human click in the "
+                     f"dashboard (agents are blocked from removing sessions by design)")
+            else:
+                warn(f"could not archive '{name}' ({c})")
+
+
 def create_schedules(org, sessions):
     """Attach amux schedules. Kept disabled until explicitly enabled so a seeded
     demo cannot start burning budget on its own."""
@@ -398,6 +437,9 @@ def main():
 
     step("Create schedules")
     schedules = create_schedules(org, sessions)
+
+    step("Remove first-run scaffold")
+    remove_scaffold(org, sessions)
 
     if a.run:
         step("Run once")
