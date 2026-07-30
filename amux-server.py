@@ -1076,7 +1076,119 @@ def _browser_touch(session: str = "amux"):
     """Record activity for a browser-use session (called on every _bu_call)."""
     _browser_session_activity[session] = time.time()
 
+_ILOG_MAX = 200_000          # rows kept; ~weeks of fleet activity
+_ILOG_BLOB_CAP = 4000        # per-field cap so one huge eval cannot bloat the table
+_ilog_seq_lock = threading.Lock()
+
+def _ilog(kind, action, actor="", target="", url="", detail=None,
+          before=None, result=None, ok=True, ms=0):
+    """Record one interaction. Best-effort: logging must never break the action.
+
+    Deliberately called at the CHOKEPOINTS (_bu_call/_cdp_call/send_text) rather
+    than at each API handler. /api/browser/action alone has ~20 return paths,
+    and the one that gets missed is the one you needed in the audit."""
+    try:
+        def _blob(v):
+            if v is None:
+                return ""
+            s = v if isinstance(v, str) else json.dumps(v, default=str)
+            return s[:_ILOG_BLOB_CAP]
+        db = get_db()
+        with _ilog_seq_lock:
+            row = db.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM interaction_log WHERE kind=? AND target=?",
+                (kind, target or "")).fetchone()
+            seq = (row[0] if row else 0) + 1
+            db.execute(
+                "INSERT INTO interaction_log "
+                "(ts,kind,actor,target,action,url,detail,before,result,ok,ms,seq) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (int(time.time() * 1000), kind, actor or "", target or "", action or "",
+                 url or "", _blob(detail), _blob(before), _blob(result),
+                 1 if ok else 0, int(ms), seq))
+            db.commit()
+    except Exception as e:
+        slog(f"[ilog] failed to record {kind}/{action}: {e}")
+
+
+def _ilog_prune():
+    """Keep the ledger bounded. Runs on the existing scheduler tick."""
+    try:
+        db = get_db()
+        db.execute("DELETE FROM interaction_log WHERE id NOT IN "
+                   "(SELECT id FROM interaction_log ORDER BY id DESC LIMIT ?)", (_ILOG_MAX,))
+        db.commit()
+    except Exception:
+        pass
+
+
+def _bu_page_state(session: str) -> dict:
+    """Current URL/title for a browser session — the 'where' of an interaction.
+
+    Captured BEFORE each action so a replay knows what page the step assumed,
+    and a rollback knows where to return to. Silent on failure: a state probe
+    that throws must not stop the action the user actually asked for."""
+    try:
+        lock = _browser_locks.get(session)
+        if lock and lock.locked():
+            return {}          # mid-action; probing would deadlock on the per-session lock
+        # `eval location.href` rather than a `url` subcommand — browser-use has
+        # no `url` verb, and the version that did returned usage text that
+        # parsed to an empty URL, i.e. a rollback point pointing nowhere.
+        # Direct subprocess (not _bu_call) so this cannot recurse into logging.
+        r = subprocess.run(
+            [_BROWSER_USE_BIN, "--json", "--session", session, "eval",
+             "JSON.stringify({u:location.href,t:document.title})"],
+            capture_output=True, text=True, timeout=8)
+        d = json.loads((r.stdout or "").strip() or "{}")
+        raw = (d.get("data") or {}).get("result") or ""
+        try:
+            p = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
+        except Exception:
+            p = {}
+        return {"url": p.get("u", ""), "title": p.get("t", "")}
+    except Exception:
+        return {}
+
+
+# Actions that CHANGE the page. Only these get a before-state probe: a probe
+# costs a subprocess, and capturing it for read-only verbs would double the cost
+# of every screenshot for a rollback point identical to the one before it.
+_BU_MUTATING = {"click", "type", "input", "keys", "scroll", "eval", "back",
+                "navigate", "goto", "select", "upload", "press"}
+
 def _bu_call(args: list, timeout_s: int = 30, session: str = "amux") -> dict:
+    """Logging wrapper over the raw browser-use call.
+
+    Wraps rather than patching each return path: the raw function has seven,
+    and an audit trail with a hole in it is worse than none — you would trust
+    it. Captures the page the action ran against BEFORE executing, so a
+    sequence can be both replayed (what was done, where) and rolled back
+    (what the page was before)."""
+    # The real verb is the first NON-flag token: several callers lead with
+    # `-b real --profile <name>`, which logged the action as "-b" and made the
+    # ledger useless for exactly the profile-browser calls it most needed.
+    verb, _skip = "", False
+    for a in (args or []):
+        a = str(a)
+        if _skip:
+            _skip = False; continue
+        if a.startswith("-"):
+            _skip = a in ("-b", "--profile", "--browser", "--session", "--timeout", "--amount")
+            continue
+        verb = a
+        break
+    before = _bu_page_state(session) if verb in _BU_MUTATING else {}
+    t0 = time.time()
+    res = _bu_call_raw(args, timeout_s, session)
+    ok = not (isinstance(res, dict) and res.get("error"))
+    _ilog("browser", verb, actor=session, target=session,
+          url=before.get("url", ""), detail={"args": args, "backend": "profile"},
+          before=before, result=res, ok=ok, ms=int((time.time() - t0) * 1000))
+    return res
+
+
+def _bu_call_raw(args: list, timeout_s: int = 30, session: str = "amux") -> dict:
     """Run a browser-use CLI command, return parsed JSON result.
 
     Serialized per-session via lock to prevent concurrent subprocess spawning
@@ -1129,6 +1241,24 @@ _CDP_SCRIPT = str(Path(__file__).resolve().parent / "skills" / "chrome-cdp" / "s
 _live_targets: dict = {}   # amux browser-session name -> CDP target-id prefix
 
 def _cdp_call(args: list, timeout_s: int = 30) -> dict:
+    """Logging wrapper over the live-Chrome CDP call. See _bu_call for why the
+    wrap is at this level rather than at the API handlers."""
+    verb = (args[0] if args else "") or ""
+    tid = str(args[1]) if len(args) > 1 else ""
+    t0 = time.time()
+    res = _cdp_call_raw(args, timeout_s)
+    ok = not (isinstance(res, dict) and res.get("error"))
+    # The live backend drives the user's OWN Chrome — real logins, real
+    # sessions. That makes its audit trail more important than the profile
+    # browser's, not less.
+    _ilog("browser", verb, actor="live-chrome", target=tid,
+          url=(res.get("url") if isinstance(res, dict) else "") or "",
+          detail={"args": [str(a) for a in args], "backend": "live-chrome"},
+          result=res, ok=ok, ms=int((time.time() - t0) * 1000))
+    return res
+
+
+def _cdp_call_raw(args: list, timeout_s: int = 30) -> dict:
     """Run one cdp.mjs command against the user's real Chrome."""
     try:
         r = subprocess.run(["node", _CDP_SCRIPT] + [str(a) for a in args],
@@ -5615,6 +5745,13 @@ def _cmd_hist_record(session: str, text: str, ctype: str = "user", origin: str =
                    "(SELECT id FROM cmd_history WHERE session=? ORDER BY ts DESC LIMIT ?)",
                    (session, session, _CMD_HIST_KEEP))
         db.commit()
+        # Mirror into the unified ledger. cmd_history is per-session and pruned
+        # aggressively for the Messages tab; the ledger is fleet-wide and keeps
+        # the cross-session picture, which is the one you need when asking "what
+        # touched this lane, and who told it to".
+        _ilog("inter_session" if ctype == "session" else "session",
+              ctype, actor=(origin or ctype), target=session,
+              detail={"text": text, "origin": origin})
     except Exception:
         pass
 
@@ -6647,6 +6784,36 @@ CREATE INDEX IF NOT EXISTS idx_sched_runs_ran   ON schedule_runs(ran_at DESC);
 -- Mutation audit: EVERY change to a schedule's fields (esp. the enabled flag)
 -- is recorded here so a flip is never unattributed again. Forensics after the
 -- 07-14 bulk-disable / unattributed re-enables (AMUX-1735).
+-- Unified interaction ledger: everything an agent or a human DID, in one place.
+-- Previously these were scattered — cmd_history held messages, the server log
+-- held prose, and browser actions were recorded nowhere at all, so a sequence
+-- of clicks that changed a real web page left no trace you could audit or undo.
+--
+-- `kind`   session | inter_session | browser | schedule
+-- `actor`  who initiated (session name, 'human', ip:...)
+-- `target` session name, or the browser session
+-- `url`    page the action executed against  (browser only)
+-- `detail` JSON: the full arguments, enough to REPLAY the step
+-- `before` JSON: state captured before the action, enough to ROLL BACK to it
+-- `seq`    monotonic per (kind,target) so a sequence can be replayed in order
+CREATE TABLE IF NOT EXISTS interaction_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    target      TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL DEFAULT '',
+    url         TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    before      TEXT NOT NULL DEFAULT '',
+    result      TEXT NOT NULL DEFAULT '',
+    ok          INTEGER NOT NULL DEFAULT 1,
+    ms          INTEGER NOT NULL DEFAULT 0,
+    seq         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ilog_ts     ON interaction_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ilog_kind   ON interaction_log(kind, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ilog_target ON interaction_log(target, ts DESC);
 CREATE TABLE IF NOT EXISTS schedule_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     schedule_id TEXT NOT NULL,
@@ -28743,7 +28910,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.239';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.241';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49436,7 +49603,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.239';
+const CACHE = 'amux-v0.9.241';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -51725,6 +51892,175 @@ class CCHandler(BaseHTTPRequestHandler):
                         "No Tailscale hostname found, so amux only has a self-signed cert. "
                         "Service workers will not install and offline mode cannot work. "
                         "Install Tailscale, or run `mkcert` and restart amux."),
+            })
+
+        # ── MCP registry API ──────────────────────────────────────────────────
+        # GET /api/mcp — servers + which credentials each needs and whether they
+        # resolve. "configured" is not "working": four of the shipped servers
+        # were configured and unusable because nothing supplied MIXPEEK_API_KEY,
+        # so the missing-var list is the useful part of this response.
+        if method == "GET" and path == "/api/mcp":
+            reg, servers = CC_MCP_REGISTRY, {}
+            try:
+                if reg.exists():
+                    servers = json.loads(reg.read_text()).get("mcpServers") or {}
+                elif (Path(__file__).parent / "mcp.json").exists():
+                    servers = json.loads((Path(__file__).parent / "mcp.json").read_text()).get("mcpServers") or {}
+            except Exception as e:
+                return self._json({"error": f"registry unreadable: {e}", "servers": []})
+            env = {}
+            if CC_AMUX_ENV.exists():
+                for ln in CC_AMUX_ENV.read_text().splitlines():
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#") and "=" in ln:
+                        k, _, v = ln.partition("=")
+                        env[k.strip()] = v.strip()
+            out = []
+            for nm, cfg_ in servers.items():
+                blob = json.dumps(cfg_)
+                needs = sorted(set(re.findall(r"\$\{?([A-Z_][A-Z0-9_]*)\}?", blob)))
+                # A var counts as satisfied by EITHER amux.env or the server's own
+                # environment — otherwise a key exported in the shell reads as missing.
+                missing = [v for v in needs if not (env.get(v) or os.environ.get(v))]
+                out.append({"name": nm, "type": "http" if cfg_.get("url") else "stdio",
+                            "url": cfg_.get("url", ""), "command": cfg_.get("command", ""),
+                            "needs": needs, "missing": missing, "ready": not missing})
+            return self._json({"path": str(reg), "seeded": reg.exists(),
+                               "env_file": str(CC_AMUX_ENV), "env_exists": CC_AMUX_ENV.exists(),
+                               "env_keys": sorted(env.keys()), "servers": out})
+
+        # POST /api/mcp — import/replace one server: {"name":..,"config":{...}}
+        # or paste a whole {"mcpServers":{...}} blob with {"bulk": {...}}.
+        if method == "POST" and path == "/api/mcp":
+            body = self._read_body()
+            try:
+                reg = CC_MCP_REGISTRY
+                cur = {}
+                if reg.exists():
+                    cur = json.loads(reg.read_text()).get("mcpServers") or {}
+                elif (Path(__file__).parent / "mcp.json").exists():
+                    cur = json.loads((Path(__file__).parent / "mcp.json").read_text()).get("mcpServers") or {}
+                bulk = body.get("bulk")
+                if isinstance(bulk, dict):
+                    incoming = bulk.get("mcpServers") if "mcpServers" in bulk else bulk
+                    if not isinstance(incoming, dict) or not incoming:
+                        return self._json({"error": "bulk must be a non-empty object of servers"}, 400)
+                    cur.update(incoming)
+                    added = sorted(incoming.keys())
+                else:
+                    nm = (body.get("name") or "").strip()
+                    cfgv = body.get("config")
+                    if not nm or not isinstance(cfgv, dict):
+                        return self._json({"error": "name and config required"}, 400)
+                    cur[nm] = cfgv
+                    added = [nm]
+                reg.parent.mkdir(parents=True, exist_ok=True)
+                reg.write_text(json.dumps({"mcpServers": cur}, indent=2) + "\n")
+                _ilog("mcp", "import", actor=self.headers.get("X-Amux-Session", "") or "human",
+                      target="registry", detail={"added": added})
+                # Running sessions launched with the OLD file. Say so rather than
+                # implying a live change — the flag is read once, at start.
+                return self._json({"ok": True, "added": added, "servers": sorted(cur.keys()),
+                                   "note": "Running sessions keep the registry they started with; "
+                                           "restart a session to pick this up."})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        # DELETE /api/mcp/<name>
+        if method == "DELETE" and path.startswith("/api/mcp/"):
+            nm = unquote(path[len("/api/mcp/"):])
+            try:
+                reg = CC_MCP_REGISTRY
+                if not reg.exists():
+                    return self._json({"error": "no registry"}, 404)
+                d = json.loads(reg.read_text())
+                srv = d.get("mcpServers") or {}
+                if nm not in srv:
+                    return self._json({"error": "not found"}, 404)
+                srv.pop(nm)
+                reg.write_text(json.dumps({"mcpServers": srv}, indent=2) + "\n")
+                _ilog("mcp", "delete", actor=self.headers.get("X-Amux-Session", "") or "human",
+                      target="registry", detail={"removed": nm})
+                return self._json({"ok": True, "removed": nm, "servers": sorted(srv.keys())})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        # GET /api/interactions — the unified ledger.
+        #   ?kind=browser|session|inter_session  ?target=  ?actor=  ?since=<ms>
+        #   ?limit=  ?q=<substring over action/url/detail>
+        # Newest-first for browsing; ?order=asc for REPLAY, where the sequence
+        # only means anything in the order it actually happened.
+        if method == "GET" and path == "/api/interactions":
+            db = get_db()
+            where, params = ["1=1"], []
+            for col, key in (("kind", "kind"), ("target", "target"), ("actor", "actor")):
+                v = (qs.get(key, [""])[0] or "").strip()
+                if v:
+                    where.append(f"{col}=?"); params.append(v)
+            since = (qs.get("since", [""])[0] or "").strip()
+            if since.isdigit():
+                where.append("ts>=?"); params.append(int(since))
+            q = (qs.get("q", [""])[0] or "").strip()
+            if q:
+                where.append("(action LIKE ? OR url LIKE ? OR detail LIKE ?)")
+                params += [f"%{q}%"] * 3
+            try:
+                limit = max(1, min(2000, int(qs.get("limit", ["200"])[0])))
+            except Exception:
+                limit = 200
+            order = "ASC" if (qs.get("order", [""])[0] or "").lower() == "asc" else "DESC"
+            rows = db.execute(
+                f"SELECT id,ts,kind,actor,target,action,url,detail,before,result,ok,ms,seq "
+                f"FROM interaction_log WHERE {' AND '.join(where)} "
+                f"ORDER BY id {order} LIMIT ?", params + [limit]).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                for f in ("detail", "before", "result"):
+                    try:
+                        d[f] = json.loads(d[f]) if d[f] else None
+                    except Exception:
+                        pass    # keep the raw string; a truncated blob is still evidence
+                out.append(d)
+            return self._json(out)
+
+        # GET /api/interactions/replay?target=<browser session>&since=&until=
+        # One browser sequence as an ordered, self-contained script: each step
+        # with the page it ran against and the state before it — what you need
+        # to re-run it, or to walk it back.
+        if method == "GET" and path == "/api/interactions/replay":
+            db = get_db()
+            target = (qs.get("target", [""])[0] or "").strip()
+            if not target:
+                return self._json({"error": "target required"}, 400)
+            where, params = ["kind='browser'", "target=?"], [target]
+            for key, op in (("since", ">="), ("until", "<=")):
+                v = (qs.get(key, [""])[0] or "").strip()
+                if v.isdigit():
+                    where.append(f"ts{op}?"); params.append(int(v))
+            rows = db.execute(
+                f"SELECT ts,action,url,detail,before,ok,ms,seq FROM interaction_log "
+                f"WHERE {' AND '.join(where)} ORDER BY id ASC LIMIT 2000", params).fetchall()
+            steps, start_url = [], ""
+            for r in rows:
+                d = dict(r)
+                for f in ("detail", "before"):
+                    try:
+                        d[f] = json.loads(d[f]) if d[f] else None
+                    except Exception:
+                        pass
+                if not start_url and isinstance(d.get("before"), dict):
+                    start_url = d["before"].get("url") or ""
+                steps.append(d)
+            return self._json({
+                "target": target, "steps": len(steps),
+                # Where to put the browser before step 1. Without it a replay
+                # starts from whatever page happens to be open.
+                "start_url": start_url,
+                "rollback_hint": ("Restore start_url, then re-run steps in order. A step whose "
+                                  "before.url differs from the previous step's before.url marks a "
+                                  "navigation you must reproduce before replaying it."),
+                "sequence": steps,
             })
 
         # GET /api/prefs — read all prefs (or ?key=X for one)
@@ -59637,6 +59973,7 @@ def main():
     schedule_job(_snapshot_loop,         interval=60,                   name="snapshot",    initial_delay=0)
     schedule_job(_steering_fast_tick,    interval=2,                    name="steering_fast", initial_delay=8)
     schedule_job(_index_token_ledger,    interval=60,                   name="token_ledger",  initial_delay=12)
+    schedule_job(_ilog_prune,            interval=3600,                 name="ilog_prune",    initial_delay=300)
     schedule_job(_tmux_size_watchdog,    interval=60,                   name="tmux_size",   initial_delay=45)
     schedule_job(_reap_stale_browsers,  interval=120,                  name="browser_reap", initial_delay=60)
     schedule_job(_kill_stale_ray,        interval=600,                  name="ray_reap",     initial_delay=120)
