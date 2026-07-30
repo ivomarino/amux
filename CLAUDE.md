@@ -2,6 +2,22 @@
 
 Single-file project: everything lives in `amux-server.py` (Python server + inline HTML/CSS/JS dashboard).
 
+## The ethos — read before building anything
+
+**The harness gets better as the models get better. Get out of the model's way.**
+
+Every new feature or enhancement gets gut-checked against
+[`.claude/rules/ethos.md`](.claude/rules/ethos.md) before you build it and again before
+you call it done. Eight questions, each one there because it was violated in this repo
+and cost something real: capability that never reached a session, model calls spent on
+string manipulation, gates that could not be satisfied honestly, instruments that could
+not express the discriminator, automation that accumulated instead of deciding, an audit
+trail that was claimed but not implemented, checks that could not fail, and an agent
+deciding something that was the user's to decide.
+
+The question underneath all of them: when the next model is meaningfully better than
+this one, does this feature get better with it, or does it become the ceiling?
+
 ## Structure
 
 - `amux-server.py` — the server + dashboard (single file)
