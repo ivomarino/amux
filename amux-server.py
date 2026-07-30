@@ -1372,6 +1372,21 @@ def _bu_pw_profile_dirs() -> list:
                    if p.is_dir() and not p.name.startswith(".")]
     except Exception:
         out = []
+    # Profiles created since the two stores were unified live in the Chrome
+    # user-data-dir. Listing only the legacy location is how a profile could be
+    # created successfully and then not appear in the picker at all.
+    try:
+        cud = _chrome_user_data_dir()
+        if cud.is_dir():
+            for p in cud.iterdir():
+                if not p.is_dir() or p.name.startswith("."):
+                    continue
+                # Chrome keeps non-profile state (Crashpad, ShaderCache, …)
+                # beside the profiles; a profile is the thing with Preferences.
+                if (p / "Preferences").exists():
+                    out.append(p.name)
+    except Exception:
+        pass
     try:
         if (_PW_AUTH_DIR / "profile").is_dir():
             out.append("default")
@@ -1380,12 +1395,54 @@ def _bu_pw_profile_dirs() -> list:
     return sorted(set(out))
 
 
+def _chrome_user_data_dir() -> Path:
+    """The Chrome user-data-dir that browser-use's `-b real` mode opens.
+
+    Mirrors browser_use.skill_cli.utils.get_chrome_profile_path(None). A named
+    profile is a SUBDIRECTORY of this dir (Chrome's --profile-directory), which
+    is the whole reason this function exists: amux used to CREATE profiles with
+    Playwright under playwright-auth/profiles/<name> while browsing opened
+    <chrome-user-data-dir>/<name>. Two different directories, so signing in
+    through the UI could never affect the browser that actually ran — the login
+    appeared to save and then silently did nothing.
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    if sys.platform.startswith("win"):
+        return Path(os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data"))
+    return Path.home() / ".config" / "google-chrome"
+
+
 def _bu_profile_dir(name: str):
-    """Absolute path for a profile name ('default' maps to the bare dir)."""
+    """Absolute path for a profile name ('default' maps to the bare dir).
+
+    New profiles live where browser-use will look for them, so create-path and
+    use-path are the same bytes. Profiles that already exist in the old location
+    keep resolving there — people are logged into those, and relocating them
+    would silently sign everyone out.
+    """
     n = (name or "").strip()
     if not n or n == "default":
         return _PW_AUTH_DIR / "profile"
-    return _PW_PROFILES_DIR / n
+    legacy = _PW_PROFILES_DIR / n
+    if legacy.is_dir():
+        return legacy
+    return _chrome_user_data_dir() / n
+
+
+def _bu_profile_launch_target(name: str):
+    """(user_data_dir, profile_directory) for launching a profile.
+
+    Playwright's launchPersistentContext treats its argument as the USER-DATA-DIR
+    and nests a Default/ inside it, while Chrome's --profile-directory selects a
+    named folder within that dir. Handing Playwright the profile folder itself
+    therefore produced <profile>/Default while browser-use read <profile> — the
+    off-by-one-level version of the same mismatch.
+    """
+    d = _bu_profile_dir(name)
+    if d.parent == _chrome_user_data_dir():
+        return d.parent, d.name       # shared with browser-use `-b real`
+    return d, ""                      # legacy/default: the dir IS the user-data-dir
 
 
 def _bu_profile_size_mb(name: str) -> float:
@@ -1420,7 +1477,10 @@ def _bu_profile_size_mb(name: str) -> float:
 # and localStorage to disk. cwd is the repo so `require('playwright')` resolves.
 _PW_SIGNIN_JS = r"""
 const { chromium } = require('playwright');
-const dir = process.argv[2], url = process.argv[3] || 'about:blank';
+// argv: <user-data-dir> <profile-directory|""> <url>
+// profileDir empty => the user-data-dir IS the profile (legacy/default store).
+const dir = process.argv[2], profileDir = process.argv[3] || '',
+      url = process.argv[4] || 'about:blank';
 (async () => {
   // Headless when no display is available (cloud) — the SAME persistent-context
   // path either way, so a profile captured in one mode is reusable in the other.
@@ -1435,7 +1495,11 @@ const dir = process.argv[2], url = process.argv[3] || 'about:blank';
     headless,
     ignoreHTTPSErrors: true,
     viewport: null,
-    args: ['--no-first-run', '--no-default-browser-check'],
+    args: ['--no-first-run', '--no-default-browser-check']
+      // Select the SAME named folder browser-use opens with
+      // `-b real --profile <name>`, so the login captured here is the login
+      // the browser later runs with.
+      .concat(profileDir ? ['--profile-directory=' + profileDir] : []),
   };
   let ctx;
   try {
@@ -1450,9 +1514,10 @@ const dir = process.argv[2], url = process.argv[3] || 'about:blank';
   if (headless) {
     // No window for a human to close, so the close-to-save handshake cannot
     // apply. Persist immediately: this is what makes a cloud profile reusable.
-    await ctx.storageState({ path: require('path').join(dir, 'storage-state.json') });
+    const profPath = profileDir ? require('path').join(dir, profileDir) : dir;
+    await ctx.storageState({ path: require('path').join(profPath, 'storage-state.json') });
     await ctx.close();
-    console.log(JSON.stringify({ ok: true, headless: true, dir }));
+    console.log(JSON.stringify({ ok: true, headless: true, dir: profPath }));
     process.exit(0);
   }
   await new Promise(res => ctx.on('close', res));
@@ -1467,12 +1532,15 @@ def _bu_profile_signin(name: str, url: str) -> dict:
     if not safe:
         return {"error": "profile name required"}
     d = _bu_profile_dir(safe)
+    udd, profdir = _bu_profile_launch_target(safe)
     try:
         d.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return {"error": f"could not create profile dir: {e}"}
+    _log_dir = _PW_PROFILES_DIR
     script = TLS_DIR.parent / "pw-signin.cjs"
     try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
         script.write_text(_PW_SIGNIN_JS)
     except Exception as e:
         return {"error": f"could not write launcher: {e}"}
@@ -1487,9 +1555,12 @@ def _bu_profile_signin(name: str, url: str) -> dict:
         _env["NODE_PATH"] = os.pathsep.join(
             x for x in [str(_app / "node_modules"), _env.get("NODE_PATH", "")] if x)
         subprocess.Popen(
-            ["node", str(script), str(d), url or "about:blank"],
+            ["node", str(script), str(udd), profdir, url or "about:blank"],
             cwd=str(_app), env=_env,
-            stdout=open(str(d.parent / f"{safe}.log"), "ab"),
+            # Launcher logs always land in ONE predictable place, whichever
+            # store the profile itself lives in — a log you have to guess the
+            # location of is a log nobody reads when the launch fails.
+            stdout=open(str(_log_dir / f"{safe}.log"), "ab"),
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
