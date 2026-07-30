@@ -11582,6 +11582,29 @@ def _set_commit_guard_session(name: str, enabled: bool | None):
 
 # ── Task guard: nudge sessions to keep the board reflecting their work ──
 _task_guard_nudged: dict[str, bool] = {}  # session -> nudged this idle episode (re-armed when active)
+_task_guard_last: dict[str, float] = {}   # session -> epoch of last nudge (loop backstop)
+_TASK_GUARD_COOLDOWN = 6 * 3600           # never nudge the same lane twice within 6h
+_TASK_GUARD_CLOSED_WINDOW = 6 * 3600      # "just closed its work" horizon
+
+
+def _session_recently_closed_issue(name: str) -> bool:
+    """True if this session's most recent card is closed and was closed lately.
+
+    Distinguishes 'idle with untracked work' (worth a nudge) from 'idle because
+    it finished and closed the card' (the ledger rule working as intended). The
+    second was being nudged identically, which pressures a session to create a
+    placeholder card to silence it — fake work, and exactly what the ledger rule
+    forbids."""
+    try:
+        row = get_db().execute(
+            "SELECT status, updated FROM issues WHERE session=? AND deleted IS NULL "
+            "ORDER BY updated DESC LIMIT 1", (name,)).fetchone()
+        if not row:
+            return False
+        return (str(row["status"] or "").lower() in ("done", "verified", "discarded")
+                and (time.time() - (row["updated"] or 0)) < _TASK_GUARD_CLOSED_WINDOW)
+    except Exception:
+        return False
 
 
 def _task_guard_enabled() -> bool:
@@ -11667,7 +11690,22 @@ def _task_guard(name: str) -> bool:
             return False
         if _session_has_doing_issue(name):
             return False  # already tracking — _complete_session_board_issue will close it
+        # Hard cooldown, independent of the re-arm flag. The nudge is DELIVERED
+        # with send_text, which makes the session active to read it, which
+        # re-arms the flag, which fires the nudge again on the next idle — the
+        # nudge was causing the very activity that reset its own suppression.
+        # Session `random` took 10+ in a row with all its work already done.
+        last = _task_guard_last.get(name, 0)
+        if last and (time.time() - last) < _TASK_GUARD_COOLDOWN:
+            return False
+        # Nothing untracked if the lane just CLOSED its work. A session idle
+        # after marking its card done is the ledger rule working, not a session
+        # hiding work, and telling it otherwise pushes it to invent a card.
+        if _session_recently_closed_issue(name):
+            _task_guard_nudged[name] = True
+            return False
         _task_guard_nudged[name] = True
+        _task_guard_last[name] = time.time()
         msg = ("You went idle but have no board issue tracked as 'doing'. If you just did "
                "real work, record it on the board now so every session stays aware — create "
                "an issue for your session and set its status:\n"
@@ -12505,7 +12543,7 @@ def _evict_stale_caches():
         _model_cache.pop(k, None)
     # Prune session-keyed dicts for sessions that no longer have .env files
     live_sessions = {f.stem for f in CC_SESSIONS.glob("*.env")}
-    for d in (_session_auto_actions, _yolo_last_responded, _last_jsonl_backup, _session_prev_status, _commit_guard_nudged, _commit_guard_cotenant_skip, _task_guard_nudged):
+    for d in (_session_auto_actions, _yolo_last_responded, _last_jsonl_backup, _session_prev_status, _commit_guard_nudged, _commit_guard_cotenant_skip, _task_guard_nudged, _task_guard_last):
         stale_keys = [k for k in d if k not in live_sessions]
         for k in stale_keys:
             d.pop(k, None)
@@ -12524,6 +12562,7 @@ def _cleanup_session_state(name: str):
     _commit_guard_nudged.pop(name, None)
     _commit_guard_cotenant_skip.pop(name, None)
     _task_guard_nudged.pop(name, None)
+    _task_guard_last.pop(name, None)
     with _send_locks_lock:
         _send_locks.pop(name, None)
 
@@ -28971,7 +29010,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.246';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.247';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49799,7 +49838,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.246';
+const CACHE = 'amux-v0.9.247';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
