@@ -5,12 +5,17 @@ name: Cloud browser verify (headless profile save + reuse)
 # separate browser session. Reuse is the part that matters — a profile that
 # saves but doesn't reload is indistinguishable from no profile at all.
 #
-# Deliberately runs inside the container over docker exec rather than through
-# the gateway, so nothing about the result depends on auth, cookies, or proxy
-# behaviour. Everything here is read-only except the throwaway probe profile.
+# Runs inside the container over docker exec rather than through the gateway,
+# so nothing about the result depends on auth, cookies, or proxy behaviour.
+# Read-only except the throwaway probe profile.
 #
-# Every response is printed untruncated: an earlier version cut them with
-# `head -c 400` and an empty body was indistinguishable from a failed call.
+# Two traps this file exists to avoid:
+#  - Request bodies go in over STDIN, never inside `-d '...'`. JS payloads
+#    contain single quotes, which closed the shell's quoting and delivered a
+#    mangled script — the eval then returned null and read as "nothing
+#    persisted" when nothing had ever been written.
+#  - Responses print untruncated. With `head -c 400` an empty body looked
+#    identical to a successful one.
 
 on:
   workflow_dispatch:
@@ -47,11 +52,18 @@ jobs:
             P="/root/.amux/playwright-auth/profiles"
             SITE="http://localhost:8822/"
             ex() { docker exec "$C" sh -lc "$1" 2>&1; }
+
+            # $1 = endpoint, $2 = JSON body (piped in, never shell-quoted)
             api() {
-              docker exec "$C" sh -lc \
-                "curl -sS --max-time 90 -X POST localhost:8822/api/browser/$1 -H 'Content-Type: application/json' -d '$2'; echo \"  [curl exit \$?]\"" 2>&1
+              printf '%s' "$2" | docker exec -i "$C" sh -c \
+                "cat > /tmp/req.json && curl -sS --max-time 90 -X POST \
+                 localhost:8822/api/browser/$1 -H 'Content-Type: application/json' \
+                 -d @/tmp/req.json" 2>&1
             }
-            evl() { api "action" "{\"action\":\"eval\",\"script\":\"$1\",\"session\":\"$2\"}"; }
+            # $1 = JS source, $2 = session. JS may contain single quotes freely.
+            evl() {
+              api action "{\"action\":\"eval\",\"script\":\"$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')\",\"session\":\"$2\"}"
+            }
 
             echo "=== 0. environment ==="
             ex 'cd /app && node -e "console.log(require.resolve(\"playwright\"))"'
@@ -60,7 +72,8 @@ jobs:
             echo
             echo "=== 1. create profile via the UI's own endpoint ==="
             ex "rm -rf $P/$PROF $P/$PROF.log"
-            api "profile/create" "{\"name\":\"$PROF\",\"url\":\"https://example.com\"}"
+            api profile/create "{\"name\":\"$PROF\",\"url\":\"https://example.com\"}"
+            echo
             echo "  waiting for the detached launcher..."
             sleep 25
             echo "  --- launcher log ---"
@@ -69,42 +82,40 @@ jobs:
 
             echo
             echo "=== 2. WRITE through a browser session on that profile ==="
-            api "start" "{\"url\":\"$SITE\",\"session\":\"probe1\",\"profile\":\"$PROF\"}"
-            echo "  origin check:"
-            evl "location.origin" probe1
-            echo "  cookie write:"
-            evl "document.cookie='amux_probe=$TOKEN; path=/; max-age=86400'; document.cookie" probe1
-            echo "  localStorage write:"
-            evl "localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')" probe1
+            api start "{\"url\":\"$SITE\",\"session\":\"probe1\",\"profile\":\"$PROF\"}"
+            echo
+            echo "  origin:        $(evl "location.origin" probe1)"
+            echo "  cookie write:  $(evl "document.cookie='amux_probe=$TOKEN; path=/; max-age=86400'; document.cookie" probe1)"
+            echo "  localSt write: $(evl "localStorage.setItem('amux_probe','$TOKEN'); localStorage.getItem('amux_probe')" probe1)"
             echo "  closing session (graceful close is what flushes storage to disk)"
-            api "stop" "{\"session\":\"probe1\"}"
+            api stop "{\"session\":\"probe1\"}"
+            echo
             sleep 6
 
             echo
             echo "=== 2b. ON-DISK ground truth (independent of any later session) ==="
-            # Cookie names and localStorage keys are stored as plain text inside
-            # the sqlite/leveldb files, so grep -a is enough to prove the write
-            # reached disk without needing sqlite3 in the image.
+            # Cookie names and localStorage keys are plain text inside the
+            # sqlite/leveldb files, so grep -a proves the write reached disk
+            # without needing sqlite3 in the image.
             ex "ls -l '$P/$PROF/Default/Cookies' 2>&1" | sed 's/^/    /'
-            ex "grep -a -q amux_probe '$P/$PROF/Default/Cookies' && echo '    cookie amux_probe IS on disk' || echo '    cookie amux_probe NOT on disk'"
-            ex "grep -a -r -q amux_probe '$P/$PROF/Default/Local Storage/' && echo '    localStorage amux_probe IS on disk' || echo '    localStorage amux_probe NOT on disk'"
+            ex "grep -a -q amux_probe '$P/$PROF/Default/Cookies' 2>/dev/null && echo '    cookie amux_probe IS on disk' || echo '    cookie amux_probe NOT on disk'"
+            ex "grep -a -r -q amux_probe '$P/$PROF/Default/Local Storage/' 2>/dev/null && echo '    localStorage amux_probe IS on disk' || echo '    localStorage amux_probe NOT on disk'"
 
             echo
             echo "=== 3. READ BACK from a SEPARATE session on the same profile ==="
-            api "start" "{\"url\":\"$SITE\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}"
-            echo "  cookie read-back:"
+            api start "{\"url\":\"$SITE\",\"session\":\"probe2\",\"profile\":\"$PROF\",\"fresh\":true}"
+            echo
             CK=$(evl "document.cookie" probe2)
-            echo "$CK" | sed 's/^/    /'
-            echo "  localStorage read-back:"
             LS=$(evl "localStorage.getItem('amux_probe')" probe2)
-            echo "$LS" | sed 's/^/    /'
-            api "stop" "{\"session\":\"probe2\"}" >/dev/null 2>&1
+            echo "  cookie read-back:  $CK"
+            echo "  localSt read-back: $LS"
+            api stop "{\"session\":\"probe2\"}" >/dev/null 2>&1
 
             echo
             echo "=== VERDICT ==="
             OK=0
-            echo "$CK" | grep -q "$TOKEN" && { echo "  cookie   PASS"; OK=1; } || echo "  cookie   fail"
-            echo "$LS" | grep -q "$TOKEN" && { echo "  localSt  PASS"; OK=1; } || echo "  localSt  fail"
+            case "$CK" in *"$TOKEN"*) echo "  cookie       PASS"; OK=1 ;; *) echo "  cookie       fail" ;; esac
+            case "$LS" in *"$TOKEN"*) echo "  localStorage PASS"; OK=1 ;; *) echo "  localStorage fail" ;; esac
             if [ "$OK" = 1 ]; then
               echo "  PASS — profile persisted across separate browser sessions (token $TOKEN survived)"
             else
