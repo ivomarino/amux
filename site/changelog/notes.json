@@ -1,5 +1,23 @@
 [
   {
+    "hash": "5d4afba0e8c2b4d1a9f6e3c7d2b8f4a1e0c9d5b2",
+    "short": "5d4afba",
+    "title": "Sessions now detect transient API errors (529/5xx) and show a blocked state",
+    "date": "2026-07-29",
+    "type": "feat",
+    "tags": ["sessions", "reliability", "overnight", "api-errors"],
+    "description": "When Claude Code hits a 529 (Anthropic at capacity) or any 5xx API error, amux now detects it from the session output and marks the session as blocked — surfacing it visibly on the dashboard instead of leaving it in an ambiguous state. Previously, a 529 overnight would silently stall the agent with no indication in the fleet view. Now blocked sessions are highlighted and can be retried or steered from the dashboard. A follow-up fix (4fa6140) corrected the detection logic after the initial implementation — the scanner now anchors on lines that begin with 'API Error: 5xx' rather than just containing the string, to avoid false positives on sessions that reference the error in prose."
+  },
+  {
+    "hash": "cbd334f3781f6ab4d6bb229281c3618b0474310b",
+    "short": "cbd334f",
+    "title": "Board polling now uses ETag/304 — 3.4MB saved per unchanged poll",
+    "date": "2026-07-29",
+    "type": "fix",
+    "tags": ["performance", "board", "mobile", "network"],
+    "description": "The board polling endpoint now returns an ETag header and handles conditional GET requests with If-None-Match. When the board has not changed since the last poll, the server returns 304 Not Modified with an empty body instead of the full board JSON. In practice this saves approximately 3.4MB per poll cycle when nothing has changed — which is most of the time, especially overnight when agents are working and the board is stable. Significant for mobile users and anyone on a metered connection."
+  },
+  {
     "hash": "d6116f61fd1655ce689a013dfc889cb49274ff5e",
     "short": "d6116f6",
     "title": "Messages tab now filters by kind — human, session, or schedule",
