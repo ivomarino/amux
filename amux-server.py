@@ -7854,6 +7854,14 @@ def _init_db():
         "ALTER TABLE schedules ADD COLUMN done_pattern TEXT",
         "ALTER TABLE schedules ADD COLUMN done_action TEXT NOT NULL DEFAULT 'disable'",
         "ALTER TABLE schedules ADD COLUMN gcal_event_id TEXT",
+        # WHY a run happened. Without this a hand-pressed "Run now" is byte-identical
+        # to a cron fire in the runs list, so an extra same-day fire reads as the
+        # scheduler double-firing. That cost a real investigation (AMUX-1998:
+        # SCHED-108 "re-fired 3x" was one cron fire + two Run-now taps, from an
+        # iPhone and a laptop). Default 'cron' so pre-existing rows stay honest —
+        # they were overwhelmingly cron, and 'cron' is the claim least likely to
+        # invent attribution that was never recorded.
+        "ALTER TABLE schedule_runs ADD COLUMN source TEXT NOT NULL DEFAULT 'cron'",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -9835,7 +9843,7 @@ def _drain_and_fire_sched_events(now: float):
             s = dict(zip(cols, row))
             _sched_last_fire[sid] = now
             slog(f"[sched] event-trigger firing '{s['title']}' → {s.get('session')}")
-            _run_schedule(s)
+            _run_schedule(s, source="trigger:" + (str(s.get("trigger_on") or "event").split(",")[0].strip() or "event"))
             db.execute("UPDATE schedules SET last_run=?, updated=? WHERE id=?",
                        (int(time.time()), int(now), sid))   # last_run = UTC unix, same clock as schedule_runs.ran_at (AMUX-1736)
             db.commit()
@@ -9881,14 +9889,20 @@ def _sched_mutation_by(headers, client_address, body) -> str:
         return "?"
 
 
-def _run_schedule(sched):
+def _run_schedule(sched, source: str = "cron"):
     """Execute a schedule entry — send message to tmux session (kind='tmux')
     or run as shell command (kind='shell'). Logs the run.
-    If watch=1, spawns a background thread to monitor the response."""
+    If watch=1, spawns a background thread to monitor the response.
+
+    `source` records WHY this fire happened — 'cron' (the schedule came due),
+    'trigger:<event>' (an event woke it), or 'manual:<who>' (someone pressed Run
+    now). It is stored on the run row and echoed into the receiving session's
+    message history, so neither the runs list nor the target session has to
+    guess whether an off-cadence fire was the scheduler misbehaving (AMUX-1998)."""
     session = sched["session"]
     command = sched.get("command") or ""
     kind = sched.get("kind") or "tmux"
-    slog(f"[sched] running '{sched['title']}' [{kind}] → {session or '(shell)'}")
+    slog(f"[sched] running '{sched['title']}' [{kind}] ({source}) → {session or '(shell)'}")
     status, note = "ok", None
     # Capture output before sending so we can detect new output later (tmux mode only)
     pre_output = tmux_capture(session, 200) if (kind == "tmux" and sched.get("watch")) else ""
@@ -9911,16 +9925,22 @@ def _run_schedule(sched):
                 slog(f"[sched] send failed for '{sched['title']}': {err}")
             else:
                 # Record in the Messages history so the peek shows scheduled
-                # commands distinctly (origin = the schedule's title).
-                _cmd_hist_record(session, command, "schedule", sched.get("title") or sched.get("id") or "schedule")
+                # commands distinctly (origin = the schedule's title). Off-cadence
+                # fires carry their reason, so the RECEIVING session can tell a
+                # hand-pressed re-run from the scheduler double-firing without
+                # opening the runs list (AMUX-1998).
+                _origin = sched.get("title") or sched.get("id") or "schedule"
+                if source and source != "cron":
+                    _origin = f"{_origin} [{source}]"
+                _cmd_hist_record(session, command, "schedule", _origin)
     except Exception as e:
         status, note = "error", str(e)
         slog(f"[sched] exception running '{sched['title']}': {e}")
     try:
         db = get_db()
         db.execute(
-            "INSERT INTO schedule_runs (schedule_id, ran_at, status, note) VALUES (?,?,?,?)",
-            (sched["id"], int(time.time()), status, note)
+            "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) VALUES (?,?,?,?,?)",
+            (sched["id"], int(time.time()), status, note, (source or "cron")[:64])
         )
         db.execute(
             "UPDATE schedules SET run_count = COALESCE(run_count,0) + 1 WHERE id=?",
@@ -10002,16 +10022,16 @@ def _watch_schedule_response(sched, pre_output: str):
             slog(f"[sched-watch] disabled schedule '{sched['title']}'")
             # Log the auto-disable as a run note
             db.execute(
-                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note) VALUES (?,?,?,?)",
-                (sched_id, now_ts, "done", f"Auto-disabled: matched '{done_pattern}'")
+                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) VALUES (?,?,?,?,?)",
+                (sched_id, now_ts, "done", f"Auto-disabled: matched '{done_pattern}'", "watch")
             )
             db.commit()
         elif done_action == "notify":
             _push_alert("scheduler", session,
                          f"Schedule '{sched['title']}' — done pattern matched: {done_pattern}")
             db.execute(
-                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note) VALUES (?,?,?,?)",
-                (sched_id, now_ts, "done", f"Pattern matched (notify only): '{done_pattern}'")
+                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) VALUES (?,?,?,?,?)",
+                (sched_id, now_ts, "done", f"Pattern matched (notify only): '{done_pattern}'", "watch")
             )
             db.commit()
         elif done_action.startswith("command:"):
@@ -10020,8 +10040,8 @@ def _watch_schedule_response(sched, pre_output: str):
             db.execute("UPDATE schedules SET enabled=0, updated=? WHERE id=?", (now_ts, sched_id))
             _sched_audit(sched_id, "enabled", 1, 0, "watch-done-command")
             db.execute(
-                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note) VALUES (?,?,?,?)",
-                (sched_id, now_ts, "done", f"Matched '{done_pattern}' → sent: {follow_up}")
+                "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) VALUES (?,?,?,?,?)",
+                (sched_id, now_ts, "done", f"Matched '{done_pattern}' → sent: {follow_up}", "watch")
             )
             db.commit()
             _push_alert("scheduler", session,
@@ -10070,7 +10090,7 @@ def _scheduler_loop():
             cols = [d[0] for d in db.execute("SELECT * FROM schedules LIMIT 0").description]
             for row in due:
                 sched = dict(zip(cols, row))
-                _run_schedule(sched)
+                _run_schedule(sched, source="cron")
                 _sched_last_fire[sched["id"]] = now  # cron fire counts toward event cooldown
                 now_ts = int(time.time())
                 if sched["sched_type"] == "once":
@@ -28522,7 +28542,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.231';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.232';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38337,6 +38357,19 @@ async function fetchSchedulerRuns() {
   }
 }
 
+// Why a run happened. Only NON-cron sources get a chip: a cron fire is the
+// expected case, and chipping every row would bury the one row that explains an
+// off-cadence fire. Silence means "the schedule came due" (AMUX-1998).
+function _schedRunSrcChip(src) {
+  const s = String(src || 'cron');
+  if (s === 'cron') return '';
+  const kind = s.split(':')[0];
+  const label = kind === 'manual' ? 'run now' : kind === 'trigger' ? 'trigger' : kind === 'watch' ? 'watch' : kind;
+  const color = kind === 'manual' ? 'var(--accent)' : 'var(--dim)';
+  return `<span style="flex-shrink:0;font-size:0.62rem;padding:1px 5px;border-radius:4px;`
+       + `border:1px solid ${color};color:${color};white-space:nowrap;" title="${esc(s)}">${esc(label)}</span>`;
+}
+
 // ── Scheduler helpers ──────────────────────────────────────────────────────
 function relTime(val) {
   if (!val) return '—';
@@ -38583,6 +38616,7 @@ function renderScheduler(opts) {
       return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:0.75rem;min-width:0;">
         <span style="color:${okColor};font-weight:600;min-width:28px;flex-shrink:0;">${esc(r.status)}</span>
         <span style="color:var(--dim);white-space:nowrap;flex-shrink:0;" title="${esc(fullDate)}">${esc(timeStr)}</span>
+        ${_schedRunSrcChip(r.source)}
         <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${esc(r.title || r.schedule_id)}</span>
         ${r.note ? `<span style="color:var(--red);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0;" title="${esc(r.note)}">${esc(r.note)}</span>` : ''}
       </div>`;
@@ -49118,7 +49152,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.231';
+const CACHE = 'amux-v0.9.232';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53239,7 +53273,7 @@ class CCHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/api/schedules/runs":
                 db = get_db()
                 rows = db.execute(
-                    "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, s.title "
+                    "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, sr.source, s.title "
                     "FROM schedule_runs sr LEFT JOIN schedules s ON s.id = sr.schedule_id "
                     "ORDER BY sr.ran_at DESC LIMIT 50"
                 ).fetchall()
@@ -53334,7 +53368,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 sid_for_runs = sched_id[:-5]  # strip "/runs"
                 db = get_db()
                 rows = db.execute(
-                    "SELECT id, schedule_id, ran_at, status, note FROM schedule_runs "
+                    "SELECT id, schedule_id, ran_at, status, note, source FROM schedule_runs "
                     "WHERE schedule_id=? ORDER BY ran_at DESC LIMIT 20",
                     (sid_for_runs,)
                 ).fetchall()
@@ -53350,7 +53384,11 @@ class CCHandler(BaseHTTPRequestHandler):
                     self._json({"error": "not found"}, 404); return
                 cols = _sched_cols(db)
                 sched = _sched_row_to_dict(row, cols)
-                _run_schedule(sched)
+                # Attribute the tap. `{}` for body on purpose: this endpoint takes no
+                # payload, and a claimed 'by' from a body we never parse would be a
+                # fabricated attribution. Header (verified) → cloud email → IP.
+                _run_schedule(sched, source="manual:" + _sched_mutation_by(
+                    self.headers, self.client_address, {}))
                 _run_ts = int(_time.time())
                 db.execute("UPDATE schedules SET last_run=?, updated=? WHERE id=?",
                            (_run_ts, _run_ts, sid_for_run))   # last_run = UTC unix (AMUX-1736)
