@@ -1445,12 +1445,22 @@ const dir = process.argv[2], url = process.argv[3] || 'about:blank';
   // Capability-driven, never an IS_CLOUD branch: DISPLAY present => headed.
   const headless = process.env.AMUX_BROWSER_HEADLESS === '1'
     || (!process.env.DISPLAY && process.platform === 'linux');
-  const ctx = await chromium.launchPersistentContext(dir, {
+  // Use whatever browser this machine actually has. The cloud image ships
+  // branded Chrome only (no playwright-chromium), so launching plain chromium
+  // failed silently in a detached process and the profile dir was never
+  // created. Try the installed Chrome first, fall back to bundled chromium.
+  const opts = {
     headless,
     ignoreHTTPSErrors: true,
     viewport: null,
     args: ['--no-first-run', '--no-default-browser-check'],
-  });
+  };
+  let ctx;
+  try {
+    ctx = await chromium.launchPersistentContext(dir, { ...opts, channel: 'chrome' });
+  } catch (e) {
+    ctx = await chromium.launchPersistentContext(dir, opts);
+  }
   const page = ctx.pages()[0] || await ctx.newPage();
   try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
   // Resolve when the user closes the window. Persistent context writes its
@@ -1488,7 +1498,8 @@ def _bu_profile_signin(name: str, url: str) -> dict:
         subprocess.Popen(
             ["node", str(script), str(d), url or "about:blank"],
             cwd=str(Path(__file__).resolve().parent),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=open(str(d.parent / f"{safe}.log"), "ab"),
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except Exception as e:
@@ -8556,6 +8567,67 @@ _TASK_SUMMARY_MIN_GAP = float(os.environ.get("AMUX_TASK_LABEL_GAP_SECS", "600"))
 # Imperatives are fine (a task legitimately says "Disable Rate Throttling"); a
 # PROHIBITION is the shape an agent complies with without re-deriving it.
 _PROHIBITIVE_LABEL_RE = re.compile(r"^\s*(no|never|don'?t|do\s+not)\b", re.IGNORECASE)
+
+
+def _autotask_enabled() -> bool:
+    """Whether EVERY human command should land on the board. Pref, default on."""
+    try:
+        row = get_db().execute("SELECT value FROM prefs WHERE key='board_autotask'").fetchone()
+        return (row["value"] if row else "1") != "0"
+    except Exception:
+        return True
+
+
+_AUTOTASK_MIN_CHARS = 12
+_AUTOTASK_SKIP = {
+    # Control words that steer the CURRENT task rather than starting a new one.
+    # A card for "continue" is noise that buries the cards that mean something.
+    "continue", "go", "yes", "y", "no", "n", "ok", "okay", "yep", "yeah", "sure",
+    "stop", "wait", "retry", "again", "next", "done", "thanks", "ty", "k",
+    "proceed", "resume", "keep going", "carry on", "do it", "sounds good",
+}
+
+
+def _autotask_title(text: str) -> str:
+    """Derive a readable card title from the prompt itself.
+
+    Deliberately does NOT call the model. The existing labeller shells out to
+    `claude -p`, which pays a full CLI boot (~12-15k input tokens) for a 3-word
+    label — that cost is exactly why auto-create was throttled to one per 10
+    minutes per session, which is why most commands never reached the board.
+    A real instruction is usually already descriptive, so the first clause of it
+    is a better title than a paraphrase, and it is free."""
+    t = re.sub(r"^\[.*?\]\s*", "", text or "").strip()           # drop "[03:47 PM] "
+    t = re.sub(r"^\[amux-origin:.*?\]\s*", "", t, flags=re.S)     # drop relay stamps
+    t = re.sub(r"\s+", " ", t)
+    # First sentence/clause, so a long multi-paragraph brief still titles cleanly.
+    m = re.split(r"(?<=[.!?])\s|\n|  +|;\s", t, maxsplit=1)
+    head = (m[0] if m else t).strip(" -–—:")
+    if len(head) > 88:
+        head = head[:85].rsplit(" ", 1)[0] + "…"
+    return head or (t[:60] or "Task")
+
+
+def _autotask_from_command(session_name: str, text: str):
+    """One board card per human command, when the toggle is on.
+
+    The user should not have to remember to file the work; the board is only a
+    source of truth if it captures what was actually asked without anyone
+    thinking about it. Skips pure control words ('continue', 'yes') — those
+    steer the task already in flight rather than starting a new one, and a card
+    for each would bury the cards that mean something."""
+    if not _autotask_enabled():
+        return
+    try:
+        stripped = re.sub(r"^\[.*?\]\s*", "", text or "").strip().lower().rstrip(".!?")
+        if len(stripped) < _AUTOTASK_MIN_CHARS or stripped in _AUTOTASK_SKIP:
+            return
+        threading.Thread(
+            target=_auto_create_board_issue,
+            args=(session_name, _autotask_title(text), text),
+            daemon=True, name=f"autotask-{session_name}").start()
+    except Exception as e:
+        slog(f"[autotask] {session_name}: {e}")
 
 
 def _summarize_task_bg(session_name: str, text: str):
@@ -21361,6 +21433,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             </label>
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Pick &quot;Resume from summary&quot; automatically when the old-session dialog appears</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">Auto-file every command as a task</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="autotask-checkbox" onchange="toggleAutotask(this.checked)" checked>
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Every command you send becomes a board issue, so the board is the source of truth without you filing anything. Control words (&quot;continue&quot;, &quot;yes&quot;) are skipped.</div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -23794,6 +23874,26 @@ async function toggleAutoCompact(checked) {
     body: JSON.stringify({ key: 'auto_compact_enabled', value: checked ? '1' : '0' })
   });
 }
+async function toggleAutotask(checked) {
+  await fetch('/api/prefs', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ key: 'board_autotask', value: checked ? '1' : '0' })
+  });
+  if (typeof showToast === 'function') {
+    showToast(checked ? 'Every command will be filed as a task' : 'Auto-filing off');
+  }
+}
+(async function initAutotask() {
+  try {
+    const r = await fetch('/api/prefs?key=board_autotask');
+    const d = await r.json();
+    const cb = document.getElementById('autotask-checkbox');
+    // Default ON when unset — the whole point is that it works without being
+    // turned on, so an absent pref must not read as disabled.
+    if (cb) cb.checked = String((d && d.value) ?? '1') !== '0';
+  } catch (e) {}
+})();
+
 async function toggleAutoResume(checked) {
   await fetch('/api/prefs', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -29097,7 +29197,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.249';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.250';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49925,7 +50025,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.249';
+const CACHE = 'amux-v0.9.250';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58376,6 +58476,11 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     # re-deriving them — and the board outlives the conversation that
                     # would have corrected it (social-media, 2026-07-27).
                     if not _defer_busy:
+                        # Every command lands on the board (toggle: board_autotask).
+                        # Runs alongside the throttled model-labeller rather than
+                        # replacing it: this one is free and always fires, that one
+                        # occasionally improves a title.
+                        _autotask_from_command(name, _orig_text)
                         _summarize_task_bg(name, _orig_text)  # the human's prompt
                     if not str(msg).startswith("queued"):   # steering enqueue emits message.queued itself
                         _emit_event(name, "message.sent",
