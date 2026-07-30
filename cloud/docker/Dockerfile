@@ -38,10 +38,14 @@ RUN npm install playwright \
 # /usr/local/bin/browser-use), with playwright underneath — the node package
 # alone is not enough. Verify both entrypoints exist at build time so this
 # capability cannot ship broken the way the claude CLI did.
-RUN pip install --no-cache-dir browser-use playwright \
+# PIN to the version local runs. browser-use 3.x removed --json and the
+# preset subcommands amux drives, so an unpinned install builds fine and
+# then fails at runtime — exactly the class of break this file now guards.
+RUN pip install --no-cache-dir 'browser-use==0.12.2' playwright \
     && python -m playwright install chromium \
     && test -x /usr/local/bin/browser-use \
-    && echo "browser-use verified at build time"
+    && browser-use --help 2>&1 | grep -q -- "--json" \
+    && echo "browser-use 0.12.2 verified at build time (--json present)"
 
 COPY amux-server.py .
 
