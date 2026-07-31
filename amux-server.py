@@ -29426,7 +29426,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.275';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.276';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49699,7 +49699,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.275';
+const CACHE = 'amux-v0.9.276';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -59322,7 +59322,20 @@ def _watch_self(server):
     except ValueError:
         _DEBOUNCE = 30  # seconds to wait for edits to settle
     script = Path(__file__).resolve()
+    # Baseline from PROCESS START, not thread start. The watcher thread comes up
+    # ~11s into boot; an edit landing in that window used to be captured INTO the
+    # baseline and silently swallowed — the server ran new-briefing/old-version
+    # code for 15+ minutes on 2026-07-31 with no reload ever firing, and the
+    # "poll APP_VER after every edit" ritual exists because of this class.
+    # _server_start_time is set at import, milliseconds after this source was read.
     mtime = script.stat().st_mtime
+    try:
+        if mtime > _server_start_time:
+            slog(f"[restart] source changed during boot window ({mtime - _server_start_time:.1f}s after start) — reloading now")
+            new_mtime = mtime
+            mtime = 0  # force the change-detected branch on the first tick
+    except Exception:
+        pass
     while True:
         time.sleep(1)
         try:
