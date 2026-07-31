@@ -50,6 +50,25 @@ jobs:
             docker exec "$C" sh -lc 'curl -s localhost:8822/health' 2>&1 \
               | tr ',' '\n' | grep -E '"(build|uptime_s)"' | sed 's/^/  /'
 
+            # The server file hash identifies amux-server.py and says NOTHING
+            # about the IMAGE — which matters whenever a fix lives in the
+            # Dockerfile rather than the source. AC-153's autostart ENV is
+            # exactly that case: a container can carry the new server code and
+            # still predate the image that sets the flag, and without these
+            # three lines "the flag is set and did nothing" is indistinguishable
+            # from "the flag was never set".
+            echo "=== container provenance (image vs source are different facts) ==="
+            docker inspect "$C" --format 'image={{.Image}}' 2>&1 | sed 's/^/     /'
+            docker inspect "$C" --format 'image_name={{.Config.Image}}' 2>&1 | sed 's/^/     /'
+            docker inspect "$C" --format 'created={{.Created}}' 2>&1 | sed 's/^/     /'
+            docker inspect "$C" --format 'started={{.State.StartedAt}}' 2>&1 | sed 's/^/     /'
+            echo "  AMUX_AUTOSTART_SESSIONS in container env:"
+            docker exec "$C" sh -lc 'printenv AMUX_AUTOSTART_SESSIONS || echo "(unset)"' 2>&1 \
+              | sed 's/^/     /'
+            echo "  ...and in server.env (the other way it can arrive):"
+            docker exec "$C" sh -lc 'grep -s AMUX_AUTOSTART_SESSIONS /root/.amux/server.env || echo "(absent)"' 2>&1 \
+              | sed 's/^/     /'
+
             echo
             echo "=== stage probe (SHIPPED functions vs LIVE pane) ==="
             docker exec -i "$C" python3 - "$SESSION" <<'PROBE'
