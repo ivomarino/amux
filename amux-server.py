@@ -4388,6 +4388,17 @@ _RATE_LIMIT_RESET_MONTHDAY_RE = re.compile(
 # the 5-hour /rate-limit-options prompt). Detecting it lets amux record the
 # reset time so badges, bulk actions and auto-resume treat it like any other
 # rate limit. e.g. "You've hit your weekly limit · resets Jun 26 at 5am (...)".
+# Non-Claude provider limit banners (ethos D1: scrape allowed only because the
+# provider exposes this state nowhere else). Codex's cap banner sat on a session
+# card that read HEALTHY while the agent was hard-stopped until Aug 27 — found
+# by the gates-adherence probe, filed as AMUX-2088. Routed down the CREDIT path
+# (badge, no auto-resume), matched only against the live region's tail, and
+# spans are bounded (.{0,N}) so DOTALL can't stitch prose to a distant mention.
+_PROVIDER_LIMIT_RES = [
+    ("codex", re.compile(r"You've hit your usage limit\..{0,160}?(?:Codex|ChatGPT)", re.IGNORECASE | re.DOTALL)),
+    ("gemini", re.compile(r"(?:Quota exceeded|You have reached your (?:daily )?quota).{0,80}Gemini", re.IGNORECASE | re.DOTALL)),
+]
+
 _WEEKLY_LIMIT_RE = re.compile(
     r"(?:you'?ve\s+)?(?:hit|reached)\s+your\s+(?:weekly|usage)\s+limit",
     re.IGNORECASE,
@@ -4906,6 +4917,31 @@ def _rate_limit_auto_respond():
             # bulk action. Require the exact position, corroborated by the
             # banner prose just above it.
             _live_ne = [l for l in live.splitlines() if l.strip()]
+            # Non-Claude provider caps (codex/gemini) — checked BEFORE the
+            # Claude classification is acted on, because codex phrases its cap
+            # "You've hit your usage limit", which _WEEKLY_LIMIT_RE also
+            # matches: the AMUX-2088 probe classified a codex cap as a Claude
+            # weekly limit and scheduled auto-resume off "8:00 PM" lifted from
+            # the WRONG provider's banner (actual codex reset: Aug 27). On a
+            # provider hit the banner flags are cleared and the session routes
+            # down the CREDIT path — badge + is:gated + hard-gate alert, no
+            # reset time, no auto-resume nudging a lane amux cannot un-cap.
+            # Searched over the SAME `live` region as the Claude banner
+            # regexes, deliberately wider than the credit gates' tail-only
+            # window: this check exists to disambiguate, so any placement
+            # where _WEEKLY_LIMIT_RE can see the codex banner must be one the
+            # provider check sees too (tail-8 left a 9..30-line band where the
+            # codex banner re-classified as Claude-weekly). Text that would
+            # false-positive here already false-positives the weekly regex on
+            # the same words, so precedence cannot widen the blast radius —
+            # and the two-scan persistence gate applies to this flag too.
+            _provider_hit = ""
+            if matched_idx < 0:
+                for _pname, _pre in _PROVIDER_LIMIT_RES:
+                    if _pre.search(live):
+                        _provider_hit = _pname
+                        is_weekly = is_session_banner = is_banner = False
+                        break
             _is_menu_gate = bool(
                 _live_ne
                 and _MODEL_CREDIT_MENU_RE.search(_live_ne[-1])
@@ -4923,8 +4959,9 @@ def _rate_limit_auto_respond():
             _is_banner_gate = bool(
                 _MODEL_CREDIT_LIMIT_RE.search("\n".join(_live_ne[-5:]))
                 and _MODEL_CREDIT_LIMIT_CTX_RE.search("\n".join(_live_ne[-5:])))
-            _credit_raw = (matched_idx < 0 and not is_banner
-                           and (_is_banner_gate or _is_menu_gate))
+            _credit_raw = bool(_provider_hit) or (
+                matched_idx < 0 and not is_banner
+                and (_is_banner_gate or _is_menu_gate))
             # PERSISTENCE GATE. No regex fully separates "this session is gated"
             # from "this session is displaying text about the gate" — the source
             # file documenting these very patterns matches them, so any session
@@ -4992,7 +5029,7 @@ def _rate_limit_auto_respond():
                 # Same tail restriction: a model name lifted from prose higher up
                 # would mislabel the badge even when the gate itself is real.
                 m = _MODEL_CREDIT_NAME_RE.search("\n".join(_live_ne[-6:]))
-                actions["rate_limit_model_name"] = (
+                actions["rate_limit_model_name"] = _provider_hit or (
                     (m.group(1) or m.group(2) or "").strip() if m else "")
                 actions["rate_limit_last_event_ts"] = int(now)
                 actions.pop("rate_limit_reset_at", None)
@@ -29740,7 +29777,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.289';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.290';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50015,7 +50052,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.289';
+const CACHE = 'amux-v0.9.290';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
