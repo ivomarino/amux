@@ -29,6 +29,7 @@ jobs:
         run: |
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 "TOKEN='$TOKEN' bash -s" <<'ENDSSH'
             FAIL=0
+            ASSERTED=0
             for C in $(docker ps --filter name=amux-user- --format '{{.Names}}' | sort); do
               ORG="${C#amux-user-}"
               ex() { docker exec "$C" sh -lc "$1" 2>&1; }
@@ -58,6 +59,9 @@ jobs:
               case "$GOT" in
                 *"$TOKEN"*) echo "     files: WRITE+READ OK" ;;
                 *)          echo "     files: FAILED -> $(echo "$GOT" | head -c 200)"; FAIL=1 ;;
+              esac
+              ASSERTED=1
+              case x in x)
               esac
               ex "rm -f $F"
 
@@ -90,6 +94,13 @@ jobs:
             done
             echo
             echo "=== VERDICT ==="
+            # A verdict that cannot fail is worse than the bug it was meant to
+            # catch: a broken loop body once printed PASS having asserted
+            # nothing. Require evidence that at least one assertion actually ran.
+            if [ "$ASSERTED" = 0 ]; then
+              echo "  FAIL — no workspace was actually asserted; the run proved nothing"
+              exit 1
+            fi
             [ "$FAIL" = 0 ] && echo "  PASS — every non-empty workspace is readable and editable" \
                             || { echo "  FAIL — see surfaces marked FAILED above"; exit 1; }
           ENDSSH

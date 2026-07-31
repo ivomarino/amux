@@ -105,6 +105,19 @@ jobs:
             ex "ls /root/.config/google-chrome/SingletonLock >/dev/null 2>&1 && echo '    SingletonLock still present => Chrome did NOT exit cleanly' || echo '    SingletonLock gone => clean Chrome exit'"
 
             echo
+            echo "=== 2a. DECISIVE READ: what dir is Chrome ACTUALLY using? ==="
+            # Everything else here infers the profile from where bytes land on
+            # disk. This reads it from the process itself. If --profile-directory
+            # is absent, or --user-data-dir points at a temp path, then browser-use
+            # is not honouring the named profile and no amount of flush-waiting
+            # will make a login persist -- the fix is to drive Playwright directly
+            # for the profile-backed backend.
+            echo "  chrome processes:"
+            ex 'for p in $(pgrep -f "chrome|chromium" 2>/dev/null); do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null; echo; done' | sed 's/^/     /'
+            echo "  profile-relevant flags (deduped):"
+            ex 'for p in $(pgrep -f "chrome|chromium" 2>/dev/null); do tr "\\0" "\\n" < /proc/$p/cmdline 2>/dev/null; done | grep -e "--user-data-dir" -e "--profile-directory" | sort -u' | sed 's/^/     /'
+            echo "  (empty above = no chrome running at this point, NOT a pass)"
+
             echo "=== 2b. ON-DISK ground truth (independent of any later session) ==="
             # Cookie names and localStorage keys are plain text inside the
             # sqlite/leveldb files, so grep -a proves the write reached disk
@@ -122,7 +135,9 @@ jobs:
               ex "grep -a -r -q amux_probe '$D' 2>/dev/null && echo '     token IS somewhere under this dir' || echo '     token not under this dir'"
             done
             echo "  -- chrome user-data-dir contents:"
-            ex "ls /root/.config/google-chrome/ 2>&1 | head -10" | sed 's/^/     /'
+            # NOT truncated: a head -10 here is what cut off the entry that
+            # mattered and produced the wrong conclusion twice (handoff rule 3).
+            ex "ls -la /root/.config/google-chrome/ 2>&1" | sed 's/^/     /'
 
             echo
             echo "=== 3. READ BACK from a SEPARATE session on the same profile ==="
