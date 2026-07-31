@@ -3863,7 +3863,7 @@ def _session_cc_tasks(name: str) -> dict:
         if raw:
             clean = _STRIP_ANSI.sub("", raw)
             i = clean.rfind("Claude Code v")
-            if i >= 0 and "⏺" not in clean[i:]:
+            if i >= 0 and "⏺" not in clean[i:] and "●" not in clean[i:]:
                 return {"tasks": [], "counts": {}, "active": None, "total": 0}
         tasks = []
         for jf in tdir.glob("[0-9]*.json"):
@@ -4236,6 +4236,12 @@ def _render_session_transcript(name: str, max_chars: int = 40000) -> str:
                     # ⏺ bullet and renders prose in the default fg (not dim);
                     # continuation lines indent 2 cols under the bullet.
                     body = _md_to_ansi(txt).replace("\n", "\n  ")
+                    # NOTE (AMUX-2118): this ⏺ is amux's PRESENTATION choice.
+                    # The live pane may show ● instead (Claude Code's fallback
+                    # glyph on terminals without U+23FA). peek `history` is a
+                    # reconstruction from the JSONL — never source pane-parsing
+                    # fixtures from it; use `live`/tmux capture, which is what
+                    # the detectors actually read.
                     out.append("\x1b[38;5;231m⏺\x1b[39m " + body + "\x1b[0m")
                 out.append("")
             elif bt == "tool_use":
@@ -16403,12 +16409,15 @@ def _agent_panel(clean: str):
     while i >= 0:
         s = lines[i].strip()
         body = s.lstrip("❯ \xa0").strip()
-        if body[:1] in ("⏺", "◯"):
+        # Both glyph families: Claude Code draws ⏺/◯ where the terminal
+        # supports them and ●/○ where it does not (cloud containers) — the
+        # pane is ground truth, and it varies (AMUX-2118).
+        if body[:1] in ("⏺", "◯", "●", "○"):
             # Row layout: "type  title <wide column gap> timer · tokens" —
             # keep only the left column, single-spaced.
             label = re.split(r"\s{4,}", body[1:].strip())[0]
             rows.append({"cursor": s.startswith("❯"),
-                         "viewed": body[:1] == "⏺",
+                         "viewed": body[:1] in ("⏺", "●"),
                          "label": re.sub(r"\s+", " ", label)})
             i -= 1
             continue
@@ -30229,7 +30238,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.297';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.298';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30551,7 +30560,7 @@ function _markAgentRows(html) {
   const rowIdx = [];
   while (i >= 0) {
     const t = textOf(lines[i]).trim().replace(/^[❯  ]+/, '');
-    if (t[0] === '⏺' || t[0] === '◯') { rowIdx.push(i); i--; continue; }
+    if ('⏺●'.includes(t[0]) || '◯○'.includes(t[0])) { rowIdx.push(i); i--; continue; }
     break;
   }
   if (rowIdx.length < 2) return html;   // a panel always has main + ≥1 agent
@@ -31634,7 +31643,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
         // Only a VISIBLE panel row counts. The '← for agents / ↓ to manage'
         // status-bar hint is not enough: with rows hidden ↓ opens the
         // background-shells manager, so there is nothing safe to switch.
-        return t === '⏺ main' || t === '◯ main';
+        return ['⏺ main', '◯ main', '● main', '○ main'].includes(t);
       });
       agentNavEl.style.display = _hasAgents ? 'flex' : 'none';
     }
@@ -50514,7 +50523,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.297';
+const CACHE = 'amux-v0.9.298';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
