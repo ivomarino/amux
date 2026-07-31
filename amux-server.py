@@ -9076,8 +9076,27 @@ def _pickup_next_board_task(session_name: str):
         #   my own. The first card this loop handed a session after going
         #   fleet-wide was AMUX-1848, titled "[probe-stale] 1784823029868" with
         #   47 folds.
+        #   CAPTURED PROMPTS — a card whose whole body is one harvested
+        #   conversational turn. Talking to an agent created cards, pickup
+        #   dispatched them back to that same agent, and its replies produced
+        #   more: a closed loop. On 2026-07-30 it emitted eight in a row to one
+        #   session (AC-129..AC-136), including "/compact" and two duplicate
+        #   pairs of the same turn. None was a unit of work, so no gate could be
+        #   honestly satisfied and none could be cleared — they re-queue after
+        #   the cooldown forever. Matches ONLY when the desc is nothing but the
+        #   prompt block, so a real card that quotes its originating prompt
+        #   alongside actual content is unaffected.
         _folds = len(re.findall(r"New task:", desc))
+        _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
+                       (desc or "").strip(), re.S)
+        _prompt_only = ""
+        if _pm:
+            _body = _pm.group(1).strip()
+            _prompt_only = ("harness slash command, not a task"
+                            if _body.startswith("/")
+                            else "captured chat prompt, not a unit of work")
         _junk = ("journal card ({} folded tasks)".format(_folds) if _folds >= 2
+                 else _prompt_only if _prompt_only
                  else "looks like a test artifact"
                  if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
                               title or "", re.I) else "")
@@ -24588,6 +24607,66 @@ function _fmtClock(ts) {
   const t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
   return ts >= today.getTime() ? t : (d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + t);
 }
+// ── Latency probe ───────────────────────────────────────────────────────────
+// Measures round-trip time to the amux server from THIS device, which is the
+// number that matters when the dashboard feels slow over Tailscale or cellular
+// — server-side timings cannot see the network in between.
+//
+// Uses a real endpoint rather than a synthetic one: /api/ping would measure a
+// path nothing else takes. Samples several times and reports min/median/max,
+// because a single sample on a mobile radio is mostly noise. Cache-busted so a
+// 304 does not time an empty round trip.
+function _pingWidgetHtml() {
+  return '<div id="ping-box" style="border-top:1px solid var(--border);padding:10px 0 4px;">'
+    + '<div style="display:flex;align-items:center;gap:8px;">'
+    + '<button id="ping-btn" onclick="_runPing()" style="min-height:36px;padding:5px 12px;border:1px solid var(--border);'
+    + 'border-radius:7px;background:var(--card);color:var(--text);font-size:0.8rem;font-weight:600;cursor:pointer;">Ping server</button>'
+    + '<span id="ping-out" style="font-size:0.8rem;color:var(--dim);font-variant-numeric:tabular-nums;">measure round-trip latency</span>'
+    + '</div><div id="ping-detail" style="font-size:0.72rem;color:var(--dim);margin-top:5px;"></div></div>';
+}
+
+async function _runPing(n) {
+  const btn = document.getElementById('ping-btn');
+  const out = document.getElementById('ping-out');
+  const det = document.getElementById('ping-detail');
+  if (!out) return;
+  const N = n || 5;
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+  const ms = [];
+  let failed = 0;
+  for (let i = 0; i < N; i++) {
+    if (out) out.textContent = 'pinging ' + (i + 1) + '/' + N + '…';
+    const t0 = performance.now();
+    try {
+      // no-store + a unique query defeats both the HTTP cache and the ETag/304
+      // path, so this times a real request instead of a revalidation.
+      const r = await fetch(API + '/api/version-check?_p=' + Date.now() + '_' + i,
+                            { cache: 'no-store' });
+      await r.text();
+      ms.push(performance.now() - t0);
+    } catch (e) { failed++; }
+    await new Promise(r => setTimeout(r, 120));
+  }
+  if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+  if (!ms.length) {
+    out.innerHTML = '<span style="color:#f85149;">unreachable</span>';
+    if (det) det.textContent = N + '/' + N + ' requests failed — the server is not answering from this device.';
+    return;
+  }
+  const sorted = [...ms].sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)];
+  const lo = sorted[0], hi = sorted[sorted.length - 1];
+  const col = med < 80 ? '#3fb950' : med < 250 ? '#facc15' : '#f85149';
+  out.innerHTML = '<b style="color:' + col + ';">' + Math.round(med) + ' ms</b>'
+                + '<span style="color:var(--dim);"> median</span>';
+  if (det) {
+    det.textContent = 'min ' + Math.round(lo) + ' · max ' + Math.round(hi)
+      + ' · ' + ms.length + '/' + N + ' ok'
+      + (failed ? ' · ' + failed + ' failed' : '')
+      + ' · ' + (location.protocol === 'https:' ? 'https' : 'http') + ' to ' + location.host;
+  }
+}
+
 function showConnHistory() {
   const eps = _connEpisodes();
   const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
@@ -24625,7 +24704,7 @@ function showConnHistory() {
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
     + '<span style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
     + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Disconnections from this device (this browser)</div>'
-    + rows + pendingHtml + clearHtml + '</div>';
+    + _pingWidgetHtml() + rows + pendingHtml + clearHtml + '</div>';
   document.body.appendChild(modal);
 }
 
