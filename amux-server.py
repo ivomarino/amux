@@ -50411,7 +50411,11 @@ function _graphBuildFilters() {
   });
   el.innerHTML = folders.map(f => {
     const c = _graphFolderColor(f);
-    return `<button class="graph-filter-btn active" data-folder="${f}" onclick="_graphToggleFilter('${f}',this)" style="background:${c};color:#fff;border-color:transparent;">${f}</button>`;
+    // f is a folder name: an Obsidian directory for the notes graph, a
+    // department for the fleet. Both reach an HTML attribute AND a
+    // single-quoted JS string, so each layer needs its own escape — esc() for
+    // the attribute, escJs() for the JS string (esc alone leaves "'" intact).
+    return `<button class="graph-filter-btn active" data-folder="${esc(f)}" onclick="_graphToggleFilter('${escJs(f)}',this)" style="background:${c};color:#fff;border-color:transparent;">${esc(f)}</button>`;
   }).join('');
 }
 
@@ -50798,10 +50802,21 @@ function _graphOpenPanel(node) {
     </div>`;
     html += `<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">
       ${node.task ? esc(node.task) : 'no card in flight'}</div>`;
-    html += `<button onclick="_graphOpenSession('${esc(node.session)}')"
+    html += `<button id="graph-side-open"
       style="width:100%;min-height:34px;padding:7px 10px;background:var(--accent);color:#fff;border:none;
       border-radius:6px;font-size:0.75rem;font-family:inherit;cursor:pointer;">Open session</button>`;
     body.innerHTML = html;
+    // The session name is passed through a closure, never interpolated into an
+    // onclick attribute. esc() deliberately does NOT escape "'" (see its own
+    // comment), so esc(name) inside a single-quoted JS string is a breakout the
+    // moment a name carries a quote — escJs() is the helper for that shape.
+    // _VALID_SESSION_NAME_RE keeps quotes out today, but it is enforced on the
+    // API's creation paths, while this projection reads the sessions DIRECTORY;
+    // a file placed there by any other means never meets that regex. Binding
+    // the handler needs no escaping to be correct, so it cannot rot if that
+    // coupling changes.
+    const _ob = document.getElementById('graph-side-open');
+    if (_ob) _ob.addEventListener('click', () => _graphOpenSession(node.session));
     document.getElementById('graph-side-links').innerHTML = '';
     panel.classList.add('open');
     return;
