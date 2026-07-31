@@ -8685,6 +8685,11 @@ def _init_db():
         # evidence update wiped it. log is system-owned: written only by
         # _append_board_log, deliberately absent from the PATCH allow-list.
         "ALTER TABLE issues ADD COLUMN log TEXT",
+        # Optimistic concurrency (2026-07-31, AMUX-1711). rev increments on
+        # every PATCH and log-append; PATCH may send If-Match / expect_rev and
+        # gets a 409 with the current item on mismatch instead of silently
+        # last-writer-winning. Absent header = legacy behavior.
+        "ALTER TABLE issues ADD COLUMN rev INTEGER NOT NULL DEFAULT 0",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -9413,7 +9418,7 @@ def _append_board_log(issue_id: str, line: str):
         log = row["log"] or ""
         ts = time.strftime("%H:%M")
         log = (log.rstrip() + f"\n`{ts}` {line}").strip()
-        db.execute("UPDATE issues SET log=?, updated=? WHERE id=?",
+        db.execute("UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
                    (log, int(time.time()), issue_id))
         db.commit()
         _board_changed()
@@ -10149,6 +10154,7 @@ def _load_board(done_limit: int = 100) -> list:
                COALESCE(i.pos, 0) AS pos,
                COALESCE(i.archived, 0) AS archived,
                i.depends_on, i.reviewer, i.log,
+               COALESCE(i.rev, 0) AS rev,
                i.gate,
                GROUP_CONCAT(t.tag) AS tags_csv"""
     if done_limit > 0:
@@ -10276,6 +10282,7 @@ def _item_by_id(bid: str) -> dict | None:
                   COALESCE(i.pos, 0) AS pos,
                   COALESCE(i.archived, 0) AS archived,
                   i.depends_on, i.reviewer, i.log,
+                  COALESCE(i.rev, 0) AS rev,
                   i.gate,
                   GROUP_CONCAT(t.tag) AS tags_csv
            FROM issues i
@@ -30238,7 +30245,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.298';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.299';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50523,7 +50530,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.298';
+const CACHE = 'amux-v0.9.299';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -50997,12 +51004,14 @@ class CCHandler(BaseHTTPRequestHandler):
         except Exception:
             return body, False
 
-    def _json(self, data, status=200):
+    def _json(self, data, status=200, headers=None):
         body = json.dumps(data).encode()
         body, gz = self._gzip_out(body)
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json")
+        for _hk, _hv in (headers or {}).items():
+            self.send_header(_hk, _hv)
         if gz:
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
@@ -52429,6 +52438,12 @@ class CCHandler(BaseHTTPRequestHandler):
             statuses = {st.get("id"): (st.get("gate") or [])
                         for st in _load_board_statuses()}
             return self._json({
+                "concurrency": {
+                    "rev": "Monotonic revision on every item; bumps on each PATCH and system log-append.",
+                    "read": "GET /api/board/<id> returns rev (and ETag W/\"<id>-<rev>\"); the list GET includes rev per item.",
+                    "write": "PATCH with body expect_rev (or If-Match) applies ONLY if rev is unchanged; mismatch returns 409 with current_rev and the current item to re-merge from. Omit expect_rev for legacy last-writer-wins.",
+                    "why": "Read-modify-write on desc destroyed content silently (AMUX-1711); with expect_rev the interleaved write is DETECTED instead of lost.",
+                },
                 "fields": {
                     "session": "OWNER — accountable for the item MOVING. Must be a lane that can execute it.",
                     "shepherd": "WATCHER — holding the thread for a rested lane. NOT accountable for execution.",
@@ -54431,11 +54446,35 @@ class CCHandler(BaseHTTPRequestHandler):
                 # read one, and a scripted `desc` append that assumed the read
                 # worked died mid-run instead.
                 if method == "GET":
-                    return self._json(_item_by_id(bid))
+                    _it = _item_by_id(bid)
+                    # Weak etag for read-modify-write callers (AMUX-1711):
+                    # echo it back via If-Match or body expect_rev on PATCH.
+                    return self._json(_it, headers={
+                        "ETag": f'W/"{bid}-{(_it or {}).get("rev", 0)}"'})
 
                 if method == "PATCH":
                     body = self._read_body()
                     now = int(time.time())
+                    # Optimistic concurrency (AMUX-1711): opt-in. A caller that
+                    # read rev N can require the write to only apply against N;
+                    # anyone else's interleaved write bumps rev, so the stale
+                    # writer gets a 409 WITH the current item to re-merge from,
+                    # instead of a silent last-writer-wins 200.
+                    _ifm = (self.headers.get("If-Match", "") or "").strip()
+                    _exp_rev = body.get("expect_rev")
+                    if _exp_rev is None and _ifm:
+                        _m_rev = re.search(r"-(\d+)\"?$", _ifm)
+                        _exp_rev = int(_m_rev.group(1)) if _m_rev else None
+                    if _exp_rev is not None:
+                        _cur = _item_by_id(bid) or {}
+                        if int(_exp_rev) != int(_cur.get("rev", 0)):
+                            return self._json({
+                                "error": "rev mismatch",
+                                "expected": int(_exp_rev),
+                                "current_rev": int(_cur.get("rev", 0)),
+                                "item": _cur,
+                                "hint": "re-read, re-apply your change to the current item, retry with the new rev",
+                            }, 409)
                     # Canonicalise BEFORE anything reads it, so the one-doing cap,
                     # the clean-tree check, the gate and the write all see the same
                     # value. A caller sending 'in_review' or 'resolved' otherwise
@@ -54684,6 +54723,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     # If session is being changed, reset notified so the new assignee gets pinged
                     if "session" in body and (body.get("session") or None) != prior_session:
                         set_clauses.append("notified = 0")
+                    set_clauses.append("rev = COALESCE(rev, 0) + 1")
                     set_clauses.append("updated = ?")
                     params.append(now)
                     params.append(bid)
