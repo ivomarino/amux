@@ -5035,6 +5035,9 @@ _RATE_LIMIT_COOLDOWN = 10
 _RATE_LIMIT_DRIFT_TOLERANCE = 30  # seconds; reset times closer than this are "in sync"
 _RATE_LIMIT_DRIFT_LOG_COOLDOWN = 600  # don't repeat the drift warning more than every 10 min
 _rate_limit_last_responded: dict = {}
+# Swallowed-exception ledger for the fleet scan loop (AMUX-2111 post-mortem):
+# per-session dedupe so a recurring throw logs every ~10 min, not every scan.
+_rate_limit_scan_err: dict = {}
 _rate_limit_last_drift_log: float = 0.0
 
 # Proof the session produced output on a line: an assistant message (⏺), an
@@ -5423,7 +5426,19 @@ def _rate_limit_auto_respond():
                 "fallback": not parsed_reset,
             }, distinct_id=name)
         except Exception:
-            pass
+            # A poisoned iteration must not kill the fleet scan — but a SILENT
+            # pass here made a real cloud negative indistinguishable from "the
+            # loop threw before the parser ran" (AMUX-2111). Log it, deduped,
+            # so an absent flag always carries evidence one way or the other.
+            try:
+                import traceback as _tb
+                _now_e = time.time()
+                if _now_e - _rate_limit_scan_err.get(name, 0) > 600:
+                    _rate_limit_scan_err[name] = _now_e
+                    slog(f"[rate-limit] scan error on {name}: "
+                         f"{_tb.format_exc(limit=3)}")
+            except Exception:
+                pass
 
 
 def _rate_limit_auto_resume():
@@ -30152,7 +30167,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.295';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.296';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50437,7 +50452,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.295';
+const CACHE = 'amux-v0.9.296';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
