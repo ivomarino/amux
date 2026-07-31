@@ -24640,7 +24640,7 @@ async function _runPing(n) {
     try {
       // no-store + a unique query defeats both the HTTP cache and the ETag/304
       // path, so this times a real request instead of a revalidation.
-      const r = await fetch(API + '/api/version-check?_p=' + Date.now() + '_' + i,
+      const r = await fetch(API + '/api/prefs?key=_ping&_p=' + Date.now() + '_' + i,
                             { cache: 'no-store' });
       await r.text();
       ms.push(performance.now() - t0);
@@ -29330,7 +29330,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.271';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.272';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49603,7 +49603,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.271';
+const CACHE = 'amux-v0.9.272';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
