@@ -1280,8 +1280,11 @@ def _cdp_call_raw(args: list, timeout_s: int = 30) -> dict:
 
 # Observation budgets: hard caps so a page dump can never flood the session's
 # context. The URL is always surfaced as the restorable pointer instead.
-_OBS_EVAL_CAP = 8_000
-_OBS_STATE_CAP = 24_000
+# Budget knobs, not constants (ethos dev-4): these bound what the model may SEE,
+# which is context-scarcity policy — it belongs in ~/.amux/server.env where it can
+# grow with the model's window, not hardcoded where it silently becomes the ceiling.
+_OBS_EVAL_CAP = int(os.environ.get("AMUX_OBS_EVAL_CAP", "8000"))
+_OBS_STATE_CAP = int(os.environ.get("AMUX_OBS_STATE_CAP", "24000"))
 
 def _obs_cap(text, limit: int):
     if not isinstance(text, str) or len(text) <= limit:
@@ -1965,13 +1968,22 @@ def _fetch_claude_usage() -> dict:
         return {"available": False, "reason": f"Usage fetch failed: {e}"}
 
 
-def _claude_oneshot(prompt: str, model: str = "haiku", timeout: int = 35) -> tuple:
+# One knob for every helper one-shot (ethos dev-3). Pinning a named weak model
+# in 5 separate call sites was a bet that could not improve as models improve —
+# and the throttle its cost forced is why most commands never reached the board.
+# Set AMUX_HELPER_MODEL (CLI alias) / AMUX_HELPER_MODEL_API (full API id) in
+# ~/.amux/server.env to move the whole fleet's helper tier in one line.
+_HELPER_MODEL = os.environ.get("AMUX_HELPER_MODEL", "haiku")
+_HELPER_MODEL_API = os.environ.get("AMUX_HELPER_MODEL_API", "claude-haiku-4-5-20251001")
+
+def _claude_oneshot(prompt: str, model: str = None, timeout: int = 35) -> tuple:
     """Run a one-shot headless `claude -p` query using the active Claude Code
     session's auth — Plan OAuth or API key, whichever the CLI is configured with.
 
     Returns (text, error). Mirrors amux's session launch: when on a Plan, the
     ANTHROPIC_API_KEY is unset so the subscription is used rather than a key.
     """
+    model = model or _HELPER_MODEL
     claude_bin = _resolve_claude_bin()
     if not claude_bin:
         return ("", "claude CLI not found")
@@ -1999,7 +2011,7 @@ def _claude_oneshot(prompt: str, model: str = "haiku", timeout: int = 35) -> tup
 # doesn't need an Anthropic key just to explain a snippet. Not the session's own
 # (possibly heavy) model: the point is a cheap, snappy answer.
 _PROVIDER_LOOKUP_MODEL = {
-    "claude": "haiku",
+    "claude": _HELPER_MODEL,
     "gemini": "gemini-2.5-flash-lite",
     "codex":  "gpt-5-mini",
 }
@@ -2049,13 +2061,13 @@ def _lookup_via_claude(prompt: str, timeout: int = 35) -> tuple:
             import anthropic as _anthropic
             client = _anthropic.Anthropic(api_key=api_key)
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=400,
+                model=_HELPER_MODEL_API, max_tokens=400,
                 messages=[{"role": "user", "content": prompt}],
             )
             return (msg.content[0].text.strip(), "")
         except Exception as e:
             return ("", str(e))
-    return _claude_oneshot(prompt, model="haiku", timeout=timeout)
+    return _claude_oneshot(prompt, timeout=timeout)
 
 
 def _lookup_via_provider(provider: str, prompt: str, name: str = "", timeout: int = 35) -> tuple:
@@ -2563,6 +2575,13 @@ _VALID_CC_SESSION_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$')
 _stop_pool = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=4)
 _USER_SHELL = os.environ.get("SHELL", "/bin/bash")
 _session_auto_actions: dict = {} # {name: {"last_compact": ts, "last_restart": ts}}
+# Harness SELF-REPORTED state (ethos dev-1). Written by POST /api/sessions/<n>/report
+# — fired by Claude Code's own Stop / UserPromptSubmit hooks — so state flows FROM
+# the harness instead of being inferred by regex over a rendered terminal. A fresh
+# report outranks the pane scrape; a stale one falls through to it. The scrapers
+# stay as the fallback for crashes, subagents, and providers without hooks.
+_session_reported: dict = {}   # name -> {"state": ..., "detail": ..., "ts": epoch}
+_SELF_REPORT_FRESH_S = 25      # Stop fires per turn; anything older is inference territory
 _steering_queue: dict = {}      # {session_name: [{"text": str, "queued_at": float, "id": str}]}
 _steering_lock = threading.Lock()
 
@@ -4777,11 +4796,22 @@ def _rate_limit_auto_respond():
             # (the reset line can sit ~10-20 lines above the menu); only the
             # decision to press a key requires a live menu render.
             tail = "\n".join(clean.splitlines()[-30:])
+            # The POLICY here is the human's, set once, not amux's (ethos dev-2):
+            # rate_limit_action pref — 'wait' (default) answers the menu with
+            # option 1 fleet-wide; 'off' detects but leaves the menu for a human.
+            # The scrape itself stays only because Claude Code exposes this state
+            # nowhere else; exit condition tracked in ethos.md known-deviations.
+            try:
+                _rl_row = get_db().execute("SELECT value FROM prefs WHERE key='rate_limit_action'").fetchone()
+                _rl_action = (_rl_row[0] or "wait").strip().lower() if _rl_row else "wait"
+            except Exception:
+                _rl_action = "wait"
             matched_idx = -1
             for i, (pattern, response) in enumerate(_RATE_LIMIT_PROMPTS):
                 if pattern.search(tail):
-                    send_text(name, response)
-                    _rate_limit_last_responded[name] = now
+                    if _rl_action != "off":
+                        send_text(name, response)
+                        _rate_limit_last_responded[name] = now
                     matched_idx = i
                     break
             # Weekly/usage-cap banner has no menu to answer — detect it on its own
@@ -6078,7 +6108,15 @@ def _snapshot_all_sessions_inner():
                 if pct < 30 and now - actions.get("last_backup", 0) > 120:
                     actions["last_backup"] = now
                     threading.Thread(target=backup_session_jsonl, args=(name, "pre_compact"), daemon=True).start()
-                if _ac_enabled and pct < 50 and now - actions.get("last_compact", 0) > 300:
+                # Threshold is a pref, not amux's hardcoded judgment (ethos dev-5):
+                # WHEN to summarize is increasingly the model's own call. 0 disables
+                # the proactive path entirely while keeping resume-dialog handling.
+                try:
+                    _th_row = get_db().execute("SELECT value FROM prefs WHERE key='auto_compact_threshold'").fetchone()
+                    _ac_threshold = int(_th_row[0]) if _th_row and str(_th_row[0]).strip() else 50
+                except Exception:
+                    _ac_threshold = 50
+                if _ac_enabled and _ac_threshold > 0 and pct < _ac_threshold and now - actions.get("last_compact", 0) > 300:
                     actions["last_compact"] = now
                     actions["post_compact_continue"] = True  # send continuation when compact finishes
                     send_text(name, "/compact")
@@ -8724,7 +8762,7 @@ def _summarize_task_bg(session_name: str, text: str):
             result = subprocess.run(
                 [
                     "claude", "-p",
-                    "--model", "haiku",
+                    "--model", _HELPER_MODEL,
                     "--system-prompt", "You are a task labeler. Output ONLY 3 words in title case. No punctuation, no explanation.",
                     "--no-session-persistence",
                     prompt,
@@ -12251,6 +12289,11 @@ def list_sessions() -> list:
             preview = strip_ansi(lines[-1][:120]) if lines else ""
             if running:
                 status = _detect_session_status(name, raw)
+                # A fresh self-report from the harness's own hooks beats pane
+                # inference — the hook KNOWS the turn ended; the regex guesses.
+                _rep = _session_reported.get(name)
+                if _rep and (time.time() - _rep.get("ts", 0)) < _SELF_REPORT_FRESH_S                         and _rep.get("state") in ("active", "idle", "waiting"):
+                    status = _rep["state"]
             # Detect session becoming idle → auto-complete board issue, then pick up next queued task
             prev = _session_prev_status.get(name)
             # Observable status transition → the event log (issue #48). Only on a
@@ -12391,6 +12434,10 @@ def list_sessions() -> list:
             "preview_lines": preview_lines,
             "last_activity": last_activity,
             "last_human_ts": _human_ts.get(name, 0),
+            "self_report": ({"state": _session_reported[name]["state"],
+                             "age_s": int(time.time() - _session_reported[name]["ts"]),
+                             "source": _session_reported[name].get("source", "")}
+                            if name in _session_reported else None),
             "active_model": active_model,
             "session_created": session_created,
             "task_time": task_time,
@@ -14036,6 +14083,42 @@ def _install_amux_commit_hook(work_dir: str) -> None:
         os.chmod(hook_path, 0o755)
     except Exception:
         pass
+
+
+_STATE_HOOK_MARKER = "/api/sessions/$AMUX_SESSION/report"
+
+def _install_state_report_hooks() -> None:
+    """Install Stop/UserPromptSubmit hooks in ~/.claude/settings.json so every
+    Claude Code session REPORTS its state to amux instead of amux inferring it
+    from the rendered terminal (ethos dev-1). Follows the tracked-files hook
+    precedent already in that file: guarded on $AMUX_SESSION so it is a no-op
+    outside amux, 2s timeout, always exits 0 so it can never wedge a turn.
+    Merge-safe and idempotent: appends alongside existing hooks, never replaces
+    anything, keyed on _STATE_HOOK_MARKER. Failures are swallowed — a missing
+    hook only means the scraper fallback keeps doing the work."""
+    try:
+        sp = Path.home() / ".claude" / "settings.json"
+        cfg = json.loads(sp.read_text()) if sp.exists() else {}
+        hooks = cfg.setdefault("hooks", {})
+        def _cmd(state, source):
+            return ("[ -n \"$AMUX_SESSION\" ] && curl -sk -m 2 -X POST "
+                    "-H 'Content-Type: application/json' "
+                    "-d '{\"state\":\"" + state + "\",\"source\":\"" + source + "\"}' "
+                    "\"${AMUX_URL:-https://localhost:8822}" + _STATE_HOOK_MARKER + "\" "
+                    ">/dev/null 2>&1; exit 0")
+        changed = False
+        for event, state, source in (("Stop", "idle", "stop-hook"),
+                                     ("UserPromptSubmit", "active", "prompt-hook")):
+            arr = hooks.setdefault(event, [])
+            if any(_STATE_HOOK_MARKER in json.dumps(e) for e in arr):
+                continue
+            arr.append({"hooks": [{"type": "command", "command": _cmd(state, source)}]})
+            changed = True
+        if changed:
+            sp.write_text(json.dumps(cfg, indent=2) + "\n")
+            slog("[hooks] installed state-report hooks (Stop->idle, UserPromptSubmit->active)")
+    except Exception as e:
+        slog(f"[hooks] state-report install failed (scraper fallback still active): {e}")
 
 
 def _install_hooks_all_sessions() -> None:
@@ -29334,7 +29417,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.273';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.274';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49607,7 +49690,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.273';
+const CACHE = 'amux-v0.9.274';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58264,6 +58347,22 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             if action == "reset":
                 ok, msg = reset_session(name)
                 return self._json({"ok": ok, "message": msg}, 200 if ok else 500)
+            # POST /api/sessions/<name>/report — the harness reports its OWN state
+            # (ethos dev-1). Fired by Claude Code hooks: UserPromptSubmit -> active,
+            # Stop -> idle. This is the interface that replaces regex-over-terminal
+            # as the control plane; the scrapers remain only as its fallback.
+            if action == "report":
+                body = self._read_body()
+                st = str(body.get("state") or "").strip().lower()
+                _ALIAS = {"working": "active", "busy": "active", "done": "idle", "blocked": "waiting"}
+                st = _ALIAS.get(st, st)
+                if st not in ("active", "idle", "waiting", "error"):
+                    return self._json({"error": f"state must be one of active|idle|waiting|error (got {st!r})"}, 400)
+                _session_reported[name] = {"state": st,
+                                           "detail": str(body.get("detail") or "")[:200],
+                                           "source": str(body.get("source") or "hook")[:40],
+                                           "ts": time.time()}
+                return self._json({"ok": True, "state": st})
             if action == "apply-template":
                 body = self._read_body()
                 tmpl_id = re.sub(r'[^a-z0-9\-]', '', body.get("template_id", ""))
@@ -59896,6 +59995,7 @@ def main():
     # Watch notes directory for external edits (Obsidian, other editors)
     # Install the commit-stamping hook into all existing session repos
     threading.Thread(target=_install_hooks_all_sessions, daemon=True).start()
+    threading.Thread(target=_install_state_report_hooks, daemon=True).start()
 
     # Resume sessions that were running before a reboot/crash — runs in
     # background so the server is already accepting requests while sessions spin up.

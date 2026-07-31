@@ -18,6 +18,11 @@ deciding something that was the user's to decide.
 The question underneath all of them: when the next model is meaningfully better than
 this one, does this feature get better with it, or does it become the ceiling?
 
+The bottom of that file is a **Known deviations** ledger — live places where amux
+still fights the ethos, each with a status and an exit condition. Check it before
+touching state detection, auto-answers, helper-model calls, observation caps, or
+auto-compact; move the deviation toward its exit rather than deepening it.
+
 ## You are dogfooding — fix it at the root
 
 You run *inside* amux. Every rough edge you hit while working is a rough edge a user

@@ -147,3 +147,61 @@ message, so the next person can weigh it.
 **The compounding question, above all of them:** when the next model is meaningfully
 better than this one, does this feature get better with it, or does it become the
 ceiling?
+
+---
+
+# Known deviations — tracked, not re-discovered
+
+Live places where amux still fights the ethos, found in the 2026-07-30 audit
+("any capability that acts as a stop-gap on top of a weaker model needs to not
+exist"). Each has a STATUS and an EXIT CONDITION. When you touch one of these
+systems, move it toward its exit, and update this section when a row changes.
+
+## D1 — Terminal-scraping as the control plane
+14 of 40 compiled regexes parsed Claude Code's rendered UI to infer state. None
+improve with a better model; all break when a string changes (the API-error
+detector was fixed twice in one day).
+**Status: mitigated.** `POST /api/sessions/<n>/report` + global Stop /
+UserPromptSubmit hooks let the harness report its own state; a fresh report
+outranks the scrape in the status loop. Scrapers remain the FALLBACK (crashes,
+subagents, hookless providers).
+**Exit:** every consumer reads reported state; scrapers demoted to a
+liveness check only.
+
+## D2 — amux answering prompts on the model's behalf
+`_RATE_LIMIT_PROMPTS` matches the rate-limit menu and presses 1 fleet-wide — a
+scraper pretending to be a user.
+**Status: mitigated.** The POLICY is now the human's, set once: pref
+`rate_limit_action` = `wait` (default, today's behavior) or `off` (detect but
+leave the menu for a human). The scrape stays only because Claude Code exposes
+this state nowhere else.
+**Exit:** Claude Code exposes rate-limit state via hook/JSON; delete the
+pattern table.
+
+## D3 — Hardcoded weak-model helpers
+Six call sites pinned `haiku` for helper one-shots. Pinning a weak model is a
+bet that cannot improve; the 12–15k-token label call it produced forced a
+throttle, which is why most commands never reached the board.
+**Status: fixed.** One knob: `AMUX_HELPER_MODEL` / `AMUX_HELPER_MODEL_API` in
+`~/.amux/server.env`; all sites read it. (The audit said 5 sites; fixing it
+found a 6th.)
+**Exit condition met** — the helper tier moves with one line of config.
+
+## D4 — Caps on what the model may see
+`_OBS_EVAL_CAP`/`_OBS_STATE_CAP` were code constants — context-scarcity policy
+hardcoded where it silently becomes the ceiling as windows grow.
+**Status: fixed.** `AMUX_OBS_EVAL_CAP` / `AMUX_OBS_STATE_CAP` in server.env;
+defaults unchanged.
+**Exit:** revisit defaults upward as model windows grow; policy now lives in
+config where that takes one line.
+
+## D5 — Auto-compact at a hardcoded 50%
+amux decided WHEN the model should summarize — preempting a judgment models
+increasingly make better, with a lossy operation.
+**Status: mitigated.** Pref `auto_compact_threshold` (default 50 = today's
+behavior; 0 disables the proactive path while keeping resume-dialog handling).
+**Exit:** models manage their own context; amux only surfaces the number.
+
+The pattern under all five: amux WATCHED the model and acted on inference. The
+durable inverse — the model reporting its own state through a real interface —
+is D1's report endpoint; prefer extending it over adding any new scraper.
