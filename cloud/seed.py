@@ -495,6 +495,9 @@ def main():
     ap.add_argument("--prune-duplicate-schedules", action="store_true",
                     help="maintenance mode: report extra copies of the plan's "
                          "schedules and exit (add --apply to remove them)")
+    ap.add_argument("--reconcile-schedules", action="store_true",
+                    help="maintenance mode: bring schedules in line with the plan "
+                         "(enabled/command/expr) and exit, touching nothing else")
     ap.add_argument("--apply", action="store_true",
                     help="with --prune-duplicate-schedules, actually delete")
     ap.add_argument("--emit-template", action="store_true")
@@ -532,6 +535,14 @@ def main():
         bad("workspace is gated (budget or trial expired)")
         return 1
     ok(f"container ready in {el}s")
+
+    if a.reconcile_schedules:
+        # Same reason as prune mode: the schedule steps are idempotent, the
+        # docs/board steps are not (AC-141), so "make the schedules match the
+        # plan" must not require re-running the whole plan.
+        step("Reconcile schedules to plan")
+        create_schedules(org, plan.get("sessions", []))
+        a.prune_duplicate_schedules, a.apply = True, False  # then show the result
 
     if a.prune_duplicate_schedules:
         # Maintenance mode: touches schedules ONLY. Deliberately does not run the
