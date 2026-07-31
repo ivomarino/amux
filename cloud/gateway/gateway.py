@@ -3094,6 +3094,20 @@ class Handler(BaseHTTPRequestHandler):
                 d["members"] = [dict(m) for m in db.execute(
                     "SELECT m.user_id, m.role, u.email FROM org_memberships m "
                     "LEFT JOIN users u ON u.id = m.user_id WHERE m.org_id=?", (r["id"],)).fetchall()]
+                # Who is this workspace FOR. owner_email cannot answer that: an
+                # admin-provisioned org is owned by the acting admin, so every
+                # prospect workspace reads ethan@mixpeek.com and the one field
+                # that distinguishes them sat in org_invites, which no endpoint
+                # returned. A session trying to map orgs to prospects had to
+                # hand-write SQL through /admin/query to find it.
+                # invite_email is the OLDEST invite — the address the workspace
+                # was provisioned for. Later invites are usually teammates added
+                # afterwards, so newest-first would name the wrong person.
+                invites = [dict(i) for i in db.execute(
+                    "SELECT email, role, created_at FROM org_invites WHERE org_id=? "
+                    "ORDER BY created_at ASC", (r["id"],)).fetchall()]
+                d["invites"] = invites
+                d["invite_email"] = invites[0]["email"] if invites else None
                 out.append(d)
             return self._json({"orgs": out, "count": len(out)})
 
