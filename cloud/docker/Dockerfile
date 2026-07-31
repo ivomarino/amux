@@ -55,6 +55,22 @@ RUN (which google-chrome || which google-chrome-stable || ls /root/.cache/ms-pla
 COPY amux-server.py .
 
 ENV AMUX_PORT=8822
+# Bring the user's sessions back when this container is replaced. Deploying a
+# new image recreates it; the volume restores every session's .env, the board
+# and the schedules, but the tmux processes died with the old container — so the
+# workspace reads fully populated through the API and shows its owner nothing.
+#
+# Set HERE rather than by the gateway because the deploy path never touches the
+# gateway: .github/workflows/deploy-cloud.yml runs `docker compose up -d
+# --no-recreate` directly, so a per-container write in start_container() reaches
+# only containers the gateway itself starts — which is exactly why the first
+# live test of this found every session still down on a container that already
+# had the code. Image-level covers every start path.
+#
+# amux-server.py defaults this OFF, which is the right default on a workstation
+# (starting an entire fleet on every restart). This image is the environment
+# where the opposite is right, so the image is what says so.
+ENV AMUX_AUTOSTART_SESSIONS=1
 EXPOSE 8822
 
 CMD ["python", "amux-server.py", "8822", "--no-tls"]

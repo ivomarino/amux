@@ -1365,38 +1365,15 @@ def _write_proxy_env(user_id):
         return False
 
 
-def _write_autostart_env(user_id):
-    """Tell this container to bring its sessions back after it is replaced.
-
-    Deploying a new image REPLACES the container. The volume carries every
-    session's .env, the board and the schedules back; tmux does not, because the
-    processes died with the old container. So a workspace reads fully populated
-    through the API and shows its owner the first-run scaffold — which is
-    exactly how a prospect workspace was reported as seeded three times while
-    the person looking at it saw nothing.
-
-    Set per container rather than in the image, because the same amux-server.py
-    runs on workstations where starting every session on boot would be wrong.
-    """
-    vol = f"amux-data-{user_id}"
-    script = (
-        'ENV=/root/.amux/server.env; touch "$ENV"; '
-        'grep -v -e "^AMUX_AUTOSTART_SESSIONS=" "$ENV" > "$ENV.tmp" 2>/dev/null || true; '
-        'mv "$ENV.tmp" "$ENV"; printf "AMUX_AUTOSTART_SESSIONS=1\\n" >> "$ENV"'
-    )
-    try:
-        subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{vol}:/root/.amux", "alpine:latest",
-             "sh", "-c", script],
-            capture_output=True, timeout=30)
-    except Exception as e:
-        print(f"[autostart] could not set autostart env for {user_id}: {e}", flush=True)
-
-
 def start_container(user_id, port):
+    # AMUX_AUTOSTART_SESSIONS lives in the IMAGE (cloud/docker/Dockerfile), not
+    # here. A per-container write in this function reaches only containers the
+    # gateway itself starts, and the deploy path never calls it —
+    # deploy-cloud.yml runs `docker compose up -d --no-recreate` directly. That
+    # is why the first live test found every session still down on a container
+    # that already had the autostart code.
     _write_compose(user_id, port)
     _restore_user_files(user_id)
-    _write_autostart_env(user_id)
     # Preferred path: route through our proxy so no key lands in the container.
     _proxied = _write_proxy_env(user_id)
     # Fallback (self-supplied or per-org key) only when there is no house key.
