@@ -29426,7 +29426,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.276';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.277';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49699,7 +49699,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.276';
+const CACHE = 'amux-v0.9.277';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53334,6 +53334,17 @@ class CCHandler(BaseHTTPRequestHandler):
                 if not title:
                     return self._json({"error": "missing title"}, 400)
                 session = body.get("session", "").strip()
+                # MO-3038: X-Amux-Session set `creator` but not `session`, so a
+                # header-only create landed unassigned with the generic AMUX-
+                # prefix — attribution not lost, but in a different field than
+                # every consumer reads (88 of 250 session=None cards carried a
+                # creator). When the body OMITS the key and the verified header
+                # is present, the card is for the sender's own lane. An
+                # EXPLICIT session in the body — including explicit "" for a
+                # deliberately unassigned card — is always respected, and the
+                # header-less dashboard path is unchanged.
+                if "session" not in body:
+                    session = (self.headers.get("X-Amux-Session", "") or "").strip()[:64]
                 prefix = _prefix_from_session(session)
                 item_id = _next_issue_id(prefix)
                 now = int(time.time())
