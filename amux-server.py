@@ -29683,7 +29683,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.284';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.285';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49956,7 +49956,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.284';
+const CACHE = 'amux-v0.9.285';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55071,6 +55071,12 @@ class CCHandler(BaseHTTPRequestHandler):
                         "token_uri": creds.token_uri, "client_id": creds.client_id,
                         "client_secret": creds.client_secret,
                     }))
+                    # A fresh grant must clear every cached failure state for the
+                    # account, or the negative cache keeps answering not_connected
+                    # for up to its TTL AFTER a successful re-auth — the user
+                    # reconnects and the API still says broken (hello@amux.io,
+                    # 2026-07-31, minutes after the cache shipped).
+                    _gmail_creds_fail.pop(account, None)
                     html = f"<html><body><h2>✓ {account} connected!</h2><p>You can close this tab.</p></body></html>"
                     self.send_response(200); self.send_header("Content-Type","text/html"); self.end_headers()
                     self.wfile.write(html.encode()); return
