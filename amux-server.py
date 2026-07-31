@@ -17293,6 +17293,8 @@ def _gmail_send_message(account: str, to: str, subject: str, body: str,
         if thread_id:
             send_body["threadId"] = thread_id
         result = svc.users().messages().send(userId="me", body=send_body).execute()
+        with _gmail_query_cache_lock:
+            _gmail_query_cache.clear()
         return {"ok": True, "id": result.get("id"), "thread_id": result.get("threadId")}
     except Exception as e:
         _gmail_check_revoked(account, e)
@@ -17383,6 +17385,8 @@ def _gmail_compose_send(account: str, to: str, subject: str, body: str,
         if thread_id:
             send_body["threadId"] = thread_id
         result = svc.users().messages().send(userId="me", body=send_body).execute()
+        with _gmail_query_cache_lock:
+            _gmail_query_cache.clear()
         return {"ok": True, "id": result.get("id"), "thread_id": result.get("threadId"),
                 "signature_included": bool(sig_html)}
     except Exception as e:
@@ -17577,6 +17581,26 @@ def _gmail_latest_matching(account: str, from_addr: str = "", with_addr: str = "
     return None
 
 
+_gmail_query_cache: dict = {}
+_gmail_query_cache_lock = threading.Lock()
+_GMAIL_QUERY_CACHE_TTL = 30  # seconds — prevent hammering Gmail API
+
+def _gmail_cache_get(key: str):
+    with _gmail_query_cache_lock:
+        entry = _gmail_query_cache.get(key)
+        if entry and time.time() - entry["ts"] < _GMAIL_QUERY_CACHE_TTL:
+            return entry["data"]
+    return None
+
+def _gmail_cache_set(key: str, data):
+    with _gmail_query_cache_lock:
+        _gmail_query_cache[key] = {"ts": time.time(), "data": data}
+        if len(_gmail_query_cache) > 200:
+            cutoff = time.time() - _GMAIL_QUERY_CACHE_TTL
+            stale = [k for k, v in _gmail_query_cache.items() if v["ts"] < cutoff]
+            for k in stale:
+                del _gmail_query_cache[k]
+
 def _gmail_inbox_messages(account: str, count: int = 20, q: str = "", days: float = 0.0) -> dict:
     """Return messages for the unified /api/email/inbox shape, using the RFC822
     Message-ID header as `message_id` so it round-trips into /reply.
@@ -17587,6 +17611,10 @@ def _gmail_inbox_messages(account: str, count: int = 20, q: str = "", days: floa
     poc_radar false-zero). Paginates via pageToken up to `count` (the hard cap).
     Returns {messages, truncated}: truncated=True means more matched the window
     than the cap returned, so a caller can tell a real 0 from a capped slice."""
+    cache_key = f"{account}:{count}:{q}:{days}"
+    cached = _gmail_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         svc = _gmail_service(account)
         if not svc:
@@ -17650,7 +17678,9 @@ def _gmail_inbox_messages(account: str, count: int = 20, q: str = "", days: floa
                 "read": "UNREAD" not in full.get("labelIds", []),
                 "body": full.get("snippet", ""),
             })
-        return {"messages": out, "truncated": truncated}
+        result = {"messages": out, "truncated": truncated}
+        _gmail_cache_set(cache_key, result)
+        return result
     except Exception as e:
         _gmail_check_revoked(account, e)
         slog(f"[gmail] inbox_messages {account}: {e}")
