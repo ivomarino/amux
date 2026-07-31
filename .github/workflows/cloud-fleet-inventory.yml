@@ -40,9 +40,16 @@ jobs:
               docker exec "$C" sh -lc 'curl -s localhost:8822/api/board' 2>/dev/null \
                 | tr ',' '\n' | grep -o '"status": *"[a-z]*"' | sort | uniq -c \
                 | sed 's/^/     /' || echo "     EMPTY"
-              echo "  -- workspace files:"
-              docker exec "$C" sh -lc 'find /root -maxdepth 3 -type f \
-                 -not -path "*/.amux/*" -not -path "*/.cache/*" -not -path "*/.config/*" \
-                 -not -path "*/.npm/*" 2>/dev/null | head -12' 2>&1 | sed 's/^/     /'
+              # Workspace files = what the PROSPECT would see. Every dot-directory
+              # is excluded, not a hand-listed few: the old filter named .amux,
+              # .cache, .config and .npm, so /root/.claude and /root/.codex
+              # boilerplate filled the head -12 and a seeded workspace reported as
+              # "boilerplate only" while its context docs sat right there in
+              # /root/demo. The count is printed BEFORE the truncation so a long
+              # list can never read as a short one.
+              echo "  -- workspace files (non-hidden, /root, depth<=3):"
+              docker exec "$C" sh -lc 'n=$(find /root -maxdepth 3 -type f -not -path "*/.*" 2>/dev/null | wc -l);
+                 echo "     ($n file(s) total; showing up to 20)";
+                 find /root -maxdepth 3 -type f -not -path "*/.*" 2>/dev/null | head -20' 2>&1 | sed 's/^/     /'
             done
           ENDSSH
