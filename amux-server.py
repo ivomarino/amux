@@ -2520,6 +2520,7 @@ def _classify_request(method: str, path: str) -> tuple:
         if method == "DELETE"and sub == "steer":   return ("session", "steer-cleared",sname, sname)
         if method == "POST"  and sub == "archive": return ("session", "archived",     sname, sname)
         if method == "POST"  and sub == "wake":    return ("session", "woken",        sname, sname)
+        if method == "POST"  and sub == "reset":   return ("session", "reset",       sname, sname)
         if method == "PATCH" and sub == "config":  return ("session", "configured",   sname, sname)
         if method == "DELETE":                     return ("session", "deleted",       sname, sname)
         if method == "POST"  and sub == "memory":  return ("memory",  "updated",      sname, sname)
@@ -14713,6 +14714,53 @@ def _archive_session_issues(name: str, flag: int) -> int:
     except Exception as e:
         slog(f"[board] issue archive cascade failed for '{name}': {e}")
         return 0
+
+
+def reset_session(name: str) -> tuple[bool, str]:
+    """Drop the CONVERSATION, keep the lane.
+
+    A session is two things welded together: the lane (working dir, model,
+    flags, board cards, schedules, tags, and the name other sessions message)
+    and the conversation. Only the second one fills up. Until now the only way
+    to get a clean context was to abandon the lane and build a new one, because
+    start_session always resumes cc_conversation_id — so "I am out of context"
+    meant "this lane is finished", which it never was.
+
+    Clearing the conversation pointer makes the next start a fresh one. The
+    session then rebuilds its own context from the board on boot: the existing
+    boot briefing already sends _board_digest(name), which carries what is in
+    flight across the fleet plus this session's own queued work. That is the
+    board being the source of truth doing the job it exists for — the
+    conversation is disposable precisely because the board is not."""
+    f = CC_SESSIONS / f"{name}.env"
+    if not f.exists():
+        return False, f"session '{name}' not found"
+    if _is_session_blocked(name):
+        return False, "session is blocked; remove it from blocked-sessions.txt first"
+    was_running = is_running(name)
+    if was_running:
+        # Save scrollback first: the terminal history is the only record of the
+        # conversation once its id is gone, and a reset should not silently
+        # destroy the transcript of what it is resetting.
+        try:
+            r = subprocess.run(["tmux", "capture-pane", "-t", tmux_target(name), "-p", "-S", "-"],
+                               capture_output=True, text=True, timeout=30)
+            if r.stdout.strip():
+                data = r.stdout.encode("utf-8", errors="replace")
+                _log_path(name).write_bytes(data[-MAX_LOG_BYTES:])
+        except Exception:
+            pass
+        stop_session(name)
+        _kill_tmux_session(name)
+    meta = _load_meta(name)
+    dropped = meta.pop("cc_conversation_id", None)
+    meta.pop("cc_session_name", None)
+    _save_meta(name, meta)
+    slog(f"[reset] {name}: dropped conversation {dropped or '(none)'}; lane kept")
+    _ilog("session", "reset", actor=name, target=name,
+          detail={"dropped_conversation": dropped or None, "was_running": was_running})
+    ok, msg = start_session(name)
+    return ok, ("reset — fresh conversation, lane intact" if ok else msg)
 
 
 def wake_session(name: str) -> tuple[bool, str]:
@@ -29030,7 +29078,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.264';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.265';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49216,7 +49264,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.264';
+const CACHE = 'amux-v0.9.265';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57853,6 +57901,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 return self._json({"ok": ok, "message": msg}, 200 if ok else 500)
             if action == "wake":
                 ok, msg = wake_session(name)
+                return self._json({"ok": ok, "message": msg}, 200 if ok else 500)
+            # POST /api/sessions/<name>/reset — fresh conversation, same lane.
+            # The context is what fills up; the lane is not, so this is the verb
+            # that was missing every time a session said "I am out of context".
+            if action == "reset":
+                ok, msg = reset_session(name)
                 return self._json({"ok": ok, "message": msg}, 200 if ok else 500)
             if action == "apply-template":
                 body = self._read_body()
