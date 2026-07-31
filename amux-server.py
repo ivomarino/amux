@@ -9390,11 +9390,16 @@ _DEFAULT_STATUSES = [
 # session/schedule) and is kept as-is so nothing is rewritten; `kind` is derived
 # on read. Storing five and displaying three is what let the history modal badge
 # a session message as "direct".
-_MSG_KINDS = ("human", "session", "schedule")
+_MSG_KINDS = ("human", "session", "schedule", "amux")
 _MSG_KIND_OF = {
     "direct": "human", "steering": "human", "user": "human", "": "human",
     "session": "session",
     "schedule": "schedule",
+    # amux's own automation (advance nudges, commit-guard, auto-continue). It
+    # fell through the human default: 150 nudges across 21 lanes wore the Human
+    # chip, matched kind=human, and bumped last_human_ts — so an amux nudge made
+    # a lane sort under "Last message from me" as if a person had touched it.
+    "system": "amux",
 }
 
 
@@ -12402,7 +12407,7 @@ def list_sessions() -> list:
     try:
         for _r in get_db().execute(
                 "SELECT session, MAX(ts) AS t FROM cmd_history "
-                "WHERE type NOT IN ('session','schedule') GROUP BY session").fetchall():
+                "WHERE type NOT IN ('session','schedule','system') GROUP BY session").fetchall():
             if _r["session"]:
                 _human_ts[_r["session"]] = int((_r["t"] or 0) / 1000)
     except Exception as _e:
@@ -29683,7 +29688,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.285';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.287';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -33255,10 +33260,10 @@ function _cmdHistRenderChips(items) {
   // Server totals when we have them; local tally only as a pre-fetch placeholder.
   let counts;
   if (_cmdHistCounts) {
-    counts = { all: _cmdHistCounts.all || 0, human: _cmdHistCounts.human || 0,
+    counts = { all: _cmdHistCounts.all || 0, human: _cmdHistCounts.human || 0, amux: _cmdHistCounts.amux || 0,
                session: _cmdHistCounts.session || 0, schedule: _cmdHistCounts.schedule || 0 };
   } else {
-    counts = { all: items.length, human: 0, session: 0, schedule: 0 };
+    counts = { all: items.length, human: 0, session: 0, schedule: 0, amux: 0 };
     items.forEach(e => { counts[_msgKind(e)]++; });
   }
   const chips = [['all','All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
@@ -33348,6 +33353,7 @@ function _msgKind(e) {
   const t = (typeof e === 'string' ? '' : (e.type || '')).toLowerCase();
   if (t === 'session') return 'session';
   if (t === 'schedule') return 'schedule';
+  if (t === 'system') return 'amux';   // amux's own nudges, not a person
   return 'human';   // direct / steering / user / '' — all a person typing
 }
 // Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
@@ -33360,8 +33366,9 @@ const _MSG_KIND = {
   human:    { label: 'Human',     color: '#58a6ff', bg: 'rgba(88,166,255,0.14)' },
   session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
   schedule: { label: 'Scheduled', color: '#3fb950', bg: 'rgba(63,185,80,0.15)' },
+  amux:     { label: 'amux',      color: '#8b949e', bg: 'rgba(139,148,158,0.14)' },
 };
-const _MSG_KIND_ORDER = ['human', 'session', 'schedule'];
+const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux'];
 // Back-compat shim: _msgOrigin was the old 4-way classifier. Anything still
 // calling it gets the canonical kind.
 function _msgOrigin(e) { return _msgKind(e); }
@@ -33449,7 +33456,7 @@ function _peekMsgRenderChips(items) {
   const bar = document.getElementById('peek-messages-filter');
   if (!bar) return;
   // Count by kind so each chip shows how many of that type exist.
-  const counts = { all: items.length, human: 0, session: 0, schedule: 0 };
+  const counts = { all: items.length, human: 0, session: 0, schedule: 0, amux: 0 };
   items.forEach(e => { counts[_msgKind(e)]++; });
   // Every kind chip is ALWAYS shown, even at zero. Hiding empty ones made the
   // filter row change shape as you moved between sessions, and an absent chip
@@ -49956,7 +49963,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.285';
+const CACHE = 'amux-v0.9.287';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -52362,7 +52369,9 @@ class CCHandler(BaseHTTPRequestHandler):
                     ors = []
                     for k in want:
                         if k == "human":
-                            ors.append("type NOT IN ('session','schedule')")
+                            ors.append("type NOT IN ('session','schedule','system')")
+                        elif k == "amux":
+                            ors.append("type='system'")
                         else:
                             ors.append("type=?")
                             params.append(k)
