@@ -16400,6 +16400,50 @@ _GMAIL_DEFAULT_CLIENT = None  # Must supply ~/.amux/gmail-oauth-client.json
 
 # Pending OAuth flows: state → (account, flow)
 _gmail_pending: dict = {}
+# Pending OAuth state must survive restarts: this server execv-reloads on every
+# save of its own file, and a shared-checkout cotenant can trigger that at any
+# moment. A user who clicks the consent link 40s after a restart lands on
+# "Invalid or expired auth request" through no fault of their own (hello@amux.io
+# re-auth, 2026-07-31: URL minted 08:44, cotenant restart 08:51:05, click
+# 08:51:45). Only account + PKCE verifier are needed to rebuild the Flow.
+_GMAIL_PENDING_PATH = CC_HOME / "gmail-pending.json"
+
+def _gmail_pending_save(state: str, account: str, flow) -> None:
+    try:
+        d = {}
+        if _GMAIL_PENDING_PATH.exists():
+            d = json.loads(_GMAIL_PENDING_PATH.read_text())
+        now = time.time()
+        d = {k: v for k, v in d.items() if now - v.get("ts", 0) < 3600}   # 1h TTL
+        d[state] = {"account": account,
+                    "verifier": getattr(flow, "code_verifier", None), "ts": now}
+        _GMAIL_PENDING_PATH.write_text(json.dumps(d))
+        _GMAIL_PENDING_PATH.chmod(0o600)
+    except Exception as e:
+        slog(f"[gmail] pending persist failed (auth still works until a restart): {e}")
+
+def _gmail_pending_restore(state: str):
+    """(account, rebuilt_flow) for a state minted by a PREVIOUS process, or None."""
+    try:
+        if not _GMAIL_PENDING_PATH.exists():
+            return None
+        d = json.loads(_GMAIL_PENDING_PATH.read_text())
+        e = d.pop(state, None)
+        _GMAIL_PENDING_PATH.write_text(json.dumps(d))   # single-use either way
+        if not e or time.time() - e.get("ts", 0) > 3600:
+            return None
+        cfg = _gmail_oauth_client_config()
+        if not cfg:
+            return None
+        from google_auth_oauthlib.flow import Flow
+        flow = Flow.from_client_config(cfg, _GMAIL_SCOPES, redirect_uri=_GMAIL_REDIRECT_URI)
+        if e.get("verifier"):
+            flow.code_verifier = e["verifier"]
+        slog(f"[gmail] pending state {state[:8]}… restored from disk (survived a restart)")
+        return (e["account"], flow)
+    except Exception as ex:
+        slog(f"[gmail] pending restore failed: {ex}")
+        return None
 _gmail_creds_fail: dict = {}  # account → timestamp of last refresh failure (negative cache)
 _GMAIL_CREDS_FAIL_TTL = 300   # skip refresh retries for 5 min after a failure
 
@@ -16497,6 +16541,7 @@ def _gmail_auth_url(account: str) -> tuple[str, str] | tuple[None, str]:
             login_hint=account, include_granted_scopes="true"
         )
         _gmail_pending[state] = (account, flow)
+        _gmail_pending_save(state, account, flow)
         return url, state
     except Exception as e:
         return None, str(e)
@@ -29638,7 +29683,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.283';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.284';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49911,7 +49956,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.283';
+const CACHE = 'amux-v0.9.284';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54996,7 +55041,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     html = f"<html><body><h2>Auth failed: {error}</h2><p>Close this tab.</p></body></html>"
                     self.send_response(400); self.send_header("Content-Type","text/html"); self.end_headers()
                     self.wfile.write(html.encode()); return
-                entry = _gmail_pending.pop(state, None)
+                entry = _gmail_pending.pop(state, None) or _gmail_pending_restore(state)
                 if not entry or not code:
                     html = "<html><body><h2>Invalid or expired auth request.</h2><p>Close this tab and try again.</p></body></html>"
                     self.send_response(400); self.send_header("Content-Type","text/html"); self.end_headers()
