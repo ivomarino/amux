@@ -8610,6 +8610,13 @@ def _init_db():
         # cross-session verification first-class instead of voluntary.
         "ALTER TABLE issues ADD COLUMN depends_on TEXT",
         "ALTER TABLE issues ADD COLUMN reviewer TEXT",
+        # Append-only system history (2026-07-31, AMUX-2112). _append_board_log
+        # used to append into desc, where any full-desc PATCH (the normal way
+        # sessions and the detail-panel textarea update a card) silently
+        # destroyed it — a hook-attached commit line lived 2 minutes before an
+        # evidence update wiped it. log is system-owned: written only by
+        # _append_board_log, deliberately absent from the PATCH allow-list.
+        "ALTER TABLE issues ADD COLUMN log TEXT",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -9220,7 +9227,7 @@ def _is_same_task(issue_id: str, title: str, prompt_text: str) -> bool:
     missed fold costs one extra card you can discard, a wrong fold silently
     buries a real task inside another card, which is the bug being fixed."""
     try:
-        row = get_db().execute("SELECT title, desc FROM issues WHERE id=?", (issue_id,)).fetchone()
+        row = get_db().execute("SELECT title, desc, log FROM issues WHERE id=?", (issue_id,)).fetchone()
         if not row:
             return False
         def words(s):
@@ -9232,7 +9239,8 @@ def _is_same_task(issue_id: str, title: str, prompt_text: str) -> bool:
         # 40 folds accumulates enough vocabulary to match almost anything if the
         # whole desc is treated as one bag of words.
         cands = [row["title"] or ""]
-        cands += re.findall(r"New task:\s*(.+)", row["desc"] or "")
+        cands += re.findall(r"New task:\s*(.+)",
+                            (row["desc"] or "") + "\n" + (row["log"] or ""))
         for c in cands:
             cw = words(c)
             if not cw:
@@ -9313,17 +9321,21 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
 
 
 def _append_board_log(issue_id: str, line: str):
-    """Append an action line to a board issue's description."""
+    """Append an action line to a board issue's append-only system log.
+
+    NOT desc: desc is writer-owned narrative and gets wholesale-replaced by
+    every PATCH and by the detail-panel textarea, which silently destroyed
+    appended history (AMUX-2112). log has no PATCH path at all."""
     try:
         db = get_db()
-        row = db.execute("SELECT desc FROM issues WHERE id=?", (issue_id,)).fetchone()
+        row = db.execute("SELECT log FROM issues WHERE id=?", (issue_id,)).fetchone()
         if not row:
             return
-        desc = row["desc"] or ""
+        log = row["log"] or ""
         ts = time.strftime("%H:%M")
-        desc = desc.rstrip() + f"\n`{ts}` {line}"
-        db.execute("UPDATE issues SET desc=?, updated=? WHERE id=?",
-                   (desc, int(time.time()), issue_id))
+        log = (log.rstrip() + f"\n`{ts}` {line}").strip()
+        db.execute("UPDATE issues SET log=?, updated=? WHERE id=?",
+                   (log, int(time.time()), issue_id))
         db.commit()
         _board_changed()
     except Exception:
@@ -9405,7 +9417,8 @@ def _advance_open_card(session_name: str) -> bool:
         # done, so any move it makes is a lie. Guarding pickup but not this left
         # the loop still handing sessions uncompletable work — the second half
         # of the same bug (2026-07-30).
-        _d = (_item_by_id(row["id"]) or {}).get("desc") or ""
+        _it = _item_by_id(row["id"]) or {}
+        _d = (_it.get("desc") or "") + "\n" + (_it.get("log") or "")
         _f = len(re.findall(r"New task:", _d))
         if _f >= 2 or re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
                                 row["title"] or "", re.I):
@@ -9559,7 +9572,7 @@ def _pickup_next_board_task(session_name: str):
         time.sleep(3)
         db = get_db()
         rows = db.execute(
-            "SELECT id, title, desc FROM issues i "
+            "SELECT id, title, desc, log FROM issues i "
             "WHERE session=? AND status='todo' AND owner_type='agent' AND deleted IS NULL "
             # Freshness gate: never auto-run a card nobody has touched in 7+
             # days — fossils get triaged/parked by a human, not silently
@@ -9591,6 +9604,9 @@ def _pickup_next_board_task(session_name: str):
         if not row:
             return
         item_id, title, desc = row["id"], row["title"], row["desc"] or ""
+        # Fold lines moved from desc to the append-only log (AMUX-2112);
+        # old cards still carry them in desc — count across both.
+        desc = desc + "\n" + ((row["log"] if "log" in row.keys() else "") or "")
         # IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
         # "do not drop without confirmation" prose, but PROSE DOES NOT BIND AN
         # AUTOMATED READER — an agent auto-executing the card scrolls straight
@@ -10053,7 +10069,7 @@ def _load_board(done_limit: int = 100) -> list:
                COALESCE(i.pinned, 0) AS pinned,
                COALESCE(i.pos, 0) AS pos,
                COALESCE(i.archived, 0) AS archived,
-               i.depends_on, i.reviewer,
+               i.depends_on, i.reviewer, i.log,
                i.gate,
                GROUP_CONCAT(t.tag) AS tags_csv"""
     if done_limit > 0:
@@ -10180,7 +10196,7 @@ def _item_by_id(bid: str) -> dict | None:
                   COALESCE(i.pinned, 0) AS pinned,
                   COALESCE(i.pos, 0) AS pos,
                   COALESCE(i.archived, 0) AS archived,
-                  i.depends_on, i.reviewer,
+                  i.depends_on, i.reviewer, i.log,
                   i.gate,
                   GROUP_CONCAT(t.tag) AS tags_csv
            FROM issues i
@@ -21292,6 +21308,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border: none; color: var(--text); outline: none; padding: 10px 0;
     font-family: inherit; line-height: 1.65; resize: none; box-sizing: border-box;
   }
+  .board-detail-log { margin-top: 10px; padding: 8px 10px; background: var(--panel2, rgba(255,255,255,0.03)); border-radius: 8px; font-size: 0.74rem; line-height: 1.5; color: var(--dim); max-height: 180px; overflow-y: auto; }
+  .bd-log-title { font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; color: var(--dim); }
+  .bd-log-line { white-space: pre-wrap; word-break: break-word; }
   .board-detail-desc-input::placeholder { color: var(--dim); }
   .board-detail-preview { min-height: 200px; font-size: 0.92rem; color: var(--text); padding: 10px 0; }
   .board-detail-meta { margin-top: 12px; font-size: 0.78rem; color: var(--dim); border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 5px; }
@@ -24075,6 +24094,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="board-detail-tab" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
+    <div id="bd-log" class="board-detail-log" style="display:none"></div>
     <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
     <div class="board-detail-meta" id="bd-meta"></div>
   </div>
@@ -30096,7 +30116,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.293';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.294';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40621,7 +40641,7 @@ function _bqIs(item, val, ix) {
     case 'archived': return !!item.archived;
     case 'pinned':   return !!item.pinned;
     case 'overdue':  return !!item.due && (item.due * (item.due > 1e11 ? 0.001 : 1)) < Date.now() / 1000;
-    case 'folded':   return ((item.desc || '').match(/New task:/g) || []).length > 0;
+    case 'folded':   return (((item.desc || '') + '\n' + (item.log || '')).match(/New task:/g) || []).length > 0;
     default:         return false;
   }
 }
@@ -41575,6 +41595,16 @@ function openBoardDetail(id) {
   titleEl.style.height = 'auto';
   titleEl.style.height = titleEl.scrollHeight + 'px';
   document.getElementById('bd-desc').value = draft ? draft.desc : (item.desc || '');
+  const logEl = document.getElementById('bd-log');
+  if (logEl) {
+    // System history (commit attachments, auto-pickup notes) — append-only on
+    // the server, deliberately NOT part of the editable desc so saving the
+    // textarea can never clobber it (AMUX-2112).
+    logEl.style.display = item.log ? '' : 'none';
+    logEl.innerHTML = item.log
+      ? '<div class="bd-log-title">History</div>' + esc(item.log).split('\n').map(l => '<div class="bd-log-line">' + l + '</div>').join('')
+      : '';
+  }
   _renderDetailStatusBtns();
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
@@ -50371,7 +50401,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.293';
+const CACHE = 'amux-v0.9.294';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
