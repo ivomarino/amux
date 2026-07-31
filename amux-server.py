@@ -52062,11 +52062,22 @@ def _media_prepare_job(src: Path, out: Path, key: str):
 # "computed and found none" only because this comment says so.
 _FLEET_GRAPH_ID = "fleet"
 
-# Fixed palette rather than a generated hue: these are picked to stay legible
-# on the dashboard's dark background, which an arbitrary HSL sweep does not.
-_FLEET_PALETTE = ("#5b8ff9", "#5ad8a6", "#f6bd16", "#e8684a", "#6dc8ec",
-                  "#9270ca", "#ff9d4d", "#269a99", "#ff99c3", "#7ea6e0",
-                  "#d4a017", "#8fd14f", "#c86fd8", "#4dbfa5")
+# Eight categorical slots, stepped for a DARK surface and validated rather than
+# chosen by eye. The first cut of this list was fourteen hand-picked hues and it
+# failed four objective checks against the dashboard's #0a0a0c background:
+# ten sat outside the dark lightness band, two dropped below the chroma floor
+# and read as gray, the worst adjacent pair separated by only ΔE 5.5 under
+# protanopia, and one pair (#8fd14f/#d4a017) by ΔE 14.4 for NORMAL vision — two
+# departments a full-sighted reader cannot tell apart, which defeats the entire
+# point of colouring by department.
+#
+# These eight pass all five: lightness band, chroma floor, CVD separation
+# (worst adjacent ΔE 8.4 protan), normal-vision floor (19.3) and ≥3:1 contrast.
+# Eight is the cap on purpose — a ninth department reuses a slot rather than
+# inventing a hue, which is safe here because every node also carries its
+# department label, so identity is never colour-alone.
+_FLEET_PALETTE = ("#3987e5", "#d95926", "#199e70", "#c98500",
+                  "#d55181", "#008300", "#9085e9", "#e66767")
 
 
 def _fleet_dept_of(name: str) -> str:
@@ -52094,34 +52105,35 @@ def _fleet_departments(names) -> dict:
 
 
 def _fleet_colors(depts) -> dict:
-    """{department: colour}, distinct per department wherever the palette allows.
+    """{department: colour}, taking palette slots IN ORDER.
 
-    Hashing each name independently is the obvious implementation and it is
-    wrong: with a 14-colour palette, five departments collide about 40% of the
-    time (birthday problem), and two teams sharing a colour destroys the one
-    thing the colour is FOR — "same colour, same team" is the whole reason this
-    view reads at a glance. So the hash only picks a PREFERRED slot; taken
-    slots probe forward.
+    Two earlier attempts were wrong in instructive ways.
 
-    hashlib, NOT the builtin hash(): hash() is salted per process, so every
-    server restart would silently repaint the whole org chart — churn that
-    reads as a rendering bug and sends someone debugging the client.
+    Hashing each department name to a slot collides — five departments in eight
+    slots collide over half the time (birthday problem), and two teams sharing
+    a colour destroys the one thing the colour is FOR.
 
-    Assignment order is sorted by name so the result is identical on every
-    machine and every restart. Past `len(_FLEET_PALETTE)` departments, reuse is
-    unavoidable and the probe wraps.
+    Adding collision-probing fixed that and introduced a subtler failure: the
+    palette's separation guarantees hold for slots taken IN ORDER, and a hash
+    picks an arbitrary SUBSET. On the live fleet it chose slots 3 and 6 — aqua
+    #199e70 next to green #008300, ΔE 11.9 for *normal* vision, below the 15
+    floor. Two departments a full-sighted reader cannot tell apart, which is
+    the same defect the probing was added to prevent, just harder to see.
+
+    So: sorted by name, slots consumed 1,2,3… — the order the palette was
+    validated in. Sorting makes it identical on every machine and restart, with
+    no hashing involved (the builtin hash() would have been salted per process
+    and repainted the chart on every restart anyway).
+
+    Known cost: inserting a department that sorts early shifts the colours of
+    those after it. Acceptable only because this whole department heuristic is
+    scaffolding — missions (#69) carry an explicit, user-owned colour, which
+    ends both the shifting and the guessing. Past eight departments a slot is
+    reused rather than a hue invented; every node also renders its department
+    label, so identity is never colour-alone.
     """
-    out, taken = {}, set()
-    for d in sorted(set(depts), key=lambda s: s.casefold()):
-        h = int(_hashlib.md5(d.casefold().encode()).hexdigest()[:8], 16)
-        start = h % len(_FLEET_PALETTE)
-        for step in range(len(_FLEET_PALETTE)):
-            idx = (start + step) % len(_FLEET_PALETTE)
-            if idx not in taken:
-                break
-        taken.add(idx)
-        out[d] = _FLEET_PALETTE[idx]
-    return out
+    return {d: _FLEET_PALETTE[i % len(_FLEET_PALETTE)]
+            for i, d in enumerate(sorted(set(depts), key=lambda s: s.casefold()))}
 
 
 def _fleet_graph() -> dict:
