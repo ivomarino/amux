@@ -53727,6 +53727,17 @@ class CCHandler(BaseHTTPRequestHandler):
                 if not exists:
                     return self._json({"error": "item not found"}, 404)
 
+                # GET /api/board/<id> — read ONE card. There was no GET branch
+                # here, so the request fell through this block to the generic
+                # 404, and every card in the board answered "not found" while
+                # sitting in the list and accepting PATCH on the same URL. The
+                # workaround is to fetch the whole board and filter it in the
+                # client, which is what callers have been doing: ~1700 cards to
+                # read one, and a scripted `desc` append that assumed the read
+                # worked died mid-run instead.
+                if method == "GET":
+                    return self._json(_item_by_id(bid))
+
                 if method == "PATCH":
                     body = self._read_body()
                     now = int(time.time())
