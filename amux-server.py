@@ -1308,6 +1308,13 @@ def _cdp_call_raw(args: list, timeout_s: int = 30) -> dict:
 # Budget knobs, not constants (ethos dev-4): these bound what the model may SEE,
 # which is context-scarcity policy — it belongs in ~/.amux/server.env where it can
 # grow with the model's window, not hardcoded where it silently becomes the ceiling.
+# Bring sessions back after the container/host they lived in was replaced.
+# OFF by default and deliberately so: on a desktop this would launch every
+# session in the fleet on every server restart. The cloud gateway sets it per
+# user container, where the opposite default is the right one — a session a
+# person created should not silently disappear because we shipped an image.
+_AUTOSTART_SESSIONS = (os.environ.get("AMUX_AUTOSTART_SESSIONS", "") or "").strip().lower() \
+    in ("1", "true", "yes", "on")
 _OBS_EVAL_CAP = int(os.environ.get("AMUX_OBS_EVAL_CAP", "8000"))
 _OBS_STATE_CAP = int(os.environ.get("AMUX_OBS_STATE_CAP", "24000"))
 
@@ -4683,7 +4690,7 @@ _API_ERROR_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
 # Anchored form: the marker line must START with the error (after the ⏺ glyph),
 # which is how Claude Code emits it. Used for the decision; the loose form above
 # is only used to COUNT occurrences once the decision is made.
-_API_ERROR_START_RE = re.compile(r"^(?:⏺\s*)?API Error:\s*(5\d\d)\b", re.IGNORECASE)
+_API_ERROR_START_RE = re.compile(r"^(?:[⏺●]\s*)?API Error:\s*(5\d\d)\b", re.IGNORECASE)
 # API-key quota exhaustion arrives IN-BAND as a 4xx, not a banner: every
 # session on an exhausted key prints "⏺ API Error: 400 You have reached your
 # specified API usage limits. You will regain access on 2026-08-01 at 00:00
@@ -4698,7 +4705,7 @@ _API_ERROR_START_RE = re.compile(r"^(?:⏺\s*)?API Error:\s*(5\d\d)\b", re.IGNOR
 # Raw concat self-heals mid-word splits; the \s* between words absorbs
 # word-boundary wraps whether or not they keep the space.
 _API_QUOTA_MARKER_RE = re.compile(
-    r"^(?:⏺\s*)?API Error:\s*4\d\d\b", re.IGNORECASE)
+    r"^(?:[⏺●]\s*)?API Error:\s*4\d\d\b", re.IGNORECASE)
 _API_QUOTA_PHRASE_RE = re.compile(
     r"API\s*usage\s*limits", re.IGNORECASE)
 _API_QUOTA_RESET_RE = re.compile(
@@ -4710,7 +4717,7 @@ _API_QUOTA_RESET_RE = re.compile(
 # it carries credit-path semantics, not a reset target. Same wrap tolerance
 # as the quota patterns.
 _API_BUDGET_MARKER_RE = re.compile(
-    r"^(?:⏺\s*)?API Error:\s*402\b", re.IGNORECASE)
+    r"^(?:[⏺●]\s*)?API Error:\s*402\b", re.IGNORECASE)
 _API_BUDGET_PHRASE_RE = re.compile(
     r"budget\s*exhausted", re.IGNORECASE)
 
@@ -5042,7 +5049,12 @@ _rate_limit_last_drift_log: float = 0.0
 
 # Proof the session produced output on a line: an assistant message (⏺), an
 # echoed user message (❯ [09:32 AM] …), or a tool-run summary.
-_LIMIT_ACTIVITY_RE = re.compile(r"^(?:⏺\s|❯\s*\[\d|Ran \d+ shell command)")
+# ⏺/● both accepted: the live `tmux capture-pane` (what the scan reads)
+# renders Claude Code's record glyph as ● U+25CF, while the peek endpoint
+# yields ⏺ U+23FA — fixtures built from peek matched, live panes did not
+# (AMUX-2111, cloud stage-probe run 30644742436: the ONLY failing stage was
+# the marker lookup; phrase and reset parsed clean).
+_LIMIT_ACTIVITY_RE = re.compile(r"^(?:[⏺●]\s|❯\s*\[\d|Ran \d+ shell command)")
 
 
 def _live_limit_region(clean: str) -> str:
@@ -30167,7 +30179,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.296';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.297';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50452,7 +50464,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.296';
+const CACHE = 'amux-v0.9.297';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60794,6 +60806,8 @@ def main():
     # Tunnels are opt-in per target now (managed from the Proxies tab). Only
     # auto-start on boot when a specific target port is explicitly configured
     # (AMUX_TUNNEL_PORT) — never default to exposing amux's own control plane.
+    if _AUTOSTART_SESSIONS:
+        threading.Thread(target=_autostart_sessions_bg, daemon=True).start()
     if _TUNNEL_TOKEN and _TUNNEL_TARGET_PORT:
         threading.Thread(target=lambda: _tunnel_start(target_port=_TUNNEL_TARGET_PORT),
                          daemon=True).start()
