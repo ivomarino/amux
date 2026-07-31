@@ -9047,6 +9047,29 @@ def _pickup_next_board_task(session_name: str):
         # So the CONSUMER enforces, not the card text: anything naming an
         # unrecoverable operation is never auto-executed. It stays in todo for a
         # human to dispatch, and the owner is told why.
+        # NOT-A-TASK GUARD. Auto-pickup says "work it now", which is meaningless
+        # for a card that is not a single unit of work. Two shapes qualify, and
+        # both were in the eligible pool the moment pickup went fleet-wide
+        # (2026-07-30: 345 eligible, 66 journals, 16 test artifacts):
+        #
+        #   JOURNALS — cards with tasks folded into the desc. One reached 451
+        #   folds. Nothing about them is done or not-done, so no gate governs
+        #   them and there is no state in which finishing is possible. The fold
+        #   fix stops NEW ones forming; these already exist.
+        #
+        #   PROBE/TEST ARTIFACTS — leftovers from verification runs, including
+        #   my own. The first card this loop handed a session after going
+        #   fleet-wide was AMUX-1848, titled "[probe-stale] 1784823029868" with
+        #   47 folds.
+        _folds = len(re.findall(r"New task:", desc))
+        _junk = ("journal card ({} folded tasks)".format(_folds) if _folds >= 2
+                 else "looks like a test artifact"
+                 if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
+                              title or "", re.I) else "")
+        if _junk:
+            slog(f"[auto-pickup] {session_name}: skipped {item_id} — {_junk}")
+            _append_board_log(item_id, f"Auto-pickup SKIPPED — {_junk}; needs a human to split or discard it.")
+            return
         _blob = (title + "\n" + desc).lower()
         _danger = re.search(r"stash\s+(drop|clear)|rm\s+-[rf]{1,2}\b|push\s+(--force|-f)\b|"
                             r"reset\s+--hard|git\s+clean\s+-[a-z]*[fd]|drop\s+table|"
@@ -29213,7 +29236,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.269';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.270';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49486,7 +49509,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.269';
+const CACHE = 'amux-v0.9.270';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
