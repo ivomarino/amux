@@ -50,7 +50,10 @@ jobs:
 
               echo "  -- FILES read + write (PUT then GET then remove):"
               F="/root/amux-rw-probe-$TOKEN.txt"
-              put "/api/file?path=$F" "{\"content\":\"probe $TOKEN\"}" | head -c 160; echo
+              # path goes in the BODY, not the query string (amux-server.py
+              # /api/file PUT reads body["path"]) — sending ?path= silently
+              # wrote nothing and the read-back then "correctly" found nothing.
+              put "/api/file" "{\"path\":\"$F\",\"content\":\"probe $TOKEN\"}" | head -c 160; echo
               GOT=$(ex "curl -sS --max-time 20 'localhost:8822/api/file?path=$F'")
               case "$GOT" in
                 *"$TOKEN"*) echo "     files: WRITE+READ OK" ;;
@@ -64,7 +67,9 @@ jobs:
               ID=$(printf '%s' "$NEW" | tr ',' '\n' | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
               if [ -n "$ID" ]; then
                 printf '%s' '{"status":"doing"}' | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 20 -X PATCH localhost:8822/api/board/$ID -H 'Content-Type: application/json' -d @/tmp/rw.json" >/dev/null 2>&1
-                MOVED=$(ex "curl -sS --max-time 20 localhost:8822/api/board/$ID | head -c 200")
+                # There is no GET /api/board/<id>; read the item back out of
+                # the board listing instead of 404-ing on a route that does not exist.
+                MOVED=$(ex "curl -sS --max-time 20 localhost:8822/api/board | tr '}' '\n' | grep '$ID'")
                 case "$MOVED" in
                   *doing*) echo "     board: CREATE+MOVE OK (items before=$BEFORE)" ;;
                   *)       echo "     board: move FAILED -> $MOVED"; FAIL=1 ;;
