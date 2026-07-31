@@ -9235,7 +9235,18 @@ def _summarize_task_bg(session_name: str, text: str):
                 summary = "Re: " + summary
             if summary:
                 _update_meta(session_name, task_summary=summary)
-                _auto_create_board_issue(session_name, summary, text)
+                if not _autotask_enabled():
+                    # When autotask is on, the card already exists with the
+                    # prompt's own first clause as its title — a second create
+                    # here was the double-fire (AMUX-2114): _auto_create never
+                    # retitles (MO-2952), and the invented 3-word label dilutes
+                    # the fold-dedupe word overlap below threshold ("Status
+                    # Update Check" vs "status of it ?" = 0.33), so "improve
+                    # the title later" materialized as a twin card instead.
+                    # This path's product is the session label above; the card
+                    # is autotask's. Card-create remains only for fleets with
+                    # autotask disabled, where this is the sole capture path.
+                    _auto_create_board_issue(session_name, summary, text)
         except Exception:
             pass
     threading.Thread(target=_run, daemon=True).start()
@@ -30141,7 +30152,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.294';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.295';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50426,7 +50437,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.294';
+const CACHE = 'amux-v0.9.295';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58881,9 +58892,11 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     # would have corrected it (social-media, 2026-07-27).
                     if not _defer_busy:
                         # Every command lands on the board (toggle: board_autotask).
-                        # Runs alongside the throttled model-labeller rather than
-                        # replacing it: this one is free and always fires, that one
-                        # occasionally improves a title.
+                        # The throttled model-labeller below only updates the
+                        # session's task_summary label when autotask is on —
+                        # letting it also create cards double-filed every
+                        # prompt as raw-title + invented-title twins
+                        # (AMUX-2114).
                         _autotask_from_command(name, _orig_text)
                         _summarize_task_bg(name, _orig_text)  # the human's prompt
                     if not str(msg).startswith("queued"):   # steering enqueue emits message.queued itself
