@@ -1673,6 +1673,66 @@ def _bu_session_profile(session: str) -> str:
         pass
     return ""
 
+_CHROME_SINGLETONS = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+
+def _chrome_locks_present(user_data_dir) -> list:
+    """Which Singleton* entries Chrome still holds in a user-data-dir.
+
+    lstat, not exists(): these are symlinks pointing at <host>-<pid>, and
+    exists() follows the link, so a LIVE lock whose target is unresolvable
+    reads as absent — the check would pass exactly when it should fail.
+    """
+    out = []
+    for n in _CHROME_SINGLETONS:
+        try:
+            (Path(user_data_dir) / n).lstat()
+            out.append(n)
+        except OSError:
+            pass
+    return out
+
+
+def _bu_wait_for_exit(profile: str, timeout_s: float = 8.0) -> dict:
+    """Block until Chrome has actually exited after a close, or the wait runs out.
+
+    Chrome writes Cookies and Local Storage on graceful shutdown; a killed
+    Chrome never flushes them, which is why a profile could be written, verified
+    live in the page, and still come back empty in the next session. The tell is
+    the Singleton* symlinks: Chrome removes them on a clean exit and leaves them
+    behind when it dies. Returning from /api/browser/stop the moment browser-use
+    replies means returning BEFORE that flush, so the caller starts the next
+    session against a half-written profile.
+
+    Never kills anything. On a desktop the profile backend shares its
+    user-data-dir with the human's own Chrome, so a lingering lock may just mean
+    the user has a window open — reporting that honestly is right, killing it
+    would not be. Reports rather than raises: `clean_exit` false with the
+    remaining locks named is a usable answer, a silent success is not.
+    """
+    if not profile:
+        return {"clean_exit": None,
+                "note": "no profile recorded for this session; nothing to wait on"}
+    try:
+        user_data_dir, _ = _bu_profile_launch_target(profile)
+    except Exception as e:
+        return {"clean_exit": None, "note": f"could not resolve profile dir: {e}"}
+    t0 = time.time()
+    remaining = _chrome_locks_present(user_data_dir)
+    while remaining and (time.time() - t0) < timeout_s:
+        time.sleep(0.25)
+        remaining = _chrome_locks_present(user_data_dir)
+    out = {"profile": profile, "user_data_dir": str(user_data_dir),
+           "clean_exit": not remaining,
+           "waited_ms": int((time.time() - t0) * 1000)}
+    if remaining:
+        out["locks_remaining"] = remaining
+        out["note"] = (f"Chrome still holds {', '.join(remaining)} after {timeout_s:g}s — "
+                       f"storage may not be flushed. Another Chrome (e.g. the user's own "
+                       f"window) may share this user-data-dir.")
+    return out
+
+
 def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
              fresh: bool = False, timeout_s: int = 30) -> dict:
     """Open a URL under the correct profile.
@@ -57583,7 +57643,21 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _cdp_call(["close", tid], 10)   # browser-level closeTarget — window.close() can't close our tab
                     _cdp_call(["stop", tid], 8)
                     return self._json({"ok": True, "backend": "live", "closed": tid})
-                return self._json(_bu_call(["close"], session=session, timeout_s=10))
+                # Read the profile BEFORE closing — the session meta that records
+                # it goes away with the session, and after that there is nothing
+                # left to tell us which user-data-dir to wait on.
+                prof = _bu_session_profile(session)
+                res = _bu_call(["close"], session=session, timeout_s=10)
+                # Then WAIT for Chrome to finish exiting. browser-use returns as
+                # soon as it has asked it to close, which is before Cookies and
+                # Local Storage are flushed; returning there is what let the next
+                # session open a profile whose login had never reached disk.
+                # wait_s:0 opts out.
+                w = body.get("wait_s")
+                if isinstance(res, dict):
+                    res = dict(res)
+                    res.update(_bu_wait_for_exit(prof, timeout_s=8.0 if w is None else float(w)))
+                return self._json(res)
 
             # GET /api/browser/sessions
             if method == "GET" and path == "/api/browser/sessions":
