@@ -1803,6 +1803,55 @@ def _chrome_locks_present(user_data_dir) -> list:
     return out
 
 
+def _chrome_terminate_automation(user_data_dir) -> list:
+    """SIGTERM the AUTOMATION Chrome(s) holding `user_data_dir`. Returns pids.
+
+    Deliberately narrow. A process qualifies only if all three hold:
+      - it is chrome/chromium,
+      - its --user-data-dir is exactly this one,
+      - it carries --headless or a --remote-debugging flag.
+    That last condition is what keeps a human's own browser safe: a normal
+    Chrome window has neither, so this can never close the browser someone is
+    using. Only the browser amux itself launched is in scope.
+
+    SIGTERM, never SIGKILL. TERM is the signal Chrome flushes Cookies and Local
+    Storage on; KILL is precisely what loses them, which is the bug this exists
+    to fix — killing harder would make it worse, not better.
+    """
+    want = str(user_data_dir)
+    killed = []
+    try:
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return []          # POSIX-but-no-/proc (macOS): leave it alone
+        for p in proc.iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                argv = [a.decode("utf-8", errors="replace")
+                        for a in (p / "cmdline").read_bytes().split(b"\0") if a]
+            except OSError:
+                continue
+            if not argv or not re.search(r"chrom(e|ium)", argv[0], re.I):
+                continue
+            if not any(a == f"--user-data-dir={want}" for a in argv):
+                continue
+            if not any(a.startswith("--headless") or a.startswith("--remote-debugging")
+                       for a in argv):
+                continue      # looks like a human's window — never touch it
+            try:
+                os.kill(int(p.name), signal.SIGTERM)
+                killed.append(int(p.name))
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        return killed
+    if killed:
+        slog(f"[browser] SIGTERM to automation Chrome {killed} on {want} — it "
+             f"survived its own close and was holding the profile")
+    return killed
+
+
 def _bu_wait_for_exit(profile: str, timeout_s: float = 8.0) -> dict:
     """Block until Chrome has actually exited after a close, or the wait runs out.
 
@@ -1835,6 +1884,29 @@ def _bu_wait_for_exit(profile: str, timeout_s: float = 8.0) -> dict:
     out = {"profile": profile, "user_data_dir": str(user_data_dir),
            "clean_exit": not remaining,
            "waited_ms": int((time.time() - t0) * 1000)}
+    if remaining:
+        # It did not go. Ask the OS, gracefully.
+        #
+        # SIGTERM is what makes Chrome flush Cookies and Local Storage and drop
+        # its Singleton locks — the same path a window close takes. Without this
+        # the browser survives its own stop, keeps the profile locked, and the
+        # NEXT session cannot open that profile: browser-use silently falls back
+        # to a throwaway temp user-data-dir, so the login just written is
+        # invisible and the profile looks like it never persisted (AMUX-2070).
+        #
+        # Only ever an AUTOMATION Chrome on this exact profile: the process must
+        # carry --headless or a --remote-debugging flag, which a human's own
+        # browser window never does. amux started this browser; stop has to mean
+        # stopped. Never SIGKILL — that is the thing that loses the storage.
+        killed = _chrome_terminate_automation(user_data_dir)
+        if killed:
+            t1 = time.time()
+            while remaining and (time.time() - t1) < 6:
+                time.sleep(0.25)
+                remaining = _chrome_locks_present(user_data_dir)
+            out["terminated_pids"] = killed
+            out["clean_exit"] = not remaining
+            out["waited_ms"] = int((time.time() - t0) * 1000)
     if remaining:
         out["locks_remaining"] = remaining
         out["note"] = (f"Chrome still holds {', '.join(remaining)} after {timeout_s:g}s — "
@@ -4587,6 +4659,70 @@ _API_ERROR_RE = re.compile(r"API Error:\s*(5\d\d)\b", re.IGNORECASE)
 # which is how Claude Code emits it. Used for the decision; the loose form above
 # is only used to COUNT occurrences once the decision is made.
 _API_ERROR_START_RE = re.compile(r"^(?:⏺\s*)?API Error:\s*(5\d\d)\b", re.IGNORECASE)
+# API-key quota exhaustion arrives IN-BAND as a 4xx, not a banner: every
+# session on an exhausted key prints "⏺ API Error: 400 You have reached your
+# specified API usage limits. You will regain access on 2026-08-01 at 00:00
+# UTC." and then just sits there looking idle (AMUX-2111; fleet-wide live
+# specimen on the cloud gateway key, 2026-07-31). Unlike a 5xx this is a HARD
+# gate — but unlike the credit gates it carries a machine-readable reset, so
+# it maps onto rate_limit_reset_at and auto-resume genuinely works once the
+# key regains access.
+# The marker test runs on one physical line; the phrase and timestamp run on
+# the tail with line breaks REMOVED, because tmux hard-wraps the capture at
+# pane width and splits mid-word (observed live: "You will rega/in access").
+# Raw concat self-heals mid-word splits; the \s* between words absorbs
+# word-boundary wraps whether or not they keep the space.
+_API_QUOTA_MARKER_RE = re.compile(
+    r"^(?:⏺\s*)?API Error:\s*4\d\d\b", re.IGNORECASE)
+_API_QUOTA_PHRASE_RE = re.compile(
+    r"API\s*usage\s*limits", re.IGNORECASE)
+_API_QUOTA_RESET_RE = re.compile(
+    r"regain\s*access\s*on\s*(\d{4})-(\d{2})-(\d{2})\s*at\s*(\d{1,2}):(\d{2})\s*UTC",
+    re.IGNORECASE)
+
+
+def _api_error_region(clean: str) -> tuple:
+    """(last activity-marker line, capture-tail lines) — the shared structural
+    anchor for in-band API-error detection. See _api_error_state for why the
+    anchor is the LAST activity marker above the input box, and why it reads
+    the capture tail rather than _live_limit_region's slice."""
+    lines = [l.rstrip() for l in clean.splitlines()[-60:]]
+    box = -1
+    for i, l in enumerate(lines):
+        if l.strip()[:1] == "❯":
+            box = i          # last ❯ wins; earlier ones are echoed user messages
+    region = lines[:box] if box >= 0 else lines
+    last_marker = ""
+    for l in region:
+        if _LIMIT_ACTIVITY_RE.match(l.strip()):
+            last_marker = l.strip()
+    return last_marker, lines
+
+
+def _api_quota_reset(clean: str):
+    """Epoch reset time when an in-band 4xx usage-limit API error is the
+    session's CURRENT state (same structural anchor as _api_error_state),
+    else None. Only flags when the reset timestamp parses: the timestamp is
+    what makes this class actionable (rate_limit_reset_at → auto-resume), so
+    a 4xx without one stays unflagged rather than badging with no target."""
+    marker, lines = _api_error_region(clean)
+    if not marker or not _API_QUOTA_MARKER_RE.match(marker):
+        return None
+    # Line breaks removed, not joined: see the _API_QUOTA_*_RE comment on
+    # tmux's mid-word hard-wrapping.
+    flat = "".join(lines)
+    if not _API_QUOTA_PHRASE_RE.search(flat):
+        return None
+    m = _API_QUOTA_RESET_RE.search(flat)
+    if not m:
+        return None
+    import datetime as _dt
+    y, mo, d, h, mi = (int(x) for x in m.groups())
+    try:
+        return int(_dt.datetime(y, mo, d, h, mi,
+                                tzinfo=_dt.timezone.utc).timestamp())
+    except ValueError:
+        return None
 
 
 def _api_error_state(clean: str) -> tuple:
@@ -4611,16 +4747,7 @@ def _api_error_state(clean: str) -> tuple:
     positive that once told a sender its delivered message had failed
     (social-media, 2026-07-27).
     """
-    lines = [l.rstrip() for l in clean.splitlines()[-60:]]
-    box = -1
-    for i, l in enumerate(lines):
-        if l.strip()[:1] == "❯":
-            box = i          # last ❯ wins; earlier ones are echoed user messages
-    region = lines[:box] if box >= 0 else lines
-    last_marker = ""
-    for l in region:
-        if _LIMIT_ACTIVITY_RE.match(l.strip()):
-            last_marker = l.strip()
+    last_marker, lines = _api_error_region(clean)
     if not last_marker:
         return "", 0
     # Must BEGIN with the error, not merely contain it. A session explaining the
@@ -5120,6 +5247,29 @@ def _rate_limit_auto_respond():
                 _st.pop("api_error_code", None)
                 _st.pop("api_error_count", None)
                 slog(f"[api-error] session={name} API error cleared")
+            # In-band 4xx quota gate (AMUX-2111): a hard stop with a REAL
+            # reset time, printed as an API error rather than a banner. Same
+            # two-scan persistence as above, recorded on _st for the same
+            # reason (it must survive the no-rate-limit-UI `continue` below).
+            # Setting rate_limit_reset_at gives the badge, is:gated and
+            # auto-resume for free; cleared as soon as the error leaves the
+            # live tail — output below it means the session is working again.
+            _q_reset = _api_quota_reset(clean)
+            _q_prev = int(_st.get("api_quota_prev") or 0)
+            _st["api_quota_prev"] = _q_reset or 0
+            if _q_reset and _q_prev == _q_reset:
+                if not _st.get("rate_limit_api_quota"):
+                    slog(f"[api-quota] session={name} in-band API usage-limit "
+                         f"error — gated until {_q_reset} (parsed UTC reset)")
+                _st["rate_limit_api_quota"] = True
+                _st["rate_limit_reset_at"] = _q_reset
+                _st.pop("rate_limit_reset_at_fallback", None)
+                _st["rate_limit_last_event_ts"] = int(now)
+            elif not _q_reset and _st.get("rate_limit_api_quota"):
+                _st.pop("rate_limit_api_quota", None)
+                _st.pop("rate_limit_reset_at", None)
+                _st.pop("rate_limit_reset_at_fallback", None)
+                slog(f"[api-quota] session={name} quota error cleared")
             if matched_idx < 0 and not is_banner and not is_credit:
                 # No live rate-limit UI. A real banner cap keeps its banner on
                 # screen until reset, so a session flagged from a banner without a
@@ -29898,7 +30048,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.290';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.291';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50173,7 +50323,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.290';
+const CACHE = 'amux-v0.9.291';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
