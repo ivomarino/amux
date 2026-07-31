@@ -66,13 +66,21 @@ jobs:
               NEW=$(post "/api/board" "{\"title\":\"rw probe $TOKEN\",\"status\":\"todo\"}")
               ID=$(printf '%s' "$NEW" | tr ',' '\n' | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
               if [ -n "$ID" ]; then
-                printf '%s' '{"status":"doing"}' | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 20 -X PATCH localhost:8822/api/board/$ID -H 'Content-Type: application/json' -d @/tmp/rw.json" >/dev/null 2>&1
-                # There is no GET /api/board/<id>; read the item back out of
-                # the board listing instead of 404-ing on a route that does not exist.
-                MOVED=$(ex "curl -sS --max-time 20 localhost:8822/api/board | tr '}' '\n' | grep '$ID'")
+                # Capture the PATCH response. Sending it to /dev/null hid a real
+                # 409 ("gate not acknowledged") and left me reporting a genuine
+                # product bug as a parse bug in this very script. Never discard a
+                # response body to keep output tidy. todo->doing on a type=code
+                # card requires acking the gate.
+                PR=$(printf '%s' '{"status":"doing","gate_ack":true}' | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 20 -X PATCH localhost:8822/api/board/$ID -H 'Content-Type: application/json' -d @/tmp/rw.json" 2>&1)
+                echo "     PATCH response: $(printf '%s' "$PR" | head -c 300)"
+                # Parse with python3, not `tr '}'` — card descs contain literal
+                # '}' and shatter record-splitting on that character. Kept to one
+                # line: a multi-line script restarts at column 0 and breaks the
+                # YAML block scalar.
+                MOVED=$(ex "curl -sS --max-time 20 localhost:8822/api/board" | python3 -c "import json,sys; d=json.load(sys.stdin); m=[i for i in d if i.get('id')=='$ID']; print(m[0].get('status') if m else 'NOT_IN_LISTING')" 2>&1)
                 case "$MOVED" in
-                  *doing*) echo "     board: CREATE+MOVE OK (items before=$BEFORE)" ;;
-                  *)       echo "     board: move FAILED -> $MOVED"; FAIL=1 ;;
+                  doing) echo "     board: CREATE+MOVE OK (items before=$BEFORE)" ;;
+                  *)     echo "     board: move FAILED -> status=$MOVED resp=$(printf '%s' "$PR" | head -c 200)"; FAIL=1 ;;
                 esac
                 ex "curl -sS --max-time 20 -X DELETE localhost:8822/api/board/$ID >/dev/null"
                 echo "     board: probe item removed"
