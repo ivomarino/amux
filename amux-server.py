@@ -23046,6 +23046,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #graph-view.sidebar-collapsed .graph-expand-btn { display: flex; }
   #graph-view.sidebar-collapsed .graph-controls { left: 46px; }
   .graph-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+  /* Graph source switch (Notes / Fleet). 44px min height keeps it a legal
+     touch target on the phone, per .claude/rules/css-mobile.md. */
+  .graph-switch-btn { flex:1; min-height:32px; padding:6px 10px; font-size:0.75rem; font-family:inherit;
+    background:var(--bg); color:var(--dim); border:1px solid var(--border); border-radius:6px; cursor:pointer; }
+  .graph-switch-btn.active { background:var(--accent); color:#fff; border-color:transparent; }
+  @media (max-width: 600px) { .graph-switch-btn { min-height:44px; font-size:0.8rem; } }
   .graph-canvas { position: absolute; inset: 0; background: radial-gradient(circle, rgba(255,255,255,0.03) 1px, transparent 1px); background-size: 24px 24px; cursor: grab; overflow: hidden; }
   .graph-canvas.grabbing { cursor: grabbing; }
   .graph-controls { position: absolute; top: 8px; left: 8px; display: flex; flex-direction: column; gap: 3px; z-index: 15; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); padding: 4px; }
@@ -24426,7 +24432,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="notes-toggle-btn" onclick="_graphToggleSidebar()" title="Collapse sidebar"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
       </div>
     </div>
-    <div style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+    <div style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:6px;">
+      <button id="graph-switch-default" class="graph-switch-btn active" onclick="_graphSwitch('default')">Notes</button>
+      <button id="graph-switch-fleet" class="graph-switch-btn" onclick="_graphSwitch('fleet')">Fleet</button>
+    </div>
+    <div id="graph-vault-row" style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
       <input id="graph-vault-path" type="text" placeholder="/path/to/obsidian/vault" style="flex:1;min-width:100px;font-size:0.75rem;padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;">
       <button onclick="_graphImportVault()" style="padding:3px 10px;background:var(--accent);color:#fff;border:none;border-radius:4px;font-size:0.72rem;cursor:pointer;white-space:nowrap;">Import</button>
     </div>
@@ -50207,6 +50217,8 @@ async function _gmailSubmitCode(account) {
 // GRAPH / MIND MAP TAB
 // ═══════════════════════════════════════════
 let _graphData = { nodes: [], edges: [] };
+let _graphId = 'default';
+let _graphColorAuthority = false;
 let _graphInited = false;
 let _graphTransform = { x: 0, y: 0, scale: 1 };
 let _graphShowAllEdges = true;
@@ -50281,13 +50293,61 @@ async function _graphInit() {
   _graphApplySidebarState();
   const inp = document.getElementById('graph-vault-path');
   if (inp && _graphVaultPath) inp.value = _graphVaultPath;
-  await _graphLoad();
+  await _graphLoad(_graphId);
 }
 
-async function _graphLoad() {
+// Which graph a node's colour comes from. The fleet projection sends
+// color_authority, meaning its palette was chosen deliberately (validated for
+// contrast and colour-vision separation server-side) and must survive to the
+// screen. Everything else keeps the old behaviour: folder colouring wins, and
+// node.color is a per-note default worth overriding.
+function _graphNodeColor(n) {
+  if (_graphColorAuthority && n && n.color) return n.color;
+  return (n && _GRAPH_FOLDER_COLORS[n.folder]) || '#888';
+}
+
+function _graphFolderColor(f) {
+  if (_graphColorAuthority) {
+    const n = _graphData.nodes.find(x => x.folder === f);
+    if (n && n.color) return n.color;
+  }
+  return _GRAPH_FOLDER_COLORS[f] || '#888';
+}
+
+// Jump from an org-chart node straight into that agent's session peek. The
+// panel closes first so the graph is not left with a selection pointing at a
+// view the user has navigated away from.
+function _graphOpenSession(name) {
+  _graphClosePanel();
+  openPeek(name);
+}
+
+async function _graphSwitch(gid) {
+  if (gid === _graphId) return;
+  _graphClosePanel();
+  _graphActiveFilters.clear();
+  await _graphLoad(gid);
+}
+
+function _graphApplySwitchState() {
+  ['default', 'fleet'].forEach(g => {
+    const b = document.getElementById('graph-switch-' + g);
+    if (b) b.classList.toggle('active', g === _graphId);
+  });
+  // Importing an Obsidian vault into the fleet projection is meaningless — the
+  // fleet has no stored nodes to import into — so hide the control rather than
+  // letting it fail in a way the user has to interpret.
+  const v = document.getElementById('graph-vault-row');
+  if (v) v.style.display = (_graphId === 'default') ? '' : 'none';
+}
+
+async function _graphLoad(gid) {
   try {
-    const r = await fetch(API + '/api/graph/default', { headers: _authHeaders() });
+    if (gid) _graphId = gid;
+    _graphApplySwitchState();
+    const r = await fetch(API + '/api/graph/' + encodeURIComponent(_graphId), { headers: _authHeaders() });
     const d = await r.json();
+    _graphColorAuthority = !!d.color_authority;
     _graphData = d;
     _graphRestorePositions();
     _graphRender();
@@ -50307,7 +50367,13 @@ async function _graphLoad() {
 
 function _graphUpdateStats() {
   const el = document.getElementById('graph-stats');
-  if (el) el.textContent = `${_graphData.nodes.length} nodes, ${_graphData.edges.length} edges`;
+  if (!el) return;
+  if (_graphId === 'fleet') {
+    const depts = new Set(_graphData.nodes.map(n => n.folder)).size;
+    el.textContent = `${_graphData.nodes.length} agents, ${depts} department${depts===1?'':'s'}`;
+  } else {
+    el.textContent = `${_graphData.nodes.length} nodes, ${_graphData.edges.length} edges`;
+  }
 }
 
 async function _graphImportVault() {
@@ -50337,17 +50403,20 @@ function _graphBuildFilters() {
   // Auto-assign colors for unknown folders
   const palette = ['#C97B3A','#4A6FA5','#A54A4A','#4A9A6F','#7A4AA5','#6B8E8A','#B5651D','#8B5CF6','#EC4899','#10B981','#F59E0B','#6366F1'];
   let pi = 0;
-  folders.forEach(f => {
+  // Only auto-assign when the client owns colour. Writing department names into
+  // _GRAPH_FOLDER_COLORS would leak fleet folders into the notes graph's map,
+  // which outlives this view.
+  if (!_graphColorAuthority) folders.forEach(f => {
     if (!_GRAPH_FOLDER_COLORS[f]) _GRAPH_FOLDER_COLORS[f] = palette[pi++ % palette.length];
   });
   el.innerHTML = folders.map(f => {
-    const c = _GRAPH_FOLDER_COLORS[f] || '#888';
+    const c = _graphFolderColor(f);
     return `<button class="graph-filter-btn active" data-folder="${f}" onclick="_graphToggleFilter('${f}',this)" style="background:${c};color:#fff;border-color:transparent;">${f}</button>`;
   }).join('');
 }
 
 function _graphToggleFilter(folder, btn) {
-  const c = _GRAPH_FOLDER_COLORS[folder] || '#888';
+  const c = _graphFolderColor(folder);
   if (_graphActiveFilters.has(folder)) {
     _graphActiveFilters.delete(folder);
     btn.classList.remove('active');
@@ -50384,7 +50453,7 @@ function _graphRender() {
     el.className = 'graph-node';
     el.dataset.id = n.id;
     el.dataset.folder = n.folder;
-    const c = _GRAPH_FOLDER_COLORS[n.folder] || _GRAPH_FOLDER_COLORS[n.color] || '#888';
+    const c = _graphNodeColor(n);
     const isLight = document.body.classList.contains('light');
     el.style.background = c + (isLight ? '20' : '30');
     el.style.color = isLight ? c : _lightenColor(c, 0.3);
@@ -50419,7 +50488,7 @@ function _graphRenderEdges() {
     if (!src || !tgt) return;
     if (!visible.has(src.folder) || !visible.has(tgt.folder)) return;
     const show = _graphShowAllEdges || _graphHoveredNode === e.source || _graphHoveredNode === e.target || _graphSelectedNode === e.source || _graphSelectedNode === e.target;
-    const c = _GRAPH_FOLDER_COLORS[src.folder] || '#888';
+    const c = _graphNodeColor(src);
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     const x1 = (src.x||0)+50, y1 = (src.y||0)+16, x2 = (tgt.x||0)+50, y2 = (tgt.y||0)+16;
     const mx = (x1+x2)/2, my = (y1+y2)/2 - 30;
@@ -50488,7 +50557,7 @@ function _graphEndDrag(e) {
     s.node.pinned = 1;
     _graphSavePositions();
     // Update server
-    fetch(API + '/api/graph/default/nodes/' + encodeURIComponent(s.node.id), {
+    fetch(API + '/api/graph/' + encodeURIComponent(_graphId) + '/nodes/' + encodeURIComponent(s.node.id), {
       method: 'PATCH', headers: _authHeaders({'Content-Type':'application/json'}),
       body: JSON.stringify({ x: s.node.x, y: s.node.y, pinned: 1 })
     }).catch(()=>{});
@@ -50711,12 +50780,32 @@ function _graphOpenPanel(node) {
   const panel = document.getElementById('graph-side-panel');
   document.getElementById('graph-side-title').textContent = node.label;
   const badge = document.getElementById('graph-side-badge');
-  const c = _GRAPH_FOLDER_COLORS[node.folder] || '#888';
+  const c = _graphNodeColor(node);
   badge.textContent = node.folder;
   badge.style.background = c;
   // Source file path
   const body = document.getElementById('graph-side-body');
   let html = '';
+  // A fleet node is an agent, not a note: show what it is doing and offer the
+  // one action you actually want from an org chart — go look at that session.
+  if (_graphId === 'fleet' && node.session) {
+    const st = node.status || '';
+    const dot = st === 'active' ? 'var(--green)' : (st === 'waiting' ? '#d29922' : 'var(--dim)');
+    html += `<div style="display:flex;align-items:center;gap:7px;font-size:0.8rem;margin-bottom:8px;">
+      <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex:none;"></span>
+      <span>${esc(st || 'unknown')}</span>
+      ${node.provider ? `<span style="color:var(--dim);font-size:0.72rem;">· ${esc(node.provider)}</span>` : ''}
+    </div>`;
+    html += `<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">
+      ${node.task ? esc(node.task) : 'no card in flight'}</div>`;
+    html += `<button onclick="_graphOpenSession('${esc(node.session)}')"
+      style="width:100%;min-height:34px;padding:7px 10px;background:var(--accent);color:#fff;border:none;
+      border-radius:6px;font-size:0.75rem;font-family:inherit;cursor:pointer;">Open session</button>`;
+    body.innerHTML = html;
+    document.getElementById('graph-side-links').innerHTML = '';
+    panel.classList.add('open');
+    return;
+  }
   if (node.source_path) {
     html += `<div style="font-size:0.68rem;color:var(--dim);margin-bottom:10px;word-break:break-all;font-family:monospace;padding:4px 8px;background:var(--bg);border-radius:4px;">${node.source_path}</div>`;
   }
@@ -50737,7 +50826,7 @@ function _graphOpenPanel(node) {
   const nodeMap = {}; _graphData.nodes.forEach(n => nodeMap[n.id] = n);
   links.innerHTML = connected.filter(id => nodeMap[id]).map(id => {
     const n = nodeMap[id];
-    const cc = _GRAPH_FOLDER_COLORS[n.folder] || '#888';
+    const cc = _graphNodeColor(n);
     return `<span class="chip" style="border-color:${cc}40;color:${cc}" onclick="_graphFocusNode('${n.id}')">${n.label}</span>`;
   }).join('');
   panel.classList.add('open');
@@ -52186,7 +52275,14 @@ def _fleet_graph() -> dict:
         }
         nodes.append(node)
 
-    return {"nodes": nodes, "edges": []}
+    # color_authority tells the client these colours are DELIBERATE and must be
+    # rendered as sent. Without it the graph client falls back to its own
+    # _GRAPH_FOLDER_COLORS map and auto-assigns unknown folders from a local
+    # palette — which would silently discard the validated department palette
+    # above and repaint the fleet in whatever hues happened to be free. The
+    # Obsidian graph keeps the old behaviour, where node.color is a per-note
+    # default that folder colouring is meant to override.
+    return {"nodes": nodes, "edges": [], "color_authority": True}
 
 
 class CCHandler(BaseHTTPRequestHandler):
