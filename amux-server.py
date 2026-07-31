@@ -10182,9 +10182,23 @@ SCHED_EVENT_TYPES = ("session_idle", "board")
 def _board_changed():
     """Invalidate the board SSE cache and emit a closed-loop 'board' event.
     (Written without the literal cache-assignment substring so the bulk
-    replace that routed all board writes here didn't rewrite this body too.)"""
+    replace that routed all board writes here didn't rewrite this body too.)
+
+    Drops the cached PAYLOAD, not just its timestamp. GET /api/board is
+    stale-while-revalidate: when the entry is stale but still holds data it
+    kicks off a background refresh and returns the OLD json. Marking the time
+    as stale therefore left exactly one more GET serving a board without the
+    write in it, so create-then-read was broken for every client — a card
+    created and read back a moment later came up missing. Nulling the data
+    makes the next GET take the synchronous path and rebuild. TTL expiry still
+    serves stale-while-revalidate, which is what keeps the multi-MB payload
+    cheap for pollers; only an explicit write forces the slow path."""
     _bc = _sse_cache["board"]
     _bc["time"] = 0
+    _bc["data"] = None
+    # Generation guard: an in-flight background refresh that started before this
+    # write must not commit its result on top of the invalidation.
+    _bc["gen"] = _bc.get("gen", 0) + 1
     _fire_schedule_event("board")
 
 def _fire_schedule_event(event_type: str, source_session: str | None = None):
@@ -29016,7 +29030,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.261';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.264';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49202,7 +49216,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.261';
+const CACHE = 'amux-v0.9.264';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -52782,9 +52796,18 @@ class CCHandler(BaseHTTPRequestHandler):
                         try:
                             if time.time() - bc["time"] > _SSE_CACHE_TTL:
                                 if bc["data"] is not None:
+                                    # Capture the generation BEFORE reading. A write
+                                    # landing while _load_board() is in flight bumps
+                                    # it, and committing this now-stale result would
+                                    # silently undo that invalidation AND stamp it
+                                    # fresh — which is exactly how a just-created card
+                                    # stayed missing across repeated writes.
+                                    _gen0 = bc.get("gen", 0)
                                     def _bg_board():
                                         try:
                                             data = _load_board()
+                                            if bc.get("gen", 0) != _gen0:
+                                                return   # superseded by a write; leave it invalid
                                             bc["data"] = data
                                             bc["json"] = json.dumps(data, sort_keys=True)
                                             bc["time"] = time.time()
@@ -52801,12 +52824,24 @@ class CCHandler(BaseHTTPRequestHandler):
                             if not released_to_bg:
                                 _sse_cache_lock.release()
                     else:
+                        # Lock held by an in-flight refresh. Serving bc["json"] here
+                        # hands back PRE-WRITE data purely because a refresh happened
+                        # to be running — the last hole in read-after-write, and the
+                        # reason a just-created card still went missing under rapid
+                        # writes even with the generation guard. When an explicit
+                        # write has invalidated the cache (data is None), read
+                        # through instead: correctness beats the cache on the rare
+                        # request that collides with a refresh.
+                        if bc["data"] is None:
+                            return self._json(_load_board())
                         if bc["json"]:
                             return self._json_raw(bc["json"], etag=_cache_etag(bc))
                         for _ in range(100):
                             time.sleep(0.1)
                             if bc["json"]:
                                 break
+                if bc["data"] is None:
+                    return self._json(_load_board())
                 return self._json_raw(bc["json"], etag=_cache_etag(bc)) if bc["json"] else self._json([])
 
             # POST /api/board — create issue
