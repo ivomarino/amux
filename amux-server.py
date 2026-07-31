@@ -4679,6 +4679,15 @@ _API_QUOTA_PHRASE_RE = re.compile(
 _API_QUOTA_RESET_RE = re.compile(
     r"regain\s*access\s*on\s*(\d{4})-(\d{2})-(\d{2})\s*at\s*(\d{1,2}):(\d{2})\s*UTC",
     re.IGNORECASE)
+# The gateway's own budget wall is a third in-band class (AMUX-2113): "API
+# Error: 402 amux trial budget exhausted ($25.03 of $25.00). Upgrade at
+# https://cloud...". No reset time exists — the fix is an upgrade/top-up — so
+# it carries credit-path semantics, not a reset target. Same wrap tolerance
+# as the quota patterns.
+_API_BUDGET_MARKER_RE = re.compile(
+    r"^(?:⏺\s*)?API Error:\s*402\b", re.IGNORECASE)
+_API_BUDGET_PHRASE_RE = re.compile(
+    r"budget\s*exhausted", re.IGNORECASE)
 
 
 def _api_error_region(clean: str) -> tuple:
@@ -4723,6 +4732,19 @@ def _api_quota_reset(clean: str):
                                 tzinfo=_dt.timezone.utc).timestamp())
     except ValueError:
         return None
+
+
+def _api_budget_gated(clean: str) -> bool:
+    """True when the gateway's 402 budget wall is the session's CURRENT state
+    (same structural anchor as _api_error_state). No reset time exists — the
+    fix is an upgrade/top-up — so callers feed this into the CREDIT path
+    rather than a reset target."""
+    marker, lines = _api_error_region(clean)
+    if not marker or not _API_BUDGET_MARKER_RE.match(marker):
+        return False
+    # Line breaks removed, not joined: see the _API_QUOTA_*_RE comment on
+    # tmux's mid-word hard-wrapping.
+    return bool(_API_BUDGET_PHRASE_RE.search("".join(lines)))
 
 
 def _api_error_state(clean: str) -> tuple:
@@ -5207,7 +5229,13 @@ def _rate_limit_auto_respond():
             _is_banner_gate = bool(
                 _MODEL_CREDIT_LIMIT_RE.search("\n".join(_live_ne[-5:]))
                 and _MODEL_CREDIT_LIMIT_CTX_RE.search("\n".join(_live_ne[-5:])))
-            _credit_raw = bool(_provider_hit) or (
+            # Gateway 402 budget wall (AMUX-2113): in-band, no reset time —
+            # credit-path semantics, so it feeds _credit_raw and inherits the
+            # two-scan gate, badge, is:gated, hard-gate alert and clear
+            # machinery wholesale. The model-name slot names the gate so the
+            # badge reads "trial budget limit".
+            _budget_gated = matched_idx < 0 and _api_budget_gated(clean)
+            _credit_raw = bool(_provider_hit) or _budget_gated or (
                 matched_idx < 0 and not is_banner
                 and (_is_banner_gate or _is_menu_gate))
             # PERSISTENCE GATE. No regex fully separates "this session is gated"
@@ -5300,8 +5328,10 @@ def _rate_limit_auto_respond():
                 # Same tail restriction: a model name lifted from prose higher up
                 # would mislabel the badge even when the gate itself is real.
                 m = _MODEL_CREDIT_NAME_RE.search("\n".join(_live_ne[-6:]))
-                actions["rate_limit_model_name"] = _provider_hit or (
-                    (m.group(1) or m.group(2) or "").strip() if m else "")
+                actions["rate_limit_model_name"] = (
+                    _provider_hit
+                    or ("trial budget" if _budget_gated else "")
+                    or ((m.group(1) or m.group(2) or "").strip() if m else ""))
                 actions["rate_limit_last_event_ts"] = int(now)
                 actions.pop("rate_limit_reset_at", None)
                 actions.pop("rate_limit_reset_at_fallback", None)
@@ -30048,7 +30078,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.291';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.292';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50323,7 +50353,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.291';
+const CACHE = 'amux-v0.9.292';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
