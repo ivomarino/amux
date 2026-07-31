@@ -1505,6 +1505,29 @@ const dir = process.argv[2], profileDir = process.argv[3] || '',
       .concat(profileDir ? ['--profile-directory=' + profileDir] : []),
   };
   let ctx;
+  // A headless launcher must never outlive its job. There is no window for a
+  // human to close, and for as long as it lives it HOLDS this profile's Chrome
+  // locks — so the next `browser-use -b real --profile <name>` cannot open the
+  // profile and silently runs a throwaway temp user-data-dir instead, sending
+  // every cookie and localStorage write to /tmp. That is AMUX-2070, and it
+  // presents as "the profile saves but never reloads". The code below already
+  // closes on the headless path; this covers it HANGING before it gets there
+  // (goto, storageState and close are each an await that can stall), because a
+  // stall here poisons the profile for the life of the container.
+  if (headless) {
+    const t = setTimeout(async () => {
+      try {
+        await Promise.race([
+          ctx ? ctx.close() : Promise.resolve(),
+          new Promise(r => setTimeout(r, 10000)),
+        ]);
+      } catch (e) {}
+      console.error(JSON.stringify({ ok: false, headless: true,
+        error: 'watchdog: launcher exceeded 90s; exiting so the profile lock is released' }));
+      process.exit(1);
+    }, 90000);
+    if (t.unref) t.unref();
+  }
   try {
     ctx = await chromium.launchPersistentContext(dir, { ...opts, channel: 'chrome' });
   } catch (e) {
@@ -1673,6 +1696,93 @@ def _bu_session_profile(session: str) -> str:
         pass
     return ""
 
+def _chrome_user_data_dirs_in_use() -> list:
+    """Every --user-data-dir a live Chrome is actually running with.
+
+    Read from the processes themselves, because every other signal here lies.
+    browser-use answers a profile-backed open with mode:'real' and the profile
+    NAME it was asked for even when its Chrome is on
+    /tmp/browser-use-user-data-dir-*, and that response is what sent two
+    sessions chasing a directory-resolution bug that had already been ruled out.
+    Returns [] when it cannot tell (no /proc, no ps) — the caller must treat
+    empty as UNKNOWN, never as "not running".
+    """
+    dirs, seen = [], set()
+
+    def _add(v):
+        v = (v or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            dirs.append(v)
+
+    # /proc keeps the argv boundaries (NUL-separated), so a path containing a
+    # space stays one argument.
+    argvs = []
+    try:
+        proc = Path("/proc")
+        if proc.is_dir():
+            for p in proc.iterdir():
+                if not p.name.isdigit():
+                    continue
+                try:
+                    raw = (p / "cmdline").read_bytes()
+                except OSError:
+                    continue
+                if raw:
+                    argvs.append([a.decode("utf-8", errors="replace")
+                                  for a in raw.split(b"\0") if a])
+    except Exception:
+        pass
+    if argvs:
+        for argv in argvs:
+            # Chrome is not the only thing that takes --user-data-dir: every
+            # Electron app does. Without this filter the probe reported Docker
+            # Desktop's and Granola's directories as "Chrome is running on".
+            if not re.search(r"chrom(e|ium)", argv[0], re.I):
+                continue
+            for tok in argv:
+                if tok.startswith("--user-data-dir="):
+                    _add(tok.split("=", 1)[1])
+        return dirs
+    # ps flattens argv into one string, so splitting on whitespace CUTS a path
+    # that contains a space — macOS's is
+    # "~/Library/Application Support/Google/Chrome", which truncated to
+    # ".../Library/Application" and would have reported a correctly-running
+    # profile as a mismatch. Match to the next " --" instead.
+    try:
+        r = subprocess.run(["ps", "-ax", "-o", "command="],
+                           capture_output=True, text=True, timeout=8)
+    except Exception:
+        return []
+    for line in r.stdout.splitlines():
+        if not re.search(r"chrom(e|ium)", line, re.I):
+            continue
+        for m in re.finditer(r"--user-data-dir=(.*?)(?=\s+--|$)", line):
+            _add(m.group(1))
+    return dirs
+
+
+def _bu_profile_in_use(profile: str) -> dict:
+    """Is a live Chrome actually running on the profile we asked for?
+
+    {"verified": True|False|None, ...} — None means undeterminable, which is a
+    different answer from False and must not be reported as success.
+    """
+    try:
+        want_udd, _ = _bu_profile_launch_target(profile)
+    except Exception:
+        return {"verified": None, "why": "could not resolve the profile directory"}
+    in_use = _chrome_user_data_dirs_in_use()
+    if not in_use:
+        return {"verified": None, "why": "no Chrome process readable from here"}
+    if str(want_udd) in in_use:
+        return {"verified": True, "user_data_dir": str(want_udd)}
+    return {"verified": False, "expected_user_data_dir": str(want_udd),
+            "actual_user_data_dirs": in_use[:4],
+            "why": ("Chrome is running on a different user-data-dir than the profile "
+                    "asked for — writes will not persist to that profile")}
+
+
 _CHROME_SINGLETONS = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 
 
@@ -1765,6 +1875,17 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
         res = dict(res)
         res["profile"] = profile
         res["auto_profile"] = auto
+        # `profile` above is what we ASKED for. Say what we actually GOT: a
+        # caller that trusts the request echo has no way to learn its writes are
+        # landing in a temp dir, which is precisely how this stayed misdiagnosed.
+        if not res.get("error"):
+            chk = _bu_profile_in_use(profile)
+            res["profile_verified"] = chk.get("verified")
+            if chk.get("verified") is False:
+                res["profile_warning"] = chk["why"]
+                res["actual_user_data_dirs"] = chk.get("actual_user_data_dirs")
+                slog(f"[browser] profile '{profile}' requested but Chrome is on "
+                     f"{chk.get('actual_user_data_dirs')} — writes will not persist")
         # Re-install the console/network capture shim on every navigation (page
         # globals reset on load) so /api/browser/inspect can troubleshoot the page.
         if not res.get("error"):
