@@ -95,6 +95,17 @@ jobs:
             # on clean shutdown, so a value that appears on disk BEFORE we ask
             # the session to close means the write was fine and the shutdown is
             # what loses it.
+            # THE decisive readout, taken while the write session is still OPEN.
+            # The one further down runs after the stop, so it can only ever show
+            # leftovers — it cannot say which directory the browser that did the
+            # WRITING was using, which is the whole question. Reading it here
+            # separates "profile opened, storage not flushed" from "the named
+            # profile was never opened at all and the writes went to /tmp".
+            echo
+            echo "  -- LIVE cmdline of the session that just wrote (session still open):"
+            ex 'for p in $(pgrep -f "chrome|chromium" 2>/dev/null); do tr "\0" "\n" < /proc/$p/cmdline 2>/dev/null; done | grep -e "--user-data-dir" -e "--profile-directory" | sort | uniq -c' | sed 's/^/     /'
+            echo "     (expect --user-data-dir=/root/.config/google-chrome AND --profile-directory=$PROF)"
+            echo
             echo "  waiting 40s for Chrome's own periodic flush (no close yet)"
             sleep 40
             ex "grep -a -r -q amux_probe '/root/.config/google-chrome/$PROF' 2>/dev/null && echo '    token on disk BEFORE close (write is fine; shutdown is the problem)' || echo '    token NOT on disk before close'"
