@@ -722,6 +722,31 @@ AUTH_TOKEN = _load_or_create_auth_token()
 # by any API endpoint. Override for trusted automation with
 # AMUX_ALLOW_AGENT_SESSION_DELETE=1 in ~/.amux/server.env.
 import hashlib as _hashlib
+
+_BUILD_ID = None
+
+
+def _build_id() -> str:
+    """Short content hash of this server file: which BUILD is actually running.
+
+    A deployed container reports uptime, which says the process is young and
+    nothing about what code it contains. Verifying a fix in prod today meant
+    reading a field, getting the pre-fix answer, and having no way to tell a real
+    negative from a container still on the previous image — for two different
+    sessions, on two different fixes, in the same hour.
+
+    Hashing the file itself rather than baking in a git sha keeps it honest
+    through execv reloads and hand-patched containers, where a build-time
+    constant would keep asserting a commit the file no longer matches.
+    """
+    global _BUILD_ID
+    if _BUILD_ID is None:
+        try:
+            _BUILD_ID = _hashlib.sha256(
+                Path(__file__).resolve().read_bytes()).hexdigest()[:12]
+        except Exception:
+            _BUILD_ID = "unknown"
+    return _BUILD_ID
 _UI_TOKEN = _hashlib.sha256(("amux-ui-guard:" + AUTH_TOKEN).encode()).hexdigest()[:40]
 
 
@@ -51472,6 +51497,14 @@ class CCHandler(BaseHTTPRequestHandler):
             _proc = psutil_process_info()
             return self._json({
                 "status": "ok",
+                # WHICH BUILD is this. Without it, "is the fix live here?" is
+                # unanswerable: two sessions spent today reading prod fields that
+                # came back wrong, unable to tell a real negative from a container
+                # still on the previous image. uptime_s only says the process is
+                # young, not what code it is running.
+                # Map it to a commit with:
+                #   git show <sha>:amux-server.py | shasum -a 256 | cut -c1-12
+                "build": _build_id(),
                 "pid": os.getpid(),
                 "uptime_s": int(time.time() - _server_start_time),
                 "requests": _server_request_count,
