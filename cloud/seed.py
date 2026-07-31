@@ -356,15 +356,112 @@ def prune_duplicate_schedules(org, sessions, apply=False):
     return removed
 
 
+def prune_duplicate_board(org, plan, apply=False):
+    """Report (and optionally remove) extra copies of the plan's board items and
+    columns. Only titles/labels the plan itself declares are in scope, so a card
+    or column a person added by hand is never touched.
+
+    Cards in a duplicate column are MOVED to the kept column before it goes:
+    deleting a column server-side reparents its cards to 'todo', which would
+    quietly undo work the prospect had already sorted.
+    """
+    live_items, live_cols = existing_board(org), existing_columns(org)
+    if live_items is None or live_cols is None:
+        bad("could not list board — nothing pruned")
+        return
+    for title in sorted({i["title"] for i in plan.get("board", [])}):
+        copies = sorted(live_items.get(title.strip(), []),
+                        key=lambda x: (x.get("created") or 0, x.get("id") or ""))
+        for x in copies[1:]:
+            if not apply:
+                warn(f"duplicate board item {x.get('id')} '{title[:44]}' "
+                     f"(would keep {copies[0].get('id')})")
+                continue
+            code, _ = gw("DELETE", f"/api/board/{x['id']}", org=org)
+            (ok if code in (200, 204) else bad)(
+                f"removed duplicate board item {x['id']} '{title[:44]}' "
+                f"(kept {copies[0]['id']})")
+    # Re-read: the item pass above just deleted cards, and most of them were the
+    # very cards sitting in the duplicate columns. Reusing the pre-delete
+    # snapshot here would "move" rows that no longer exist and report a card
+    # count nobody could reconcile with the board.
+    if apply:
+        live_items = existing_board(org) or live_items
+    for label in plan.get("board_columns", []):
+        cols = live_cols.get(label.strip().lower(), [])
+        if len(cols) < 2:
+            continue
+        cols = sorted(cols, key=lambda c: (c.get("position") or 0, c.get("id") or ""))
+        keep, extra = cols[0], cols[1:]
+        for c in extra:
+            stranded = [i for group in live_items.values() for i in group
+                        if i.get("status") == c["id"]]
+            if not apply:
+                warn(f"duplicate column '{label}' {c['id']} "
+                     f"(would move {len(stranded)} card(s) to {keep['id']}, then delete)")
+                continue
+            moved = 0
+            for i in stranded:
+                mc, _ = gw("PATCH", f"/api/board/{i['id']}",
+                           body={"status": keep["id"]}, org=org)
+                moved += 1 if mc == 200 else 0
+            code, _ = gw("DELETE", f"/api/board/statuses/{c['id']}", org=org)
+            (ok if code in (200, 204) else bad)(
+                f"removed duplicate column '{label}' {c['id']} "
+                f"(moved {moved}/{len(stranded)} card(s) to {keep['id']})")
+
+
+def existing_columns(org):
+    """Live board columns grouped by lowercased label. None if unreadable."""
+    code, d = gw_json("GET", "/api/board/statuses", org=org)
+    rows = d if isinstance(d, list) else (d or {}).get("statuses")
+    if code != 200 or not isinstance(rows, list):
+        return None
+    idx = {}
+    for s in rows:
+        idx.setdefault((s.get("label") or "").strip().lower(), []).append(s)
+    return idx
+
+
+def existing_board(org):
+    """Live board items grouped by title. None if unreadable."""
+    code, d = gw_json("GET", "/api/board", org=org)
+    rows = d if isinstance(d, list) else (d or {}).get("items")
+    if code != 200 or not isinstance(rows, list):
+        return None
+    idx = {}
+    for i in rows:
+        idx.setdefault((i.get("title") or "").strip(), []).append(i)
+    return idx
+
+
 def create_board_columns(org, labels):
     """Add a board column per category of work, so the kanban mirrors how the
     prospect actually thinks about their pipeline rather than generic todo/doing.
-    Returns {label: status_id} for placing items into them."""
+    Returns {label: status_id} for placing items into them.
+
+    Reuses a column that already carries the label. POST does not dedupe — it
+    mints a fresh id with a numeric suffix, so re-seeding used to leave
+    Underwriting, Underwriting-2, Underwriting-3 side by side in the prospect's
+    kanban (Jacob's workspace, seeded four times, AC-141).
+    """
+    live = existing_columns(org)
+    if live is None:
+        bad("could not list board columns — refusing to create (would duplicate)")
+        return {}
     mapping = {}
     for label in labels:
+        have = live.get(label.strip().lower(), [])
+        if have:
+            keep = have[0]
+            mapping[label] = keep["id"]
+            extra = f" ({len(have)} columns share this label)" if len(have) > 1 else ""
+            ok(f"board column '{label}' → {keep['id']} (exists, reused){extra}")
+            continue
         code, d = gw_json("POST", "/api/board/statuses", body={"label": label}, org=org)
         if code in (200, 201) and isinstance(d, dict) and d.get("id"):
             mapping[label] = d["id"]
+            live.setdefault(label.strip().lower(), []).append(d)
             ok(f"board column '{label}' → {d['id']}")
         else:
             bad(f"board column '{label}' failed: {code} {str(d)[:120]}")
@@ -372,15 +469,36 @@ def create_board_columns(org, labels):
 
 
 def create_board(org, items, columns=None):
+    """Seed the plan's board items, once.
+
+    An item already present under the same title is left ALONE, including its
+    status: a board card is something a person moves, and re-applying the plan
+    must not drag a card the prospect advanced back to its seeded column.
+    """
     columns = columns or {}
+    live = existing_board(org)
+    if live is None:
+        bad("could not list board items — refusing to create (would duplicate)")
+        return
     for it in items:
         # A plan may target a column by its human label; fall back to a raw status.
         status = columns.get(it.get("column", ""), it.get("status", "todo"))
+        have = live.get(it["title"].strip(), [])
+        if have:
+            extra = f" ({len(have)} copies exist)" if len(have) > 1 else ""
+            ok(f"board item '{it['title'][:44]}' already present, left as-is "
+               f"(status={have[0].get('status')}){extra}")
+            continue
         body = {"title": it["title"], "desc": it.get("desc", ""), "status": status}
         if it.get("tags"):
             body["tags"] = it["tags"]
-        code, _ = gw("POST", "/api/board", body=body, org=org)
-        (ok if code in (200, 201) else bad)(f"board item '{it['title'][:44]}' → {status}")
+        code, d = gw_json("POST", "/api/board", body=body, org=org)
+        if code in (200, 201):
+            live.setdefault(it["title"].strip(), []).append(
+                d if isinstance(d, dict) else {"title": it["title"], "status": status})
+            ok(f"board item '{it['title'][:44]}' → {status}")
+        else:
+            bad(f"board item '{it['title'][:44]}' failed: {code}")
 
 
 def run_once(org, sessions, schedules):
@@ -492,14 +610,17 @@ def main():
     ap.add_argument("--verify", action="store_true", help="check outputs after running")
     ap.add_argument("--settle", type=int, default=90, help="seconds to let agents work")
     ap.add_argument("--teardown", action="store_true", help="delete the org afterwards")
+    ap.add_argument("--prune-duplicates", action="store_true",
+                    help="maintenance mode: report extra copies of everything the "
+                         "plan declares — schedules, board items, columns — and "
+                         "exit (add --apply to remove them)")
     ap.add_argument("--prune-duplicate-schedules", action="store_true",
-                    help="maintenance mode: report extra copies of the plan's "
-                         "schedules and exit (add --apply to remove them)")
+                    help="as --prune-duplicates but schedules only")
     ap.add_argument("--reconcile-schedules", action="store_true",
                     help="maintenance mode: bring schedules in line with the plan "
                          "(enabled/command/expr) and exit, touching nothing else")
     ap.add_argument("--apply", action="store_true",
-                    help="with --prune-duplicate-schedules, actually delete")
+                    help="with a --prune-* mode, actually delete")
     ap.add_argument("--emit-template", action="store_true")
     a = ap.parse_args()
 
@@ -537,19 +658,20 @@ def main():
     ok(f"container ready in {el}s")
 
     if a.reconcile_schedules:
-        # Same reason as prune mode: the schedule steps are idempotent, the
-        # docs/board steps are not (AC-141), so "make the schedules match the
-        # plan" must not require re-running the whole plan.
+        # Reconcile is schedules-only: it is the one part of a plan that is a
+        # pure declaration. Board cards are things a person moves, so re-applying
+        # a plan must never drag them back.
         step("Reconcile schedules to plan")
         create_schedules(org, plan.get("sessions", []))
         a.prune_duplicate_schedules, a.apply = True, False  # then show the result
 
-    if a.prune_duplicate_schedules:
-        # Maintenance mode: touches schedules ONLY. Deliberately does not run the
-        # rest of the plan, because docs/board/columns are not idempotent yet
-        # (AC-141) and a full re-seed to clean schedules would duplicate those.
+    if a.prune_duplicates or a.prune_duplicate_schedules:
         step(f"Prune duplicate schedules ({'APPLY' if a.apply else 'report only'})")
         prune_duplicate_schedules(org, plan.get("sessions", []), apply=a.apply)
+        if a.prune_duplicates:
+            step(f"Prune duplicate board items + columns "
+                 f"({'APPLY' if a.apply else 'report only'})")
+            prune_duplicate_board(org, plan, apply=a.apply)
         step("Resulting schedules")
         live = existing_schedules(org) or {}
         for (sess_name, title), copies in sorted(live.items()):
@@ -559,6 +681,15 @@ def main():
         total = sum(len(v) for v in live.values())
         planned = sum(len(s.get("schedules", [])) for s in plan.get("sessions", []))
         log(f"{total} live schedule(s); plan declares {planned}")
+        if a.prune_duplicates:
+            items, cols = existing_board(org) or {}, existing_columns(org) or {}
+            n_items = sum(len(v) for v in items.values())
+            planned_cols = [l.strip().lower() for l in plan.get("board_columns", [])]
+            dup_cols = sum(len(cols.get(l, [])) - 1
+                           for l in planned_cols if len(cols.get(l, [])) > 1)
+            log(f"{n_items} live board item(s); plan declares "
+                f"{len(plan.get('board', []))}. "
+                f"{dup_cols} duplicate plan column(s) remain")
         print("\n" + "═" * 52)
         print(f"  PASS: {PASS}  FAIL: {FAIL}  WARN: {len(WARN)}")
         for w in WARN:
