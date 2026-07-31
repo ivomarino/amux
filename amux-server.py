@@ -13556,6 +13556,82 @@ exit 0
 """
 
 
+_AMUX_PUSH_MARKER = "# amux-push-guard"
+_AMUX_PUSH_BODY = '''#!/usr/bin/env python3
+# amux-push-guard — blocks a push that would ship commits authored by a
+# DIFFERENT amux session sharing this checkout.
+#
+# The staged-guard stops one session COMMITTING another's staged files. Nothing
+# stopped one session PUSHING another's commits, and in a shared checkout that
+# is the same class of problem one layer up: `git push` ships whatever is on the
+# branch, so a session pushing its own work silently deploys everyone else's
+# too. On 2026-07-30 that happened five times in one day — work shipped without
+# the owner asking, and once a board feature went out inside a commit message
+# about browser fixes.
+#
+# Attribution comes from the Amux-Session trailer that prepare-commit-msg
+# already stamps on every commit, so this needs no new bookkeeping.
+#
+# Fail-open by design: any error lets the push proceed. Outside amux
+# ($AMUX_SESSION unset) it is a no-op — the human is always allowed to push.
+# Intentional cross-session push: AMUX_ALLOW_FOREIGN=1 git push ...
+import os, subprocess, sys
+
+ZERO = "0" * 40
+
+
+def main():
+    sess = os.environ.get("AMUX_SESSION", "")
+    if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
+        return 0
+    if os.environ.get("AMUX_PUSH_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
+        return 0
+    foreign = {}
+    try:
+        for line in sys.stdin.read().splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            local_sha, remote_sha = parts[1], parts[3]
+            if local_sha.strip("0") == "":
+                continue                      # branch deletion
+            rng = local_sha if remote_sha == ZERO else remote_sha + ".." + local_sha
+            out = subprocess.run(
+                ["git", "log", "--format=%h%x1f%s%x1f%(trailers:key=Amux-Session,valueonly)", rng],
+                capture_output=True, text=True, timeout=15).stdout
+            for row in out.splitlines():
+                if not row.strip():
+                    continue
+                bits = row.split("\\x1f")
+                if len(bits) < 3:
+                    continue
+                who = bits[2].strip()
+                if who and who != sess:
+                    foreign.setdefault(who, []).append((bits[0], bits[1][:62]))
+    except Exception:
+        return 0  # fail open — the guard must never brick a push
+    if not foreign:
+        return 0
+    w = sys.stderr.write
+    n = sum(len(v) for v in foreign.values())
+    w("\\namux push-guard: PUSH BLOCKED — this would ship %d commit(s) authored by "
+      "another session in this shared checkout:\\n\\n" % n)
+    for who in sorted(foreign):
+        w("  %s:\\n" % who)
+        for sha, subj in foreign[who][:6]:
+            w("    %s  %s\\n" % (sha, subj))
+        if len(foreign[who]) > 6:
+            w("    ... and %d more\\n" % (len(foreign[who]) - 6))
+    w("\\nTheir work is not yours to deploy. Options:\\n"
+      "  - ask that session to push its own commits, or\\n"
+      "  - if the human explicitly asked you to ship everything:\\n"
+      "      AMUX_ALLOW_FOREIGN=1 git push ...\\n\\n")
+    return 1
+
+
+sys.exit(main())
+'''
+
 _AMUX_GUARD_MARKER = "# amux-staged-guard"
 _AMUX_GUARD_BODY = '''#!/usr/bin/env python3
 # amux-staged-guard — blocks a commit whose staged set contains files that a
@@ -13689,6 +13765,39 @@ def _install_amux_precommit_guard(work_dir: str) -> None:
         pass
 
 
+def _install_amux_prepush_guard(work_dir: str) -> None:
+    """Install the pre-push guard. Written as pre-push directly (not a shim +
+    chained hook like pre-commit) because pre-push reads the ref list from
+    STDIN, and a shim would have to tee it to every chained hook to stay
+    correct. If a foreign pre-push already exists we leave it alone rather than
+    risk swallowing its stdin. Best-effort; failures are swallowed."""
+    try:
+        gr = subprocess.run(["git", "-C", work_dir, "rev-parse", "--git-dir"],
+                            capture_output=True, text=True, timeout=5)
+        if gr.returncode != 0:
+            return
+        git_dir = gr.stdout.strip()
+        if not os.path.isabs(git_dir):
+            git_dir = os.path.join(work_dir, git_dir)
+        hooks_dir = os.path.join(git_dir, "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        hook_path = os.path.join(hooks_dir, "pre-push")
+        cur = ""
+        if os.path.exists(hook_path):
+            try:
+                cur = open(hook_path).read()
+            except Exception:
+                return
+            if cur and _AMUX_PUSH_MARKER not in cur:
+                return  # someone else's pre-push — do not touch it
+        if cur != _AMUX_PUSH_BODY:
+            with open(hook_path, "w") as fh:
+                fh.write(_AMUX_PUSH_BODY)
+            os.chmod(hook_path, 0o755)
+    except Exception:
+        pass
+
+
 def _install_amux_commit_hook(work_dir: str) -> None:
     """Install a non-destructive prepare-commit-msg hook that stamps commits
     with $AMUX_SESSION. Idempotent; never clobbers a foreign hook (chains onto
@@ -13697,6 +13806,7 @@ def _install_amux_commit_hook(work_dir: str) -> None:
     # so both hooks reach every session repo through the same three paths
     # (start_session, _install_hooks_all_sessions, the git peek action).
     _install_amux_precommit_guard(work_dir)
+    _install_amux_prepush_guard(work_dir)
     try:
         gr = subprocess.run(["git", "-C", work_dir, "rev-parse", "--git-dir"],
                             capture_output=True, text=True, timeout=5)
@@ -28906,7 +29016,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.260';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.261';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49092,7 +49202,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.260';
+const CACHE = 'amux-v0.9.261';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
