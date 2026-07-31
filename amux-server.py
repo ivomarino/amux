@@ -52047,6 +52047,136 @@ def _media_prepare_job(src: Path, out: Path, key: str):
             pass
 
 
+# ── Fleet graph (projection over sessions) ───────────────────────────────────
+# The org chart is DERIVED on every read and never synced into graph_nodes. A
+# stored copy of "who works here" drifts from what the sessions actually do,
+# and a chart that disagrees with the fleet is worse than no chart, because
+# nothing on screen tells you which of the two is lying. So the only thing that
+# persists is the user's LAYOUT (x/y/pinned under graph_id='fleet'); labels,
+# departments, status and current card are projected from list_sessions() —
+# the same call the dashboard's session list uses, so the two cannot disagree.
+#
+# Edges are deliberately empty here. Derived handoffs (who actually messaged
+# whom, which card moved between sessions) are the next phase of #71; an empty
+# list is the honest answer until that lands, and is distinguishable from
+# "computed and found none" only because this comment says so.
+_FLEET_GRAPH_ID = "fleet"
+
+# Fixed palette rather than a generated hue: these are picked to stay legible
+# on the dashboard's dark background, which an arbitrary HSL sweep does not.
+_FLEET_PALETTE = ("#5b8ff9", "#5ad8a6", "#f6bd16", "#e8684a", "#6dc8ec",
+                  "#9270ca", "#ff9d4d", "#269a99", "#ff99c3", "#7ea6e0",
+                  "#d4a017", "#8fd14f", "#c86fd8", "#4dbfa5")
+
+
+def _fleet_dept_of(name: str) -> str:
+    """The leading segment of a session name — `Amux-gtm` → `Amux`.
+
+    A THROWAWAY heuristic that exists only until missions land (#69), which is
+    why it is one line and not a configurable rule. Do not build on it.
+    """
+    return re.split(r"[-_ ]", name.strip(), 1)[0] or name.strip()
+
+
+def _fleet_departments(names) -> dict:
+    """{session_name: department_label}.
+
+    Grouping is case-insensitive so `Amux-gtm`, `Amux-inspector` and
+    `amux-helper` land in ONE department instead of three; the label shown is
+    the casing of the first session (sorted) that claimed it, so the department
+    does not rename itself when an unrelated session is added or removed.
+    """
+    canon: dict = {}
+    for n in sorted(names):
+        seg = _fleet_dept_of(n)
+        canon.setdefault(seg.casefold(), seg)
+    return {n: canon.get(_fleet_dept_of(n).casefold(), _fleet_dept_of(n)) for n in names}
+
+
+def _fleet_colors(depts) -> dict:
+    """{department: colour}, distinct per department wherever the palette allows.
+
+    Hashing each name independently is the obvious implementation and it is
+    wrong: with a 14-colour palette, five departments collide about 40% of the
+    time (birthday problem), and two teams sharing a colour destroys the one
+    thing the colour is FOR — "same colour, same team" is the whole reason this
+    view reads at a glance. So the hash only picks a PREFERRED slot; taken
+    slots probe forward.
+
+    hashlib, NOT the builtin hash(): hash() is salted per process, so every
+    server restart would silently repaint the whole org chart — churn that
+    reads as a rendering bug and sends someone debugging the client.
+
+    Assignment order is sorted by name so the result is identical on every
+    machine and every restart. Past `len(_FLEET_PALETTE)` departments, reuse is
+    unavoidable and the probe wraps.
+    """
+    out, taken = {}, set()
+    for d in sorted(set(depts), key=lambda s: s.casefold()):
+        h = int(_hashlib.md5(d.casefold().encode()).hexdigest()[:8], 16)
+        start = h % len(_FLEET_PALETTE)
+        for step in range(len(_FLEET_PALETTE)):
+            idx = (start + step) % len(_FLEET_PALETTE)
+            if idx not in taken:
+                break
+        taken.add(idx)
+        out[d] = _FLEET_PALETTE[idx]
+    return out
+
+
+def _fleet_graph() -> dict:
+    """{"nodes": [...], "edges": []} for the fleet org chart."""
+    sessions = list_sessions()
+
+    # Layout the user has already arranged, if anything has stored it yet.
+    # Keyed by node id, which is why the id must stay stable across reads.
+    saved: dict = {}
+    try:
+        for r in get_db().execute(
+                "SELECT id, x, y, pinned FROM graph_nodes WHERE graph_id=?",
+                (_FLEET_GRAPH_ID,)).fetchall():
+            saved[r["id"]] = r
+    except Exception as e:
+        slog(f"[fleet] layout load failed: {e}")
+
+    names = [s.get("name") or "" for s in sessions if s.get("name")]
+    depts = _fleet_departments(names)
+    colors = _fleet_colors(depts.values())
+
+    nodes = []
+    for s in sessions:
+        name = s.get("name") or ""
+        if not name:
+            continue
+        nid = f"sess:{name}"
+        dept = depts.get(name) or _fleet_dept_of(name)
+        status = (s.get("status") or "").strip() or ("running" if s.get("running") else "stopped")
+        task = (s.get("task_name") or "").strip()
+        pos = saved.get(nid)
+        node = {
+            "id": nid,
+            "label": name,
+            # What this agent is doing right now, in the field the graph client
+            # already renders — not a new one the client would have to learn.
+            "body": f"{status} — {task}" if task else status,
+            "color": colors.get(dept, _FLEET_PALETTE[0]),
+            "folder": dept,          # drives the existing department filter chips
+            "source_path": "",
+            "x": pos["x"] if pos else None,
+            "y": pos["y"] if pos else None,
+            "pinned": (pos["pinned"] if pos else 0) or 0,
+            # Projection-only extras; the default graph has no equivalent.
+            "session": name,
+            "status": status,
+            "running": bool(s.get("running")),
+            "task": task,
+            "provider": s.get("provider") or "",
+        }
+        nodes.append(node)
+
+    return {"nodes": nodes, "edges": []}
+
+
 class CCHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # Suppressed — we do our own timing-aware logging in _route()
@@ -58986,6 +59116,13 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
         if path.startswith("/api/graph"):
             db = get_db()
             now = int(time.time())
+
+            # GET /api/graph/fleet — the org chart, PROJECTED from live sessions.
+            # Must precede the generic /api/graph/:id read below, which would
+            # otherwise answer with the (empty) stored rows for this graph_id
+            # and look like a fleet of nobody.
+            if method == "GET" and path == f"/api/graph/{_FLEET_GRAPH_ID}":
+                return self._json(_fleet_graph())
 
             # GET /api/graph/:id — get full graph (nodes + edges)
             m = re.match(r"^/api/graph/([^/]+)$", path)
