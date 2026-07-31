@@ -1555,9 +1555,9 @@ const dir = process.argv[2], profileDir = process.argv[3] || '',
         ]);
       } catch (e) {}
       console.error(JSON.stringify({ ok: false, headless: true,
-        error: 'watchdog: launcher exceeded 90s; exiting so the profile lock is released' }));
+        error: 'watchdog: launcher exceeded 30s; exiting so the profile lock is released' }));
       process.exit(1);
-    }, 90000);
+    }, 30000);
     if (t.unref) t.unref();
   }
   try {
@@ -1566,7 +1566,17 @@ const dir = process.argv[2], profileDir = process.argv[3] || '',
     ctx = await chromium.launchPersistentContext(dir, opts);
   }
   const page = ctx.pages()[0] || await ctx.newPage();
-  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) {}
+  // 60s is for a HUMAN signing in, where waiting for the page is the point. In
+  // headless there is nobody to sign in: the job is to materialize the profile
+  // and get out. Waiting longer does not make the profile better, it just holds
+  // the profile's Chrome locks — and for as long as they are held, the next
+  // `browser-use -b real --profile <name>` cannot open it and silently runs a
+  // temp user-data-dir instead. That is AMUX-2070, and it was not a hang: with
+  // goto at 60s and the watchdog at 90s, the launcher was ENTITLED to hold the
+  // profile for a minute and a half, while the verify starts writing at t+25s.
+  // The overlap was the bug.
+  try { await page.goto(url, { waitUntil: 'domcontentloaded',
+                               timeout: headless ? 15000 : 60000 }); } catch (e) {}
   // Resolve when the user closes the window. Persistent context writes its
   // storage on close, so this is the moment the login becomes reusable.
   if (headless) {
