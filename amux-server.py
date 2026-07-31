@@ -8899,6 +8899,94 @@ def _complete_session_board_issue(session_name: str):
 _autopickup_danger_flagged: set = set()
 
 
+_advance_last: dict = {}
+_ADVANCE_COOLDOWN = 15 * 60     # never push the same lane twice inside this window
+
+
+def _advance_open_card(session_name: str) -> bool:
+    """A session that goes idle holding an in-flight card gets pushed to finish it.
+
+    _pickup_next_board_task only promotes a `todo`, so a lane sitting on a
+    `doing` card was invisible to every autonomy path amux had: the task-guard
+    stays silent because a doing card exists, and pickup stays silent because
+    it will not break WIP-1. mixpeek-general went idle with 36 open cards, wrote
+    "Next up: MG-1362" in its own last message, and nothing moved it.
+
+    Pushes rather than promotes: the session decides whether the card is done,
+    blocked, or still live. Never forces a status — a nudge that closed cards
+    itself would be the fake-progress the gates exist to prevent.
+
+    Returns True iff it sent something."""
+    try:
+        cfg = parse_env_file(CC_SESSIONS / f"{session_name}.env")
+        if cfg.get("CC_AUTO_PICKUP", "").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        # The nudge is DELIVERED with send_text, which makes the session active
+        # and then idle again — the same self-retriggering loop the task-guard
+        # hit today. The cooldown, not the idle transition, is what bounds this.
+        last = _advance_last.get(session_name, 0)
+        if last and (time.time() - last) < _ADVANCE_COOLDOWN:
+            return False
+        db = get_db()
+        row = db.execute(
+            "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
+            "AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' "
+            "ORDER BY updated DESC LIMIT 1", (session_name,)).fetchone()
+        if not row:
+            return False
+        nxt = db.execute(
+            "SELECT COUNT(*) AS n FROM issues WHERE session=? AND deleted IS NULL "
+            "AND COALESCE(archived,0)=0 AND status IN ('todo','backlog') AND owner_type='agent'",
+            (session_name,)).fetchone()
+        queued = (nxt["n"] if nxt else 0)
+        item = _item_by_id(row["id"]) or {}
+        gate_next = "review" if row["status"] == "doing" else "done"
+        gate = _effective_gate(item, gate_next) or []
+        gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
+        msg = (
+            f"[amux] You went idle holding {row['id']} in '{row['status']}': "
+            f"{(row['title'] or '')[:110]}\n\n"
+            f"Keep driving it. Do exactly one of:\n"
+            f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
+            f"     Satisfy those honestly and move it, then continue to the next card.\n"
+            f"  2. If it is genuinely finished, close it out to verified with the evidence.\n"
+            f"  3. If it is BLOCKED, say what on — and if the blocker is another card, "
+            f"go work that dependency instead of waiting.\n"
+            f"  4. If it is blocked on a HUMAN decision, record that on the card and pick up "
+            f"the next unblocked one.\n\n"
+            f"You have {queued} more card(s) queued. Do not stall on a full queue: the aim is "
+            f"every card driven to verified, working dependencies first. Never --force a gate "
+            f"you cannot satisfy — an honest blocker beats a false 'done'."
+        )
+        if not is_running(session_name):
+            return False
+        # send_text returns (ok, err) and CAN fail or defer. Stamping the
+        # cooldown and logging "pushed" without checking would claim a delivery
+        # that never happened AND buy 15 minutes of silence for a lane that
+        # received nothing — the same defect as discarding a response body.
+        ok, err = send_text(session_name, msg, defer_if_busy=True)
+        if not ok:
+            slog(f"[advance] {session_name}: send failed ({err}) — not starting the cooldown")
+            return False
+        _advance_last[session_name] = time.time()
+        # Record it in the Messages history like every other system send.
+        # send_text alone does NOT record (only the API send path does), so
+        # without this the nudge was invisible in the one surface built for
+        # "what was sent to this session" — unverifiable by exactly the person
+        # trying to check whether the autonomy loop is working.
+        _cmd_hist_record(session_name, msg, "system", "advance")
+        _ilog("session", "advance_nudge", actor="amux", target=session_name,
+              detail={"card": row["id"], "status": row["status"], "queued": queued},
+              # ok from send_text with defer_if_busy means ACCEPTED, which is not
+              # the same as landed in the terminal. Say what is actually known.
+              result={"accepted": True, "deferred_if_busy": True})
+        slog(f"[advance] {session_name}: pushed on {row['id']} ({row['status']}, {queued} queued)")
+        return True
+    except Exception as e:
+        slog(f"[advance] {session_name}: {e}")
+        return False
+
+
 def _pickup_next_board_task(session_name: str):
     """Pick up the next queued (todo) board task for this session — OPT-IN only.
     Called when a session goes idle; moves the oldest agent todo to 'doing' and
@@ -8918,8 +9006,15 @@ def _pickup_next_board_task(session_name: str):
     AMUX-1471 (footgun hit by MO-2029 / MS-921)."""
     try:
         cfg = parse_env_file(CC_SESSIONS / f"{session_name}.env")
-        if cfg.get("CC_AUTO_PICKUP", "").strip().lower() not in ("1", "true", "yes"):
-            return  # not opted into the autonomous loop
+        # OPT-OUT, not opt-in (2026-07-30). As opt-in this reached 4 of 101
+        # sessions, so 97 lanes went idle on a full queue and stayed there:
+        # mixpeek-general sat idle holding 36 open cards, having named its own
+        # next card in its last message. An autonomy loop nobody is enrolled in
+        # is not an autonomy loop. Every guard below still applies — freshness,
+        # re-claim cooldown, agent-only, and the irreversible-operation refusal —
+        # so what changed is enrollment, not what may be auto-run.
+        if cfg.get("CC_AUTO_PICKUP", "").strip().lower() in ("0", "false", "no", "off"):
+            return  # explicitly opted out of the autonomous loop
         time.sleep(3)
         db = get_db()
         row = db.execute(
@@ -12111,7 +12206,13 @@ def list_sessions() -> list:
                     task_nudged = _task_guard(sname)     # remind to log untracked work on the board
                     _complete_session_board_issue(sname)
                     if not nudged and not task_nudged:   # don't pile a new task on a nudge
-                        _pickup_next_board_task(sname)
+                        # Two different stalls, two different pushes. A lane holding
+                        # a doing/review card needs finishing, not a second card
+                        # (that would break WIP-1); a lane holding none needs the
+                        # next one claimed. Before this, the first case matched no
+                        # path at all and simply stopped.
+                        if not _advance_open_card(sname):
+                            _pickup_next_board_task(sname)
                 threading.Thread(target=_on_idle, daemon=True).start()
             elif status == "idle" and prev == "idle" and not running:
                 threading.Thread(target=_complete_session_board_issue, args=(name,), daemon=True).start()
@@ -12781,7 +12882,7 @@ def _evict_stale_caches():
         _model_cache.pop(k, None)
     # Prune session-keyed dicts for sessions that no longer have .env files
     live_sessions = {f.stem for f in CC_SESSIONS.glob("*.env")}
-    for d in (_session_auto_actions, _yolo_last_responded, _last_jsonl_backup, _session_prev_status, _commit_guard_nudged, _commit_guard_cotenant_skip, _task_guard_nudged, _task_guard_last):
+    for d in (_session_auto_actions, _yolo_last_responded, _last_jsonl_backup, _session_prev_status, _commit_guard_nudged, _commit_guard_cotenant_skip, _task_guard_nudged, _task_guard_last, _advance_last):
         stale_keys = [k for k in d if k not in live_sessions]
         for k in stale_keys:
             d.pop(k, None)
@@ -12801,6 +12902,7 @@ def _cleanup_session_state(name: str):
     _commit_guard_cotenant_skip.pop(name, None)
     _task_guard_nudged.pop(name, None)
     _task_guard_last.pop(name, None)
+    _advance_last.pop(name, None)
     with _send_locks_lock:
         _send_locks.pop(name, None)
 
@@ -29111,7 +29213,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.266';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.269';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49384,7 +49486,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.266';
+const CACHE = 'amux-v0.9.269';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
