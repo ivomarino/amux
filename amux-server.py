@@ -8824,9 +8824,13 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             # existing one, so the incident this replaces stays fixed.
             prefix = _prefix_from_session(session_name)
             item_id = _next_issue_id(prefix)
+            # notified=1 at birth: the session already RECEIVED this prompt as
+            # its live command; the card is the ledger of it, not news. Born at
+            # 0, the first later patch of any kind (even a desc edit) tripped
+            # the assignment notifier and re-announced the card hours stale.
             db.execute(
-                """INSERT INTO issues (id, title, desc, status, session, creator, created, updated, owner_type)
-                   VALUES (?, ?, ?, 'todo', ?, 'amux', ?, ?, 'agent')""",
+                """INSERT INTO issues (id, title, desc, status, session, creator, created, updated, owner_type, notified)
+                   VALUES (?, ?, ?, 'todo', ?, 'amux', ?, ?, 'agent', 1)""",
                 (item_id, title, f"**Prompt:** {prompt_text[:300]}", session_name, now, now),
             )
             db.commit()
@@ -8837,8 +8841,8 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
         prefix = _prefix_from_session(session_name)
         item_id = _next_issue_id(prefix)
         db.execute(
-            """INSERT INTO issues (id, title, desc, status, session, creator, created, updated, owner_type)
-               VALUES (?, ?, ?, 'doing', ?, 'amux', ?, ?, 'agent')""",
+            """INSERT INTO issues (id, title, desc, status, session, creator, created, updated, owner_type, notified)
+               VALUES (?, ?, ?, 'doing', ?, 'amux', ?, ?, 'agent', 1)""",
             (item_id, title, f"**Prompt:** {prompt_text[:300]}", session_name, now, now),
         )
         db.commit()
@@ -29330,7 +29334,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.272';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.273';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49603,7 +49607,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.272';
+const CACHE = 'amux-v0.9.273';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53721,12 +53725,25 @@ class CCHandler(BaseHTTPRequestHandler):
                                       due_time=updated_item.get("due_time", "") or "",
                                       desc=updated_item.get("desc", ""),
                                       status=updated_item.get("status", ""))
-                        # Auto-notify the (possibly new) assignee if the card is now an
-                        # agent task waiting for pickup. Idempotent via the notified flag.
+                        # Auto-notify the assignee — but only when THIS patch is
+                        # assignment-shaped: the session changed, or the status moved
+                        # INTO the pickup states from somewhere else. It used to fire on
+                        # the card's STATE (agent+todo), so any first-ever patch of a
+                        # card born notified=0 announced it — auto-filed cards are born
+                        # that way on purpose (the session already received the prompt
+                        # as its command), and a desc-only cleanup pass re-announced 17
+                        # of them, hours stale, to the session that created them
+                        # (2026-07-31). Notification belongs to the assignment EVENT,
+                        # not the state; the notified flag stays as the race dedupe.
                         new_session = updated_item.get("session") or ""
+                        _prior_status = prior["status"] if prior else None
+                        _assigned_now = ("session" in body and (body.get("session") or None) != prior_session)
+                        _entered_queue = (updated_item.get("status") in ("todo", "backlog")
+                                          and _prior_status not in ("todo", "backlog"))
                         if (new_session
                                 and updated_item.get("owner_type") == "agent"
-                                and updated_item.get("status") in ("todo", "backlog")):
+                                and updated_item.get("status") in ("todo", "backlog")
+                                and (_assigned_now or _entered_queue)):
                             _notify_session_of_task(new_session, bid, updated_item.get("title", ""))
                     except Exception as _e:
                         slog(f"[board-patch] post-commit side effect failed for {bid} "
