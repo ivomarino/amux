@@ -12030,6 +12030,23 @@ def list_sessions() -> list:
     running_names = [f.stem for f in env_files if tmux_name(f.stem) in tmux_info]
     captures = _tmux_capture_batch(running_names, 30, activity=tmux_info) if running_names else {}
     # Token cache is refreshed by background job (_refresh_token_cache via scheduler)
+    # Last HUMAN message per session, batched in one query. "Last activity" is
+    # dominated by schedulers and inter-session traffic, so a lane you have not
+    # touched in a week can sit at the top of the list looking busy. Sorting by
+    # the last thing a PERSON sent is a different and often more useful order.
+    # Same definition as the Messages filter (_MSG_KIND_OF): anything that is
+    # not session-to-session and not a schedule is human. ts is epoch MILLIs
+    # here, unlike last_activity's seconds — converted below rather than
+    # letting two clocks reach the client under similar names.
+    _human_ts: dict = {}
+    try:
+        for _r in get_db().execute(
+                "SELECT session, MAX(ts) AS t FROM cmd_history "
+                "WHERE type NOT IN ('session','schedule') GROUP BY session").fetchall():
+            if _r["session"]:
+                _human_ts[_r["session"]] = int((_r["t"] or 0) / 1000)
+    except Exception as _e:
+        slog(f"[sessions] last-human lookup failed: {_e}")
     # Batch-load "doing" board tasks per session for task_name display.
     # ORDER BY updated ASC + dict overwrite → the NEWEST-touched doing card
     # wins. The old query had no ORDER BY, so with multiple doing cards per
@@ -12211,6 +12228,7 @@ def list_sessions() -> list:
             "preview": preview,
             "preview_lines": preview_lines,
             "last_activity": last_activity,
+            "last_human_ts": _human_ts.get(name, 0),
             "active_model": active_model,
             "session_created": session_created,
             "task_time": task_time,
@@ -19915,6 +19933,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stat-card-label { font-size: 0.69rem; color: var(--dim); margin-bottom: 5px; }
   .stat-card-value { font-size: 1.5rem; font-weight: 700; color: var(--text); }
 
+  /* Session sort dropdown */
+  .sort-menu {
+    position: absolute; right: 0; top: calc(100% + 5px); z-index: 60;
+    min-width: 232px; padding: 5px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: 0 8px 26px rgba(0,0,0,0.34);
+  }
+  .sort-opt {
+    padding: 8px 9px; border-radius: 6px; cursor: pointer; font-size: 0.82rem;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sort-opt:hover { background: var(--bg); }
+  .sort-opt.active { background: var(--bg); }
+  @media (max-width: 600px) {
+    /* Thumb-sized rows, and anchored to the right edge so a 232px menu cannot
+       run off a 375px screen. */
+    .sort-opt { min-height: 44px; padding: 9px 10px; }
+    .sort-menu { min-width: 210px; max-width: calc(100vw - 24px); }
+  }
+
   /* Tab icons. Default is icon + label; body.tabs-icons hides the labels to
      buy back horizontal space once you know what the glyphs mean. The COUNT
      badge deliberately survives icon-only mode -- an unread count is the one
@@ -21899,7 +21937,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <span id="filters-count" class="filters-count" style="display:none;">0</span>
   </button>
   <div class="tile-controls">
-    <button class="tile-btn" id="tile-sort-btn" onclick="toggleSortMode()" title="Sort alphabetically (pinned stay on top, order stops shifting)" style="font-size:0.7rem;font-weight:700;">A&#x2193;</button>
+    <div class="sort-wrap" style="position:relative;display:inline-block;">
+      <button class="tile-btn" id="tile-sort-btn" onclick="event.stopPropagation();toggleSortMenu()" title="Sort sessions" style="font-size:0.7rem;font-weight:700;">A&#x2193;</button>
+      <div class="sort-menu" id="sort-menu" style="display:none;"></div>
+    </div>
     <button class="tile-btn" id="tile-freeze-btn" onclick="toggleFreeze()" title="Freeze session order — click again to unfreeze and reset">&#x2744;</button>
     <button class="tile-btn" id="tile-expand-btn" onclick="toggleExpand()" title="Expand active sessions — click again to collapse all">&#x26A1;</button>
   </div>
@@ -26232,11 +26273,7 @@ function render() {
   // Grid mode: flat list sorted by activity or alpha, no grouping (desktop only)
   if (layoutMode === 'grid' && window.innerWidth >= 900) {
     let sortedFiltered;
-    if (sortMode === 'alpha') {
-      sortedFiltered = [...filtered].sort(_alphaSortSessions);
-    } else {
-      sortedFiltered = [...filtered].sort(_naturalSortSessions);
-    }
+    sortedFiltered = [...filtered].sort(_sortFnFor(sortMode));
     el.innerHTML = draftCards + sortedFiltered.map(_renderSessionCard).join('');
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
@@ -26268,8 +26305,8 @@ function render() {
     });
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
     for (const key of Object.keys(buckets)) {
-      if (sortMode === 'alpha') {
-        buckets[key].sort(_alphaSortSessions);
+      if (sortMode !== 'natural') {
+        buckets[key].sort(_sortFnFor(sortMode));
       } else {
         buckets[key].sort((a, b) => {
           if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -26303,12 +26340,7 @@ function render() {
     }
   } else {
     // list mode (flat) or group mode with active filter: flat list
-    let flatList = filtered;
-    if (sortMode === 'alpha') {
-      flatList = [...filtered].sort(_alphaSortSessions);
-    } else {
-      flatList = [...filtered].sort(_naturalSortSessions);
-    }
+    let flatList = [...filtered].sort(_sortFnFor(sortMode));
     el.innerHTML = draftCards + flatList.map(_renderSessionCard).join('');
     if (layoutMode === 'list') requestAnimationFrame(initSortable);
   }
@@ -26692,6 +26724,7 @@ function closeAllMenus() {
 }
 document.addEventListener('click', e => {
   closeAllMenus(); closeActiveDropdown(e); closeAddMenu();
+  if (!e.target.closest('.sort-wrap')) closeSortMenu();
   if (_tabCustomizerOpen && !e.target.closest('.tab-customize-wrap')) {
     _tabCustomizerOpen = false;
     const m = document.getElementById('tab-customizer-menu');
@@ -29078,7 +29111,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.265';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.266';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -36913,6 +36946,11 @@ document.addEventListener('keydown', (e) => {
 // ═══════ LAYOUT MODES (list / grid) ═══════
 let layoutMode = localStorage.getItem('amux_layout') || 'grid';
 let sortMode = localStorage.getItem('amux_sort_mode') || 'natural';
+// A mode persisted by an older build (or hand-edited) must not leave the
+// list sorting by a comparator that no longer exists.
+if (!['natural','human','alpha','status'].includes(sortMode)) sortMode = 'natural';
+if (document.body) setTimeout(() => _sortBtnSync(), 0);
+else document.addEventListener('DOMContentLoaded', () => _sortBtnSync());
 let cardOrder = JSON.parse(localStorage.getItem('amux_card_order') || '[]');
 let _frozen = localStorage.getItem('amux_frozen') === '1';
 let _sortable = null;
@@ -36934,6 +36972,36 @@ function _naturalSortSessions(a, b) {
 function _alphaSortSessions(a, b) {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   return (a.name || '').localeCompare(b.name || '');
+}
+
+// Last message a PERSON sent, newest first. Schedulers and inter-session
+// traffic are excluded server-side (last_human_ts), so a lane driven entirely
+// by a cron sinks instead of masquerading as the most recent thing you touched.
+// Sessions you have never messaged sort last rather than jumbling into the
+// middle at position zero.
+function _humanSortSessions(a, b) {
+  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+  const at = a.last_human_ts || 0, bt = b.last_human_ts || 0;
+  if (!at && !bt) return _naturalSortSessions(a, b);
+  if (!at) return 1;
+  if (!bt) return -1;
+  return bt - at;
+}
+
+// Status order, then recency within each bucket.
+function _statusSortSessions(a, b) {
+  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+  if (a.running !== b.running) return a.running ? -1 : 1;
+  const ap = _STATUS_PRI[a.status] ?? 1, bp = _STATUS_PRI[b.status] ?? 1;
+  if (ap !== bp) return ap - bp;
+  return (b.last_activity || 0) - (a.last_activity || 0);
+}
+
+function _sortFnFor(mode) {
+  return mode === 'alpha'  ? _alphaSortSessions
+       : mode === 'human'  ? _humanSortSessions
+       : mode === 'status' ? _statusSortSessions
+       : _naturalSortSessions;
 }
 
 // Sort by frozen cardOrder; sessions not in the list go to the end in natural order
@@ -36965,16 +37033,11 @@ function toggleFreeze() {
         else if (s.status === 'waiting') buckets.waiting.push(s);
         else buckets.idle.push(s);
       });
-      const sortFn = sortMode === 'alpha' ? _alphaSortSessions : (a, b) => {
-        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-        return (b.last_activity || 0) - (a.last_activity || 0);
-      };
+      const sortFn = _sortFnFor(sortMode);
       for (const k of Object.keys(buckets)) buckets[k].sort(sortFn);
       ordered = [...buckets.active, ...buckets.waiting, ...buckets.idle, ...buckets.stopped];
-    } else if (sortMode === 'alpha') {
-      ordered = [...visible].sort(_alphaSortSessions);
     } else {
-      ordered = [...visible].sort(_naturalSortSessions);
+      ordered = [...visible].sort(_sortFnFor(sortMode));
     }
     cardOrder = ordered.map(s => s.name);
     localStorage.setItem('amux_card_order', JSON.stringify(cardOrder));
@@ -37002,18 +37065,75 @@ function setLayoutMode(mode) {
   _updateResetBtn();
 }
 
-function toggleSortMode() {
-  sortMode = sortMode === 'alpha' ? 'natural' : 'alpha';
-  localStorage.setItem('amux_sort_mode', sortMode);
+// Sort options. 'human' exists because "last activity" is dominated by
+// schedulers and inter-session traffic — a lane nobody has touched in a week
+// can sit at the top looking busy. Sorting by the last thing a PERSON sent
+// answers "where did I leave off", which is a different question.
+const _SORT_OPTS = [
+  { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other sessions' },
+  { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
+  { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
+  { id: 'status',  label: 'Status',               hint: 'Active, then waiting, then idle, then stopped' },
+];
+const _SORT_GLYPH = { natural: '⇅', human: '●', alpha: 'A↓', status: '☷' };
+
+function _sortLabel(id) {
+  const o = _SORT_OPTS.find(x => x.id === id);
+  return o ? o.label : id;
+}
+function _sortBtnSync() {
   const btn = document.getElementById('tile-sort-btn');
-  if (btn) btn.classList.toggle('active', sortMode === 'alpha');
-  if (sortMode === 'alpha') destroySortable();
+  if (!btn) return;
+  btn.innerHTML = _SORT_GLYPH[sortMode] || 'A↓';
+  btn.title = 'Sort: ' + _sortLabel(sortMode);
+  btn.classList.toggle('active', sortMode !== 'natural');
+}
+function toggleSortMenu() {
+  const m = document.getElementById('sort-menu');
+  if (!m) return;
+  const open = m.style.display !== 'block';
+  m.innerHTML = _SORT_OPTS.map(o => {
+    const on = o.id === sortMode;
+    return `<div class="sort-opt${on ? ' active' : ''}" onclick="event.stopPropagation();setSortMode('${o.id}')">
+      <div style="display:flex;align-items:center;gap:7px;">
+        <span style="width:14px;opacity:${on ? 1 : 0.35};">${on ? '✓' : ''}</span>
+        <span style="font-weight:${on ? 600 : 400};">${esc(o.label)}</span>
+      </div>
+      <div style="font-size:0.66rem;color:var(--dim);margin-left:21px;">${esc(o.hint)}</div>
+    </div>`;
+  }).join('');
+  m.style.display = open ? 'block' : 'none';
+}
+function closeSortMenu() {
+  const m = document.getElementById('sort-menu');
+  if (m) m.style.display = 'none';
+}
+function setSortMode(mode) {
+  sortMode = _SORT_OPTS.some(o => o.id === mode) ? mode : 'natural';
+  localStorage.setItem('amux_sort_mode', sortMode);
+  closeSortMenu();
+  _sortBtnSync();
+  // Sorting is an explicit act, so it must beat the frozen card order that
+  // otherwise pins the list to whatever it looked like when you froze it.
+  _frozen = false;
+  try { localStorage.removeItem('amux_frozen'); localStorage.removeItem('amux_card_order'); } catch (e) {}
+  cardOrder = [];
+  if (typeof showToast === 'function') showToast('Sorted by ' + _sortLabel(sortMode).toLowerCase());
+  render();
+}
+
+function toggleSortMode() {   // legacy entry point; cycles through the options
+  const i = _SORT_OPTS.findIndex(o => o.id === sortMode);
+  setSortMode(_SORT_OPTS[(i + 1) % _SORT_OPTS.length].id);
+  const btn = document.getElementById('tile-sort-btn');
+  if (btn) btn.classList.toggle('active', sortMode !== 'natural');
+  if (sortMode !== 'natural') destroySortable();   // computed order — manual drag would fight it
   render();
 }
 
 function initSortable() {
   if (typeof Sortable === 'undefined') return;
-  if (sortMode === 'alpha') { destroySortable(); return; }
+  if (sortMode !== 'natural') { destroySortable(); return; }
   destroySortable();
   const cards = document.querySelector('.cards');
   if (!cards) return;
@@ -37071,7 +37191,7 @@ document.addEventListener('DOMContentLoaded', function() {
     setTimeout(initSortable, 200);
   }
   const sortBtn = document.getElementById('tile-sort-btn');
-  if (sortBtn) sortBtn.classList.toggle('active', sortMode === 'alpha');
+  if (sortBtn) sortBtn.classList.toggle('active', sortMode !== 'natural');
   const freezeBtn = document.getElementById('tile-freeze-btn');
   if (freezeBtn) freezeBtn.classList.toggle('active', _frozen);
 });
@@ -49264,7 +49384,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.265';
+const CACHE = 'amux-v0.9.266';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
