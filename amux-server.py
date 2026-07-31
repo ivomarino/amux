@@ -53934,7 +53934,18 @@ class CCHandler(BaseHTTPRequestHandler):
                     "sched_type": stype,
                     "recurrence": data.get("recurrence"),
                     "run_at": run_at, "next_run": run_at,
-                    "last_run": None, "enabled": 1, "run_count": 0,
+                    "last_run": None,
+                    # Honor an EXPLICIT enabled from the caller; default 1 so the
+                    # dashboard (whose create payload omits the field) is
+                    # unchanged. This used to be a literal 1, which silently
+                    # discarded the caller's intent: cloud/seed.py posts
+                    # enabled:0 and documents that seeded demos stay disabled
+                    # until someone turns them on, and every seeded schedule
+                    # came up running anyway. A Wexus prospect workspace burned
+                    # its entire $25 trial budget on schedules its own plan
+                    # declared disabled (AC-139).
+                    "enabled": 1 if data.get("enabled", 1) else 0,
+                    "run_count": 0,
                     "schedule_expr": schedule_expr or None,
                     "watch": int(data.get("watch") or 0),
                     "watch_timeout": int(data.get("watch_timeout") or 120),
@@ -53974,6 +53985,11 @@ class CCHandler(BaseHTTPRequestHandler):
                 _sched_audit(sid, "created", "",
                              json.dumps({"title": sched["title"], "session": sched["session"],
                                          "expr": sched["schedule_expr"] or sched["run_at"],
+                                         # created-enabled is the discriminator that
+                                         # cost a trial budget (AC-139) — record it,
+                                         # or "why was this firing?" is unanswerable
+                                         # from the trail that exists to answer it.
+                                         "enabled": sched["enabled"],
                                          "kind": sched["kind"]}),
                              "api-create",
                              _sched_mutation_by(self.headers, self.client_address, data))

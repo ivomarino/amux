@@ -22,6 +22,12 @@ Usage:
   python3 cloud/seed.py --plan p.json --run --verify                 # + run once + check
   python3 cloud/seed.py --emit-template > plans/new.json
   python3 cloud/seed.py --plan p.json --teardown                     # remove the org
+  python3 cloud/seed.py --plan p.json --org o --prune-duplicate-schedules [--apply]
+
+Applying a plan is idempotent for sessions and schedules: re-running reconciles
+what is already there instead of adding another copy. Board items and columns do
+NOT converge yet (AC-141) — until they do, use --prune-duplicate-schedules for
+schedule maintenance rather than re-running a full seed to clean up.
 
 Env:
   CLERK_SECRET_KEY   (only needed for --teardown of Clerk users)
@@ -229,24 +235,125 @@ def remove_scaffold(org, seeded):
                 warn(f"could not archive '{name}' ({c})")
 
 
+def existing_schedules(org):
+    """Index the org's live schedules by (session, title).
+
+    Returns None if the workspace could not be read — the caller must treat that
+    as "unknown", not as "empty", or it will re-create everything.
+    """
+    code, d = gw_json("GET", "/api/schedules", org=org)
+    if code != 200 or not isinstance(d, list):
+        return None
+    idx = {}
+    for s in d:
+        idx.setdefault((s.get("session") or "", s.get("title") or ""), []).append(s)
+    return idx
+
+
 def create_schedules(org, sessions):
-    """Attach amux schedules. Kept disabled until explicitly enabled so a seeded
-    demo cannot start burning budget on its own."""
+    """Attach amux schedules, idempotently.
+
+    A plan DECLARES what should exist, so applying it twice must converge, not
+    accumulate. This used to POST unconditionally: the Wexus prospect workspace
+    ended up running 14 schedules for a 7-schedule plan — exactly 2x, one extra
+    copy per re-seed — and because four of them recur every 15m, the duplicates
+    doubled the workspace's burn rate until the $25 trial budget was gone
+    (AC-137). Matching is on (session, title), the pair a plan author controls.
+
+    Schedules stay disabled unless the plan says otherwise, so a seeded demo
+    cannot start spending on its own. Enforcing that took a server fix too: POST
+    /api/schedules ignored `enabled` and created everything running (AC-139).
+    """
+    existing = existing_schedules(org)
+    if existing is None:
+        # Fail closed. Creating blind is precisely what produced the duplicates.
+        bad("could not list existing schedules — refusing to create any "
+            "(a blind create is how the 2x duplication happened)")
+        return []
     out = []
     for s in sessions:
         for sch in s.get("schedules", []):
-            body = {"title": sch["title"], "session": s["name"],
-                    "command": sch["command"],
+            want = {"command": sch["command"],
                     "schedule_expr": sch.get("expr", "daily at 9am"),
                     "enabled": 1 if sch.get("enabled") else 0}
+            live = existing.get((s["name"], sch["title"]), [])
+            if live:
+                cur = live[0]
+                if len(live) > 1:
+                    # Report, do not auto-delete: extra copies are workspace data
+                    # and removing them is the operator's call, not the seeder's.
+                    warn(f"'{sch['title']}' → {s['name']} has {len(live)} copies "
+                         f"({', '.join(x['id'] for x in live)}); reconciling {cur['id']}, "
+                         f"remove the rest with --prune-duplicate-schedules")
+                drift = {k: v for k, v in want.items() if cur.get(k) != v}
+                if drift:
+                    code, d = gw_json("PATCH", f"/api/schedules/{cur['id']}",
+                                      body={**drift, "by": "seed.py"}, org=org)
+                    if code == 200:
+                        ok(f"schedule {cur['id']} '{sch['title']}' reconciled to plan "
+                           f"({', '.join(f'{k}={v!r}' for k, v in drift.items())})")
+                    else:
+                        bad(f"schedule {cur['id']} '{sch['title']}' PATCH failed: "
+                            f"{code} {str(d)[:140]}")
+                else:
+                    ok(f"schedule {cur['id']} '{sch['title']}' → {s['name']} "
+                       f"already matches the plan (skipped)")
+                out.append((cur["id"], s["name"], sch["title"]))
+                continue
+            body = {"title": sch["title"], "session": s["name"], **want}
             code, d = gw_json("POST", "/api/schedules", body=body, org=org)
             if code in (200, 201) and isinstance(d, dict) and d.get("id"):
                 out.append((d["id"], s["name"], sch["title"]))
+                existing.setdefault((s["name"], sch["title"]), []).append(d)
+                # The server used to force enabled=1 regardless of the body. If
+                # this workspace still runs an old build, say so here rather than
+                # letting a "disabled" demo quietly spend.
+                if not body["enabled"] and d.get("enabled"):
+                    warn(f"{d['id']} '{sch['title']}' was created ENABLED though the "
+                         f"plan disables it — this workspace predates the POST "
+                         f"enabled fix (AC-139); update its image or disable by hand")
                 ok(f"schedule {d['id']} '{sch['title']}' → {s['name']} "
                    f"[{body['schedule_expr']}]{'' if body['enabled'] else ' (disabled)'}")
             else:
                 bad(f"schedule '{sch['title']}' failed: {code} {str(d)[:140]}")
     return out
+
+
+def prune_duplicate_schedules(org, sessions, apply=False):
+    """Report (and optionally remove) extra copies of a plan's schedules.
+
+    Keeps the OLDEST id per (session, title) — it carries the run history — and
+    only ever touches pairs the plan itself declares, so nothing a human added
+    by hand is in scope. Deletion is the amux soft-delete, and it is audited.
+    """
+    live = existing_schedules(org)
+    if live is None:
+        bad("could not list schedules — nothing pruned")
+        return []
+    planned = {(s["name"], sch["title"])
+               for s in sessions for sch in s.get("schedules", [])}
+    removed = []
+    for key in sorted(planned):
+        copies = live.get(key, [])
+        if len(copies) < 2:
+            continue
+        copies = sorted(copies, key=lambda x: (x.get("created") or 0, x["id"]))
+        keep, extra = copies[0], copies[1:]
+        for x in extra:
+            if not apply:
+                warn(f"duplicate {x['id']} '{key[1]}' → {key[0]} "
+                     f"(would keep {keep['id']}, runs={keep.get('run_count')})")
+                continue
+            code, _ = gw("DELETE", f"/api/schedules/{x['id']}?by=seed.py", org=org)
+            if code == 200:
+                removed.append(x["id"])
+                ok(f"removed duplicate {x['id']} '{key[1]}' → {key[0]} "
+                   f"(kept {keep['id']}, runs={keep.get('run_count')})")
+            else:
+                bad(f"could not remove {x['id']}: {code}")
+    if not removed and apply:
+        ok("no duplicate schedules to remove")
+    return removed
 
 
 def create_board_columns(org, labels):
@@ -385,6 +492,11 @@ def main():
     ap.add_argument("--verify", action="store_true", help="check outputs after running")
     ap.add_argument("--settle", type=int, default=90, help="seconds to let agents work")
     ap.add_argument("--teardown", action="store_true", help="delete the org afterwards")
+    ap.add_argument("--prune-duplicate-schedules", action="store_true",
+                    help="maintenance mode: report extra copies of the plan's "
+                         "schedules and exit (add --apply to remove them)")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --prune-duplicate-schedules, actually delete")
     ap.add_argument("--emit-template", action="store_true")
     a = ap.parse_args()
 
@@ -420,6 +532,28 @@ def main():
         bad("workspace is gated (budget or trial expired)")
         return 1
     ok(f"container ready in {el}s")
+
+    if a.prune_duplicate_schedules:
+        # Maintenance mode: touches schedules ONLY. Deliberately does not run the
+        # rest of the plan, because docs/board/columns are not idempotent yet
+        # (AC-141) and a full re-seed to clean schedules would duplicate those.
+        step(f"Prune duplicate schedules ({'APPLY' if a.apply else 'report only'})")
+        prune_duplicate_schedules(org, plan.get("sessions", []), apply=a.apply)
+        step("Resulting schedules")
+        live = existing_schedules(org) or {}
+        for (sess_name, title), copies in sorted(live.items()):
+            for c in copies:
+                log(f"{c['id']:9s} enabled={c.get('enabled')} runs={c.get('run_count')} "
+                    f"| {sess_name} :: {title} [{c.get('schedule_expr')}]")
+        total = sum(len(v) for v in live.values())
+        planned = sum(len(s.get("schedules", [])) for s in plan.get("sessions", []))
+        log(f"{total} live schedule(s); plan declares {planned}")
+        print("\n" + "═" * 52)
+        print(f"  PASS: {PASS}  FAIL: {FAIL}  WARN: {len(WARN)}")
+        for w in WARN:
+            print(f"  ⚠ {w}")
+        print(f"  ORG: {org}")
+        return 0 if FAIL == 0 else 1
 
     if plan.get("docs"):
         step("Upload context docs")
