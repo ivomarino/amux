@@ -143,7 +143,14 @@ def provision(plan):
 
 
 def upload_docs(org, docs):
-    """Write context files into the workspace before anyone signs in."""
+    """Write context files into the workspace before anyone signs in.
+
+    Overwrites: a plan declares that a path should hold these bytes. The upload
+    endpoint's default is never-clobber (right for a human dragging a file in,
+    wrong here) and it suffixes instead, so before this a re-seed left
+    compliance.md, compliance_1.md, compliance_2.md and compliance_3.md side by
+    side in a workspace a prospect was about to be shown.
+    """
     for doc in docs:
         path = doc["path"]
         directory, _, fname = path.rpartition("/")
@@ -160,6 +167,7 @@ def upload_docs(org, docs):
         b = "----amux" + uuid.uuid4().hex
         payload = b"".join([
             f"--{b}\r\nContent-Disposition: form-data; name=\"dir\"\r\n\r\n{directory}\r\n".encode(),
+            f"--{b}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\n1\r\n".encode(),
             (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n"
              f"Content-Type: {ctype_part}\r\n\r\n").encode() + blob + b"\r\n",
             f"--{b}--\r\n".encode(),

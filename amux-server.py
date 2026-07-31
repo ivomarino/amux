@@ -53274,9 +53274,14 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "invalid multipart"}, 400)
             # find target directory field
             target_dir = None
+            overwrite = False
             for part in parts:
-                if part.get_param("name", header="content-disposition") == "dir":
+                pname = part.get_param("name", header="content-disposition")
+                if pname == "dir":
                     target_dir = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace").strip()
+                elif pname == "overwrite":
+                    v = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace").strip().lower()
+                    overwrite = v in ("1", "true", "yes", "on")
             if not target_dir:
                 return self._json({"error": "missing 'dir' field"}, 400)
             dest_dir = Path(target_dir).expanduser().resolve()
@@ -53297,7 +53302,15 @@ class CCHandler(BaseHTTPRequestHandler):
                 if _is_dangerous_write(dest):
                     saved.append({"name": safe_name, "error": "refused: could execute code"})
                     continue
-                if dest.exists():
+                # Never clobber by default — a person dragging a file into the
+                # dashboard must not lose the one already there. But a caller
+                # applying a DECLARATION (cloud/seed.py writing a plan's context
+                # docs) means "this file should have these bytes", and suffixing
+                # turned every re-seed into another copy: a prospect workspace
+                # ended up with compliance.md, compliance_1.md, compliance_2.md
+                # and compliance_3.md sitting next to each other. overwrite=1 is
+                # opt-in, so the human path is unchanged.
+                if dest.exists() and not overwrite:
                     stem, suffix, i = dest.stem, dest.suffix, 1
                     while dest.exists():
                         dest = dest_dir / f"{stem}_{i}{suffix}"
