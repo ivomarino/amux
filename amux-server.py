@@ -14823,6 +14823,46 @@ def _mcp_registry_path():
         return None
 
 
+def _autostart_sessions_bg():
+    """Restart sessions this server knows about but tmux does not.
+
+    A cloud image deploy REPLACES the user's container. The amux data lives on a
+    volume, so every session's .env, the board and the schedules come back
+    exactly as they were — and tmux does not, because the processes died with
+    the old container. The result is a workspace that reads fully populated
+    through the API and shows its owner nothing but the first-run scaffold.
+    That is not hypothetical: a prospect workspace was reported as seeded three
+    times while its owner was looking at an empty dashboard, and four separate
+    deploys wiped it again over one afternoon while it was being verified.
+
+    Nothing was rebuilding them, so the repair was manual and had to be
+    remembered after every deploy. Gated on AMUX_AUTOSTART_SESSIONS because on a
+    workstation this would be wrong — see the flag's definition.
+    """
+    try:
+        time.sleep(8)          # let the listener bind and the DB settle first
+        tmux_info = _tmux_info_map()
+        names = [f.stem for f in sorted(CC_SESSIONS.glob("*.env"))
+                 if not _is_session_blocked(f.stem)]
+        missing = [n for n in names if tmux_name(n) not in tmux_info]
+        if not missing:
+            slog(f"[autostart] {len(names)} session(s) known, all already running")
+            return
+        slog(f"[autostart] {len(missing)} of {len(names)} session(s) have no tmux "
+             f"(container replaced?) — restarting: {', '.join(missing[:8])}"
+             + (" …" if len(missing) > 8 else ""))
+        for n in missing:
+            try:
+                ok_, msg = start_session(n)
+                slog(f"[autostart] {n}: {'started' if ok_ else 'FAILED — ' + str(msg)}")
+            except Exception as e:
+                slog(f"[autostart] {n}: FAILED — {e}")
+            time.sleep(1.5)    # stagger: a fleet coming up at once starves the box
+    except Exception as e:
+        # Never take the server down over this; it is a repair, not a dependency.
+        slog(f"[autostart] aborted: {e}")
+
+
 def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False) -> tuple[bool, str]:
     """Start a session headless (no attach). Returns (success, message)."""
     if not _VALID_SESSION_NAME_RE.match(name):
