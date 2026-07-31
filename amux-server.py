@@ -27838,6 +27838,28 @@ function toggleMenu(name) {
   el.style.right = 'auto';
   el.style.visibility = '';
   openMenu = name;
+  // Mobile menu-geometry beacon (AMUX-1731): the ⋯ menu detaches on iPhone
+  // with no desktop repro. Compare the intended placement against where the
+  // fixed box ACTUALLY landed one frame later — that drift, plus the
+  // visualViewport numbers, separates the three candidate causes (vv offset
+  // desync, innerHeight vs fixed-viewport mismatch, zoom-probe misread) from
+  // real device numbers, no user round-trip. Two per load, small screens only.
+  if (window.innerWidth <= 700 && _menuBeaconCount < 2) {
+    _menuBeaconCount++;
+    const intendedTop = el.style.top, intendedBottom = el.style.bottom, intendedLeft = left;
+    requestAnimationFrame(() => { try {
+      const a = el.getBoundingClientRect();
+      const vv = window.visualViewport || {};
+      fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'card-menu-geo', ver: APP_VER, menu: name,
+          btn: { t: Math.round(r.top), b: Math.round(r.bottom), l: Math.round(r.left), r: Math.round(r.right) },
+          intended: { top: intendedTop, bottom: intendedBottom, left: intendedLeft },
+          actual: { t: Math.round(a.top), b: Math.round(a.bottom), l: Math.round(a.left) },
+          z: z, vh: Math.round(vh), winH: window.innerHeight, winW: window.innerWidth,
+          vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0), vvLeft: Math.round(vv.offsetLeft || 0),
+          scrollY: Math.round(window.scrollY || 0) }) });
+    } catch (e) {} });
+  }
 }
 function closeAllMenus() {
   if (openMenu) {
@@ -30245,7 +30267,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.299';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.300';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -30842,6 +30864,7 @@ function _syncPeekOverlayToVisualViewport() {
 // (POST /api/client-debug) so mobile layout bugs are diagnosed from real
 // device numbers — no user round-trips.
 let _geoBeaconSent = false;
+let _menuBeaconCount = 0;   // card-menu-geo beacons per load (AMUX-1731)
 // Second snapshot with the keyboard UP (fires once, on first input focus) —
 // the keyboard-down beacon can't show keyboard-state bugs.
 let _kbdBeaconSent = false;
@@ -50530,7 +50553,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.299';
+const CACHE = 'amux-v0.9.300';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
