@@ -20387,6 +20387,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent;
     will-change: transform;
     position: relative;
+    /* Offscreen cards skip layout/paint entirely; the intrinsic size keeps the
+       scrollbar honest. On a 300-card column this is the difference between
+       painting 300 cards and painting the ~8 visible ones. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 96px;
   }
   /* Kill all transitions while dragging so Sortable's JS animation is the sole driver */
   body.board-dragging .board-card { transition: none !important; }
@@ -20441,8 +20446,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .board-owner-toggle .bv-btn { flex: 1; text-align: center; font-size: 0.78rem; padding: 6px 4px; }
     .board-view-toggle { order: 4; }
     .board-view-toggle .bv-btn { padding: 6px 8px; }
-    .board-col { min-width: 160px; max-width: 280px; padding: 8px 6px; }
-    .board-columns { gap: 8px; min-height: 160px; }
+    /* Mobile kanban, the pattern every major board converged on: one column
+       per swipe with scroll-snap and an ~12vw peek of the next column so the
+       horizontal axis is discoverable. Fixed column width beats squeezed
+       multi-column: 160px columns rendered 2.3 abreast and truncated every
+       title. Snap is proximity, not mandatory — mandatory fights a drag in
+       progress, and Sortable owns the gesture mid-drag. */
+    .board-columns {
+      gap: 10px; min-height: 160px;
+      scroll-snap-type: x proximity;
+      scroll-padding-left: 8px;
+    }
+    body.board-dragging .board-columns { scroll-snap-type: none; }
+    .board-col {
+      flex: 0 0 86vw; min-width: 86vw; max-width: 86vw;
+      scroll-snap-align: start;
+      padding: 8px 8px;
+    }
+    /* A collapsed column is a stub, not a screen. At 86vw the default-collapsed
+       BACKLOG/TODO made the board's first paint an empty header over blank
+       space — the real columns were two swipes away. */
+    .board-col.col-collapsed {
+      flex: 0 0 auto; min-width: 120px; max-width: 136px;
+    }
+    /* Column header stays visible while scrolling a tall column. */
+    .board-col-header { position: sticky; top: 0; z-index: 2;
+      background: var(--bg); border-radius: 6px; }
     .board-card { padding: 8px 10px; }
     .board-card-title { font-size: 0.82rem; }
     .board-card-desc { font-size: 0.7rem; }
@@ -20455,7 +20484,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .board-session-count { font-size: 0.62rem !important; padding: 1px 5px !important; }
   }
   @media (max-width: 400px) {
-    .board-col { min-width: 140px; max-width: 260px; }
+    /* (removed 2026-07-31: this later block re-clamped columns to 260px and
+       silently beat the 86vw snap sizing above — one width authority only) */
     .board-card { padding: 7px 8px; }
     .board-card-title { font-size: 0.78rem; }
     .board-col-header { font-size: 0.66rem; padding: 2px 2px 6px 2px; }
@@ -29512,7 +29542,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.279';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.282';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49785,7 +49815,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.279';
+const CACHE = 'amux-v0.9.282';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
