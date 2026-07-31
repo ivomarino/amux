@@ -16323,6 +16323,12 @@ _gmail_pending: dict = {}
 _gmail_creds_fail: dict = {}  # account → timestamp of last refresh failure (negative cache)
 _GMAIL_CREDS_FAIL_TTL = 300   # skip refresh retries for 5 min after a failure
 
+def _gmail_check_revoked(account: str, exc: Exception) -> None:
+    """If exc is an invalid_grant (token revoked/expired), populate the negative
+    cache so we stop round-tripping to Google on every request."""
+    if "invalid_grant" in str(exc):
+        _gmail_creds_fail[account] = time.time()
+
 _GMAIL_REDIRECT_URI = "http://localhost:8822/api/gmail/callback"
 
 # Google often returns a SUPERSET of the requested scopes (e.g. previously-granted
@@ -16530,6 +16536,7 @@ def _gmail_list_messages(account: str, label: str = "INBOX",
                 pass
         return {"messages": summaries, "next_page_token": page_next}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] list_messages {account}: {e}")
         return {"error": str(e)}
 
@@ -16577,6 +16584,7 @@ def _gmail_get_thread(account: str, thread_id: str) -> dict:
                 pass
         return {"thread_id": thread_id, "messages": messages}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] get_thread {account}: {e}")
         return {"error": str(e)}
 
@@ -16604,6 +16612,7 @@ def _gmail_send_message(account: str, to: str, subject: str, body: str,
         result = svc.users().messages().send(userId="me", body=send_body).execute()
         return {"ok": True, "id": result.get("id"), "thread_id": result.get("threadId")}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] send {account}: {e}")
         return {"error": str(e)}
 
@@ -16633,6 +16642,7 @@ def _gmail_get_signature(account: str, send_as: str = "") -> str:
             chosen = sendas[0]
         return (chosen or {}).get("signature", "") or ""
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] get_signature {account}: {e}")
         return ""
 
@@ -16693,6 +16703,7 @@ def _gmail_compose_send(account: str, to: str, subject: str, body: str,
         return {"ok": True, "id": result.get("id"), "thread_id": result.get("threadId"),
                 "signature_included": bool(sig_html)}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] compose_send {account}: {e}")
         return {"error": str(e)}
 
@@ -16715,6 +16726,7 @@ def _gmail_find_message_by_rfc822(account: str, rfc822_id: str) -> dict | None:
             metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID",
                              "References", "In-Reply-To"]).execute()
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] find_rfc822 {account}: {e}")
         return None
 
@@ -16825,6 +16837,7 @@ def _gmail_get_message_full(account: str, rfc822_id: str) -> dict | None:
         return svc.users().messages().get(
             userId="me", id=msgs[0]["id"], format="full").execute()
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] get_full {account}: {e}")
         return None
 
@@ -16876,6 +16889,7 @@ def _gmail_latest_matching(account: str, from_addr: str = "", with_addr: str = "
                     "gmail_message_id": m["id"], "thread_id": meta.get("threadId", ""),
                     "account": account}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] latest_matching {account}: {e}")
     return None
 
@@ -16955,6 +16969,7 @@ def _gmail_inbox_messages(account: str, count: int = 20, q: str = "", days: floa
             })
         return {"messages": out, "truncated": truncated}
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] inbox_messages {account}: {e}")
         return {"error": str(e)}
 
@@ -16973,6 +16988,7 @@ def _gmail_list_labels(account: str) -> list:
             return (0, PRIO.index(n)) if n in PRIO else (1, n.lower())
         return sorted(labels, key=_key)
     except Exception as e:
+        _gmail_check_revoked(account, e)
         slog(f"[gmail] list_labels {account}: {e}")
         return []
 
@@ -53773,6 +53789,16 @@ class CCHandler(BaseHTTPRequestHandler):
                         gate_item = _item_by_id(bid) or {}
                         if "session" in body:
                             gate_item["session"] = body.get("session") or None
+                        if "type" in body:
+                            # Type feeds the gate (_item_type_gate), so a PATCH that
+                            # reclassifies AND moves must be judged by the NEW type.
+                            # Without this, correcting a mistyped card is impossible in
+                            # one call: reclassifying a decision card from `code` to
+                            # `ops` was rejected for lacking a diff — which is the very
+                            # reason it was being reclassified. The ethos says fix the
+                            # type rather than bypass the gate; this makes that
+                            # instruction followable.
+                            gate_item["type"] = (body.get("type") or "").strip() or None
                         if "gate" in body:
                             _g = body.get("gate")
                             gate_item["gate"] = ([str(x).strip() for x in _g if str(x).strip()]
