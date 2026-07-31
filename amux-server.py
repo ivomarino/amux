@@ -12264,6 +12264,26 @@ def _commit_guard(name: str) -> bool:
         if not files:
             _commit_guard_nudged.pop(name, None)   # clean → re-arm for the next episode
             return False
+        # Foreign-dirt filter (2026-07-31). _checkout_busy_cotenant only covers a
+        # peer that is busy RIGHT NOW; a cotenant that edited a file 2 minutes ago
+        # and went idle slipped through, and this session got told — twice inside
+        # ten minutes — to commit amux-cloud's half-written gmail fix. The
+        # staged-guard's per-file attribution already knows whose recent edit each
+        # path is; a file another session touched inside the window is theirs, and
+        # nudging THIS session about it asks it to sweep a peer's WIP (the exact
+        # incident class the staged-guard exists to block).
+        try:
+            _fg = _staged_guard_check(name, wd, files).get("foreign") or []
+            _theirs = {f.get("path") for f in _fg}
+            _own = [f for f in files if f not in _theirs]
+            if not _own:
+                _owners = sorted({f.get("owner") or "?" for f in _fg})
+                slog(f"[commit-guard] {name}: all {len(files)} dirty file(s) are "
+                     f"{'/'.join(_owners)}'s recent edits — not nudging")
+                return False
+            files = _own
+        except Exception:
+            pass   # attribution unavailable → keep the old (over-nudging) behavior
         if _commit_guard_nudged.get(name):
             return False   # already nudged this episode; don't re-nag, allow normal flow
         _commit_guard_nudged[name] = True
