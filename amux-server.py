@@ -14186,9 +14186,12 @@ _AMUX_POSTCOMMIT_BODY = """#!/bin/sh
 # exits 0 — reporting must never wedge a commit. Fail-open by design.
 [ -n "$AMUX_SESSION" ] || exit 0
 sha=$(git rev-parse --short HEAD 2>/dev/null)
-subj=$(git log -1 --format=%s 2>/dev/null | cut -c1-120)
+# tr strips the two JSON-hostile characters instead of escaping them — a
+# quote-less subject in a log line beats a sed pipeline that broke on its own
+# escaping and posted empty subjects (first live test of this hook).
+subj=$(git log -1 --format=%s 2>/dev/null | tr -d '"\\' | cut -c1-120)
 [ -n "$sha" ] || exit 0
-payload=$(printf '{"sha":"%s","subject":"%s"}' "$sha" "$(printf '%s' "$subj" | sed 's/\\/\\\\/g; s/"/\\"/g')")
+payload=$(printf '{"sha":"%s","subject":"%s"}' "$sha" "$subj")
 curl -sk -m 3 -X POST -H 'Content-Type: application/json' \
   -H "X-Amux-Session: $AMUX_SESSION" -d "$payload" \
   "${AMUX_URL:-https://localhost:8822}/api/sessions/$AMUX_SESSION/commit-report" >/dev/null 2>&1
@@ -29737,7 +29740,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.288';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.289';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50012,7 +50015,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.288';
+const CACHE = 'amux-v0.9.289';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
