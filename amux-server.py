@@ -4699,7 +4699,19 @@ def _api_error_region(clean: str) -> tuple:
     box = -1
     for i, l in enumerate(lines):
         if l.strip()[:1] == "❯":
-            box = i          # last ❯ wins; earlier ones are echoed user messages
+            box = i          # candidate live input box; echoes also start with ❯
+    # A ❯ line is only the LIVE input box if no transcript marker follows it.
+    # Echoed user messages start with ❯ too, and a session with no live box
+    # rendered (manual mode) has its last echo sitting ABOVE fresh transcript:
+    # cutting there swallowed everything below, and a fleet-wide cloud 400
+    # read rate_limited_until=0 with the error directly under '❯ ping'
+    # (AMUX-2111 respecimen, 2026-07-31). Content after the last ❯ means that
+    # ❯ was an echo — keep the whole tail. Cost: error text PASTED into a
+    # live composer (wrapped onto ⏺-prefixed lines below its ❯) could flag;
+    # that needs the paste to persist two scans, and the inverse failure was
+    # live, not hypothetical.
+    if box >= 0 and any(_LIMIT_ACTIVITY_RE.match(l.strip()) for l in lines[box + 1:]):
+        box = -1
     region = lines[:box] if box >= 0 else lines
     last_marker = ""
     for l in region:
@@ -5025,7 +5037,13 @@ def _live_limit_region(clean: str) -> str:
     box = -1
     for i, l in enumerate(lines):
         if l.strip()[:1] == "❯":
-            box = i  # last ❯ wins: earlier ones are echoed user messages
+            box = i  # candidate live input box; echoes also start with ❯
+    # Same echo-vs-live-box discrimination as _api_error_region: a ❯ with
+    # transcript markers below it is an echoed message, not the input box —
+    # cutting there blinded every banner class on manual-mode panes (no live
+    # box rendered), the failure the AMUX-2111 cloud respecimen exposed.
+    if box >= 0 and any(_LIMIT_ACTIVITY_RE.match(l.strip()) for l in lines[box + 1:]):
+        box = -1
     region = lines[:box] if box >= 0 else lines
     cut = -1
     for i, l in enumerate(region):
@@ -30078,7 +30096,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.292';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.293';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50353,7 +50371,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.292';
+const CACHE = 'amux-v0.9.293';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
