@@ -173,6 +173,68 @@ def upload_docs(org, docs):
             bad(f"doc {path} failed: {code} {resp[:140]}")
 
 
+def session_is_live(org, name):
+    """Is an AGENT actually running in this session? Returns (live, why).
+
+    The one check that matters and the one that was missing. POST /api/sessions
+    returns 200 for the DB record, which is not the same fact as "a session is
+    running": a container recreated by a cloud image deploy keeps the record
+    (the DB lives on a volume) and loses every tmux session with it. Three times
+    a workspace was reported as seeded while its owner looked at an empty
+    dashboard, because the seeder believed its own 200.
+
+    Uses the server's `running` flag, which is tmux-backed: it checks the tmux
+    session exists, that the pane is not sitting at a shell prompt, and
+    cross-checks that the shell actually has a child process. Do NOT substitute
+    "peek returned some lines" for this — a STOPPED session keeps its tmux and
+    its scrollback, so peek happily returns 17 lines of a dead session. That
+    check passes exactly when it should fail, which is the failure mode this
+    function exists to prevent.
+    """
+    code, body = gw("GET", "/api/sessions", org=org)
+    if code != 200:
+        return False, f"session list unreadable (HTTP {code})"
+    try:
+        rows = json.loads(body)
+    except Exception:
+        return False, "session list unparsable"
+    for s in rows if isinstance(rows, list) else []:
+        if s.get("name") == name:
+            if s.get("running"):
+                return True, f"running, status={s.get('status') or 'starting'}"
+            return False, f"not running (preview: {str(s.get('preview') or '')[:40]!r})"
+    return False, "no such session in this workspace"
+
+
+def ensure_sessions_live(org, sessions, settle=15):
+    """Start any session that has no live pane, then PROVE it came up.
+
+    Called after create_sessions because creation and aliveness are different
+    facts, and only the second one is what a prospect sees.
+    """
+    started = []
+    for s in sessions:
+        name = s["name"]
+        live, why = session_is_live(org, name)
+        if live:
+            ok(f"session '{name}' is live ({why})")
+            continue
+        log(f"session '{name}' is NOT running — {why}; starting it")
+        code, _ = gw("POST", f"/api/sessions/{name}/start", org=org, timeout=120)
+        if code not in (200, 201, 202):
+            bad(f"session '{name}' would not start: HTTP {code}")
+            continue
+        started.append(name)
+    if started:
+        log(f"started {len(started)} session(s); letting them come up ({settle}s)…")
+        time.sleep(settle)
+        for name in started:
+            live, why = session_is_live(org, name)
+            (ok if live else bad)(
+                f"session '{name}' {'started and running' if live else 'START DID NOT TAKE'} ({why})")
+    return started
+
+
 def create_sessions(org, sessions):
     made = []
     for s in sessions:
@@ -710,6 +772,13 @@ def main():
 
     step("Create sessions")
     sessions = create_sessions(org, plan.get("sessions", []))
+
+    # Creating a session and having one RUNNING are different facts. Re-seeding
+    # after a container was recreated finds every record intact and every tmux
+    # session gone, and without this the seeder reports a fully seeded workspace
+    # that shows nothing but the scaffold.
+    step("Ensure sessions are actually running")
+    ensure_sessions_live(org, sessions)
 
     step("Create schedules")
     schedules = create_schedules(org, sessions)
