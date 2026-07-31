@@ -14179,6 +14179,54 @@ def _install_amux_precommit_guard(work_dir: str) -> None:
         pass
 
 
+_AMUX_POSTCOMMIT_MARKER = "# amux-commit-report"
+_AMUX_POSTCOMMIT_BODY = """#!/bin/sh
+# amux-commit-report — attach each commit to the session's in-flight board card
+# (AMUX-2015: a card should carry its code history). No-op outside amux; always
+# exits 0 — reporting must never wedge a commit. Fail-open by design.
+[ -n "$AMUX_SESSION" ] || exit 0
+sha=$(git rev-parse --short HEAD 2>/dev/null)
+subj=$(git log -1 --format=%s 2>/dev/null | cut -c1-120)
+[ -n "$sha" ] || exit 0
+payload=$(printf '{"sha":"%s","subject":"%s"}' "$sha" "$(printf '%s' "$subj" | sed 's/\\/\\\\/g; s/"/\\"/g')")
+curl -sk -m 3 -X POST -H 'Content-Type: application/json' \
+  -H "X-Amux-Session: $AMUX_SESSION" -d "$payload" \
+  "${AMUX_URL:-https://localhost:8822}/api/sessions/$AMUX_SESSION/commit-report" >/dev/null 2>&1
+exit 0
+"""
+
+
+def _install_amux_postcommit_hook(work_dir: str) -> None:
+    """Install the commit-report hook as post-commit. Written whole when absent;
+    a foreign post-commit is left alone (post-commit takes no stdin, but the
+    same never-clobber rule as every other amux hook applies)."""
+    try:
+        gr = subprocess.run(["git", "-C", work_dir, "rev-parse", "--git-dir"],
+                            capture_output=True, text=True, timeout=5)
+        if gr.returncode != 0:
+            return
+        git_dir = gr.stdout.strip()
+        if not os.path.isabs(git_dir):
+            git_dir = os.path.join(work_dir, git_dir)
+        hooks_dir = os.path.join(git_dir, "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        hook_path = os.path.join(hooks_dir, "post-commit")
+        cur = ""
+        if os.path.exists(hook_path):
+            try:
+                cur = open(hook_path).read()
+            except Exception:
+                return
+            if cur and _AMUX_POSTCOMMIT_MARKER not in cur:
+                return
+        if cur != _AMUX_POSTCOMMIT_BODY:
+            with open(hook_path, "w") as fh:
+                fh.write(_AMUX_POSTCOMMIT_BODY)
+            os.chmod(hook_path, 0o755)
+    except Exception:
+        pass
+
+
 def _install_amux_prepush_guard(work_dir: str) -> None:
     """Install the pre-push guard. Written as pre-push directly (not a shim +
     chained hook like pre-commit) because pre-push reads the ref list from
@@ -14221,6 +14269,7 @@ def _install_amux_commit_hook(work_dir: str) -> None:
     # (start_session, _install_hooks_all_sessions, the git peek action).
     _install_amux_precommit_guard(work_dir)
     _install_amux_prepush_guard(work_dir)
+    _install_amux_postcommit_hook(work_dir)
     try:
         gr = subprocess.run(["git", "-C", work_dir, "rev-parse", "--git-dir"],
                             capture_output=True, text=True, timeout=5)
@@ -29688,7 +29737,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.287';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.288';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49963,7 +50012,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.287';
+const CACHE = 'amux-v0.9.288';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58744,6 +58793,28 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # (ethos dev-1). Fired by Claude Code hooks: UserPromptSubmit -> active,
             # Stop -> idle. This is the interface that replaces regex-over-terminal
             # as the control plane; the scrapers remain only as its fallback.
+            # POST /api/sessions/<name>/commit-report — attach a commit to the
+            # session's in-flight card (AMUX-2015). A card should carry its code
+            # history; a session reading it later sees WHAT shipped, not just
+            # that something did. No in-flight card = silently accepted and
+            # dropped: not everything needs a commit, and not every commit has
+            # a card.
+            if action == "commit-report":
+                body = self._read_body()
+                sha = str(body.get("sha") or "").strip()[:16]
+                subj = str(body.get("subject") or "").strip()[:140]
+                if not sha:
+                    return self._json({"error": "sha required"}, 400)
+                row = get_db().execute(
+                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL "
+                    "AND COALESCE(archived,0)=0 AND status IN ('doing','review') "
+                    "AND owner_type='agent' ORDER BY updated DESC LIMIT 1", (name,)).fetchone()
+                if not row:
+                    return self._json({"ok": True, "attached": None})
+                _append_board_log(row["id"], f"commit {sha} — {subj}")
+                _ilog("board", "commit_attached", actor=name, target=row["id"],
+                      detail={"sha": sha, "subject": subj})
+                return self._json({"ok": True, "attached": row["id"], "sha": sha})
             if action == "report":
                 body = self._read_body()
                 st = str(body.get("state") or "").strip().lower()
