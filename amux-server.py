@@ -22943,7 +22943,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Notes sync (read + write) with this folder — e.g. your Obsidian vault</div>
           <div id="settings-notes-dir" style="font-family:monospace;font-size:0.74rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px;word-break:break-all;color:var(--text);">…</div>
           <div id="settings-notes-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
-          <div style="font-size:0.66rem;color:var(--dim);margin-top:4px;">Change via <code>AMUX_NOTES_DIR</code> in <code>~/.amux/server.env</code></div>
+
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-billing-section" style="display:none;">
@@ -30315,7 +30315,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.302';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.303';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50624,7 +50624,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.302';
+const CACHE = 'amux-v0.9.303';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
