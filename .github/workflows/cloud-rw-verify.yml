@@ -1,0 +1,82 @@
+name: Cloud read/write verify (every workspace, every surface)
+
+# Answers "are sessions, logs, files and boards actually readable AND editable
+# in every provisioned workspace" from inside each container, so the result does
+# not depend on anyone's login. The gateway only puts auth in front of these
+# same endpoints.
+#
+# Non-destructive: it writes ONE clearly-named probe file and ONE probe board
+# item, then removes exactly those two. It never touches existing data.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rw:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H 34.121.177.76 >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Read/write every surface in every workspace
+        env:
+          TOKEN: rw${{ github.run_id }}
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 "TOKEN='$TOKEN' bash -s" <<'ENDSSH'
+            FAIL=0
+            for C in $(docker ps --filter name=amux-user- --format '{{.Names}}' | sort); do
+              ORG="${C#amux-user-}"
+              ex() { docker exec "$C" sh -lc "$1" 2>&1; }
+              post() { printf '%s' "$2" | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 30 -X POST localhost:8822$1 -H 'Content-Type: application/json' -d @/tmp/rw.json" 2>&1; }
+              put()  { printf '%s' "$2" | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 30 -X PUT  localhost:8822$1 -H 'Content-Type: application/json' -d @/tmp/rw.json" 2>&1; }
+
+              echo "=============================================================="
+              echo "workspace: $ORG"
+
+              N=$(ex 'tmux list-sessions -F "#{session_name}" 2>/dev/null | wc -l' | tr -d ' ')
+              echo "  sessions: $N"
+              [ "$N" = "0" ] && { echo "    (empty workspace — nothing to read)"; continue; }
+
+              echo "  -- LOGS readable (scrollback per session):"
+              ex 'tmux list-sessions -F "#{session_name}" 2>/dev/null | while read s; do
+                    n=$(tmux capture-pane -p -S - -t "$s" 2>/dev/null | grep -c .)
+                    printf "     %-40s %5s lines\n" "$s" "$n"
+                  done'
+
+              echo "  -- FILES read + write (PUT then GET then remove):"
+              F="/root/amux-rw-probe-$TOKEN.txt"
+              put "/api/file?path=$F" "{\"content\":\"probe $TOKEN\"}" | head -c 160; echo
+              GOT=$(ex "curl -sS --max-time 20 'localhost:8822/api/file?path=$F'")
+              case "$GOT" in
+                *"$TOKEN"*) echo "     files: WRITE+READ OK" ;;
+                *)          echo "     files: FAILED -> $(echo "$GOT" | head -c 200)"; FAIL=1 ;;
+              esac
+              ex "rm -f $F"
+
+              echo "  -- BOARD read + write (create, move, delete):"
+              BEFORE=$(ex "curl -sS --max-time 20 localhost:8822/api/board | tr ',' '\n' | grep -c '\"id\"'")
+              NEW=$(post "/api/board" "{\"title\":\"rw probe $TOKEN\",\"status\":\"todo\"}")
+              ID=$(printf '%s' "$NEW" | tr ',' '\n' | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
+              if [ -n "$ID" ]; then
+                printf '%s' '{"status":"doing"}' | docker exec -i "$C" sh -c "cat > /tmp/rw.json && curl -sS --max-time 20 -X PATCH localhost:8822/api/board/$ID -H 'Content-Type: application/json' -d @/tmp/rw.json" >/dev/null 2>&1
+                MOVED=$(ex "curl -sS --max-time 20 localhost:8822/api/board/$ID | head -c 200")
+                case "$MOVED" in
+                  *doing*) echo "     board: CREATE+MOVE OK (items before=$BEFORE)" ;;
+                  *)       echo "     board: move FAILED -> $MOVED"; FAIL=1 ;;
+                esac
+                ex "curl -sS --max-time 20 -X DELETE localhost:8822/api/board/$ID >/dev/null"
+                echo "     board: probe item removed"
+              else
+                echo "     board: CREATE FAILED -> $(echo "$NEW" | head -c 200)"; FAIL=1
+              fi
+            done
+            echo
+            echo "=== VERDICT ==="
+            [ "$FAIL" = 0 ] && echo "  PASS — every non-empty workspace is readable and editable" \
+                            || { echo "  FAIL — see surfaces marked FAILED above"; exit 1; }
+          ENDSSH
