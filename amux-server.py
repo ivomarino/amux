@@ -14728,7 +14728,16 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                             time.sleep(1.0)  # space the two sends out
                         _send_after_ready(
                             sname,
-                            "Board snapshot (startup):\n\n" + digest, 60)
+                            "Board snapshot (startup):\n\n" + digest +
+                            "\n\nSTANDING RULE — decompose prompts into tasks: when a prompt "
+                            "you receive contains more than one distinct task, immediately "
+                            "create one board card PER unit of work (correct type; queue in "
+                            "todo) instead of one umbrella card, then work them through the "
+                            "gates in order. amux auto-captures each prompt as a single card "
+                            "for the ledger; SPLIT that card when it covers several tasks — "
+                            "you have the context to decompose it, amux does not. A card is "
+                            "one unit of work: something that can be honestly done or not "
+                            "done. Never fold new tasks into an old card's description.", 60)
                 threading.Thread(target=_send_boot_briefing, daemon=True,
                                  name=f"boot-{name}").start()
             _emit_event(name, "session.started",
@@ -29417,7 +29426,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.274';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.275';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49690,7 +49699,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.274';
+const CACHE = 'amux-v0.9.275';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
