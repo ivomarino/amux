@@ -8934,6 +8934,21 @@ def _advance_open_card(session_name: str) -> bool:
             "ORDER BY updated DESC LIMIT 1", (session_name,)).fetchone()
         if not row:
             return False
+        # Same not-a-task guard as auto-pickup. Pushing a session to "advance"
+        # a journal card asks for exactly the false progress the gates exist to
+        # prevent: there is no state in which 47 folded tasks are collectively
+        # done, so any move it makes is a lie. Guarding pickup but not this left
+        # the loop still handing sessions uncompletable work — the second half
+        # of the same bug (2026-07-30).
+        _d = (_item_by_id(row["id"]) or {}).get("desc") or ""
+        _f = len(re.findall(r"New task:", _d))
+        if _f >= 2 or re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
+                                row["title"] or "", re.I):
+            why = f"journal card ({_f} folded tasks)" if _f >= 2 else "test artifact"
+            slog(f"[advance] {session_name}: not nudging on {row['id']} — {why}")
+            _append_board_log(row["id"], f"Advance-nudge SKIPPED — {why}; split it into real cards "
+                                         f"or discard it. A session cannot honestly finish this.")
+            return False
         nxt = db.execute(
             "SELECT COUNT(*) AS n FROM issues WHERE session=? AND deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND status IN ('todo','backlog') AND owner_type='agent'",
@@ -29236,7 +29251,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.270';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.271';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49509,7 +49524,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.270';
+const CACHE = 'amux-v0.9.271';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
