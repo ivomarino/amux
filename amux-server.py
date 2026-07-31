@@ -27860,8 +27860,26 @@ function toggleMenu(name) {
           scrollY: Math.round(window.scrollY || 0) }) });
     } catch (e) {} });
   }
+  // Dismiss on scroll (AMUX-1731, reproduced on the simulator rig): the menu
+  // is position:fixed, so once ANYTHING scrolls the list it detaches and
+  // floats — on iPhone the opening tap's own momentum/rubber-band scroll
+  // lands right after the menu opens, which is the "detached near the top"
+  // report. The beacon proved placement is correct at open time; the page
+  // moves afterwards. Native context menus dismiss on scroll; do the same.
+  // Attached one frame late so the opening tap's own event storm settles;
+  // capture:true catches inner-container scrolls, not just the window.
+  requestAnimationFrame(() => {
+    if (openMenu === name) window.addEventListener('scroll', _menuScrollClose, { capture: true, passive: true });
+  });
+}
+function _menuScrollClose(e) {
+  // Scrolls INSIDE the open menu (it has overflow-y:auto) must not close it.
+  const el = openMenu && document.getElementById('menu-' + openMenu);
+  if (el && e.target instanceof Node && el.contains(e.target)) return;
+  closeAllMenus();
 }
 function closeAllMenus() {
+  window.removeEventListener('scroll', _menuScrollClose, { capture: true });
   if (openMenu) {
     const el = document.getElementById('menu-' + openMenu);
     if (el) {
@@ -30267,7 +30285,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.300';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.302';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -45523,6 +45541,29 @@ async function _handleDeeplink(hash) {
     tryOpen(0);
     return;
   }
+  // #menu=<session>[&scroll=N] — open a session card's ⋯ menu directly. Rig
+  // deeplink like #peek= above (AMUX-1731): the menu detaches on iPhone, the
+  // geometry beacon lives in toggleMenu, and a real-WebKit reproduction needs
+  // to drive the SHIPPED function without tap automation. scroll=N scrolls
+  // the list first so scrolled-state geometry is what gets measured.
+  if (hash && hash.startsWith('#menu=')) {
+    const raw = hash.slice(6);
+    const amp = raw.indexOf('&');
+    const target = decodeURIComponent(amp < 0 ? raw : raw.slice(0, amp));
+    let scrollN = 0;
+    if (amp >= 0) { const m = raw.slice(amp + 1).match(/(?:^|&)scroll=(\d+)/); if (m) scrollN = parseInt(m[1]); }
+    const tryMenu = (attempt) => {
+      const el = document.getElementById('menu-' + target);
+      if (el) {
+        if (scrollN) window.scrollTo(0, scrollN);
+        setTimeout(() => { try { toggleMenu(target); } catch(e) {} }, 250);
+        return;
+      }
+      if (attempt < 20) setTimeout(() => tryMenu(attempt + 1), 400);
+    };
+    tryMenu(0);
+    return;
+  }
   let dpath = null;
   if (hash && hash.startsWith('#path=')) {
     dpath = decodeURIComponent(hash.slice(6));
@@ -50553,7 +50594,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.300';
+const CACHE = 'amux-v0.9.302';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
