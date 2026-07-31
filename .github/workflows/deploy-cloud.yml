@@ -95,5 +95,18 @@ jobs:
                    s/\${R2_SECRET_KEY}/${R2_SECRET_KEY}/g" \
                 "$TEMPLATE" > "$compose_file"
               cd "$user_dir" && docker compose up -d --no-recreate 2>&1 | grep -v "^#" | tail -3
+              # Session autostart has to arrive through server.env, NOT the image.
+              # These containers are never recreated: --no-recreate is the whole
+              # point here, so a container created 2026-07-30 is still serving
+              # today's amux-server.py, and an ENV added to the Dockerfile or to
+              # the compose template reaches it only if it is rebuilt — which it
+              # is not. server.env lives on the volume and is read at server
+              # start, so it survives exactly the restart this loop performs.
+              # Without it a deploy stops every session in the workspace and
+              # nothing brings them back (AC-153).
+              docker exec "amux-user-${user_id}" sh -c \
+                'grep -qs AMUX_AUTOSTART_SESSIONS /root/.amux/server.env \
+                 || echo AMUX_AUTOSTART_SESSIONS=1 >> /root/.amux/server.env' 2>/dev/null \
+                && echo "  autostart env ensured" || true
             done
           ENDSSH
