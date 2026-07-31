@@ -8187,6 +8187,13 @@ def _init_db():
         # (cost analysis, pricing, root causes) should survive their session
         # being put away, just not clutter the live board.
         "ALTER TABLE issues ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        # Graph edges (2026-07-31). depends_on: JSON list of card ids — a card is
+        # BLOCKED while any of them is open; the autonomy loop traverses these
+        # instead of parsing "BLOCKS X" prose. reviewer: session name — when set,
+        # review->done requires the ACK to come from the reviewer, making
+        # cross-session verification first-class instead of voluntary.
+        "ALTER TABLE issues ADD COLUMN depends_on TEXT",
+        "ALTER TABLE issues ADD COLUMN reviewer TEXT",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -8997,6 +9004,46 @@ def _advance_open_card(session_name: str) -> bool:
             (session_name,)).fetchone()
         queued = (nxt["n"] if nxt else 0)
         item = _item_by_id(row["id"]) or {}
+        # Dependency edge: if the held card is blocked, the useful push is at
+        # the BLOCKER, not the holder. Same-session dependency -> redirect the
+        # nudge to it; another lane's -> say so and do not nudge the holder.
+        _blocking = _deps_blocking(item)
+        if _blocking:
+            _dep_id = _blocking[0]
+            _dep = _item_by_id(_dep_id) or {}
+            if (_dep.get("session") or "") == session_name:
+                if not is_running(session_name):
+                    return False
+                ok, err = send_text(session_name,
+                    f"[amux] {row['id']} is blocked by {_dep_id} ({(_dep.get('title') or '')[:80]}), "
+                    f"which is YOURS. Work the dependency first: drive {_dep_id} through its gates, "
+                    f"then return to {row['id']}. Do not mark {row['id']} done while its dependency is open.",
+                    defer_if_busy=True)
+                if ok:
+                    _advance_last[session_name] = time.time()
+                    _cmd_hist_record(session_name, f"[amux] advance: work dependency {_dep_id} of {row['id']}", "system", "advance")
+                    slog(f"[advance] {session_name}: routed to dependency {_dep_id} of {row['id']}")
+                return bool(ok)
+            slog(f"[advance] {session_name}: {row['id']} blocked by {_dep_id} ({_dep.get('session') or 'unassigned'}) — not nudging the holder")
+            return False
+        # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
+        # work now — pushing the author asks for a self-ack the transition refuses.
+        _rev = (item.get("reviewer") or "").strip()
+        if row["status"] == "review" and _rev and _rev != session_name:
+            if not is_running(_rev):
+                slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
+                return False
+            ok, err = send_text(_rev,
+                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in review and names YOU as "
+                f"reviewer. Review it: if the work holds, ack review->done yourself (your "
+                f"X-Amux-Session is the required sign-off); if not, say what fails on the card. "
+                f"The author cannot close it.",
+                defer_if_busy=True)
+            if ok:
+                _advance_last[session_name] = time.time()
+                _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
+                slog(f"[advance] routed review of {row['id']} to reviewer {_rev}")
+            return bool(ok)
         gate_next = "review" if row["status"] == "doing" else "done"
         gate = _effective_gate(item, gate_next) or []
         gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
@@ -9044,6 +9091,27 @@ def _advance_open_card(session_name: str) -> bool:
         return False
 
 
+def _deps_blocking(item) -> list:
+    """Card ids in item.depends_on that are still OPEN (deleted/absent do not
+    block). This is the edge the autonomy loop traverses: prose like 'BLOCKS
+    AC-138' was invisible to it; a field is not."""
+    try:
+        deps = item.get("depends_on") or []
+        if isinstance(deps, str):
+            deps = json.loads(deps or "[]")
+        if not deps:
+            return []
+        db = get_db()
+        out = []
+        for d in deps:
+            row = db.execute("SELECT status FROM issues WHERE id=? AND deleted IS NULL", (d,)).fetchone()
+            if row and _status_canon(row["status"]) not in ("done", "verified", "discarded"):
+                out.append(d)
+        return out
+    except Exception:
+        return []
+
+
 def _pickup_next_board_task(session_name: str):
     """Pick up the next queued (todo) board task for this session — OPT-IN only.
     Called when a session goes idle; moves the oldest agent todo to 'doing' and
@@ -9074,7 +9142,7 @@ def _pickup_next_board_task(session_name: str):
             return  # explicitly opted out of the autonomous loop
         time.sleep(3)
         db = get_db()
-        row = db.execute(
+        rows = db.execute(
             "SELECT id, title, desc FROM issues i "
             "WHERE session=? AND status='todo' AND owner_type='agent' AND deleted IS NULL "
             # Freshness gate: never auto-run a card nobody has touched in 7+
@@ -9091,9 +9159,19 @@ def _pickup_next_board_task(session_name: str):
             "AND NOT EXISTS (SELECT 1 FROM session_events e "
             "                WHERE e.type='task.claimed' AND e.ts > ? "
             "                AND e.data LIKE '%\"' || i.id || '\"%') "
-            "ORDER BY created ASC LIMIT 1",
+            "ORDER BY created ASC LIMIT 8",
             (session_name, int(time.time()) - 7 * 86400, time.time() - 86400)
-        ).fetchone()
+        ).fetchall()
+        # Dependency edges: skip cards whose depends_on is still open. Fetch a
+        # few candidates so one blocked card does not stall the whole queue.
+        row = None
+        for cand in (rows or []):
+            blocking = _deps_blocking(_item_by_id(cand["id"]) or {})
+            if blocking:
+                slog(f"[auto-pickup] {session_name}: {cand['id']} blocked by {blocking} — skipping")
+                continue
+            row = cand
+            break
         if not row:
             return
         item_id, title, desc = row["id"], row["title"], row["desc"] or ""
@@ -9554,6 +9632,7 @@ def _load_board(done_limit: int = 100) -> list:
                COALESCE(i.pinned, 0) AS pinned,
                COALESCE(i.pos, 0) AS pos,
                COALESCE(i.archived, 0) AS archived,
+               i.depends_on, i.reviewer,
                i.gate,
                GROUP_CONCAT(t.tag) AS tags_csv"""
     if done_limit > 0:
@@ -9679,6 +9758,8 @@ def _item_by_id(bid: str) -> dict | None:
                   i.due, i.due_time, i.created, i.updated, i.owner_type,
                   COALESCE(i.pinned, 0) AS pinned,
                   COALESCE(i.pos, 0) AS pos,
+                  COALESCE(i.archived, 0) AS archived,
+                  i.depends_on, i.reviewer,
                   i.gate,
                   GROUP_CONCAT(t.tag) AS tags_csv
            FROM issues i
@@ -9697,6 +9778,11 @@ def _item_by_id(bid: str) -> dict | None:
         item["gate"] = json.loads(g) if g else []
     except Exception:
         item["gate"] = []
+    d = item.get("depends_on")
+    try:
+        item["depends_on"] = json.loads(d) if d else []
+    except Exception:
+        item["depends_on"] = []
     return item
 
 
@@ -29426,7 +29512,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.277';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.279';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49699,7 +49785,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.277';
+const CACHE = 'amux-v0.9.279';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -51600,6 +51686,8 @@ class CCHandler(BaseHTTPRequestHandler):
                 "fields": {
                     "session": "OWNER — accountable for the item MOVING. Must be a lane that can execute it.",
                     "shepherd": "WATCHER — holding the thread for a rested lane. NOT accountable for execution.",
+                    "depends_on": "JSON list of card ids this card is BLOCKED by while they are open; the autonomy loop skips blocked cards and routes nudges to the dependency.",
+                    "reviewer": "Session whose X-Amux-Session must ack review->done when set (cross-session verification; force is the logged escape).",
                     "type": f"Item type; DERIVES the gate. One of {list(_ITEM_TYPES)}. Default '{_DEFAULT_ITEM_TYPE}'.",
                     "status": f"One of {list(statuses)}.",
                 },
@@ -53660,6 +53748,25 @@ class CCHandler(BaseHTTPRequestHandler):
                             gate_item["gate"] = ([str(x).strip() for x in _g if str(x).strip()]
                                                  if isinstance(_g, list) else [])
                         eff_gate = _effective_gate(gate_item, new_status)
+                        # Reviewer edge (opt-in per card): when set, closing out of
+                        # review must be acked BY the reviewer session — the author
+                        # self-acking its own review is exactly the voluntary-only
+                        # cross-checking this field exists to replace. force stays
+                        # the logged escape.
+                        _rev = (gate_item.get("reviewer") or "").strip()
+                        if (_rev and gate_item.get("status") == "review"
+                                and new_status in ("done", "verified")
+                                and not body.get("force")):
+                            _acker = (self.headers.get("X-Amux-Session", "") or "").strip()
+                            if _acker != _rev:
+                                return self._json({
+                                    "error": "review sign-off required from the reviewer",
+                                    "blocked": True, "reviewer": _rev,
+                                    "acker": _acker or "(no X-Amux-Session)",
+                                    "how": (f"this card names '{_rev}' as reviewer; the review->done ack "
+                                            f"must come from that session (X-Amux-Session), or pass "
+                                            f"force=true (logged) if the human overrides."),
+                                }, 409)
                         # The contract advertises force as "logged" in two places and
                         # NOTHING logged it — the one escape hatch from the gate system
                         # was the one action leaving no trace, while claiming otherwise.
@@ -53763,6 +53870,22 @@ class CCHandler(BaseHTTPRequestHandler):
                         if _t:
                             body["type"] = _t
                     set_clauses, params = [], []
+                    if "depends_on" in body:
+                        _dep = body.get("depends_on")
+                        if not isinstance(_dep, list):
+                            return self._json({"error": "depends_on must be a list of card ids"}, 400)
+                        _dep = [str(x).strip() for x in _dep if str(x).strip()]
+                        if bid in _dep:
+                            return self._json({"error": "a card cannot depend on itself"}, 400)
+                        _missing_dep = [x for x in _dep
+                                        if not db.execute("SELECT 1 FROM issues WHERE id=? AND deleted IS NULL", (x,)).fetchone()]
+                        if _missing_dep:
+                            return self._json({"error": f"unknown card id(s) in depends_on: {_missing_dep}"}, 400)
+                        set_clauses.append("depends_on = ?")
+                        params.append(json.dumps(_dep) if _dep else None)
+                    if "reviewer" in body:
+                        set_clauses.append("reviewer = ?")
+                        params.append((str(body.get("reviewer") or "").strip() or None))
                     for k in ("title", "desc", "status", "session", "shepherd", "type", "due", "due_time", "owner_type", "pinned", "pos"):
                         if k in body:
                             set_clauses.append(f"{k} = ?")
