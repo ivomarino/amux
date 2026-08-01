@@ -30363,7 +30363,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.305';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.306';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50672,7 +50672,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.305';
+const CACHE = 'amux-v0.9.306';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -59087,6 +59087,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if body.get("record_history"):
                     _cmd_hist_record(name, text, "user",
                                      self.headers.get("X-Amux-User-Email", ""))
+                    # Same capture as /send (AMUX-2132): a QUEUED human prompt is
+                    # still an instruction — steering is a delivery mechanism, not
+                    # a different kind of message. This branch recorded history but
+                    # skipped autotask, so every prompt sent while its session was
+                    # BUSY left zero board trace (both 15:46 MHC dictations; the
+                    # busier the lane, the likelier its instructions vanished).
+                    _autotask_from_command(name, text)
+                    _summarize_task_bg(name, text)
                 return self._json({"ok": True, "id": msg_id, "message": "queued for next turn boundary"})
             return self._json({"error": "method not allowed"}, 405)
 
