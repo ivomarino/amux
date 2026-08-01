@@ -106,7 +106,23 @@ jobs:
               user_id=$(basename "$user_dir")
               compose_file="$user_dir/docker-compose.yml"
               port=$(grep -A1 "ports:" "$compose_file" 2>/dev/null | grep -oP "[0-9]{4,}(?=:8822)")
-              [ -z "$port" ] && continue
+              if [ -z "$port" ]; then
+                # Was a silent `continue`. The glob matches 19 workspaces and the
+                # step still produced no output in 0.2s, which means every one of
+                # them landed here and said nothing — so the compose regeneration
+                # and `docker compose up -d` have not run for ANY workspace, for
+                # as long as this has been true. Containers still restart on
+                # deploy, but from the step-4 shared-mount touch, not from here.
+                echo "  SKIP ${user_id}: no port parsed from ${compose_file}"
+                if [ -z "${_diag_done:-}" ]; then
+                  _diag_done=1
+                  echo "    compose file exists: $([ -f "$compose_file" ] && echo yes || echo NO)"
+                  echo "    grep -P supported:   $(echo x8822 | grep -qoP '8822' 2>/dev/null && echo yes || echo NO)"
+                  echo "    ports: line(s) seen:"
+                  grep -A1 "ports:" "$compose_file" 2>&1 | head -4 | sed 's/^/      /'
+                fi
+                continue
+              fi
               sed "s/\${USER_ID}/${user_id}/g;
                    s/\${USER_PORT}/${port}/g;
                    s/\${CF_ACCOUNT_ID}/${CF_ACCOUNT_ID}/g;
