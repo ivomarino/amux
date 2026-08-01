@@ -1174,92 +1174,71 @@ _BU_MUTATING = {"click", "type", "input", "keys", "scroll", "eval", "back",
 # the amux-resolved dir. The CLI finds the server already running and every
 # verb hits the correctly-pathed daemon unchanged. profile_verified is the
 # regression tripwire that proves the directory actually taken.
-_BU_BOOTSTRAP = (
-    "import os,sys,runpy\n"
-    "import browser_use.skill_cli.utils as U\n"
-    "_ud=os.environ.get('AMUX_BU_USER_DATA_DIR')\n"
-    "if _ud:\n"
-    "    _o=U.get_chrome_profile_path\n"
-    "    U.get_chrome_profile_path=lambda p=None,*a,**k:(_ud if p is None else _o(p,*a,**k))\n"
-    "sys.argv=['browser_use.skill_cli.server']+sys.argv[1:]\n"
-    "runpy.run_module('browser_use.skill_cli.server',run_name='__main__')\n"
+# ── Profile-true sessions via self-patching daemon (AMUX-2133/2159 v2) ──────
+# v1 pre-spawned a patched daemon and raced the CLI's own ensure-server; the
+# bootstrap needed ~9s to import browser_use while the CLI spawns instantly,
+# so the CLI's unpatched daemon won the session lock every time (watched
+# second-by-second: pidfile appears at t≈9s, owner '-m skill_cli.server').
+# v2 stops racing: a sitecustomize shim on PYTHONPATH patches
+# get_chrome_profile_path inside ANY python that starts with
+# AMUX_BU_USER_DATA_DIR set — including the daemon the CLI itself spawns,
+# which copies our env. The CLI can win every race; its daemon is ours now.
+_BU_SHIM_DIR = CC_HOME / "bu-shim"
+_BU_SHIM_SRC = (
+    "import os\n"
+    "if os.environ.get('AMUX_BU_USER_DATA_DIR'):\n"
+    "    try:\n"
+    "        import browser_use.skill_cli.utils as _U\n"
+    "        _o = _U.get_chrome_profile_path\n"
+    "        def _amux_gcpp(profile=None, *a, **k):\n"
+    "            return os.environ['AMUX_BU_USER_DATA_DIR'] if profile is None else _o(profile, *a, **k)\n"
+    "        _U.get_chrome_profile_path = _amux_gcpp\n"
+    "    except Exception:\n"
+    "        pass\n"
 )
-_bu_server_spawned: dict = {}   # session -> (profile, monotonic ts) of last pre-spawn
 
-
-def _bu_ensure_profile_server(session: str, profile: str):
-    """Pre-spawn the browser-use session server with the CORRECT user-data-dir.
-
-    Idempotent and cheap: the server module holds a per-session portalocker
-    lock, so a second spawn exits immediately if one is alive. Called from
-    _bu_call_raw whenever args carry --profile, so every code path (start,
-    agent loop, computer-use) is covered without per-caller wiring."""
+def _bu_write_shim():
     try:
-        # Provenance check: if a daemon is alive for this session, is it OURS
-        # (path-patched bootstrap) or the CLI's hardwired one? A stale
-        # wrong-dir daemon holds the lock and silently wins otherwise — the
-        # exact way the first live test of this fix failed. Our bootstrap is
-        # identifiable by its -c source; the CLI spawns with -m.
-        import tempfile
-        _pidf = Path(tempfile.gettempdir()) / f"browser-use-{session}.pid"
-        if _pidf.exists():
-            try:
+        _BU_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+        f = _BU_SHIM_DIR / "sitecustomize.py"
+        if not f.exists() or f.read_text() != _BU_SHIM_SRC:
+            f.write_text(_BU_SHIM_SRC)
+    except Exception as e:
+        slog(f"[browser] shim write failed: {e}")
+
+_bu_daemon_checked: dict = {}   # session -> monotonic ts of last provenance check
+
+def _bu_ensure_profile_env(session: str, profile: str, env: dict) -> dict:
+    """Arm env so the CLI (and the daemon it spawns) self-patch to the amux
+    profile store, and kill a live UNARMED daemon once so the next spawn
+    inherits the armed env. No pre-spawn: the CLI owns its daemon lifecycle."""
+    udir, pdir = _bu_profile_launch_target(profile)
+    _bu_write_shim()
+    env["AMUX_BU_USER_DATA_DIR"] = str(udir)
+    env["PYTHONPATH"] = str(_BU_SHIM_DIR) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        now_m = time.monotonic()
+        if now_m - _bu_daemon_checked.get(session, 0) > 10:
+            _bu_daemon_checked[session] = now_m
+            import tempfile as _tf
+            _pidf = Path(_tf.gettempdir()) / f"browser-use-{session}.pid"
+            if _pidf.exists():
                 _pid = int(_pidf.read_text().strip() or 0)
-            except Exception:
-                _pid = 0
-            if _pid:
-                _r = subprocess.run(["ps", "-p", str(_pid), "-o", "command="],
+                _r = subprocess.run(["ps", "-wwwE", "-p", str(_pid)],
                                     capture_output=True, text=True)
-                _cmdline = (_r.stdout or "").strip()
-                if _cmdline:
-                    if "import os,sys,runpy" in _cmdline:
-                        _prev = _bu_server_spawned.get(session)
-                        if _prev and _prev[0] == profile:
-                            return  # ours, right profile — leave it be
-                        # ours but wrong profile: fall through to replace
-                    slog(f"[browser] replacing session server pid={_pid} for "
-                         f"{session} (profile-true takeover, was: {_cmdline[:80]!r})")
-                    try:
-                        os.kill(_pid, signal.SIGTERM)
-                    except Exception:
-                        pass
+                _alive = subprocess.run(["ps", "-p", str(_pid)], capture_output=True).returncode == 0
+                if _alive and "AMUX_BU_USER_DATA_DIR=" + str(udir) not in (_r.stdout or ""):
+                    slog(f"[browser] recycling unarmed daemon pid={_pid} for {session} "
+                         f"(target store: {udir})")
+                    os.kill(_pid, signal.SIGTERM)
                     for _ in range(20):
                         if subprocess.run(["ps", "-p", str(_pid)],
                                           capture_output=True).returncode != 0:
                             break
                         time.sleep(0.25)
-        udir, pdir = _bu_profile_launch_target(profile)
-        env = dict(os.environ)
-        env["AMUX_BU_USER_DATA_DIR"] = str(udir)
-        cmd = [sys.executable, "-c", _BU_BOOTSTRAP,
-               "--session", session, "--browser", "real"]
-        if pdir:
-            cmd += ["--profile", pdir]
-        subprocess.Popen(cmd, env=env, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # WAIT until OUR daemon owns the session before returning: the caller
-        # is about to run the CLI, whose own ensure-server spawns a hardwired
-        # daemon the instant it finds no socket — and a python -c bootstrap
-        # takes seconds to import. Losing that race is exactly how the
-        # seeded-from-source discriminator stayed red after the path fix
-        # (AMUX-2159): right env, wrong daemon holding the lock.
-        import tempfile as _tf
-        _pidf2 = Path(_tf.gettempdir()) / f"browser-use-{session}.pid"
-        for _ in range(24):
-            try:
-                _pid2 = int(_pidf2.read_text().strip() or 0)
-                _r2 = subprocess.run(["ps", "-p", str(_pid2), "-o", "command="],
-                                     capture_output=True, text=True)
-                if "import os,sys,runpy" in (_r2.stdout or ""):
-                    break
-            except Exception:
-                pass
-            time.sleep(0.25)
-        _bu_server_spawned[session] = (profile, time.monotonic())
-        slog(f"[browser] pre-spawned profile-true server session={session} "
-             f"profile={profile!r} user_data_dir={udir}")
     except Exception as e:
-        slog(f"[browser] profile-server pre-spawn failed for {session}: {e}")
+        slog(f"[browser] daemon provenance check failed for {session}: {e}")
+    return env, pdir
 
 
 def _bu_call(args: list, timeout_s: int = 30, session: str = "amux") -> dict:
@@ -1309,19 +1288,15 @@ def _bu_call_raw(args: list, timeout_s: int = 30, session: str = "amux") -> dict
         # pre-spawn must happen before the CLI's own ensure-server logic runs,
         # or the CLI spawns the hardwired-directory one and wins the lock.
         _sargs = [str(a) for a in (args or [])]
+        _env = None
         if "--profile" in _sargs:
             try:
                 _pi = _sargs.index("--profile")
                 _pname = _sargs[_pi + 1] if _pi + 1 < len(_sargs) else ""
-                _bu_ensure_profile_server(session, _pname)
-                # The CLI's --profile value must be the CHROME profile-directory
-                # inside the daemon's (patched) user-data-dir — not the amux
-                # profile name. Passing the name doubled the path
-                # (<store>/<name>/<name>) and the session ran a fresh empty
-                # profile; the seeded-from-source discriminator caught it red
-                # on its first run (AMUX-2159/2133). Legacy stores use ''
-                # (Chrome's Default), so the flag is dropped entirely.
-                _udir, _pdir = _bu_profile_launch_target(_pname)
+                _env, _pdir = _bu_ensure_profile_env(session, _pname, dict(os.environ))
+                # --profile carries the CHROME profile-directory inside the
+                # armed store, never the amux name (the name doubled the path
+                # into a fresh empty profile — first red of the discriminator).
                 if _pdir:
                     _sargs[_pi + 1] = _pdir
                 else:
@@ -1337,7 +1312,8 @@ def _bu_call_raw(args: list, timeout_s: int = 30, session: str = "amux") -> dict
         last = None
         for attempt in range(3):
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s,
+                                   env=_env)
             except subprocess.TimeoutExpired:
                 return {"error": "browser operation timed out"}
             except Exception as e:
@@ -30617,7 +30593,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.322';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.323';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51177,7 +51153,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.322';
+const CACHE = 'amux-v0.9.323';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
