@@ -9461,6 +9461,8 @@ _autopickup_danger_flagged: set = set()
 
 
 _autopickup_junk_flagged: set = set()   # card-log SKIPPED note fired once per card (AMUX-2128)
+_decompose_nudge_last: dict = {}        # session -> monotonic ts of last decompose dispatch (AMUX-2131)
+_DECOMPOSE_NUDGE_COOLDOWN = 6 * 3600
 
 
 # IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
@@ -9771,6 +9773,31 @@ def _pickup_next_board_task(session_name: str):
             row = cand
             break
         if not row:
+            # Every candidate was refused. If the refusals were captured-prompt
+            # shells or journals and the lane is otherwise free, dispatch ONE
+            # decompose instruction instead of going silent (AMUX-2131): the
+            # guard is right that a shell is not a unit of work, but the fix is
+            # the session SPLITTING it — judgment the model does well — not the
+            # card rotting. Ethan's 13:30-17:00 audit found six shells parked
+            # on an idle gtm-engine lane exactly this way. Cooldown keeps it to
+            # one nudge per lane per 6h; irreversible-op declines stay silent
+            # (those need a human, and they already alerted once).
+            _shells = [(c["id"], (c["title"] or "")[:70]) for c in (rows or [])
+                       if _pickup_junk_reason(c["title"] or "",
+                                              (c["desc"] or "") + "\n" + ((c["log"] if "log" in c.keys() else "") or ""))]
+            if _shells:
+                _nowm = time.monotonic()
+                if _nowm - _decompose_nudge_last.get(session_name, 0) > _DECOMPOSE_NUDGE_COOLDOWN:
+                    _decompose_nudge_last[session_name] = _nowm
+                    _lst = "\n".join(f"  {cid} — {t}" for cid, t in _shells[:8])
+                    send_text(session_name,
+                        f"[amux auto-pickup] Your queue's next {len(_shells)} card(s) are captured "
+                        f"prompts or journals — not dispatchable as-is:\n{_lst}\n"
+                        f"Decompose each into real cards (one honest unit of work per card, correct "
+                        f"type), carry the content over, then discard the shell. Auto-pickup will "
+                        f"work the real cards at your next idle.")
+                    slog(f"[auto-pickup] {session_name}: dispatched decompose nudge for "
+                         f"{len(_shells)} shell card(s)")
             return
         item_id, title, desc = row["id"], row["title"], row["desc"] or ""
         # Fold lines moved from desc to the append-only log (AMUX-2112);
@@ -30336,7 +30363,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.304';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.305';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50645,7 +50672,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.304';
+const CACHE = 'amux-v0.9.305';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
