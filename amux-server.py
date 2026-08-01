@@ -54319,6 +54319,80 @@ class CCHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
 
+        # ── File read / directory list ──
+        # /api/fs could write, move and delete but never read anything back, so a
+        # caller had no way to confirm its own upload landed. A session reading
+        # the 404 from a GET that was simply never routed concluded the files
+        # were gone and the container had been recycled, and went looking for an
+        # infrastructure fault that did not exist — the documents were sitting in
+        # /root/demo the whole time. Verifying workspace contents otherwise meant
+        # a GitHub Actions run that docker-execs `find` on the host (AC-152).
+        # Same containment as write and delete: _is_path_allowed decides.
+        if method == "GET" and path == "/api/fs/read":
+            target_path = (qs.get("path", [""])[0] or "").strip()
+            if not target_path:
+                return self._json({"error": "missing 'path'"}, 400)
+            target = Path(target_path).expanduser()
+            if not _is_path_allowed(target):
+                return self._json({"error": "access denied"}, 403)
+            target = target.resolve()
+            if not target.exists():
+                return self._json({"error": "not found", "path": str(target)}, 404)
+            if target.is_dir():
+                return self._json({"error": "is a directory — use /api/fs/list",
+                                   "path": str(target)}, 400)
+            try:
+                size = target.stat().st_size
+                # Cap the body rather than refusing outright: a caller checking
+                # "did my write land" needs the head of a big file, not an error.
+                cap = min(int(qs.get("max_bytes", ["1048576"])[0] or 1048576), 8 * 1024 * 1024)
+                raw = target.open("rb").read(cap)
+                try:
+                    text, binary = raw.decode("utf-8"), False
+                except UnicodeDecodeError:
+                    text, binary = base64.b64encode(raw).decode("ascii"), True
+                return self._json({
+                    "path": str(target), "size": size, "returned": len(raw),
+                    "truncated": size > len(raw),
+                    "encoding": "base64" if binary else "utf-8",
+                    "content": text,
+                    "modified": int(target.stat().st_mtime),
+                })
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+
+        if method == "GET" and path == "/api/fs/list":
+            target_path = (qs.get("path", [""])[0] or "").strip()
+            if not target_path:
+                return self._json({"error": "missing 'path'"}, 400)
+            target = Path(target_path).expanduser()
+            if not _is_path_allowed(target):
+                return self._json({"error": "access denied"}, 403)
+            target = target.resolve()
+            if not target.exists():
+                return self._json({"error": "not found", "path": str(target)}, 404)
+            if not target.is_dir():
+                return self._json({"error": "not a directory — use /api/fs/read",
+                                   "path": str(target)}, 400)
+            try:
+                entries = []
+                for p in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                    try:
+                        st = p.stat()
+                        entries.append({"name": p.name, "dir": p.is_dir(),
+                                        "size": st.st_size, "modified": int(st.st_mtime)})
+                    except OSError:
+                        entries.append({"name": p.name, "error": "unreadable"})
+                # count is emitted separately from the (capped) list so a
+                # truncated listing can never read as a complete short one.
+                out = {"path": str(target), "count": len(entries),
+                       "entries": entries[:1000]}
+                if len(entries) > 1000:
+                    out["truncated"] = True
+                return self._json(out)
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+
         # ── File/directory delete ──
         if method == "DELETE" and path == "/api/fs/delete":
             data = self._read_body()
