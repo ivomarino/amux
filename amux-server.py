@@ -9279,6 +9279,21 @@ _AUTOTASK_SKIP = {
     "stop", "wait", "retry", "again", "next", "done", "thanks", "ty", "k",
     "proceed", "resume", "keep going", "carry on", "do it", "sounds good",
 }
+# Slash commands drive the HARNESS, not the work. `/compact` became a board card
+# titled "Load Project Context", auto-pickup dispatched it as a task, and the
+# session that received it had nothing it could honestly do — no gate is
+# satisfiable by a card that describes a UI action. Each one burns a pickup slot
+# and pushes real cards down the queue.
+# Named built-ins are skipped even with arguments; anything else starting with
+# "/" is skipped only when it is a BARE command, so a user-defined skill invoked
+# with a real brief ("/deploy the gateway change") still files a card.
+_AUTOTASK_SLASH_CONTROL = {
+    "compact", "clear", "model", "help", "resume", "exit", "quit", "cost",
+    "status", "config", "doctor", "login", "logout", "memory", "init", "agents",
+    "mcp", "hooks", "ide", "privacy-settings", "release-notes", "bug", "export",
+    "upgrade", "permissions", "add-dir", "terminal-setup", "vim", "pr-comments",
+    "install-github-app", "context", "output-style", "todos", "usage",
+}
 
 
 def _autotask_title(text: str) -> str:
@@ -9315,6 +9330,10 @@ def _autotask_from_command(session_name: str, text: str):
         stripped = re.sub(r"^\[.*?\]\s*", "", text or "").strip().lower().rstrip(".!?")
         if len(stripped) < _AUTOTASK_MIN_CHARS or stripped in _AUTOTASK_SKIP:
             return
+        if stripped.startswith("/"):
+            cmd = stripped[1:].split()[0] if len(stripped) > 1 else ""
+            if cmd in _AUTOTASK_SLASH_CONTROL or " " not in stripped:
+                return
         threading.Thread(
             target=_auto_create_board_issue,
             args=(session_name, _autotask_title(text), text),
