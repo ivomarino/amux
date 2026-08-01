@@ -120,6 +120,13 @@ every function called, and inspect the callers.
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
 
+The sharpest variant: the sanctioned instruction itself can be the theatre. Every
+assignment notification told sessions to run `amux board claim <id>`; the command did
+not exist, fell through to the help text, and exited 0 — so following the instruction
+EXACTLY produced a success signal and no claim (AMUX-2140). When the instruction and
+the failure are the same action, no amount of care catches it; only using the result
+does. Anything a notification or doc tells an agent to run must itself be exercised.
+
 ## 8. Are you deciding something that is the human's to decide?
 
 Getting out of the model's way includes getting out of the user's way.
