@@ -826,6 +826,39 @@ cmd_start_all() {
   done
 }
 
+# Outcome-based exit for board mutations (AMUX-2140): the CLI used to report
+# the TRANSPORT (curl ok = exit 0) while the server refused the write — every
+# `$?` caller and every `&& echo moved` printed success on blocked mutations,
+# and a refused status PATCH left desc/status contradicting each other
+# fleet-visible. Codes: 0 ok · 3 gate not acknowledged · 4 WIP/holding limit ·
+# 5 rev mismatch · 1 other refusal or malformed response. Refusals print the
+# server body to STDERR so pipelines keep clean stdout.
+_board_outcome() {
+  python3 -c '
+import sys, json
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.stderr.write((raw[:300] or "empty response") + "\n")
+    sys.exit(1)
+err = (d.get("error") or "") if isinstance(d, dict) else ""
+ok = isinstance(d, dict) and not err and d.get("ok") is not False
+if ok:
+    label = d.get("status") or d.get("title") or "ok"
+    print(d.get("id", "?"), "\u2192", label)
+    sys.exit(0)
+sys.stderr.write(json.dumps(d) + "\n")
+e = err.lower()
+if "gate" in e:
+    sys.exit(3)
+if "holding" in e or "doing" in e or "wip" in e:
+    sys.exit(4)
+if "rev mismatch" in e:
+    sys.exit(5)
+sys.exit(1)'
+}
+
 cmd_board() {
   local AMUX_API="${AMUX_API:-https://localhost:8822}"
   local subcmd="${1:-help}"; shift 2>/dev/null || true
@@ -837,13 +870,11 @@ cmd_board() {
       local result
       result=$(curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
         -d "{\"status\":\"$status\"}" \
         "$AMUX_API/api/board/$id")
-      if echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'→',d['status'])" 2>/dev/null; then
-        :
-      else
-        echo "$result"
-      fi
+      echo "$result" | _board_outcome
+      return $?
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
@@ -851,9 +882,11 @@ cmd_board() {
       local result
       result=$(curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
         -d "{\"status\":\"$new_status\"}" \
         "$AMUX_API/api/board/$id")
-      echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'→',d['status'])" 2>/dev/null || echo "$result"
+      echo "$result" | _board_outcome
+      return $?
       ;;
     add|create)
       # Title via --stdin/--file keeps it out of a shell-evaluated string
@@ -875,7 +908,21 @@ cmd_board() {
         -H "X-Amux-Session: ${AMUX_SESSION:-}" \
         -d "$body" \
         "$AMUX_API/api/board")
-      echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Created',d['id'],'→',d['title'])" 2>/dev/null || echo "$result"
+      echo "$result" | _board_outcome
+      return $?
+      ;;
+    claim)
+      # Atomic claim (the assignment notifications tell every session to run
+      # this — it fell through to help and exited 0 until AMUX-2140).
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board claim <ISSUE-ID>"
+      local result
+      result=$(curl -sk -X POST \
+        -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "{\"session\":\"${AMUX_SESSION:-}\"}" \
+        "$AMUX_API/api/board/$id/claim")
+      echo "$result" | _board_outcome
+      return $?
       ;;
     import)
       # amux board import gh:owner/repo#N [--workspace W] [--project P]
@@ -1099,6 +1146,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
 
   amux board ls                    List all issues (with tags)
   amux board add <title>           Create a new todo issue
+  amux board claim <ID>            Atomically claim a todo/backlog card for this session
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
