@@ -8780,6 +8780,11 @@ def _init_db():
         # gets a 409 with the current item on mismatch instead of silently
         # last-writer-winning. Absent header = legacy behavior.
         "ALTER TABLE issues ADD COLUMN rev INTEGER NOT NULL DEFAULT 0",
+        # Message->card join (2026-08-01, AMUX-2143). Capture stamps the id of
+        # the card it created/folded onto the message row itself — a FIELD,
+        # not a timestamp heuristic — so 'what happened to what I asked' is a
+        # join, not an inference.
+        "ALTER TABLE cmd_history ADD COLUMN card_id TEXT",
         # Messages history: tag each command by WHO sent it (origin session name
         # or schedule title), so the peek can color-code user vs inter-session vs
         # scheduled vs system commands.
@@ -9445,6 +9450,27 @@ def _is_same_task(issue_id: str, title: str, prompt_text: str) -> bool:
         return True              # on error, preserve today's behaviour rather than spawning
 
 
+def _stamp_msg_card(session_name: str, prompt_text: str, card_id: str):
+    """Stamp the capture's card id onto the message row it came from
+    (AMUX-2143): exact text+session match, newest unstamped row. Retries
+    briefly because /send fires capture BEFORE it records history — the
+    steer path records first, so ordering differs per path."""
+    for _ in range(4):
+        try:
+            db = get_db()
+            cur = db.execute(
+                "UPDATE cmd_history SET card_id=? WHERE id=("
+                "SELECT id FROM cmd_history WHERE session=? AND text=? "
+                "AND card_id IS NULL ORDER BY ts DESC LIMIT 1)",
+                (card_id, session_name, prompt_text))
+            db.commit()
+            if cur.rowcount:
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
 def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
     """Create or update a board issue for a session task. If the session already has an
     active (non-done/discarded) issue, update its title instead of creating a duplicate.
@@ -9472,6 +9498,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             # (MO-2952/2963 incident, 2026-07-06), and a status/title change must
             # be a deliberate act, never a side effect of run-state.
             _append_board_log(existing["id"], f"New task: {prompt_text[:200]}")
+            _stamp_msg_card(session_name, prompt_text, existing["id"])
             return
         if existing:
             # A DISTINCT task arrived while another card is open. Folding it into
@@ -9502,6 +9529,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             # marker and re-armed pickup forever — the honest act broke the
             # protection. The log survives every desc rewrite (AMUX-2112).
             _append_board_log(item_id, "capture: session prompt")
+            _stamp_msg_card(session_name, prompt_text, item_id)
             _board_changed()
             slog(f"[board] {session_name}: new task -> {item_id} (queued alongside {existing['id']})")
             return
@@ -9515,6 +9543,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
         )
         db.commit()
         _append_board_log(item_id, "capture: session prompt")  # durable marker, see above
+        _stamp_msg_card(session_name, prompt_text, item_id)
         _board_changed()
     except Exception as e:
         print(f"[board] auto-create failed for {session_name}: {e}", flush=True)
@@ -30545,7 +30574,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.313';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.314';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47719,9 +47748,37 @@ function _messagesRender() {
                 : (sessF ? 'No messages for ' + esc(sessF) + '.' : 'No messages yet.')) + '</div>';
     return;
   }
+  // Burst grouping + message→card join (AMUX-2143): you fire clusters
+  // across sessions and lose the thread. A divider marks each burst (>90s
+  // gap), and a human row whose capture stamped card_id gets a live chip:
+  // card id + status now + last attached commit, click-through to the card.
+  const _cardById = {};
+  (typeof boardItems !== 'undefined' ? boardItems : []).forEach(c => { _cardById[c.id] = c; });
+  const _stColor = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
+    : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
+    : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
+  let _prevTs = null;
   list.innerHTML = rows.map(m => {
     const enc = encodeURIComponent(m.text || '').replace(/'/g, '%27');
     const sess = m.session || '';
+    let burst = '';
+    if (_msgsKind === 'human' && _prevTs !== null && (_prevTs - m.ts) > 90000) {
+      burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(m.ts) + '</div>';
+    }
+    _prevTs = m.ts;
+    let cardChip = '';
+    if (m.card_id) {
+      const c = _cardById[m.card_id];
+      const st = c ? (c.status || 'todo') : '';
+      const undecomposed = c && ((c.log || '').indexOf('capture: session prompt') !== -1) && st === 'todo';
+      const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
+      cardChip = '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(m.card_id) + '\'), 250);" '
+        + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
+        + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? _stColor(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
+        + 'color:' + (c ? _stColor(st) : 'var(--dim)') + ';">\u2192 ' + esc(m.card_id)
+        + (c ? ' \u00B7 ' + esc(undecomposed ? 'captured, not yet decomposed' : st) : ' \u00B7 gone')
+        + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
+    }
     // Was queued-only, so a session or scheduled message carried no marker at
     // all here. Same badge the other two surfaces show.
     const _k = _msgKind(m), _km = _MSG_KIND[_k] || _MSG_KIND.human;
@@ -47729,11 +47786,11 @@ function _messagesRender() {
                                 : (m.origin ? ' \u00B7 ' + esc(String(m.origin).slice(0, 26)) : '');
     const tag = '<span class="msg-tag" style="background:' + _km.bg + ';color:' + _km.color
       + ';font-weight:600;border-left:3px solid ' + _km.color + ';">' + _km.label + _sfx + '</span>';
-    return '<div class="msg-row" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
+    return burst + '<div class="msg-row" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
       '<div class="msg-main">' +
         '<div class="msg-meta">' +
           (sess ? '<span class="msg-sess">' + esc(sess) + '</span>' : '<span class="msg-sess" style="color:var(--dim);">(unknown)</span>') +
-          '<span class="msg-ts">' + _msgsFmtTs(m.ts) + '</span>' + tag +
+          '<span class="msg-ts">' + _msgsFmtTs(m.ts) + '</span>' + tag + cardChip +
         '</div>' +
         '<div class="msg-text">' + esc(m.text || '') + '</div>' +
       '</div>' +
@@ -50854,7 +50911,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.313';
+const CACHE = 'amux-v0.9.314';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53283,7 +53340,7 @@ class CCHandler(BaseHTTPRequestHandler):
                             ors.append("type=?")
                             params.append(k)
                     where.append("(" + " OR ".join(ors) + ")")
-                sql = "SELECT id, text, type, session, ts, origin FROM cmd_history"
+                sql = "SELECT id, text, type, session, ts, origin, card_id FROM cmd_history"
                 if where:
                     sql += " WHERE " + " AND ".join(where)
                 sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
