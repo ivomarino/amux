@@ -1237,6 +1237,24 @@ def _bu_ensure_profile_server(session: str, profile: str):
             cmd += ["--profile", pdir]
         subprocess.Popen(cmd, env=env, start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # WAIT until OUR daemon owns the session before returning: the caller
+        # is about to run the CLI, whose own ensure-server spawns a hardwired
+        # daemon the instant it finds no socket — and a python -c bootstrap
+        # takes seconds to import. Losing that race is exactly how the
+        # seeded-from-source discriminator stayed red after the path fix
+        # (AMUX-2159): right env, wrong daemon holding the lock.
+        import tempfile as _tf
+        _pidf2 = Path(_tf.gettempdir()) / f"browser-use-{session}.pid"
+        for _ in range(24):
+            try:
+                _pid2 = int(_pidf2.read_text().strip() or 0)
+                _r2 = subprocess.run(["ps", "-p", str(_pid2), "-o", "command="],
+                                     capture_output=True, text=True)
+                if "import os,sys,runpy" in (_r2.stdout or ""):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
         _bu_server_spawned[session] = (profile, time.monotonic())
         slog(f"[browser] pre-spawned profile-true server session={session} "
              f"profile={profile!r} user_data_dir={udir}")
@@ -1294,7 +1312,21 @@ def _bu_call_raw(args: list, timeout_s: int = 30, session: str = "amux") -> dict
         if "--profile" in _sargs:
             try:
                 _pi = _sargs.index("--profile")
-                _bu_ensure_profile_server(session, _sargs[_pi + 1] if _pi + 1 < len(_sargs) else "")
+                _pname = _sargs[_pi + 1] if _pi + 1 < len(_sargs) else ""
+                _bu_ensure_profile_server(session, _pname)
+                # The CLI's --profile value must be the CHROME profile-directory
+                # inside the daemon's (patched) user-data-dir — not the amux
+                # profile name. Passing the name doubled the path
+                # (<store>/<name>/<name>) and the session ran a fresh empty
+                # profile; the seeded-from-source discriminator caught it red
+                # on its first run (AMUX-2159/2133). Legacy stores use ''
+                # (Chrome's Default), so the flag is dropped entirely.
+                _udir, _pdir = _bu_profile_launch_target(_pname)
+                if _pdir:
+                    _sargs[_pi + 1] = _pdir
+                else:
+                    del _sargs[_pi:_pi + 2]
+                args = _sargs
             except Exception:
                 pass
         cmd = [_BROWSER_USE_BIN, "--json", "--session", session] + args
@@ -30585,7 +30617,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.319';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.321';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51145,7 +51177,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.319';
+const CACHE = 'amux-v0.9.321';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
