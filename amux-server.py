@@ -9460,6 +9460,58 @@ def _complete_session_board_issue(session_name: str):
 _autopickup_danger_flagged: set = set()
 
 
+_autopickup_junk_flagged: set = set()   # card-log SKIPPED note fired once per card (AMUX-2128)
+
+
+# IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
+# "do not drop without confirmation" prose, but PROSE DOES NOT BIND AN
+# AUTOMATED READER — an agent auto-executing the card scrolls straight
+# past the warning and does the destructive thing the warning forbade.
+# So the CONSUMER enforces, not the card text: anything naming an
+# unrecoverable operation is never auto-executed. It stays in todo for a
+# human to dispatch, and the owner is told why.
+# NOT-A-TASK GUARD. Auto-pickup says "work it now", which is meaningless
+# for a card that is not a single unit of work. Two shapes qualify, and
+# both were in the eligible pool the moment pickup went fleet-wide
+# (2026-07-30: 345 eligible, 66 journals, 16 test artifacts):
+#
+#   JOURNALS — cards with tasks folded into the desc. One reached 451
+#   folds. Nothing about them is done or not-done, so no gate governs
+#   them and there is no state in which finishing is possible. The fold
+#   fix stops NEW ones forming; these already exist.
+#
+#   PROBE/TEST ARTIFACTS — leftovers from verification runs, including
+#   my own. The first card this loop handed a session after going
+#   fleet-wide was AMUX-1848, titled "[probe-stale] 1784823029868" with
+#   47 folds.
+#   CAPTURED PROMPTS — a card whose whole body is one harvested
+#   conversational turn. Talking to an agent created cards, pickup
+#   dispatched them back to that same agent, and its replies produced
+#   more: a closed loop. On 2026-07-30 it emitted eight in a row to one
+#   session (AC-129..AC-136), including "/compact" and two duplicate
+#   pairs of the same turn. None was a unit of work, so no gate could be
+#   honestly satisfied and none could be cleared — they re-queue after
+#   the cooldown forever. Matches ONLY when the desc is nothing but the
+#   prompt block, so a real card that quotes its originating prompt
+#   alongside actual content is unaffected.
+def _pickup_junk_reason(title: str, desc: str) -> str:
+    """Why auto-pickup must refuse this card, or '' if it is a real task.
+    Journals (>=2 folds), captured-prompt shells, probe/test artifacts —
+    the NOT-A-TASK guard reasons documented at the call site."""
+    _folds = len(re.findall(r"New task:", desc))
+    _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
+                   (desc or "").strip(), re.S)
+    _prompt_only = ""
+    if _pm:
+        _body = _pm.group(1).strip()
+        _prompt_only = ("harness slash command, not a task"
+                        if _body.startswith("/")
+                        else "captured chat prompt, not a unit of work")
+    return ("journal card ({} folded tasks)".format(_folds) if _folds >= 2
+            else _prompt_only if _prompt_only
+            else "looks like a test artifact"
+            if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
+                         title or "", re.I) else "")
 _advance_last: dict = {}
 _ADVANCE_COOLDOWN = 15 * 60     # never push the same lane twice inside this window
 
@@ -9672,7 +9724,10 @@ def _pickup_next_board_task(session_name: str):
             "AND NOT EXISTS (SELECT 1 FROM session_events e "
             "                WHERE e.type='task.claimed' AND e.ts > ? "
             "                AND e.data LIKE '%\"' || i.id || '\"%') "
-            "ORDER BY created ASC LIMIT 8",
+            # Board drag order IS the priority queue (AMUX-2128): pos is what
+            # the user reorders in the UI, so dragging a card up prioritizes
+            # it for pickup. created breaks ties for never-dragged cards.
+            "ORDER BY COALESCE(pos, 0) ASC, created ASC LIMIT 16",
             (session_name, int(time.time()) - 7 * 86400, time.time() - 86400)
         ).fetchall()
         # Dependency edges: skip cards whose depends_on is still open. Fetch a
@@ -9683,6 +9738,36 @@ def _pickup_next_board_task(session_name: str):
             if blocking:
                 slog(f"[auto-pickup] {session_name}: {cand['id']} blocked by {blocking} — skipping")
                 continue
+            # Refusal guards run INSIDE the loop (AMUX-2128): they used to
+            # return, so one refusable card at the head of the queue stalled
+            # the entire lane forever — 81 clean todos sat behind refusable
+            # heads when this was measured. A refusal now tries the next
+            # candidate, and its card-log note fires once, not every tick.
+            _cid = cand["id"]
+            _ctitle = cand["title"] or ""
+            _cdesc = (cand["desc"] or "") + "\n" + ((cand["log"] if "log" in cand.keys() else "") or "")
+            _junk = _pickup_junk_reason(_ctitle, _cdesc)
+            if _junk:
+                slog(f"[auto-pickup] {session_name}: skipped {_cid} — {_junk}")
+                if _cid not in _autopickup_junk_flagged:
+                    _autopickup_junk_flagged.add(_cid)
+                    _append_board_log(_cid, f"Auto-pickup SKIPPED — {_junk}; needs a human to split or discard it.")
+                continue
+            _blob = (_ctitle + "\n" + _cdesc).lower()
+            _danger = re.search(r"stash\s+(drop|clear)|rm\s+-[rf]{1,2}\b|push\s+(--force|-f)\b|"
+                                r"reset\s+--hard|git\s+clean\s+-[a-z]*[fd]|drop\s+table|"
+                                r"truncate\s+table|delete\s+from\s+\w+\s*;|--no-preserve-root", _blob)
+            if _danger:
+                if _cid not in _autopickup_danger_flagged:
+                    _autopickup_danger_flagged.add(_cid)
+                    _append_board_log(_cid, f"Auto-pickup DECLINED — names an irreversible operation "
+                                            f"({_danger.group(0).strip()}); needs a human to dispatch.")
+                    slog(f"[auto-pickup] {session_name}: declined {_cid} — irreversible op "
+                         f"'{_danger.group(0).strip()}'")
+                    _push_alert("task_pickup", session_name,
+                                f"'{_cid}' was NOT auto-executed: it names an irreversible operation "
+                                f"('{_danger.group(0).strip()}'). Review and dispatch it yourself if intended.")
+                continue
             row = cand
             break
         if not row:
@@ -9691,70 +9776,6 @@ def _pickup_next_board_task(session_name: str):
         # Fold lines moved from desc to the append-only log (AMUX-2112);
         # old cards still carry them in desc — count across both.
         desc = desc + "\n" + ((row["log"] if "log" in row.keys() else "") or "")
-        # IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
-        # "do not drop without confirmation" prose, but PROSE DOES NOT BIND AN
-        # AUTOMATED READER — an agent auto-executing the card scrolls straight
-        # past the warning and does the destructive thing the warning forbade.
-        # So the CONSUMER enforces, not the card text: anything naming an
-        # unrecoverable operation is never auto-executed. It stays in todo for a
-        # human to dispatch, and the owner is told why.
-        # NOT-A-TASK GUARD. Auto-pickup says "work it now", which is meaningless
-        # for a card that is not a single unit of work. Two shapes qualify, and
-        # both were in the eligible pool the moment pickup went fleet-wide
-        # (2026-07-30: 345 eligible, 66 journals, 16 test artifacts):
-        #
-        #   JOURNALS — cards with tasks folded into the desc. One reached 451
-        #   folds. Nothing about them is done or not-done, so no gate governs
-        #   them and there is no state in which finishing is possible. The fold
-        #   fix stops NEW ones forming; these already exist.
-        #
-        #   PROBE/TEST ARTIFACTS — leftovers from verification runs, including
-        #   my own. The first card this loop handed a session after going
-        #   fleet-wide was AMUX-1848, titled "[probe-stale] 1784823029868" with
-        #   47 folds.
-        #   CAPTURED PROMPTS — a card whose whole body is one harvested
-        #   conversational turn. Talking to an agent created cards, pickup
-        #   dispatched them back to that same agent, and its replies produced
-        #   more: a closed loop. On 2026-07-30 it emitted eight in a row to one
-        #   session (AC-129..AC-136), including "/compact" and two duplicate
-        #   pairs of the same turn. None was a unit of work, so no gate could be
-        #   honestly satisfied and none could be cleared — they re-queue after
-        #   the cooldown forever. Matches ONLY when the desc is nothing but the
-        #   prompt block, so a real card that quotes its originating prompt
-        #   alongside actual content is unaffected.
-        _folds = len(re.findall(r"New task:", desc))
-        _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
-                       (desc or "").strip(), re.S)
-        _prompt_only = ""
-        if _pm:
-            _body = _pm.group(1).strip()
-            _prompt_only = ("harness slash command, not a task"
-                            if _body.startswith("/")
-                            else "captured chat prompt, not a unit of work")
-        _junk = ("journal card ({} folded tasks)".format(_folds) if _folds >= 2
-                 else _prompt_only if _prompt_only
-                 else "looks like a test artifact"
-                 if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
-                              title or "", re.I) else "")
-        if _junk:
-            slog(f"[auto-pickup] {session_name}: skipped {item_id} — {_junk}")
-            _append_board_log(item_id, f"Auto-pickup SKIPPED — {_junk}; needs a human to split or discard it.")
-            return
-        _blob = (title + "\n" + desc).lower()
-        _danger = re.search(r"stash\s+(drop|clear)|rm\s+-[rf]{1,2}\b|push\s+(--force|-f)\b|"
-                            r"reset\s+--hard|git\s+clean\s+-[a-z]*[fd]|drop\s+table|"
-                            r"truncate\s+table|delete\s+from\s+\w+\s*;|--no-preserve-root", _blob)
-        if _danger:
-            if item_id not in _autopickup_danger_flagged:
-                _autopickup_danger_flagged.add(item_id)
-                _append_board_log(item_id, f"Auto-pickup DECLINED — names an irreversible operation "
-                                           f"({_danger.group(0).strip()}); needs a human to dispatch.")
-                slog(f"[auto-pickup] {session_name}: declined {item_id} — irreversible op "
-                     f"'{_danger.group(0).strip()}'")
-                _push_alert("task_pickup", session_name,
-                            f"'{item_id}' was NOT auto-executed: it names an irreversible operation "
-                            f"('{_danger.group(0).strip()}'). Left in todo for you to run manually.")
-            return
         now = int(time.time())
         db.execute("UPDATE issues SET status='doing', updated=? WHERE id=?", (now, item_id))
         _emit_event(session_name, "task.claimed", {"issue": item_id}, source="auto-pickup")
@@ -30315,7 +30336,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.303';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.304';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50624,7 +50645,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.303';
+const CACHE = 'amux-v0.9.304';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
