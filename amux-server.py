@@ -9747,6 +9747,57 @@ def _advance_open_card(session_name: str) -> bool:
         return False
 
 
+def _stamp_evicted_dependents(evicted) -> int:
+    """Before cards leave the board, tell every OPEN card that references them.
+
+    Eviction does not just lose history — an open card waiting on the evicted
+    id would wait forever, and once the id resolves to nothing nobody can tell
+    what the dependency MEANT, so the honest triage outcome "still real,
+    re-point it" becomes unreachable (MO-3049; confirmed in two lanes). The
+    stamp carries the dead id AND its title while the title still exists,
+    lands in the append-only log (desc writes cannot destroy it, AMUX-2112),
+    and strips the structured edge so the autonomy loop unblocks. Prose
+    references keep their text — their semantics belong to the owning lane.
+    evicted: iterable of (id, title). Returns cards stamped."""
+    stamped = 0
+    try:
+        db = get_db()
+        open_rows = db.execute(
+            "SELECT id, depends_on, COALESCE(desc,'') AS d, COALESCE(log,'') AS l "
+            "FROM issues WHERE deleted IS NULL "
+            "AND status NOT IN ('done','verified','discarded')").fetchall()
+        for cid, title in evicted:
+            pat = re.compile(re.escape(cid) + r"(?![0-9])")  # AMUX-2 must not match AMUX-21
+            for r in open_rows:
+                if r["id"] == cid:
+                    continue
+                blob = (r["depends_on"] or "") + "\n" + r["d"] + "\n" + r["l"]
+                if not pat.search(blob):
+                    continue
+                if f"EVICTED-DEPENDENCY: {cid}" in r["l"]:
+                    continue
+                deps = []
+                try:
+                    deps = json.loads(r["depends_on"] or "[]")
+                except Exception:
+                    deps = []
+                if cid in deps:
+                    deps = [x for x in deps if x != cid]
+                    db.execute("UPDATE issues SET depends_on=? WHERE id=?",
+                               (json.dumps(deps) if deps else None, r["id"]))
+                _t = (title or "").strip()
+                _append_board_log(r["id"],
+                    f"EVICTED-DEPENDENCY: {cid}" + (f" — '{_t[:80]}'" if _t else "")
+                    + " left the board (evicted/cleared); a wait on it can never"
+                      " complete. If the work is alive elsewhere, re-point this"
+                      " card; otherwise drop the reference.")
+                stamped += 1
+        db.commit()
+    except Exception as e:
+        slog(f"[board] evicted-dependents stamp failed: {e}")
+    return stamped
+
+
 def _deps_blocking(item) -> list:
     """Card ids in item.depends_on that are still OPEN (deleted/absent do not
     block). This is the edge the autonomy loop traverses: prose like 'BLOCKS
@@ -30462,7 +30513,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.309';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.311';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50771,7 +50822,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.309';
+const CACHE = 'amux-v0.9.311';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54511,13 +54562,18 @@ class CCHandler(BaseHTTPRequestHandler):
             # POST /api/board/clear-done — soft-delete all done issues
             if method == "POST" and path == "/api/board/clear-done":
                 now = int(time.time())
-                done_ids = [r["id"] for r in db.execute(
-                    "SELECT id FROM issues WHERE status = 'done' AND deleted IS NULL"
-                ).fetchall()]
+                done_rows = db.execute(
+                    "SELECT id, title FROM issues WHERE status = 'done' AND deleted IS NULL"
+                ).fetchall()
+                done_ids = [r["id"] for r in done_rows]
                 db.execute(
                     "UPDATE issues SET deleted = ? WHERE status = 'done' AND deleted IS NULL", (now,)
                 )
                 db.commit()
+                # Stamp survivors that referenced the evicted cards (MO-3049).
+                _n = _stamp_evicted_dependents([(r["id"], r["title"]) for r in done_rows])
+                if _n:
+                    slog(f"[board] clear-done: stamped {_n} open card(s) referencing evicted ids")
                 _board_changed()
                 remaining = db.execute(
                     "SELECT COUNT(*) FROM issues WHERE deleted IS NULL"
@@ -55041,8 +55097,10 @@ class CCHandler(BaseHTTPRequestHandler):
 
                 if method == "DELETE":
                     now = int(time.time())
+                    _del_row = db.execute("SELECT title FROM issues WHERE id = ?", (bid,)).fetchone()
                     db.execute("UPDATE issues SET deleted = ? WHERE id = ?", (now, bid))
                     db.commit()
+                    _stamp_evicted_dependents([(bid, (_del_row["title"] if _del_row else ""))])
                     _board_changed()
                     _gcal_sync_bg(bid, deleted=True)
                     return self._json({"ok": True, "deleted": bid})
@@ -60358,12 +60416,57 @@ def _db_maintenance():
         # Skip gh-linked tasks until their GH issue is also closed (checked by tag)
         seven_days_ago = int(time.time()) - 7 * 86400
         now = int(time.time())
+        _evict_rows = conn.execute(
+            "SELECT id, title FROM issues "
+            "WHERE status = 'done' AND deleted IS NULL AND updated < ? "
+            "AND id NOT IN (SELECT issue_id FROM issue_tags WHERE tag LIKE 'gh:%')",
+            (seven_days_ago,),
+        ).fetchall()
         archived = conn.execute(
             "UPDATE issues SET deleted = ? "
             "WHERE status = 'done' AND deleted IS NULL AND updated < ? "
             "AND id NOT IN (SELECT issue_id FROM issue_tags WHERE tag LIKE 'gh:%')",
             (now, seven_days_ago),
         ).rowcount
+        if _evict_rows:
+            _n = _stamp_evicted_dependents([(r["id"], r["title"]) for r in _evict_rows])
+            if _n:
+                slog(f"[cleanup] auto-archive: stamped {_n} open card(s) referencing evicted ids")
+        # Retro-sweep STRUCTURED ghost edges only (MO-3049): depends_on ids
+        # with no row at all — cards evicted before stamping existed. Exact
+        # set, no estimation; prose references stay with their lanes (the 68
+        # -> 15-17 retraction is why nothing here guesses at prose semantics).
+        # Titles are gone, which is the tragedy the stamp now prevents.
+        try:
+            _ghost_stamped = 0
+            for _r in conn.execute(
+                    "SELECT id, depends_on, COALESCE(log,'') AS l FROM issues "
+                    "WHERE deleted IS NULL AND depends_on IS NOT NULL "
+                    "AND status NOT IN ('done','verified','discarded')").fetchall():
+                try:
+                    _deps = json.loads(_r["depends_on"] or "[]")
+                except Exception:
+                    continue
+                _dead = [d for d in _deps
+                         if not conn.execute("SELECT 1 FROM issues WHERE id=?", (d,)).fetchone()]
+                for _d in _dead:
+                    if f"EVICTED-DEPENDENCY: {_d}" in _r["l"]:
+                        continue
+                    _append_board_log(_r["id"],
+                        f"EVICTED-DEPENDENCY: {_d} — id no longer resolves anywhere; it was "
+                        f"evicted before eviction stamping existed, so its meaning is not "
+                        f"recoverable from the board (check the lane's messages/git history "
+                        f"if re-pointing matters). Edge stripped; this card is unblocked.")
+                    _ghost_stamped += 1
+                if _dead:
+                    _keep = [d for d in _deps if d not in _dead]
+                    conn.execute("UPDATE issues SET depends_on=? WHERE id=?",
+                                 (json.dumps(_keep) if _keep else None, _r["id"]))
+            if _ghost_stamped:
+                conn.commit()
+                slog(f"[cleanup] ghost-edge sweep: stamped {_ghost_stamped} dead depends_on reference(s)")
+        except Exception as _e:
+            slog(f"[cleanup] ghost-edge sweep failed: {_e}")
         # Hard-delete tasks soft-deleted >30 days ago
         thirty_days_ago = int(time.time()) - 30 * 86400
         purged = conn.execute(
