@@ -82,6 +82,26 @@ jobs:
             source /etc/amux/gateway.env
             R2_ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
             TEMPLATE=/opt/amux-cloud/docker/docker-compose.template.yml
+            # This step has produced ZERO output on every recent run — no compose
+            # output, none of the per-workspace lines added below it — and
+            # finished in 1.4s while reporting success. Two fixes have now been
+            # shipped INTO a loop that may never iterate. Before any more logic
+            # goes in here, say out loud what the glob actually matched: an empty
+            # glob leaves `user_dir` as the literal pattern, the body runs once,
+            # `port` comes back empty and `continue` skips it silently, which is
+            # indistinguishable from "there were no workspaces".
+            echo "== deploy loop preflight =="
+            echo "  template exists: $([ -f "$TEMPLATE" ] && echo yes || echo NO)"
+            _n=$(ls -d /var/amux/users/*/ 2>/dev/null | wc -l | tr -d ' ')
+            echo "  /var/amux/users/*/ matched: ${_n} dir(s)"
+            if [ "${_n}" = "0" ]; then
+              echo "  LOOP WILL DO NOTHING — what actually exists under /var/amux:"
+              ls -la /var/amux/ 2>&1 | head -10 | sed 's/^/    /'
+              echo "  and where compose files really are:"
+              find / -name docker-compose.yml -path '*amux*' -not -path '*/node_modules/*' 2>/dev/null | head -5 | sed 's/^/    /'
+            else
+              ls -d /var/amux/users/*/ 2>/dev/null | head -3 | sed 's/^/    /'
+            fi
             for user_dir in /var/amux/users/*/; do
               user_id=$(basename "$user_dir")
               compose_file="$user_dir/docker-compose.yml"
