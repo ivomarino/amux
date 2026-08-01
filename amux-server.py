@@ -1185,16 +1185,30 @@ _BU_MUTATING = {"click", "type", "input", "keys", "scroll", "eval", "back",
 # which copies our env. The CLI can win every race; its daemon is ours now.
 _BU_SHIM_DIR = CC_HOME / "bu-shim"
 _BU_SHIM_SRC = (
-    "import os\n"
+    "import os, sys\n"
+    "def _amux_log(msg):\n"
+    "    try:\n"
+    "        open('/tmp/amux-bu-shim.log', 'a').write(msg + chr(10))\n"
+    "    except Exception:\n"
+    "        pass\n"
     "if os.environ.get('AMUX_BU_USER_DATA_DIR'):\n"
     "    try:\n"
     "        import browser_use.skill_cli.utils as _U\n"
     "        _o = _U.get_chrome_profile_path\n"
     "        def _amux_gcpp(profile=None, *a, **k):\n"
-    "            return os.environ['AMUX_BU_USER_DATA_DIR'] if profile is None else _o(profile, *a, **k)\n"
+    "            _r = os.environ['AMUX_BU_USER_DATA_DIR'] if profile is None else _o(profile, *a, **k)\n"
+    "            _amux_log('resolve pid=%s argv0=%s profile=%r -> %s' % (os.getpid(), sys.argv[0:2], profile, _r))\n"
+    "            return _r\n"
     "        _U.get_chrome_profile_path = _amux_gcpp\n"
-    "    except Exception:\n"
-    "        pass\n"
+    "        import browser_use.browser.profile as _BP\n"
+    "        _oc = _BP.BrowserProfile._copy_profile\n"
+    "        def _amux_copy(self):\n"
+    "            _amux_log('copy_profile pid=%s udd=%r pdir=%r' % (os.getpid(), str(self.user_data_dir), str(getattr(self, chr(112)+'rofile_directory', '?'))))\n"
+    "            return _oc(self)\n"
+    "        _BP.BrowserProfile._copy_profile = _amux_copy\n"
+    "        _amux_log('patched pid=%s argv=%s dir=%s' % (os.getpid(), sys.argv[0:2], os.environ['AMUX_BU_USER_DATA_DIR']))\n"
+    "    except Exception as _e:\n"
+    "        _amux_log('PATCH FAILED pid=%s: %r' % (os.getpid(), _e))\n"
 )
 
 def _bu_write_shim():
@@ -30593,7 +30607,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.323';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.325';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51153,7 +51167,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.323';
+const CACHE = 'amux-v0.9.325';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
