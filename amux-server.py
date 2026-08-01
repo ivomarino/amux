@@ -9461,8 +9461,7 @@ _autopickup_danger_flagged: set = set()
 
 
 _autopickup_junk_flagged: set = set()   # card-log SKIPPED note fired once per card (AMUX-2128)
-_decompose_nudge_last: dict = {}        # session -> monotonic ts of last decompose dispatch (AMUX-2131)
-_DECOMPOSE_NUDGE_COOLDOWN = 6 * 3600
+_DECOMPOSE_NUDGE_COOLDOWN = 6 * 3600    # decompose-dispatch cooldown; durably enforced via session_events
 
 
 # IRREVERSIBLE-ACTION GUARD (orch, 2026-07-26): a card can carry careful
@@ -9786,9 +9785,19 @@ def _pickup_next_board_task(session_name: str):
                        if _pickup_junk_reason(c["title"] or "",
                                               (c["desc"] or "") + "\n" + ((c["log"] if "log" in c.keys() else "") or ""))]
             if _shells:
-                _nowm = time.monotonic()
-                if _nowm - _decompose_nudge_last.get(session_name, 0) > _DECOMPOSE_NUDGE_COOLDOWN:
-                    _decompose_nudge_last[session_name] = _nowm
+                # Cooldown must be DURABLE (same reason as the re-claim
+                # cooldown's task.claimed events): the in-memory dict was wiped
+                # by the very first reload after shipping, and the dispatch
+                # re-fired at the same lane within minutes. On a server that
+                # restarts many times a day, an in-memory cooldown is fiction.
+                _recent = get_db().execute(
+                    "SELECT 1 FROM session_events WHERE session=? AND type='pickup.decompose_nudge' "
+                    "AND ts > ? LIMIT 1",
+                    (session_name, time.time() - _DECOMPOSE_NUDGE_COOLDOWN)).fetchone()
+                if not _recent:
+                    _emit_event(session_name, "pickup.decompose_nudge",
+                                {"shells": [c for c, _ in _shells[:8]]},
+                                source="auto-pickup")
                     _lst = "\n".join(f"  {cid} — {t}" for cid, t in _shells[:8])
                     send_text(session_name,
                         f"[amux auto-pickup] Your queue's next {len(_shells)} card(s) are captured "
@@ -30363,7 +30372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.306';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.307';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50672,7 +50681,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.306';
+const CACHE = 'amux-v0.9.307';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
