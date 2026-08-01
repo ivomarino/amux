@@ -24502,6 +24502,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
+        <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this session's live progress, searched to this card">&#x2192; session</button>
     </div>
     <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
@@ -30584,7 +30585,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.318';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.319';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38978,8 +38979,6 @@ let boardEditId = null;
 let boardEditStatus = 'todo';
 let lastBoardJSON = '';
 let lastStatusesJSON = '';
-let boardFilterTag = null;
-let boardFilterSession = null;
 let boardSearchQuery = '';
 // Restore a shared #bq= filter link before the first render (AMUX-2151).
 window.addEventListener('DOMContentLoaded', () => { try { _bfRestoreHash(); _bfRenderChips(); } catch(e) {} });
@@ -41461,38 +41460,29 @@ function renderBoardFilters() {
   const el = document.getElementById('board-filters');
   if (!el) return;
   _boardRenderViews();
-  const allTags = [...new Set(boardItems.flatMap(i => i.tags || []))].sort();
-  const allSessions = [...new Set(boardItems.map(i => i.session).filter(Boolean))].sort();
+  // Curated + query-compiling (Ethan 07:19: chips filtered into an empty set
+  // and machine tags polluted the row). Two fixes with one design rule:
+  // clicking a chip APPENDS tag:x / session:x to the query — the same single
+  // mechanism as the + Filter menu, which bypasses the owner toggle, so a
+  // chip can never show nothing. The row shows only HUMAN-meaning tags with
+  // open cards (machine/namespaced tags — anything with ':' or '@', like
+  // hrsla:someone@x.com — stay reachable via + Filter and typed queries, but
+  // do not earn toolbar real estate), ranked by open-card count, capped.
+  const openItems = boardItems.filter(i => !i.archived && !['done','verified','discarded'].includes(_statusCanon(i.status)));
+  const tagCount = {};
+  openItems.forEach(i => (i.tags || []).forEach(t => {
+    if (t.includes(':') || t.includes('@')) return;
+    tagCount[t] = (tagCount[t] || 0) + 1;
+  }));
+  const topTags = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).slice(0, 12);
   let html = '';
-  if (allTags.length) {
+  if (topTags.length) {
     html += '<span class="board-filter-label">Tag:</span>';
-    allTags.forEach(t => {
-      const active = boardFilterTag === t;
-      html += "<button class='board-filter-chip" + (active ? " active" : "") + "' onclick='toggleBoardTag(" + JSON.stringify(t) + ")'>" + esc(t) + "</button>";
+    topTags.forEach(([t, n]) => {
+      html += "<button class='board-filter-chip' onclick='_bfTarget=\"board\";_bfAppend(" + JSON.stringify('tag:' + t) + ")'>" + esc(t) + " <span style='color:var(--dim)'>" + n + "</span></button>";
     });
-  }
-  if (allSessions.length) {
-    if (allTags.length) html += '<span class="board-filter-sep">|</span>';
-    html += '<span class="board-filter-label">Session:</span>';
-    allSessions.forEach(s => {
-      const active = boardFilterSession === s;
-      html += "<button class='board-filter-chip" + (active ? " active" : "") + "' onclick='toggleBoardSession(" + JSON.stringify(s) + ")'>" + esc(s) + "</button>";
-    });
-  }
-  if (boardFilterTag || boardFilterSession) {
-    html += '<button class="board-filter-chip board-filter-clear" onclick="boardFilterTag=null;boardFilterSession=null;document.getElementById(\'board-search\').value=\'\';boardSearchQuery=\'\';renderBoard()">&#x2715; Clear</button>';
   }
   el.innerHTML = html;
-}
-
-function toggleBoardTag(tag) {
-  boardFilterTag = boardFilterTag === tag ? null : tag;
-  renderBoard();
-}
-
-function toggleBoardSession(session) {
-  boardFilterSession = boardFilterSession === session ? null : session;
-  renderBoard();
 }
 
 function boardDragStart(e, id) {
@@ -41725,8 +41715,7 @@ function renderBoard() {
   const _qActive = !!(boardSearchQuery || '').trim();
   let visible = _qActive ? boardItems.slice()
     : boardItems.filter(i => boardOwnerFilter === 'agent' ? i.owner_type === 'agent' : i.owner_type !== 'agent');
-  if (boardFilterTag) visible = visible.filter(i => (i.tags || []).includes(boardFilterTag));
-  if (boardFilterSession) visible = visible.filter(i => i.session === boardFilterSession);
+
   // Structured query: key:value facets, -negation, quoted phrases, and is:
   // facets derived from live session state. Bare words still substring-match,
   // so the old search behaviour is a strict subset of this.
@@ -42312,6 +42301,19 @@ function openBoardDetail(id) {
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
   _populateSessionSelect('bd-session', draft ? draft.session : (item.session || ''));
+  // One-tap jump from a card to the owning session's live progress
+  // (Ethan 07:19): opens the peek on the terminal, prefilled to search for
+  // this card id so the jump lands where the session last touched it.
+  const goBtn = document.getElementById('bd-goto-session');
+  if (goBtn) {
+    const _sess = (draft ? draft.session : item.session) || '';
+    goBtn.style.display = _sess ? '' : 'none';
+    goBtn.onclick = (e) => {
+      e.stopPropagation();
+      try { closeBoardDetail(); } catch (err) {}
+      openPeek(_sess, { query: item.id });
+    };
+  }
   const dueEl = document.getElementById('bd-due');
   if (dueEl) dueEl.value = draft ? (draft.due || '') : (item.due || '');
   const dueTimeEl = document.getElementById('bd-due-time');
@@ -51143,7 +51145,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.318';
+const CACHE = 'amux-v0.9.319';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
