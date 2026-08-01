@@ -21301,6 +21301,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   /* Board */
+  .bf-menu { position: fixed; z-index: 120; background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); padding: 10px 12px;
+    max-height: 60vh; overflow-y: auto; min-width: 250px; max-width: 330px; }
+  .bf-sheet { left: 0 !important; right: 0; top: auto !important; bottom: 0; max-width: none;
+    border-radius: 16px 16px 0 0; max-height: 70vh; padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+  .bf-sheet-grab { width: 40px; height: 4px; border-radius: 2px; background: var(--border); margin: 2px auto 10px; }
+  .bf-grp { margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .bf-grp:last-child { border-bottom: none; }
+  .bf-grp-label { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 4px 0; }
+  .bf-opt { padding: 8px 8px; border-radius: 6px; font-size: 0.82rem; cursor: pointer; min-height: 28px; }
+  .bf-opt:hover { background: var(--border); }
+  .bf-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 0.74rem;
+    border: 1px solid var(--accent); color: var(--accent); border-radius: 14px; padding: 3px 10px; }
+  .bf-chip-neg { border-color: var(--red); color: var(--red); }
+  .bf-chip-x { cursor: pointer; opacity: 0.7; padding: 2px 2px; }
+  .bf-chip-x:hover { opacity: 1; }
   .board-search-wrap {
     position: relative; margin-bottom: 4px;
   }
@@ -23322,9 +23338,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="board-view" style="display:none;">
   <div class="board-toolbar">
+    <div id="bf-chips" style="display:none;flex-basis:100%;order:3;flex-wrap:wrap;gap:6px;padding-top:6px;"></div>
     <div class="board-search-wrap" style="flex:1;">
-      <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -session:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';renderBoard()">
-      <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';_boardActiveView='';renderBoard()">&#x2715;</button>
+      <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -session:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';_bfSyncHash();renderBoard()">
+      <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';_boardActiveView='';_bfSyncHash();renderBoard()">&#x2715;</button>
+      <button class="btn" id="bf-add" onclick="_bfOpenMenu(event)" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
     </div>
     <button class="btn primary board-new-btn" onclick="openBoardAdd('todo')"><span class="board-new-label">+ New issue</span><span class="board-new-icon">+</span></button>
     <div class="board-owner-toggle">
@@ -30574,7 +30592,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.315';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.316';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38938,6 +38956,8 @@ let lastStatusesJSON = '';
 let boardFilterTag = null;
 let boardFilterSession = null;
 let boardSearchQuery = '';
+// Restore a shared #bq= filter link before the first render (AMUX-2151).
+window.addEventListener('DOMContentLoaded', () => { try { _bfRestoreHash(); _bfRenderChips(); } catch(e) {} });
 let _boardDragId = null;
 let boardViewMode = localStorage.getItem('amux_board_view') || 'session';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
@@ -41040,12 +41060,33 @@ function _bqParse(q) {
 // Duration filters: updated:>7d  created:<3d  updated:>36h
 function _bqAgeMatch(vals, epochSecs) {
   if (!epochSecs) return false;
-  const ageDays = (Date.now() / 1000 - (epochSecs > 1e11 ? epochSecs / 1000 : epochSecs)) / 86400;
+  const ts = epochSecs > 1e11 ? epochSecs / 1000 : epochSecs;
+  const ageDays = (Date.now() / 1000 - ts) / 86400;
+  // Three value forms, comma still means OR like every other key: relative
+  // (<7d, >2w, <36h), absolute day (>2026-07-01, <2026-08-01), and range
+  // literal (2026-07-01..2026-07-31, inclusive) — the filter bar's date
+  // pickers compile to the range form, so the query string stays the single
+  // source of truth (AMUX-2151).
   return vals.some(v => {
-    const m = v.match(/^([<>])(\d+)([dhw])$/);
-    if (!m) return false;
-    const n = parseInt(m[2], 10) * (m[3] === 'h' ? 1 / 24 : m[3] === 'w' ? 7 : 1);
-    return m[1] === '>' ? ageDays > n : ageDays < n;
+    let m = v.match(/^([<>])(\d+)([dhw])$/);
+    if (m) {
+      const n = parseInt(m[2], 10) * (m[3] === 'h' ? 1 / 24 : m[3] === 'w' ? 7 : 1);
+      return m[1] === '>' ? ageDays > n : ageDays < n;
+    }
+    m = v.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+    if (m) {
+      const a = new Date(m[1] + 'T00:00:00').getTime() / 1000;
+      const b = new Date(m[2] + 'T00:00:00').getTime() / 1000;
+      if (isNaN(a) || isNaN(b)) return false;
+      return ts >= a && ts < b + 86400;
+    }
+    m = v.match(/^([<>])(\d{4}-\d{2}-\d{2})$/);
+    if (m) {
+      const d = new Date(m[2] + 'T00:00:00').getTime() / 1000;
+      if (isNaN(d)) return false;
+      return m[1] === '>' ? ts >= d : ts < d + 86400;
+    }
+    return false;
   });
 }
 
@@ -41147,6 +41188,117 @@ function _bqWantsArchived(q) {
 }
 function _bqHideArchived(items, q) {
   return _bqWantsArchived(q) ? items : items.filter(i => !i.archived);
+}
+
+// ── Filter bar (AMUX-2151, Linear-oriented) ────────────────────────────────
+// The UI COMPILES to the existing query language: chips are a parsed render
+// of boardSearchQuery and the menu appends tokens to it. One filter
+// mechanism, one source of truth — the same rule that keeps _bqHideArchived
+// honest. State is mirrored to the URL hash so a filtered view is shareable.
+function _bfSyncHash() {
+  try {
+    const q = (boardSearchQuery || '').trim();
+    const cur = location.hash;
+    const next = q ? '#bq=' + encodeURIComponent(q) : (cur.startsWith('#bq=') ? '' : cur);
+    if (cur !== next) history.replaceState({}, '', location.pathname + (next || ''));
+  } catch (e) {}
+  _bfRenderChips();
+}
+function _bfRestoreHash() {
+  try {
+    if (location.hash.startsWith('#bq=')) {
+      boardSearchQuery = decodeURIComponent(location.hash.slice(4));
+      const inp = document.getElementById('board-search');
+      if (inp) inp.value = boardSearchQuery;
+    }
+  } catch (e) {}
+}
+function _bfRenderChips() {
+  const row = document.getElementById('bf-chips');
+  if (!row) return;
+  let ast;
+  try { ast = _bqParse((boardSearchQuery || '').trim()); } catch (e) { ast = { terms: [], text: [] }; }
+  if (!ast.terms.length) { row.style.display = 'none'; row.innerHTML = ''; return; }
+  row.style.display = 'flex';
+  row.innerHTML = ast.terms.map((t, i) =>
+    '<span class="bf-chip' + (t.neg ? ' bf-chip-neg' : '') + '">'
+    + esc((t.neg ? '-' : '') + t.key + ': ' + t.vals.join(', '))
+    + '<span class="bf-chip-x" onclick="_bfRemoveTerm(' + i + ')" title="Remove filter">\u2715</span></span>'
+  ).join('');
+}
+function _bfRemoveTerm(idx) {
+  const q = (boardSearchQuery || '').trim();
+  const toks = q.split(/\s+/);
+  let seen = -1;
+  const kept = toks.filter(tok => {
+    if (/^-?[a-z_]+:/i.test(tok)) { seen += 1; return seen !== idx; }
+    return true;
+  });
+  boardSearchQuery = kept.join(' ');
+  const inp = document.getElementById('board-search');
+  if (inp) inp.value = boardSearchQuery;
+  _bfSyncHash(); renderBoard();
+}
+function _bfAppend(token) {
+  boardSearchQuery = ((boardSearchQuery || '').trim() + ' ' + token).trim();
+  const inp = document.getElementById('board-search');
+  if (inp) inp.value = boardSearchQuery;
+  _boardActiveView = '';
+  _bfCloseMenu(); _bfSyncHash(); renderBoard();
+}
+function _bfCloseMenu() {
+  const m = document.getElementById('bf-menu');
+  if (m) m.remove();
+  document.removeEventListener('click', _bfOutside, true);
+}
+function _bfOutside(e) {
+  const m = document.getElementById('bf-menu');
+  if (m && !m.contains(e.target)) _bfCloseMenu();
+}
+function _bfOpenMenu(ev) {
+  ev.stopPropagation();
+  _bfCloseMenu();
+  const items = (typeof boardItems !== 'undefined' ? boardItems : []).filter(i => !i.archived);
+  const uniq = a => [...new Set(a.filter(Boolean))].sort();
+  const statuses = uniq(items.map(i => _statusCanon(i.status)));
+  const sessions = uniq(items.map(i => i.session)).slice(0, 40);
+  const types = uniq(items.map(i => i.type || 'code'));
+  const tags = uniq(items.flatMap(i => i.tags || [])).slice(0, 40);
+  const isPreds = ['open', 'working', 'waiting', 'gated', 'rotting', 'orphan', 'overdue', 'pinned', 'folded', 'archived'];
+  const today = new Date(); const iso = d => d.toISOString().slice(0, 10);
+  const grp = (label, entries) => entries.length
+    ? '<div class="bf-grp"><div class="bf-grp-label">' + label + '</div>' + entries.join('') + '</div>' : '';
+  const opt = (label, token) =>
+    '<div class="bf-opt" onclick="_bfAppend(\'' + escJs(token) + '\')">' + esc(label) + '</div>';
+  const dateGrp = key => grp(key.charAt(0).toUpperCase() + key.slice(1), [
+    opt('today', key + ':<1d'), opt('last 7 days', key + ':<7d'), opt('last 30 days', key + ':<30d'),
+    opt('older than 7 days', key + ':>7d'),
+    '<div class="bf-opt" style="display:flex;gap:4px;align-items:center;" onclick="event.stopPropagation()">'
+      + '<input type="date" id="bf-' + key + '-a" style="font-size:0.72rem;max-width:120px;">\u2013'
+      + '<input type="date" id="bf-' + key + '-b" style="font-size:0.72rem;max-width:120px;">'
+      + '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="(function(){'
+      + 'var a=document.getElementById(\'bf-' + key + '-a\').value,b=document.getElementById(\'bf-' + key + '-b\').value;'
+      + 'if(a&&b)_bfAppend(\'' + key + ':\'+a+\'..\'+b);})()">apply</button></div>',
+  ]);
+  const html =
+    grp('Status', statuses.map(v => opt(v, 'status:' + v)))
+    + grp('Type', types.map(v => opt(v, 'type:' + v)))
+    + grp('Tag', tags.map(v => opt(v, 'tag:' + v)))
+    + grp('Session', sessions.map(v => opt(v, 'session:' + v)))
+    + grp('Quick (is:)', isPreds.map(v => opt(v, 'is:' + v)))
+    + dateGrp('updated') + dateGrp('created');
+  const m = document.createElement('div');
+  m.id = 'bf-menu';
+  const mobile = window.innerWidth <= 700;
+  m.className = mobile ? 'bf-menu bf-sheet' : 'bf-menu';
+  m.innerHTML = (mobile ? '<div class="bf-sheet-grab"></div>' : '') + html;
+  document.body.appendChild(m);
+  if (!mobile) {
+    const r = _cssRect(ev.currentTarget || ev.target);
+    m.style.top = (r.bottom + 6) + 'px';
+    m.style.left = Math.max(8, Math.min(r.left, (document.documentElement.clientWidth || innerWidth) - 340)) + 'px';
+  }
+  setTimeout(() => document.addEventListener('click', _bfOutside, true), 0);
 }
 
 function _bqFilter(items, q) {
@@ -50911,7 +51063,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.315';
+const CACHE = 'amux-v0.9.316';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
