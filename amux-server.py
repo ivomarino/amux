@@ -23350,7 +23350,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button id="bo-agent" class="bv-btn" onclick="setBoardOwner('agent')" title="Session issues">Sessions</button>
     </div>
     <div class="board-view-toggle">
-      <button id="bv-session" class="bv-btn" onclick="setBoardView('session')" title="Group by session">&#x25A4;</button>
+      <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
+        <button id="bv-session" class="bv-btn" onclick="setBoardView('session')" title="Group by session">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
   </div>
@@ -24869,11 +24870,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <!-- Same query language as the global board (_bqFilter), so is:rotting /
          status:doing / -tag:x behave identically on both surfaces. Scoped by the
          session filter above, not by a separate code path. -->
-    <div class="board-search-wrap" style="padding:0 10px 6px;">
+    <div id="bf-chips-peek" style="display:none;flex-wrap:wrap;gap:6px;padding:0 10px 6px;"></div>
+    <div class="board-search-wrap" style="padding:0 10px 6px;display:flex;gap:6px;">
+      <button class="btn" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
       <input id="peek-issues-search" class="search-input" type="text"
              placeholder="Search or filter: is:rotting, status:doing, -session:none"
              autocapitalize="off" autocorrect="off" spellcheck="false"
-             oninput="_peekIssuesQuery=this.value;renderPeekIssues()">
+             oninput="_peekIssuesQuery=this.value;_bfTarget='peek';_bfRenderChips();renderPeekIssues()">
       <button class="search-clear" style="right:16px;"
               onclick="document.getElementById('peek-issues-search').value='';_peekIssuesQuery='';renderPeekIssues()">&#x2715;</button>
     </div>
@@ -30212,20 +30215,9 @@ function renderPeekIssues() {
     return;
   }
 
-  list.innerHTML = items.map(item => {
-    const sty = statusStyle(item.status || 'todo');
-    const badge = '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.7rem;padding:1px 6px;border-radius:10px;">' + esc(item.status || 'todo') + '</span>';
-    const due = item.due ? '<span class="peek-issue-due">' + esc(item.due) + '</span>' : '';
-    // In all-sessions scope, tag each row with its owning session for awareness.
-    const owner = (allScope && item.session && item.session !== peekSession)
-      ? '<span class="peek-issue-owner" style="font-size:0.68rem;color:var(--accent);background:rgba(88,166,255,0.12);border-radius:8px;padding:1px 6px;margin-right:4px;">' + esc(item.session) + '</span>'
-      : '';
-    return '<div class="peek-issue-item" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
-      '<span class="peek-issue-key">' + esc(item.id) + '</span>' +
-      '<span class="peek-issue-title">' + owner + esc(item.title) + '</span>' +
-      '<span class="peek-issue-meta">' + badge + due + '</span>' +
-      '</div>';
-  }).join('');
+  // Shared renderer with the global List view (AMUX-2152/parity).
+  list.innerHTML = items.map(item => _issueRowHTML(item,
+    { showOwner: allScope && item.session && item.session !== peekSession })).join('');
 }
 
 function _renderPeekIssuesKanban(items, list) {
@@ -30592,7 +30584,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.317';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.318';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41247,10 +41239,12 @@ function _bfRestoreHash() {
   } catch (e) {}
 }
 function _bfRenderChips() {
-  const row = document.getElementById('bf-chips');
+  const peek = _bfTarget === 'peek';
+  const row = document.getElementById(peek ? 'bf-chips-peek' : 'bf-chips');
   if (!row) return;
   let ast;
-  try { ast = _bqParse((boardSearchQuery || '').trim()); } catch (e) { ast = { terms: [], text: [] }; }
+  const _q = peek ? (_peekIssuesQuery || '') : (boardSearchQuery || '');
+  try { ast = _bqParse(_q.trim()); } catch (e) { ast = { terms: [], text: [] }; }
   if (!ast.terms.length) { row.style.display = 'none'; row.innerHTML = ''; return; }
   row.style.display = 'flex';
   row.innerHTML = ast.terms.map((t, i) =>
@@ -41260,19 +41254,38 @@ function _bfRenderChips() {
   ).join('');
 }
 function _bfRemoveTerm(idx) {
-  const q = (boardSearchQuery || '').trim();
+  const peek = _bfTarget === 'peek';
+  const q = (peek ? (_peekIssuesQuery || '') : (boardSearchQuery || '')).trim();
   const toks = q.split(/\s+/);
   let seen = -1;
   const kept = toks.filter(tok => {
     if (/^-?[a-z_]+:/i.test(tok)) { seen += 1; return seen !== idx; }
     return true;
   });
-  boardSearchQuery = kept.join(' ');
-  const inp = document.getElementById('board-search');
-  if (inp) inp.value = boardSearchQuery;
-  _bfSyncHash(); renderBoard();
+  const next = kept.join(' ');
+  if (peek) {
+    _peekIssuesQuery = next;
+    const pinp = document.getElementById('peek-issues-search');
+    if (pinp) pinp.value = next;
+    _bfRenderChips(); renderPeekIssues();
+  } else {
+    boardSearchQuery = next;
+    const inp = document.getElementById('board-search');
+    if (inp) inp.value = next;
+    _bfSyncHash(); renderBoard();
+  }
 }
+// Which surface the filter menu writes to: the global board (default) or the
+// peek Board tab — same menu, same chips, two query targets (parity, 07:17).
+let _bfTarget = 'board';
 function _bfAppend(token) {
+  if (_bfTarget === 'peek') {
+    _peekIssuesQuery = ((_peekIssuesQuery || '').trim() + ' ' + token).trim();
+    const pinp = document.getElementById('peek-issues-search');
+    if (pinp) pinp.value = _peekIssuesQuery;
+    _bfCloseMenu(); _bfRenderChips(); renderPeekIssues();
+    return;
+  }
   boardSearchQuery = ((boardSearchQuery || '').trim() + ' ' + token).trim();
   const inp = document.getElementById('board-search');
   if (inp) inp.value = boardSearchQuery;
@@ -41288,8 +41301,9 @@ function _bfOutside(e) {
   const m = document.getElementById('bf-menu');
   if (m && !m.contains(e.target)) _bfCloseMenu();
 }
-function _bfOpenMenu(ev) {
+function _bfOpenMenu(ev, target) {
   ev.stopPropagation();
+  _bfTarget = target === 'peek' ? 'peek' : 'board';
   _bfCloseMenu();
   const items = (typeof boardItems !== 'undefined' ? boardItems : []).filter(i => !i.archived);
   const uniq = a => [...new Set(a.filter(Boolean))].sort();
@@ -41542,6 +41556,27 @@ function toggleSessionGroup(name) {
   renderBoard();
 }
 
+// Shared Linear-dense issue row (AMUX-2152): status dot · id · one-line
+// title · owner chip · due · status badge, 44px tap target. ONE renderer for
+// the global List view and the peek Board tab, so the two surfaces cannot
+// drift (Ethan 07:17: same UX on both).
+function _issueRowHTML(item, opts) {
+  opts = opts || {};
+  const sty = statusStyle(item.status || 'todo');
+  const due = item.due ? '<span class="peek-issue-due">' + esc(item.due) + '</span>' : '';
+  const owner = (opts.showOwner && item.session)
+    ? '<span class="peek-issue-owner" style="font-size:0.68rem;color:var(--accent);background:rgba(88,166,255,0.12);border-radius:8px;padding:1px 6px;margin-right:4px;">' + esc(item.session) + '</span>'
+    : '';
+  const badge = '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.7rem;padding:1px 6px;border-radius:10px;">' + esc(item.status || 'todo') + '</span>';
+  const dot = '<span class="board-status-dot" style="background:' + sty.dot + ';flex:0 0 auto;"></span>';
+  return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
+    dot +
+    '<span class="peek-issue-key">' + esc(item.id) + '</span>' +
+    '<span class="peek-issue-title">' + owner + esc(item.title) + '</span>' +
+    '<span class="peek-issue-meta">' + badge + due + '</span>' +
+    '</div>';
+}
+
 function _renderBoardCard(item) {
   const tags = item.tags || [];
   const firstLine = (item.desc || '').split('\n')[0].slice(0, 80);
@@ -41673,8 +41708,10 @@ function renderBoard() {
   // Update view toggle buttons
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
+  var bvL = document.getElementById('bv-list');
   if (bvS) bvS.classList.toggle('active', boardViewMode === 'session');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
+  if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
   var boH = document.getElementById('bo-human');
   var boA = document.getElementById('bo-agent');
   if (boH) boH.classList.toggle('active', boardOwnerFilter === 'human');
@@ -41696,6 +41733,28 @@ function renderBoard() {
   visible = _bqHideArchived(visible, boardSearchQuery);
   visible = _bqFilter(visible, boardSearchQuery);
 
+  if (boardViewMode === 'list') {
+    // Linear-dense List view (AMUX-2152): grouped by status with counts,
+    // shared row renderer with the peek Board tab.
+    container.classList.remove('board-columns');
+    container.classList.add('board-list-mode');
+    const order = ['doing', 'review', 'todo', 'backlog', 'done', 'verified', 'discarded'];
+    const groups = {};
+    visible.forEach(i => { const st = _statusCanon(i.status || 'todo'); (groups[st] = groups[st] || []).push(i); });
+    let html = '';
+    order.concat(Object.keys(groups).filter(k => !order.includes(k))).forEach(st => {
+      const g = groups[st];
+      if (!g || !g.length) return;
+      const sty = statusStyle(st);
+      html += '<div class="board-list-group-head" style="display:flex;align-items:center;gap:8px;padding:10px 6px 4px;font-size:0.74rem;font-weight:600;color:' + sty.color + ';text-transform:uppercase;letter-spacing:0.05em;">'
+        + '<span class="board-status-dot" style="background:' + sty.dot + '"></span>' + esc(st)
+        + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
+      html += g.map(i => _issueRowHTML(i, { showOwner: true })).join('');
+    });
+    container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
+    return;
+  }
+  container.classList.remove('board-list-mode');
   if (boardViewMode === 'session') {
     container.classList.remove('board-columns');
     container.classList.add('board-columns-list');
@@ -51084,7 +51143,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.317';
+const CACHE = 'amux-v0.9.318';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
