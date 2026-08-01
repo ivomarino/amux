@@ -120,6 +120,12 @@ every function called, and inspect the callers.
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
 
+Verification habits do not transfer between operands. A session that learned to
+re-read STATUS after the exit-code bug kept re-reading status while its DESC
+writes were being silently destroyed twenty times over (desc_append, AMUX-2161)
+— the habit gave the feeling of rigour while pointing at the wrong field. Verify
+the operand you just wrote, not the one that burned you last time.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction
