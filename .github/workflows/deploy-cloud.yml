@@ -105,7 +105,15 @@ jobs:
             for user_dir in /var/amux/users/*/; do
               user_id=$(basename "$user_dir")
               compose_file="$user_dir/docker-compose.yml"
-              port=$(grep -A1 "ports:" "$compose_file" 2>/dev/null | grep -oP "[0-9]{4,}(?=:8822)")
+              # Search the WHOLE file for the host port bound to :8822. This used
+              # to be `grep -A1 "ports:"`, which assumed the mapping sits on the
+              # very next line — until the loopback-only security fix put a
+              # four-line comment there. From that commit onward the parse read
+              # the comment, found no port, and every workspace hit the silent
+              # `continue` below: 19 of 19 skipped, compose never regenerated,
+              # `docker compose up -d` never run, and the step still exited 0.
+              # A security fix disabled the deploy loop and nothing said so.
+              port=$(grep -oP "[0-9]{4,}(?=:8822)" "$compose_file" 2>/dev/null | head -1)
               if [ -z "$port" ]; then
                 # Was a silent `continue`. The glob matches 19 workspaces and the
                 # step still produced no output in 0.2s, which means every one of
