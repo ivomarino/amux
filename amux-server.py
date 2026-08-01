@@ -30592,7 +30592,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.316';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.317';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -34030,7 +34030,7 @@ async function _loadCmdHistoryFromServer() {
       return;
     }
     // Server is authoritative — merge and deduplicate
-    _cmdHistory = rows.reverse().map(r => ({ text: r.text, type: r.type, session: r.session, time: r.ts, id: r.id, origin: r.origin || '' }));
+    _cmdHistory = rows.reverse().map(r => ({ text: r.text, type: r.type, session: r.session, time: r.ts, id: r.id, origin: r.origin || '', card_id: r.card_id || '' }));
     localStorage.setItem('amux_cmd_history', JSON.stringify(_cmdHistory));
     _cmdHistoryServerLoaded = true;
   } catch(e) {}
@@ -34277,6 +34277,39 @@ const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux'];
 // Back-compat shim: _msgOrigin was the old 4-way classifier. Anything still
 // calling it gets the canonical kind.
 function _msgOrigin(e) { return _msgKind(e); }
+// Card-id mentions in message text become links, and a capture-joined
+// message carries its live card chip — ONE definition for both the global
+// Messages view and the peek Messages tab (AMUX-2153). Only ids that
+// resolve on the live board linkify: the pattern alone would catch
+// UTF-8-shaped tokens, and a link to nothing is worse than plain text.
+function _linkifyCardIds(safeHtml) {
+  try {
+    if (typeof boardItems === 'undefined' || !Array.isArray(boardItems) || !boardItems.length) return safeHtml;
+    const ids = new Set(boardItems.map(i => i.id));
+    return safeHtml.replace(/\b([A-Z]{2,8}-\d{1,6})\b/g, (m, id) =>
+      ids.has(id)
+        ? '<a href="javascript:void(0)" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + id + '\'), 250);" style="color:var(--accent);text-decoration:underline dotted;">' + id + '</a>'
+        : m);
+  } catch (e) { return safeHtml; }
+}
+function _msgCardChip(cardId) {
+  if (!cardId) return '';
+  const c = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
+    ? boardItems.find(i => i.id === cardId) : null;
+  const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
+    : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
+    : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
+  const st = c ? (c.status || 'todo') : '';
+  const undec = c && ((c.log || '').indexOf('capture: session prompt') !== -1) && st === 'todo';
+  const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
+  return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
+    + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
+    + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? stC(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
+    + 'color:' + (c ? stC(st) : 'var(--dim)') + ';">\u2192 ' + esc(cardId)
+    + (c ? ' \u00B7 ' + esc(undec ? 'captured, not yet decomposed' : st) : ' \u00B7 gone')
+    + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
+}
+
 function _cmdHistItemHTML(e) {
   const text = typeof e === 'string' ? e : e.text;
   const session = typeof e === 'string' ? '' : (e.session || '');
@@ -34295,11 +34328,11 @@ function _cmdHistItemHTML(e) {
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;border-left:3px solid ${km.color};">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
-  const meta = tag + sessTag + tsTag;
+  const meta = tag + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || peekSession || '').replace(/'/g,'');
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
   const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
-  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${safe}</div>${copyBtn}${locate}</div>`;
+  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_linkifyCardIds(safe)}</div>${copyBtn}${locate}</div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -47918,19 +47951,7 @@ function _messagesRender() {
       burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(m.ts) + '</div>';
     }
     _prevTs = m.ts;
-    let cardChip = '';
-    if (m.card_id) {
-      const c = _cardById[m.card_id];
-      const st = c ? (c.status || 'todo') : '';
-      const undecomposed = c && ((c.log || '').indexOf('capture: session prompt') !== -1) && st === 'todo';
-      const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
-      cardChip = '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(m.card_id) + '\'), 250);" '
-        + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
-        + 'style="cursor:pointer;font-size:0.68rem;border:1px solid ' + (c ? _stColor(st) : 'var(--border)') + ';border-radius:6px;padding:1px 7px;white-space:nowrap;'
-        + 'color:' + (c ? _stColor(st) : 'var(--dim)') + ';">\u2192 ' + esc(m.card_id)
-        + (c ? ' \u00B7 ' + esc(undecomposed ? 'captured, not yet decomposed' : st) : ' \u00B7 gone')
-        + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
-    }
+    const cardChip = _msgCardChip(m.card_id || '');   // one chip definition (AMUX-2153)
     // Was queued-only, so a session or scheduled message carried no marker at
     // all here. Same badge the other two surfaces show.
     const _k = _msgKind(m), _km = _MSG_KIND[_k] || _MSG_KIND.human;
@@ -47944,7 +47965,7 @@ function _messagesRender() {
           (sess ? '<span class="msg-sess">' + esc(sess) + '</span>' : '<span class="msg-sess" style="color:var(--dim);">(unknown)</span>') +
           '<span class="msg-ts">' + _msgsFmtTs(m.ts) + '</span>' + tag + cardChip +
         '</div>' +
-        '<div class="msg-text">' + esc(m.text || '') + '</div>' +
+        '<div class="msg-text">' + _linkifyCardIds(esc(m.text || '')) + '</div>' +
       '</div>' +
       '<button class="btn msg-copy" onclick="event.stopPropagation();_msgCopyBtn(this,\'' + enc + '\')" title="Copy message text">&#x1F4CB;</button>' +
       '<button class="btn msg-locate" onclick="event.stopPropagation();_msgLocate(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open the peek and scroll to where this was sent">&#x2316; Locate</button>' +
@@ -51063,7 +51084,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.316';
+const CACHE = 'amux-v0.9.317';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
