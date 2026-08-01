@@ -30574,7 +30574,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.314';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.315';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50911,7 +50911,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.314';
+const CACHE = 'amux-v0.9.315';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55009,9 +55009,25 @@ class CCHandler(BaseHTTPRequestHandler):
                         wd = _session_work_dir(eff_session) if eff_session else None
                         if wd:
                             dirty = _session_dirty_files(eff_session, wd)
-                            # Don't block on dirt we can't attribute: if a peer is
-                            # actively working the same checkout, the uncommitted
-                            # files may be theirs, not this task's.
+                            # Per-FILE attribution first (AMUX-2145): in a
+                            # many-cotenant checkout, IDLE peers' dirt used to
+                            # block every verify here, and the 409's own text
+                            # prescribed force — so honest verifications were
+                            # recorded as full-gate bypasses (backend on
+                            # BACKE-3024, the only force of the night, HAD its
+                            # prod evidence on the card). Same discrimination
+                            # the commit guard already uses: dirt edited by a
+                            # DIFFERENT session is not this task's to commit.
+                            if dirty:
+                                try:
+                                    _att = _staged_guard_check(eff_session, wd, dirty)
+                                    _foreign = set(_att.get("foreign") or [])
+                                    if _foreign:
+                                        dirty = [f for f in dirty if f not in _foreign]
+                                except Exception:
+                                    pass
+                            # Blanket fallback for UNATTRIBUTED dirt: a peer
+                            # actively working the same checkout may own it.
                             if dirty and _checkout_busy_cotenant(eff_session, wd):
                                 dirty = []
                             if dirty:
@@ -55086,6 +55102,14 @@ class CCHandler(BaseHTTPRequestHandler):
                                           "to": new_status,
                                           "type": gate_item.get("type") or "code",
                                           "bypassed_gate": eff_gate,
+                                          # Discriminator (AMUX-2145): a force
+                                          # WITH honest acks (escaping only the
+                                          # dirt check) reads very differently
+                                          # from a naked bypass — record which
+                                          # this was, or the ledger overstates.
+                                          "acks_provided": (body.get("gate_checked")
+                                                            if isinstance(body.get("gate_checked"), list)
+                                                            else bool(body.get("gate_ack"))),
                                           "title": (gate_item.get("title") or "")[:120]})
                             slog(f"[board] GATE FORCED {bid} -> {new_status} "
                                  f"(bypassed {len(eff_gate)} criteria)")
