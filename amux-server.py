@@ -30513,7 +30513,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.311';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.312';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50822,7 +50822,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.311';
+const CACHE = 'amux-v0.9.312';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54691,6 +54691,26 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json({"tag": tag, "total": total, "done": done, "complete": total > 0 and done == total})
 
             # POST /api/board/<id>/claim — atomic task claim for multi-agent coordination
+            # GET /api/board/<id>/history — the mutation audit, readable where
+            # the consumer already looks (AMUX-2141; ethos #4 second layer: a
+            # record in a store nobody opens is the same failure as no record).
+            hist_m = re.match(r"^/api/board/([A-Za-z0-9_-]+)/history$", path)
+            if hist_m and method == "GET":
+                _hid = hist_m.group(1)
+                _rows = db.execute(
+                    "SELECT ts, actor, action, detail, before, ok FROM interaction_log "
+                    "WHERE kind='board' AND target=? ORDER BY ts DESC LIMIT 200",
+                    (_hid,)).fetchall()
+                def _j(v):
+                    try:
+                        return json.loads(v) if isinstance(v, str) and v else v
+                    except Exception:
+                        return v
+                return self._json({"id": _hid, "history": [
+                    {"ts": r["ts"], "actor": r["actor"], "action": r["action"],
+                     "changed": _j(r["detail"]), "before": _j(r["before"]),
+                     "ok": bool(r["ok"])} for r in _rows]})
+
             claim_m = re.match(r"^/api/board/([A-Za-z0-9_-]+)/claim$", path)
             if claim_m and method == "POST":
                 bid = claim_m.group(1)
@@ -54784,6 +54804,11 @@ class CCHandler(BaseHTTPRequestHandler):
                         "SELECT session, status, owner_type FROM issues WHERE id = ?", (bid,)
                     ).fetchone()
                     prior_session = prior["session"] if prior else None
+                    # Full prior item for the mutation audit (AMUX-2141): the
+                    # ledger held only commit_attached and gate_force, so a
+                    # PATCH that destroyed a 2112-char desc left no recovery
+                    # path. before-values make the next MHC-267 recoverable.
+                    _audit_prior = _item_by_id(bid) or {}
                     # ── One-doing-per-session soft cap (AMUX-1707) ──────────────
                     # `doing` is only meaningful if it's HARD TO HOLD. Taking a 2nd
                     # doing item is how 164 of them accumulated. Soft by design:
@@ -55050,6 +55075,23 @@ class CCHandler(BaseHTTPRequestHandler):
                         pass
                     try:
                         updated_item = _item_by_id(bid)
+                        try:
+                            _AUDIT_FIELDS = ("title", "desc", "status", "session", "shepherd",
+                                             "type", "owner_type", "reviewer", "depends_on",
+                                             "due", "due_time", "pinned")
+                            _chg = {k: updated_item.get(k) for k in _AUDIT_FIELDS
+                                    if k in body and _audit_prior.get(k) != updated_item.get(k)}
+                            if _chg:
+                                _ilog("board", "patch",
+                                      actor=(self.headers.get("X-Amux-Session", "")
+                                             or self.headers.get("X-Amux-User-Email", "")
+                                             or "unattributed"),
+                                      target=bid,
+                                      detail=_chg,
+                                      before={k: _audit_prior.get(k) for k in _chg},
+                                      ok=True)
+                        except Exception as _ae:
+                            slog(f"[board] patch audit failed for {bid}: {_ae}")
                     except Exception:
                         updated_item = None
                     if not updated_item:
