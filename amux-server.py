@@ -9496,6 +9496,12 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
                 (item_id, title, f"**Prompt:** {prompt_text[:300]}", session_name, now, now),
             )
             db.commit()
+            # Durable capture marker (amux-cloud finding, 2026-08-01): the
+            # not-a-task guard used to regex the DESC for '**Prompt:**', so
+            # annotating a spurious card ("NOT A TASK — ...") REMOVED the
+            # marker and re-armed pickup forever — the honest act broke the
+            # protection. The log survives every desc rewrite (AMUX-2112).
+            _append_board_log(item_id, "capture: session prompt")
             _board_changed()
             slog(f"[board] {session_name}: new task -> {item_id} (queued alongside {existing['id']})")
             return
@@ -9508,6 +9514,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             (item_id, title, f"**Prompt:** {prompt_text[:300]}", session_name, now, now),
         )
         db.commit()
+        _append_board_log(item_id, "capture: session prompt")  # durable marker, see above
         _board_changed()
     except Exception as e:
         print(f"[board] auto-create failed for {session_name}: {e}", flush=True)
@@ -9609,6 +9616,12 @@ def _pickup_junk_reason(title: str, desc: str) -> str:
     Journals (>=2 folds), captured-prompt shells, probe/test artifacts —
     the NOT-A-TASK guard reasons documented at the call site."""
     _folds = len(re.findall(r"New task:", desc))
+    # Durable marker first: callers pass desc+log as one blob, and the log
+    # copy of this string survives any desc rewrite — annotating a spurious
+    # card no longer re-arms it (the desc regex stays as the fallback for
+    # cards captured before the marker existed).
+    if "capture: session prompt" in desc and _folds < 2:
+        return "captured chat prompt, not a unit of work"
     _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
                    (desc or "").strip(), re.S)
     _prompt_only = ""
@@ -30532,7 +30545,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.312';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.313';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50841,7 +50854,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.312';
+const CACHE = 'amux-v0.9.313';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
