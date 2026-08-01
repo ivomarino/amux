@@ -2069,6 +2069,135 @@ def _bu_wait_for_exit(profile: str, timeout_s: float = 8.0) -> dict:
     return out
 
 
+# ── v3 profile driver (AMUX-2159): amux owns the browser process ───────────
+# Five instrument layers proved the CLI+daemon path cannot be made
+# profile-true from outside on browser_use 0.12.2 (the launch BrowserProfile
+# does not descend from any patched instance). The driver removes every
+# intermediary: ONE Playwright persistent context opened directly on the
+# amux profile store — no copy, so reads AND writes persist, and the
+# desktop-Chrome lock is irrelevant because the store is not the real Chrome
+# dir. JSON-lines REPL, one process per amux browser session. The CLI path
+# remains for non-profile modes. Acceptance is the seeded-from-source ROUND
+# TRIP (amux-cloud's contract): dir equality (profile_verified) is a
+# tripwire, never a verdict.
+_BU_DRIVER_SRC = r"""
+import asyncio, base64, json, sys
+async def main():
+    udir, headless = sys.argv[1], sys.argv[2] == "1"
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    ctx = await pw.chromium.launch_persistent_context(
+        udir, headless=headless, ignore_https_errors=True, viewport={"width": 1280, "height": 900})
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    print(json.dumps({"ready": True, "user_data_dir": udir}), flush=True)
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        rid, verb = req.get("id"), req.get("verb")
+        out = {"id": rid, "ok": True}
+        try:
+            if verb == "open":
+                await page.goto(req["url"], wait_until="domcontentloaded", timeout=45000)
+                out.update(url=page.url, title=await page.title())
+            elif verb == "state":
+                txt = await page.evaluate("document.body ? document.body.innerText.slice(0, 4000) : ''")
+                out.update(url=page.url, title=await page.title(), text=txt)
+            elif verb == "screenshot":
+                img = await page.screenshot(full_page=False)
+                out.update(b64=base64.b64encode(img).decode())
+            elif verb == "click":
+                await page.mouse.click(float(req["x"]), float(req["y"]))
+            elif verb == "type":
+                await page.keyboard.type(str(req.get("text", "")), delay=20)
+            elif verb == "keys":
+                await page.keyboard.press(str(req.get("key", "Enter")))
+            elif verb == "eval":
+                out.update(value=await page.evaluate(str(req.get("js", ""))))
+            elif verb == "cookies":
+                out.update(cookies=await ctx.cookies())
+            elif verb == "set_cookie":
+                await ctx.add_cookies([req["cookie"]])
+            elif verb == "close":
+                await ctx.close()
+                await pw.stop()
+                print(json.dumps({"id": rid, "ok": True, "closed": True}), flush=True)
+                return
+            else:
+                out = {"id": rid, "ok": False, "error": "unknown verb: %s" % verb}
+        except Exception as e:
+            out = {"id": rid, "ok": False, "error": str(e)[:300]}
+        print(json.dumps(out), flush=True)
+asyncio.run(main())
+"""
+
+_bu_drivers: dict = {}          # session -> {proc, profile, udir}
+_bu_driver_lock = threading.Lock()
+
+def _bu_driver_stop(session: str):
+    d = _bu_drivers.pop(session, None)
+    if not d:
+        return
+    try:
+        d["proc"].stdin.write('{"id":"x","verb":"close"}\n')
+        d["proc"].stdin.flush()
+        d["proc"].wait(timeout=8)
+    except Exception:
+        try:
+            d["proc"].kill()
+        except Exception:
+            pass
+
+def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None = None,
+                    timeout_s: int = 45) -> dict:
+    """Run a verb against the profile-true driver, spawning it on demand.
+    Returns {ok, ...} or {error}. Serialized per session."""
+    with _bu_driver_lock:
+        d = _bu_drivers.get(session)
+        if d and (d["profile"] != profile or d["proc"].poll() is not None):
+            _bu_driver_stop(session)
+            d = None
+        if not d:
+            udir, _pdir = _bu_profile_launch_target(profile)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _BU_DRIVER_SRC, str(udir), "1"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True)
+            ready = proc.stdout.readline()
+            try:
+                if not json.loads(ready or "{}").get("ready"):
+                    raise ValueError(ready[:200])
+            except Exception as e:
+                try: proc.kill()
+                except Exception: pass
+                return {"error": f"driver failed to start: {e}"}
+            d = {"proc": proc, "profile": profile, "udir": str(udir)}
+            _bu_drivers[session] = d
+            slog(f"[browser] v3 driver up session={session} profile={profile!r} store={udir}")
+        req = dict(params or {})
+        req.update(id="r", verb=verb)
+        try:
+            d["proc"].stdin.write(json.dumps(req) + "\n")
+            d["proc"].stdin.flush()
+            import select as _select
+            r, _, _ = _select.select([d["proc"].stdout], [], [], timeout_s)
+            if not r:
+                return {"error": "driver timeout"}
+            line = d["proc"].stdout.readline()
+            res = json.loads(line or "{}")
+            if res.get("closed"):
+                _bu_drivers.pop(session, None)
+            return res
+        except Exception as e:
+            _bu_driver_stop(session)
+            return {"error": f"driver io: {e}"}
+
+
 def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
              fresh: bool = False, timeout_s: int = 30) -> dict:
     """Open a URL under the correct profile.
@@ -30607,7 +30736,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.325';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.326';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51167,7 +51296,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.325';
+const CACHE = 'amux-v0.9.326';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
