@@ -30617,7 +30617,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.321';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.322';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51177,7 +51177,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.321';
+const CACHE = 'amux-v0.9.322';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53085,6 +53085,7 @@ class CCHandler(BaseHTTPRequestHandler):
             statuses = {st.get("id"): (st.get("gate") or [])
                         for st in _load_board_statuses()}
             return self._json({
+                "desc_append": "PATCH {desc_append: \"text\"} or {desc: \"text\", desc_append: true} appends to the existing desc instead of replacing it. Plain {desc: ...} REPLACES — pair it with expect_rev, and remember system history lives in the append-only log, not desc.",
                 "concurrency": {
                     "rev": "Monotonic revision on every item; bumps on each PATCH and system log-append.",
                     "read": "GET /api/board/<id> returns rev (and ETag W/\"<id>-<rev>\"); the list GET includes rev per item.",
@@ -55238,6 +55239,24 @@ class CCHandler(BaseHTTPRequestHandler):
                     # PATCH that destroyed a 2112-char desc left no recovery
                     # path. before-values make the next MHC-267 recoverable.
                     _audit_prior = _item_by_id(bid) or {}
+                    # desc_append is HONOURED (homepage-claude, 2026-08-01):
+                    # the field was accepted, ignored, and the destructive
+                    # replace ran anyway — 200 at the call site, ~20 silent
+                    # wipes in one day, nine cards rebuilt from /history.
+                    # Silently ignoring an unknown field while performing a
+                    # destructive default is the worst option; the obvious
+                    # guess now simply works. Both natural shapes:
+                    #   {desc_append: "text"}            -> old + "\n" + text
+                    #   {desc: "text", desc_append: true} -> old + "\n" + text
+                    _da = body.get("desc_append")
+                    if _da is not None:
+                        _new_txt = _da if isinstance(_da, str) else (body.get("desc") or "")
+                        if isinstance(_da, bool) and not _da:
+                            pass  # explicit false = plain replace semantics
+                        elif _new_txt:
+                            _old_desc = (_audit_prior.get("desc") or "").rstrip()
+                            body["desc"] = (_old_desc + "\n" + _new_txt).strip()
+                        body.pop("desc_append", None)
                     # ── One-doing-per-session soft cap (AMUX-1707) ──────────────
                     # `doing` is only meaningful if it's HARD TO HOLD. Taking a 2nd
                     # doing item is how 164 of them accumulated. Soft by design:
