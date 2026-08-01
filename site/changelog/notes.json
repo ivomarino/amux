@@ -1,5 +1,50 @@
 [
   {
+    "hash": "cee2e62986a34d41a69afb738cdb58e941987ab8",
+    "short": "cee2e62",
+    "title": "Workspace file browser — read any file or directory in a session's workspace from the dashboard",
+    "date": "2026-08-01",
+    "type": "feat",
+    "tags": ["files", "workspace", "api", "dashboard"],
+    "description": "Two new endpoints — GET /api/fs/read and /api/fs/list — let you read any file or list any directory inside a session's registered workspace directly from the amux dashboard or API. Browse source files, check generated outputs, read logs, or inspect CLAUDE.md configuration without leaving the dashboard or opening a terminal. The endpoints respect the workspace root, so agents cannot traverse outside their registered directory."
+  },
+  {
+    "hash": "34cca015a64bd801b521e7bf8208d52d37c5572d",
+    "short": "34cca01",
+    "title": "Burst view — see exactly what work was done in response to a message",
+    "date": "2026-08-01",
+    "type": "feat",
+    "tags": ["messages", "board", "visibility", "workflow"],
+    "description": "The Messages tab now shows which board card(s) were created or updated in response to each message you sent — a direct answer to 'what happened to what I asked.' Cards spawned by a prompt appear inline next to the message in a burst view. This closes the loop between instruction and outcome: instead of hunting through board history, you see the causal chain from your words to the agent's work in one place."
+  },
+  {
+    "hash": "25ccf95996fc8d952179e6317f6a9b817408c0c0",
+    "short": "25ccf95",
+    "title": "Full board audit trail — every card edit now records before-values and is readable via API",
+    "date": "2026-08-01",
+    "type": "feat",
+    "tags": ["board", "audit", "history", "transparency"],
+    "description": "Every PATCH to a board card now stores the before-values alongside the change, creating an immutable audit trail in amux.db. Read a card's full edit history via GET /api/board/<id>/history — see every status transition, description update, and dependency change with timestamps and the session that made it. Useful for post-mortems, verifying that a gate was honestly satisfied, and reconstructing what a card looked like at any point in time."
+  },
+  {
+    "hash": "0ae5070fd87434ea90d27ba50e50e7b61b00cbb5",
+    "short": "0ae5070",
+    "title": "Autostart env write fixed — workspace settings now persist across container restarts",
+    "date": "2026-08-01",
+    "type": "fix",
+    "tags": ["deploy", "cloud", "config", "reliability"],
+    "description": "The autostart configuration write was silently failing on every workspace creation in cloud environments — meaning workspaces appeared set up but did not auto-launch on container restart. The write path is now correct and verified. Workspaces configured to autostart will reliably start their sessions after any restart, deploy, or container eviction."
+  },
+  {
+    "hash": "38c66bd45ec15aa6c21a3bd4f26973ae22754ccf",
+    "short": "38c66bd",
+    "title": "Autonomy capture marker moved to append-only log — spurious card annotations no longer re-arm themselves",
+    "date": "2026-08-01",
+    "type": "fix",
+    "tags": ["autonomy", "board", "reliability", "agents"],
+    "description": "When an agent annotated a card it had already processed, the in-memory capture marker was being reset, causing the same card to be re-annotated on the next autonomy tick — creating duplicate cards and noisy board state. The marker now lives in the append-only session log, so it survives restarts and cannot be reset by a card mutation. Agents that previously created duplicate board cards in burst mode will no longer do so."
+  },
+  {
     "hash": "20ae941ccc4dc7fbf9c363ca7af7545f3329adbe",
     "short": "20ae941",
     "title": "Mobile kanban board \u2014 column snap, swipe between columns, live peek on tap",
