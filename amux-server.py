@@ -9930,40 +9930,36 @@ _DECOMPOSE_NUDGE_COOLDOWN = 6 * 3600    # decompose-dispatch cooldown; durably e
 #   alongside actual content is unaffected.
 def _pickup_junk_reason(title: str, desc: str) -> str:
     """Why auto-pickup must refuse this card, or '' if it is a real task.
-    Journals (>=2 folds), captured-prompt shells, probe/test artifacts —
-    the NOT-A-TASK guard reasons documented at the call site."""
+    ORDER MATTERS (MG three-verdicts incident, 2026-08-02): the checks run
+    marker -> journal -> artifact/dormant -> structure veto -> shell, so a
+    STRUCTURED tripwire is still refused (structure protects against the
+    shell classifier, it does not make dormant work dispatchable) and a
+    33-fold journal is a journal no matter how structured. Every caller
+    must pass the SAME inputs (title, desc+log) — a second inlined copy of
+    any of these checks WILL diverge on the next edit; that is how three
+    paths gave three verdicts on one unchanged card."""
     _folds = len(re.findall(r"New task:", desc))
-    # Durable marker first: callers pass desc+log as one blob, and the log
-    # copy of this string survives any desc rewrite — annotating a spurious
-    # card no longer re-arms it (the desc regex stays as the fallback for
-    # cards captured before the marker existed).
     if "capture: session prompt" in desc and _folds < 2:
         return "captured chat prompt, not a unit of work"
-    # Structure veto (MG audit #4): the fallback heuristics flagged 4 of 5
-    # fully-STRUCTURED cards as shells — one carried a live-verified root
-    # cause across 7k chars; decomposing it would have destroyed a working
-    # card. A card with sections, success criteria, or a gate block is a real
-    # task no matter how it was born. Only the durable capture marker above
-    # may overrule this.
-    _structured = bool(re.search(
-        r"^#{1,3}\s|\bsuccess criteri|\bacceptance criteri|^SCOPE:|^- \[[ x]\]|"
-        r"\bgate(?:_checked| policy| criteria)\b|\bROOT CAUSE\b|\bunhappy path",
-        desc or "", re.I | re.M))
-    if _structured:
+    if _folds >= 2:
+        return "journal card ({} folded tasks)".format(_folds)
+    if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b|"
+                 r"\btripwire\b|\barmed watch\b", title or "", re.I):
+        return "looks like a test artifact or armed tripwire"
+    # Structure veto (MG audit #4): protects real structured cards from the
+    # SHELL heuristics below — and only from those.
+    if re.search(r"^#{1,3}\s|\bsuccess criteri|\bacceptance criteri|^SCOPE:|^- \[[ x]\]|"
+                 r"\bgate(?:_checked| policy| criteria)\b|\bROOT CAUSE\b|\bunhappy path",
+                 desc or "", re.I | re.M):
         return ""
     _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
                    (desc or "").strip(), re.S)
-    _prompt_only = ""
     if _pm:
         _body = _pm.group(1).strip()
-        _prompt_only = ("harness slash command, not a task"
-                        if _body.startswith("/")
-                        else "captured chat prompt, not a unit of work")
-    return ("journal card ({} folded tasks)".format(_folds) if _folds >= 2
-            else _prompt_only if _prompt_only
-            else "looks like a test artifact"
-            if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
-                         title or "", re.I) else "")
+        return ("harness slash command, not a task" if _body.startswith("/")
+                else "captured chat prompt, not a unit of work")
+    return ""
+
 _advance_last: dict = {}
 _ADVANCE_COOLDOWN = 15 * 60     # never push the same lane twice inside this window
 
@@ -10007,10 +10003,13 @@ def _advance_open_card(session_name: str) -> bool:
         # of the same bug (2026-07-30).
         _it = _item_by_id(row["id"]) or {}
         _d = (_it.get("desc") or "") + "\n" + (_it.get("log") or "")
-        _f = len(re.findall(r"New task:", _d))
-        if _f >= 2 or re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b",
-                                row["title"] or "", re.I):
-            why = f"journal card ({_f} folded tasks)" if _f >= 2 else "test artifact"
+        # ONE predicate, same inputs as pickup (MG three-verdicts incident):
+        # this block used to inline its own copy of the journal/artifact
+        # regexes, which diverged from the shared predicate the moment the
+        # shared one gained the structure veto — three paths, three verdicts,
+        # one unchanged card.
+        why = _pickup_junk_reason(row["title"] or "", _d)
+        if why:
             slog(f"[advance] {session_name}: not nudging on {row['id']} — {why}")
             _append_board_log(row["id"], f"Advance-nudge SKIPPED — {why}; split it into real cards "
                                          f"or discard it. A session cannot honestly finish this.")
@@ -10533,6 +10532,19 @@ _NONCODE_GATES = {
 }
 # code → no override; the per-status defaults (merge/tests/CI) apply unchanged.
 _TYPE_GATES = {t: _NONCODE_GATES for t in _ITEM_TYPES if t != "code"}
+# Dormant types (MG follow-up): an armed tripwire/watch is claimable-but-not-
+# workable — pickup never claims it and it does not consume WIP (both enforced
+# in the pickup loop). Its gates are honest for what it IS: arming, then
+# firing-or-standing-down. Without these entries the pickup exclusion shipped
+# UNREACHABLE — the validator (rightly) refused the type.
+_ITEM_TYPES = _ITEM_TYPES + ("tripwire", "watch") if isinstance(_ITEM_TYPES, tuple) else _ITEM_TYPES + ["tripwire", "watch"]
+for _dt in ("tripwire", "watch"):
+    _TYPE_GATES[_dt] = {
+        "doing": ["Trigger condition documented on the card", "Armed and monitoring"],
+        "review": ["Fired: evidence of the triggering event recorded"],
+        "done": ["Fired and handled, or deliberately stood down (which, and why, on the card)"],
+        "verified": ["Outcome confirmed (handled recurrence, or stand-down still correct)"],
+    }
 
 
 def _item_type_gate(item: dict, target_status: str) -> list:
@@ -31225,7 +31237,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.359';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.360';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52328,7 +52340,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.359';
+const CACHE = 'amux-v0.9.360';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
