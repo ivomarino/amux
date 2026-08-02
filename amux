@@ -864,6 +864,17 @@ cmd_board() {
   local subcmd="${1:-help}"; shift 2>/dev/null || true
 
   case "$subcmd" in
+    needsyou|needs-you)
+      # Mark a card as blocked-on-human WITHOUT clobbering existing tags
+      # (AMUX-2167): additive read-modify-write of the tag set.
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID>"
+      local cur result
+      cur=$(curl -sk "$AMUX_API/api/board/$id" | python3 -c "import sys,json;d=json.load(sys.stdin);i=d.get('item') or d;print(json.dumps(sorted(set((i.get('tags') or [])+['needs:you']))))" 2>/dev/null)
+      [[ -n "$cur" ]] || die "card $id not found"
+      result=$(curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "{\"tags\":$cur}" "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome; return $?
+      ;;
     done|doing|todo|backlog|discarded|review)
       local status="$subcmd"
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID>"
@@ -1147,6 +1158,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ls                    List all issues (with tags)
   amux board add <title>           Create a new todo issue
   amux board claim <ID>            Atomically claim a todo/backlog card for this session
+  amux board needsyou <ID>         Mark a card as blocked on the human (surfaces in Needs-you)
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review

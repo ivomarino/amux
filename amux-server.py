@@ -30751,7 +30751,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.326';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.327';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41308,6 +41308,12 @@ function _bqSessionIndex() {
   return ix;
 }
 
+// Tags a session sets to say "this card is parked on a human" — the durable
+// signal is:needsyou reads, so the owning session (which KNOWS) marks it
+// rather than the board guessing from prose (AMUX-2167).
+const _NEEDS_HUMAN_TAGS = new Set(['needs:you', 'needs:ethan', 'needs:human',
+  'blocked:human', 'human-gated', 'awaiting-decision', 'awaiting-ethan']);
+
 function _bqIs(item, val, ix) {
   const st = _statusCanon(item.status);
   const sess = item.session ? ix[item.session] : null;
@@ -41326,6 +41332,17 @@ function _bqIs(item, val, ix) {
     case 'working':  return !!sess && sess.status === 'active';
     case 'waiting':  return !!sess && sess.status === 'waiting';
     case 'gated':    return !!sess && !!(sess.credit_limited || sess.rate_limited_until);
+    // Needs-you (AMUX-2167): the DURABLE union, not just live session state.
+    // A session working other cards while these await your call read as
+    // 'working' under is:waiting/gated, so they surfaced nowhere. Three
+    // honest signals, no prose-guessing (the MO-3049 lesson): your own cards
+    // (owner:human), a card the owning session explicitly marked
+    // needs-human, and the live waiting/gated state.
+    case 'needsyou': return _bqIs(item, 'open', ix) && (
+                       item.owner_type === 'human'
+                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
+                       || (!!sess && (sess.status === 'waiting'
+                                      || !!sess.credit_limited || !!sess.rate_limited_until)));
     case 'offline':  return !!item.session && (!sess || !sess.running);
     case 'orphan':   return !item.session || !ix[item.session];
     case 'archived': return !!item.archived;
@@ -41529,7 +41546,7 @@ function _bqFilter(items, q) {
 // so a view saved on the desktop is there on the phone.
 const _BOARD_BUILTIN_VIEWS = [
   { id: '_working',  name: 'Working now', q: 'is:working is:open',        hint: 'Cards whose session is running right now' },
-  { id: '_needsyou', name: 'Needs you',   q: 'is:waiting,gated is:open',  hint: 'Session is blocked at a prompt or a model gate' },
+  { id: '_needsyou', name: 'Needs you',   q: 'is:needsyou',  hint: 'Blocked on you: your own cards, cards a session marked needs-human, or a session at a prompt/model gate' },
   { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+' },
   { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no session can execute it' },
   { id: '_mine',     name: 'Mine',        q: 'owner:human is:open',       hint: 'Your own issues, not the agent cards' },
@@ -51311,7 +51328,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.326';
+const CACHE = 'amux-v0.9.327';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
