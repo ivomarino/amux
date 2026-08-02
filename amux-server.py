@@ -14818,13 +14818,20 @@ def _attach_log_streaming():
     Called on every server startup — including os.execv reloads where tmux
     sessions survive. For surviving sessions, this re-attaches pipe-pane so
     logs continue streaming after a server restart/deploy.
+
+    Runs in a background thread (non-blocking to port binding) and
+    parallelizes tmux calls so 50+ sessions finish in ~1s, not ~13s.
     """
     CC_LOGS.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    targets = []
     for f in CC_SESSIONS.glob("*.env"):
         name = f.stem
         if not is_running(name):
             continue
+        targets.append(name)
+
+    def _attach_one(name):
         lp = _log_path(name)
         try:
             with lp.open("ab") as lf:
@@ -14839,6 +14846,11 @@ def _attach_log_streaming():
             )
         except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
             pass
+
+    if targets:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_attach_one, targets))
 
 
 def _migrate_memory_files():
@@ -54436,20 +54448,27 @@ class CCHandler(BaseHTTPRequestHandler):
                 from concurrent.futures import ThreadPoolExecutor
                 sc = _sse_cache["sessions"]
                 sess_list = sc["data"] if sc["data"] is not None else []
-                def _get_git(s):
-                    name = s.get("name", "")
+                # Deduplicate by work_dir: run git once per unique dir,
+                # then fan the result to all sessions that share it.
+                dir_to_names: dict[str, list[str]] = {}
+                for s in sess_list:
                     wd = s.get("dir", "")
-                    if not wd:
-                        return None
+                    name = s.get("name", "")
+                    if wd and name:
+                        dir_to_names.setdefault(wd, []).append(name)
+                unique_dirs = list(dir_to_names.keys())
+                def _get_git_dir(wd):
                     info = _git_info(wd)
                     if info.get("branch"):
-                        return {"name": name, **info}
+                        return (wd, info)
                     return None
                 results = {}
                 with ThreadPoolExecutor(max_workers=4) as pool:
-                    for r in pool.map(_get_git, sess_list):
+                    for r in pool.map(_get_git_dir, unique_dirs):
                         if r:
-                            results[r["name"]] = r
+                            wd, info = r
+                            for name in dir_to_names[wd]:
+                                results[name] = {"name": name, **info}
                 sgc["data"] = results
                 sgc["time"] = time.time()
                 return self._json(results)
@@ -63899,7 +63918,7 @@ def main():
     _init_db()
     _migrate_flat_to_sqlite()
     _init_default_sessions()
-    _attach_log_streaming()  # re-attach pipe-pane for sessions surviving os.execv
+    threading.Thread(target=_attach_log_streaming, daemon=True).start()
 
     # Pre-configure ~/.claude.json to skip interactive setup wizard
     _init_claude_config()
