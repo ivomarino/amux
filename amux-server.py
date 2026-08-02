@@ -21546,6 +21546,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .review-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 8px; margin-bottom: 14px; }
   .rv-click { cursor: pointer; } .rv-click:hover { border-color: var(--accent); }
   .rv-clear { background: var(--surface-2,var(--bg-2)); border:1px solid var(--green); border-radius:10px; padding:12px 14px; color:var(--green); font-size:0.9rem; margin-bottom:12px; }
+  .rv-unblock-all { width:100%; margin-bottom:12px; font-size:0.9rem; min-height:46px; }
   .rv-blockers { display:flex; flex-direction:column; gap:12px; margin-bottom:18px; }
   .rv-block { border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
   .rv-block-needsyou { border-color: var(--red); background: rgba(248,81,73,0.05); }
@@ -30943,7 +30944,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.340';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.341';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41531,6 +41532,13 @@ function _bqIs(item, val, ix) {
     // honest signals, no prose-guessing (the MO-3049 lesson): your own cards
     // (owner:human), a card the owning session explicitly marked
     // needs-human, and the live waiting/gated state.
+    case 'blocked': {
+      if (!_bqIs(item, 'open', ix)) return false;
+      if (_bqIs(item, 'needsyou', ix) || _bqIs(item, 'rotting', ix)) return true;
+      const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
+      return deps.some(d => { const dc = (boardItems||[]).find(x => x.id === d);
+        return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status)); });
+    }
     case 'needsyou': return _bqIs(item, 'open', ix) && (
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
@@ -41893,6 +41901,7 @@ function _focusKey(e) {
   else if (e.key === 'a') { e.preventDefault(); _focusDecide('approved'); }
   else if (e.key === 'r') { e.preventDefault(); _focusDecide('rejected'); }
   else if (e.key === 'u') { e.preventDefault(); _focusUnblock(); }
+  else if (e.key === 'n') { e.preventDefault(); _focusNudge(); }
 }
 async function _focusPatch(id, body) {
   try { return await apiCall(API + '/api/board/' + id, { method: 'PATCH',
@@ -41935,6 +41944,15 @@ async function _focusDecide(verdict) {
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
   _focusNext();
 }
+async function _focusNudge() {
+  const item = _focusList[_focusIdx]; if (!item) return;
+  if (item.session) { await _focusSend(item.session,
+    '[amux] Please advance ' + item.id + ' (' + (item.title||'').slice(0,60) + '): work it now, or post a status-update / mark its blocker. It is showing as blocked.'); }
+  await _focusPatch(item.id, { desc_append: '`nudge` Ethan asked ' + (item.session||'?') + ' to advance this' });
+  showToast('Nudged ' + (item.session||'') + ' on ' + item.id);
+  _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
+  _focusNext();
+}
 async function _focusUnblock() {
   const item = _focusList[_focusIdx]; if (!item) return;
   await _focusResolveTag(item);
@@ -41970,6 +41988,7 @@ function _focusRender() {
     + '<button class="btn" style="color:var(--green);border-color:var(--green);" onclick="_focusDecide(\'approved\')" title="Approve (a)">\u2713 Approve</button>'
     + '<button class="btn" style="color:var(--red);border-color:var(--red);" onclick="_focusDecide(\'rejected\')" title="Reject (r)">\u2717 Reject</button>'
     + '<button class="btn" onclick="_focusUnblock()" title="Just clear the block (u)">Unblock</button>'
+    + '<button class="btn" onclick="_focusNudge()" title="Nudge the owning session (n)">\uD83D\uDC49 Nudge</button>'
     + '<button class="btn" onclick="_focusNext()" title="Skip (j)">Skip \u2192</button>';
 }
 
@@ -47537,6 +47556,8 @@ function _reviewRender() {
       + (kind === 'needsyou' && list.length ? '<button class="btn primary" style="margin-top:8px;font-size:0.78rem;" onclick="_focusStart(\'is:needsyou\')">\u26A1 Rapid-fire these</button>' : '')
       + '</div>';
   };
+  const allBlocked = _bqFilter(all, 'is:blocked');
+  if (allBlocked.length) html += '<button class="btn primary rv-unblock-all" onclick="_focusStart(\'is:blocked\')">\u26A1 Unblock everything (' + allBlocked.length + ')</button>';
   html += '<div class="rv-blockers">'
     + blkCard('\uD83D\uDD34 Blocked on you', needsyou, 'needsyou')
     + blkCard('\u23F8 Blocked by a dependency', depBlocked, 'dep')
@@ -52010,7 +52031,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.340';
+const CACHE = 'amux-v0.9.341';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
