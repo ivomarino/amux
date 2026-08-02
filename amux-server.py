@@ -9467,8 +9467,23 @@ def _autotask_title(text: str) -> str:
     # First sentence/clause, so a long multi-paragraph brief still titles cleanly.
     m = re.split(r"(?<=[.!?])\s|\n|  +|;\s", t, maxsplit=1)
     head = (m[0] if m else t).strip(" -–—:")
-    if len(head) > 88:
-        head = head[:85].rsplit(" ", 1)[0] + "…"
+    # Best-practice shaping (AMUX-2163): strip conversational filler so the
+    # title is the ACTION, drop a leading discourse marker, sentence-case a
+    # lowercase opener, trim trailing punctuation. Applied to the derived
+    # clause only — the model is not called (see docstring).
+    head = re.sub(r"^(?:"
+                  r"(?:can|could|would|will)\s+you\s+(?:please\s+)?|"
+                  r"i\s+(?:want|need|would\s+like)\s+(?:you\s+)?(?:to\s+)?|"
+                  r"i'?d\s+like\s+(?:you\s+)?(?:to\s+)?|"
+                  r"let'?s\s+|we\s+(?:should|need\s+to)\s+|"
+                  r"please\s+|kindly\s+|pls\s+|"
+                  r"(?:also|so|and|oh|ok|okay|hey|yeah|yea|um)[,\s]+)+",
+                  "", head, flags=re.I).strip(" -–—:,")
+    head = head.rstrip(".!?,; ").strip()
+    if head and head[0].islower():
+        head = head[0].upper() + head[1:]
+    if len(head) > 80:
+        head = head[:77].rsplit(" ", 1)[0] + "…"
     return head or (t[:60] or "Task")
 
 
