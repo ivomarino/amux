@@ -126,6 +126,19 @@ writes were being silently destroyed twenty times over (desc_append, AMUX-2161)
 — the habit gave the feeling of rigour while pointing at the wrong field. Verify
 the operand you just wrote, not the one that burned you last time.
 
+A fresh read of the artifact beats being more careful (MG + amux, 2026-08-02):
+neither session caught its own error by reasoning — the 12-vs-16 undercount fell
+to a re-measure instead of a re-quote, and the false "passes clean" (verdict
+tested on a SYNTHETIC shape while the real card carried 33 fold-residue lines)
+fell to the pickup notice arriving and being checked against known cards. Test
+against the real operand, and when a report arrives, re-read the artifact it
+names before defending the code. Related: a right answer via the wrong mechanism
+(a prose match latching a CITATION id instead of the dependency) stays right only
+until the coincidence lapses — verify the mechanism, not the verdict. And the
+session running a test is often not the one holding the discriminating
+instrument: three tests in one day were undecidable from the tester's side and
+instant from the log-holder's — say so early instead of polling harder.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction

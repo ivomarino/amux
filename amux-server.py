@@ -9805,6 +9805,20 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             # in flight, and auto-starting a second one would break WIP-1 and make
             # "what is being worked on" untrue. Creating a card cannot clobber the
             # existing one, so the incident this replaces stays fixed.
+            # Dedupe-at-mint (AMUX-2207): the same prompt re-delivered an hour apart
+            # minted twin cards (MG-1382/1383 — identical body, identical title,
+            # both routed to pickup). While an identical OPEN capture exists for
+            # this session, re-capture is a no-op: the ledger already has it.
+            _dup = db.execute(
+                "SELECT id FROM issues WHERE session=? AND title=? AND deleted IS NULL "
+                "AND status NOT IN ('done','verified','discarded') "
+                "AND COALESCE(log,'') LIKE '%capture: session prompt%' LIMIT 1",
+                (session_name, title)).fetchone()
+            if _dup:
+                slog(f"[board] {session_name}: duplicate prompt capture suppressed "
+                     f"({_dup['id']} already open with identical title)")
+                _stamp_msg_card(session_name, prompt_text, _dup["id"])
+                return
             prefix = _prefix_from_session(session_name)
             item_id = _next_issue_id(prefix)
             # notified=1 at birth: the session already RECEIVED this prompt as
@@ -9827,7 +9841,17 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             _board_changed()
             slog(f"[board] {session_name}: new task -> {item_id} (queued alongside {existing['id']})")
             return
-        # Create new issue
+        # Create new issue (same dedupe as the queued path — AMUX-2207)
+        _dup2 = db.execute(
+            "SELECT id FROM issues WHERE session=? AND title=? AND deleted IS NULL "
+            "AND status NOT IN ('done','verified','discarded') "
+            "AND COALESCE(log,'') LIKE '%capture: session prompt%' LIMIT 1",
+            (session_name, title)).fetchone()
+        if _dup2:
+            slog(f"[board] {session_name}: duplicate prompt capture suppressed "
+                 f"({_dup2['id']} already open with identical title)")
+            _stamp_msg_card(session_name, prompt_text, _dup2["id"])
+            return
         prefix = _prefix_from_session(session_name)
         item_id = _next_issue_id(prefix)
         db.execute(
@@ -31266,7 +31290,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.364';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.365';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52369,7 +52393,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.364';
+const CACHE = 'amux-v0.9.365';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
