@@ -26,6 +26,10 @@ on:
         description: 'lines of docker journal to pull'
         required: false
         default: '120'
+      recreate_watchdogs:
+        description: 'recreate ALL watchdog sidecars so they pick up watchdog.py + on-failure:5 (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   recover:
@@ -102,4 +106,30 @@ jobs:
             echo "=== settling 30s, then health across the fleet ==="
             sleep 30
             docker ps --format '{{.Names}}\t{{.Status}}' 2>&1 | sed 's/^/  /'
+          ENDSSH
+
+      - name: Recreate watchdog sidecars (pick up the file + capped restart policy)
+        if: ${{ inputs.recreate_watchdogs == 'true' }}
+        run: |
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'bash -s' <<'ENDSSH'
+            # A container's bind mounts AND restart policy are fixed at creation.
+            # Shipping watchdog.py and changing the template does nothing for
+            # sidecars already running with the old empty-directory mount and
+            # `unless-stopped` — they keep crashlooping and keep endangering the
+            # daemon. Only a recreate picks either up.
+            for d in /var/amux/users/*/; do
+              u=$(basename "$d")
+              [ -f "$d/docker-compose.yml" ] || continue
+              printf '%-46s ' "$u"
+              if (cd "$d" && timeout 120 docker compose up -d --force-recreate watchdog >/dev/null 2>&1); then
+                sleep 3
+                echo "recreated -> $(docker inspect amux-watchdog-$u --format '{{.State.Status}} restarts={{.RestartCount}}' 2>/dev/null)"
+              else
+                echo "FAILED to recreate watchdog"
+              fi
+            done
+            echo
+            echo "=== crashloopers remaining (want: none) ==="
+            timeout 30 docker ps -a --filter status=restarting --format '  {{.Names}}\t{{.Status}}' 2>&1 | head -12
+            echo "  (empty above = no container is crashlooping)"
           ENDSSH
