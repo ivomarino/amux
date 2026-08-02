@@ -30751,7 +30751,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.327';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.328';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51328,7 +51328,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.327';
+const CACHE = 'amux-v0.9.328';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55323,6 +55323,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     return self._json({"error": "claim failed — taken by another session"}, 409)
                 _board_changed()
                 _emit_event(session_name, "task.claimed", {"issue": bid}, source="api-claim")
+                _append_board_log(bid, f"claimed by {session_name} (todo/backlog \u2192 doing)")  # AMUX-2164
                 return self._json(_item_by_id(bid))
 
             # PATCH/DELETE /api/board/<id>
@@ -55704,15 +55705,29 @@ class CCHandler(BaseHTTPRequestHandler):
                                              "due", "due_time", "pinned")
                             _chg = {k: updated_item.get(k) for k in _AUDIT_FIELDS
                                     if k in body and _audit_prior.get(k) != updated_item.get(k)}
+                            _actor = (self.headers.get("X-Amux-Session", "")
+                                      or self.headers.get("X-Amux-User-Email", "")
+                                      or "unattributed")
                             if _chg:
-                                _ilog("board", "patch",
-                                      actor=(self.headers.get("X-Amux-Session", "")
-                                             or self.headers.get("X-Amux-User-Email", "")
-                                             or "unattributed"),
-                                      target=bid,
+                                _ilog("board", "patch", actor=_actor, target=bid,
                                       detail=_chg,
                                       before={k: _audit_prior.get(k) for k in _chg},
                                       ok=True)
+                                # Status transitions are the STORY of the card;
+                                # surface them in the visible append-only History
+                                # (AMUX-2164), not only in interaction_log which
+                                # the detail panel never shows. Reviewer-acks and
+                                # forces annotate the line so the History reads as
+                                # a narrative, not a diff.
+                                if "status" in _chg:
+                                    _frm = _audit_prior.get("status") or "?"
+                                    _to = _chg["status"]
+                                    _extra = ""
+                                    if body.get("force"):
+                                        _extra = " [forced]"
+                                    elif isinstance(body.get("gate_checked"), list) and body.get("gate_checked"):
+                                        _extra = " [gate acked]"
+                                    _append_board_log(bid, f"status: {_frm} \u2192 {_to} (by {_actor}){_extra}")
                         except Exception as _ae:
                             slog(f"[board] patch audit failed for {bid}: {_ae}")
                     except Exception:
