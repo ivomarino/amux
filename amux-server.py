@@ -10519,18 +10519,43 @@ def _pick_reviewer(exclude_session: str) -> str | None:
     Deterministic (load, then name) — no model call; the REVIEW itself is the
     model-judgment step and compounds with better models."""
     try:
-        live = [s["name"] for s in list_sessions()
-                if s.get("running") and s["name"] != exclude_session
-                and not s.get("archived")]
-        if not live:
+        sess = [s for s in list_sessions() if s.get("running")
+                and s["name"] != exclude_session and not s.get("archived")]
+        if not sess:
+            return None
+        # CAPABILITY-AWARE (the `random` refusal, 2026-08-02): load-only
+        # routing sent monorepo cards to an Obsidian-vault session, which
+        # honestly declined all four — the contract held, the routing wasted
+        # a day. The work dir is the durable capability signal we have:
+        # prefer a lane in the SAME repo root as the author; require a lane
+        # whose dir is under ~/Dev at all (vault/personal lanes cannot review
+        # code they cannot open).
+        home_dev = str(Path.home() / "Dev")
+        def _root(d):
+            d = d or ""
+            if not d.startswith(home_dev):
+                return None
+            parts = d[len(home_dev):].strip("/").split("/")
+            return parts[0] if parts and parts[0] else None
+        author_dir = ""
+        try:
+            _ai = get_session_info(exclude_session) or {}
+            author_dir = _ai.get("dir") or ""
+        except Exception:
+            pass
+        author_root = _root(author_dir)
+        cands = [s for s in sess if _root(s.get("dir") or "")]
+        if not cands:
             return None
         db = get_db()
         load = {r[0]: r[1] for r in db.execute(
             "SELECT reviewer, COUNT(*) FROM issues WHERE status='review' "
             "AND deleted IS NULL AND reviewer IS NOT NULL AND reviewer != '' "
             "GROUP BY reviewer").fetchall()}
-        live.sort(key=lambda n: (load.get(n, 0), n))
-        return live[0]
+        cands.sort(key=lambda s: (
+            0 if (author_root and _root(s.get("dir") or "") == author_root) else 1,
+            load.get(s["name"], 0), s["name"]))
+        return cands[0]["name"]
     except Exception:
         return None
 
@@ -31432,7 +31457,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.370';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.371';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52567,7 +52592,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.370';
+const CACHE = 'amux-v0.9.371';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
