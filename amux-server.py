@@ -30830,7 +30830,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.336';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.337';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51669,7 +51669,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.336';
+const CACHE = 'amux-v0.9.337';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56693,6 +56693,55 @@ class CCHandler(BaseHTTPRequestHandler):
         # GET /api/usage — Claude subscription usage (5h + weekly + per-model
         # scoped limits). Proxied server-side because the OAuth token can't be
         # exposed to the browser and api.anthropic.com blocks cross-origin.
+        # GET /api/review/week?days=7 — the weekly-synthesis DATA ENGINE
+        # (AMUX-2179): joins human messages, the board cards they became, and
+        # per-session tokens/cost/time for the window. The EPIC clustering is
+        # left to the consumer's model (a scheduled session summarizes this
+        # into themes) — the endpoint supplies the exact numbers, not the
+        # judgment, so it stays right and improves as models improve.
+        if method == "GET" and path == "/api/review/week":
+            try:
+                days = max(1, min(90, int(qs.get("days", ["7"])[0])))
+            except Exception:
+                days = 7
+            now = int(time.time()); since = now - days * 86400; since_ms = since * 1000
+            db = get_db()
+            per = {}
+            def _slot(sess):
+                return per.setdefault(sess or "(none)", {
+                    "session": sess or "(none)", "messages": 0, "cards_created": 0,
+                    "cards_done": 0, "cards_verified": 0, "tokens": 0, "cost_usd": 0.0,
+                    "samples": []})
+            for r in db.execute(
+                    "SELECT session, text, card_id FROM cmd_history WHERE ts>=? "
+                    "AND (type IS NULL OR type NOT IN ('session','schedule','system')) ORDER BY ts",
+                    (since_ms,)).fetchall():
+                sl = _slot(r["session"]); sl["messages"] += 1
+                if len(sl["samples"]) < 5 and r["text"]:
+                    sl["samples"].append(re.sub(r"^\[.*?\]\s*", "", r["text"]).strip()[:140])
+            for r in db.execute(
+                    "SELECT session, status FROM issues WHERE created>=? AND deleted IS NULL",
+                    (since,)).fetchall():
+                sl = _slot(r["session"]); sl["cards_created"] += 1
+                if r["status"] == "done": sl["cards_done"] += 1
+                elif r["status"] == "verified": sl["cards_verified"] += 1
+            for r in db.execute(
+                    "SELECT session, SUM(COALESCE(input,0)+COALESCE(output,0)) tk, "
+                    "SUM(COALESCE(cost_usd,0)) c FROM token_ledger WHERE ts>=? GROUP BY session",
+                    (since,)).fetchall():
+                sl = _slot(r["session"]); sl["tokens"] = int(r["tk"] or 0); sl["cost_usd"] = round(r["c"] or 0.0, 2)
+            rows = sorted(per.values(), key=lambda x: -(x["messages"] + x["cards_created"]))
+            totals = {
+                "messages": sum(x["messages"] for x in rows),
+                "cards_created": sum(x["cards_created"] for x in rows),
+                "cards_done": sum(x["cards_done"] for x in rows),
+                "cards_verified": sum(x["cards_verified"] for x in rows),
+                "tokens": sum(x["tokens"] for x in rows),
+                "cost_usd": round(sum(x["cost_usd"] for x in rows), 2),
+                "active_sessions": len([x for x in rows if x["messages"] or x["cards_created"]]),
+            }
+            return self._json({"days": days, "since": since, "totals": totals, "per_session": rows})
+
         if method == "GET" and path == "/api/usage":
             now = time.time()
             if not _usage_cache["data"] or now - _usage_cache["time"] > _USAGE_TTL:
