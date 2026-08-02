@@ -1184,6 +1184,7 @@ for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
       cat <<EOF
 ${BOLD}amux board${RESET} — manage board issues from the CLI
 
+  amux whoami                      Live session identity vs inherited env (mismatch warns)
   amux board ls                    List all issues (with tags)
   amux board add <title>           Create a new todo issue
   amux board claim <ID>            Atomically claim a todo/backlog card for this session
@@ -1436,6 +1437,36 @@ print('alert sent →', ', '.join('%s: %s' % (k, v) for k, v in ch.items()) or '
 "
 }
 
+cmd_whoami() {
+  # Live identity vs inherited env (MG audit #8 / AMUX-2203): $AMUX_SESSION is
+  # per-process and inherited from whoever launched the pane; `claude --resume`
+  # in another pane moves a conversation between sessions silently, and a
+  # session once disowned its own card by trusting conversation history over
+  # the live binding. The tmux pane is the ground truth when present.
+  local env_id="${AMUX_SESSION:-}"
+  local live_id=""
+  if [[ -n "${TMUX:-}" ]]; then
+    live_id=$(tmux display-message -p '#S' 2>/dev/null)
+    live_id="${live_id#amux-}"
+  fi
+  echo "env  AMUX_SESSION : ${env_id:-'(unset)'}"
+  if [[ -n "$live_id" ]]; then
+    echo "live tmux pane   : $live_id"
+    if [[ -n "$env_id" && "$env_id" != "$live_id" ]]; then
+      echo ""
+      echo "⚠ MISMATCH: this process INHERITED '$env_id' but is RUNNING in '$live_id'."
+      echo "  Board writes, sends and commits will be attributed to '$env_id'."
+      echo "  The live pane is the ground truth — a resumed transcript carries its"
+      echo "  old identity. Export AMUX_SESSION='$live_id' if this pane is home."
+      return 1
+    fi
+    echo "match: identity is consistent"
+  else
+    echo "live tmux pane   : (not inside tmux — env is all we have; treat with care)"
+  fi
+  return 0
+}
+
 # ── Main dispatch ────────────────────────────────────────────────────────────
 #
 # Source guard: when this script is run normally as `amux ...`, BASH_SOURCE[0]
@@ -1464,6 +1495,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     board|b)          shift; cmd_board "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
+    whoami)           cmd_whoami ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;
     "")               cmd_dashboard ;;
