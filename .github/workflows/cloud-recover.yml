@@ -65,6 +65,18 @@ jobs:
               echo "  -- $c"
               docker inspect "$c" --format '{{range .State.Health.Log}}{{.Output}}{{end}}' 2>&1 | tail -3 | sed 's/^/     /'
             done
+            echo
+            # The crashloopers are the actual cause: a sidecar exiting 1 under
+            # `unless-stopped` with no backoff restarted 4318 times and saturated
+            # dockerd. These are in state Restarting, NOT unhealthy, so the loop
+            # above never sees them — and their exit reason lives only here.
+            echo "=== CRASHLOOPERS: restart counts and why they exit ==="
+            for c in $(timeout 20 docker ps -a --filter status=restarting --format '{{.Names}}' 2>/dev/null | head -6); do
+              n=$(docker inspect "$c" --format '{{.RestartCount}}' 2>/dev/null)
+              code=$(docker inspect "$c" --format '{{.State.ExitCode}}' 2>/dev/null)
+              echo "  -- $c  restartCount=$n  lastExit=$code"
+              docker logs --tail 25 "$c" 2>&1 | sed 's/^/     /'
+            done
           ENDSSH
 
       - name: Restart ONLY the named containers
