@@ -413,7 +413,7 @@ Expected: PASS (20 passed)
 - [ ] **Step 5: Run the full suite for regressions**
 
 Run: `python3 -m pytest tests/ -q`
-Expected: PASS, no failures. (Baseline before this plan: 193 passed.)
+Expected: PASS, no failures. (Baseline before this plan: 178 passed.)
 
 - [ ] **Step 6: Commit**
 
@@ -435,56 +435,81 @@ resolve multiple matches to the most recently modified."
 ### Task 3: Stop requiring the session name to be persisted
 
 **Files:**
+- Modify: `amux-server.py` — add `_resolve_cc_session_name` immediately after `_cc_session_id_for_name` (the function Task 2 rewrites)
 - Modify: `amux-server.py:14922` (one line, inside `start_session`)
 - Test: `tests/test_session_resume.py` (append)
 
 **Interfaces:**
 - Consumes: `_cc_session_id_for_name` (Task 2)
-- Produces: no new symbols — changes the resume-strategy branch's input
+- Produces: `_resolve_cc_session_name(meta: dict, name: str) -> str`
 
-- [ ] **Step 1: Write the failing test**
+The derivation lives in its own helper rather than inline in `start_session`.
+`start_session` is ~700 lines with tmux side effects and cannot be unit tested;
+inlining the logic would leave the fix's only real decision covered by nothing
+but a test that re-implements it. A named helper makes the production code
+itself the thing under test.
+
+- [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_session_resume.py`:
 
 ```python
 # ── name derivation ─────────────────────────────────────────────────────────
 
-def test_session_name_is_derivable_without_meta(amux_server, project):
-    """amux always launches with `--name <session name>`, so the Claude-side
-    name never needed storing. It was written only in stop_session(), so any
-    ending that was not a graceful stop — crash, reboot, sleep, server restart
-    — lost it and forced a fresh start on a session that was fully resumable.
+def test_derives_amux_name_when_meta_is_empty(amux_server):
+    """The crash case. cc_session_name was written only in stop_session(), so
+    any ending that was not a graceful stop — crash, reboot, sleep, server
+    restart — left meta empty and forced a fresh start on a session that was
+    fully resumable. amux always launches with `--name <session name>`, so the
+    name was derivable the whole time."""
+    assert amux_server._resolve_cc_session_name({}, "Amux-gtm") == "Amux-gtm"
 
-    This pins the property the one-line change in start_session relies on:
-    resolution works from the amux session name alone, with empty meta.
-    """
+
+def test_persisted_meta_name_wins(amux_server):
+    """A /rename inside Claude must still be honoured over the amux name."""
+    assert amux_server._resolve_cc_session_name(
+        {"cc_session_name": "Renamed-By-User"}, "Amux-gtm") == "Renamed-By-User"
+
+
+def test_blank_meta_name_falls_back_to_amux_name(amux_server):
+    """An empty string is not a rename — it is absence, and must not win."""
+    assert amux_server._resolve_cc_session_name(
+        {"cc_session_name": ""}, "Amux-gtm") == "Amux-gtm"
+
+
+def test_derived_name_resolves_to_a_conversation(amux_server, project):
+    """End to end: empty meta, as after a crash, still finds the conversation."""
     add, work_dir = project
     add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
-    meta = {}                                    # nothing persisted, as after a crash
-    cc_session_name = meta.get("cc_session_name") or "Amux-gtm"
-    assert amux_server._validate_cc_session_name(cc_session_name)
-    assert amux_server._cc_session_id_for_name(cc_session_name, work_dir) == \
+    resolved = amux_server._resolve_cc_session_name({}, "Amux-gtm")
+    assert amux_server._cc_session_id_for_name(resolved, work_dir) == \
         "aaaaaaaa-0000-0000-0000-000000000000"
-
-
-def test_persisted_meta_name_overrides_amux_name(amux_server, project):
-    """A /rename inside Claude is still honoured over the amux name."""
-    add, work_dir = project
-    add("bbbbbbbb-0000-0000-0000-000000000000", "Renamed-By-User", time.time())
-    meta = {"cc_session_name": "Renamed-By-User"}
-    cc_session_name = meta.get("cc_session_name") or "Amux-gtm"
-    assert amux_server._cc_session_id_for_name(cc_session_name, work_dir) == \
-        "bbbbbbbb-0000-0000-0000-000000000000"
 ```
 
-- [ ] **Step 2: Run tests to verify they pass or fail meaningfully**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python3 -m pytest tests/test_session_resume.py -k derivab -v`
-Expected: PASS — these assert the property Task 2 already provides. They exist to lock it in before the production line changes; if they fail, Task 2 is wrong and Task 3 must not proceed.
+Run: `.venv/bin/python -m pytest tests/test_session_resume.py -k resolve_cc -v`
+Expected: FAIL — `AttributeError: module 'amux_server' has no attribute '_resolve_cc_session_name'`
 
-- [ ] **Step 3: Change the production line**
+- [ ] **Step 3: Write the implementation**
 
-In `amux-server.py`, in `start_session`, replace line 14922:
+In `amux-server.py`, immediately after `_cc_session_id_for_name`, add:
+
+```python
+def _resolve_cc_session_name(meta: dict, name: str) -> str:
+    """Return the Claude-side session name for an amux session.
+
+    amux always launches Claude with `--name <amux session name>`, so this is
+    derivable and never needed persisting. It used to be read from meta alone,
+    and meta was only written in stop_session() — so any ending that was not a
+    graceful stop lost it and forced a fresh start on a resumable session.
+
+    A name persisted in meta still wins, so `/rename` inside Claude is honoured.
+    """
+    return meta.get("cc_session_name") or name
+```
+
+Then in `start_session`, replace line 14922:
 
 ```python
             cc_session_name = meta.get("cc_session_name", "")
@@ -493,16 +518,12 @@ In `amux-server.py`, in `start_session`, replace line 14922:
 with:
 
 ```python
-            # amux always launches Claude with `--name <session name>`, so the
-            # Claude-side name is derivable and never needed persisting. It used
-            # to be written only in stop_session(), which meant any ending that
-            # was not a graceful stop — crash, reboot, sleep, server restart —
-            # lost it and forced a fresh start on a fully resumable session.
-            # meta still wins, so a /rename inside Claude is honoured.
-            cc_session_name = meta.get("cc_session_name") or name
+            cc_session_name = _resolve_cc_session_name(meta, name)
 ```
 
-Change nothing else in the branch. The existing not-found path (which pops the meta keys and falls back to `--name`) stays correct: with derivation, a pop simply means the next start derives the name again.
+Change nothing else in the branch. The existing not-found path (which pops the
+meta keys and falls back to `--name`) stays correct: with derivation, a pop
+simply means the next start derives the name again.
 
 - [ ] **Step 4: Run the full suite**
 
@@ -599,7 +620,7 @@ Note: the repo's pre-push guard mis-fires on new branches, listing every ancesto
 **Spec coverage (Part A):**
 | Spec item | Task |
 |---|---|
-| A1 derive session name | Task 3 |
+| A1 derive session name | Task 3 (`_resolve_cc_session_name`) |
 | A2 scan JSONL header block | Task 1 (`_cc_session_title`) + Task 2 (both call sites) |
 | A3 recency tie-break | Task 2 (`_cc_session_candidates` sort) |
 | A3 skip snapshot-only files | Task 1 (`_jsonl_has_messages`) + Task 2 (filter) |
