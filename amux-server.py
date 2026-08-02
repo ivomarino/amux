@@ -10496,12 +10496,15 @@ def _verification_sweep():
             if not rows:
                 continue
             lst = "\n".join(f"  {r['id']} — {(r['title'] or '')[:70]}" for r in rows)
-            ok, _ = send_text(name,
-                f"[amux verification sweep] {len(rows)} of your done cards await the "
-                f"done→verified gap:\n{lst}\nFor each: move to verified WITH prod "
-                f"evidence via its gates, or append one line on the card saying why it "
-                f"honestly stays done. Never force a gate you cannot satisfy.",
-                defer_if_busy=True)
+            try:
+                _steer_enqueue(name,
+                    f"[amux verification sweep] {len(rows)} of your done cards await the "
+                    f"done→verified gap:\n{lst}\nFor each: move to verified WITH prod "
+                    f"evidence via its gates, or append one line on the card saying why it "
+                    f"honestly stays done. Never force a gate you cannot satisfy.")
+                ok = True
+            except Exception:
+                ok = False
             if ok:
                 sent += 1
                 for r in rows:
@@ -10552,7 +10555,19 @@ def _pick_reviewer(exclude_session: str) -> str | None:
             "SELECT reviewer, COUNT(*) FROM issues WHERE status='review' "
             "AND deleted IS NULL AND reviewer IS NOT NULL AND reviewer != '' "
             "GROUP BY reviewer").fetchall()}
+        # Same-TAG first (Ethan 14:10: "peer revision should be within the
+        # same tag"): session tags are the human-drawn team boundaries (gtm,
+        # mixpeek, amux...). Then same repo root, then load.
+        author_tags = set()
+        try:
+            author_tags = {t.lower() for t in ((_ai.get("tags") or []) if isinstance(_ai.get("tags"), list) else [])}
+        except Exception:
+            pass
+        def _tag_rank(cand):
+            ct = {t.lower() for t in (cand.get("tags") or [])}
+            return 0 if (author_tags and ct & author_tags) else 1
         cands.sort(key=lambda s: (
+            _tag_rank(s),
             0 if (author_root and _root(s.get("dir") or "") == author_root) else 1,
             load.get(s["name"], 0), s["name"]))
         return cands[0]["name"]
@@ -10575,11 +10590,15 @@ def _auto_assign_reviewer(bid: str, item: dict, notify: bool = True) -> str | No
         _append_board_log(bid, f"reviewer auto-assigned: {rev} (peer-review loop)")
         _board_changed()
         if notify:
-            send_text(rev, f"[amux peer-review] You are the reviewer for {bid} — "
-                           f"{(item.get('title') or '')[:100]}. Read it "
-                           f"(#issue={bid}), then either ack review→done honestly "
-                           f"via its gates, or comment on the card what blocks. "
-                           f"Never ack what you cannot verify.", defer_if_busy=True)
+            # STEERING queue, not send_text(defer_if_busy): the blocking send
+            # spawned one settle-polling thread PER review-enter — 47 threads,
+            # 192% CPU, 90-second board reads (2026-08-02 outage). The queue
+            # delivers at the reviewer's next turn boundary with zero threads.
+            _steer_enqueue(rev, f"[amux peer-review] You are the reviewer for {bid} — "
+                                f"{(item.get('title') or '')[:100]}. Read it "
+                                f"(#issue={bid}), then either ack review→done honestly "
+                                f"via its gates, or comment on the card what blocks. "
+                                f"Never ack what you cannot verify.")
         return rev
     except Exception as e:
         slog(f"[review-loop] assign failed for {bid}: {e}")
@@ -31457,7 +31476,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.371';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.373';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52592,7 +52611,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.371';
+const CACHE = 'amux-v0.9.373';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56449,9 +56468,17 @@ class CCHandler(BaseHTTPRequestHandler):
                                     _gen0 = bc.get("gen", 0)
                                     def _bg_board():
                                         try:
-                                            data = _load_board()
-                                            if bc.get("gen", 0) != _gen0:
-                                                return   # superseded by a write; leave it invalid
+                                            # Rebuild-until-stable (2026-08-02 outage): under a
+                                            # write BURST every gen bump discarded the in-flight
+                                            # build, the cache never became fresh, and every
+                                            # client full-built its own board — 2 cores pinned,
+                                            # 90s reads. A build STARTED after the latest bump
+                                            # is correct to commit; loop bounded.
+                                            for _ in range(4):
+                                                _gen0 = bc.get("gen", 0)
+                                                data = _load_board()
+                                                if bc.get("gen", 0) == _gen0:
+                                                    break
                                             bc["data"] = data
                                             bc["json"] = json.dumps(data, sort_keys=True)
                                             bc["time"] = time.time()
@@ -56460,7 +56487,11 @@ class CCHandler(BaseHTTPRequestHandler):
                                     threading.Thread(target=_bg_board, daemon=True).start()
                                     released_to_bg = True
                                     return self._json_raw(bc["json"], etag=_cache_etag(bc))
-                                data = _load_board()
+                                for _ in range(4):
+                                    _g0 = bc.get("gen", 0)
+                                    data = _load_board()
+                                    if bc.get("gen", 0) == _g0:
+                                        break
                                 bc["data"] = data
                                 bc["json"] = json.dumps(data, sort_keys=True)
                                 bc["time"] = time.time()
@@ -57837,6 +57868,18 @@ class CCHandler(BaseHTTPRequestHandler):
         # left to the consumer's model (a scheduled session summarizes this
         # into themes) — the endpoint supplies the exact numbers, not the
         # judgment, so it stays right and improves as models improve.
+        # GET /api/debug/threads — live thread stacks (2026-08-02 outage: the
+        # server pinned 2 cores with 47 threads and NOTHING could say which;
+        # py-spy needs root on macOS. The instrument the next spin needs.)
+        if method == "GET" and path == "/api/debug/threads":
+            import traceback as _tb
+            _names = {t.ident: t.name for t in threading.enumerate()}
+            _out = []
+            for _tid, _frm in sys._current_frames().items():
+                _out.append({"tid": _tid, "name": _names.get(_tid, "?"),
+                             "stack": _tb.format_stack(_frm)[-5:]})
+            return self._json({"count": len(_out), "threads": _out})
+
         # GET /api/review/digest — the latest committed weekly-review markdown
         # (the model-authored epic synthesis), for the Review tab to render.
         if method == "GET" and path == "/api/review/digest":
