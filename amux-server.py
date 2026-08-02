@@ -31073,7 +31073,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.346';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.347';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52168,7 +52168,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.346';
+const CACHE = 'amux-v0.9.347';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56099,7 +56099,10 @@ class CCHandler(BaseHTTPRequestHandler):
                 elif not creator:
                     creator = _chdr or self.headers.get("X-Amux-User-Email", "").strip()
                 desc = body.get("desc", "").strip()
-                tags = [t for t in body.get("tags", []) if t]
+                _tags_in = body.get("tags", [])
+                if isinstance(_tags_in, str):   # same coercion as PATCH (SP-539)
+                    _tags_in = [_tags_in] if _tags_in.strip() else []
+                tags = [t for t in _tags_in if t]
                 owner_type = body.get("owner_type", "agent" if session else "human")
                 if owner_type not in ("human", "agent"):
                     owner_type = "human"
@@ -56742,6 +56745,12 @@ class CCHandler(BaseHTTPRequestHandler):
                             f"UPDATE issues SET {', '.join(set_clauses)} WHERE id = ?", params
                         )
                     if "tags" in body:
+                        # A bare-string tags value is coerced to [string]: iterating
+                        # a str explodes it into one tag PER CHARACTER — 200, no
+                        # error, silently corrupted card (studio-plg, SP-539). Same
+                        # design call as desc_append: the obvious shape works.
+                        if isinstance(body.get("tags"), str):
+                            body["tags"] = [body["tags"]] if body["tags"].strip() else []
                         db.execute("DELETE FROM issue_tags WHERE issue_id = ?", (bid,))
                         for tag in (body["tags"] or []):
                             if tag:
