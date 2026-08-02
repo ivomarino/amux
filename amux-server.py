@@ -10542,7 +10542,7 @@ def _age_archive_sweep():
         rows = db.execute(
             "SELECT id, status, session, updated FROM issues WHERE deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND COALESCE(pinned,0)=0 AND updated < ? "
-            "LIMIT 500", (cut,)).fetchall()
+            "LIMIT 2000", (cut,)).fetchall()
         for r in rows:
             _days = max(3, int((now - (r["updated"] or now)) / 86400))
             _append_board_log(r["id"],
@@ -31577,7 +31577,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.375';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.376';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52716,7 +52716,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.375';
+const CACHE = 'amux-v0.9.376';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
