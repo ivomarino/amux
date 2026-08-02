@@ -10251,22 +10251,33 @@ def _pickup_next_board_task(session_name: str):
             if blocking:
                 slog(f"[auto-pickup] {session_name}: {cand['id']} blocked by {blocking} — skipping")
                 continue
-            # Prose-dependency heuristic (MG audit #2): five validation cards
-            # were dispatched for unbuilt work because their dependencies lived
-            # in PROSE ("cannot start until Ray-6a ships"), not depends_on.
-            # Conservative: only skip when the text names a real card id in a
-            # dependency phrase AND that card is still open.
-            _dep_blob = (cand["title"] or "") + "\n" + (cand["desc"] or "")
-            _pm2 = re.search(r"(?:blocked\s+(?:by|on)|cannot\s+start\s+until|"
-                             r"depends\s+on|waits?\s+(?:for|on))\s+.{0,40}?"
-                             r"([A-Z][A-Z]+-\d+)(?![0-9])", _dep_blob)
-            if _pm2:
-                _dep_item = _item_by_id(_pm2.group(1))
-                if _dep_item and _dep_item.get("status") not in ("done", "verified", "discarded"):
-                    slog(f"[auto-pickup] {session_name}: {cand['id']} prose-blocked by "
-                         f"{_pm2.group(1)} ({_dep_item.get('status')}) — skipping")
-                    continue
-            # Refusal guards run INSIDE the loop (AMUX-2128): they used to
+            # Prose-dependency FALLBACK (MG audit #2 + their red-test report):
+            # fires ONLY when depends_on is EMPTY. Card ids in prose are
+            # ambiguous by nature — MG-1363's blocker names Ray-6a in words
+            # but the only id in it is the EPIC it cites for authority, so a
+            # prose match would skip it for the WRONG reason: right answer via
+            # wrong mechanism, broken the day the coincidence lapses. The
+            # structured field is the unambiguous edge; when the fallback
+            # fires it logs LOUDLY so someone populates depends_on.
+            _has_deps = bool((_item_by_id(cand["id"]) or {}).get("depends_on"))
+            if not _has_deps:
+                _dep_blob = (cand["title"] or "") + "\n" + (cand["desc"] or "")
+                _pm2 = re.search(r"(?:blocked\s+(?:by|on)|cannot\s+start\s+until|"
+                                 r"depends\s+on|waits?\s+(?:for|on))\s+.{0,40}?"
+                                 r"\b([A-Z][A-Z]+-\d+)(?![0-9])", _dep_blob)
+                if _pm2:
+                    _dep_item = _item_by_id(_pm2.group(1))
+                    if _dep_item and _dep_item.get("status") not in ("done", "verified", "discarded"):
+                        slog(f"[auto-pickup] {session_name}: {cand['id']} prose-blocked by "
+                             f"{_pm2.group(1)} ({_dep_item.get('status')}) — skipping; "
+                             f"POPULATE depends_on (prose is an ambiguous fallback)")
+                        if cand["id"] not in _autopickup_junk_flagged:
+                            _autopickup_junk_flagged.add(cand["id"])
+                            _append_board_log(cand["id"],
+                                f"Auto-pickup skipped on PROSE dependency ({_pm2.group(1)} open). "
+                                f"Prose cannot distinguish dependency from citation — set depends_on "
+                                f"to make this edge unambiguous.")
+                        continue            # Refusal guards run INSIDE the loop (AMUX-2128): they used to
             # return, so one refusable card at the head of the queue stalled
             # the entire lane forever — 81 clean todos sat behind refusable
             # heads when this was measured. A refusal now tries the next
@@ -31203,7 +31214,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.357';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.358';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52306,7 +52317,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.357';
+const CACHE = 'amux-v0.9.358';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
