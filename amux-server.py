@@ -28592,6 +28592,7 @@ function render() {
       ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.dir)}">${esc(s.dir)}</span></div>` : ''}
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
+      ${(s.sched_on || s.sched_off) ? `<span class="sched-count-chip" title="${s.sched_on} enabled / ${s.sched_off} disabled schedule(s)" onclick="event.stopPropagation();openPeek('${esc(s.name)}');setTimeout(()=>setPeekTab('schedules'),400)" style="cursor:pointer;font-size:0.66rem;border:1px solid var(--border);border-radius:8px;padding:0 6px;font-family:var(--font-mono);"><span style="color:var(--green);font-weight:700;">${s.sched_on}</span><span style="color:var(--dim);">/</span><span style="color:${s.sched_off ? '#d29922' : 'var(--dim)'};">${s.sched_off}</span></span>` : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
       ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
       ${!isExp && (schedOn + schedOff) ? `<div class="card-sched-count" onclick="event.stopPropagation();switchView('scheduler')" title="${schedOn} enabled, ${schedOff} disabled">&#x23F2; ${[schedOn ? `<span class="sched-on">${schedOn} on</span>` : '', schedOff ? `<span class="sched-off">${schedOff} off</span>` : ''].filter(Boolean).join(' &middot; ')}</div>` : ''}
@@ -31639,7 +31640,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.378';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.379';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52778,7 +52779,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.378';
+const CACHE = 'amux-v0.9.379';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
