@@ -21940,6 +21940,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-family: inherit; line-height: 1.65; resize: none; box-sizing: border-box;
   }
   .board-detail-log { margin-top: 10px; padding: 8px 10px; background: var(--panel2, rgba(255,255,255,0.03)); border-radius: 8px; font-size: 0.74rem; line-height: 1.5; color: var(--dim); max-height: 180px; overflow-y: auto; }
+  .board-detail-key { cursor: pointer; }
+  .board-detail-key:hover { text-decoration: underline; }
+  .bd-status-banner { background: var(--accent-dim, rgba(199,91,46,0.12)); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 10px 12px; margin: 4px 0 12px; }
+  .bd-sb-label { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+  .bd-sb-text { font-size: 0.9rem; line-height: 1.5; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+  .bd-sb-empty { font-size: 0.82rem; color: var(--dim); display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+  .bd-hist-n { font-size: 0.68rem; opacity: 0.7; }
+  .bd-hist { display: flex; flex-direction: column; gap: 2px; }
+  .bd-hist-row { display: flex; gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--border); align-items: flex-start; }
+  .bd-hist-row:last-child { border-bottom: none; }
+  .bd-hist-ic { flex: 0 0 16px; text-align: center; font-size: 0.8rem; line-height: 1.5; }
+  .bd-hist-b { flex: 1; min-width: 0; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .bd-hist-txt { font-size: 0.82rem; line-height: 1.5; word-break: break-word; }
+  .bd-hist-ts { font-size: 0.68rem; color: var(--dim); flex: 0 0 auto; font-family: var(--font-mono); }
+  .bd-hist-status .bd-hist-txt { font-weight: 600; }
+  .bd-hist-warn .bd-hist-txt { color: var(--red); }
   .bd-log-title { font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; color: var(--dim); }
   .bd-log-line { white-space: pre-wrap; word-break: break-word; }
   .board-detail-desc-input::placeholder { color: var(--dim); }
@@ -24689,12 +24706,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div class="overlay-header">
     <div style="display:flex;align-items:center;gap:10px;min-width:0;">
       <button class="btn" onclick="closeBoardDetail()">&#x2190; Back</button>
-      <span id="bd-key" class="board-detail-key"></span>
+      <span id="bd-key" class="board-detail-key" onclick="_bdCopyLink()" title="Copy link to this card"></span>
     </div>
     <button class="btn" onclick="boardDetailDelete()" style="color:var(--red);border-color:rgba(248,81,73,0.3);">Delete</button>
   </div>
   <div class="board-detail-body">
     <textarea id="bd-title" class="board-detail-title-input" placeholder="Untitled" autocomplete="off" autocorrect="on" spellcheck="true" rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+    <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
     <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
@@ -24728,6 +24746,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="board-detail-tabs">
       <button class="board-detail-tab active" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
       <button class="board-detail-tab" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
+      <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">History<span id="bd-hist-n" class="bd-hist-n"></span></button>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
@@ -30811,7 +30830,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.335';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.336';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42683,16 +42702,14 @@ function openBoardDetail(id) {
   titleEl.style.height = 'auto';
   titleEl.style.height = titleEl.scrollHeight + 'px';
   document.getElementById('bd-desc').value = draft ? draft.desc : (item.desc || '');
+  // History is now a TAB (below); the inline strip is retired.
   const logEl = document.getElementById('bd-log');
-  if (logEl) {
-    // System history (commit attachments, auto-pickup notes) — append-only on
-    // the server, deliberately NOT part of the editable desc so saving the
-    // textarea can never clobber it (AMUX-2112).
-    logEl.style.display = item.log ? '' : 'none';
-    logEl.innerHTML = item.log
-      ? '<div class="bd-log-title">History</div>' + esc(item.log).split('\n').map(l => '<div class="bd-log-line">' + l + '</div>').join('')
-      : '';
-  }
+  if (logEl) { logEl.style.display = 'none'; }
+  _bdRenderHistory(item);
+  // Latest-status banner: the freshest model-authored STATUS on the card, or a
+  // prompt to ask for one (AMUX status-request flow). Makes the card answer
+  // "where is this?" the moment it opens.
+  _bdRenderStatusBanner(item);
   _renderDetailStatusBtns();
   const keyEl = document.getElementById('bd-key');
   if (keyEl) keyEl.textContent = item.id || '';
@@ -42727,21 +42744,99 @@ function openBoardDetail(id) {
   _beTagInputUpdate('bd');
   const meta = document.getElementById('bd-meta');
   const parts = [];
+  if (item.type) parts.push('Type ' + esc(item.type));
   if (item.creator) parts.push('From ' + esc(item.creator));
   if (item.created) parts.push('Created ' + timeAgo(item.created));
   if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
-  meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('');
+  if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
+  const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
+  let depHtml = '';
+  if (deps.length) depHtml = '<div class="board-detail-meta-row">Blocked by ' + deps.map(d =>
+    '<span class="task-id-chip" onclick="_openIssue(\'' + escJs(d) + '\')" style="cursor:pointer;">' + esc(d) + '</span>').join(' ') + '</div>';
+  meta.innerHTML = parts.map(p => '<div class="board-detail-meta-row">' + p + '</div>').join('') + depHtml;
   document.getElementById('bd-save-status').textContent = '';
   document.getElementById('board-detail-overlay').classList.add('active');
   setTimeout(() => document.getElementById('bd-title').focus(), 100);
 }
 
+// ── Improved detail: status banner, typed History, permalink (AMUX-2178) ───
+function _bdParseHistory(log) {
+  // Each backtick-timestamped line becomes a typed event for styled rendering.
+  return (log || '').split('\n').filter(l => l.trim()).map(line => {
+    const m = line.match(/^`(\d{1,2}:\d{2})`\s*(.*)$/);
+    const ts = m ? m[1] : '';
+    const body = m ? m[2] : line;
+    let kind = 'note';
+    if (/^STATUS\s*\(/i.test(body)) kind = 'status';
+    else if (/^status:\s/i.test(body)) kind = 'transition';
+    else if (/^commit\s/i.test(body)) kind = 'commit';
+    else if (/^claimed by/i.test(body)) kind = 'claim';
+    else if (/^status requested/i.test(body)) kind = 'request';
+    else if (/EVICTED-DEPENDENCY|FORCED/i.test(body)) kind = 'warn';
+    else if (/^(decision|answered)/i.test(body)) kind = 'decision';
+    return { ts, body, kind };
+  });
+}
+const _BD_KIND_ICON = { status:'\uD83D\uDCCD', transition:'\u2192', commit:'\u2318', claim:'\u270B',
+  request:'\uD83D\uDCAC', decision:'\u2713', warn:'\u26A0', note:'\u00B7' };
+const _BD_KIND_COL = { status:'var(--accent)', transition:'var(--fg)', commit:'var(--green)',
+  claim:'#d29922', request:'var(--accent)', decision:'var(--green)', warn:'var(--red)', note:'var(--dim)' };
+function _bdRenderHistory(item) {
+  const el = document.getElementById('bd-log');
+  const nb = document.getElementById('bd-hist-n');
+  const evs = _bdParseHistory(item.log);
+  if (nb) nb.textContent = evs.length ? ' ' + evs.length : '';
+  if (!el) return;
+  el.innerHTML = evs.length
+    ? '<div class="bd-hist">' + evs.slice().reverse().map(e =>
+        '<div class="bd-hist-row bd-hist-' + e.kind + '">'
+        + '<span class="bd-hist-ic" style="color:' + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span>'
+        + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyCardIds(esc(e.body)) + '</span>'
+        + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div></div>').join('')
+      + '</div>'
+    : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No activity recorded yet.</div>';
+}
+function _bdRenderStatusBanner(item) {
+  const el = document.getElementById('bd-status-banner');
+  if (!el) return;
+  const evs = _bdParseHistory(item.log).filter(e => e.kind === 'status');
+  const sess = item.session || '';
+  if (evs.length) {
+    const last = evs[evs.length - 1];
+    el.style.display = '';
+    el.innerHTML = '<div class="bd-sb-label">\uD83D\uDCCD Latest status'
+      + (last.ts ? ' \u00B7 ' + esc(last.ts) : '') + '</div>'
+      + '<div class="bd-sb-text">' + _linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, ''))) + '</div>'
+      + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
+  } else if (sess) {
+    el.style.display = '';
+    el.innerHTML = '<div class="bd-sb-empty">No status posted yet.'
+      + ' <button class="btn" style="font-size:0.74rem;min-height:36px;margin-left:6px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDCAC Ask ' + esc(sess) + '</button></div>';
+  } else { el.style.display = 'none'; }
+}
+function _bdCopyLink() {
+  if (!boardDetailId) return;
+  const url = location.origin + location.pathname + '#issue=' + encodeURIComponent(boardDetailId);
+  try { navigator.clipboard.writeText(url); showToast('Link copied: ' + boardDetailId); }
+  catch (e) { showToast(url); }
+}
+
 function boardDetailTab(tab) {
   const editBtn = document.getElementById('bd-tab-edit');
   const previewBtn = document.getElementById('bd-tab-preview');
+  const histBtn = document.getElementById('bd-tab-history');
   const desc = document.getElementById('bd-desc');
   const preview = document.getElementById('bd-preview');
+  const log = document.getElementById('bd-log');
   if (!editBtn || !previewBtn || !desc || !preview) return;
+  [editBtn, previewBtn, histBtn].forEach(bt => bt && bt.classList.remove('active'));
+  if (tab === 'history') {
+    if (histBtn) histBtn.classList.add('active');
+    desc.style.display = 'none'; preview.style.display = 'none';
+    if (log) log.style.display = '';
+    return;
+  }
+  if (log) log.style.display = 'none';
   if (tab === 'preview') {
     editBtn.classList.remove('active');
     previewBtn.classList.add('active');
@@ -51574,7 +51669,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.335';
+const CACHE = 'amux-v0.9.336';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
