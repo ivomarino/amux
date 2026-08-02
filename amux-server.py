@@ -31264,7 +31264,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.362';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.363';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52367,7 +52367,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.362';
+const CACHE = 'amux-v0.9.363';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56335,8 +56335,12 @@ class CCHandler(BaseHTTPRequestHandler):
                                  "session": session, "detail": f"{item_id}: {title}"}
                 # Auto-notify the assignee session if this is an agent task waiting for pickup.
                 # Skip if creator==session (the session created its own task).
+                # 'todo' only (MG/AMUX-2205): backlog is deliberate parking —
+                # a backlog move must stop the claim AND the routing. Dormant
+                # types never route (arming is not an assignment).
                 if (session and owner_type == "agent"
-                        and status in ("todo", "backlog")
+                        and status == "todo"
+                        and (body.get("type") or "") not in ("tripwire", "watch")
                         and creator != session):
                     _notify_session_of_task(session, item_id, title)
                 return self._json(item, 201)
@@ -57042,11 +57046,15 @@ class CCHandler(BaseHTTPRequestHandler):
                         new_session = updated_item.get("session") or ""
                         _prior_status = prior["status"] if prior else None
                         _assigned_now = ("session" in body and (body.get("session") or None) != prior_session)
-                        _entered_queue = (updated_item.get("status") in ("todo", "backlog")
-                                          and _prior_status not in ("todo", "backlog"))
+                        # 'todo' only (MG/AMUX-2205): a doing->backlog park
+                        # fired "New board task assigned" at the mover —
+                        # backlog stops the claim, so it must stop the routing.
+                        _entered_queue = (updated_item.get("status") == "todo"
+                                          and _prior_status != "todo")
                         if (new_session
                                 and updated_item.get("owner_type") == "agent"
-                                and updated_item.get("status") in ("todo", "backlog")
+                                and updated_item.get("status") == "todo"
+                                and (updated_item.get("type") or "") not in ("tripwire", "watch")
                                 and (_assigned_now or _entered_queue)):
                             _notify_session_of_task(new_session, bid, updated_item.get("title", ""))
                     except Exception as _e:
