@@ -218,3 +218,10 @@ behavior; 0 disables the proactive path while keeping resume-dialog handling).
 The pattern under all five: amux WATCHED the model and acted on inference. The
 durable inverse — the model reporting its own state through a real interface —
 is D1's report endpoint; prefer extending it over adding any new scraper.
+
+**D1 exit, extended (2026-08-02):** the board status-request flow
+(`POST /api/board/<id>/status-request` -> session authors a status-update onto
+the card) is the report endpoint applied to WORK STATUS, not just liveness. The
+board is the source of truth because activity flows to it from the session's own
+model; amux never scrapes a terminal or summarizes with a pinned helper to fill
+a card. It compounds: better model -> better status, no harness change.

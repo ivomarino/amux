@@ -24700,6 +24700,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
         <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this session's live progress, searched to this card">&#x2192; session</button>
+        <button id="bd-ask-status" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Ask the owning session to post a status update to this card">&#x1F4AC; Ask status</button>
     </div>
     <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
@@ -28060,6 +28061,18 @@ function _taskIdChip(s) {
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
+async function _askCardStatus(id, sess) {
+  // Ask the owning session to report status onto the board (AMUX-2174). The
+  // session's model authors the answer; amux only routes + records.
+  try {
+    const r = await apiCall(API + '/api/board/' + id + '/status-request', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}) });
+    if (r && r.delivered) showToast('Asked ' + sess + ' to post a status update');
+    else showToast((r && (r.reason || r.message)) || 'Could not reach ' + sess);
+  } catch (e) { showToast('Status request failed'); }
+}
+
 function _openIssue(id) {
   try { history.replaceState({}, '', location.pathname + '#issue=' + encodeURIComponent(id)); } catch (e) {}
   switchView('board');
@@ -30798,7 +30811,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.333';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.335';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42696,6 +42709,11 @@ function openBoardDetail(id) {
       try { closeBoardDetail(); } catch (err) {}
       openPeek(_sess, { query: item.id });
     };
+    const askBtn = document.getElementById('bd-ask-status');
+    if (askBtn) {
+      askBtn.style.display = _sess ? '' : 'none';
+      askBtn.onclick = (e) => { e.stopPropagation(); _askCardStatus(item.id, _sess); };
+    }
   }
   const dueEl = document.getElementById('bd-due');
   if (dueEl) dueEl.value = draft ? (draft.due || '') : (item.due || '');
@@ -51556,7 +51574,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.333';
+const CACHE = 'amux-v0.9.335';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53464,6 +53482,7 @@ class CCHandler(BaseHTTPRequestHandler):
             statuses = {st.get("id"): (st.get("gate") or [])
                         for st in _load_board_statuses()}
             return self._json({
+                "board_is_source_of_truth": "All activity flows TO the card. Ask a session for status with POST /api/board/<id>/status-request (or `amux board ask <id>`); the SESSION answers via status-update, which appends a model-AUTHORED status to the card history. amux routes and records — it does NOT scrape the terminal or summarize with a helper model. This is the durable inverse of watching: as the session's model improves, its status reports improve, for free. A chat reply alone never updates the card; only a status-update does.",
                 "state_capture_best_practices": {
                     "one_status": "A card has ONE status (backlog/todo/doing/review/done/verified/discarded), moved through type-derived gates. Never invent parallel status fields.",
                     "done_ne_verified": "done = implemented/merged. verified = confirmed in prod with evidence. Never mark verified on faith.",
@@ -55529,6 +55548,71 @@ class CCHandler(BaseHTTPRequestHandler):
                      "changed": _j(r["detail"]), "before": _j(r["before"]),
                      "ok": bool(r["ok"])} for r in _rows]})
 
+            # POST /api/board/<id>/status-request {question?} — ask the OWNING
+            # session to report this card's status onto the board (AMUX-2174).
+            # The ethos inverse of scraping (D1): amux does not infer status; it
+            # routes a request and the session's model AUTHORS the answer, so
+            # quality improves as models improve. Board stays the source of
+            # truth because the session pushes its status HERE.
+            sr_m = re.match(r"^/api/board/([A-Za-z0-9_-]+)/status-request$", path)
+            if sr_m and method == "POST":
+                bid = sr_m.group(1)
+                body = self._read_body()
+                q = (body.get("question") or "").strip()[:400]
+                it = _item_by_id(bid)
+                if not it:
+                    return self._json({"error": "item not found"}, 404)
+                sess = (it.get("session") or "").strip()
+                requester = (self.headers.get("X-Amux-Session", "")
+                             or self.headers.get("X-Amux-User-Email", "") or "Ethan").strip()
+                if not sess:
+                    return self._json({"ok": False, "delivered": False,
+                                       "reason": "card has no owning session to ask"}, 409)
+                if not is_running(sess):
+                    # Honest offline path (ethos #7): no faking a live answer.
+                    _last = ""
+                    for _l in reversed((it.get("log") or "").splitlines()):
+                        if "STATUS" in _l or "commit " in _l:
+                            _last = _l.strip(); break
+                    return self._json({"ok": False, "delivered": False,
+                                       "reason": f"session '{sess}' is not running",
+                                       "last_known": _last,
+                                       "hint": "the request is not queued; ask again when the session runs"})
+                _prompt = (f"[amux status request on {bid}: {(it.get('title') or '')[:80]}] "
+                           f"{requester} asks for a status update"
+                           + (f": {q}" if q else "") + ".\n"
+                           f"Reply by running:  amux board status-update {bid} \"<what's done, what's next, any blocker>\"\n"
+                           f"That posts to the BOARD, which is the source of truth — a chat reply alone does not update the card.")
+                # Dispatch the send in the background: send_text can block on the
+                # target's settle state, and an HTTP handler must not hang on it
+                # (the request timed out at 15s in the first live test). The
+                # record and the delivery are both guaranteed; the return is
+                # immediate. defer_if_busy so it lands at the next turn boundary
+                # rather than interrupting a working session mid-task.
+                threading.Thread(target=send_text, args=(sess, _prompt),
+                                 kwargs={"defer_if_busy": True}, daemon=True).start()
+                _append_board_log(bid, f"status requested by {requester}"
+                                       + (f" — \"{q}\"" if q else "") + f" (routed to {sess})")
+                _ilog("board", "status_request", actor=requester, target=bid,
+                      detail={"session": sess, "question": q}, ok=True)
+                return self._json({"ok": True, "delivered": True, "session": sess,
+                                   "message": f"asked {sess} to post a status update to {bid}"})
+
+            # POST /api/board/<id>/status-update {text} — the owning session's
+            # model-authored answer, appended to the card history AND stored as
+            # the card's latest status (AMUX-2174).
+            su_m = re.match(r"^/api/board/([A-Za-z0-9_-]+)/status-update$", path)
+            if su_m and method == "POST":
+                bid = su_m.group(1)
+                body = self._read_body()
+                txt = (body.get("text") or "").strip()[:1200]
+                if not txt:
+                    return self._json({"error": "text required"}, 400)
+                actor = (self.headers.get("X-Amux-Session", "") or "session").strip()
+                _append_board_log(bid, f"STATUS ({actor}): {txt}")
+                _ilog("board", "status_update", actor=actor, target=bid, detail={"text": txt}, ok=True)
+                return self._json({"ok": True, "id": bid})
+
             claim_m = re.match(r"^/api/board/([A-Za-z0-9_-]+)/claim$", path)
             if claim_m and method == "POST":
                 bid = claim_m.group(1)
@@ -55959,12 +56043,19 @@ class CCHandler(BaseHTTPRequestHandler):
                                 if "status" in _chg:
                                     _frm = _audit_prior.get("status") or "?"
                                     _to = _chg["status"]
+                                    # Verbose entry (AMUX-2175): the actor, the
+                                    # transition, and HOW it passed the gate —
+                                    # which criteria were acknowledged, or the
+                                    # force, so the History reads as an audit
+                                    # trail, not a bare diff.
                                     _extra = ""
                                     if body.get("force"):
-                                        _extra = " [forced]"
+                                        _extra = " [FORCED — gate bypassed]"
                                     elif isinstance(body.get("gate_checked"), list) and body.get("gate_checked"):
-                                        _extra = " [gate acked]"
-                                    _append_board_log(bid, f"status: {_frm} \u2192 {_to} (by {_actor}){_extra}")
+                                        _gc = body.get("gate_checked")
+                                        _extra = f" [gate: {', '.join(str(x) for x in _gc[:4])}]"
+                                    _role = "human" if _audit_prior.get("owner_type") != "agent" or _actor == "Ethan" else "session"
+                                    _append_board_log(bid, f"status: {_frm} \u2192 {_to} (by {_actor}/{_role}){_extra}")
                         except Exception as _ae:
                             slog(f"[board] patch audit failed for {bid}: {_ae}")
                     except Exception:

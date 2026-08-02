@@ -927,6 +927,30 @@ cmd_board() {
       echo "$result" | _board_outcome
       return $?
       ;;
+    ask|status-request)
+      # Ask the owning session to report a card's status onto the board.
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board ask <ISSUE-ID> [question]"
+      shift 2>/dev/null || true
+      local q="$*" body result
+      body=$(Q="$q" python3 -c "import os,json;print(json.dumps({'question':os.environ['Q'].strip()}))")
+      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$body" "$AMUX_API/api/board/$id/status-request")
+      echo "$result" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('message') or d.get('reason') or json.dumps(d)); sys.exit(0 if d.get('delivered') else 1)"
+      return $?
+      ;;
+    status-update)
+      # The owning session posts its status to the board (source of truth).
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board status-update <ISSUE-ID> \"<what's done, next, blockers>\""
+      shift 2>/dev/null || true
+      local text="$*"
+      if [[ "$text" == "--stdin" || "$text" == "-" ]]; then text=$(cat); fi
+      [[ -n "$text" ]] || die "status text required"
+      local body result
+      body=$(T="$text" python3 -c "import os,json;print(json.dumps({'text':os.environ['T'].strip()}))")
+      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$body" "$AMUX_API/api/board/$id/status-update")
+      echo "$result" | _board_outcome; return $?
+      ;;
     claim)
       # Atomic claim (the assignment notifications tell every session to run
       # this — it fell through to help and exited 0 until AMUX-2140).
@@ -1164,6 +1188,8 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board add <title>           Create a new todo issue
   amux board claim <ID>            Atomically claim a todo/backlog card for this session
   amux board needsyou <ID>         Mark a card as blocked on the human (surfaces in Needs-you)
+  amux board ask <ID> [question]   Ask the owning session to post a status update
+  amux board status-update <ID> …  (for the owning session) post status to the board
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
