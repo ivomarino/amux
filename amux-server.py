@@ -723,6 +723,56 @@ AUTH_TOKEN = _load_or_create_auth_token()
 # AMUX_ALLOW_AGENT_SESSION_DELETE=1 in ~/.amux/server.env.
 import hashlib as _hashlib
 
+def _health_store_probe(budget_ms: int = 800) -> dict:
+    """Actually touch the board store, so /health can observe what it claims.
+
+    Runs the probe on a worker thread and gives up on the WALL CLOCK rather than
+    waiting for sqlite: during the AC-164 spin the process is at ~100% CPU and a
+    query may never return, and a /health that blocks would be its own outage.
+    Timing out is a RESULT here, not an error — "the store did not answer in
+    800ms" is precisely the fact /health was previously unable to express.
+
+    Never raises: a health endpoint that can fail is one more thing to page on.
+    """
+    out = {"store": "unknown", "store_ms": None}
+    res = {}
+
+    def _probe():
+        t0 = time.time()
+        try:
+            db = get_db()
+            db.execute("SELECT 1").fetchone()
+            # A second, representative read: SELECT 1 never touches a page of
+            # the 132MB db and would stay fast while every real query starved.
+            db.execute("SELECT id FROM issues WHERE deleted IS NULL LIMIT 1").fetchone()
+            res["ms"] = int((time.time() - t0) * 1000)
+        except Exception as e:
+            res["ms"] = int((time.time() - t0) * 1000)
+            res["err"] = str(e)[:120]
+
+    t = threading.Thread(target=_probe, daemon=True)
+    t.start()
+    t.join(budget_ms / 1000.0)
+    if t.is_alive():
+        out["store"] = "hung"
+        out["store_ms"] = budget_ms
+        out["degraded"] = True
+        out["detail"] = (f"board store did not answer within {budget_ms}ms — endpoints backed "
+                         f"by it (/api/board, /api/email/*) are likely hanging right now")
+    elif res.get("err"):
+        out["store"] = "error"
+        out["store_ms"] = res.get("ms")
+        out["degraded"] = True
+        out["detail"] = res["err"]
+    else:
+        out["store_ms"] = res.get("ms")
+        out["store"] = "slow" if (res.get("ms") or 0) > 250 else "ok"
+        if out["store"] == "slow":
+            out["degraded"] = True
+            out["detail"] = "board store responding but slow — spin may be starting"
+    return out
+
+
 _BUILD_ID = None
 
 
@@ -53849,6 +53899,17 @@ class CCHandler(BaseHTTPRequestHandler):
                 "memory_mb": _proc.get("memory_mb", -1),
                 "fd_count": _proc.get("fd_count", -1),
                 "sessions": _proc.get("session_count", -1),
+                # /health USED TO LIE. It answered 200 in 60ms straight through
+                # windows where /api/board and /api/email/* hung indefinitely —
+                # TCP connecting in 2ms, then never returning — because it never
+                # touched the store those endpoints are backed by. Anything
+                # watching it, com.amux.watchdog included, reported amux HEALTHY
+                # while the fleet's shared source of truth was unavailable to
+                # every session, and `amux alert` posts to this same server, so
+                # the fire alarm was down exactly when it was needed (AC-164).
+                # A liveness ping that cannot observe the failure is not a health
+                # check; it is a green light wired to nothing.
+                **_health_store_probe(),
             })
 
         # GET /release-notes — standalone SEO-indexable release notes page
