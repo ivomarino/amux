@@ -10620,6 +10620,24 @@ def _verification_sweep():
         slog(f"[verify-sweep] failed: {e}")
 
 
+def _caller_scope(headers):
+    """(scoped, tags, name) for the requesting SESSION; dashboard/no-header is
+    unscoped (Ethan tag-isolation policy, 2026-08-02): a session sees only
+    same-tag sessions and same-tag board cards; an untagged session sees only
+    itself and its own cards. The dashboard (no X-Amux-Session) sees all."""
+    name = (headers.get("X-Amux-Session") or "").strip()
+    if not name:
+        return (False, set(), "")
+    try:
+        info = get_session_info(name)
+    except Exception:
+        info = None
+    if not info:
+        # Unknown claimant: strictest honest scope — self only.
+        return (True, set(), name)
+    return (True, {t.lower() for t in (info.get("tags") or [])}, name)
+
+
 def _pick_reviewer(exclude_session: str) -> str | None:
     """Least-loaded LIVE agent lane, never the card's own session (throughput
     plan loop 1, Ethan go 2026-08-02): 189 review cards had 2 reviewers
@@ -10660,19 +10678,23 @@ def _pick_reviewer(exclude_session: str) -> str | None:
             "SELECT reviewer, COUNT(*) FROM issues WHERE status='review' "
             "AND deleted IS NULL AND reviewer IS NOT NULL AND reviewer != '' "
             "GROUP BY reviewer").fetchall()}
-        # Same-TAG first (Ethan 14:10: "peer revision should be within the
-        # same tag"): session tags are the human-drawn team boundaries (gtm,
-        # mixpeek, amux...). Then same repo root, then load.
+        # Same-TAG REQUIRED (Ethan, hardened from 14:10's preference): peer
+        # review never crosses tag boundaries, and an UNTAGGED author gets no
+        # external peer at all — tags are the human-drawn trust groups, and
+        # a lane outside yours reviewing your work is exactly the
+        # random/self misroute class, now structural instead of heuristic.
         author_tags = set()
         try:
             author_tags = {t.lower() for t in ((_ai.get("tags") or []) if isinstance(_ai.get("tags"), list) else [])}
         except Exception:
             pass
-        def _tag_rank(cand):
-            ct = {t.lower() for t in (cand.get("tags") or [])}
-            return 0 if (author_tags and ct & author_tags) else 1
+        if not author_tags:
+            return None
+        cands = [c for c in cands
+                 if {t.lower() for t in (c.get("tags") or [])} & author_tags]
+        if not cands:
+            return None
         cands.sort(key=lambda s: (
-            _tag_rank(s),
             0 if (author_root and _root(s.get("dir") or "") == author_root) else 1,
             load.get(s["name"], 0), s["name"]))
         return cands[0]["name"]
@@ -13864,6 +13886,18 @@ def list_sessions() -> list:
     _doing_tasks: dict = {}
     _doing_updated: dict = {}
     _doing_ids: dict = {}      # session -> the doing card's id (AMUX-2165)
+    # Per-session schedule counts for the list card chip (AMUX-2116):
+    # enabled vs disabled at a glance, same numbers the peek tab badges.
+    _sched_counts: dict = {}
+    try:
+        for r in get_db().execute(
+                "SELECT session, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) o, "
+                "SUM(CASE WHEN enabled=1 THEN 0 ELSE 1 END) f FROM schedules "
+                "WHERE deleted IS NULL AND session IS NOT NULL AND session != '' "
+                "GROUP BY session").fetchall():
+            _sched_counts[r["session"]] = (int(r["o"] or 0), int(r["f"] or 0))
+    except Exception:
+        pass
     try:
         for row in get_db().execute(
             "SELECT session, id, title, updated FROM issues "
@@ -14066,6 +14100,8 @@ def list_sessions() -> list:
             # "<title> (ID)" and deep-link into the board (AMUX-2165). Only set
             # when the label IS the board title (source 'board'); '' otherwise.
             "task_board_id": (_doing_ids.get(name, "") if _tsrc == "board" else ""),
+            "sched_on": _sched_counts.get(name, (0, 0))[0],
+            "sched_off": _sched_counts.get(name, (0, 0))[1],
             "task_updated": _bu,
             "task_board_age": int(time.time() - _bu) if (_bt and _bu and not _board_fresh) else 0,
             "tokens": tokens,
@@ -31581,7 +31617,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.377';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.378';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52720,7 +52756,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.377';
+const CACHE = 'amux-v0.9.378';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54301,6 +54337,18 @@ class CCHandler(BaseHTTPRequestHandler):
 
         # GET /api/sessions
         if method == "GET" and path == "/api/sessions":
+            _scoped, _ctags, _cname = _caller_scope(self.headers)
+            if _scoped:
+                # Tag isolation: session callers get the filtered view built
+                # from cache-or-fresh; the raw-json fast path below is
+                # dashboard-only because the payload differs per caller.
+                _data = _sse_cache["sessions"]["data"] or list_sessions()
+                def _vis(x):
+                    if x.get("name") == _cname:
+                        return True
+                    _st = {t.lower() for t in (x.get("tags") or [])}
+                    return bool(_ctags and _st & _ctags)
+                return self._json([x for x in _data if _vis(x)])
             # Shared cache with stale-while-revalidate. Only ONE thread ever
             # runs list_sessions() at a time. Other threads return stale data
             # immediately (if any) or wait briefly then return whatever the
@@ -56568,6 +56616,25 @@ class CCHandler(BaseHTTPRequestHandler):
             # ?done_limit=N  limits returned done/discarded items (default 100, 0=all)
             if method == "GET" and path == "/api/board":
                 done_limit = int(qs.get("done_limit", ["100"])[0])
+                _scoped, _ctags, _cname = _caller_scope(self.headers)
+                if _scoped:
+                    # Tag isolation (Ethan 2026-08-02): a session sees its OWN
+                    # cards plus cards owned by same-tag sessions; untagged
+                    # sees own only. Unowned cards are visible to no session
+                    # caller (they are the human's to route). Dashboard
+                    # (no header) is unfiltered below.
+                    _bd = _sse_cache["board"]["data"] or _load_board(done_limit=done_limit or 100)
+                    _sess_data = _sse_cache["sessions"]["data"] or []
+                    _tagmap = {x.get("name"): {t.lower() for t in (x.get("tags") or [])}
+                               for x in _sess_data}
+                    def _bvis(it):
+                        _own = it.get("session") or ""
+                        if _own == _cname:
+                            return True
+                        if not _own or not _ctags:
+                            return False
+                        return bool(_tagmap.get(_own, set()) & _ctags)
+                    return self._json([it for it in _bd if _bvis(it)])
                 if done_limit == 0:
                     return self._json(_load_board(done_limit=0))
                 # Default done_limit=100 → use the shared SSE board cache
