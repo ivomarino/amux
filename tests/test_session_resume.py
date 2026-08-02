@@ -230,3 +230,35 @@ def test_candidates_empty_when_project_dir_cannot_be_listed(amux_server, project
 
     monkeypatch.setattr(Path, "glob", boom)
     assert amux_server._cc_session_candidates("Amux-gtm", work_dir) == []
+
+
+# ── name derivation ─────────────────────────────────────────────────────────
+
+def test_derives_amux_name_when_meta_is_empty(amux_server):
+    """The crash case. cc_session_name was written only in stop_session(), so
+    any ending that was not a graceful stop — crash, reboot, sleep, server
+    restart — left meta empty and forced a fresh start on a session that was
+    fully resumable. amux always launches with `--name <session name>`, so the
+    name was derivable the whole time."""
+    assert amux_server._resolve_cc_session_name({}, "Amux-gtm") == "Amux-gtm"
+
+
+def test_persisted_meta_name_wins(amux_server):
+    """A /rename inside Claude must still be honoured over the amux name."""
+    assert amux_server._resolve_cc_session_name(
+        {"cc_session_name": "Renamed-By-User"}, "Amux-gtm") == "Renamed-By-User"
+
+
+def test_blank_meta_name_falls_back_to_amux_name(amux_server):
+    """An empty string is not a rename — it is absence, and must not win."""
+    assert amux_server._resolve_cc_session_name(
+        {"cc_session_name": ""}, "Amux-gtm") == "Amux-gtm"
+
+
+def test_derived_name_resolves_to_a_conversation(amux_server, project):
+    """End to end: empty meta, as after a crash, still finds the conversation."""
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    resolved = amux_server._resolve_cc_session_name({}, "Amux-gtm")
+    assert amux_server._cc_session_id_for_name(resolved, work_dir) == \
+        "aaaaaaaa-0000-0000-0000-000000000000"

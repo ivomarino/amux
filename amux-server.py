@@ -3277,6 +3277,19 @@ def _cc_session_id_for_name(session_name: str, work_dir: str) -> str:
     return candidates[0].stem if candidates else ""
 
 
+def _resolve_cc_session_name(meta: dict, name: str) -> str:
+    """Return the Claude-side session name for an amux session.
+
+    amux always launches Claude with `--name <amux session name>`, so this is
+    derivable and never needed persisting. It used to be read from meta alone,
+    and meta was only written in stop_session() — so any ending that was not a
+    graceful stop lost it and forced a fresh start on a resumable session.
+
+    A name persisted in meta still wins, so `/rename` inside Claude is honoured.
+    """
+    return meta.get("cc_session_name") or name
+
+
 # Per-session token cache — refreshed every 30s, keyed by resolved dir
 _token_cache = {"data": {}, "timestamps": {}, "time": 0}
 _TOKEN_CACHE_TTL = 120
@@ -15449,7 +15462,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
         provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
         _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
         if not _skip_conv_id and provider == "claude":
-            cc_session_name = meta.get("cc_session_name", "")
+            cc_session_name = _resolve_cc_session_name(meta, name)
             conv_id = meta.get("cc_conversation_id", "")
             if cc_session_name and _validate_cc_session_name(cc_session_name):
                 _sid = _cc_session_id_for_name(cc_session_name, work_dir)
@@ -15457,19 +15470,6 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                     # Use UUID to resume — bypasses interactive picker
                     session_flag = f'--resume {_sid}'
                     print(f"[start] {name}: resume={cc_session_name} (uuid={_sid})")
-                elif _cc_session_exists_in_project(cc_session_name, work_dir):
-                    # Multiple sessions with this name — fall back to UUID if available
-                    if conv_id and _uuid_re.match(conv_id):
-                        conv_file = CLAUDE_HOME / "projects" / _project_name(work_dir) / f"{conv_id}.jsonl"
-                        if conv_file.exists():
-                            session_flag = f'--resume {conv_id}'
-                            print(f"[start] {name}: resume via UUID fallback (ambiguous name '{cc_session_name}', uuid={conv_id})")
-                        else:
-                            session_flag = f'--name {shlex.quote(name)}'
-                            print(f"[start] {name}: fresh start (ambiguous name, stale uuid)")
-                    else:
-                        session_flag = f'--name {shlex.quote(name)}'
-                        print(f"[start] {name}: fresh start (ambiguous session name '{cc_session_name}')")
                 else:
                     meta.pop("cc_session_name", None)
                     meta.pop("cc_conversation_id", None)
