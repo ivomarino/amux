@@ -3234,8 +3234,11 @@ def _jsonl_has_messages(path: Path, max_lines: int = 2000) -> bool:
 
 def _cc_session_candidates(session_name: str, work_dir: str) -> list[Path]:
     """Resumable conversation files titled `session_name`, newest first."""
-    proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
-    if not proj_dir.is_dir():
+    try:
+        proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
+        if not proj_dir.is_dir():
+            return []
+    except (OSError, RuntimeError):
         return []
     scored: list[tuple[float, Path]] = []
     try:

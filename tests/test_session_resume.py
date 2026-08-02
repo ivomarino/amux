@@ -203,3 +203,30 @@ def test_candidates_are_ordered_newest_first(amux_server, project):
     add("22222222-0000-0000-0000-000000000000", "S", now - 100)
     got = [p.stem[:8] for p in amux_server._cc_session_candidates("S", work_dir)]
     assert got == ["22222222", "11111111"]
+
+
+def test_candidates_empty_when_project_name_resolution_raises(amux_server, tmp_path, monkeypatch):
+    """A pathological work_dir (e.g. a symlink cycle, or a home directory that
+    can't be determined) can raise RuntimeError out of Path.expanduser()/
+    resolve() inside _project_name. That must not escape into session startup."""
+    monkeypatch.setattr(amux_server, "CLAUDE_HOME", tmp_path)
+
+    def boom(work_dir):
+        raise RuntimeError("symlink cycle")
+
+    monkeypatch.setattr(amux_server, "_project_name", boom)
+    assert amux_server._cc_session_candidates("Amux-gtm", "/some/dir") == []
+
+
+def test_candidates_empty_when_project_dir_cannot_be_listed(amux_server, project, monkeypatch):
+    """A project directory that exists but raises OSError on iteration (e.g.
+    permission denied) must not raise into session startup. Forced via
+    monkeypatch rather than chmod so this passes when run as root too."""
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+
+    def boom(self, pattern):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "glob", boom)
+    assert amux_server._cc_session_candidates("Amux-gtm", work_dir) == []
