@@ -31526,7 +31526,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.373';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.374';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52661,7 +52661,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.373';
+const CACHE = 'amux-v0.9.374';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56569,6 +56569,18 @@ class CCHandler(BaseHTTPRequestHandler):
                         # through instead: correctness beats the cache on the rare
                         # request that collides with a refresh.
                         if bc["data"] is None:
+                            # SINGLE-FLIGHT (second leg of the 2026-08-02
+                            # outage): under sustained fleet writes every
+                            # lock-losing reader built its OWN full board —
+                            # the pile-up returned at 15s within minutes of
+                            # the first fix. Wait for the one builder (their
+                            # build post-dates the invalidating write, so
+                            # read-your-write holds); build ourselves only if
+                            # the wait times out.
+                            for _ in range(200):
+                                time.sleep(0.1)
+                                if bc["json"] and bc["data"] is not None:
+                                    return self._json_raw(bc["json"], etag=_cache_etag(bc))
                             return self._json(_load_board())
                         if bc["json"]:
                             return self._json_raw(bc["json"], etag=_cache_etag(bc))
@@ -57117,9 +57129,18 @@ class CCHandler(BaseHTTPRequestHandler):
                         # self-acking its own review is exactly the voluntary-only
                         # cross-checking this field exists to replace. force stays
                         # the logged escape.
+                        # The `status == "review"` condition used to be here and was
+                        # a silent bypass: the requirement only fired when the card
+                        # was ALREADY in review, so an author could close their own
+                        # reviewer-gated card by never entering it — doing ->
+                        # verified skipped the check entirely. AMUX-2217 reached
+                        # `verified` naming a reviewer who never acked it, and the
+                        # peer-review routing now being built assumes this field
+                        # binds. A gate that any author can step around by choosing
+                        # a different transition is a gate that cannot fail.
+                        # Now: a reviewer, once set, is required for ANY close.
                         _rev = (gate_item.get("reviewer") or "").strip()
-                        if (_rev and gate_item.get("status") == "review"
-                                and new_status in ("done", "verified")
+                        if (_rev and new_status in ("done", "verified")
                                 and not body.get("force")):
                             _acker = (self.headers.get("X-Amux-Session", "") or "").strip()
                             if _acker != _rev:
