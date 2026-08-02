@@ -25909,6 +25909,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div id="channel-thread" class="channel-thread"></div>
     <form class="channel-input-row" onsubmit="event.preventDefault(); channelSend();">
       <textarea id="channel-input" class="channel-input" placeholder="Message..." rows="1"
+        oninput="try{localStorage.setItem('amux_draft_channel_'+(_channelMe||'')+'_'+(_channelOther||''),this.value)}catch(e){}"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();channelSend();}"></textarea>
       <button type="submit" class="btn primary" id="channel-send-btn">Send</button>
     </form>
@@ -31331,7 +31332,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.368';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.369';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -33520,6 +33521,12 @@ function channelOpen(me, other, prefillText) {
   }
   _channelMe = me;
   _channelOther = other;
+  // Restore any offline-typed draft for this pair (AMUX-2209)
+  try {
+    const _cd = localStorage.getItem('amux_draft_channel_' + me + '_' + other);
+    const _ci = document.getElementById('channel-input');
+    if (_cd && _ci && !prefillText) setTimeout(() => { if (!_ci.value) _ci.value = _cd; }, 50);
+  } catch (e) {}
   _channelLastTs = 0;
   document.getElementById('channel-header-pair').textContent = me + ' ↔ ' + other;
   document.getElementById('channel-thread').innerHTML =
@@ -33613,6 +33620,7 @@ async function channelSend() {
   const text = inp.value.trim();
   if (!text) return;
   inp.value = '';
+  try { localStorage.removeItem('amux_draft_channel_' + (_channelMe||'') + '_' + (_channelOther||'')); } catch (e) {}
   inp.style.height = 'auto';
   const btn = document.getElementById('channel-send-btn');
   btn.disabled = true;
@@ -43223,7 +43231,16 @@ async function saveBoardEdit() {
 // ── Board detail (full-screen) ──
 let boardDetailId = null;
 let boardDetailStatus = 'todo';
-const _boardDrafts = {};  // item id → { title, desc, session, status, due }
+// Persisted to localStorage (AMUX-2209): board-detail edits typed OFFLINE
+// used to live only in memory — a reload or iOS killing the backgrounded PWA
+// destroyed them. Hydrated at boot, saved on every draft write.
+const _boardDrafts = (function() {
+  try { return JSON.parse(localStorage.getItem('amux_board_drafts') || '{}') || {}; }
+  catch (e) { return {}; }
+})();
+function _boardDraftsPersist() {
+  try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
+}
 
 function openBoardDetail(id) {
   const item = boardItems.find(i => i.id === id);
@@ -43424,8 +43441,10 @@ function closeBoardDetail() {
       // Only save draft if something actually differs from saved state
       if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '')) {
         _boardDrafts[boardDetailId] = { title: t, desc: d, session: s, status: st, due, due_time };
+        _boardDraftsPersist();
       } else {
         delete _boardDrafts[boardDetailId];
+        _boardDraftsPersist();
       }
     }
   }
@@ -52448,7 +52467,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.368';
+const CACHE = 'amux-v0.9.369';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
