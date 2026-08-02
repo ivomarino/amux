@@ -74,7 +74,15 @@ jobs:
           # instantly, forever. restartCount reached 4318, the churn saturated
           # dockerd, `docker ps` began timing out, sshd starved, and the host
           # went dark for an hour (AC-162/AC-163). One missing rsync line.
-          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'mkdir -p /opt/amux-cloud/app/scripts'
+          # The path is currently a DIRECTORY (docker's bind-mount artifact), and
+          # rsyncing a file onto a directory path puts the file INSIDE it —
+          # .../watchdog.py/watchdog.py — which is still not a module. Clear the
+          # directory first. Scoped to exactly this path and only when it IS a
+          # directory, so this can never remove a real file.
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 '
+            p=/opt/amux-cloud/app/scripts/watchdog.py
+            if [ -d "$p" ]; then echo "clearing stale DIRECTORY at $p (docker bind-mount artifact)"; rm -rf "$p"; fi
+            mkdir -p /opt/amux-cloud/app/scripts'
           rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" scripts/watchdog.py \
             root@34.121.177.76:/opt/amux-cloud/app/scripts/watchdog.py
           ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
