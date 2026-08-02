@@ -13193,7 +13193,30 @@ def _has_running_subagent(raw_output: str) -> bool:
     return False
 
 
-def _detect_session_status(name: str, raw_output: str) -> str:
+def _detect_gemini_status(raw_output: str) -> str:
+    """Gemini-CLI state from its rendered UI (sherpa-execution, 2026-08-02:
+    provider=gemini sessions sat status='' FOREVER — the Claude-pattern
+    scraper matches nothing in Gemini's frame, so the lane never emitted an
+    idle event and pickup/steering/nudges all skipped it; it answered direct
+    messages while being invisible to every loop. D1-class: the scraper is
+    the fallback control plane and it only spoke one provider's UI.)
+    Markers from the live pane: the empty-input placeholder ('Type your
+    message') is definitive IDLE — it renders only when input is empty and
+    nothing is generating; 'esc to cancel' renders only DURING generation."""
+    tail = _STRIP_ANSI.sub("", raw_output or "")[-2500:]
+    if re.search(r"esc to cancel|\(esc\s", tail, re.I):
+        return "active"
+    if "Type your message" in tail:
+        return "idle"
+    return ""
+
+
+def _detect_session_status(name: str, raw_output: str, provider: str = "claude") -> str:
+    if provider == "gemini":
+        g = _detect_gemini_status(raw_output)
+        if g == "active":
+            _status_last_active[name] = time.monotonic()
+        return g
     raw = _detect_claude_status(raw_output)
     now = time.monotonic()
     if raw == "active":
@@ -13959,7 +13982,7 @@ def list_sessions() -> list:
             lines = [l for l in raw.splitlines() if l.strip()]
             preview = strip_ansi(lines[-1][:120]) if lines else ""
             if running:
-                status = _detect_session_status(name, raw)
+                status = _detect_session_status(name, raw, provider=cfg.get("CC_PROVIDER", "claude"))
                 # A fresh self-report from the harness's own hooks beats pane
                 # inference — the hook KNOWS the turn ended; the regex guesses.
                 _rep = _session_reported.get(name)
@@ -31652,7 +31675,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.379';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.380';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52791,7 +52814,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.379';
+const CACHE = 'amux-v0.9.380';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
