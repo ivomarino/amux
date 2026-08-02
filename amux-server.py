@@ -5419,6 +5419,16 @@ def _rate_limit_auto_respond():
                 continue
             if now - _rate_limit_last_responded.get(name, 0) < _RATE_LIMIT_COOLDOWN:
                 continue
+            # Already handled: if we already pressed "1" and recorded a
+            # reset_at in the future, skip the expensive tmux capture.
+            # Re-pressing "1" is destructive: the menu text lingers in
+            # scrollback and re-matches, sending "1" as user input which
+            # triggers another rate-limit cycle (CPU hot-loop).
+            _existing_actions = _session_auto_actions.get(name)
+            if _existing_actions:
+                _ra = _existing_actions.get("rate_limit_reset_at")
+                if _ra and _ra > now and not _existing_actions.get("rate_limit_credits"):
+                    continue
             # 300 lines is enough to catch the reset-time line, which can
             # appear ~10-20 lines above the menu in Claude Code's UI.
             raw = tmux_capture(name, 300)
