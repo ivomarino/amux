@@ -21498,6 +21498,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-top: 1px solid var(--border); }
   .focus-actions .btn { min-height: 44px; flex: 1 1 auto; }
   @media (max-width: 600px) { .focus-actions .btn { flex: 1 1 40%; } .focus-title { font-size: 1.05rem; } }
+  .review-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .rv-stat { background: var(--surface-2, var(--bg-2)); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; text-align: center; }
+  .rv-stat-n { font-size: 1.25rem; font-weight: 700; color: var(--fg); }
+  .rv-stat-l { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-top: 2px; }
+  .rv-digest { background: var(--surface-2, var(--bg-2)); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; }
+  .rv-digest h1 { font-size: 1.15rem; } .rv-digest h2 { font-size: 1rem; margin-top: 16px; } .rv-digest h3 { font-size: 0.9rem; }
+  .rv-table-wrap { overflow-x: auto; }
+  .rv-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .rv-table th, .rv-table td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .rv-table th:first-child, .rv-table td:first-child { text-align: left; }
+  .rv-table tbody tr:hover { background: var(--border); }
   .bf-menu { position: fixed; z-index: 120; background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); padding: 10px 12px;
     max-height: 60vh; overflow-y: auto; min-width: 250px; max-width: 330px; }
@@ -23506,6 +23517,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-map" onclick="switchView('map')"><span class="tab-ico">◈</span><span class="tab-lbl">Map</span></button>
   <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
   <button id="tab-cost" onclick="switchView('cost')"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
+  <button id="tab-review" onclick="switchView('review')"><span class="tab-ico">&#x1F4CA;</span><span class="tab-lbl">Review</span></button>
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
@@ -24016,6 +24028,21 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <span id="cost-updated" style="font-size:0.7rem;color:var(--dim);"></span>
   </div>
   <div id="cost-body"><div style="color:var(--dim);padding:24px;">Loading…</div></div>
+</div>
+
+<!-- Weekly Review view (AMUX-2179) -->
+<div id="review-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;padding:14px 16px 60px;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+    <h2 style="margin:0;font-size:1.1rem;">Weekly Review</h2>
+    <select id="review-days" onchange="_reviewLoad()" style="font-size:0.8rem;padding:4px 8px;">
+      <option value="7">Last 7 days</option>
+      <option value="14">Last 14 days</option>
+      <option value="30">Last 30 days</option>
+    </select>
+    <button class="btn" onclick="_reviewLoad()" style="font-size:0.78rem;">&#x21BB; Refresh</button>
+  </div>
+  <div id="review-totals" class="review-totals"></div>
+  <div id="review-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
 </div>
 
 <!-- Metrics view -->
@@ -30830,7 +30857,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.337';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.338';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -39433,11 +39460,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
-  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'review', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'review', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
   // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
+  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -39452,6 +39479,7 @@ function switchView(view) {
   if (view === 'map') { _mapLoad(); _mapInit(); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); } // always refresh on tab switch
   if (view === 'cost') _costLoad();
+  if (view === 'review') _reviewLoad();
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
   if (view === 'journal') _journalInit();
   if (view === 'habits') _habitsLoad();
@@ -47356,6 +47384,56 @@ function _costRender(d, opts) {
   html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that session; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
   return html;
 }
+async function _reviewLoad() {
+  const days = document.getElementById('review-days')?.value || '7';
+  const totalsEl = document.getElementById('review-totals');
+  const bodyEl = document.getElementById('review-body');
+  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--dim);padding:20px;">Loading…</div>';
+  try {
+    const [wk, dg] = await Promise.all([
+      fetch(API + '/api/review/week?days=' + days).then(r => r.json()),
+      fetch(API + '/api/review/digest').then(r => r.json()).catch(() => ({})),
+    ]);
+    const t = wk.totals || {};
+    const stat = (n, l) => '<div class="rv-stat"><div class="rv-stat-n">' + n + '</div><div class="rv-stat-l">' + l + '</div></div>';
+    if (totalsEl) totalsEl.innerHTML =
+      stat((t.messages||0).toLocaleString(), 'your messages')
+      + stat((t.cards_created||0).toLocaleString(), 'cards')
+      + stat((t.cards_verified||0) + ' / ' + (t.cards_done||0), 'verified / done')
+      + stat((t.tokens||0) >= 1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens')
+      + stat('$' + (t.cost_usd||0).toLocaleString(), 'model spend')
+      + stat(t.active_sessions||0, 'active lanes');
+    // The model-authored epic synthesis (the committed weekly doc) is the
+    // high-level story; the per-lane table is the exact join beneath it.
+    let html = '';
+    if (dg && dg.markdown) {
+      html += '<div class="rv-digest md-content">' + renderMarkdown(dg.markdown) + '</div>';
+    } else {
+      html += '<div style="color:var(--dim);padding:12px 0;">No synthesis doc yet — the weekly job writes one each Monday, or run it now.</div>';
+    }
+    html += '<h3 style="margin:20px 0 8px;font-size:0.95rem;">By lane</h3>';
+    html += '<div class="rv-table-wrap"><table class="rv-table"><thead><tr>'
+      + '<th>Lane</th><th>Your msgs</th><th>Cards</th><th>Verified</th><th>Tokens</th><th>$</th></tr></thead><tbody>';
+    (wk.per_session || []).filter(r => r.messages || r.cards_created).forEach(r => {
+      html += '<tr onclick="_reviewLane(\'' + escJs(r.session) + '\')" style="cursor:pointer;">'
+        + '<td>' + esc(r.session) + '</td>'
+        + '<td>' + r.messages + '</td>'
+        + '<td>' + r.cards_created + '</td>'
+        + '<td>' + r.cards_verified + '</td>'
+        + '<td>' + ((r.tokens||0) >= 1e6 ? (r.tokens/1e6).toFixed(1)+'M' : (r.tokens||0).toLocaleString()) + '</td>'
+        + '<td>$' + (r.cost_usd||0).toLocaleString() + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+    if (bodyEl) bodyEl.innerHTML = html;
+  } catch (e) {
+    if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load review.</div>';
+  }
+}
+function _reviewLane(sess) {
+  // Drill from a lane into its messages (what you asked it this week).
+  switchView('messages'); setTimeout(() => { try { _messagesLoad(true, sess); } catch(e) {} }, 200);
+}
+
 function _costLoad() {
   const days = document.getElementById('cost-days')?.value || '7';
   const body = document.getElementById('cost-body');
@@ -51669,7 +51747,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.337';
+const CACHE = 'amux-v0.9.338';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56699,6 +56777,19 @@ class CCHandler(BaseHTTPRequestHandler):
         # left to the consumer's model (a scheduled session summarizes this
         # into themes) — the endpoint supplies the exact numbers, not the
         # judgment, so it stays right and improves as models improve.
+        # GET /api/review/digest — the latest committed weekly-review markdown
+        # (the model-authored epic synthesis), for the Review tab to render.
+        if method == "GET" and path == "/api/review/digest":
+            try:
+                d = CC_DIR_ROOT if False else Path(__file__).resolve().parent / "docs" / "weekly-review"
+                files = sorted(d.glob("*.md")) if d.is_dir() else []
+                if not files:
+                    return self._json({"markdown": "", "file": ""})
+                latest = files[-1]
+                return self._json({"markdown": latest.read_text()[:20000], "file": latest.name})
+            except Exception as e:
+                return self._json({"markdown": "", "error": str(e)[:200]})
+
         if method == "GET" and path == "/api/review/week":
             try:
                 days = max(1, min(90, int(qs.get("days", ["7"])[0])))
