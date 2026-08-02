@@ -3232,52 +3232,46 @@ def _jsonl_has_messages(path: Path, max_lines: int = 2000) -> bool:
     return False
 
 
-def _cc_session_exists_in_project(session_name: str, work_dir: str) -> bool:
-    """Check if a Claude Code session with this name exists in the project directory."""
+def _cc_session_candidates(session_name: str, work_dir: str) -> list[Path]:
+    """Resumable conversation files titled `session_name`, newest first."""
     proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
     if not proj_dir.is_dir():
-        return False
+        return []
+    scored: list[tuple[float, Path]] = []
     try:
         for jf in proj_dir.glob("*.jsonl"):
             try:
-                first_line = jf.open().readline()
-                if not first_line:
+                if _cc_session_title(jf) != session_name:
                     continue
-                rec = json.loads(first_line)
-                if rec.get("customTitle") == session_name or rec.get("sessionName") == session_name:
-                    return True
-            except Exception:
+                if not _jsonl_has_messages(jf):
+                    continue
+                scored.append((jf.stat().st_mtime, jf))
+            except OSError:
                 continue
-    except Exception:
-        pass
-    return False
+    except OSError:
+        return []
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [p for _, p in scored]
+
+
+def _cc_session_exists_in_project(session_name: str, work_dir: str) -> bool:
+    """Check if a resumable Claude Code session with this name exists."""
+    return bool(_cc_session_candidates(session_name, work_dir))
 
 
 def _cc_session_id_for_name(session_name: str, work_dir: str) -> str:
-    """Return the UUID of a uniquely-named Claude Code session, or '' if ambiguous/missing.
+    """Return the UUID of the most recent resumable session with this name, or ''.
 
-    When exactly one session matches, return its UUID so we can --resume <uuid>
-    (which bypasses the interactive picker). When multiple match, return '' to
-    force a fresh --name start instead of opening the picker."""
-    proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
-    if not proj_dir.is_dir():
-        return ""
-    matches = []
-    try:
-        for jf in proj_dir.glob("*.jsonl"):
-            try:
-                first_line = jf.open().readline()
-                if not first_line:
-                    continue
-                rec = json.loads(first_line)
-                if rec.get("customTitle") == session_name or rec.get("sessionName") == session_name:
-                    sid = rec.get("sessionId", jf.stem)
-                    matches.append(sid)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return matches[0] if len(matches) == 1 else ""
+    Multiple matches are not genuinely ambiguous: two *live* amux sessions
+    cannot share a name within one install and project directory, so extra
+    matches are always older incarnations of the same logical session.
+
+    Requiring a unique match (as this did) was self-defeating — every fresh
+    start wrote another identically-named conversation, so the second failure
+    guaranteed all subsequent ones. Taking the newest breaks that spiral.
+    """
+    candidates = _cc_session_candidates(session_name, work_dir)
+    return candidates[0].stem if candidates else ""
 
 
 # Per-session token cache — refreshed every 30s, keyed by resolved dir

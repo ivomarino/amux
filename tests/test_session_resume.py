@@ -118,3 +118,88 @@ def test_has_messages_false_for_snapshot_only(amux_server, tmp_path):
 
 def test_has_messages_false_for_missing_file(amux_server, tmp_path):
     assert amux_server._jsonl_has_messages(tmp_path / "nope.jsonl") is False
+
+
+# ── name → conversation id ──────────────────────────────────────────────────
+
+@pytest.fixture
+def project(amux_server, tmp_path, monkeypatch):
+    """Build a fake ~/.claude/projects/<slug>/ and return a writer + work_dir."""
+    monkeypatch.setattr(amux_server, "CLAUDE_HOME", tmp_path)
+    work_dir = "/Users/someone/Projects/demo"
+    proj = tmp_path / "projects" / amux_server._project_name(work_dir)
+    proj.mkdir(parents=True)
+
+    def add(uuid, title, mtime, with_messages=True):
+        f = proj / f"{uuid}.jsonl"
+        entries = _header(title) + ([_msg()] if with_messages else
+                                    [{"type": "file-history-snapshot"}])
+        _write_jsonl(f, entries)
+        os.utime(f, (mtime, mtime))
+        return f
+
+    return add, work_dir
+
+
+def test_resolves_title_recorded_on_line_two(amux_server, project):
+    """End-to-end for the line-1 bug: nothing resolved before this."""
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    assert amux_server._cc_session_id_for_name("Amux-gtm", work_dir) == \
+        "aaaaaaaa-0000-0000-0000-000000000000"
+
+
+def test_many_same_named_sessions_resolve_to_newest(amux_server, project):
+    """The death spiral: each fresh start added another 'Amux-gtm' conversation,
+    and the old code required exactly one match — so once it had failed twice it
+    could never succeed again. Newest wins instead."""
+    add, work_dir = project
+    now = time.time()
+    add("11111111-0000-0000-0000-000000000000", "Amux-gtm", now - 500_000)
+    add("22222222-0000-0000-0000-000000000000", "Amux-gtm", now - 100_000)
+    add("33333333-0000-0000-0000-000000000000", "Amux-gtm", now - 10)
+    add("44444444-0000-0000-0000-000000000000", "Amux-gtm", now - 200_000)
+    assert amux_server._cc_session_id_for_name("Amux-gtm", work_dir) == \
+        "33333333-0000-0000-0000-000000000000"
+
+
+def test_snapshot_only_files_are_not_resume_targets(amux_server, project):
+    """A newer snapshot-only file must not beat an older real conversation."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", now - 1000)
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", now, with_messages=False)
+    assert amux_server._cc_session_id_for_name("Amux-gtm", work_dir) == \
+        "aaaaaaaa-0000-0000-0000-000000000000"
+
+
+def test_no_match_returns_empty(amux_server, project):
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Other-Session", time.time())
+    assert amux_server._cc_session_id_for_name("Amux-gtm", work_dir) == ""
+
+
+def test_missing_project_dir_returns_empty(amux_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(amux_server, "CLAUDE_HOME", tmp_path)
+    assert amux_server._cc_session_id_for_name("Amux-gtm", "/no/such/dir") == ""
+
+
+def test_exists_in_project_sees_line_two_title(amux_server, project):
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    assert amux_server._cc_session_exists_in_project("Amux-gtm", work_dir) is True
+
+
+def test_exists_in_project_false_when_absent(amux_server, project):
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Other", time.time())
+    assert amux_server._cc_session_exists_in_project("Amux-gtm", work_dir) is False
+
+
+def test_candidates_are_ordered_newest_first(amux_server, project):
+    add, work_dir = project
+    now = time.time()
+    add("11111111-0000-0000-0000-000000000000", "S", now - 300)
+    add("22222222-0000-0000-0000-000000000000", "S", now - 100)
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates("S", work_dir)]
+    assert got == ["22222222", "11111111"]
