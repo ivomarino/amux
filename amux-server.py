@@ -21543,17 +21543,44 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-top: 1px solid var(--border); }
   .focus-actions .btn { min-height: 44px; flex: 1 1 auto; }
   @media (max-width: 600px) { .focus-actions .btn { flex: 1 1 40%; } .focus-title { font-size: 1.05rem; } }
-  .review-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; margin-bottom: 16px; }
-  .rv-stat { background: var(--surface-2, var(--bg-2)); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; text-align: center; }
-  .rv-stat-n { font-size: 1.25rem; font-weight: 700; color: var(--fg); }
-  .rv-stat-l { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-top: 2px; }
-  .rv-digest { background: var(--surface-2, var(--bg-2)); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; }
-  .rv-digest h1 { font-size: 1.15rem; } .rv-digest h2 { font-size: 1rem; margin-top: 16px; } .rv-digest h3 { font-size: 0.9rem; }
-  .rv-table-wrap { overflow-x: auto; }
-  .rv-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  .rv-table th, .rv-table td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-  .rv-table th:first-child, .rv-table td:first-child { text-align: left; }
-  .rv-table tbody tr:hover { background: var(--border); }
+  .review-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .rv-click { cursor: pointer; } .rv-click:hover { border-color: var(--accent); }
+  .rv-clear { background: var(--surface-2,var(--bg-2)); border:1px solid var(--green); border-radius:10px; padding:12px 14px; color:var(--green); font-size:0.9rem; margin-bottom:12px; }
+  .rv-blockers { display:flex; flex-direction:column; gap:12px; margin-bottom:18px; }
+  .rv-block { border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
+  .rv-block-needsyou { border-color: var(--red); background: rgba(248,81,73,0.05); }
+  .rv-block-rot { border-color:#d29922; background: rgba(210,153,34,0.05); }
+  .rv-block-h { font-weight:700; font-size:0.9rem; margin-bottom:8px; }
+  .rv-block-n { font-size:0.72rem; color:var(--dim); font-weight:400; }
+  .rv-brow { display:flex; gap:8px; align-items:baseline; padding:6px 4px; border-top:1px solid var(--border); cursor:pointer; flex-wrap:wrap; }
+  .rv-brow:hover { background: var(--border); border-radius:6px; }
+  .rv-bid { font-family:var(--font-mono); font-size:0.72rem; color:var(--accent); flex:0 0 auto; }
+  .rv-btitle { font-size:0.82rem; flex:1; min-width:120px; }
+  .rv-bsess { font-size:0.68rem; color:var(--dim); border:1px solid var(--border); border-radius:6px; padding:0 6px; cursor:pointer; }
+  .rv-bwhy { font-size:0.72rem; color:var(--dim); flex-basis:100%; }
+  .rv-h { margin:18px 0 8px; font-size:0.95rem; }
+  .rv-lanes { display:flex; flex-direction:column; gap:8px; }
+  .rv-lane { border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .rv-lane-h { display:flex; align-items:center; gap:8px; padding:9px 12px; cursor:pointer; flex-wrap:wrap; }
+  .rv-lane-h:hover { background: var(--surface-2,var(--bg-2)); }
+  .rv-dot { width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  .rv-dot-active { background: var(--green); } .rv-dot-idle { background: var(--dim); } .rv-dot-off { background: var(--red); opacity:0.6; }
+  .rv-lane-name { font-weight:600; font-size:0.88rem; cursor:pointer; text-decoration:underline dotted; }
+  .rv-lane-count { font-size:0.72rem; color:var(--dim); }
+  .rv-lane-cost { font-size:0.7rem; color:var(--dim); margin-left:auto; font-family:var(--font-mono); }
+  .rv-lane-x { font-size:1rem; color:var(--dim); width:20px; text-align:center; }
+  .rv-flag { font-size:0.66rem; border-radius:8px; padding:0 6px; font-weight:600; }
+  .rv-flag-you { background: rgba(248,81,73,0.15); color: var(--red); }
+  .rv-flag-rot { background: rgba(210,153,34,0.15); color:#d29922; }
+  .rv-flag-off { background: var(--border); color: var(--dim); }
+  .rv-lane-cur { font-size:0.78rem; padding:4px 12px 8px; color:var(--fg); cursor:pointer; }
+  .rv-lane-cur:hover { color: var(--accent); }
+  .rv-lane-cards { padding:4px 12px 10px; background: var(--surface-2,var(--bg-2)); }
+  .rv-lane-grp-h { font-size:0.66rem; text-transform:uppercase; color:var(--dim); margin:8px 0 3px; letter-spacing:0.05em; }
+  .rv-lane-card { font-size:0.8rem; padding:4px 0; cursor:pointer; border-bottom:1px solid var(--border); }
+  .rv-lane-card:hover { color: var(--accent); }
+  .rv-digest { background: var(--surface-2,var(--bg-2)); border:1px solid var(--border); border-radius:10px; padding:12px 16px; }
+  
   .bf-menu { position: fixed; z-index: 120; background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); padding: 10px 12px;
     max-height: 60vh; overflow-y: auto; min-width: 250px; max-width: 330px; }
@@ -24094,6 +24121,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div id="review-totals" class="review-totals"></div>
   <div id="review-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
+  <details style="margin-top:18px;"><summary style="cursor:pointer;font-size:0.85rem;color:var(--dim);">Weekly narrative (model-authored digest)</summary>
+    <div id="review-digest" class="rv-digest md-content" style="margin-top:10px;"></div>
+  </details>
 </div>
 
 <!-- Metrics view -->
@@ -30913,7 +30943,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.339';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.340';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47440,54 +47470,137 @@ function _costRender(d, opts) {
   html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that session; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
   return html;
 }
+let _reviewExpanded = {};
+let _reviewWeek = null;
 async function _reviewLoad() {
   const days = document.getElementById('review-days')?.value || '7';
   const totalsEl = document.getElementById('review-totals');
   const bodyEl = document.getElementById('review-body');
-  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--dim);padding:20px;">Loading…</div>';
   try {
-    const [wk, dg] = await Promise.all([
-      fetch(API + '/api/review/week?days=' + days).then(r => r.json()),
-      fetch(API + '/api/review/digest').then(r => r.json()).catch(() => ({})),
-    ]);
-    const t = wk.totals || {};
-    const stat = (n, l) => '<div class="rv-stat"><div class="rv-stat-n">' + n + '</div><div class="rv-stat-l">' + l + '</div></div>';
-    if (totalsEl) totalsEl.innerHTML =
-      stat((t.messages||0).toLocaleString(), 'your messages')
-      + stat((t.cards_created||0).toLocaleString(), 'cards')
-      + stat((t.cards_verified||0) + ' / ' + (t.cards_done||0), 'verified / done')
-      + stat((t.tokens||0) >= 1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens')
-      + stat('$' + (t.cost_usd||0).toLocaleString(), 'model spend')
-      + stat(t.active_sessions||0, 'active lanes');
-    // The model-authored epic synthesis (the committed weekly doc) is the
-    // high-level story; the per-lane table is the exact join beneath it.
-    let html = '';
-    if (dg && dg.markdown) {
-      html += '<div class="rv-digest md-content">' + renderMarkdown(dg.markdown) + '</div>';
-    } else {
-      html += '<div style="color:var(--dim);padding:12px 0;">No synthesis doc yet — the weekly job writes one each Monday, or run it now.</div>';
-    }
-    html += '<h3 style="margin:20px 0 8px;font-size:0.95rem;">By lane</h3>';
-    html += '<div class="rv-table-wrap"><table class="rv-table"><thead><tr>'
-      + '<th>Lane</th><th>Your msgs</th><th>Cards</th><th>Verified</th><th>Tokens</th><th>$</th></tr></thead><tbody>';
-    (wk.per_session || []).filter(r => r.messages || r.cards_created).forEach(r => {
-      html += '<tr onclick="_reviewLane(\'' + escJs(r.session) + '\')" style="cursor:pointer;">'
-        + '<td>' + esc(r.session) + '</td>'
-        + '<td>' + r.messages + '</td>'
-        + '<td>' + r.cards_created + '</td>'
-        + '<td>' + r.cards_verified + '</td>'
-        + '<td>' + ((r.tokens||0) >= 1e6 ? (r.tokens/1e6).toFixed(1)+'M' : (r.tokens||0).toLocaleString()) + '</td>'
-        + '<td>$' + (r.cost_usd||0).toLocaleString() + '</td></tr>';
-    });
-    html += '</tbody></table></div>';
-    if (bodyEl) bodyEl.innerHTML = html;
+    // Board + sessions are the SOURCE OF TRUTH (Ethan): render live from them,
+    // not from a static doc. The week endpoint only supplies tokens/cost.
+    if (!Array.isArray(boardItems) || !boardItems.length) { try { await fetchBoard(); } catch(e){} }
+    _reviewWeek = await fetch(API + '/api/review/week?days=' + days).then(r => r.json()).catch(() => null);
+    _reviewRender();
+    fetch(API + '/api/review/digest').then(r => r.json()).then(d => {
+      const el = document.getElementById('review-digest');
+      if (el && d && d.markdown) el.innerHTML = renderMarkdown(d.markdown);
+    }).catch(() => {});
   } catch (e) {
     if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load review.</div>';
   }
 }
-function _reviewLane(sess) {
-  // Drill from a lane into its messages (what you asked it this week).
-  switchView('messages'); setTimeout(() => { try { _messagesLoad(true, sess); } catch(e) {} }, 200);
+function _reviewCostMap() {
+  const m = {};
+  ((_reviewWeek && _reviewWeek.per_session) || []).forEach(r => { m[r.session] = r; });
+  return m;
+}
+function _reviewOpen(items) { return items.filter(i => !i.deleted && !['done','verified','discarded'].includes(_statusCanon(i.status))); }
+function _reviewRender() {
+  const totalsEl = document.getElementById('review-totals');
+  const bodyEl = document.getElementById('review-body');
+  const ix = _bqSessionIndex();
+  const all = (boardItems || []).filter(i => !i.deleted);
+  const open = _reviewOpen(all);
+  const needsyou = _bqFilter(all, 'is:needsyou');
+  const rotting = _bqFilter(all, 'is:rotting');
+  // Blocked by a dependency that is still open
+  const byId = {}; all.forEach(i => byId[i.id] = i);
+  const depBlocked = open.filter(i => (Array.isArray(i.depends_on) ? i.depends_on : []).some(d => {
+    const dc = byId[d]; return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status));
+  }));
+  const t = (_reviewWeek && _reviewWeek.totals) || {};
+  const stat = (n, l, q) => '<div class="rv-stat' + (q ? ' rv-click' : '') + '"' + (q ? ' onclick="_reviewFilter(\'' + escJs(q) + '\')"' : '') + '><div class="rv-stat-n">' + n + '</div><div class="rv-stat-l">' + l + '</div></div>';
+  if (totalsEl) totalsEl.innerHTML =
+      stat(open.length, 'open', '')
+    + stat('<span style="color:var(--red)">' + needsyou.length + '</span>', 'blocked on you', 'needsyou')
+    + stat('<span style="color:#d29922">' + rotting.length + '</span>', 'rotting', 'rotting')
+    + stat((t.cards_verified||0), 'verified ' + (document.getElementById('review-days')?.value||7) + 'd', '')
+    + stat((t.tokens||0) >= 1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens', '')
+    + stat('$' + Math.round(t.cost_usd||0).toLocaleString(), 'spend', '');
+
+  let html = '';
+  // ── BLOCKERS FIRST: the CEO's first question is "what's stuck and why" ──
+  const blkCard = (title, list, kind, why) => {
+    if (!list.length) return '';
+    return '<div class="rv-block rv-block-' + kind + '">'
+      + '<div class="rv-block-h">' + title + ' <span class="rv-block-n">' + list.length + '</span></div>'
+      + list.slice(0, 40).map(i => {
+          const s = ix[i.session];
+          const ask = kind === 'needsyou' ? _focusAsk(i) : (kind === 'dep' ? 'waiting on ' + (Array.isArray(i.depends_on) ? i.depends_on.join(', ') : '') : (s ? 'session idle' : 'no owner'));
+          return '<div class="rv-brow" onclick="openBoardDetail(\'' + escJs(i.id) + '\')">'
+            + '<span class="rv-bid">' + esc(i.id) + '</span>'
+            + '<span class="rv-btitle">' + esc((i.title||'').slice(0,70)) + '</span>'
+            + (i.session ? '<span class="rv-bsess" onclick="event.stopPropagation();openPeek(\'' + escJs(i.session) + '\',{query:\'' + escJs(i.id) + '\'})">' + esc(i.session) + '</span>' : '')
+            + '<span class="rv-bwhy">' + esc(String(ask).slice(0,60)) + '</span></div>';
+        }).join('')
+      + (kind === 'needsyou' && list.length ? '<button class="btn primary" style="margin-top:8px;font-size:0.78rem;" onclick="_focusStart(\'is:needsyou\')">\u26A1 Rapid-fire these</button>' : '')
+      + '</div>';
+  };
+  html += '<div class="rv-blockers">'
+    + blkCard('\uD83D\uDD34 Blocked on you', needsyou, 'needsyou')
+    + blkCard('\u23F8 Blocked by a dependency', depBlocked, 'dep')
+    + blkCard('\uD83D\uDD52 Rotting (idle 7d+)', rotting, 'rot')
+    + '</div>';
+  if (!needsyou.length && !depBlocked.length && !rotting.length)
+    html = '<div class="rv-clear">\u2705 Nothing is blocked — every open card has an active owner.</div>' + html;
+
+  // ── BY LANE: sessions as the workstreams; click to drill ──
+  html += '<h3 class="rv-h">Lanes <span style="color:var(--dim);font-weight:400;font-size:0.8rem;">(click to expand \u00B7 tap name for terminal)</span></h3>';
+  const costs = _reviewCostMap();
+  const bySess = {};
+  open.forEach(i => { (bySess[i.session||'(unowned)'] = bySess[i.session||'(unowned)'] || []).push(i); });
+  const lanes = Object.keys(bySess).map(name => {
+    const cards = bySess[name];
+    const s = ix[name];
+    const doing = cards.filter(c => _statusCanon(c.status)==='doing');
+    const review = cards.filter(c => _statusCanon(c.status)==='review');
+    const ny = cards.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
+    const rot = cards.filter(c => rotting.includes(c));
+    const cw = costs[name] || {};
+    // Verified count this window from the week endpoint
+    return { name, cards, s, doing, review, ny, rot, cw,
+             attention: ny.length*100 + rot.length*10 + (s && !s.running ? 5 : 0) };
+  }).sort((a,b) => b.attention - a.attention || b.cards.length - a.cards.length);
+
+  html += '<div class="rv-lanes">' + lanes.map(L => {
+    const st = L.s ? (L.s.status || (L.s.running ? 'idle' : 'off')) : 'off';
+    const dot = '<span class="rv-dot rv-dot-' + (L.s && L.s.status==='active' ? 'active' : (L.s && L.s.running ? 'idle' : 'off')) + '"></span>';
+    const flags = (L.ny.length ? '<span class="rv-flag rv-flag-you">' + L.ny.length + ' need you</span>' : '')
+      + (L.rot.length ? '<span class="rv-flag rv-flag-rot">' + L.rot.length + ' rotting</span>' : '')
+      + (L.s && !L.s.running ? '<span class="rv-flag rv-flag-off">offline</span>' : '');
+    const cur = L.doing[0];
+    const exp = _reviewExpanded[L.name];
+    let sub = '';
+    if (exp) {
+      const order = ['doing','review','todo','backlog'];
+      sub = '<div class="rv-lane-cards">' + order.map(stt => {
+        const g = L.cards.filter(c => _statusCanon(c.status)===stt);
+        if (!g.length) return '';
+        return '<div class="rv-lane-grp"><div class="rv-lane-grp-h">' + stt + ' (' + g.length + ')</div>'
+          + g.map(c => '<div class="rv-lane-card" onclick="event.stopPropagation();openBoardDetail(\'' + escJs(c.id) + '\')">'
+            + '<span class="rv-bid">' + esc(c.id) + '</span> ' + esc((c.title||'').slice(0,64))
+            + ((c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) ? ' <span class="rv-flag rv-flag-you">you</span>' : '') + '</div>').join('')
+          + '</div>';
+      }).join('') + '</div>';
+    }
+    return '<div class="rv-lane">'
+      + '<div class="rv-lane-h" onclick="_reviewToggle(\'' + escJs(L.name) + '\')">'
+      + dot + '<span class="rv-lane-name" onclick="event.stopPropagation();' + (L.s ? 'openPeek(\'' + escJs(L.name) + '\')' : '') + '">' + esc(L.name) + '</span>'
+      + '<span class="rv-lane-count">' + L.cards.length + ' open</span>' + flags
+      + '<span class="rv-lane-cost">' + (L.cw.tokens ? ((L.cw.tokens/1e6).toFixed(1)+'M \u00B7 $' + Math.round(L.cw.cost_usd||0)) : '') + '</span>'
+      + '<span class="rv-lane-x">' + (exp ? '\u2212' : '+') + '</span></div>'
+      + (cur ? '<div class="rv-lane-cur" onclick="openBoardDetail(\'' + escJs(cur.id) + '\')">\u25B6 ' + esc(cur.id) + ' \u00B7 ' + esc((cur.title||'').slice(0,60)) + '</div>' : '')
+      + sub + '</div>';
+  }).join('') + '</div>';
+
+  if (bodyEl) bodyEl.innerHTML = html;
+}
+function _reviewToggle(name) { _reviewExpanded[name] = !_reviewExpanded[name]; _reviewRender(); }
+function _reviewFilter(q) {
+  if (q === 'needsyou') { _focusStart('is:needsyou'); return; }
+  switchView('board');
+  setTimeout(() => { boardSearchQuery = 'is:' + q; const inp = document.getElementById('board-search'); if (inp) inp.value = boardSearchQuery; _bfSyncHash && _bfSyncHash(); renderBoard(); }, 200);
 }
 
 function _costLoad() {
@@ -51897,7 +52010,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.339';
+const CACHE = 'amux-v0.9.340';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
