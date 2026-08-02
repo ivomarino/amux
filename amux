@@ -1135,10 +1135,11 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
       local id="${1:-}"; shift 2>/dev/null || true
       local msg="$*"
       [[ -n "$id" && -n "$msg" ]] || die "Usage: amux board progress <ISSUE-ID> <message>"
-      # Update board task description
+      # Append progress note to board task description (desc_append preserves prior content;
+      # a plain {"desc":...} REPLACES and silently destroys the card body — see MC-1219)
       curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
-        -d "{\"desc\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg")}" \
+        -d "{\"desc_append\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg")}" \
         "$AMUX_API/api/board/$id" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'— progress noted')" 2>/dev/null
       # Check if task has a gh: tag — if so, post comment to GH issue
       local task_json
