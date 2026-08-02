@@ -509,7 +509,8 @@ def _resolve_cc_session_name(meta: dict, name: str) -> str:
     return meta.get("cc_session_name") or name
 ```
 
-Then in `start_session`, replace line 14922:
+Then in `start_session`, replace the `cc_session_name` assignment (locate it by
+content — Tasks 1 and 2 shifted the line numbers):
 
 ```python
             cc_session_name = meta.get("cc_session_name", "")
@@ -521,9 +522,62 @@ with:
             cc_session_name = _resolve_cc_session_name(meta, name)
 ```
 
-Change nothing else in the branch. The existing not-found path (which pops the
-meta keys and falls back to `--name`) stays correct: with derivation, a pop
-simply means the next start derives the name again.
+- [ ] **Step 3b: Remove the branch Task 2 made unreachable**
+
+**Amendment, ruled by the human partner after Task 2's review.** The plan
+originally said "change nothing else in the branch." That is overridden here:
+Task 2 made one branch of this exact `if/elif` chain dead, and this task is
+already editing the chain.
+
+Task 2 rebuilt `_cc_session_id_for_name` and `_cc_session_exists_in_project` as
+thin wrappers over the same `_cc_session_candidates` call, so each is truthy
+exactly when the other is. That makes the `elif` below unreachable: whenever it
+would be `True`, `_sid` is already truthy and the `if` above it has fired. The
+branch existed to handle an ambiguous name, a state Task 2 deliberately made
+impossible. Delete the whole `elif` clause:
+
+```python
+                elif _cc_session_exists_in_project(cc_session_name, work_dir):
+                    # Multiple sessions with this name — fall back to UUID if available
+                    if conv_id and _uuid_re.match(conv_id):
+                        conv_file = CLAUDE_HOME / "projects" / _project_name(work_dir) / f"{conv_id}.jsonl"
+                        if conv_file.exists():
+                            session_flag = f'--resume {conv_id}'
+                            print(f"[start] {name}: resume via UUID fallback (ambiguous name '{cc_session_name}', uuid={conv_id})")
+                        else:
+                            session_flag = f'--name {shlex.quote(name)}'
+                            print(f"[start] {name}: fresh start (ambiguous name, stale uuid)")
+                    else:
+                        session_flag = f'--name {shlex.quote(name)}'
+                        print(f"[start] {name}: fresh start (ambiguous session name '{cc_session_name}')")
+```
+
+leaving the chain as:
+
+```python
+            if cc_session_name and _validate_cc_session_name(cc_session_name):
+                _sid = _cc_session_id_for_name(cc_session_name, work_dir)
+                if _sid:
+                    # Use UUID to resume — bypasses interactive picker
+                    session_flag = f'--resume {_sid}'
+                    print(f"[start] {name}: resume={cc_session_name} (uuid={_sid})")
+                else:
+                    meta.pop("cc_session_name", None)
+                    meta.pop("cc_conversation_id", None)
+                    _save_meta(name, meta)
+                    session_flag = f'--name {shlex.quote(name)}'
+                    print(f"[start] {name}: fresh start (session '{cc_session_name}' not found in project)")
+```
+
+Nothing else in the enclosing `if not _skip_conv_id and provider == "claude":`
+block changes. In particular **keep** the outer `elif conv_id and
+_uuid_re.match(conv_id):` migration branch that follows. It is still reachable:
+it runs when `cc_session_name` fails `_validate_cc_session_name`, which happens
+for amux session names that do not match `^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$`. Both
+`conv_id` and `_uuid_re` therefore remain in use — do not delete them.
+
+The remaining not-found path stays correct: with derivation, popping the meta
+keys simply means the next start derives the name again.
 
 - [ ] **Step 4: Run the full suite**
 
