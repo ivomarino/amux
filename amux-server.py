@@ -10461,6 +10461,106 @@ def _pickup_next_board_task(session_name: str):
         print(f"[board] pickup failed for {session_name}: {e}", flush=True)
 
 
+def _verification_sweep():
+    """Loop 2 (throughput plan, Ethan go 2026-08-02): done != verified, and
+    NOTHING ever asked the owner to close the gap — 821 done cards, all
+    under a week old, none ever prompted. Once per ~20h, each live session
+    gets ONE message: its 10 oldest done agent-cards, verify with prod
+    evidence via the gates or say on-card why it stays done (an honest
+    terminal state). verify.requested events (durable) stop re-nagging a
+    card within 7 days. The verdict is model-authored by the owner —
+    compounds; amux only routes."""
+    try:
+        db = get_db()
+        now = int(time.time())
+        last = 0
+        try:
+            row = db.execute("SELECT value FROM prefs WHERE key='verify_sweep_last'").fetchone()
+            last = int(json.loads(row[0])) if row else 0
+        except Exception:
+            last = 0
+        if now - last < 20 * 3600:
+            return
+        db.execute("INSERT INTO prefs (key, value) VALUES ('verify_sweep_last', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now),))
+        db.commit()
+        live = [s["name"] for s in list_sessions() if s.get("running") and not s.get("archived")]
+        sent = 0
+        for name in live:
+            rows = db.execute(
+                "SELECT id, title FROM issues i WHERE session=? AND status='done' "
+                "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
+                "AND NOT EXISTS (SELECT 1 FROM session_events e WHERE "
+                "  e.type='verify.requested' AND e.ts > ? AND e.data LIKE '%\"' || i.id || '\"%') "
+                "ORDER BY updated ASC LIMIT 10", (name, now - 7 * 86400)).fetchall()
+            if not rows:
+                continue
+            lst = "\n".join(f"  {r['id']} — {(r['title'] or '')[:70]}" for r in rows)
+            ok, _ = send_text(name,
+                f"[amux verification sweep] {len(rows)} of your done cards await the "
+                f"done→verified gap:\n{lst}\nFor each: move to verified WITH prod "
+                f"evidence via its gates, or append one line on the card saying why it "
+                f"honestly stays done. Never force a gate you cannot satisfy.",
+                defer_if_busy=True)
+            if ok:
+                sent += 1
+                for r in rows:
+                    _emit_event(name, "verify.requested", {"issue": r["id"]},
+                                source="verification-sweep")
+        slog(f"[verify-sweep] batched {sent} session(s)")
+    except Exception as e:
+        slog(f"[verify-sweep] failed: {e}")
+
+
+def _pick_reviewer(exclude_session: str) -> str | None:
+    """Least-loaded LIVE agent lane, never the card's own session (throughput
+    plan loop 1, Ethan go 2026-08-02): 189 review cards had 2 reviewers
+    between them — finished work waited because it was nobody's turn.
+    Deterministic (load, then name) — no model call; the REVIEW itself is the
+    model-judgment step and compounds with better models."""
+    try:
+        live = [s["name"] for s in list_sessions()
+                if s.get("running") and s["name"] != exclude_session
+                and not s.get("archived")]
+        if not live:
+            return None
+        db = get_db()
+        load = {r[0]: r[1] for r in db.execute(
+            "SELECT reviewer, COUNT(*) FROM issues WHERE status='review' "
+            "AND deleted IS NULL AND reviewer IS NOT NULL AND reviewer != '' "
+            "GROUP BY reviewer").fetchall()}
+        live.sort(key=lambda n: (load.get(n, 0), n))
+        return live[0]
+    except Exception:
+        return None
+
+
+def _auto_assign_reviewer(bid: str, item: dict, notify: bool = True) -> str | None:
+    """Assign a peer reviewer to a review card that has none. Returns the
+    reviewer or None. The notice tells the reviewer the honest contract:
+    ack review->done via the gates, or write back what blocks."""
+    rev = _pick_reviewer(item.get("session") or "")
+    if not rev:
+        return None
+    try:
+        db = get_db()
+        db.execute("UPDATE issues SET reviewer=? WHERE id=? AND (reviewer IS NULL OR reviewer='')",
+                   (rev, bid))
+        db.commit()
+        _append_board_log(bid, f"reviewer auto-assigned: {rev} (peer-review loop)")
+        _board_changed()
+        if notify:
+            send_text(rev, f"[amux peer-review] You are the reviewer for {bid} — "
+                           f"{(item.get('title') or '')[:100]}. Read it "
+                           f"(#issue={bid}), then either ack review→done honestly "
+                           f"via its gates, or comment on the card what blocks. "
+                           f"Never ack what you cannot verify.", defer_if_busy=True)
+        return rev
+    except Exception as e:
+        slog(f"[review-loop] assign failed for {bid}: {e}")
+        return None
+
+
 def _notify_session_of_task(session_name: str, item_id: str, title: str):
     """Push a one-line task pickup notice into the target session's tmux pane.
     Idempotent per (session, item_id): we atomically flip the issue's `notified`
@@ -31332,7 +31432,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.369';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.370';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52467,7 +52567,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.369';
+const CACHE = 'amux-v0.9.370';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57164,6 +57264,15 @@ class CCHandler(BaseHTTPRequestHandler):
                         new_session = updated_item.get("session") or ""
                         _prior_status = prior["status"] if prior else None
                         _assigned_now = ("session" in body and (body.get("session") or None) != prior_session)
+                        # Loop 1 (throughput plan): entering review with no
+                        # reviewer -> a live peer is assigned automatically.
+                        if (updated_item.get("status") == "review"
+                                and _prior_status != "review"
+                                and updated_item.get("owner_type") == "agent"
+                                and not (updated_item.get("reviewer") or "").strip()):
+                            threading.Thread(target=_auto_assign_reviewer,
+                                             args=(bid, dict(updated_item)),
+                                             daemon=True).start()
                         # 'todo' only (MG/AMUX-2205): a doing->backlog park
                         # fired "New board task assigned" at the mover —
                         # backlog stops the claim, so it must stop the routing.
@@ -62629,6 +62738,9 @@ def _cleanup_recordings():
 
 
 def _db_maintenance():
+    # Loop 2 of the throughput plan: daily verification batches (pref-gated
+    # inside — cheap no-op on every other maintenance pass).
+    _verification_sweep()
     # Single-char-tag canary (studio-plg, SP-539): a string tags value once
     # char-exploded silently, and the retro sweep's ">=5 singles" threshold was
     # blind to short tags ("wip" -> 3 singles). The STRUCTURAL predicate — a
