@@ -21545,6 +21545,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-top: 1px solid var(--border); }
   .focus-actions .btn { min-height: 44px; flex: 1 1 auto; }
   @media (max-width: 600px) { .focus-actions .btn { flex: 1 1 40%; } .focus-title { font-size: 1.05rem; } }
+  .msg-mode-btn { font-size:0.82rem; padding:6px 14px; border:1px solid var(--border); background:transparent; color:var(--dim); border-radius:8px; cursor:pointer; min-height:40px; }
+  .msg-mode-btn.active { border-color:var(--accent); color:var(--accent); background:var(--accent-dim,rgba(199,91,46,0.12)); font-weight:600; }
+  .tr-theme { border:1px solid var(--border); border-radius:10px; margin-bottom:8px; overflow:hidden; }
+  .tr-theme-h { display:flex; align-items:center; gap:8px; padding:10px 12px; cursor:pointer; flex-wrap:wrap; }
+  .tr-theme-h:hover { background:var(--surface-2,var(--bg-2)); }
+  .tr-theme-x { width:18px; color:var(--dim); font-size:1rem; }
+  .tr-theme-name { font-weight:700; font-size:0.9rem; }
+  .tr-theme-meta { font-size:0.72rem; color:var(--dim); }
+  .tr-theme-status { font-size:0.72rem; margin-left:auto; }
+  .tr-sessions { display:flex; gap:5px; flex-wrap:wrap; padding:0 12px 10px; }
+  .tr-sess { font-size:0.68rem; color:var(--accent); border:1px solid var(--border); border-radius:8px; padding:0 7px; cursor:pointer; }
+  .tr-cards, .tr-evidence { padding:4px 12px 10px; background:var(--surface-2,var(--bg-2)); }
+  .tr-sub { font-size:0.66rem; text-transform:uppercase; color:var(--dim); letter-spacing:0.05em; margin:8px 0 4px; }
+  .tr-card { font-size:0.8rem; padding:4px 0; cursor:pointer; border-bottom:1px solid var(--border); }
+  .tr-card:hover { color:var(--accent); }
+  .tr-msg { padding:6px 0; border-bottom:1px solid var(--border); }
+  .tr-msg-sess { font-size:0.68rem; color:var(--accent); font-weight:600; }
+  .tr-msg-t { font-size:0.8rem; color:var(--fg); line-height:1.45; margin-top:2px; }
   .review-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 8px; margin-bottom: 14px; }
   .rv-click { cursor: pointer; } .rv-click:hover { border-color: var(--accent); }
   .rv-clear { background: var(--surface-2,var(--bg-2)); border:1px solid var(--green); border-radius:10px; padding:12px 14px; color:var(--green); font-size:0.9rem; margin-bottom:12px; }
@@ -23598,7 +23616,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-map" onclick="switchView('map')"><span class="tab-ico">◈</span><span class="tab-lbl">Map</span></button>
   <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
   <button id="tab-cost" onclick="switchView('cost')"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
-  <button id="tab-review" onclick="switchView('review')"><span class="tab-ico">&#x1F4CA;</span><span class="tab-lbl">Review</span></button>
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
@@ -24112,22 +24129,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Weekly Review view (AMUX-2179) -->
-<div id="review-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;padding:14px 16px 60px;">
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
-    <h2 style="margin:0;font-size:1.1rem;">Weekly Review</h2>
-    <select id="review-days" onchange="_reviewLoad()" style="font-size:0.8rem;padding:4px 8px;">
-      <option value="7">Last 7 days</option>
-      <option value="14">Last 14 days</option>
-      <option value="30">Last 30 days</option>
-    </select>
-    <button class="btn" onclick="_reviewLoad()" style="font-size:0.78rem;">&#x21BB; Refresh</button>
-  </div>
-  <div id="review-totals" class="review-totals"></div>
-  <div id="review-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
-  <details style="margin-top:18px;"><summary style="cursor:pointer;font-size:0.85rem;color:var(--dim);">Weekly narrative (model-authored digest)</summary>
-    <div id="review-digest" class="rv-digest md-content" style="margin-top:10px;"></div>
-  </details>
-</div>
+
 
 <!-- Metrics view -->
 <div id="metrics-view" style="display:none;flex-direction:row;overflow:hidden;">
@@ -24270,7 +24272,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       line-height:1.45; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
     #messages-view .msg-locate { flex-shrink:0; font-size:0.72rem; padding:4px 10px; align-self:center; }
   </style>
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-shrink:0;flex-wrap:wrap;">
+  <div style="display:flex;gap:6px;margin-bottom:10px;flex-shrink:0;">
+    <button class="msg-mode-btn active" id="msgmode-messages" onclick="_msgSetMode('messages')">Messages</button>
+    <button class="msg-mode-btn" id="msgmode-trends" onclick="_msgSetMode('trends')">&#x1F4C8; Trends</button>
+    <select id="trends-days" onchange="_trendsLoad()" style="display:none;font-size:0.8rem;padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin-left:auto;">
+      <option value="7">Last 7 days</option>
+      <option value="14">Last 14 days</option>
+      <option value="30">Last 30 days</option>
+    </select>
+  </div>
+  <div id="msgs-controls" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-shrink:0;flex-wrap:wrap;">
     <div class="search-wrap" style="flex:1;min-width:180px;">
       <input class="search-input" id="msgs-search" type="text" placeholder="Search messages..." autocomplete="off" oninput="_messagesRender()">
     </div>
@@ -24283,6 +24294,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="btn" onclick="_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
   <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
+  <div id="trends-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
+    <div id="trends-totals" class="review-totals"></div>
+    <div id="trends-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
+  </div>
   <div style="flex-shrink:0;padding-top:8px;text-align:center;">
     <button class="btn" id="msgs-more-btn" style="display:none;font-size:0.78rem;" onclick="_messagesLoad(false)">Load older</button>
   </div>
@@ -28596,7 +28611,6 @@ const ALL_TABS = [
   { id: 'map',           label: 'Map' },
   { id: 'metrics',       label: 'Metrics' },
   { id: 'cost',          label: 'Cost' },
-  { id: 'review',        label: 'Review' },
   { id: 'torrents',      label: 'Torrents' },
   { id: 'terminal',      label: 'Terminal' },
   { id: 'mcp',           label: 'MCP' },
@@ -31027,7 +31041,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.342';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.343';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -39631,11 +39645,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'review', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
-  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'review', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
   // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
+  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -39650,7 +39664,6 @@ function switchView(view) {
   if (view === 'map') { _mapLoad(); _mapInit(); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); } // always refresh on tab switch
   if (view === 'cost') _costLoad();
-  if (view === 'review') _reviewLoad();
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
   if (view === 'journal') _journalInit();
   if (view === 'habits') _habitsLoad();
@@ -47573,140 +47586,107 @@ function _costRender(d, opts) {
   html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that session; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
   return html;
 }
-let _reviewExpanded = {};
-let _reviewWeek = null;
-async function _reviewLoad() {
-  const days = document.getElementById('review-days')?.value || '7';
-  const totalsEl = document.getElementById('review-totals');
-  const bodyEl = document.getElementById('review-body');
+// ── Messages > Trends (AMUX-2179 relocated) ────────────────────────────────
+// The theme/trend synthesis of what YOU have been tasking amux, over N days,
+// with evidence (your messages), session linkage, and the board issues each
+// became. Lives in the Messages tab because that is where your directives are.
+let _msgMode = 'messages';
+let _trendsWeek = null;
+let _trendsExpanded = {};
+const _TREND_THEMES = [
+  { key: 'board', label: 'Board / workflow', re: /board|issue|card|kanban|linear|needs.?you|focus|status|review tab|history|filter/i },
+  { key: 'homepage', label: 'Homepage / GTM site', re: /homepage|page|mxp\.co|cta|traffic|posthog|amux\.io|guide|landing/i },
+  { key: 'infra', label: 'Infra / utilization', re: /gcp|cluster|utiliz|adaptive|latency|\bray\b|tune|resource|scale|sla/i },
+  { key: 'cost', label: 'Cost / billing', re: /bill|cost|token|budget|pric|arrears|credit|revenue|projection/i },
+  { key: 'browser', label: 'Browser / profiles', re: /browser|profile|sign.?in|chrome|playwright|outbound/i },
+  { key: 'creative', label: 'Creative-DNA / campaigns', re: /creative dna|campaign|linkedin|social|signal app|carousel|ad\b|ads\b|face/i },
+  { key: 'poc', label: 'POCs / demos', re: /pluralsight|plural site|canvas|universal extractor|capital express|wexus|prospect|demo/i },
+];
+function _msgSetMode(mode) {
+  _msgMode = mode;
+  document.getElementById('msgmode-messages')?.classList.toggle('active', mode === 'messages');
+  document.getElementById('msgmode-trends')?.classList.toggle('active', mode === 'trends');
+  const isT = mode === 'trends';
+  ['msgs-controls','msgs-kind-filter','msgs-list'].forEach(id => { const e=document.getElementById(id); if(e) e.style.display = isT ? 'none' : ''; });
+  const tv = document.getElementById('trends-view'); if (tv) tv.style.display = isT ? '' : 'none';
+  const td = document.getElementById('trends-days'); if (td) td.style.display = isT ? '' : 'none';
+  if (isT) _trendsLoad();
+}
+async function _trendsLoad() {
+  const days = document.getElementById('trends-days')?.value || '7';
   try {
-    // Board + sessions are the SOURCE OF TRUTH (Ethan): render live from them,
-    // not from a static doc. The week endpoint only supplies tokens/cost.
     if (!Array.isArray(boardItems) || !boardItems.length) { try { await fetchBoard(); } catch(e){} }
-    _reviewWeek = await fetch(API + '/api/review/week?days=' + days).then(r => r.json()).catch(() => null);
-    _reviewRender();
-    fetch(API + '/api/review/digest').then(r => r.json()).then(d => {
-      const el = document.getElementById('review-digest');
-      if (el && d && d.markdown) el.innerHTML = renderMarkdown(d.markdown);
-    }).catch(() => {});
+    if (!Array.isArray(_cmdHistory) || !_cmdHistory.length) { try { await _loadCmdHistoryFromServer(); } catch(e){} }
+    _trendsWeek = await fetch(API + '/api/review/week?days=' + days).then(r => r.json()).catch(() => null);
+    _trendsRender();
   } catch (e) {
-    if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load review.</div>';
+    const b = document.getElementById('trends-body'); if (b) b.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load trends.</div>';
   }
 }
-function _reviewCostMap() {
-  const m = {};
-  ((_reviewWeek && _reviewWeek.per_session) || []).forEach(r => { m[r.session] = r; });
-  return m;
-}
-function _reviewOpen(items) { return items.filter(i => !i.deleted && !['done','verified','discarded'].includes(_statusCanon(i.status))); }
-function _reviewRender() {
-  const totalsEl = document.getElementById('review-totals');
-  const bodyEl = document.getElementById('review-body');
-  const ix = _bqSessionIndex();
-  const all = (boardItems || []).filter(i => !i.deleted);
-  const open = _reviewOpen(all);
-  const needsyou = _bqFilter(all, 'is:needsyou');
-  const rotting = _bqFilter(all, 'is:rotting');
-  // Blocked by a dependency that is still open
-  const byId = {}; all.forEach(i => byId[i.id] = i);
-  const depBlocked = open.filter(i => (Array.isArray(i.depends_on) ? i.depends_on : []).some(d => {
-    const dc = byId[d]; return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status));
-  }));
-  const t = (_reviewWeek && _reviewWeek.totals) || {};
-  const stat = (n, l, q) => '<div class="rv-stat' + (q ? ' rv-click' : '') + '"' + (q ? ' onclick="_reviewFilter(\'' + escJs(q) + '\')"' : '') + '><div class="rv-stat-n">' + n + '</div><div class="rv-stat-l">' + l + '</div></div>';
+function _trendsRender() {
+  const totalsEl = document.getElementById('trends-totals');
+  const bodyEl = document.getElementById('trends-body');
+  const days = +(document.getElementById('trends-days')?.value || 7);
+  const since = Date.now() - days * 86400 * 1000;
+  // Your human messages in the window (evidence).
+  const humans = (_cmdHistory || []).filter(m => (m.time || m.ts) >= since && _msgKind(m) === 'human' && (m.text||'').replace(/^\[.*?\]\s*/,'').trim().length > 12);
+  const byId = {}; (boardItems||[]).forEach(i => byId[i.id] = i);
+  const t = (_trendsWeek && _trendsWeek.totals) || {};
+  const stat = (n, l) => '<div class="rv-stat"><div class="rv-stat-n">' + n + '</div><div class="rv-stat-l">' + l + '</div></div>';
   if (totalsEl) totalsEl.innerHTML =
-      stat(open.length, 'open', '')
-    + stat('<span style="color:var(--red)">' + needsyou.length + '</span>', 'blocked on you', 'needsyou')
-    + stat('<span style="color:#d29922">' + rotting.length + '</span>', 'rotting', 'rotting')
-    + stat((t.cards_verified||0), 'verified ' + (document.getElementById('review-days')?.value||7) + 'd', '')
-    + stat((t.tokens||0) >= 1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens', '')
-    + stat('$' + Math.round(t.cost_usd||0).toLocaleString(), 'spend', '');
-
+      stat(humans.length, 'your directives')
+    + stat((t.cards_created||0).toLocaleString(), 'cards')
+    + stat((t.cards_verified||0)+' / '+(t.cards_done||0), 'verified / done')
+    + stat((t.tokens||0)>=1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens')
+    + stat('$'+Math.round(t.cost_usd||0).toLocaleString(), 'spend');
+  // Cluster your directives into themes.
+  const themed = _TREND_THEMES.map(th => ({ ...th, msgs: [], sessions: new Set(), cards: new Set() }));
+  const other = { key:'other', label:'Other', msgs:[], sessions:new Set(), cards:new Set() };
+  humans.forEach(m => {
+    const txt = (m.text||'').replace(/^\[.*?\]\s*/,'');
+    let hit = themed.find(th => th.re.test(txt)) || other;
+    hit.msgs.push(m); if (m.session) hit.sessions.add(m.session); if (m.card_id) hit.cards.add(m.card_id);
+  });
+  const groups = themed.concat([other]).filter(g => g.msgs.length).sort((a,b)=>b.msgs.length-a.msgs.length);
   let html = '';
-  // ── BLOCKERS FIRST: the CEO's first question is "what's stuck and why" ──
-  const blkCard = (title, list, kind, why) => {
-    if (!list.length) return '';
-    return '<div class="rv-block rv-block-' + kind + '">'
-      + '<div class="rv-block-h">' + title + ' <span class="rv-block-n">' + list.length + '</span></div>'
-      + list.slice(0, 40).map(i => {
-          const s = ix[i.session];
-          const ask = kind === 'needsyou' ? _focusAsk(i) : (kind === 'dep' ? 'waiting on ' + (Array.isArray(i.depends_on) ? i.depends_on.join(', ') : '') : (s ? 'session idle' : 'no owner'));
-          return '<div class="rv-brow" onclick="openBoardDetail(\'' + escJs(i.id) + '\')">'
-            + '<span class="rv-bid">' + esc(i.id) + '</span>'
-            + '<span class="rv-btitle">' + esc((i.title||'').slice(0,70)) + '</span>'
-            + (i.session ? '<span class="rv-bsess" onclick="event.stopPropagation();openPeek(\'' + escJs(i.session) + '\',{query:\'' + escJs(i.id) + '\'})">' + esc(i.session) + '</span>' : '')
-            + '<span class="rv-bwhy">' + esc(String(ask).slice(0,60)) + '</span></div>';
-        }).join('')
-      + (kind === 'needsyou' && list.length ? '<button class="btn primary" style="margin-top:8px;font-size:0.78rem;" onclick="_focusStart(\'is:needsyou\')">\u26A1 Rapid-fire these</button>' : '')
+  groups.forEach(g => {
+    // Roll up card status for this theme.
+    const cards = [...g.cards].map(id => byId[id]).filter(Boolean);
+    const verified = cards.filter(c => c.status==='verified').length;
+    const done = cards.filter(c => c.status==='done').length;
+    const openC = cards.filter(c => !['done','verified','discarded'].includes(_statusCanon(c.status)));
+    const blocked = openC.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
+    const exp = _trendsExpanded[g.key];
+    html += '<div class="tr-theme">'
+      + '<div class="tr-theme-h" onclick="_trendsToggle(\'' + g.key + '\')">'
+      + '<span class="tr-theme-x">' + (exp ? '\u2212' : '+') + '</span>'
+      + '<span class="tr-theme-name">' + esc(g.label) + '</span>'
+      + '<span class="tr-theme-meta">' + g.msgs.length + ' directives \u00B7 ' + g.sessions.size + ' lanes \u00B7 ' + cards.length + ' cards</span>'
+      + '<span class="tr-theme-status">' + (verified?('<span style="color:var(--green)">'+verified+' verified</span> '):'') + (done?(done+' done '):'') + (blocked.length?('<span style="color:var(--red)">'+blocked.length+' blocked</span>'):'') + '</span>'
       + '</div>';
-  };
-  const allBlocked = _bqFilter(all, 'is:blocked');
-  if (allBlocked.length) html += '<button class="btn primary rv-unblock-all" onclick="_focusStart(\'is:blocked\')">\u26A1 Unblock everything (' + allBlocked.length + ')</button>';
-  html += '<div class="rv-blockers">'
-    + blkCard('\uD83D\uDD34 Blocked on you', needsyou, 'needsyou')
-    + blkCard('\u23F8 Blocked by a dependency', depBlocked, 'dep')
-    + blkCard('\uD83D\uDD52 Rotting (idle 7d+)', rotting, 'rot')
-    + '</div>';
-  if (!needsyou.length && !depBlocked.length && !rotting.length)
-    html = '<div class="rv-clear">\u2705 Nothing is blocked — every open card has an active owner.</div>' + html;
-
-  // ── BY LANE: sessions as the workstreams; click to drill ──
-  html += '<h3 class="rv-h">Lanes <span style="color:var(--dim);font-weight:400;font-size:0.8rem;">(click to expand \u00B7 tap name for terminal)</span></h3>';
-  const costs = _reviewCostMap();
-  const bySess = {};
-  open.forEach(i => { (bySess[i.session||'(unowned)'] = bySess[i.session||'(unowned)'] || []).push(i); });
-  const lanes = Object.keys(bySess).map(name => {
-    const cards = bySess[name];
-    const s = ix[name];
-    const doing = cards.filter(c => _statusCanon(c.status)==='doing');
-    const review = cards.filter(c => _statusCanon(c.status)==='review');
-    const ny = cards.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
-    const rot = cards.filter(c => rotting.includes(c));
-    const cw = costs[name] || {};
-    // Verified count this window from the week endpoint
-    return { name, cards, s, doing, review, ny, rot, cw,
-             attention: ny.length*100 + rot.length*10 + (s && !s.running ? 5 : 0) };
-  }).sort((a,b) => b.attention - a.attention || b.cards.length - a.cards.length);
-
-  html += '<div class="rv-lanes">' + lanes.map(L => {
-    const st = L.s ? (L.s.status || (L.s.running ? 'idle' : 'off')) : 'off';
-    const dot = '<span class="rv-dot rv-dot-' + (L.s && L.s.status==='active' ? 'active' : (L.s && L.s.running ? 'idle' : 'off')) + '"></span>';
-    const flags = (L.ny.length ? '<span class="rv-flag rv-flag-you">' + L.ny.length + ' need you</span>' : '')
-      + (L.rot.length ? '<span class="rv-flag rv-flag-rot">' + L.rot.length + ' rotting</span>' : '')
-      + (L.s && !L.s.running ? '<span class="rv-flag rv-flag-off">offline</span>' : '');
-    const cur = L.doing[0];
-    const exp = _reviewExpanded[L.name];
-    let sub = '';
+    // session chips (linkage)
+    html += '<div class="tr-sessions">' + [...g.sessions].slice(0,10).map(sn =>
+      '<span class="tr-sess" onclick="switchView(\'sessions\');setTimeout(()=>openPeek(\'' + escJs(sn) + '\'),150)">' + esc(sn) + '</span>').join('') + '</div>';
     if (exp) {
-      const order = ['doing','review','todo','backlog'];
-      sub = '<div class="rv-lane-cards">' + order.map(stt => {
-        const g = L.cards.filter(c => _statusCanon(c.status)===stt);
-        if (!g.length) return '';
-        return '<div class="rv-lane-grp"><div class="rv-lane-grp-h">' + stt + ' (' + g.length + ')</div>'
-          + g.map(c => '<div class="rv-lane-card" onclick="event.stopPropagation();openBoardDetail(\'' + escJs(c.id) + '\')">'
-            + '<span class="rv-bid">' + esc(c.id) + '</span> ' + esc((c.title||'').slice(0,64))
-            + ((c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) ? ' <span class="rv-flag rv-flag-you">you</span>' : '') + '</div>').join('')
-          + '</div>';
+      // board issues for this theme
+      if (cards.length) html += '<div class="tr-cards"><div class="tr-sub">Board issues</div>' + cards.slice(0,30).map(c =>
+        '<div class="tr-card" onclick="openBoardDetail(\'' + escJs(c.id) + '\')"><span class="rv-bid">' + esc(c.id) + '</span> <span class="status-badge" style="background:' + statusStyle(c.status).bg + ';color:' + statusStyle(c.status).color + ';font-size:0.66rem;padding:0 5px;border-radius:8px;">' + esc(c.status||'todo') + '</span> ' + esc((c.title||'').slice(0,60)) + '</div>').join('') + '</div>';
+      // evidence: your actual messages
+      html += '<div class="tr-evidence"><div class="tr-sub">What you asked (evidence)</div>' + g.msgs.slice(0,12).map(m => {
+        const txt = (m.text||'').replace(/^\[.*?\]\s*/,'');
+        const link = m.card_id ? ' <span class="rv-bid" onclick="event.stopPropagation();openBoardDetail(\'' + escJs(m.card_id) + '\')">' + esc(m.card_id) + '</span>' : '';
+        return '<div class="tr-msg"><span class="tr-msg-sess">' + esc(m.session||'') + '</span>' + link + '<div class="tr-msg-t">' + _linkifyCardIds(esc(txt.slice(0,220))) + (txt.length>220?'\u2026':'') + '</div></div>';
       }).join('') + '</div>';
     }
-    return '<div class="rv-lane">'
-      + '<div class="rv-lane-h" onclick="_reviewToggle(\'' + escJs(L.name) + '\')">'
-      + dot + '<span class="rv-lane-name" onclick="event.stopPropagation();' + (L.s ? 'openPeek(\'' + escJs(L.name) + '\')' : '') + '">' + esc(L.name) + '</span>'
-      + '<span class="rv-lane-count">' + L.cards.length + ' open</span>' + flags
-      + '<span class="rv-lane-cost">' + (L.cw.tokens ? ((L.cw.tokens/1e6).toFixed(1)+'M \u00B7 $' + Math.round(L.cw.cost_usd||0)) : '') + '</span>'
-      + '<span class="rv-lane-x">' + (exp ? '\u2212' : '+') + '</span></div>'
-      + (cur ? '<div class="rv-lane-cur" onclick="openBoardDetail(\'' + escJs(cur.id) + '\')">\u25B6 ' + esc(cur.id) + ' \u00B7 ' + esc((cur.title||'').slice(0,60)) + '</div>' : '')
-      + sub + '</div>';
-  }).join('') + '</div>';
-
+    html += '</div>';
+  });
+  if (!groups.length) html = '<div style="color:var(--dim);padding:24px;text-align:center;">No directives in this window.</div>';
+  // model-authored narrative below
+  html += '<details style="margin-top:16px;"><summary style="cursor:pointer;font-size:0.85rem;color:var(--dim);">Weekly narrative (model-authored)</summary><div id="trends-digest" class="rv-digest md-content" style="margin-top:10px;"></div></details>';
   if (bodyEl) bodyEl.innerHTML = html;
+  fetch(API + '/api/review/digest').then(r=>r.json()).then(d => { const el=document.getElementById('trends-digest'); if (el && d && d.markdown) el.innerHTML = renderMarkdown(d.markdown); }).catch(()=>{});
 }
-function _reviewToggle(name) { _reviewExpanded[name] = !_reviewExpanded[name]; _reviewRender(); }
-function _reviewFilter(q) {
-  if (q === 'needsyou') { _focusStart('is:needsyou'); return; }
-  switchView('board');
-  setTimeout(() => { boardSearchQuery = 'is:' + q; const inp = document.getElementById('board-search'); if (inp) inp.value = boardSearchQuery; _bfSyncHash && _bfSyncHash(); renderBoard(); }, 200);
-}
+function _trendsToggle(k) { _trendsExpanded[k] = !_trendsExpanded[k]; _trendsRender(); }
 
 function _costLoad() {
   const days = document.getElementById('cost-days')?.value || '7';
@@ -52115,7 +52095,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.342';
+const CACHE = 'amux-v0.9.343';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
