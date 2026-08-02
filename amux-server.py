@@ -2241,6 +2241,13 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
                         "profile": profile, "auto_profile": auto,
                         "url": dres.get("url", url), "title": dres.get("title", ""),
                         "writes_persist": True,
+                        # REGIME NOTE (amux-cloud, 2026-08-02): under CLI copy
+                        # semantics this field was a failure detector and a
+                        # useless success detector. On the driver backend it is
+                        # true BY CONSTRUCTION, so a FALSE here now means "the
+                        # CLI fallback fired" — same field, opposite job: a
+                        # clean fallback tripwire, never a success verdict. The
+                        # cookie round trip remains the only verdict.
                         "profile_verified": True,
                         "profile_verified_note": ("driver holds the store open "
                                                   "directly — no temp copy exists")}
@@ -11664,6 +11671,29 @@ def _run_schedule(sched, source: str = "cron"):
     session = sched["session"]
     command = sched.get("command") or ""
     kind = sched.get("kind") or "tmux"
+    # Archived sessions STAY archived (Ethan 2026-08-02): a schedule must
+    # never be a wake path. The send path already refuses ("auto-wake failed:
+    # session is archived"), but that surfaced as a nightly ERROR run forever
+    # and left the intent ambiguous. Skip explicitly BEFORE any delivery
+    # attempt, visibly in the runs list — unarchiving is the wake endpoint's
+    # job, i.e. a human's.
+    if kind != "shell" and session:
+        _sf = CC_SESSIONS / f"{session}.env"
+        if _sf.exists() and parse_env_file(_sf).get("CC_ARCHIVED") == "1":
+            slog(f"[sched] SKIP '{sched['title']}' ({source}) — target "
+                 f"'{session}' is archived; schedules never wake archived sessions")
+            try:
+                db = get_db()
+                db.execute(
+                    "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) "
+                    "VALUES (?,?,?,?,?)",
+                    (sched["id"], int(time.time()), "skipped",
+                     f"target '{session}' is archived — not delivered, not woken",
+                     (source or "cron")[:64]))
+                db.commit()
+            except Exception as _se:
+                slog(f"[sched] failed to log archived-skip: {_se}")
+            return
     slog(f"[sched] running '{sched['title']}' [{kind}] ({source}) → {session or '(shell)'}")
     status, note = "ok", None
     # Capture output before sending so we can detect new output later (tmux mode only)
@@ -31133,7 +31163,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.353';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.354';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52228,7 +52258,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.353';
+const CACHE = 'amux-v0.9.354';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
