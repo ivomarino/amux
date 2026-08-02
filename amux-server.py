@@ -9026,6 +9026,13 @@ def _init_db():
         # schedule run WITHOUT a model in the loop: the script decides, the
         # map escalates, the session is the escalation path not the poller.
         "ALTER TABLE schedules ADD COLUMN exit_actions TEXT",
+        # Monitor-card provenance (AMUX-2204 / MG audit #10): a derived card
+        # decays independently of its source — 3 of 4 SLA-breach cards
+        # escalated to Ethan were already resolved in the thread (one had
+        # CONVERTED TO PAYING). source_ref names what the card derives from;
+        # last_verified_at is when the producer last re-checked the source.
+        "ALTER TABLE issues ADD COLUMN source_ref TEXT",
+        "ALTER TABLE issues ADD COLUMN last_verified_at INTEGER",
         # WHY a run happened. Without this a hand-pressed "Run now" is byte-identical
         # to a cron fire in the runs list, so an extra same-day fire reads as the
         # scheduler double-firing. That cost a real investigation (AMUX-1998:
@@ -10837,7 +10844,7 @@ def _load_board(done_limit: int = 100) -> list:
                COALESCE(i.pinned, 0) AS pinned,
                COALESCE(i.pos, 0) AS pos,
                COALESCE(i.archived, 0) AS archived,
-               i.depends_on, i.reviewer, i.log,
+               i.depends_on, i.reviewer, i.log, i.source_ref, i.last_verified_at,
                COALESCE(i.rev, 0) AS rev,
                i.gate,
                GROUP_CONCAT(t.tag) AS tags_csv"""
@@ -10965,7 +10972,7 @@ def _item_by_id(bid: str) -> dict | None:
                   COALESCE(i.pinned, 0) AS pinned,
                   COALESCE(i.pos, 0) AS pos,
                   COALESCE(i.archived, 0) AS archived,
-                  i.depends_on, i.reviewer, i.log,
+                  i.depends_on, i.reviewer, i.log, i.source_ref, i.last_verified_at,
                   COALESCE(i.rev, 0) AS rev,
                   i.gate,
                   GROUP_CONCAT(t.tag) AS tags_csv
@@ -31324,7 +31331,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.366';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.368';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41927,6 +41934,12 @@ function _bqIs(item, val, ix) {
       return deps.some(d => { const dc = (boardItems||[]).find(x => x.id === d);
         return dc && !['done','verified','discarded'].includes(_statusCanon(dc.status)); });
     }
+    // Derived card whose producer hasn't re-checked its source in 24h+
+    // (AMUX-2204): it may be ASSERTING a state (breach, blocker) its source
+    // already resolved — 3 of 4 escalated SLA cards were stale this way.
+    case 'sourcestale': return _bqIs(item, 'open', ix) && !!item.source_ref
+                        && (!item.last_verified_at
+                            || (Date.now()/1000 - item.last_verified_at) > 86400);
     case 'needsyou': return _bqIs(item, 'open', ix) && (
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
@@ -43270,6 +43283,14 @@ function openBoardDetail(id) {
   if (item.created) parts.push('Created ' + timeAgo(item.created));
   if (item.updated && item.updated !== item.created) parts.push('Updated ' + timeAgo(item.updated));
   if (item.reviewer) parts.push('Reviewer ' + esc(item.reviewer));
+  if (item.source_ref) {
+    const lv = item.last_verified_at;
+    const ageH = lv ? Math.round((Date.now()/1000 - lv) / 3600) : null;
+    const stale = !lv || ageH > 24;
+    parts.push('Derived from ' + esc(String(item.source_ref).slice(0,60))
+      + (lv ? (' · source re-checked ' + ageH + 'h ago') : ' · never re-verified')
+      + (stale ? ' <span style="color:var(--red);font-weight:600;">STALE — re-check the source before acting</span>' : ''));
+  }
   const deps = Array.isArray(item.depends_on) ? item.depends_on : [];
   let depHtml = '';
   if (deps.length) depHtml = '<div class="board-detail-meta-row">Blocked by ' + deps.map(d =>
@@ -52427,7 +52448,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.366';
+const CACHE = 'amux-v0.9.368';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54485,6 +54506,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         for st in _load_board_statuses()}
             return self._json({
                 "board_is_source_of_truth": "All activity flows TO the card. Ask a session for status with POST /api/board/<id>/status-request (or `amux board ask <id>`); the SESSION answers via status-update, which appends a model-AUTHORED status to the card history. amux routes and records — it does NOT scrape the terminal or summarize with a helper model. This is the durable inverse of watching: as the session's model improves, its status reports improve, for free. A chat reply alone never updates the card; only a status-update does.",
+                "monitor_cards": "A card CREATED BY A MONITOR must set source_ref (what it derives from: a thread id, CRM record, alert name) and update last_verified_at (unix) each time the monitor re-checks the source. Cards with a source_ref unverified for 24h+ show STALE in the detail and match is:sourcestale — they may assert a state the source already resolved. An escalation from a stale card wastes the human's attention (3 of 4 did, 2026-08-02).",
                 "state_capture_best_practices": {
                     "one_status": "A card has ONE status (backlog/todo/doing/review/done/verified/discarded), moved through type-derived gates. Never invent parallel status fields.",
                     "done_ne_verified": "done = implemented/merged. verified = confirmed in prod with evidence. Never mark verified on faith.",
@@ -57000,7 +57022,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     if "reviewer" in body:
                         set_clauses.append("reviewer = ?")
                         params.append((str(body.get("reviewer") or "").strip() or None))
-                    for k in ("title", "desc", "status", "session", "shepherd", "type", "due", "due_time", "owner_type", "pinned", "pos"):
+                    for k in ("title", "desc", "status", "session", "shepherd", "type", "due", "due_time", "owner_type", "pinned", "pos", "source_ref", "last_verified_at"):
                         if k in body:
                             set_clauses.append(f"{k} = ?")
                             v = body[k]
