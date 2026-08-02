@@ -31073,7 +31073,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.347';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.348';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52168,7 +52168,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.347';
+const CACHE = 'amux-v0.9.348';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -62242,6 +62242,21 @@ def _cleanup_recordings():
 
 
 def _db_maintenance():
+    # Single-char-tag canary (studio-plg, SP-539): a string tags value once
+    # char-exploded silently, and the retro sweep's ">=5 singles" threshold was
+    # blind to short tags ("wip" -> 3 singles). The STRUCTURAL predicate — a
+    # single-char tag is essentially never legitimate, so >=2 on one card —
+    # needs no threshold judgement. Detect-and-report only; repair is a human
+    # or owning-session call (ethos #8).
+    try:
+        _sc = get_db().execute(
+            "SELECT issue_id, COUNT(*) n FROM issue_tags WHERE LENGTH(tag)=1 "
+            "GROUP BY issue_id HAVING n >= 2").fetchall()
+        for _row in _sc:
+            slog(f"[board] tag-explosion signature on {_row[0]}: "
+                 f"{_row[1]} single-char tags — inspect/repair (SP-539 class)")
+    except Exception:
+        pass
     """Periodic database maintenance: WAL checkpoint, optimize, and board cleanup."""
     try:
         conn = get_db()
