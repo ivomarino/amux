@@ -5094,6 +5094,19 @@ _MODEL_CREDIT_BANNER_RE = re.compile(
     r"(?:uses|runs\s+on|have)\s+usage\s+credits",
     re.IGNORECASE,
 )
+# Spend-limit adjustment menu (gtm-videos, 2026-08-02 / GMA-29): yet another
+# gate render — "What do you want to do?  Usage credit balance: $N /
+# ❯ Adjust monthly spend limit: $N / Wait for limit to reset  Resets 1pm (TZ)".
+# ETHAN-32's verification of AMUX-1898 was real AND expired: a pattern list
+# answers "does this render match a gate I know", which needs a new entry per
+# variant forever (the pattern-free stalled-Nm badge is the durable half —
+# gtm-media-assets' framing). Detection only: this menu's default-selected row
+# ADJUSTS A SPEND LIMIT, i.e. money, so amux never auto-answers it regardless
+# of rate_limit_action; badge + is:gated + bulk visibility, human presses keys.
+_SPEND_MENU_OPT_RE = re.compile(r"Adjust\s+monthly\s+spend\s+limit", re.I)
+_SPEND_MENU_WAIT_RE = re.compile(r"Wait\s+for\s+limit\s+to\s+reset", re.I)
+_SPEND_MENU_BAL_RE = re.compile(r"Usage\s+credit\s+balance", re.I)
+
 # Pull the model name out for display ("Fable 5", "Opus", ...). Best-effort.
 _MODEL_CREDIT_NAME_RE = re.compile(
     r"reached\s+your\s+([A-Za-z0-9][A-Za-z0-9.\s-]{0,19}?)\s+limit"
@@ -5554,6 +5567,22 @@ def _rate_limit_auto_respond():
             _is_banner_gate = bool(
                 _MODEL_CREDIT_LIMIT_RE.search("\n".join(_live_ne[-5:]))
                 and _MODEL_CREDIT_LIMIT_CTX_RE.search("\n".join(_live_ne[-5:])))
+            # Spend-limit menu: option line + corroboration (the wait option or
+            # the balance readout). Tested against the CLEAN SCREEN's tail, not
+            # the live region — _live_limit_region cuts AT the highlighted
+            # "❯ Adjust monthly spend limit" row, so this menu's option lines
+            # always fall OUTSIDE the region (verified against the live
+            # gtm-videos gate: region ends at "What do you want to do?").
+            # Position still holds: a live modal owns the bottom of the screen,
+            # while a session merely QUOTING these strings has its own input
+            # box/activity rendered below them — and the two-scan persistence
+            # gate applies on top.
+            _clean_tail = "\n".join(
+                [l for l in clean.splitlines() if l.strip()][-8:])
+            _is_spend_menu_gate = bool(
+                _SPEND_MENU_OPT_RE.search(_clean_tail)
+                and (_SPEND_MENU_WAIT_RE.search(_clean_tail)
+                     or _SPEND_MENU_BAL_RE.search(_clean_tail)))
             # Gateway 402 budget wall (AMUX-2113): in-band, no reset time —
             # credit-path semantics, so it feeds _credit_raw and inherits the
             # two-scan gate, badge, is:gated, hard-gate alert and clear
@@ -5562,7 +5591,7 @@ def _rate_limit_auto_respond():
             _budget_gated = matched_idx < 0 and _api_budget_gated(clean)
             _credit_raw = bool(_provider_hit) or _budget_gated or (
                 matched_idx < 0 and not is_banner
-                and (_is_banner_gate or _is_menu_gate))
+                and (_is_banner_gate or _is_menu_gate or _is_spend_menu_gate))
             # PERSISTENCE GATE. No regex fully separates "this session is gated"
             # from "this session is displaying text about the gate" — the source
             # file documenting these very patterns matches them, so any session
@@ -5656,6 +5685,7 @@ def _rate_limit_auto_respond():
                 actions["rate_limit_model_name"] = (
                     _provider_hit
                     or ("trial budget" if _budget_gated else "")
+                    or ("monthly spend" if _is_spend_menu_gate else "")
                     or ((m.group(1) or m.group(2) or "").strip() if m else ""))
                 actions["rate_limit_last_event_ts"] = int(now)
                 actions.pop("rate_limit_reset_at", None)
@@ -31073,7 +31103,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.348';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.351';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52168,7 +52198,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.348';
+const CACHE = 'amux-v0.9.351';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60608,6 +60638,16 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
 
         if method == "GET":
+            if not action:
+                # Bare GET /api/sessions/<name> -> the SAME record the list
+                # endpoint serves for this session (gtm-media-assets got a 404
+                # error body here and read every field as None — the natural
+                # URL should answer with the natural shape, not make callers
+                # fetch the whole fleet for one session).
+                _one = next((x for x in list_sessions() if x.get("name") == name), None)
+                if _one is not None:
+                    return self._json(_one)
+                return self._json({"error": f"session '{name}' not found"}, 404)
             if action == "tasks":
                 # Claude Code's native task list (read-only) — the agent's live plan.
                 return self._json(_session_cc_tasks(name))
