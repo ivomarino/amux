@@ -13304,16 +13304,18 @@ def list_sessions() -> list:
     # `updated` rides along so the UI can show the card's age when it's stale.
     _doing_tasks: dict = {}
     _doing_updated: dict = {}
+    _doing_ids: dict = {}      # session -> the doing card's id (AMUX-2165)
     try:
         for row in get_db().execute(
-            "SELECT session, title, updated FROM issues "
+            "SELECT session, id, title, updated FROM issues "
             "WHERE status='doing' AND deleted IS NULL AND session IS NOT NULL "
             "ORDER BY updated ASC"
         ).fetchall():
             _doing_tasks[row["session"]] = row["title"]
             _doing_updated[row["session"]] = row["updated"] or 0
+            _doing_ids[row["session"]] = row["id"]
     except Exception:
-        _doing_tasks, _doing_updated = {}, {}
+        _doing_tasks, _doing_updated, _doing_ids = {}, {}, {}
     for f in env_files:
         name = f.stem
         cfg = parse_env_file(f)
@@ -13501,6 +13503,10 @@ def list_sessions() -> list:
             # client hint that a stale doing card is parked on the board even
             # when the displayed label came from the summary.
             "task_source": _tsrc,
+            # The board card id behind the label, so the session card can show
+            # "<title> (ID)" and deep-link into the board (AMUX-2165). Only set
+            # when the label IS the board title (source 'board'); '' otherwise.
+            "task_board_id": (_doing_ids.get(name, "") if _tsrc == "board" else ""),
             "task_updated": _bu,
             "task_board_age": int(time.time() - _bu) if (_bt and _bu and not _board_fresh) else 0,
             "tokens": tokens,
@@ -27824,7 +27830,7 @@ function render() {
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
-      ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
+      ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
       ${!isExp && (schedOn + schedOff) ? `<div class="card-sched-count" onclick="event.stopPropagation();switchView('scheduler')" title="${schedOn} enabled, ${schedOff} disabled">&#x23F2; ${[schedOn ? `<span class="sched-on">${schedOn} on</span>` : '', schedOff ? `<span class="sched-off">${schedOff} off</span>` : ''].filter(Boolean).join(' &middot; ')}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
@@ -27845,7 +27851,7 @@ function render() {
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
       </div>` : ''}
       <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && s.task_name ? `<div class="card-task-name${taskDim ? ' task-stale' : ''}" onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" title="Click to edit task label" style="cursor:pointer;"><span class="tn-label">Task:</span>${esc(s.task_name)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
+        ${isExp && s.task_name ? `<div class="card-task-name${taskDim ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span class="tn-label">Task:</span><span onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" style="cursor:pointer;">${esc(s.task_name)}</span>${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
           ${s.session_created ? `<div class="timing-item"><span class="timing-label">Session</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
@@ -28017,6 +28023,22 @@ function _cssRect(el) {
   const r = el.getBoundingClientRect();
   const z = _uiZoomFactor();
   return { top: r.top / z, right: r.right / z, bottom: r.bottom / z, left: r.left / z, width: r.width / z, height: r.height / z };
+}
+
+// The board-id chip on a session's task label (AMUX-2165): shows the card
+// id when the label came from a board card, click-through straight to the
+// board detail. '' when the label is a summary/desc fallback (no card).
+function _taskIdChip(s) {
+  const id = s && s.task_board_id;
+  if (!id) return '';
+  return ' <span class="task-id-chip" onclick="event.stopPropagation();_openIssue(\'' + escJs(id) + '\')" '
+    + 'title="Open board card ' + esc(id) + '" '
+    + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
+}
+function _openIssue(id) {
+  try { history.replaceState({}, '', location.pathname + '#issue=' + encodeURIComponent(id)); } catch (e) {}
+  switchView('board');
+  setTimeout(() => { try { openBoardDetail(id); } catch (e) {} }, 250);
 }
 
 function _taskStaleAge(s) {
@@ -30751,7 +30773,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.328';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.329';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44005,10 +44027,13 @@ function _wsTermSetupHandlers(pid) {
   });
   p.term.onResize(({ cols, rows }) => {
     if (!p.ptyId) return;
-    fetch(API + '/api/terminal/' + p.ptyId + '/resize', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cols, rows }),
-    }).catch(() => {});
+    clearTimeout(p._resizeTimer);
+    p._resizeTimer = setTimeout(() => {
+      fetch(API + '/api/terminal/' + p.ptyId + '/resize', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => {});
+    }, 150);
   });
 }
 
@@ -46282,6 +46307,21 @@ async function _handleDeeplink(hash) {
     tryMenu(0);
     return;
   }
+  // #issue=<id> — open a board card directly from anywhere (AMUX-2165), the
+  // shareable twin of the task-label id chip.
+  if (hash && hash.startsWith('#issue=')) {
+    const id = decodeURIComponent(hash.slice(7));
+    const tryOpen = (attempt) => {
+      if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {
+        switchView('board');
+        setTimeout(() => { try { openBoardDetail(id); } catch (e) {} }, 250);
+        return;
+      }
+      if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
+    };
+    tryOpen(0);
+    return;
+  }
   let dpath = null;
   if (hash && hash.startsWith('#path=')) {
     dpath = decodeURIComponent(hash.slice(6));
@@ -47822,6 +47862,7 @@ let _termFit = null;    // FitAddon
 let _termId = null;     // server PTY session id
 let _termPoll = null;   // polling interval
 let _termInited = false;
+let _termResizeTimer = null;
 
 // Make the terminal fill the viewport: body is normal flow (not a full-height
 // flex column), so terminal-view's flex:1 does nothing on its own — pin an
@@ -47857,8 +47898,12 @@ function _termInit() {
   requestAnimationFrame(_termLayout);
   const _tc = document.getElementById('term-container');
   if (_tc && window.ResizeObserver) {
+    let _roTimer;
     new ResizeObserver(() => {
-      if (_term && _termFit && activeView === 'terminal') { try { _termFit.fit(); } catch (e) {} }
+      clearTimeout(_roTimer);
+      _roTimer = setTimeout(() => {
+        if (_term && _termFit && activeView === 'terminal') { try { _termFit.fit(); } catch (e) {} }
+      }, 100);
     }).observe(_tc);
   }
   // Load saved font size
@@ -47993,14 +48038,17 @@ async function _termConnect() {
     }).catch(() => {});
   });
 
-  // Handle resize
+  // Handle resize — debounce to avoid flooding the server during drag/animation
   _term.onResize(({ cols, rows }) => {
     if (!_termId) return;
-    fetch(API + '/api/terminal/' + _termId + '/resize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cols, rows }),
-    }).catch(() => {});
+    clearTimeout(_termResizeTimer);
+    _termResizeTimer = setTimeout(() => {
+      fetch(API + '/api/terminal/' + _termId + '/resize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cols, rows }),
+      }).catch(() => {});
+    }, 150);
   });
 
   // Stream output via long-poll: each request blocks server-side until output
@@ -48057,9 +48105,11 @@ function _termSetFontSize(size) {
 }
 
 // Recompute the terminal's viewport-fill height (and refit xterm) on resize.
+{ let _wrt;
 window.addEventListener('resize', () => {
-  if (activeView === 'terminal') _termLayout();
-});
+  clearTimeout(_wrt);
+  _wrt = setTimeout(() => { if (activeView === 'terminal') _termLayout(); }, 100);
+}); }
 
 // ── Messages tab (global send history across all sessions) ──────────────────
 let _msgsData = [];
@@ -51328,7 +51378,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.328';
+const CACHE = 'amux-v0.9.329';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
