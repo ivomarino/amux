@@ -184,18 +184,6 @@ def test_missing_project_dir_returns_empty(amux_server, tmp_path, monkeypatch):
     assert amux_server._cc_session_id_for_name("Amux-gtm", "/no/such/dir") == ""
 
 
-def test_exists_in_project_sees_line_two_title(amux_server, project):
-    add, work_dir = project
-    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
-    assert amux_server._cc_session_exists_in_project("Amux-gtm", work_dir) is True
-
-
-def test_exists_in_project_false_when_absent(amux_server, project):
-    add, work_dir = project
-    add("aaaaaaaa-0000-0000-0000-000000000000", "Other", time.time())
-    assert amux_server._cc_session_exists_in_project("Amux-gtm", work_dir) is False
-
-
 def test_candidates_are_ordered_newest_first(amux_server, project):
     add, work_dir = project
     now = time.time()
@@ -326,3 +314,233 @@ def test_resume_strategy_first_ever_start_nothing_to_clear(amux_server, project)
     assert flag == "--name Amux-gtm"
     assert cleared == []
     assert "no prior conversation" in msg
+
+
+def test_resume_strategy_migration_branch_rejects_snapshot_only(amux_server, project):
+    """Migration path (no usable title, bare uuid in meta): a snapshot-only
+    file is not resumable — `claude --resume` exits instantly on it — so the
+    uuid-only branch must apply the same has-messages guard as step 2 rather
+    than handing --resume a file it will bounce off."""
+    add, work_dir = project
+    add("dddddddd-0000-0000-0000-000000000000", "Whatever", time.time(),
+        with_messages=False)
+    # An invalid amux name forces the elif (migration) branch.
+    meta = {"cc_session_name": "!!bad!!",
+            "cc_conversation_id": "dddddddd-0000-0000-0000-000000000000"}
+    flag, _cleared, msg = amux_server._resume_strategy(meta, "!!also-bad!!", work_dir)
+    assert flag == "--name '!!also-bad!!'"
+    assert "stale uuid" in msg
+
+
+def test_resume_strategy_invalid_persisted_name_falls_back_to_amux_name(amux_server, project):
+    """A corrupt/illegal `cc_session_name` in meta must not permanently poison
+    resume for the session: fall back to the derived amux name, which is what
+    Claude was actually launched with."""
+    add, work_dir = project
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    meta = {"cc_session_name": "!! not a valid name !!"}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--resume aaaaaaaa-0000-0000-0000-000000000000"
+    assert cleared == []
+
+
+# ── the reset escape hatch: cc_fresh_after ───────────────────────────────────
+#
+# reset_session and PATCH /config {new_conversation:true} used to force a fresh
+# start by DELETING cc_session_name / cc_conversation_id from meta. That only
+# worked because the title lookup was dead. Now that the name is derived, the
+# absence of meta says nothing — the next start would title-match and resume
+# the very conversation just abandoned, while still reporting success. The
+# signal is therefore positive and a TIMESTAMP: conversations older than the
+# reset are excluded, conversations created after it are not.
+
+def test_candidates_drop_conversations_older_than_fresh_marker(amux_server, project):
+    add, work_dir = project
+    now = time.time()
+    add("11111111-0000-0000-0000-000000000000", "Amux-gtm", now - 500)
+    assert amux_server._cc_session_candidates(
+        "Amux-gtm", work_dir, fresh_after=now - 100) == []
+
+
+def test_candidates_keep_conversations_newer_than_fresh_marker(amux_server, project):
+    """The whole point of a timestamp rather than a flag: the conversation the
+    reset itself creates must be resumable on the NEXT restart."""
+    add, work_dir = project
+    now = time.time()
+    add("11111111-0000-0000-0000-000000000000", "Amux-gtm", now - 500)
+    add("22222222-0000-0000-0000-000000000000", "Amux-gtm", now)
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates(
+        "Amux-gtm", work_dir, fresh_after=now - 100)]
+    assert got == ["22222222"]
+
+
+def test_resume_strategy_after_reset_starts_fresh(amux_server, project):
+    """Post-reset meta (keys popped, marker set) in a project that still holds
+    a matching conversation older than the reset. This is the gap that let the
+    bug through: without the marker this returns --resume and reset is a no-op
+    that reports success."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", now - 500)
+    meta = {"cc_fresh_after": int(now - 100)}
+    flag, cleared, msg = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+    assert cleared == []
+    assert "aaaaaaaa" not in msg
+
+
+def test_resume_strategy_resumes_conversation_created_after_reset(amux_server, project):
+    """One reset must not disable resume forever."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", now - 500)
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", now)
+    meta = {"cc_fresh_after": int(now - 100)}
+    flag, _cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--resume bbbbbbbb-0000-0000-0000-000000000000"
+
+
+def test_resume_strategy_without_marker_is_unchanged(amux_server, project):
+    """No marker in meta → byte-identical behaviour to before the marker
+    existed. Every pre-existing session's meta is in this state."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", now - 500)
+    flag, cleared, _ = amux_server._resume_strategy({}, "Amux-gtm", work_dir)
+    assert flag == "--resume aaaaaaaa-0000-0000-0000-000000000000"
+    assert cleared == []
+
+
+def test_resume_strategy_marker_also_suppresses_conv_id_fallback(amux_server, project):
+    """A reset must not be quietly undone via the conv_id fallback: a stale
+    pointer to a pre-reset conversation is exactly what the reset dropped."""
+    add, work_dir = project
+    now = time.time()
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Some-Other-Title", now - 500)
+    meta = {"cc_conversation_id": "bbbbbbbb-0000-0000-0000-000000000000",
+            "cc_fresh_after": int(now - 100)}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+    assert set(cleared) == {"cc_conversation_id"}
+
+
+def test_reset_session_records_the_fresh_marker(amux_server, tmp_path, monkeypatch):
+    """The contract in reset_session's own docstring, pinned: after a reset the
+    next start must be a fresh conversation. Popping the keys no longer
+    achieves that on its own, so the marker must actually be written."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "Amux-gtm.env").write_text('CC_DIR="/Users/someone/Projects/demo"\n')
+    monkeypatch.setattr(amux_server, "CC_SESSIONS", sessions)
+    (sessions / "Amux-gtm.meta.json").write_text(json.dumps({
+        "cc_conversation_id": "aaaaaaaa-0000-0000-0000-000000000000",
+        "cc_session_name": "Amux-gtm",
+    }))
+    monkeypatch.setattr(amux_server, "_is_session_blocked", lambda n: False)
+    monkeypatch.setattr(amux_server, "is_running", lambda n: False)
+    monkeypatch.setattr(amux_server, "slog", lambda *a, **k: None)
+    monkeypatch.setattr(amux_server, "_ilog", lambda *a, **k: None)
+    monkeypatch.setattr(amux_server, "start_session", lambda n: (True, "started"))
+
+    before = int(time.time())
+    ok, _msg = amux_server.reset_session("Amux-gtm")
+    assert ok
+    meta = json.loads((sessions / "Amux-gtm.meta.json").read_text())
+    assert "cc_conversation_id" not in meta
+    assert "cc_session_name" not in meta
+    assert meta.get("cc_fresh_after", 0) >= before
+
+
+# ── ownership: never adopt a neighbour's conversation ────────────────────────
+
+@pytest.fixture
+def sessions_dir(amux_server, tmp_path, monkeypatch):
+    d = tmp_path / "sessions"
+    d.mkdir()
+    monkeypatch.setattr(amux_server, "CC_SESSIONS", d)
+    return d
+
+
+def test_candidates_exclude_conversation_owned_by_another_session(
+        amux_server, project, sessions_dir):
+    """AMUX-1730: two amux sessions collided onto one conversation (shared
+    CC_DIR + a borrowed id) and each pane mirrored the other. Title matching
+    can reproduce that collision, so a conversation another session's meta
+    already claims is not a candidate."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "Amux-gtm", now - 10)
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", now)
+    (sessions_dir / "neighbour.meta.json").write_text(json.dumps(
+        {"cc_conversation_id": "bbbbbbbb-0000-0000-0000-000000000000"}))
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates(
+        "Amux-gtm", work_dir, this_session="Amux-gtm")]
+    assert got == ["aaaaaaaa"]
+
+
+def test_candidates_keep_conversation_owned_by_this_session(
+        amux_server, project, sessions_dir):
+    """Our own claim is not a collision."""
+    add, work_dir = project
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    (sessions_dir / "Amux-gtm.meta.json").write_text(json.dumps(
+        {"cc_conversation_id": "bbbbbbbb-0000-0000-0000-000000000000"}))
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates(
+        "Amux-gtm", work_dir, this_session="Amux-gtm")]
+    assert got == ["bbbbbbbb"]
+
+
+def test_resume_strategy_skips_a_neighbours_conversation(
+        amux_server, project, sessions_dir):
+    add, work_dir = project
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    (sessions_dir / "neighbour.meta.json").write_text(json.dumps(
+        {"cc_conversation_id": "bbbbbbbb-0000-0000-0000-000000000000"}))
+    flag, _cleared, _ = amux_server._resume_strategy({}, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+
+
+def test_candidates_survive_unreadable_sessions_dir(
+        amux_server, project, sessions_dir, monkeypatch):
+    """The ownership guard must keep the function total — it may never raise
+    into session startup."""
+    add, work_dir = project
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+
+    def boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(amux_server, "_conversation_owned_by_other", boom)
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates(
+        "Amux-gtm", work_dir, this_session="Amux-gtm")]
+    assert got == ["bbbbbbbb"]
+
+
+def test_candidates_tie_break_is_deterministic(amux_server, project):
+    """Identical mtimes previously fell back to glob (filesystem) order, so the
+    resume target could differ between runs on the same data."""
+    add, work_dir = project
+    same = time.time() - 60
+    add("22222222-0000-0000-0000-000000000000", "S", same)
+    add("11111111-0000-0000-0000-000000000000", "S", same)
+    add("33333333-0000-0000-0000-000000000000", "S", same)
+    got = [p.stem[:8] for p in amux_server._cc_session_candidates("S", work_dir)]
+    assert got == ["11111111", "22222222", "33333333"]
+
+
+# ── peek transcript resolution (the second title lookup) ─────────────────────
+
+def test_peek_path_matches_title_recorded_on_line_two(
+        amux_server, project, sessions_dir):
+    """`_session_jsonl_path_uncached` had its own hand-rolled line-1-only title
+    read — the exact bug this branch exists to fix, in a second place. With it
+    broken the title branch never matched and peek fell through to the
+    ambiguity guard, rendering live-only or a sibling's transcript."""
+    add, work_dir = project
+    now = time.time()
+    add("aaaaaaaa-0000-0000-0000-000000000000", "mine", now - 100)
+    add("bbbbbbbb-0000-0000-0000-000000000000", "neighbour", now)
+    for n in ("mine", "neighbour"):
+        (sessions_dir / f"{n}.env").write_text(f'CC_DIR="{work_dir}"\n')
+    got = amux_server._session_jsonl_path_uncached("mine")
+    assert got is not None and got.stem == "aaaaaaaa-0000-0000-0000-000000000000"

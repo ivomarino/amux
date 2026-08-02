@@ -3185,8 +3185,11 @@ _CC_TITLE_SCAN_LINES = 30
 def _cc_session_title(path: Path, max_lines: int = _CC_TITLE_SCAN_LINES) -> str:
     """Return the session title recorded in a conversation JSONL, or ''.
 
-    Reads at most `max_lines` lines — this runs for every conversation file in
-    a project on each session-list refresh, so it must not scan whole files.
+    Reads at most `max_lines` lines. Conversation files grow without bound
+    (hundreds of MB on long-lived sessions) and every candidate in a project
+    directory is opened on the resume path and on peek transcript resolution,
+    so this must never scan a whole file. The header block Claude writes is a
+    handful of lines; anything past the window is not a header.
     """
     try:
         with path.open(errors="replace") as fh:
@@ -3232,15 +3235,30 @@ def _jsonl_has_messages(path: Path, max_lines: int = 2000) -> bool:
     return False
 
 
-def _cc_session_candidates(session_name: str, work_dir: str) -> list[Path]:
-    """Resumable conversation files titled `session_name`, newest first."""
+def _cc_session_candidates(session_name: str, work_dir: str,
+                           fresh_after: float = 0,
+                           this_session: str = "") -> list[Path]:
+    """Resumable conversation files titled `session_name`, newest first.
+
+    `fresh_after` is a reset watermark (`meta["cc_fresh_after"]`): any
+    conversation last modified at or before it was abandoned by an explicit
+    "start a fresh conversation" action and must never be offered again. It is
+    a timestamp rather than a flag precisely so the conversation the reset
+    itself creates — newer than the mark — stays resumable on later restarts.
+
+    `this_session` enables the ownership guard: a conversation another amux
+    session's meta already claims is skipped, because two sessions sharing one
+    conversation makes each pane mirror the other (AMUX-1730).
+
+    Total by construction: never raises, whatever the filesystem does.
+    """
     try:
         proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
         if not proj_dir.is_dir():
             return []
     except (OSError, RuntimeError):
         return []
-    scored: list[tuple[float, Path]] = []
+    scored: list[tuple[float, str, Path]] = []
     try:
         for jf in proj_dir.glob("*.jsonl"):
             try:
@@ -3248,21 +3266,29 @@ def _cc_session_candidates(session_name: str, work_dir: str) -> list[Path]:
                     continue
                 if not _jsonl_has_messages(jf):
                     continue
-                scored.append((jf.stat().st_mtime, jf))
+                mtime = jf.stat().st_mtime
+                if fresh_after and mtime <= fresh_after:
+                    continue
+                if this_session:
+                    try:
+                        if _conversation_owned_by_other(jf.stem, this_session):
+                            continue
+                    except Exception:
+                        pass
+                scored.append((mtime, jf.stem, jf))
             except OSError:
                 continue
     except OSError:
         return []
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [p for _, p in scored]
+    # Secondary key so identical mtimes resolve the same way every run instead
+    # of following glob (filesystem) order.
+    scored.sort(key=lambda triple: (-triple[0], triple[1]))
+    return [p for _, _, p in scored]
 
 
-def _cc_session_exists_in_project(session_name: str, work_dir: str) -> bool:
-    """Check if a resumable Claude Code session with this name exists."""
-    return bool(_cc_session_candidates(session_name, work_dir))
-
-
-def _cc_session_id_for_name(session_name: str, work_dir: str) -> str:
+def _cc_session_id_for_name(session_name: str, work_dir: str,
+                            fresh_after: float = 0,
+                            this_session: str = "") -> str:
     """Return the UUID of the most recent resumable session with this name, or ''.
 
     Multiple matches are not genuinely ambiguous: two *live* amux sessions
@@ -3272,8 +3298,12 @@ def _cc_session_id_for_name(session_name: str, work_dir: str) -> str:
     Requiring a unique match (as this did) was self-defeating — every fresh
     start wrote another identically-named conversation, so the second failure
     guaranteed all subsequent ones. Taking the newest breaks that spiral.
+
+    `fresh_after` / `this_session` are forwarded to `_cc_session_candidates`.
     """
-    candidates = _cc_session_candidates(session_name, work_dir)
+    candidates = _cc_session_candidates(session_name, work_dir,
+                                        fresh_after=fresh_after,
+                                        this_session=this_session)
     return candidates[0].stem if candidates else ""
 
 
@@ -3313,10 +3343,24 @@ def _resume_strategy(meta: dict, name: str, work_dir: str) -> tuple[str, list[st
        branch below.
     3. `cc_conversation_id` alone (migration path, pre-dates title tracking).
     4. Fresh start.
+
+    Every one of those is vetoed by `meta["cc_fresh_after"]`, the watermark an
+    explicit reset writes. Reset used to work by DELETING the pointers, which
+    only forced a fresh start while the title lookup was dead; now that the
+    name is derived, absence says nothing and the marker is what says it.
     """
     _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
     cc_session_name = _resolve_cc_session_name(meta, name)
+    if cc_session_name and not _validate_cc_session_name(cc_session_name):
+        # A persisted name that fails validation is a bad read, not a verdict:
+        # fall back to the name Claude was actually launched with rather than
+        # letting one corrupt meta poison resume for this session forever.
+        cc_session_name = name
     conv_id = meta.get("cc_conversation_id", "")
+    try:
+        fresh_after = float(meta.get("cc_fresh_after", 0) or 0)
+    except (TypeError, ValueError):
+        fresh_after = 0.0
 
     def _conv_file(cid: str) -> Path:
         return CLAUDE_HOME / "projects" / _project_name(work_dir) / f"{cid}.jsonl"
@@ -3324,12 +3368,18 @@ def _resume_strategy(meta: dict, name: str, work_dir: str) -> tuple[str, list[st
     def _resumable(cid: str) -> bool:
         try:
             cf = _conv_file(cid)
-            return cf.exists() and _jsonl_has_messages(cf)
+            if not cf.exists():
+                return False
+            if fresh_after and cf.stat().st_mtime <= fresh_after:
+                return False  # dropped by an explicit reset
+            return _jsonl_has_messages(cf)
         except (OSError, RuntimeError):
             return False
 
     if cc_session_name and _validate_cc_session_name(cc_session_name):
-        _sid = _cc_session_id_for_name(cc_session_name, work_dir)
+        _sid = _cc_session_id_for_name(cc_session_name, work_dir,
+                                       fresh_after=fresh_after,
+                                       this_session=name)
         if _sid:
             return (f'--resume {_sid}', [],
                     f"resume={cc_session_name} (uuid={_sid})")
@@ -3345,11 +3395,9 @@ def _resume_strategy(meta: dict, name: str, work_dir: str) -> tuple[str, list[st
         return (f'--name {shlex.quote(name)}', keys, msg)
     elif conv_id and _uuid_re.match(conv_id):
         # Migration path: old UUID-based session, pre-dates title tracking.
-        try:
-            exists = _conv_file(conv_id).exists()
-        except (OSError, RuntimeError):
-            exists = False
-        if exists:
+        # Same guards as step 2 — a file that exists but holds no turns bounces
+        # `claude --resume` straight back out, and a reset still vetoes.
+        if _resumable(conv_id):
             return (f'--resume {conv_id}', [], f"resume (migration) uuid={conv_id}")
         return (f'--name {shlex.quote(name)}', [], "fresh start (stale uuid)")
     else:
@@ -4329,14 +4377,11 @@ def _session_jsonl_path_uncached(name: str):
         # resolve to THIS session's own conversation by matching Claude Code's
         # per-conversation title (set from the launch `--name`) to the amux
         # session name. Files are mtime-desc, so the first match is this
-        # session's newest conversation.
+        # session's newest conversation. Read the title with _cc_session_title:
+        # Claude puts it in the header block, not on line 1, so the readline()
+        # this used to do matched nothing and the branch never fired.
         for jf in files:
-            try:
-                with jf.open() as fh:
-                    rec = json.loads(fh.readline() or "{}")
-            except Exception:
-                continue
-            if rec.get("customTitle") == name or rec.get("sessionName") == name:
+            if _cc_session_title(jf) == name:
                 return jf
         # No titled match. Do NOT fall back to the newest file — in a shared
         # workdir that's a SIBLING session's transcript bleeding into this one
@@ -16292,8 +16337,11 @@ def reset_session(name: str) -> tuple[bool, str]:
     start_session always resumes cc_conversation_id — so "I am out of context"
     meant "this lane is finished", which it never was.
 
-    Clearing the conversation pointer makes the next start a fresh one. The
-    session then rebuilds its own context from the board on boot: the existing
+    Dropping the conversation pointer and stamping `cc_fresh_after` makes the
+    next start a fresh one — the stamp is load-bearing, because the Claude-side
+    session name is derived from the amux name, so an absent pointer alone
+    would let the next start title-match right back onto this conversation.
+    The session then rebuilds its own context from the board on boot: the existing
     boot briefing already sends _board_digest(name), which carries what is in
     flight across the fleet plus this session's own queued work. That is the
     board being the source of truth doing the job it exists for — the
@@ -16321,6 +16369,12 @@ def reset_session(name: str) -> tuple[bool, str]:
     meta = _load_meta(name)
     dropped = meta.pop("cc_conversation_id", None)
     meta.pop("cc_session_name", None)
+    # Clearing the pointers is not enough: the session name is DERIVED from the
+    # amux name now, so the next start would title-match and resume the very
+    # conversation this call abandoned. The watermark is what makes the reset
+    # real — everything older than it is off the table, everything the fresh
+    # start goes on to create is not.
+    meta["cc_fresh_after"] = int(time.time())
     _save_meta(name, meta)
     slog(f"[reset] {name}: dropped conversation {dropped or '(none)'}; lane kept")
     _ilog("session", "reset", actor=name, target=name,
@@ -62046,6 +62100,11 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json({"error": "stop the session before starting a new conversation"}, 409)
                     meta = _load_meta(name)
                     meta.pop("cc_conversation_id", None)
+                    # Same watermark as reset_session(): with the session name
+                    # derived from the amux name, dropping the pointer alone
+                    # would let the next start title-match straight back onto
+                    # the conversation the user just asked to leave behind.
+                    meta["cc_fresh_after"] = int(time.time())
                     _save_meta(name, meta)
                     return self._json({"ok": True, "message": "conversation reset — next start will be a fresh conversation"})
 
