@@ -146,6 +146,16 @@ EXACTLY produced a success signal and no claim (AMUX-2140). When the instruction
 the failure are the same action, no amount of care catches it; only using the result
 does. Anything a notification or doc tells an agent to run must itself be exercised.
 
+Make the answer space match the shape of the claim (fleet-converged,
+2026-08-02, four instances in one day — orch's MO-3000 the clearest): a prompt
+offering exactly `done` or `todo` about a STANDING-ROLE card forces a false
+statement either way, and the less-wrong pick (`todo`) recycles the card into
+the rot queue forever — rot detection that cannot express "this should not
+exist" manufactures permanent rot. Before shipping any N-cell question, ask
+which cell a partial, contradictory, or mis-shaped reading lands in; if the
+honest answer is "none", the question is missing a cell, and the operator
+following instructions literally will never reach the truthful exit.
+
 ## 8. Are you deciding something that is the human's to decide?
 
 Getting out of the model's way includes getting out of the user's way.

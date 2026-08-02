@@ -10162,7 +10162,11 @@ def _advance_open_card(session_name: str) -> bool:
             f"  3. If it is BLOCKED, say what on — and if the blocker is another card, "
             f"go work that dependency instead of waiting.\n"
             f"  4. If it is blocked on a HUMAN decision, record that on the card and pick up "
-            f"the next unblocked one.\n\n"
+            f"the next unblocked one.\n"
+            f"  5. If NEITHER done nor todo would be a TRUE statement about this card — a "
+            f"standing role, a journal, a mis-shape — it cannot rot because it cannot finish: "
+            f"DISCARD it with a note pointing at the closable units (or retype it "
+            f"tripwire/watch if it is a real dormant watch).\n\n"
             f"You have {queued} more card(s) queued. Do not stall on a full queue: the aim is "
             f"every card driven to verified, working dependencies first. Never --force a gate "
             f"you cannot satisfy — an honest blocker beats a false 'done'."
@@ -31577,7 +31581,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.376';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.377';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52716,7 +52720,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.376';
+const CACHE = 'amux-v0.9.377';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
