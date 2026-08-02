@@ -21553,7 +21553,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tr-theme-x { width:18px; color:var(--dim); font-size:1rem; }
   .tr-theme-name { font-weight:700; font-size:0.9rem; }
   .tr-theme-meta { font-size:0.72rem; color:var(--dim); }
-  .tr-theme-status { font-size:0.72rem; margin-left:auto; }
+  .tr-theme-status { font-size:0.72rem; margin-left:auto; display:flex; gap:4px; flex-wrap:wrap; }
+  .tr-theme-you { border-color: var(--red); }
+  .tr-pill { font-size:0.66rem; border-radius:8px; padding:1px 7px; font-weight:600; }
+  .tr-pill-v { background:rgba(63,185,80,0.15); color:var(--green); }
+  .tr-pill-d { background:rgba(63,185,80,0.10); color:#3fb950; }
+  .tr-pill-p { background:rgba(210,153,34,0.14); color:#d29922; }
+  .tr-pill-y { background:rgba(248,81,73,0.16); color:var(--red); cursor:pointer; }
+  .tr-pill-done { background:var(--border); color:var(--dim); }
+  .tr-owners { padding:0 12px 10px 30px; font-size:0.74rem; }
+  .tr-owners-l { color:var(--dim); }
+  .tr-owners-meta { color:var(--dim); margin-left:6px; }
+  .tr-answer { background:var(--surface-2,var(--bg-2)); border:1px solid var(--border); border-radius:10px; padding:10px 12px; font-size:0.88rem; }
   .tr-sessions { display:flex; gap:5px; flex-wrap:wrap; padding:0 12px 10px; }
   .tr-sess { font-size:0.68rem; color:var(--accent); border:1px solid var(--border); border-radius:8px; padding:0 7px; cursor:pointer; }
   .tr-cards, .tr-evidence { padding:4px 12px 10px; background:var(--surface-2,var(--bg-2)); }
@@ -31041,7 +31052,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.343';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.345';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47657,16 +47668,24 @@ function _trendsRender() {
     const openC = cards.filter(c => !['done','verified','discarded'].includes(_statusCanon(c.status)));
     const blocked = openC.filter(c => (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())));
     const exp = _trendsExpanded[g.key];
-    html += '<div class="tr-theme">'
+    const inProg = openC.length - blocked.length;
+    // AM I NEEDED: any card blocked-on-you -> a red flag that opens Focus for
+    // exactly this theme's blocked cards; else it's moving on its own.
+    const needYou = blocked.length;
+    html += '<div class="tr-theme' + (needYou ? ' tr-theme-you' : '') + '">'
       + '<div class="tr-theme-h" onclick="_trendsToggle(\'' + g.key + '\')">'
       + '<span class="tr-theme-x">' + (exp ? '\u2212' : '+') + '</span>'
       + '<span class="tr-theme-name">' + esc(g.label) + '</span>'
-      + '<span class="tr-theme-meta">' + g.msgs.length + ' directives \u00B7 ' + g.sessions.size + ' lanes \u00B7 ' + cards.length + ' cards</span>'
-      + '<span class="tr-theme-status">' + (verified?('<span style="color:var(--green)">'+verified+' verified</span> '):'') + (done?(done+' done '):'') + (blocked.length?('<span style="color:var(--red)">'+blocked.length+' blocked</span>'):'') + '</span>'
-      + '</div>';
-    // session chips (linkage)
-    html += '<div class="tr-sessions">' + [...g.sessions].slice(0,10).map(sn =>
-      '<span class="tr-sess" onclick="switchView(\'sessions\');setTimeout(()=>openPeek(\'' + escJs(sn) + '\'),150)">' + esc(sn) + '</span>').join('') + '</div>';
+      + '<span class="tr-theme-status">'
+        + (verified?('<span class="tr-pill tr-pill-v">' + verified + ' verified</span>'):'')
+        + (done?('<span class="tr-pill tr-pill-d">' + done + ' done</span>'):'')
+        + (inProg>0?('<span class="tr-pill tr-pill-p">' + inProg + ' in progress</span>'):'')
+        + (needYou?('<span class="tr-pill tr-pill-y" onclick="event.stopPropagation();_trendsFocusTheme(\'' + g.key + '\')">\u26A1 ' + needYou + ' need you</span>'):(openC.length===0?'<span class="tr-pill tr-pill-done">\u2713 all closed</span>':''))
+      + '</span></div>'
+      // WHO is responsible — owners inline, no drilling.
+      + '<div class="tr-owners"><span class="tr-owners-l">Owners:</span> ' + ([...g.sessions].slice(0,8).map(sn =>
+          '<span class="tr-sess" onclick="switchView(\'sessions\');setTimeout(()=>openPeek(\'' + escJs(sn) + '\'),150)">' + esc(sn) + '</span>').join('') || '<span style="color:var(--dim)">\u2014</span>')
+      + ' <span class="tr-owners-meta">' + g.msgs.length + ' directives \u00B7 ' + cards.length + ' cards</span></div>';
     if (exp) {
       // board issues for this theme
       if (cards.length) html += '<div class="tr-cards"><div class="tr-sub">Board issues</div>' + cards.slice(0,30).map(c =>
@@ -47681,12 +47700,45 @@ function _trendsRender() {
     html += '</div>';
   });
   if (!groups.length) html = '<div style="color:var(--dim);padding:24px;text-align:center;">No directives in this window.</div>';
-  // model-authored narrative below
-  html += '<details style="margin-top:16px;"><summary style="cursor:pointer;font-size:0.85rem;color:var(--dim);">Weekly narrative (model-authored)</summary><div id="trends-digest" class="rv-digest md-content" style="margin-top:10px;"></div></details>';
+  // LEAD with the recurring weekly task-theme SUMMARY (Ethan: a summary running
+  // every 7 days), with a selector to browse prior weeks; the live theme
+  // clustering above is the current-window evidence beneath it.
+  const summaryTop = '<div id="trends-summary-wrap" style="margin-bottom:16px;">'
+    + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">'
+    + '<span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--accent);font-weight:600;">\uD83D\uDCC8 Weekly task-theme summary</span>'
+    + '<select id="trends-week" onchange="_trendsLoadSummary(this.value)" style="font-size:0.76rem;padding:3px 6px;margin-left:auto;"></select></div>'
+    + '<div id="trends-digest" class="rv-digest md-content"><span style="color:var(--dim);">Loading summary\u2026</span></div></div>';
+  const totalNeed = groups.reduce((a,g)=>a + [...g.cards].map(id=>byId[id]).filter(c=>c && (c.tags||[]).some(x=>_NEEDS_HUMAN_TAGS.has(String(x).toLowerCase())) && !['done','verified','discarded'].includes(_statusCanon(c.status))).length, 0);
+  const answerBar = '<div class="tr-answer">'
+    + (totalNeed ? '<span style="color:var(--red);font-weight:600;">\u26A1 ' + totalNeed + ' item(s) need you</span> <button class="btn" style="font-size:0.74rem;min-height:34px;margin-left:6px;" onclick="_focusStart(\'is:blocked\')">Clear them</button>'
+                 : '<span style="color:var(--green);font-weight:600;">\u2713 Nothing needs you — it\'s all moving.</span>')
+    + '</div>';
+  html = summaryTop + answerBar + '<div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--dim);font-weight:600;margin:10px 0 6px;">By theme \u00B7 what \u00B7 who \u00B7 status \u00B7 needs-you</div>' + html;
   if (bodyEl) bodyEl.innerHTML = html;
-  fetch(API + '/api/review/digest').then(r=>r.json()).then(d => { const el=document.getElementById('trends-digest'); if (el && d && d.markdown) el.innerHTML = renderMarkdown(d.markdown); }).catch(()=>{});
+  _trendsLoadSummary('');
+}
+function _trendsLoadSummary(file) {
+  fetch(API + '/api/review/digest' + (file ? '?file=' + encodeURIComponent(file) : '')).then(r=>r.json()).then(d => {
+    const sel = document.getElementById('trends-week');
+    if (sel && d.weeks) {
+      sel.innerHTML = d.weeks.map(w => '<option value="' + esc(w.file) + '"' + (w.file===d.file?' selected':'') + '>' + esc(w.file.replace(/\.md$/,'').replace('task-themes-','').replace('2026-','')) + '</option>').join('') || '<option>no summaries yet</option>';
+    }
+    const el = document.getElementById('trends-digest');
+    if (el) el.innerHTML = d.markdown ? renderMarkdown(d.markdown)
+      : '<span style="color:var(--dim);">No weekly summary yet — the Monday job writes one, or it can be generated now.</span>';
+  }).catch(()=>{});
 }
 function _trendsToggle(k) { _trendsExpanded[k] = !_trendsExpanded[k]; _trendsRender(); }
+function _trendsFocusTheme(k) {
+  const th = _TREND_THEMES.find(t => t.key === k);
+  // Focus over this theme's blocked cards specifically.
+  const ids = new Set();
+  (_cmdHistory||[]).forEach(m => { if (m.card_id && (!th || th.re.test((m.text||'')))) ids.add(m.card_id); });
+  _focusQ = 'is:blocked';
+  _focusList = _bqFilter((boardItems||[]).filter(i=>!i.deleted && ids.has(i.id)), 'is:blocked');
+  if (!_focusList.length) { _focusStart('is:blocked'); return; }
+  _focusIdx = 0; document.addEventListener('keydown', _focusKey, true); _focusRender();
+}
 
 function _costLoad() {
   const days = document.getElementById('cost-days')?.value || '7';
@@ -52095,7 +52147,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.343';
+const CACHE = 'amux-v0.9.345';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57277,15 +57329,21 @@ class CCHandler(BaseHTTPRequestHandler):
         # GET /api/review/digest — the latest committed weekly-review markdown
         # (the model-authored epic synthesis), for the Review tab to render.
         if method == "GET" and path == "/api/review/digest":
+            # The running series of weekly task-theme summaries, latest first,
+            # so Trends can browse prior weeks (AMUX-2179 / Ethan: "a summary
+            # running every 7 days of the theme of tasks I've sent").
             try:
-                d = CC_DIR_ROOT if False else Path(__file__).resolve().parent / "docs" / "weekly-review"
-                files = sorted(d.glob("*.md")) if d.is_dir() else []
+                d = Path(__file__).resolve().parent / "docs" / "weekly-review"
+                files = sorted(d.glob("*.md"), reverse=True) if d.is_dir() else []
+                which = qs.get("file", [""])[0]
+                weeks = [{"file": f.name} for f in files]
                 if not files:
-                    return self._json({"markdown": "", "file": ""})
-                latest = files[-1]
-                return self._json({"markdown": latest.read_text()[:20000], "file": latest.name})
+                    return self._json({"markdown": "", "file": "", "weeks": []})
+                target = next((f for f in files if f.name == which), files[0])
+                return self._json({"markdown": target.read_text()[:20000],
+                                   "file": target.name, "weeks": weeks})
             except Exception as e:
-                return self._json({"markdown": "", "error": str(e)[:200]})
+                return self._json({"markdown": "", "weeks": [], "error": str(e)[:200]})
 
         if method == "GET" and path == "/api/review/week":
             try:
