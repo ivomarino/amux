@@ -19358,6 +19358,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .sched-group { margin-bottom:10px; }
   .sched-group-header { display:flex;align-items:center;gap:6px;font-size:0.68rem;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:0.06em;padding:4px 0 5px;border-bottom:1px solid var(--border);margin-bottom:6px; }
   .sched-group-count { background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1px 6px;font-size:0.63rem;color:var(--dim); }
+  .sched-fires { font-size: 0.66rem; color: var(--dim); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0 6px; margin-left: 6px; font-family: var(--font-mono); }
+  .sched-fires.hot { color: var(--red); border-color: var(--red); font-weight: 700; }
   .sched-cadence-pill { font-size:0.62rem;padding:1px 5px;border-radius:10px;border:1px solid var(--border);color:var(--dim);background:var(--card);font-family:monospace; }
   .sched-id-badge { font-size:0.6rem;padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--accent);font-family:monospace;cursor:pointer;flex-shrink:0;letter-spacing:0.02em; }
   .sched-id-badge:hover { border-color:var(--accent); }
@@ -31200,7 +31203,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.355';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.357';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41291,6 +41294,14 @@ function renderScheduler(opts) {
         ? `<span class="sched-sess-dot ${sessStatus}" title="${s.session}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('sessions');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
         : `<span style="color:var(--dim);">(shell)</span>`;
       const nextRel = s.next_run ? `▶ <strong style="color:var(--text);" title="${s.next_run}">${relTime(s.next_run)}</strong>` : '';
+      // Measured cost badge (MG audit #1): fires last 24h + fleet share; red
+      // when one schedule dominates — 51% of wake-ups sat invisible until
+      // measured by hand.
+      const fpd = s.fires_day || 0;
+      const share = s.fleet_share || 0;
+      const fireBadge = fpd
+        ? `<span class="sched-fires${share >= 20 ? ' hot' : ''}" title="${fpd} fires in 24h = ${share}% of fleet">${fpd}/day${share >= 5 ? ` \u00B7 ${share}%` : ''}</span>`
+        : '';
       const _lrTitle = s.last_run ? (/^\d+$/.test(String(s.last_run)) ? new Date((+s.last_run > 2e9 ? +s.last_run : +s.last_run * 1000)).toLocaleString() : new Date(s.last_run).toLocaleString()) : '';
       const lastRel = s.last_run ? `<span style="color:var(--dim);" title="${esc(_lrTitle)}">&#x2713; ${relTime(s.last_run)}</span>` : `<span style="color:var(--dim);">never</span>`;
       const trigLabel = s.trigger_on ? `&nbsp;&middot;&nbsp;<span style="color:var(--accent);font-size:0.65rem;">&#x26A1; ${esc((s.trigger_on||'').split(',').map(t=>t==='session_idle'?'idle':t==='board'?'board':t).join('+')).trim()}</span>` : '';
@@ -41307,7 +41318,7 @@ function renderScheduler(opts) {
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
               <code class="sched-id-badge" title="Schedule id — click to copy" onclick="event.stopPropagation();_copySchedId('${esc(s.id)}')">${esc(s.id)}</code>
               <span style="font-weight:600;font-size:0.84rem;cursor:pointer;" onclick="toggleSchedExpand('${esc(s.id)}')">${esc(s.title)}</span>
-              <code class="sched-cadence-pill">${esc(recLabel)}</code>
+              <code class="sched-cadence-pill">${esc(recLabel)}</code>${fireBadge}
               ${trigLabel}${watchLabel}${doneLabel}
             </div>
             <div style="font-size:0.72rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dim);">
@@ -52295,7 +52306,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.355';
+const CACHE = 'amux-v0.9.357';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57028,7 +57039,24 @@ class CCHandler(BaseHTTPRequestHandler):
                     "SELECT * FROM schedules WHERE deleted IS NULL ORDER BY next_run ASC, created ASC"
                 ).fetchall()
                 cols = _sched_cols(db)
-                self._json([_sched_row_to_dict(r, cols) for r in rows])
+                out = [_sched_row_to_dict(r, cols) for r in rows]
+                # MEASURED fires/day + fleet share (MG audit #1 interim):
+                # run_count 1667 sat invisible in this API while ONE 5-minute
+                # canary was 51% of all fleet wake-ups. Counted from actual
+                # runs in the last 24h — measured, not parsed from the expr —
+                # so the next runaway schedule is self-evident in the list.
+                try:
+                    _fd = {r[0]: r[1] for r in db.execute(
+                        "SELECT schedule_id, COUNT(*) FROM schedule_runs "
+                        "WHERE ran_at >= ? GROUP BY schedule_id",
+                        (int(_time.time()) - 86400,)).fetchall()}
+                    _tot = sum(_fd.values()) or 1
+                    for o in out:
+                        o["fires_day"] = _fd.get(o.get("id"), 0)
+                        o["fleet_share"] = round(100 * _fd.get(o.get("id"), 0) / _tot, 1)
+                except Exception:
+                    pass
+                self._json(out)
                 return
 
             # GET /api/schedules/runs — recent runs across all schedules
@@ -62424,6 +62452,35 @@ def _db_maintenance():
                  f"{_row[1]} single-char tags — inspect/repair (SP-539 class)")
     except Exception:
         pass
+    # Stranded-claim self-revert (MG audit follow-up, their shape (b)): a
+    # `doing` card with no update activity for N hours is indistinguishable
+    # from active work, and every session reads the lie — 16 cards sat
+    # falsely 'active' for 13h after the pre-WIP-cap burst, and a session
+    # dying mid-card produces the same state with no bug anywhere. AGENT
+    # cards only (a human's stalled doing is theirs to hold, ethos #8);
+    # reverts to todo with the reason in the visible History.
+    try:
+        _stale_h = int(os.environ.get("AMUX_DOING_STALE_REVERT_HOURS", "24") or 24)
+        if _stale_h > 0:
+            _cut = int(time.time()) - _stale_h * 3600
+            _stranded = get_db().execute(
+                "SELECT id, session FROM issues WHERE status='doing' "
+                "AND owner_type='agent' AND deleted IS NULL AND updated < ?",
+                (_cut,)).fetchall()
+            for _sr in _stranded:
+                get_db().execute(
+                    "UPDATE issues SET status='todo', updated=? WHERE id=?",
+                    (int(time.time()), _sr[0]))
+                _append_board_log(_sr[0],
+                    f"auto-reverted doing \u2192 todo: no activity for {_stale_h}h "
+                    f"(stranded claim or dead session; re-claim to resume)")
+                slog(f"[board] stranded doing card {_sr[0]} ({_sr[1]}) "
+                     f"auto-reverted to todo after {_stale_h}h idle")
+            if _stranded:
+                get_db().commit()
+                _board_changed()
+    except Exception as _swe:
+        slog(f"[board] stranded-doing sweep failed: {_swe}")
     """Periodic database maintenance: WAL checkpoint, optimize, and board cleanup."""
     try:
         conn = get_db()
