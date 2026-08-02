@@ -9936,28 +9936,30 @@ _DECOMPOSE_NUDGE_COOLDOWN = 6 * 3600    # decompose-dispatch cooldown; durably e
 #   alongside actual content is unaffected.
 def _pickup_junk_reason(title: str, desc: str) -> str:
     """Why auto-pickup must refuse this card, or '' if it is a real task.
-    ORDER MATTERS (MG three-verdicts incident, 2026-08-02): the checks run
-    marker -> journal -> artifact/dormant -> structure veto -> shell, so a
-    STRUCTURED tripwire is still refused (structure protects against the
-    shell classifier, it does not make dormant work dispatchable) and a
-    33-fold journal is a journal no matter how structured. Every caller
-    must pass the SAME inputs (title, desc+log) — a second inlined copy of
-    any of these checks WILL diverge on the next edit; that is how three
-    paths gave three verdicts on one unchanged card."""
+    ORDER (MG ground truth, 2026-08-02, second revision): marker ->
+    artifact/dormant -> STRUCTURE VETO -> journal -> shell. Structure now
+    beats the fold count: MG-1328 (7,111 chars, root cause, named fix)
+    carries 33 fold lines as RESIDUE of the folding era in its desc and is
+    a real card; a true journal (the 451-fold class) has folds and no
+    structure. Structure = my markers OR 2+ ALLCAPS-PHRASE: section heads
+    (THE DEFECT: / CONSEQUENCE: / NOTE ON SCOPE: ...), which real
+    investigation cards use and 26-312-char shells never do. Dormancy
+    still beats structure (a structured tripwire is not dispatchable).
+    Every caller passes the SAME inputs (title, desc+log)."""
     _folds = len(re.findall(r"New task:", desc))
     if "capture: session prompt" in desc and _folds < 2:
         return "captured chat prompt, not a unit of work"
-    if _folds >= 2:
-        return "journal card ({} folded tasks)".format(_folds)
     if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b|"
                  r"\btripwire\b|\barmed watch\b", title or "", re.I):
         return "looks like a test artifact or armed tripwire"
-    # Structure veto (MG audit #4): protects real structured cards from the
-    # SHELL heuristics below — and only from those.
-    if re.search(r"^#{1,3}\s|\bsuccess criteri|\bacceptance criteri|^SCOPE:|^- \[[ x]\]|"
-                 r"\bgate(?:_checked| policy| criteria)\b|\bROOT CAUSE\b|\bunhappy path",
-                 desc or "", re.I | re.M):
+    _caps_heads = len(re.findall(r"^[A-Z][A-Z0-9 /'-]{3,40}:", desc or "", re.M))
+    if (_caps_heads >= 2
+        or re.search(r"^#{1,3}\s|\bsuccess criteri|\bacceptance criteri|^SCOPE:|^- \[[ x]\]|"
+                     r"\bgate(?:_checked| policy| criteria)\b|\bROOT CAUSE\b|\bunhappy path",
+                     desc or "", re.I | re.M)):
         return ""
+    if _folds >= 2:
+        return "journal card ({} folded tasks)".format(_folds)
     _pm = re.match(r"^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$",
                    (desc or "").strip(), re.S)
     if _pm:
@@ -31264,7 +31266,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.363';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.364';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52367,7 +52369,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.363';
+const CACHE = 'amux-v0.9.364';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
