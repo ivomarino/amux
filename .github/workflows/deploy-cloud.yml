@@ -64,6 +64,24 @@ jobs:
           sync_secret STRIPE_PLATFORM_FEE_PRICE_ID "${{ secrets.STRIPE_PLATFORM_FEE_PRICE_ID }}"
           sync_secret STRIPE_PLATFORM_PRICE_ID "${{ secrets.STRIPE_PLATFORM_PRICE_ID }}"
 
+      - name: Deploy scripts/watchdog.py (bind-mounted by every watchdog sidecar)
+        run: |
+          # This file was NEVER shipped. The compose template bind-mounts
+          # /opt/amux-cloud/app/scripts/watchdog.py into every watchdog sidecar,
+          # and docker CREATES A DIRECTORY when a bind-mount source does not
+          # exist. Python was handed a directory, said "can't find '__main__'
+          # module", exited 1 — and `restart: unless-stopped` restarted it
+          # instantly, forever. restartCount reached 4318, the churn saturated
+          # dockerd, `docker ps` began timing out, sshd starved, and the host
+          # went dark for an hour (AC-162/AC-163). One missing rsync line.
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 'mkdir -p /opt/amux-cloud/app/scripts'
+          rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" scripts/watchdog.py \
+            root@34.121.177.76:/opt/amux-cloud/app/scripts/watchdog.py
+          ssh -i ~/.ssh/amux_cloud root@34.121.177.76 \
+            'test -f /opt/amux-cloud/app/scripts/watchdog.py \
+               && echo "watchdog.py present as a FILE ($(wc -c < /opt/amux-cloud/app/scripts/watchdog.py) bytes)" \
+               || { echo "STILL NOT A FILE — sidecars will keep crashlooping"; exit 1; }'
+
       - name: Deploy gateway.py
         run: |
           rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/gateway.py \
