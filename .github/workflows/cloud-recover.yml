@@ -40,8 +40,25 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
           chmod 600 ~/.ssh/amux_cloud
-          ssh-keyscan -H 34.121.177.76 >> ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          # ssh-keyscan must NOT be able to fail this job. When the host wedges,
+          # the kernel still completes the TCP handshake while sshd is too
+          # starved to send its banner — so `nc` to port 22 succeeds and keyscan
+          # times out. Under `bash -e` that killed every diagnostic run at the
+          # first step, which meant the tool built to investigate an outage was
+          # unusable during exactly that outage.
+          # Best-effort keyscan, longer patience, and accept-new as the fallback:
+          # a slow-but-alive sshd now gets us in instead of failing the job.
+          timeout 45 ssh-keyscan -T 30 -H 34.121.177.76 >> ~/.ssh/known_hosts 2>/dev/null \
+            && echo "keyscan ok" || echo "keyscan failed/timed out — continuing with accept-new"
+          chmod 644 ~/.ssh/known_hosts 2>/dev/null || true
+          cat >> ~/.ssh/config <<'EOF'
+          Host 34.121.177.76
+            StrictHostKeyChecking accept-new
+            ConnectTimeout 30
+            ServerAliveInterval 10
+            ServerAliveCountMax 6
+          EOF
+          chmod 600 ~/.ssh/config
 
       - name: Diagnose BEFORE touching anything
         env:
