@@ -10217,12 +10217,23 @@ def _pickup_next_board_task(session_name: str):
         _wip_cap = int(os.environ.get("AMUX_MAX_DOING_PER_SESSION", "1") or 1)
         _doing_n = db.execute(
             "SELECT COUNT(*) FROM issues WHERE session=? AND status='doing' "
-            "AND deleted IS NULL", (session_name,)).fetchone()[0]
+            "AND deleted IS NULL "
+            # Dormant types don't consume WIP (MG follow-up): an armed
+            # tripwire 'costs nothing until it fires' and can never be
+            # completed by working it — one held a lane's entire WIP-1
+            # budget indefinitely. type is the honest discriminator
+            # (ethos #3: fix the type, not the truth).
+            "AND COALESCE(type,'') NOT IN ('tripwire','watch')",
+            (session_name,)).fetchone()[0]
         if _doing_n >= _wip_cap:
             return
         rows = db.execute(
             "SELECT id, title, desc, log FROM issues i "
             "WHERE session=? AND status='todo' AND owner_type='agent' AND deleted IS NULL "
+            # A dormant card (tripwire/watch) is not dispatchable work — it
+            # arms and waits. The loop never claims one; a human or the
+            # firing event moves it.
+            "AND COALESCE(type,'') NOT IN ('tripwire','watch') "
             # Freshness gate: never auto-run a card nobody has touched in 7+
             # days — fossils get triaged/parked by a human, not silently
             # executed at idle (2026-07-23 sweep found 337 such cards; blind
@@ -31214,7 +31225,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.358';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.359';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52317,7 +52328,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.358';
+const CACHE = 'amux-v0.9.359';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
