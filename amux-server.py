@@ -7459,8 +7459,50 @@ def get_claude_stats(work_dir: str) -> dict:
 _model_cache = {}  # {work_dir: (model, mtime, timestamp)}
 _MODEL_CACHE_TTL = 15  # seconds
 
+# `/model opus` is recorded as a plain user turn — command name, message and
+# args in one entry — and carries no `message.model` anywhere. Without reading
+# it, a model switch stays invisible until the session's next assistant turn,
+# which for an idle session never comes.
+_SLASH_MODEL_RE = re.compile(
+    r"<command-name>\s*/model\s*</command-name>.*?<command-args>(.*?)</command-args>",
+    re.DOTALL,
+)
+
+
+def _entry_text(entry: dict) -> str:
+    """Flatten a JSONL entry's message content to text. Content is a bare string
+    for simple turns and a list of blocks for richer ones; slash commands appear
+    in both shapes depending on how the turn was composed."""
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def _slash_model_switch(entry: dict) -> str:
+    """Return the model a `/model <arg>` turn switched to, or "" if this entry is
+    not one — or is the bare `/model` that opens the interactive picker, which
+    records no id we could trust."""
+    if entry.get("type") != "user":
+        return ""
+    text = _entry_text(entry)
+    if "/model" not in text:
+        return ""
+    m = _SLASH_MODEL_RE.search(text)
+    if not m:
+        return ""
+    ok, model, _err = _validate_model_name(m.group(1).strip())
+    return model if ok else ""
+
+
 def detect_active_model(work_dir: str, conversation_id: str = "") -> str:
-    """Detect the model in use from the session's own JSONL conversation file."""
+    """Detect the model in use from the session's own JSONL conversation file.
+
+    Reads backward and returns whichever signal is most recent: an explicit
+    `/model <id>` switch, or the model observed on the last assistant turn.
+    """
     if not work_dir:
         return ""
     project_name = _project_name(work_dir)
@@ -7503,7 +7545,10 @@ def detect_active_model(work_dir: str, conversation_id: str = "") -> str:
             for line in reversed(data.splitlines()):
                 try:
                     entry = json.loads(line)
-                    model = entry.get("message", {}).get("model", "")
+                    # Whichever comes first scanning backward is the newer
+                    # signal, so a /model switch after the last assistant turn
+                    # wins, and a later assistant turn overrides the switch.
+                    model = entry.get("message", {}).get("model", "") or _slash_model_switch(entry)
                     if model:
                         _model_cache[cache_key] = (model, mtime, time.time())
                         return model
