@@ -21315,6 +21315,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     min-width: 150px; z-index: 200; padding: 6px 0;
     box-shadow: 0 4px 16px rgba(0,0,0,0.2);
   }
+  #peek-tab-customizer-menu { position: absolute; right: 6px; top: 100%; z-index: 60; }
+  .peek-tabs { position: relative; }
   .tab-customizer-item {
     display: flex; align-items: center; gap: 8px; padding: 6px 14px;
     font-size: 0.82rem; cursor: pointer; color: var(--fg); user-select: none;
@@ -25036,6 +25038,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
+    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder session tabs" style="flex:0 0 auto;">&#x229E;</button>
+    <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
   </div>
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
@@ -28718,6 +28722,85 @@ function _renderTabCustomizerMenu() {
   }
 }
 
+// ── Peek (session) tab customizer (AMUX-2185) ──────────────────────────────
+// Same mechanism as the main tab bar: hide/show + reorder, persisted to
+// localStorage, applied UNIFORMLY to every session's peek. Terminal is pinned
+// (always visible, always first) — everything else is customizable.
+const PEEK_TABS = [
+  { id: 'steering',   label: 'Steering' },
+  { id: 'schedules',  label: 'Schedules' },
+  { id: 'messages',   label: 'Messages' },
+  { id: 'dictation',  label: 'Dictation' },
+  { id: 'issues',     label: 'Board' },
+  { id: 'cost',       label: 'Cost' },
+  { id: 'transcript', label: 'Transcript' },
+  { id: 'commits',    label: 'Commits' },
+  { id: 'git',        label: 'Worktree' },
+];
+let peekHiddenTabs = (function() {
+  try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
+  return new Set(['dictation', 'commits', 'git']);   // sensible default
+})();
+let peekTabOrder = (function() {
+  try {
+    const v = localStorage.getItem('amux_peek_tab_order');
+    if (v) { const saved = JSON.parse(v); const all = PEEK_TABS.map(t => t.id);
+      return [...new Set([...saved.filter(id => all.includes(id)), ...all.filter(id => !saved.includes(id))])]; }
+  } catch(e) {}
+  return PEEK_TABS.map(t => t.id);
+})();
+function _savePeekTabPrefs() {
+  peekTabOrder = [...new Set(peekTabOrder)];
+  localStorage.setItem('amux_peek_hidden_tabs', JSON.stringify([...peekHiddenTabs]));
+  localStorage.setItem('amux_peek_tab_order', JSON.stringify(peekTabOrder));
+}
+function _applyPeekTabVisibility() {
+  const bar = document.querySelector('.peek-tabs');
+  if (!bar) return;
+  // Reorder AFTER terminal (which stays first), BEFORE the customize button.
+  const custBtn = document.getElementById('peek-tab-customize');
+  peekTabOrder.forEach(id => {
+    const el = document.getElementById('peek-tab-' + id);
+    if (el && custBtn) bar.insertBefore(el, custBtn);
+  });
+  PEEK_TABS.forEach(t => {
+    const el = document.getElementById('peek-tab-' + t.id);
+    if (el) el.style.display = peekHiddenTabs.has(t.id) ? 'none' : '';
+  });
+}
+let _peekTabCustomizerOpen = false, _peekTabMenuSortable = null;
+function togglePeekTabCustomizer() {
+  _peekTabCustomizerOpen = !_peekTabCustomizerOpen;
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  if (!menu) return;
+  if (_peekTabCustomizerOpen) { _renderPeekTabCustomizer(); menu.style.display = ''; }
+  else { menu.style.display = 'none'; }
+}
+function _renderPeekTabCustomizer() {
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  if (!menu) return;
+  const ordered = peekTabOrder.map(id => PEEK_TABS.find(t => t.id === id)).filter(Boolean);
+  let html = '<div class="tab-customizer-item required" onclick="event.stopPropagation()" style="opacity:0.7;">'
+    + '<span style="padding:0 4px 0 0;color:var(--dim);">\uD83D\uDCCC</span><input type="checkbox" checked disabled> Terminal (pinned)</div>';
+  html += ordered.map(t => {
+    const checked = !peekHiddenTabs.has(t.id);
+    return '<label class="tab-customizer-item" data-ptab-id="' + t.id + '" onclick="event.stopPropagation()">'
+      + '<span class="tab-drag-handle" style="cursor:grab;color:var(--dim);padding:0 4px 0 0;font-size:0.8rem;">\u2807</span>'
+      + '<input type="checkbox" ' + (checked ? 'checked' : '') + ' onchange="togglePeekTabVisibility(\'' + t.id + '\',this.checked)"> ' + t.label + '</label>';
+  }).join('');
+  menu.innerHTML = html;
+  if (window.Sortable) {
+    if (_peekTabMenuSortable) { try { _peekTabMenuSortable.destroy(); } catch(e) {} }
+    _peekTabMenuSortable = Sortable.create(menu, { handle: '.tab-drag-handle', draggable: '.tab-customizer-item[data-ptab-id]', animation: 100,
+      onEnd() { peekTabOrder = [...new Set([...menu.querySelectorAll('.tab-customizer-item[data-ptab-id]')].map(el => el.dataset.ptabId))]; _savePeekTabPrefs(); _applyPeekTabVisibility(); } });
+  }
+}
+function togglePeekTabVisibility(id, show) {
+  if (show) peekHiddenTabs.delete(id);
+  else { if (_peekTab === id) setPeekTab('terminal'); peekHiddenTabs.add(id); }
+  _savePeekTabPrefs(); _applyPeekTabVisibility();
+}
+
 function toggleTabVisibility(id, show) {
   const tab = ALL_TABS.find(t => t.id === id);
   if (!tab || tab.required) return;
@@ -30944,7 +31027,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.341';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.342';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -31112,6 +31195,7 @@ function _paintCachedPeek(cached) {
   return true;
 }
 function openPeek(name, opts) {
+  try { _applyPeekTabVisibility(); } catch(e) {}
   _stopPeekPoll();
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   const _tb = document.getElementById('peek-transcript-body');
@@ -52031,7 +52115,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.341';
+const CACHE = 'amux-v0.9.342';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
