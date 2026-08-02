@@ -10352,6 +10352,9 @@ def _pickup_next_board_task(session_name: str):
         rows = db.execute(
             "SELECT id, title, desc, log FROM issues i "
             "WHERE session=? AND status='todo' AND owner_type='agent' AND deleted IS NULL "
+            # Archived cards stay SEARCHABLE but are never auto-grabbed
+            # (Ethan 2026-08-02) — this filter was missing here alone.
+            "AND COALESCE(archived,0)=0 "
             # A dormant card (tripwire/watch) is not dispatchable work — it
             # arms and waits. The loop never claims one; a human or the
             # firing event moves it.
@@ -10509,6 +10512,54 @@ def _pickup_next_board_task(session_name: str):
                         f"'{session_name}' picked up queued task: {title[:80]}")
     except Exception as e:
         print(f"[board] pickup failed for {session_name}: {e}", flush=True)
+
+
+def _age_archive_sweep():
+    """Age-based auto-archive (Ethan 2026-08-02): any card untouched 3+ days
+    — INCLUDING discarded, done, open queues — moves to archived, where it
+    stays fully searchable but is never auto-grabbed. Every move leaves a
+    full trail: a History line naming AGE as the reason and the actor, plus
+    a board-audit row (kind='board', action='archive') with the prior state,
+    so when/why/by-whom is answerable per card forever (AMUX-2141 class).
+    Exclusions: pinned only (pin = never auto-archive, pre-existing
+    semantics). needs:you cards remain visible to Focus even when archived
+    — archiving organizes the board, it must not hide a decision owed."""
+    try:
+        db = get_db()
+        now = int(time.time())
+        last = 0
+        try:
+            row = db.execute("SELECT value FROM prefs WHERE key='age_archive_last'").fetchone()
+            last = int(json.loads(row[0])) if row else 0
+        except Exception:
+            last = 0
+        if now - last < 6 * 3600:
+            return
+        db.execute("INSERT INTO prefs (key, value) VALUES ('age_archive_last', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now),))
+        db.commit()
+        cut = now - 3 * 86400
+        rows = db.execute(
+            "SELECT id, status, session, updated FROM issues WHERE deleted IS NULL "
+            "AND COALESCE(archived,0)=0 AND COALESCE(pinned,0)=0 AND updated < ? "
+            "LIMIT 500", (cut,)).fetchall()
+        for r in rows:
+            _days = max(3, int((now - (r["updated"] or now)) / 86400))
+            _append_board_log(r["id"],
+                f"archived: AGE — untouched {_days}d (was {r['status']}; by amux age-sweep)")
+            _ilog("board", "archive", actor="amux-age-sweep", target=r["id"],
+                  detail={"reason": "age", "days_untouched": _days},
+                  before={"archived": 0, "status": r["status"], "session": r["session"]},
+                  ok=True)
+        if rows:
+            db.execute(
+                "UPDATE issues SET archived=1, rev=COALESCE(rev,0)+1 WHERE id IN (%s)"
+                % ",".join("?" * len(rows)), [r["id"] for r in rows])
+            db.commit()
+            _board_changed()
+        slog(f"[age-archive] archived {len(rows)} card(s) untouched 3d+")
+    except Exception as e:
+        slog(f"[age-archive] failed: {e}")
 
 
 def _verification_sweep():
@@ -31526,7 +31577,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.374';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.375';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42142,6 +42193,10 @@ function _bqIs(item, val, ix) {
     case 'sourcestale': return _bqIs(item, 'open', ix) && !!item.source_ref
                         && (!item.last_verified_at
                             || (Date.now()/1000 - item.last_verified_at) > 86400);
+    // needs:you IGNORES the archived flag deliberately: the age sweep
+    // archives untouched cards after 3d, and a decision owed to the human
+    // must survive that — archived organizes, it must not hide (Ethan
+    // 2026-08-02, both asks same day).
     case 'needsyou': return _bqIs(item, 'open', ix) && (
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
@@ -52661,7 +52716,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.374';
+const CACHE = 'amux-v0.9.375';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57334,7 +57389,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         try:
                             _AUDIT_FIELDS = ("title", "desc", "status", "session", "shepherd",
                                              "type", "owner_type", "reviewer", "depends_on",
-                                             "due", "due_time", "pinned")
+                                             "due", "due_time", "pinned", "archived")
                             _chg = {k: updated_item.get(k) for k in _AUDIT_FIELDS
                                     if k in body and _audit_prior.get(k) != updated_item.get(k)}
                             _actor = (self.headers.get("X-Amux-Session", "")
@@ -62891,6 +62946,7 @@ def _db_maintenance():
     # Loop 2 of the throughput plan: daily verification batches (pref-gated
     # inside — cheap no-op on every other maintenance pass).
     _verification_sweep()
+    _age_archive_sweep()
     # Single-char-tag canary (studio-plg, SP-539): a string tags value once
     # char-exploded silently, and the retro sweep's ">=5 singles" threshold was
     # blind to short tags ("wip" -> 3 singles). The STRUCTURAL predicate — a
