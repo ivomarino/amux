@@ -9020,6 +9020,12 @@ def _init_db():
         "ALTER TABLE schedules ADD COLUMN done_pattern TEXT",
         "ALTER TABLE schedules ADD COLUMN done_action TEXT NOT NULL DEFAULT 'disable'",
         "ALTER TABLE schedules ADD COLUMN gcal_event_id TEXT",
+        # kind:shell exit-code action map (MG audit #1 / AMUX-2199): JSON like
+        # {"1":"alert","2":"retry_once_then_alert","3":"log"}. NULL = today's
+        # behavior (nonzero -> error row). This is what lets a monitoring
+        # schedule run WITHOUT a model in the loop: the script decides, the
+        # map escalates, the session is the escalation path not the poller.
+        "ALTER TABLE schedules ADD COLUMN exit_actions TEXT",
         # WHY a run happened. Without this a hand-pressed "Run now" is byte-identical
         # to a cron fire in the runs list, so an extra same-day fire reads as the
         # scheduler double-firing. That cost a real investigation (AMUX-1998:
@@ -11775,7 +11781,28 @@ def _run_schedule(sched, source: str = "cron"):
                 ["/bin/bash", "-c", command],
                 capture_output=True, text=True, timeout=600,
             )
-            if r.returncode != 0:
+            _amap = {}
+            try:
+                _amap = json.loads(sched.get("exit_actions") or "null") or {}
+            except Exception:
+                _amap = {}
+            _act = _amap.get(str(r.returncode), "")
+            if _act == "retry_once_then_alert" and r.returncode != 0:
+                slog(f"[sched] '{sched['title']}' exit {r.returncode} — retrying once")
+                r = subprocess.run(["/bin/bash", "-c", command],
+                                   capture_output=True, text=True, timeout=600)
+                _act = "alert" if r.returncode != 0 else "noop"
+            if _act == "alert" or (_act == "" and r.returncode != 0 and _amap):
+                status = "error"
+                note = (r.stderr or r.stdout or f"exit {r.returncode}")[:500]
+                _push_alert("schedule", sched.get("session") or "",
+                            f"'{sched['title']}' exit {r.returncode}: {note[:160]}")
+                slog(f"[sched] ALERT '{sched['title']}' exit {r.returncode}: {note[:120]}")
+            elif _act in ("noop", "log") or (_amap and r.returncode == 0):
+                status = "ok"
+                note = ((f"exit {r.returncode} [{_act or 'ok'}] " if _act else "")
+                        + (r.stdout or ""))[:500] or None
+            elif r.returncode != 0:
                 status = "error"
                 note = (r.stderr or r.stdout or f"exit {r.returncode}")[:500]
                 slog(f"[sched] shell failed for '{sched['title']}': {note}")
@@ -31237,7 +31264,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.360';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.362';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52340,7 +52367,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.360';
+const CACHE = 'amux-v0.9.362';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57155,6 +57182,9 @@ class CCHandler(BaseHTTPRequestHandler):
                     "watch_timeout": int(data.get("watch_timeout") or 120),
                     "done_pattern": data.get("done_pattern") or None,
                     "done_action": data.get("done_action") or "disable",
+                    "exit_actions": (json.dumps(data["exit_actions"])
+                                     if isinstance(data.get("exit_actions"), dict)
+                                     else (data.get("exit_actions") or None)),
                     "trigger_on": (data.get("trigger_on") or "").strip() or None,
                     "trigger_cooldown": int(data.get("trigger_cooldown") or 120),
                     "trigger_sessions": (data.get("trigger_sessions") or "").strip() or None,
@@ -57171,8 +57201,8 @@ class CCHandler(BaseHTTPRequestHandler):
                     """INSERT INTO schedules (id,title,session,command,kind,sched_type,recurrence,
                        run_at,next_run,last_run,enabled,run_count,schedule_expr,
                        watch,watch_timeout,done_pattern,done_action,trigger_on,trigger_cooldown,trigger_sessions,
-                       created,updated,deleted)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       exit_actions,created,updated,deleted)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (sched["id"], sched["title"], sched["session"], sched["command"], sched["kind"],
                      sched["sched_type"], sched["recurrence"], sched["run_at"],
                      sched["next_run"], sched["last_run"], sched["enabled"],
@@ -57180,7 +57210,7 @@ class CCHandler(BaseHTTPRequestHandler):
                      sched["watch"], sched["watch_timeout"],
                      sched["done_pattern"], sched["done_action"],
                      sched["trigger_on"], sched["trigger_cooldown"], sched["trigger_sessions"],
-                     sched["created"], sched["updated"], sched["deleted"])
+                     sched.get("exit_actions"), sched["created"], sched["updated"], sched["deleted"])
                 )
                 db.commit()
                 # Creation is a mutation too — unaudited creates were half of
@@ -57284,9 +57314,11 @@ class CCHandler(BaseHTTPRequestHandler):
                 # guardian. Now every flip carries at least its origin.
                 _by = _sched_mutation_by(self.headers, self.client_address, body)
                 for k in ("title","session","command","kind","sched_type","recurrence","run_at","enabled","schedule_expr",
-                          "watch","watch_timeout","done_pattern","done_action","trigger_on","trigger_cooldown","trigger_sessions"):
+                          "watch","watch_timeout","done_pattern","done_action","trigger_on","trigger_cooldown","trigger_sessions",
+                          "exit_actions"):
                     if k in body:
-                        sched[k] = body[k]
+                        sched[k] = (json.dumps(body[k]) if k == "exit_actions" and isinstance(body[k], dict)
+                                    else body[k])
                 expr = (sched.get("schedule_expr") or "").strip()
                 if expr:
                     sched["sched_type"] = "recurring"
@@ -57300,7 +57332,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     """UPDATE schedules SET title=?,session=?,command=?,kind=?,sched_type=?,recurrence=?,
                        run_at=?,next_run=?,enabled=?,schedule_expr=?,
                        watch=?,watch_timeout=?,done_pattern=?,done_action=?,trigger_on=?,trigger_cooldown=?,trigger_sessions=?,
-                       updated=? WHERE id=?""",
+                       exit_actions=?,updated=? WHERE id=?""",
                     (sched["title"], sched["session"], sched["command"], sched.get("kind") or "tmux",
                      sched["sched_type"],
                      sched["recurrence"], sched["run_at"], sched["next_run"],
@@ -57308,7 +57340,7 @@ class CCHandler(BaseHTTPRequestHandler):
                      int(sched.get("watch") or 0), int(sched.get("watch_timeout") or 120),
                      sched.get("done_pattern"), sched.get("done_action") or "disable",
                      _trig, int(sched.get("trigger_cooldown") or 120), _trig_sess,
-                     sched["updated"], sched_id)
+                     sched.get("exit_actions"), sched["updated"], sched_id)
                 )
                 db.commit()
                 # Attribution/audit — log every changed tracked field (esp. enabled)
