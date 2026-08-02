@@ -21315,8 +21315,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     min-width: 150px; z-index: 200; padding: 6px 0;
     box-shadow: 0 4px 16px rgba(0,0,0,0.2);
   }
-  #peek-tab-customizer-menu { position: absolute; right: 6px; top: 100%; z-index: 60; }
-  .peek-tabs { position: relative; }
+  #peek-tab-customizer-menu { position: fixed; z-index: 300; }
   .tab-customizer-item {
     display: flex; align-items: center; gap: 8px; padding: 6px 14px;
     font-size: 0.82rem; cursor: pointer; color: var(--fg); user-select: none;
@@ -28794,12 +28793,24 @@ function _applyPeekTabVisibility() {
   });
 }
 let _peekTabCustomizerOpen = false, _peekTabMenuSortable = null;
+function _peekCustOutside(e) {
+  const menu = document.getElementById('peek-tab-customizer-menu');
+  const btn = document.getElementById('peek-tab-customize');
+  if (menu && !menu.contains(e.target) && e.target !== btn) { _peekTabCustomizerOpen = false; menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
+}
 function togglePeekTabCustomizer() {
   _peekTabCustomizerOpen = !_peekTabCustomizerOpen;
   const menu = document.getElementById('peek-tab-customizer-menu');
   if (!menu) return;
-  if (_peekTabCustomizerOpen) { _renderPeekTabCustomizer(); menu.style.display = ''; }
-  else { menu.style.display = 'none'; }
+  if (_peekTabCustomizerOpen) {
+    _renderPeekTabCustomizer();
+    const btn = document.getElementById('peek-tab-customize');
+    if (btn) { const r = btn.getBoundingClientRect();
+      menu.style.top = (r.bottom + 4) + 'px';
+      menu.style.left = Math.max(8, Math.min(r.left - 160, (document.documentElement.clientWidth||innerWidth) - 230)) + 'px'; }
+    menu.style.display = '';
+    setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
+  } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
 }
 function _renderPeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -31052,7 +31063,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.345';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.346';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52147,7 +52158,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.345';
+const CACHE = 'amux-v0.9.346';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
