@@ -3175,6 +3175,63 @@ def _validate_cc_session_name(name: str) -> bool:
     return bool(name and len(name) <= 64 and _VALID_CC_SESSION_NAME.match(name))
 
 
+# Claude Code writes the session title as a `custom-title` entry inside the
+# conversation file's header block — in practice line 2, behind `last-prompt`
+# or `queue-operation`. The lookups below used to read only the first line,
+# which matched nothing on any install and left resume permanently dead.
+_CC_TITLE_SCAN_LINES = 30
+
+
+def _cc_session_title(path: Path, max_lines: int = _CC_TITLE_SCAN_LINES) -> str:
+    """Return the session title recorded in a conversation JSONL, or ''.
+
+    Reads at most `max_lines` lines — this runs for every conversation file in
+    a project on each session-list refresh, so it must not scan whole files.
+    """
+    try:
+        with path.open(errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                title = rec.get("customTitle") or rec.get("sessionName")
+                if title:
+                    return title
+    except OSError:
+        pass
+    return ""
+
+
+def _jsonl_has_messages(path: Path, max_lines: int = 2000) -> bool:
+    """True if a conversation has at least one user/assistant turn.
+
+    `claude --resume` exits immediately on a snapshot-only file, so offering
+    one as a resume target produces a fresh start with extra steps.
+    """
+    try:
+        with path.open(errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("type") in ("user", "assistant"):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _cc_session_exists_in_project(session_name: str, work_dir: str) -> bool:
     """Check if a Claude Code session with this name exists in the project directory."""
     proj_dir = CLAUDE_HOME / "projects" / _project_name(work_dir)
