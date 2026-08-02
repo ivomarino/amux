@@ -2164,18 +2164,27 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
             d = None
         if not d:
             udir, _pdir = _bu_profile_launch_target(profile)
+            # Interpreter: the server's own python may not have playwright
+            # (the first live spawn died at import with stderr on DEVNULL —
+            # 'driver failed to start: <empty>', undiagnosable). stderr is now
+            # captured into the error, and the interpreter is configurable.
+            _py = os.environ.get("AMUX_BU_DRIVER_PYTHON") or sys.executable
             proc = subprocess.Popen(
-                [sys.executable, "-c", _BU_DRIVER_SRC, str(udir), "1"],
+                [_py, "-c", _BU_DRIVER_SRC, str(udir), "1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True)
+                stderr=subprocess.PIPE, text=True)
             ready = proc.stdout.readline()
             try:
                 if not json.loads(ready or "{}").get("ready"):
                     raise ValueError(ready[:200])
             except Exception as e:
+                try:
+                    _err = (proc.stderr.read() or "")[-400:]
+                except Exception:
+                    _err = ""
                 try: proc.kill()
                 except Exception: pass
-                return {"error": f"driver failed to start: {e}"}
+                return {"error": f"driver failed to start: {e} :: {_err}".strip()}
             d = {"proc": proc, "profile": profile, "udir": str(udir)}
             _bu_drivers[session] = d
             slog(f"[browser] v3 driver up session={session} profile={profile!r} store={udir}")
@@ -2216,6 +2225,27 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
     else:
         if cur:  # existing session runs a different profile — close before reopening
             _bu_call(["close"], session=session, timeout_s=10)
+        # v3 driver (AMUX-2159 increment 2): profile sessions on amux-managed
+        # stores run through OUR Playwright persistent context — no CLI, no
+        # daemon, no copy; reads AND writes persist (the 0.12.2 copy ceiling
+        # is structural, proven at five instrumented layers). Legacy stores
+        # resolve to (dir, "") — that discriminator picks the driver. CLI
+        # remains for non-profile modes and as the fallback if the driver
+        # cannot start.
+        _udir, _pdir = _bu_profile_launch_target(profile)
+        if _pdir == "" and Path(_udir).exists():
+            dres = _bu_driver_call(session, profile, "open", {"url": url},
+                                   timeout_s=timeout_s)
+            if dres.get("ok"):
+                return {"success": True, "ok": True, "backend": "driver",
+                        "profile": profile, "auto_profile": auto,
+                        "url": dres.get("url", url), "title": dres.get("title", ""),
+                        "writes_persist": True,
+                        "profile_verified": True,
+                        "profile_verified_note": ("driver holds the store open "
+                                                  "directly — no temp copy exists")}
+            slog(f"[browser] v3 driver failed for {session}/{profile}: "
+                 f"{dres.get('error')!r} — falling back to CLI path")
         res = _bu_call(["-b", "real", "--profile", profile, "open", url],
                        session=session, timeout_s=timeout_s)
         # Graceful fallback: if real-Chrome mode can't launch, browse anyway
@@ -31103,7 +31133,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.351';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.353';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52198,7 +52228,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.351';
+const CACHE = 'amux-v0.9.353';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60310,6 +60340,19 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     if not r.get("ok"):
                         return self._json(r, 502)
                     return self._json({"ok": True, "backend": "live", "path": _f, "url": _live_url(session)})
+                if session in _bu_drivers:
+                    d = _bu_drivers[session]
+                    if url_param:
+                        _bu_driver_call(session, d["profile"], "open", {"url": url_param})
+                    shot = _bu_driver_call(session, d["profile"], "screenshot", {})
+                    if shot.get("ok") and shot.get("b64"):
+                        import base64 as _b64
+                        _sp = Path.home() / ".amux" / "browser-screenshots"
+                        _sp.mkdir(parents=True, exist_ok=True)
+                        _f = _sp / f"driver-{session}.png"
+                        _f.write_bytes(_b64.b64decode(shot["b64"]))
+                        return self._json({"ok": True, "backend": "driver", "path": str(_f)})
+                    return self._json({"error": shot.get("error", "driver screenshot failed")}, 502)
                 if url_param:
                     _bu_call(["open", url_param], session=session, timeout_s=20)
                     import time as _t; _t.sleep(2)
@@ -60328,6 +60371,17 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json(r, 502)
                     return self._json({"ok": True, "backend": "live", "url": _live_url(session),
                                        "a11y": _obs_cap(r.get("output", ""), _OBS_STATE_CAP)})
+                if session in _bu_drivers:
+                    d = _bu_drivers[session]
+                    st = _bu_driver_call(session, d["profile"], "state", {})
+                    if st.get("ok"):
+                        return self._json({"ok": True, "backend": "driver",
+                                           "url": st.get("url", ""), "title": st.get("title", ""),
+                                           "text": st.get("text", ""),
+                                           "elements_unavailable":
+                                               "driver backend has no indexed elements — "
+                                               "click by coordinates or use eval"})
+                    return self._json({"error": st.get("error", "driver state failed")}, 502)
                 res = _bu_call(["state"], session=session)
                 try:
                     raw = (res.get("data") or {}).get("_raw_text", "") if isinstance(res, dict) else ""
@@ -60488,6 +60542,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _cdp_call(["close", tid], 10)   # browser-level closeTarget — window.close() can't close our tab
                     _cdp_call(["stop", tid], 8)
                     return self._json({"ok": True, "backend": "live", "closed": tid})
+                if session in _bu_drivers:
+                    _prof = _bu_drivers[session].get("profile", "")
+                    _bu_driver_stop(session)
+                    return self._json({"ok": True, "backend": "driver",
+                                       "closed": True, "profile": _prof,
+                                       "note": "store writes persisted (no copy)"})
                 # Read the profile BEFORE closing — the session meta that records
                 # it goes away with the session, and after that there is nothing
                 # left to tell us which user-data-dir to wait on.
