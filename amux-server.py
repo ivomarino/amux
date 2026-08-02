@@ -10190,6 +10190,40 @@ def _stamp_evicted_dependents(evicted) -> int:
     return stamped
 
 
+def _title_trigrams(t: str) -> set:
+    t = re.sub(r"[^a-z0-9 ]", " ", (t or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return {t[i:i+3] for i in range(max(0, len(t) - 2))}
+
+
+def _similar_open_cards(title: str, exclude_session: str, db=None, limit: int = 3) -> list:
+    """Open cards from OTHER sessions whose titles trigram-match this one
+    (AMUX-2202 / MG audit #7: four sessions independently investigated ONE
+    deploy revert-loop because nothing surfaced the overlap at filing time).
+    Pure computation — no model call; a dumb trigram catches MHC-283 vs
+    MG-1381 and that is the bar."""
+    tg = _title_trigrams(title)
+    if len(tg) < 8:
+        return []                     # too short to score meaningfully
+    db = db or get_db()
+    rows = db.execute(
+        "SELECT id, session, title FROM issues WHERE deleted IS NULL "
+        "AND status IN ('todo','doing','review','backlog') "
+        "AND session IS NOT NULL AND session != ? "
+        "ORDER BY updated DESC LIMIT 400", (exclude_session or "",)).fetchall()
+    out = []
+    for r in rows:
+        og = _title_trigrams(r["title"] or "")
+        if not og:
+            continue
+        sim = len(tg & og) / max(1, len(tg | og))
+        if sim >= 0.45:
+            out.append({"id": r["id"], "session": r["session"],
+                        "title": (r["title"] or "")[:80], "sim": round(sim, 2)})
+    out.sort(key=lambda x: -x["sim"])
+    return out[:limit]
+
+
 def _deps_blocking(item) -> list:
     """Card ids in item.depends_on that are still OPEN (deleted/absent do not
     block). This is the edge the autonomy loop traverses: prose like 'BLOCKS
@@ -31290,7 +31324,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.365';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.366';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52393,7 +52427,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.365';
+const CACHE = 'amux-v0.9.366';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -56359,6 +56393,23 @@ class CCHandler(BaseHTTPRequestHandler):
                     _gcal_sync_bg(item_id, title=title, due=due, due_time=due_time or "", desc=desc, status=status)
                 _req_tl.event = {"type": "board", "action": "created", "target": item_id,
                                  "session": session, "detail": f"{item_id}: {title}"}
+                # Duplicate-investigation guard (AMUX-2202): surface open
+                # cards from OTHER sessions with similar titles at the moment
+                # of filing — the only moment the overlap is cheap to act on.
+                # Recorded on the card History (where the filer looks) and in
+                # the response (for CLI/API filers).
+                try:
+                    _sims = _similar_open_cards(title, session)
+                    if _sims:
+                        item["similar_open"] = _sims
+                        _append_board_log(item_id,
+                            "possible duplicate of: " + ", ".join(
+                                f"{x['id']} ({x['session']}, {int(x['sim']*100)}%)" for x in _sims)
+                            + " — check before investigating independently")
+                        slog(f"[board] {item_id} similar to open: "
+                             + ", ".join(x["id"] for x in _sims))
+                except Exception:
+                    pass
                 # Auto-notify the assignee session if this is an agent task waiting for pickup.
                 # Skip if creator==session (the session created its own task).
                 # 'todo' only (MG/AMUX-2205): backlog is deliberate parking —
