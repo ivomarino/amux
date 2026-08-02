@@ -1000,6 +1000,28 @@ _active_servers: list = []  # populated in main(); used by signal handler for cl
 def _install_signal_handlers():
     """Install signal handlers that log before exit."""
     import signal
+    # SIGUSR1 -> dump every thread's stack into the log, WITHOUT exiting.
+    #
+    # The spin (AC-164/AC-170) pegs a core while /api/board and /api/email hang,
+    # then launchd replaces the process, so the evidence is gone before anyone
+    # looks. py-spy would answer it in one sample — but py-spy REQUIRES ROOT ON
+    # macOS, which a session cannot do unattended, so on this machine it is not
+    # an available instrument at all. faulthandler needs no privileges because
+    # the process dumps ITSELF, and STAT=R means a pure-Python spin will service
+    # the signal between bytecodes and name the function it is looping in.
+    #
+    # Deliberately not fatal: this is a probe, not a crash path. `kill -USR1
+    # <pid>` any time the server is misbehaving and the stacks land in
+    # ~/.amux/logs/server.log next to the request log that shows what hung.
+    try:
+        import faulthandler
+        _dump_target = open(os.path.expanduser("~/.amux/logs/server.log"), "a")
+        faulthandler.register(signal.SIGUSR1, file=_dump_target, all_threads=True, chain=False)
+        slog("[diag] SIGUSR1 -> all-thread stack dump into server.log "
+             "(kill -USR1 %d to catch a spin in the act)" % os.getpid())
+    except Exception as e:
+        slog(f"[diag] faulthandler unavailable, no spin dump on SIGUSR1: {e}")
+
     def _sig_handler(signum, frame):
         sig_name = signal.Signals(signum).name
         slog(f"[SIGNAL] received {sig_name} ({signum}) — logging diagnostics before exit")
