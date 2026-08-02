@@ -3290,6 +3290,72 @@ def _resolve_cc_session_name(meta: dict, name: str) -> str:
     return meta.get("cc_session_name") or name
 
 
+def _resume_strategy(meta: dict, name: str, work_dir: str) -> tuple[str, list[str], str]:
+    """Decide how a Claude-provider session should (re)start.
+
+    Returns `(session_flag, meta_keys_to_clear, log_message)`. Pure with
+    respect to `meta` and disk — it never mutates `meta` and never writes
+    anything. `start_session` applies the result: it launches with
+    `session_flag`, pops `meta_keys_to_clear` (saving only if that list is
+    non-empty), and prints `log_message`.
+
+    `start_session` is ~700 lines with tmux side effects and cannot be unit
+    tested; this is the one real decision in that function, pulled out so it
+    is actually covered.
+
+    Precedence, newest/most-reliable first:
+    1. Title match via `_cc_session_name` — the common case after this fix,
+       since the name is now derived rather than persisted-only.
+    2. `cc_conversation_id` — the PostToolUse hook's deterministic pointer
+       (refreshed on every tool call from Claude's live session id). Title
+       matching is unreliable in shared workdirs where titles go stale, so
+       this is consulted before giving up, not only in the legacy migration
+       branch below.
+    3. `cc_conversation_id` alone (migration path, pre-dates title tracking).
+    4. Fresh start.
+    """
+    _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
+    cc_session_name = _resolve_cc_session_name(meta, name)
+    conv_id = meta.get("cc_conversation_id", "")
+
+    def _conv_file(cid: str) -> Path:
+        return CLAUDE_HOME / "projects" / _project_name(work_dir) / f"{cid}.jsonl"
+
+    def _resumable(cid: str) -> bool:
+        try:
+            cf = _conv_file(cid)
+            return cf.exists() and _jsonl_has_messages(cf)
+        except (OSError, RuntimeError):
+            return False
+
+    if cc_session_name and _validate_cc_session_name(cc_session_name):
+        _sid = _cc_session_id_for_name(cc_session_name, work_dir)
+        if _sid:
+            return (f'--resume {_sid}', [],
+                    f"resume={cc_session_name} (uuid={_sid})")
+        if conv_id and _uuid_re.match(conv_id) and _resumable(conv_id):
+            return (f'--resume {conv_id}', [],
+                    f"resume via conversation id (title '{cc_session_name}' "
+                    f"not found, uuid={conv_id})")
+        keys = [k for k in ("cc_session_name", "cc_conversation_id") if k in meta]
+        if keys:
+            msg = f"fresh start (session '{cc_session_name}' not found in project)"
+        else:
+            msg = "fresh start (no prior conversation)"
+        return (f'--name {shlex.quote(name)}', keys, msg)
+    elif conv_id and _uuid_re.match(conv_id):
+        # Migration path: old UUID-based session, pre-dates title tracking.
+        try:
+            exists = _conv_file(conv_id).exists()
+        except (OSError, RuntimeError):
+            exists = False
+        if exists:
+            return (f'--resume {conv_id}', [], f"resume (migration) uuid={conv_id}")
+        return (f'--name {shlex.quote(name)}', [], "fresh start (stale uuid)")
+    else:
+        return (f'--name {shlex.quote(name)}', [], "fresh start (new session)")
+
+
 # Per-session token cache — refreshed every 30s, keyed by resolved dir
 _token_cache = {"data": {}, "timestamps": {}, "time": 0}
 _TOKEN_CACHE_TTL = 120
@@ -15460,37 +15526,13 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
         # Determine session resume strategy: name-based (new) > UUID (migration) > fresh
         meta = _load_meta(name)
         provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
-        _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
         if not _skip_conv_id and provider == "claude":
-            cc_session_name = _resolve_cc_session_name(meta, name)
-            conv_id = meta.get("cc_conversation_id", "")
-            if cc_session_name and _validate_cc_session_name(cc_session_name):
-                _sid = _cc_session_id_for_name(cc_session_name, work_dir)
-                if _sid:
-                    # Use UUID to resume — bypasses interactive picker
-                    session_flag = f'--resume {_sid}'
-                    print(f"[start] {name}: resume={cc_session_name} (uuid={_sid})")
-                else:
-                    meta.pop("cc_session_name", None)
-                    meta.pop("cc_conversation_id", None)
-                    _save_meta(name, meta)
-                    session_flag = f'--name {shlex.quote(name)}'
-                    print(f"[start] {name}: fresh start (session '{cc_session_name}' not found in project)")
-            elif conv_id and _uuid_re.match(conv_id):
-                # Migration path: old UUID-based session
-                conv_file = (
-                    CLAUDE_HOME / "projects" / _project_name(work_dir) / f"{conv_id}.jsonl"
-                )
-                if conv_file.exists():
-                    session_flag = f"--resume {conv_id}"
-                    print(f"[start] {name}: resume (migration) uuid={conv_id}")
-                else:
-                    session_flag = f'--name {shlex.quote(name)}'
-                    print(f"[start] {name}: fresh start (stale uuid)")
-            else:
-                # First-ever start
-                session_flag = f'--name {shlex.quote(name)}'
-                print(f"[start] {name}: fresh start (new session)")
+            session_flag, _clear_keys, _log_msg = _resume_strategy(meta, name, work_dir)
+            if _clear_keys:
+                for k in _clear_keys:
+                    meta.pop(k, None)
+                _save_meta(name, meta)
+            print(f"[start] {name}: {_log_msg}")
         else:
             session_flag = ""
     

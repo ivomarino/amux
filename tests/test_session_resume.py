@@ -262,3 +262,67 @@ def test_derived_name_resolves_to_a_conversation(amux_server, project):
     resolved = amux_server._resolve_cc_session_name({}, "Amux-gtm")
     assert amux_server._cc_session_id_for_name(resolved, work_dir) == \
         "aaaaaaaa-0000-0000-0000-000000000000"
+
+
+# ── _resume_strategy ─────────────────────────────────────────────────────────
+#
+# start_session is ~700 lines with tmux side effects and cannot be unit
+# tested directly, so the Claude-provider resume decision lives in this pure
+# helper: given (meta, name, work_dir), decide the tmux launch flag and which
+# meta keys (if any) should be cleared before the next start. start_session
+# applies the result — it does not re-decide anything.
+
+def test_resume_strategy_title_miss_falls_back_to_conv_id(amux_server, project):
+    """Title match misses (stale/renamed title) but the PostToolUse hook's
+    conv_id still points at a real, resumable conversation — the deterministic
+    pointer must win over giving up."""
+    add, work_dir = project
+    add("bbbbbbbb-0000-0000-0000-000000000000", "Some-Other-Title", time.time())
+    meta = {"cc_conversation_id": "bbbbbbbb-0000-0000-0000-000000000000"}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--resume bbbbbbbb-0000-0000-0000-000000000000"
+    assert cleared == []
+
+
+def test_resume_strategy_title_miss_conv_id_file_missing(amux_server, project):
+    """conv_id is set but no such file exists — nothing to resume, and the
+    stale pointer must be cleared so the next start doesn't re-check it."""
+    add, work_dir = project
+    meta = {"cc_conversation_id": "cccccccc-0000-0000-0000-000000000000"}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+    assert set(cleared) == {"cc_conversation_id"}
+
+
+def test_resume_strategy_title_miss_conv_id_snapshot_only(amux_server, project):
+    """conv_id's file exists but has no real turns (claude --resume would exit
+    instantly on it) — treat it the same as missing: fresh start, cleared."""
+    add, work_dir = project
+    add("dddddddd-0000-0000-0000-000000000000", "Some-Other-Title", time.time(),
+        with_messages=False)
+    meta = {"cc_conversation_id": "dddddddd-0000-0000-0000-000000000000"}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+    assert set(cleared) == {"cc_conversation_id"}
+
+
+def test_resume_strategy_title_hit_wins_and_conv_id_untouched(amux_server, project):
+    """The common case: title match succeeds. conv_id (even if present and
+    unrelated) is not consulted or cleared."""
+    add, work_dir = project
+    add("eeeeeeee-0000-0000-0000-000000000000", "Amux-gtm", time.time())
+    meta = {"cc_conversation_id": "ffffffff-0000-0000-0000-000000000000"}
+    flag, cleared, _ = amux_server._resume_strategy(meta, "Amux-gtm", work_dir)
+    assert flag == "--resume eeeeeeee-0000-0000-0000-000000000000"
+    assert cleared == []
+    assert meta == {"cc_conversation_id": "ffffffff-0000-0000-0000-000000000000"}
+
+
+def test_resume_strategy_first_ever_start_nothing_to_clear(amux_server, project):
+    """A genuine first-ever start (empty meta, no conversations anywhere) must
+    not be reported as a stale name, and there is nothing to clear or save."""
+    _add, work_dir = project
+    flag, cleared, msg = amux_server._resume_strategy({}, "Amux-gtm", work_dir)
+    assert flag == "--name Amux-gtm"
+    assert cleared == []
+    assert "no prior conversation" in msg
