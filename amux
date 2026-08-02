@@ -865,14 +865,19 @@ cmd_board() {
 
   case "$subcmd" in
     needsyou|needs-you)
-      # Mark a card as blocked-on-human WITHOUT clobbering existing tags
-      # (AMUX-2167): additive read-modify-write of the tag set.
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID>"
+      # Mark a card as blocked-on-human and RECORD THE ASK (AMUX-2167/2171):
+      # additive tag (no clobber) + the question into the History, so Focus
+      # mode and the card both show WHAT is needed, not just that it's stuck.
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> [\"the question / decision needed\"]"
+      shift 2>/dev/null || true
+      local ask="$*"
       local cur result
       cur=$(curl -sk "$AMUX_API/api/board/$id" | python3 -c "import sys,json;d=json.load(sys.stdin);i=d.get('item') or d;print(json.dumps(sorted(set((i.get('tags') or [])+['needs:you']))))" 2>/dev/null)
       [[ -n "$cur" ]] || die "card $id not found"
+      local body
+      body=$(TAGS="$cur" ASK="$ask" python3 -c "import os,json; b={'tags':json.loads(os.environ['TAGS'])}; a=os.environ['ASK'].strip(); b['desc_append']=('NEEDS-YOU: '+a) if a else b.get('desc_append'); print(json.dumps({k:v for k,v in b.items() if v is not None}))")
       result=$(curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-        -d "{\"tags\":$cur}" "$AMUX_API/api/board/$id")
+        -d "$body" "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome; return $?
       ;;
     done|doing|todo|backlog|discarded|review)

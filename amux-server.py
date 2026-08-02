@@ -21473,6 +21473,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   /* Board */
+  .focus-overlay { position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+    padding-bottom: calc(16px + env(safe-area-inset-bottom)); backdrop-filter: blur(3px); }
+  .focus-card { background: var(--card); border: 1px solid var(--line-2, var(--border));
+    border-radius: 16px; width: 100%; max-width: 560px; max-height: 88vh; display: flex;
+    flex-direction: column; box-shadow: 0 24px 64px rgba(0,0,0,0.5); overflow: hidden; }
+  .focus-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .focus-progress { font-size: 0.78rem; color: var(--dim); font-weight: 600; }
+  .focus-x { background: none; border: none; color: var(--dim); font-size: 1.1rem; cursor: pointer;
+    min-width: 44px; min-height: 44px; }
+  .focus-body { padding: 18px 18px 8px; overflow-y: auto; flex: 1; }
+  .focus-idrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .focus-id { font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent);
+    cursor: pointer; text-decoration: underline dotted; }
+  .focus-sess { font-size: 0.74rem; color: var(--dim); cursor: pointer; margin-left: auto; }
+  .focus-title { font-size: 1.15rem; font-weight: 700; line-height: 1.35; margin-bottom: 14px; }
+  .focus-ask-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--accent); font-weight: 600; margin-bottom: 6px; }
+  .focus-ask { font-size: 0.92rem; line-height: 1.55; color: var(--fg); white-space: pre-wrap;
+    word-break: break-word; background: var(--surface-2, var(--bg-2)); border-radius: 10px; padding: 12px 14px; }
+  .focus-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px;
+    border-top: 1px solid var(--border); }
+  .focus-actions .btn { min-height: 44px; flex: 1 1 auto; }
+  @media (max-width: 600px) { .focus-actions .btn { flex: 1 1 40%; } .focus-title { font-size: 1.05rem; } }
   .bf-menu { position: fixed; z-index: 120; background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); padding: 10px 12px;
     max-height: 60vh; overflow-y: auto; min-width: 250px; max-width: 330px; }
@@ -30773,7 +30798,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.329';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.333';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41361,8 +41386,13 @@ function _bqIs(item, val, ix) {
     // (owner:human), a card the owning session explicitly marked
     // needs-human, and the live waiting/gated state.
     case 'needsyou': return _bqIs(item, 'open', ix) && (
-                       item.owner_type === 'human'
-                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
+                       // Explicit marker set by whoever knows (a session parking
+                       // its card, or a human reassigning a decision) — NOT every
+                       // owner:human card, which is the standing backlog and
+                       // floods the queue (306 -> the real blocked set). Own
+                       // filed work lives in the Mine view; needs-you is only
+                       // what is actively stopped ON you.
+                       (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
                        || (!!sess && (sess.status === 'waiting'
                                       || !!sess.credit_limited || !!sess.rate_limited_until)));
     case 'offline':  return !!item.session && (!sess || !sess.running);
@@ -41645,10 +41675,158 @@ function _boardRenderViews() {
       +  (n ? '<span class="bvc-n">' + n + '</span>' : '')
       +  '<span class="bvc-x" onclick="_boardDeleteView(\'' + v.id + '\',event)" title="Delete view">&#x2715;</span></button>';
   });
+  // Focus button (AMUX-2170): rapid-fire triage of whatever is:needsyou
+  // returns — one card at a time, resolve, auto-advance. Shown with a live
+  // count so "3 need you" is one tap from clearing them.
+  const _nyN = _boardViewCount('is:needsyou');
+  if (_nyN) h += '<button class="board-view-chip focus" onclick="_focusStart(\'is:needsyou\')" '
+    + 'title="Rapid-fire triage everything blocked on you" '
+    + 'style="border-color:var(--accent);color:var(--accent);font-weight:600;">\u26A1 Focus<span class="bvc-n">' + _nyN + '</span></button>';
   h += '<button class="board-view-chip add" onclick="_boardSaveCurrentView()" title="Save the current query as a view">+ Save view</button>';
   h += '<button class="board-view-chip add" onclick="_boardQueryHelp()" title="Query syntax">?</button>';
   el.innerHTML = h;
 }
+// ── Needs-you Focus mode (AMUX-2170) ───────────────────────────────────────
+// A full-screen, one-card-at-a-time triage over a query (default is:needsyou).
+// Each card shows its ASK; actions resolve and auto-advance. Keyboard: j/k
+// prev/next, e Answer, a Approve, r Reject, u Unblock, Esc close. The whole
+// point is boom-boom-boom: never hunt, never scroll, decide and move.
+let _focusQ = '';
+let _focusList = [];
+let _focusIdx = 0;
+function _focusStart(q) {
+  _focusQ = q || 'is:needsyou';
+  _focusRebuild();
+  if (!_focusList.length) { showToast('Nothing is blocked on you right now.'); return; }
+  _focusIdx = 0;
+  document.addEventListener('keydown', _focusKey, true);
+  _focusRender();
+}
+function _focusRebuild() {
+  const ix = _bqSessionIndex();
+  _focusList = _bqFilter((boardItems || []).filter(i => !i.deleted), _focusQ)
+    .sort((a, b) => (b.owner_type === 'human') - (a.owner_type === 'human') || (a.created || 0) - (b.created || 0));
+}
+// The card's ASK: an explicit NEEDS-YOU marker line in the log wins; else the
+// first line of desc; else the title. Never guesses beyond the marker.
+function _focusAsk(item) {
+  // The explicit ask wins wherever it lives (desc or log) — take the LAST
+  // NEEDS-YOU marker so a re-marked card shows its freshest question. Only
+  // then fall back to the desc's first meaningful line, then the title.
+  const hay = (item.desc || '') + '\n' + (item.log || '');
+  const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|ETHAN|HUMAN):\s*([^\n]+)/ig)];
+  if (ms.length) return ms[ms.length - 1][1].trim().slice(0, 400);
+  const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim());
+  return (d || item.title || '').slice(0, 400);
+}
+function _focusClose() {
+  document.removeEventListener('keydown', _focusKey, true);
+  const ov = document.getElementById('focus-overlay');
+  if (ov) ov.remove();
+  renderBoard();
+}
+function _focusNext() {
+  _focusIdx++;
+  if (_focusIdx >= _focusList.length) { _focusDone(); return; }
+  _focusRender();
+}
+function _focusPrev() { if (_focusIdx > 0) { _focusIdx--; _focusRender(); } }
+function _focusDone() {
+  const ov = document.getElementById('focus-overlay');
+  if (ov) ov.querySelector('.focus-body').innerHTML =
+    '<div style="text-align:center;padding:60px 20px;"><div style="font-size:2.4rem;">\u2705</div>'
+    + '<div style="font-size:1.1rem;font-weight:600;margin-top:12px;">Inbox zero.</div>'
+    + '<div style="color:var(--dim);margin-top:6px;">Nothing else is blocked on you.</div>'
+    + '<button class="btn primary" style="margin-top:20px;" onclick="_focusClose()">Done</button></div>';
+}
+function _focusKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); _focusClose(); }
+  else if (e.key === 'j' || e.key === 'ArrowRight') { e.preventDefault(); _focusNext(); }
+  else if (e.key === 'k' || e.key === 'ArrowLeft') { e.preventDefault(); _focusPrev(); }
+  else if (e.key === 'e') { e.preventDefault(); _focusAnswer(); }
+  else if (e.key === 'a') { e.preventDefault(); _focusDecide('approved'); }
+  else if (e.key === 'r') { e.preventDefault(); _focusDecide('rejected'); }
+  else if (e.key === 'u') { e.preventDefault(); _focusUnblock(); }
+}
+async function _focusPatch(id, body) {
+  try { return await apiCall(API + '/api/board/' + id, { method: 'PATCH',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) }); }
+  catch (e) { return null; }
+}
+async function _focusSend(name, text) {
+  try { const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send',
+    { method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ text, record_history: true }) }); return r.ok; }
+  catch (e) { return false; }
+}
+async function _focusResolveTag(item) {
+  // Remove the needs-human markers so it leaves the queue (owner:human cards
+  // stay yours — resolving those is a status move, handled by the actions).
+  const keep = (item.tags || []).filter(t => !_NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()));
+  await _focusPatch(item.id, { tags: keep });
+}
+async function _focusAnswer() {
+  const item = _focusList[_focusIdx]; if (!item) return;
+  const sess = item.session;
+  const ok = await showFormModal('Answer ' + item.id + (sess ? ' \u2192 ' + sess : ''),
+    '<textarea id="focus-ans" class="bw-in" style="width:100%;min-height:90px;box-sizing:border-box" '
+    + 'placeholder="Your reply — sent to the owning session and recorded on the card"></textarea>', 'Send');
+  const ans = (document.getElementById('focus-ans') || {}).value || '';
+  if (!ok || !ans.trim()) return;
+  if (sess) { try { await _focusSend(sess, '[Ethan, re ' + item.id + '] ' + ans); } catch(e) {} }
+  await _focusPatch(item.id, { desc_append: '`answered` Ethan: ' + ans });
+  await _focusResolveTag(item);
+  showToast('Answered ' + item.id);
+  _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
+  _focusNext();
+}
+async function _focusDecide(verdict) {
+  const item = _focusList[_focusIdx]; if (!item) return;
+  await _focusPatch(item.id, { desc_append: '`decision` Ethan ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
+  if (item.session) { try { await _focusSend(item.session, '[Ethan decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
+  await _focusResolveTag(item);
+  showToast(item.id + ' ' + verdict);
+  _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
+  _focusNext();
+}
+async function _focusUnblock() {
+  const item = _focusList[_focusIdx]; if (!item) return;
+  await _focusResolveTag(item);
+  showToast(item.id + ' unblocked');
+  _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
+  _focusNext();
+}
+function _focusRender() {
+  const item = _focusList[_focusIdx];
+  if (!item) { _focusDone(); return; }
+  let ov = document.getElementById('focus-overlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'focus-overlay'; ov.className = 'focus-overlay';
+    ov.innerHTML = '<div class="focus-card"><div class="focus-head"></div><div class="focus-body"></div><div class="focus-actions"></div></div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', e => { if (e.target === ov) _focusClose(); });
+  }
+  const sty = statusStyle(item.status || 'todo');
+  const sess = item.session ? '<span class="focus-sess" onclick="_focusClose();openPeek(\'' + escJs(item.session) + '\',{query:\'' + escJs(item.id) + '\'})" title="Open the session">' + esc(item.session) + ' \u2197</span>' : '';
+  ov.querySelector('.focus-head').innerHTML =
+    '<span class="focus-progress">' + (_focusIdx + 1) + ' / ' + _focusList.length + ' blocked on you</span>'
+    + '<button class="focus-x" onclick="_focusClose()" title="Close (Esc)">\u2715</button>';
+  ov.querySelector('.focus-body').innerHTML =
+    '<div class="focus-idrow"><span class="focus-id" onclick="_focusClose();openBoardDetail(\'' + escJs(item.id) + '\')">' + esc(item.id) + '</span>'
+    + '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';">' + esc(item.status || 'todo') + '</span>' + sess + '</div>'
+    + '<div class="focus-title">' + esc(item.title || '') + '</div>'
+    + '<div class="focus-ask-label">Needs your call:</div>'
+    + '<div class="focus-ask">' + _linkifyCardIds(esc(_focusAsk(item))) + '</div>';
+  ov.querySelector('.focus-actions').innerHTML =
+    '<button class="btn" onclick="_focusPrev()" title="Previous (k)">\u2190</button>'
+    + '<button class="btn primary" onclick="_focusAnswer()" title="Answer (e)">\u270E Answer</button>'
+    + '<button class="btn" style="color:var(--green);border-color:var(--green);" onclick="_focusDecide(\'approved\')" title="Approve (a)">\u2713 Approve</button>'
+    + '<button class="btn" style="color:var(--red);border-color:var(--red);" onclick="_focusDecide(\'rejected\')" title="Reject (r)">\u2717 Reject</button>'
+    + '<button class="btn" onclick="_focusUnblock()" title="Just clear the block (u)">Unblock</button>'
+    + '<button class="btn" onclick="_focusNext()" title="Skip (j)">Skip \u2192</button>';
+}
+
 function _boardQueryHelp() {
   showFormModal('Board query syntax',
     '<div style="font-size:0.8rem;line-height:1.6">'
@@ -51378,7 +51556,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.329';
+const CACHE = 'amux-v0.9.333';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -53286,6 +53464,15 @@ class CCHandler(BaseHTTPRequestHandler):
             statuses = {st.get("id"): (st.get("gate") or [])
                         for st in _load_board_statuses()}
             return self._json({
+                "state_capture_best_practices": {
+                    "one_status": "A card has ONE status (backlog/todo/doing/review/done/verified/discarded), moved through type-derived gates. Never invent parallel status fields.",
+                    "done_ne_verified": "done = implemented/merged. verified = confirmed in prod with evidence. Never mark verified on faith.",
+                    "blocked_is_a_marker_not_a_status": "A card can be doing AND blocked-on-human at once. Do NOT park it back in todo. Mark it: `amux board needsyou <ID> \"the exact question\"` — adds a needs:you tag (surfaces in is:needsyou / Focus) and records the ask. Clear the tag when answered.",
+                    "record_the_ask": "Parking on the human without saying WHAT is needed is not a captured state. Always include the question/decision so Focus mode shows it at a glance.",
+                    "live_session_state": "Live activity (active/idle/waiting) is the session's to REPORT via POST /api/sessions/<n>/report — do not infer it onto the card.",
+                    "history_is_the_audit": "The append-only log (visible History) is where the card's story lives: status transitions, claims, commits, decisions. It survives desc rewrites; desc is narrative and replaceable.",
+                    "append_dont_replace": "Use desc_append to add to desc; plain {desc:...} REPLACES (pair with expect_rev). System history goes to the log, never desc.",
+                },
                 "desc_append": "PATCH {desc_append: \"text\"} or {desc: \"text\", desc_append: true} appends to the existing desc instead of replacing it. Plain {desc: ...} REPLACES — pair it with expect_rev, and remember system history lives in the append-only log, not desc.",
                 "concurrency": {
                     "rev": "Monotonic revision on every item; bumps on each PATCH and system log-append.",
