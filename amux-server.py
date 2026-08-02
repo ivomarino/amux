@@ -56704,11 +56704,24 @@ class CCHandler(BaseHTTPRequestHandler):
                 ).fetchone()
                 new_pos = (min_pos_row["m"] if min_pos_row else 0) - 1024.0
                 db.execute(
-                    """INSERT INTO issues (id, title, desc, status, session, shepherd, type, creator, due, due_time, created, updated, owner_type, pos, gate)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    # `reviewer` belongs in this INSERT. It was accepted by the
+                    # API and silently DISCARDED — the card read back
+                    # reviewer=None and only a follow-up PATCH would set it. That
+                    # mattered the moment AC-165 made a reviewer required for any
+                    # close: a session filing a reviewer-gated card in one call
+                    # got an UNPROTECTED card and was told nothing, and could then
+                    # legitimately close it, because as far as the server was
+                    # concerned no reviewer existed. It also produced a false
+                    # negative while verifying AC-165 itself — the probe set
+                    # reviewer at POST, the gate correctly did not fire, and the
+                    # fix briefly looked broken. Accepting a field and dropping it
+                    # is worse than rejecting it.
+                    """INSERT INTO issues (id, title, desc, status, session, shepherd, type, creator, due, due_time, created, updated, owner_type, pos, gate, reviewer)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (item_id, title, desc, status, session or None, (body.get("shepherd") or None),
                      (body.get("type") or _DEFAULT_ITEM_TYPE), creator, due, due_time, now, now,
-                     owner_type, new_pos, gate_json),
+                     owner_type, new_pos, gate_json,
+                     ((body.get("reviewer") or "").strip() or None)),
                 )
                 for tag in tags:
                     db.execute(
