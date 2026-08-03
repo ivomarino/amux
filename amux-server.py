@@ -31777,7 +31777,7 @@ function renderPeekIssues() {
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
   const scoped = _bqHideArchived(
-    (boardItems || []).filter(i => !i.deleted && (allScope || i.session === peekSession)),
+    (boardItems || []).filter(i => !i.deleted && !i.archived && (allScope || i.session === peekSession)),
     _peekIssuesQuery);
   // Scope first, then query — so "3 of 12" counts within the session you are
   // looking at, not against the whole board.
@@ -31793,7 +31793,9 @@ function renderPeekIssues() {
     scopeBtn.classList.toggle('primary', allScope);
   }
   // Tab badge always reflects THIS session's count, regardless of view scope.
-  const _sessCount = (boardItems || []).filter(i => !i.deleted && i.session === peekSession).length;
+  // Archived = cleared: never counted as board items (Ethan 16:03 — the
+  // badge said 15/42 over an empty/7-card panel; it was counting archived).
+  const _sessCount = (boardItems || []).filter(i => !i.deleted && !i.archived && i.session === peekSession).length;
   const tabCount = document.getElementById('peek-tab-issues-count');
   if (tabCount) {
     if (_sessCount > 0) { tabCount.textContent = _sessCount; tabCount.classList.add('has-count'); }
@@ -31959,7 +31961,7 @@ async function _peekUpdateTabCounts() {
     setCount('peek-tab-steering-count', sq.length);
   }
   {
-    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted).length;
+    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted && !i.archived).length;
     setCount('peek-tab-issues-count', n);
   }
   try {
@@ -32191,7 +32193,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.390';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.392';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53356,7 +53358,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.390';
+const CACHE = 'amux-v0.9.392';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
