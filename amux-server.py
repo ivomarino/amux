@@ -891,6 +891,17 @@ if _RATE_LIMIT_BUDGET < 0:
 MAX_LOG_BYTES = 10 * 1024 * 1024  # 10MB per session
 SERVER_LOG = CC_LOGS / "server.log"
 _server_log_lock = threading.Lock()
+# Persistent append handle for slog(), guarded by the lock above. See slog() for why
+# open-per-line was the measured cause of the 08-03 wedge.
+# NOT rotated here, deliberately: launchd sets BOTH StandardOutPath and
+# StandardErrorPath to this same file, so its fds follow the inode across a rename.
+# Rotating by rename would leave launchd appending to the orphaned file forever while
+# this handle wrote to the new one — output split across two places, neither complete.
+# Log size is a separate problem (49MB and growing) and needs a solution that accounts
+# for those launchd fds; it is not what was causing the contention, since O_APPEND
+# open cost does not scale with file size.
+_server_log_fh = None
+_server_log_fh_checked = 0.0
 
 def slog(*args):
     """Append a timestamped line to ~/.amux/logs/server.log (and stderr if TTY)."""
@@ -901,10 +912,41 @@ def slog(*args):
     # to server.log, so writing to both would double every line.
     if sys.stderr.isatty():
         sys.stderr.write(line)
+    # MEASURED HOT SPOT (AC-174). This used to be `with open(SERVER_LOG,"a") as f`
+    # INSIDE the lock, so every one of the 244 slog() call sites paid a full
+    # open + write + close — three syscalls plus a path resolution — while holding
+    # a process-global lock. During the 2026-08-03 16:41Z wedge, 33 of ~65 threads
+    # were blocked at exactly this line (the dump's single most common frame) with
+    # the process at 97.3% CPU and /api/board returning HTTP 000. ThreadingHTTPServer
+    # has no worker cap, so a burst of heavy requests serializes every handler here
+    # and the server answers nothing while looking near-idle per-thread.
+    # Keeping the handle open makes the critical section one buffered write.
+    global _server_log_fh, _server_log_fh_checked
     try:
         with _server_log_lock:
-            with open(SERVER_LOG, "a") as f:
-                f.write(line)
+            fh = _server_log_fh
+            now = time.monotonic()
+            if fh is None or fh.closed:
+                fh = _server_log_fh = open(SERVER_LOG, "a", buffering=1)
+                _server_log_fh_checked = now
+            elif now - _server_log_fh_checked > 30:
+                # A persistent handle keeps writing into a DELETED inode if the file
+                # is moved or removed underneath us, and the lines just vanish with
+                # no error — the silent-log failure this repo keeps getting bitten by.
+                # Re-stat occasionally (not per line, that reintroduces the syscall
+                # we are removing) and reopen if the path no longer names our inode.
+                _server_log_fh_checked = now
+                try:
+                    if (not SERVER_LOG.exists()
+                            or os.fstat(fh.fileno()).st_ino != SERVER_LOG.stat().st_ino):
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        fh = _server_log_fh = open(SERVER_LOG, "a", buffering=1)
+                except Exception:
+                    pass
+            fh.write(line)
     except Exception:
         pass
 
@@ -31989,7 +32031,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.385';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.386';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53158,7 +53200,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.385';
+const CACHE = 'amux-v0.9.386';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63489,7 +63531,8 @@ def _db_maintenance():
             _cut = int(time.time()) - _stale_h * 3600
             _stranded = get_db().execute(
                 "SELECT id, session FROM issues WHERE status='doing' "
-                "AND owner_type='agent' AND deleted IS NULL AND updated < ?",
+                "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
+                "AND updated < ?",
                 (_cut,)).fetchall()
             for _sr in _stranded:
                 get_db().execute(
