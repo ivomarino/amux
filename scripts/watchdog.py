@@ -25,7 +25,7 @@ SERVER_SCRIPT = AMUX_DIR / "amux-server.py"
 
 CHECK_INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", 30))
 UNHEALTHY_THRESHOLD = 3      # consecutive failures before action
-CPU_THRESHOLD = 80.0          # percent — sustained high CPU triggers alert
+CPU_THRESHOLD = None           # disabled — server baseline is ~100%; see ethos rule 7 + commit b787841
 MEMORY_THRESHOLD = 2048       # MB — RSS above this triggers alert
 CLAUDE_COOLDOWN = 900         # seconds — don't re-invoke Claude within this window
 
@@ -245,7 +245,7 @@ def run():
             cpu = data.get("cpu_percent", 0)
             mem = data.get("memory_mb", 0)
 
-            if cpu > CPU_THRESHOLD:
+            if CPU_THRESHOLD is not None and cpu > CPU_THRESHOLD:
                 _consecutive_cpu_high += 1
                 log(f"high CPU: {cpu}% ({_consecutive_cpu_high}/3)")
                 if _consecutive_cpu_high >= 3:
