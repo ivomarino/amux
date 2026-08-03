@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Persistence for scripts/spin-catcher.sh (AC-171).
+
+  WHY THIS EXISTS: the catcher was armed as a plain background process inside an
+  amux session. When that session ends the trap dies silently and nothing says so,
+  which is the worst failure mode for a watcher — it reports nothing whether it is
+  working or gone. KeepAlive makes "is it running" true by construction instead of
+  by someone remembering.
+
+  WHAT IT IS ACTUALLY WATCHING FOR, after 625 captured events corrected the premise:
+  NOT a CPU spin. Per-thread CPU showed no hot thread (38.5/14.3/2.6/~0, every
+  STAT=S) while /health reported 80-89%, so the process is bursty, not spinning, and
+  CPU alone no longer trips. The triggers worth an unattended watcher are the two
+  that never once fired across those 625 events and would therefore be real:
+    - /health does not answer at all  (the actual reported wedge: board + email hang)
+    - store != ok / degraded          (a genuine SQLite stall)
+
+  SAFETY: the catcher only sends SIGUSR1, which makes the server PRINT its stacks.
+  It never stops, restarts, or kills anything. This machine runs 24/7 and that rule
+  is not bent here.
+
+  NOT LOADED BY THE AGENT THAT WROTE IT. Installing a permanent background job on
+  someone's machine is the owner's call, not a side effect of a debugging task:
+
+      launchctl load -w ~/Library/LaunchAgents/com.amux.spin-catcher.plist
+
+  To install:
+      cp scripts/launchd/com.amux.spin-catcher.plist ~/Library/LaunchAgents/
+      launchctl load -w ~/Library/LaunchAgents/com.amux.spin-catcher.plist
+  To verify it is actually running (do not trust the load command's exit code):
+      launchctl list | grep spin-catcher
+      tail -5 ~/.amux/spin-dumps/catcher.out
+  To remove:
+      launchctl unload -w ~/Library/LaunchAgents/com.amux.spin-catcher.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amux.spin-catcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ethan/Dev/amux/scripts/spin-catcher.sh</string>
+        <string>3</string>   <!-- poll seconds -->
+        <string>70</string>  <!-- cpu trigger, only with sustain below -->
+        <string>5</string>   <!-- consecutive polls before believing the CPU gauge -->
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- The whole point of the card: survive the session that started it. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- A watcher that respawns instantly on a crash-loop is itself a load source.
+         The cloud watchdog sidecar did exactly that: exit 1 under an uncapped
+         restart policy, 4318 restarts, dockerd saturated, host dark for an hour
+         (AC-162/AC-163). Ten seconds is cheap insurance against repeating it here. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Never /dev/null. A silent watcher cannot be distinguished from a dead one,
+         and that ambiguity is the exact defect this card was filed about. -->
+    <key>StandardOutPath</key>
+    <string>/Users/ethan/.amux/spin-dumps/catcher.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ethan/.amux/spin-dumps/catcher.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AMUX_URL</key>
+        <string>https://localhost:8822</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
