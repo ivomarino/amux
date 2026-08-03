@@ -9636,6 +9636,15 @@ def _init_db():
         # (cost analysis, pricing, root causes) should survive their session
         # being put away, just not clutter the live board.
         "ALTER TABLE issues ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        # When a TAG was applied (AC-178). The needs:you re-nag timed
+        # `issues.updated`, which is last-touch, not ask-age: a log append bumps it
+        # (10489) and so does any field PATCH, and amux writes to descs constantly
+        # — status-requests, sweeps, review notes. So the cards carrying the most
+        # commentary were exactly the ones whose stale-ask check could never fire,
+        # while quiet cards re-nagged on schedule. Measured: 16 needs:you cards,
+        # none over the 3d threshold, the 8 oldest all clustered at 1.9d — the >3d
+        # branch had never executed in production.
+        "ALTER TABLE issue_tags ADD COLUMN added_at INTEGER",
         # Graph edges (2026-07-31). depends_on: JSON list of card ids — a card is
         # BLOCKED while any of them is open; the autonomy loop traverses these
         # instead of parsing "BLOCKS X" prose. reviewer: session name — when set,
@@ -9702,6 +9711,24 @@ def _init_db():
             db.commit()
         except Exception:
             pass  # column already exists
+    # Backfill added_at for tags that predate the column (AC-178). `created` is the
+    # only defensible source: the board log records the ask, but its timestamps are
+    # HH:MM with no date, so they cannot be resolved to an absolute time — and a tag
+    # cannot have been applied before its card existed. That makes `created` a true
+    # LOWER BOUND, which is exactly why the re-nag phrasing says "at least N days"
+    # rather than asserting an age it cannot know for a backfilled row. Getting that
+    # wrong would trade a valve that never fires for one that states a falsehood.
+    # Leaving them NULL was the alternative and it is worse: the valve would stay
+    # dead for every pre-existing needs:you card, which is the very failure this
+    # fixes. Only touches NULL rows, so it is idempotent across restarts.
+    try:
+        db.execute(
+            "UPDATE issue_tags SET added_at = COALESCE("
+            " (SELECT created FROM issues WHERE issues.id = issue_tags.issue_id), ?)"
+            " WHERE added_at IS NULL", (int(time.time()),))
+        db.commit()
+    except Exception:
+        pass
     for _sid, _items in {
         "doing":    ["Scope & acceptance criteria are clear", "No blocking dependency", "Has an owner"],
         "review":   ["Implemented and self-tested", "Diff / PR is up", "Ready for another set of eyes"],
@@ -10082,8 +10109,8 @@ def _migrate_flat_to_sqlite():
         for tag in item.get("tags", []):
             if tag:
                 db.execute(
-                    "INSERT OR IGNORE INTO issue_tags (issue_id, tag) VALUES (?, ?)",
-                    (item_id, tag),
+                    "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?, ?, ?)",
+                    (item_id, tag, int(time.time())),   # AC-178: when the tag was applied
                 )
     for prefix, n in counters.items():
         db.execute(
@@ -10714,13 +10741,40 @@ def _advance_open_card(session_name: str) -> bool:
         # cannot) but "is this still the right ask?".
         _tags_l = [str(t).lower() for t in (item.get("tags") or [])]
         if any(t.startswith("needs:you") for t in _tags_l):
-            _asked_age = time.time() - float(item.get("updated") or 0)
+            # Age the ASK, not the ROW (AC-178). This read `item["updated"]`, which
+            # is last-touch: a log append bumps it, and so does any field PATCH.
+            # Since amux writes to descs constantly — status-requests, sweeps,
+            # review notes — the needs:you cards carrying the most commentary were
+            # exactly the ones whose stale-ask check could never fire, while quiet
+            # cards re-nagged on schedule. Measured before the fix: 16 needs:you
+            # cards, none over the 3d threshold, the 8 oldest clustered at 1.9d;
+            # this branch had never executed in production.
+            # issue_tags.added_at is stamped when the TAG is applied and preserved
+            # across the tags-PATCH rewrite, so no unrelated edit can reset it.
+            # Falls back to `updated` only if the row is somehow unstamped, which
+            # is the old behavior rather than a crash.
+            _asked_at = None
+            try:
+                _r = get_db().execute(
+                    "SELECT MIN(added_at) AS a FROM issue_tags WHERE issue_id=? AND lower(tag) LIKE 'needs:you%'",
+                    (row["id"],)).fetchone()
+                _asked_at = _r["a"] if _r else None
+            except Exception:
+                pass
+            _asked_age = time.time() - float(_asked_at or item.get("updated") or 0)
             if _asked_age < _NEEDSYOU_RENAG_DAYS * 86400:
                 slog(f"[advance] {session_name}: {row['id']} is needs:you "
                      f"({int(_asked_age/3600)}h) — the human owes the answer, not the lane")
                 return False
             ok, err = send_text(session_name,
-                f"[amux] {row['id']} has been waiting on a human answer for "
+                # "at least" is load-bearing, not hedging. Tags applied before
+                # issue_tags.added_at existed are backfilled from issues.created —
+                # a true LOWER BOUND (a tag cannot predate its card), but not the
+                # real application time. Asserting an exact age for those rows
+                # would state something the system does not know; "at least" is
+                # true for a backfilled row and for a precisely-stamped one alike,
+                # so one phrasing stays honest in both cases.
+                f"[amux] {row['id']} has been waiting on a human answer for at least "
                 f"{int(_asked_age/86400)} days: {(row['title'] or '')[:90]}\n\n"
                 f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
                 f"right: is the question you recorded still the question? If it is, re-state it "
@@ -58085,8 +58139,8 @@ class CCHandler(BaseHTTPRequestHandler):
                 )
                 for tag in tags:
                     db.execute(
-                        "INSERT OR IGNORE INTO issue_tags (issue_id, tag) VALUES (?, ?)",
-                        (item_id, tag),
+                        "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?, ?, ?)",
+                        (item_id, tag, int(time.time())),   # AC-178: when the tag was applied
                     )
                 db.commit()
                 _board_changed()  # invalidate SSE cache
@@ -58775,12 +58829,29 @@ class CCHandler(BaseHTTPRequestHandler):
                         # design call as desc_append: the obvious shape works.
                         if isinstance(body.get("tags"), str):
                             body["tags"] = [body["tags"]] if body["tags"].strip() else []
+                        # PRESERVE added_at ACROSS THE REWRITE (AC-178). This path is
+                        # DELETE-ALL then re-INSERT, so stamping `now` on every insert
+                        # would reset the clock on every tags PATCH — reintroducing the
+                        # exact bug this column exists to fix (a timer measuring
+                        # last-touch instead of ask-age), one layer down. A tag that
+                        # SURVIVES the rewrite keeps its original application time;
+                        # only a genuinely new tag gets `now`. Re-adding a tag that was
+                        # previously removed correctly starts a fresh clock, since its
+                        # row is already gone by then.
+                        _prev_at: dict = {}
+                        try:
+                            for _r in db.execute(
+                                    "SELECT tag, added_at FROM issue_tags WHERE issue_id = ?", (bid,)):
+                                _prev_at[_r["tag"]] = _r["added_at"]
+                        except Exception:
+                            pass
+                        _now_at = int(time.time())
                         db.execute("DELETE FROM issue_tags WHERE issue_id = ?", (bid,))
                         for tag in (body["tags"] or []):
                             if tag:
                                 db.execute(
-                                    "INSERT OR IGNORE INTO issue_tags (issue_id, tag) VALUES (?, ?)",
-                                    (bid, tag),
+                                    "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?, ?, ?)",
+                                    (bid, tag, _prev_at.get(tag) or _now_at),
                                 )
                     db.commit()
                     # ── POST-COMMIT: best-effort side effects only ──────────────
