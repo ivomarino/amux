@@ -31788,7 +31788,10 @@ function renderPeekIssues() {
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
   const scoped = _bqHideArchived(
-    (boardItems || []).filter(i => !i.deleted && !i.archived && (allScope || i.session === peekSession)),
+    // Per-session panel shows the FULL record — every column, archived
+    // included (Ethan: "all columns visible when I click each session").
+    // The all-sessions scope stays archived-hidden like the global board.
+    (boardItems || []).filter(i => !i.deleted && (allScope ? !i.archived : i.session === peekSession)),
     _peekIssuesQuery);
   // Scope first, then query — so "3 of 12" counts within the session you are
   // looking at, not against the whole board.
@@ -31804,9 +31807,12 @@ function renderPeekIssues() {
     scopeBtn.classList.toggle('primary', allScope);
   }
   // Tab badge always reflects THIS session's count, regardless of view scope.
-  // Archived = cleared: never counted as board items (Ethan 16:03 — the
-  // badge said 15/42 over an empty/7-card panel; it was counting archived).
-  const _sessCount = (boardItems || []).filter(i => !i.deleted && !i.archived && i.session === peekSession).length;
+  // Badge = ACTIVE work only (Ethan 16:1x: "only show board # for active
+  // (todo, doing)"); the panel below still shows every column for the
+  // session, archived history included.
+  const _sessCount = (boardItems || []).filter(i => !i.deleted && !i.archived
+      && i.session === peekSession
+      && (i.status === 'todo' || i.status === 'doing')).length;
   const tabCount = document.getElementById('peek-tab-issues-count');
   if (tabCount) {
     if (_sessCount > 0) { tabCount.textContent = _sessCount; tabCount.classList.add('has-count'); }
@@ -31972,7 +31978,8 @@ async function _peekUpdateTabCounts() {
     setCount('peek-tab-steering-count', sq.length);
   }
   {
-    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted && !i.archived).length;
+    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted && !i.archived
+        && (i.status === 'todo' || i.status === 'doing')).length;
     setCount('peek-tab-issues-count', n);
   }
   try {
@@ -32204,7 +32211,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.393';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.394';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53369,7 +53376,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.393';
+const CACHE = 'amux-v0.9.394';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
