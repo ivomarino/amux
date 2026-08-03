@@ -7739,6 +7739,15 @@ def detect_active_model(work_dir: str, conversation_id: str = "") -> str:
     """
     if not work_dir:
         return ""
+    # Time-based cache check BEFORE filesystem work — the no-conversation_id
+    # path globs+stats every *.jsonl in the project dir (hundreds of files),
+    # so skipping that when the cache is fresh eliminates the hot path entirely.
+    cache_key = (work_dir, conversation_id)
+    cached = _model_cache.get(cache_key)
+    if cached:
+        c_model, c_mtime, c_ts = cached
+        if time.time() - c_ts < _MODEL_CACHE_TTL:
+            return c_model
     project_name = _project_name(work_dir)
     project_dir = CLAUDE_HOME / "projects" / project_name
     if not project_dir.is_dir():
@@ -7759,13 +7768,10 @@ def detect_active_model(work_dir: str, conversation_id: str = "") -> str:
         mtime = f.stat().st_mtime
     except OSError:
         return ""
-    # Cache hit: same file mtime and within TTL
-    cache_key = (work_dir, conversation_id)
-    cached = _model_cache.get(cache_key)
-    if cached:
-        c_model, c_mtime, c_ts = cached
-        if c_mtime == mtime or (time.time() - c_ts < _MODEL_CACHE_TTL):
-            return c_model
+    # Mtime-based cache check — TTL already passed, but file hasn't changed
+    if cached and cached[1] == mtime:
+        _model_cache[cache_key] = (cached[0], mtime, time.time())
+        return cached[0]
     try:
         # Search from end in increasing chunks until we find a model
         size = f.stat().st_size
