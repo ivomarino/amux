@@ -139,6 +139,22 @@ session running a test is often not the one holding the discriminating
 instrument: three tests in one day were undecidable from the tester's side and
 instant from the log-holder's — say so early instead of polling harder.
 
+A silent probe is dangerous; a LOUD WRONG probe is worse (amux-cloud, 2026-08-03).
+Two sessions the same night concluded from a probe's SILENCE (a grep for
+`use_reloader|watchdog|reload=True` could not match an mtime watcher, so its
+no-hit was uninformative and got read as evidence). The spin-catcher failed the
+other way: it answered. It fired 625 times and named functions — all of which
+were `time.sleep(...)` lines, because `faulthandler` dumps every thread and
+ranks none, so on a 10-thread process the nine sleepers are printed with the
+same authority as the one that matters. Its `tail -c 4000` cap then discarded
+the working threads and KEPT the idle ones, so the truncation actively favoured
+a wrong answer. Nothing looked broken at any step. Ask not just "could this
+check fail" but "if it fires, does its output DISCRIMINATE?" — an instrument
+that always produces a plausible-looking answer will be believed, and evidence
+caps must be checked for which end they keep. The fix was to capture the
+measurement that ranks (`ps -M`, per-thread CPU) alongside the one that
+describes.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction
