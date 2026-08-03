@@ -13409,6 +13409,31 @@ _commit_guard_nudged: dict[str, bool] = {}  # session -> nudged this dirty episo
 _commit_guard_daily: dict = {}   # (session, YYYYMMDD) -> nudges sent that day
 _COMMIT_GUARD_MAX_PER_DAY = int(os.environ.get("AMUX_COMMIT_NUDGES_PER_DAY", "3"))
 
+_session_workdirs: dict[str, str] = {}
+_session_workdirs_ts = 0.0
+_SESSION_WORKDIRS_TTL = 5.0
+
+
+def _all_session_workdirs() -> dict[str, str]:
+    """session name -> resolved CC_DIR, cached for 5s. Eliminates redundant
+    parse+resolve across _session_dirty_files / _checkout_busy_cotenant /
+    _staged_guard_check (103 env files × 3 callers was the CPU spike)."""
+    global _session_workdirs, _session_workdirs_ts
+    now = time.time()
+    if now - _session_workdirs_ts < _SESSION_WORKDIRS_TTL:
+        return _session_workdirs
+    result = {}
+    for f in CC_SESSIONS.glob("*.env"):
+        try:
+            od = parse_env_file(f).get("CC_DIR")
+            if od:
+                result[f.stem] = str(Path(od).expanduser().resolve())
+        except Exception:
+            pass
+    _session_workdirs = result
+    _session_workdirs_ts = now
+    return result
+
 
 def _session_dirty_files(name: str, work_dir: str) -> list:
     """Uncommitted/untracked files this session owns. Scoped to its working dir,
@@ -13417,18 +13442,11 @@ def _session_dirty_files(name: str, work_dir: str) -> list:
     own territory. Returns paths; [] if clean or not a git repo."""
     try:
         wd = str(Path(work_dir).expanduser().resolve())
-        # Exclude other sessions' cwds that live inside this one (ownership partition).
+        all_dirs = _all_session_workdirs()
         excludes = []
-        for f in CC_SESSIONS.glob("*.env"):
-            if f.stem == name:
+        for other, od in all_dirs.items():
+            if other == name:
                 continue
-            try:
-                od = parse_env_file(f).get("CC_DIR")
-            except Exception:
-                od = None
-            if not od:
-                continue
-            od = str(Path(od).expanduser().resolve())
             if od != wd and (od + os.sep).startswith(wd + os.sep):
                 excludes.append(":(exclude)" + os.path.relpath(od, wd))
         r = subprocess.run(
@@ -13459,15 +13477,10 @@ def _checkout_busy_cotenant(name: str, work_dir: str) -> str:
         wd = str(Path(work_dir).expanduser().resolve())
     except Exception:
         return ""
-    for f in CC_SESSIONS.glob("*.env"):
-        other = f.stem
+    all_dirs = _all_session_workdirs()
+    for other, od in all_dirs.items():
         if other == name:
             continue
-        try:
-            od = parse_env_file(f).get("CC_DIR")
-            od = str(Path(od).expanduser().resolve()) if od else None
-        except Exception:
-            od = None
         if od == wd and _session_prev_status.get(other) in ("active", "waiting"):
             return other
     return ""
@@ -13551,18 +13564,9 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
         wd = str(Path(work_dir).expanduser().resolve())
     except Exception:
         return {"ok": True, "foreign": [], "cotenants": []}
-    cotenants = []
-    for f in CC_SESSIONS.glob("*.env"):
-        other = f.stem
-        if other == session:
-            continue
-        try:
-            od = parse_env_file(f).get("CC_DIR")
-            od = str(Path(od).expanduser().resolve()) if od else None
-        except Exception:
-            od = None
-        if od == wd:
-            cotenants.append(other)
+    all_dirs = _all_session_workdirs()
+    cotenants = [other for other, od in all_dirs.items()
+                 if other != session and od == wd]
     if not cotenants or not rel_paths:
         return {"ok": True, "foreign": [], "cotenants": cotenants}
     window = _staged_guard_window()
