@@ -7076,7 +7076,11 @@ def _steering_fast_tick():
             raw = tmux_capture(name, 60)
             if not raw:
                 continue
-            _steer_try_deliver(name, _detect_claude_status(raw), raw)
+            # Provider-aware (Ethan 16:06: 1 QUEUED sat 2h at IDLE on a
+            # Gemini lane — this tick was hardwired to the Claude detector,
+            # which reads '' for Gemini frames, so delivery never fired).
+            _prov_t = (get_session_info(name) or {}).get("provider", "claude")
+            _steer_try_deliver(name, _detect_session_status(name, raw, provider=_prov_t), raw)
         except Exception:
             pass
 
@@ -14375,7 +14379,14 @@ def list_sessions() -> list:
         # that share the same CC_DIR, common in cloud where all sessions run in /root/).
         proj_key = _project_name(raw_dir) if raw_dir else ""
         conv_id = meta.get("cc_conversation_id", "")
-        if conv_id and proj_key:
+        if provider in ("codex", "gemini"):
+            # No Claude JSONL exists for these lanes; the project-total
+            # fallback showed the CLAUDE sibling's spend on this card
+            # (sherpa-execution displayed sherpa's 849.8k — Ethan 16:06).
+            # Honest absence beats a plausible stolen number; real
+            # accounting is the AMUX-2230 parity gap.
+            tokens = 0
+        elif conv_id and proj_key:
             tokens = _token_cache["data"].get((proj_key, conv_id), 0)
         else:
             tokens = _token_cache["data"].get(proj_key, 0)
@@ -32193,7 +32204,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.392';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.393';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53358,7 +53369,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.392';
+const CACHE = 'amux-v0.9.393';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
