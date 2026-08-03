@@ -120,6 +120,17 @@ every function called, and inspect the callers.
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
 
+**Test the fix against the incident's own artifact, not against the case that is easy
+to construct.** ts-gke reported a live watch card force-discarded by an unattributed
+caller. The fix — require attribution for `force` — was first written as
+`if eff_gate and force`, which passes every test built from a convenient card and would
+have let the reported specimen straight through: a `watch` card's todo->discarded has no
+gate, so `eff_gate` was empty while `force` still stamped the History line and skipped
+the dirt/WIP/reviewer checks. The convenient case is convenient *precisely because it
+lacks the property that made the incident*. Rebuild the specimen from the log line, then
+run the check against it — a check that cannot fail on the case that motivated it is the
+purest form of theatre, because the incident report itself is what certified it.
+
 Verification habits do not transfer between operands. A session that learned to
 re-read STATUS after the exit-code bug kept re-reading status while its DESC
 writes were being silently destroyed twenty times over (desc_append, AMUX-2161)
