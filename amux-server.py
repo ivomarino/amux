@@ -6903,6 +6903,31 @@ def _snapshot_all_sessions():
     finally:
         _snapshot_running = False
 
+def _steer_guard_stale(name: str, guard: str):
+    """Is a guarded nudge still TRUE at delivery time? Returns (stale, why).
+
+    A nudge waits in the queue until the session's next turn boundary — that is
+    the correct grain (see the no-global-pub-sub decision in ethos.md) — but it
+    means every nudge asserting a fact must re-check that fact before speaking
+    it. Unknown guards are never stale, so an unguarded nudge is unaffected."""
+    if guard == "commit":
+        wd = _session_work_dir(name)
+        return (bool(wd) and not _session_dirty_files(name, wd)), "tree clean at delivery"
+    if guard.startswith("dep:"):
+        cid = guard[4:]
+        it = _item_by_id(cid)
+        if not it or it.get("deleted"):
+            return True, f"{cid} no longer exists"
+        if it.get("archived"):
+            return True, f"{cid} archived before delivery"
+        if _status_canon(it.get("status")) not in ("todo", "backlog"):
+            return True, f"{cid} is {it.get('status')} before delivery"
+        if _deps_blocking(it):
+            return True, f"{cid} blocked again before delivery"
+        return False, ""
+    return False, ""
+
+
 def _steer_enqueue(name: str, text: str, guard: str = "") -> str:
     """Append a message to a session's durable steering queue (memory + DB).
     Delivered (batched) at the next turn boundary by _steer_try_deliver.
@@ -7057,18 +7082,30 @@ def _steer_try_deliver(name: str, status: str, raw: str = "") -> None:
     # generating" signal is the SPINNER, which _detect_claude_status already
     # detects → status != 'idle' while the turn runs. The 6s continuous settle
     # below is what guards against a torn/between-task frame.
-    # Re-validate commit-guard nudges at DELIVERY: a nudge enqueued when a session
-    # went idle-dirty is HELD while the session's next turn commits, then would
-    # deliver against a now-clean tree — a stale warning (AMUX-1737, fired 4/4
-    # today). When the session is idle again and the tree is clean, drop them.
+    # Re-validate GUARDED nudges at DELIVERY. A nudge sits in the queue until the
+    # session's next turn boundary, and the world moves in between — so anything
+    # asserting a fact has to re-check that fact before it is spoken.
+    #   commit — enqueued idle-dirty, held while the next turn commits, then would
+    #            warn against a now-clean tree (AMUX-1737, fired 4/4 that day).
+    #   dep:ID — enqueued when ID's blocker closed, then would announce "pickable
+    #            now" about a card since discarded, closed, archived or re-blocked.
+    #            I hit this one myself: a dependency-unblock nudge for a test card
+    #            arrived after I had discarded it. A nudge that tells a session to
+    #            pick up a closed card spends a whole turn on a dead lead, which is
+    #            worse than no nudge.
     if deliverable:
         with _steering_lock:
-            _guard_ids = [m["id"] for m in _steering_queue.get(name, [])
-                          if m.get("guard") == "commit" and not m.get("_inflight")]
-        if _guard_ids:
-            _wd = _session_work_dir(name)
-            if _wd and not _session_dirty_files(name, _wd):
-                _drop = set(_guard_ids)
+            _guarded = [(m["id"], m.get("guard") or "") for m in _steering_queue.get(name, [])
+                        if m.get("guard") and not m.get("_inflight")]
+        if _guarded:
+            _drop, _reasons, _had_commit = set(), {}, False
+            for _mid, _g in _guarded:
+                _stale, _why = _steer_guard_stale(name, _g)
+                if _stale:
+                    _drop.add(_mid); _reasons[_mid] = _why
+                    if _g == "commit":
+                        _had_commit = True
+            if _drop:
                 with _steering_lock:
                     _steering_queue[name] = [m for m in _steering_queue.get(name, []) if m["id"] not in _drop]
                 try:
@@ -7078,10 +7115,13 @@ def _steer_try_deliver(name: str, status: str, raw: str = "") -> None:
                     _db.commit()
                 except Exception:
                     pass
-                _commit_guard_nudged.pop(name, None)   # tree clean → re-arm the guard
-                slog(f"[commit-guard] {name}: tree clean at delivery — dropped {len(_drop)} stale nudge(s)")
-                _emit_event(name, "message.dropped", {"count": len(_drop), "reason": "tree clean at delivery"},
-                            source="commit-guard")
+                if _had_commit:
+                    _commit_guard_nudged.pop(name, None)   # tree clean → re-arm the guard
+                slog(f"[steer-guard] {name}: dropped {len(_drop)} stale nudge(s) — "
+                     + "; ".join(sorted(set(_reasons.values()))))
+                _emit_event(name, "message.dropped",
+                            {"count": len(_drop), "reason": "; ".join(sorted(set(_reasons.values())))},
+                            source="steer-guard")
     with _steering_lock:
         queue = _steering_queue.get(name, [])
         if not queue or not deliverable:
@@ -32461,7 +32501,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.405';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.406';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53705,7 +53745,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.405';
+const CACHE = 'amux-v0.9.406';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58603,9 +58643,13 @@ class CCHandler(BaseHTTPRequestHandler):
                                     _emit_event(_dr["session"], "dep.freed",
                                                 {"issue": _dr["id"], "freed_by": bid},
                                                 idem=_idem, source="board")
+                                    # guard=dep:<id> — revalidated at delivery, so
+                                    # a card closed/discarded/re-blocked while the
+                                    # nudge waited is never announced as pickable.
                                     _steer_enqueue(_dr["session"],
                                         f"[amux] {_dr['id']} just UNBLOCKED — its dependency {bid} "
-                                        f"closed and no other deps remain. It is pickable now.")
+                                        f"closed and no other deps remain. It is pickable now.",
+                                        guard=f"dep:{_dr['id']}")
                             except Exception as _de:
                                 slog(f"[dep-freed] {bid}: {_de}")
                         # Loop 1 (throughput plan): entering review with no
