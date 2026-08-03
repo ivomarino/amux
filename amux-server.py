@@ -6286,6 +6286,16 @@ def _send_urgent_alert(message: str, session: str = "", reason: str = "", origin
     attempt is recorded to the owner_alerts ledger with BOTH, so this
     safety-critical action is first-hand verifiable and a claimed≠verified mismatch
     (the AMUX-1730 entanglement signature) is caught rather than believed."""
+    # Junk-message rejection (the 38-SMS night, 2026-08-03): '--help' fired 38
+    # real iMessages because a probe's flag became the MESSAGE. Flags and
+    # empty strings are never legitimate pages; refuse loudly instead of
+    # texting the owner's phone.
+    _m = (message or "").strip()
+    if not _m or _m.startswith("-") or _m.lower() in ("help", "usage", "test"):
+        slog(f"[alert] REFUSED junk owner-alert message {_m!r} from "
+             f"{origin or session or 'unknown'} — flags/empty are never pages")
+        return {"error": f"refused: {_m!r} is not an alert message", "sent": False}
+
     msg = (message or "").strip()
     if not msg:
         return {"ok": False, "error": "empty message"}
@@ -10664,6 +10674,13 @@ def _age_archive_sweep():
             _days = max(3, int((now - (r["updated"] or now)) / 86400))
             _append_board_log(r["id"],
                 f"archived: AGE — untouched {_days}d (was {r['status']}; by amux age-sweep)")
+            # MD-161: archiving is BOOKKEEPING, not activity — the log write
+            # bumps `updated`, which re-ordered 296 of the 300 verified list
+            # slots onto freshly-archived fossils and pushed genuinely recent
+            # verified work out of every session's dedupe read. Restore the
+            # card's own updated so the window stays truthful.
+            get_db().execute("UPDATE issues SET updated=? WHERE id=?",
+                             (r["updated"] or now, r["id"]))
             _ilog("board", "archive", actor="amux-age-sweep", target=r["id"],
                   detail={"reason": "age", "days_untouched": _days},
                   before={"archived": 0, "status": r["status"], "session": r["session"]},
@@ -31931,7 +31948,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.382';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.383';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53100,7 +53117,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.382';
+const CACHE = 'amux-v0.9.383';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell

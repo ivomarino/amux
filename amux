@@ -1411,6 +1411,15 @@ EOF
 }
 
 cmd_alert() {
+  # NEVER fire on help/empty (the 38-SMS night, 2026-08-03): a session ran
+  # `amux alert --help` to LEARN the command and each probe sent Ethan a real
+  # iMessage — the sanctioned instruction was the failure (AMUX-2140 class).
+  case "${1:-}" in
+    -h|--help|"")
+      echo "Usage: amux alert \"<what happened + what you need>\" \"<short why-now>\""
+      echo "FIRE ALARM: pushes + texts the owner's PHONE. Not for status updates."
+      return 0 ;;
+  esac
   # Urgent owner alert — USE SPARINGLY. Fires an in-app push + iMessage to the
   # amux owner (Ethan). For anything a session needs the owner to see NOW.
   local AMUX_API="${AMUX_API:-https://localhost:8822}"
