@@ -1,5 +1,41 @@
 [
   {
+    "hash": "321b6a8a61f54b7fa2eb485e4d62eda15a8ad0dd",
+    "short": "321b6a8",
+    "title": "Read aloud — listen to your AI agents via Piper TTS, free and local",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["tts", "audio", "mobile", "piper"],
+    "description": "amux now includes a read-aloud button on every session card and in the Trends summary, powered by Piper TTS — a free, open-source, offline text-to-speech engine. No API key, no cloud service, no per-character cost. Install Piper (brew install piper or pip install piper-tts), enable in Settings → Audio, and tap the speaker icon to hear agent output spoken aloud. Streams audio to the iOS app and mobile PWA so you can hear your morning briefing while getting ready — no screen required."
+  },
+  {
+    "hash": "1ef32cbcd26ec42dfbf241a27b32b2c1125566e4",
+    "short": "1ef32cb",
+    "title": "Gemini CLI parity — memory bridge, same-context review guard, alert help",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["gemini", "parity", "multi-runtime", "memory"],
+    "description": "Gemini CLI sessions now have full parity with Claude lanes: the shared memory bridge (notes shared across sessions) works for Gemini CLI sessions, same-context review refusal prevents a session from reviewing its own work, and the owner alert is guarded with help text to prevent misuse. This makes Gemini CLI a first-class runtime in mixed-model fleets — high-context batch tasks assigned to Gemini CLI, complex reasoning to Claude Code, both coordinating through the same board and memory system."
+  },
+  {
+    "hash": "9f80099efa91a8ce35fffed4ee56beabcbde6c83",
+    "short": "9f80099",
+    "title": "Gemini CLI state detection — Gemini lanes now visible to every status loop",
+    "date": "2026-08-03",
+    "type": "fix",
+    "tags": ["gemini", "status", "watchdog", "parity"],
+    "description": "Gemini CLI sessions were invisible to the amux status detection loop — amux couldn't tell whether they were waiting, thinking, or idle, so the watchdog couldn't self-heal them and the dashboard showed incorrect status. This fix extends state detection to the Gemini CLI provider. Gemini CLI sessions now show live status (waiting/thinking/idle/stuck) in the dashboard and receive the same watchdog coverage as Claude Code sessions."
+  },
+  {
+    "hash": "8ef08cd13fbed4529b913f64c147dd2cbefd70d9",
+    "short": "8ef08cd",
+    "title": "Server startup 13 seconds faster — log streaming no longer blocks binding",
+    "date": "2026-08-03",
+    "type": "fix",
+    "tags": ["performance", "startup", "server"],
+    "description": "The amux server was hanging for 13 seconds on startup before binding to its port — caused by _attach_log_streaming running synchronously in the main thread before the HTTP server started. Moving it to a background thread eliminates the delay. The server now binds and becomes ready to accept connections immediately on startup."
+  },
+  {
     "hash": "0e8a29be2405562079267a70fa11fd564f12446f",
     "short": "0e8a29b",
     "title": "Rate-limit recovery — parked sessions no longer receive stray keypresses every 15s",
