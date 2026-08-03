@@ -1369,6 +1369,49 @@ def _bu_ensure_profile_env(session: str, profile: str, env: dict) -> dict:
     return env, pdir
 
 
+def _bu_click_selector(session: str, selector: str) -> dict:
+    """Click by CSS selector on the driver backend (AMUX-2272).
+
+    The driver's own `click` verb takes an INDEX out of its last snapshot, so
+    every caller had to snapshot, parse the tree, and hope the index still
+    pointed at the same element. The CDP backend has accepted a selector all
+    along, so the same request succeeded or 400'd depending on which backend
+    happened to be up — and two sessions independently failed to verify a UI
+    change on the same day because of it.
+
+    The driver does expose `eval`, so a selector click is just resolve-then-
+    click. NOTE the eval contract: it takes a bare EXPRESSION. A `return`
+    statement evaluates to null and comes back as {"result": null}, which reads
+    like "ran, produced nothing" rather than "wrong script shape" — that is
+    what made this look like a dead end rather than a missing feature.
+
+    Distinguishes no-match from hidden from clicked, because a click that
+    silently hits nothing is indistinguishable from one that worked."""
+    js = ("(function(){var e=document.querySelector(%s);"
+          "if(!e)return 'NOMATCH';"
+          "e.scrollIntoView({block:'center'});"
+          "var r=e.getBoundingClientRect();"
+          "if(r.width===0&&r.height===0)return 'NOTVISIBLE';"
+          "e.click();"
+          "return 'OK|'+(e.tagName||'')+'|'+((e.textContent||'').trim().slice(0,60));})()"
+          % json.dumps(selector))
+    res = _bu_eval(session, js)
+    if res.get("error"):
+        return {"error": res["error"], "selector": selector}
+    out = res.get("result")
+    if out == "NOMATCH":
+        return {"error": f"no element matches selector {selector!r}",
+                "selector": selector, "hint": "check the selector against GET /api/browser/state"}
+    if out == "NOTVISIBLE":
+        return {"error": f"element for {selector!r} has zero size (hidden or not laid out)",
+                "selector": selector}
+    if isinstance(out, str) and out.startswith("OK|"):
+        _, tag, txt = out.split("|", 2)
+        return {"ok": True, "selector": selector, "clicked": {"tag": tag, "text": txt}}
+    return {"error": "click produced no result — the eval backend may be down",
+            "selector": selector, "raw": res}
+
+
 def _bu_call(args: list, timeout_s: int = 30, session: str = "amux") -> dict:
     """Logging wrapper over the raw browser-use call.
 
@@ -2321,6 +2364,81 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
             return {"error": f"driver io: {e}"}
 
 
+def _bu_active_driver(session: str):
+    """The live v3 driver for this session, or None. See _bu_eval."""
+    with _bu_driver_lock:
+        d = _bu_drivers.get(session)
+        if d and d["proc"].poll() is None:
+            return d
+    return None
+
+
+def _bu_eval(session: str, js: str, timeout_s: int = 20) -> dict:
+    """Evaluate JS against the browser that is ACTUALLY driving this session.
+
+    THE BUG THIS EXISTS FOR (AMUX-2272). /api/browser/start and /navigate route
+    to the v3 Playwright driver when the profile resolves to an amux-managed
+    store, and return early. But every verb under /api/browser/action went
+    straight to _bu_call, which shells out to the browser-use CLI — a DIFFERENT
+    browser process that nobody had navigated. So /state (driver) showed the
+    dashboard while /action eval (CLI) reported about:blank, and a selector
+    click reported "no element matches" against a blank page.
+
+    Two sessions independently concluded the browser API was broken, and both
+    conclusions were the honest reading of the data available: every symptom
+    was real, and every diagnosis pointed at the wrong layer, because the two
+    halves of the API were driving different browsers and nothing said so. I
+    first blamed the self-signed certificate on amux's own origin — plausible,
+    and wrong; the driver had loaded the dashboard fine all along.
+
+    Returns {"ok": True, "result": <value>} or {"error": ...}."""
+    d = _bu_active_driver(session)
+    if d:
+        r = _bu_driver_call(session, d["profile"], "eval", {"js": js}, timeout_s=timeout_s)
+        if r.get("ok"):
+            return {"ok": True, "result": r.get("value"), "backend": "driver"}
+        return {"error": r.get("error") or "driver eval failed", "backend": "driver"}
+    r = _bu_call(["eval", js], session=session, timeout_s=timeout_s)
+    if isinstance(r, dict) and r.get("error"):
+        return {"error": r["error"], "backend": "cli"}
+    return {"ok": True, "result": ((r or {}).get("data") or {}).get("result"), "backend": "cli"}
+
+
+def _bu_landing_check(url: str, session: str) -> dict:
+    """Did the page we asked for actually LOAD? Returns {} when fine.
+
+    `open` echoes the REQUESTED url and reports success whether or not the
+    navigation worked. Chromium lands on chrome-error://chromewebdata/ when it
+    refuses a page — which it does for amux's OWN dashboard, because the server
+    serves a self-signed cert and the driver's Chromium has no exception for it.
+
+    That combination cost two sessions a day of work on the same afternoon
+    (AMUX-2272): every later verb ran against the error page, so a selector
+    click reported "no element matches" and the honest conclusion from the
+    available data was "selector clicks are broken" — when the truth was "you
+    are not on the page you think you are". An open that cannot fail sends the
+    caller to debug the wrong layer, which is the ethos-#7 shape applied to an
+    instrument rather than a check."""
+    try:
+        r = _bu_eval(session, "location.href", timeout_s=15)
+        landed = r.get("result")
+        if not isinstance(landed, str):
+            return {}
+        if landed.startswith("chrome-error://"):
+            return {"nav_failed": True, "landed": landed,
+                    "why": (f"Chromium refused to load {url}. For amux's own https://localhost"
+                            " this is the self-signed certificate — the driver's browser has no"
+                            " exception for it."),
+                    "hint": "every subsequent verb runs against the error page, not your page"}
+        if landed == "about:blank" and url and url != "about:blank":
+            return {"nav_failed": True, "landed": landed,
+                    "why": f"navigation to {url} left the page on about:blank",
+                    "hint": "every subsequent verb runs against a blank page, not your page"}
+    except Exception:
+        pass
+    return {}
+
+
 def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
              fresh: bool = False, timeout_s: int = 30) -> dict:
     """Open a URL under the correct profile.
@@ -2351,7 +2469,8 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
             dres = _bu_driver_call(session, profile, "open", {"url": url},
                                    timeout_s=timeout_s)
             if dres.get("ok"):
-                return {"success": True, "ok": True, "backend": "driver",
+                _land = _bu_landing_check(url, session)
+                return {**_land, "success": not _land, "ok": not _land, "backend": "driver",
                         "profile": profile, "auto_profile": auto,
                         "url": dres.get("url", url), "title": dres.get("title", ""),
                         "writes_persist": True,
@@ -2397,6 +2516,14 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
         if not res.get("error"):
             try: _bu_inject_capture(session)
             except Exception: pass
+        # Report the LANDING, not the request. See _bu_landing_check.
+        if not res.get("error"):
+            _land = _bu_landing_check(url, session)
+            if _land:
+                res.update(_land)
+                res["success"] = False
+                res["ok"] = False
+                res["error"] = _land["why"]
     return res
 
 def _bu_parse_elements(raw_text: str, limit: int = 120) -> dict:
@@ -7046,6 +7173,90 @@ def _cmd_hist_record(session: str, text: str, ctype: str = "user", origin: str =
 # deliver). Tunable via env (raise it for a more conservative hold).
 _STEER_SETTLE_SECS = float(os.environ.get("AMUX_STEER_SETTLE_SECS", "2"))
 _steer_settle_since: dict = {}   # name -> monotonic ts of first deliverable observation
+
+# ── Undeliverable-nudge sweep (AC-176) ───────────────────────────────────────
+# Guard revalidation (above) only runs inside _steer_try_deliver, which is only
+# reached for a session the poller is WATCHING. A nudge addressed to a lane that
+# never comes back is therefore never delivered AND never dropped — nothing ever
+# looks at it again. Measured 2026-08-03: 9 rows, oldest 21 days, for
+# __steertest2__, steertest2, limitprobe (env file deleted) and lucihub,
+# ts-troubleshooting (env present, simply never idle again).
+#
+# This is not only untidiness. It makes "the queue row is gone" an unreliable
+# success signal, and something was already resting on it: AMUX-2275's stated
+# closing condition was exactly that. Its specimen only cleared because the amux
+# lane happened to go idle during review — had it stalled, the card could never
+# have closed by its own criterion, through no fault of the code under test.
+#
+# TWO causes, kept as SEPARATE reasons on purpose. message.dropped is already the
+# discriminator that made AMUX-2275 verifiable (709 "tree clean at delivery" vs 1
+# "AMUX-2274 is discarded before delivery"); an expiry sweep that dropped rows
+# without saying which cause applied would reintroduce the blindness that fix
+# removed. Emitted under source="steer-expiry", never "steer-guard", so an
+# expiry can never be mistaken for a guard firing.
+_STEER_MAX_AGE_SECS = float(os.environ.get("AMUX_STEER_MAX_AGE_SECS", str(14 * 86400)))
+_STEER_SWEEP_EVERY = float(os.environ.get("AMUX_STEER_SWEEP_EVERY", "3600"))
+
+def _steer_sweep_undeliverable() -> None:
+    """Drop queued nudges that can never be delivered. Returns nothing; audits all.
+
+    Driven off the DB rather than `_steering_queue`, deliberately: the in-memory
+    map is rebuilt at startup and a dead lane's rows may exist in the table with
+    no live entry, which is precisely the population this sweep exists to find.
+    """
+    now = time.time()
+    try:
+        db = get_db()
+        rows = db.execute(
+            "SELECT id, session, queued_at FROM steering_queue").fetchall()
+    except Exception:
+        return
+    by_session: dict = {}
+    for r in rows:
+        mid, name, qat = r["id"], r["session"], float(r["queued_at"] or now)
+        # A session EXISTS iff it has an env file — the same test list_sessions()
+        # uses. Deliberately not "is it running": a stopped session is expected to
+        # come back and its nudge is still legitimately pending. Only a session
+        # whose env file is gone can never be polled again.
+        alive = (CC_SESSIONS / f"{name}.env").exists()
+        age = now - qat
+        if not alive:
+            why = f"session {name} no longer exists"
+        elif age > _STEER_MAX_AGE_SECS:
+            why = f"undelivered {int(age // 86400)}d — never reached an idle turn boundary"
+        else:
+            continue
+        by_session.setdefault(name, []).append((mid, why))
+    for name, drops in by_session.items():
+        ids = {mid for mid, _ in drops}
+        with _steering_lock:
+            q = _steering_queue.get(name)
+            if q:
+                # Never yank a message mid-delivery: _inflight is set under this
+                # same lock by the deliverer. Rows with no in-memory entry at all
+                # (the dead-lane case) stay in `ids` — they cannot be in flight.
+                ids -= {m["id"] for m in q if m.get("_inflight")}
+                _steering_queue[name] = [m for m in q if m["id"] not in ids]
+                if not _steering_queue[name]:
+                    _steering_queue.pop(name, None)
+        if not ids:
+            continue
+        try:
+            db = get_db()
+            for mid in ids:
+                db.execute("DELETE FROM steering_queue WHERE id=?", (mid,))
+            db.commit()
+        except Exception:
+            # Do NOT swallow this silently — a sweep that fails to persist would
+            # re-drop the same rows every hour and emit a duplicate audit event
+            # each time, which reads as recurring breakage rather than one bug.
+            slog(f"[steer-expiry] {name}: DB delete FAILED for {len(ids)} row(s) — will retry next sweep")
+            continue
+        reasons = sorted({why for mid, why in drops if mid in ids})
+        slog(f"[steer-expiry] {name}: dropped {len(ids)} undeliverable nudge(s) — " + "; ".join(reasons))
+        _emit_event(name, "message.dropped",
+                    {"count": len(ids), "reason": "; ".join(reasons)},
+                    source="steer-expiry")
 
 
 def _steer_try_deliver(name: str, status: str, raw: str = "") -> None:
@@ -32501,7 +32712,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.406';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.409';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53745,7 +53956,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.406';
+const CACHE = 'amux-v0.9.409';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -62306,11 +62517,17 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if action == "click":
                     x, y = body.get("x"), body.get("y")
                     index = body.get("index")
+                    sel = body.get("selector")
+                    if sel:
+                        # Selector first, matching the CDP backend, so the same
+                        # request works whichever backend is up (AMUX-2272).
+                        r = _bu_click_selector(session, sel)
+                        return self._json(r, 400 if r.get("error") else 200)
                     if index is not None:
                         return self._json(_bu_call(["click", str(index)], session=session))
                     elif x is not None and y is not None:
                         return self._json(_bu_call(["click", str(x), str(y)], session=session))
-                    return self._json({"error": "click needs index or x,y"}, 400)
+                    return self._json({"error": "click needs selector, index, or x,y"}, 400)
                 elif action == "type":
                     text = body.get("text", "")
                     return self._json(_bu_call(["type", text], session=session))
@@ -62331,14 +62548,11 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     script = body.get("script", "")
                     if not script:
                         return self._json({"error": "script required"}, 400)
-                    _res = _bu_call(["eval", script], session=session)
-                    try:
-                        if isinstance(_res, dict) and isinstance((_res.get("data") or {}).get("result"), str):
-                            _res = dict(_res); _res["data"] = dict(_res["data"])
-                            _res["data"]["result"] = _obs_cap(_res["data"]["result"], _OBS_EVAL_CAP)
-                    except Exception:
-                        pass
-                    return self._json(_res)
+                    # Routed to whichever browser is actually driving (AMUX-2272).
+                    _res = _bu_eval(session, script, timeout_s=30)
+                    if isinstance(_res.get("result"), str):
+                        _res["result"] = _obs_cap(_res["result"], _OBS_EVAL_CAP)
+                    return self._json(_res, 400 if _res.get("error") else 200)
                 elif action == "wait":
                     selector = body.get("selector", "")
                     text = body.get("text", "")
@@ -62479,7 +62693,23 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 )
                 return self._json(result)
 
-            return self._json({"error": "browser route not found"}, 404)
+            # Name the routes. Two sessions independently guessed
+            # /api/browser/status (it is /state) and got a bare "not found",
+            # which reads as "the browser API is down" rather than "wrong
+            # path" — an error that sends you chasing the wrong cause is the
+            # bug, not the typo.
+            return self._json({
+                "error": f"browser route not found: {path}",
+                "routes": ["GET /api/browser/state", "GET /api/browser/screenshot",
+                           "GET /api/browser/profiles", "GET /api/browser/sessions",
+                           "GET /api/browser/inspect", "GET /api/browser/search",
+                           "POST /api/browser/start", "POST /api/browser/navigate",
+                           "POST /api/browser/action", "POST /api/browser/stop",
+                           "POST /api/browser/save-profile", "POST /api/browser/agent"],
+                "actions": ["click (selector|index|x,y)", "type", "input", "key",
+                            "scroll", "eval", "wait", "extract", "back"],
+                "eval_contract": "script must be a bare EXPRESSION; a `return` statement yields null",
+            }, 404)
 
         # ── Torrents (/api/torrents/*) ────────────────────────────────────────
         if path.startswith("/api/torrents"):
@@ -65191,6 +65421,13 @@ def main():
     schedule_job(_steering_fast_tick,    interval=2,                    name="steering_fast", initial_delay=8)
     schedule_job(_index_token_ledger,    interval=60,                   name="token_ledger",  initial_delay=12)
     schedule_job(_ilog_prune,            interval=3600,                 name="ilog_prune",    initial_delay=300)
+    # initial_delay is deliberately SHORT. This file live-reloads on save and is a
+    # shared checkout — observed restarting every ~2 minutes while several sessions
+    # were editing it. Every restart resets initial_delay, so a long one on a busy
+    # day means the job never fires at all: the delay must be shorter than the
+    # typical time between reloads or the schedule is decorative. The sweep is one
+    # indexed table scan plus a stat() per session, so 30s costs nothing.
+    schedule_job(_steer_sweep_undeliverable, interval=_STEER_SWEEP_EVERY, name="steer_expiry", initial_delay=30)
     schedule_job(_tmux_size_watchdog,    interval=60,                   name="tmux_size",   initial_delay=45)
     schedule_job(_reap_stale_browsers,  interval=120,                  name="browser_reap", initial_delay=60)
     schedule_job(_kill_stale_ray,        interval=600,                  name="ray_reap",     initial_delay=120)
