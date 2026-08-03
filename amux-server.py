@@ -10094,6 +10094,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
             _append_board_log(item_id, "capture: session prompt")
             _stamp_msg_card(session_name, prompt_text, item_id)
             _board_changed()
+            _capture_decompose_fastpath(session_name)
             slog(f"[board] {session_name}: new task -> {item_id} (queued alongside {existing['id']})")
             return
         # Create new issue (same dedupe as the queued path — AMUX-2207)
@@ -10118,6 +10119,7 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
         _append_board_log(item_id, "capture: session prompt")  # durable marker, see above
         _stamp_msg_card(session_name, prompt_text, item_id)
         _board_changed()
+        _capture_decompose_fastpath(session_name)
     except Exception as e:
         print(f"[board] auto-create failed for {session_name}: {e}", flush=True)
 
@@ -10897,6 +10899,40 @@ def _caller_scope(headers):
 
 
 _pick_reviewer_last_unverified: dict = {}
+
+
+def _capture_decompose_fastpath(session_name: str):
+    """Event-driven decompose ask (Ethan 16:28: shells sat 'captured, not yet
+    decomposed' for the whole active afternoon). The idle-batched dispatch
+    stays as the backstop; this adds the FAST path — when a lane accumulates
+    2+ undecomposed shells, ONE steering ask goes out (delivers at the next
+    turn boundary, inside the session's flow), max once per 30min per lane
+    via durable events. Bounded by construction: one message, not one per
+    capture."""
+    try:
+        db = get_db()
+        now = int(time.time())
+        shells = db.execute(
+            "SELECT COUNT(*) FROM issues WHERE session=? AND status='todo' "
+            "AND deleted IS NULL AND COALESCE(archived,0)=0 "
+            "AND COALESCE(log,'') LIKE '%capture: session prompt%'",
+            (session_name,)).fetchone()[0]
+        if shells < 2:
+            return
+        recent = db.execute(
+            "SELECT 1 FROM session_events WHERE session=? AND type='pickup.decompose_nudge' "
+            "AND ts > ? LIMIT 1", (session_name, now - 1800)).fetchone()
+        if recent:
+            return
+        _emit_event(session_name, "pickup.decompose_nudge",
+                    {"shells": shells, "path": "capture-fastpath"}, source="capture")
+        _steer_enqueue(session_name,
+            f"[amux] {shells} of your prompts are captured on the board but not yet "
+            f"decomposed into real cards. At your next natural pause: split each into "
+            f"one card per unit of work (or discard finished ones with a pointer) — "
+            f"you have the context to decompose them; the board does not.")
+    except Exception as e:
+        slog(f"[capture-fastpath] {session_name}: {e}")
 
 
 def _pick_reviewer(exclude_session: str) -> str | None:
@@ -32265,7 +32301,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.396';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.397';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53447,7 +53483,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.396';
+const CACHE = 'amux-v0.9.397';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
