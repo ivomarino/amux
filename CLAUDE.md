@@ -60,10 +60,31 @@ your task, not the platform.
 
 ## Deploy
 
+⚠ **BEFORE `git push origin main`: check what you are shipping that is not yours.** This is a
+SHARED checkout — other sessions commit here — and `.github/workflows/deploy-cloud.yml` triggers on
+`push: branches:[main], paths:['amux-server.py']` (as does `cloud-image.yml`). **So any push of
+main deploys EVERY unpushed commit touching that file, including other sessions' work that nobody
+reviewed at that moment.** Always run first:
+
+```bash
+git rev-list --count origin/main..main          # how many commits am I about to ship?
+git log --oneline origin/main..main             # whose are they?
+```
+
+If commits you did not write are listed, ask their author before pushing. "My change is small" is
+not the question; the question is what rides along with it.
+
+**The mirror case is just as real: "my commits are not pushed" does NOT mean they are inert.** On a
+shared checkout they are staged to ship under someone else's push, at a time you do not choose. A
+session's unpushed commit was replayed onto origin by a peer's `git pull --rebase` on 2026-08-03 —
+a third party's push shipped a commit its author never pushed. You control neither *when* your work
+ships nor *whether* it does.
+
 When the user says **"deploy"**, run the full pipeline:
 1. `git add` changed files (typically `amux-server.py`)
 2. `git commit` with a concise message
-3. `git push origin main`
+3. Run the two checks above
+4. `git push origin main`
 
 ## Single-codebase rule (CRITICAL)
 
