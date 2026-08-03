@@ -3268,6 +3268,44 @@ _session_auto_actions: dict = {} # {name: {"last_compact": ts, "last_restart": t
 # report outranks the pane scrape; a stale one falls through to it. The scrapers
 # stay as the fallback for crashes, subagents, and providers without hooks.
 _session_reported: dict = {}   # name -> {"state": ..., "detail": ..., "ts": epoch}
+
+
+def _persist_session_reports() -> None:
+    """Mirror the self-report table into prefs so it survives a restart.
+
+    This process re-execs itself on every save of this file, so anything held
+    only in memory is fiction across a restart. That was tolerable while
+    reports were a status-loop nicety with a 25s freshness window. It is not
+    tolerable now that reports gate scan demotion on a 30-minute window: a
+    restart would drop every lane back to full-rate pane capture until each
+    one happened to take a turn, which is exactly the load the demotion
+    exists to remove."""
+    try:
+        db = get_db()
+        db.execute("INSERT INTO prefs (key, value) VALUES ('session_reports', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (json.dumps(_session_reported),))
+        db.commit()
+    except Exception as e:
+        try: slog(f"[report] persist failed: {e}")
+        except Exception: pass
+
+
+def _hydrate_session_reports() -> None:
+    """Restore self-reports at boot, dropping any older than the hooks-live
+    window (a report that stale licenses nothing anyway)."""
+    try:
+        row = get_db().execute("SELECT value FROM prefs WHERE key='session_reports'").fetchone()
+        if not row:
+            return
+        now = time.time()
+        for k, v in (json.loads(row["value"]) or {}).items():
+            if isinstance(v, dict) and (now - float(v.get("ts", 0))) < _HOOKS_LIVE_S:
+                _session_reported[k] = v
+        slog(f"[report] hydrated {len(_session_reported)} self-report(s) across restart")
+    except Exception as e:
+        try: slog(f"[report] hydrate failed: {e}")
+        except Exception: pass
 _SELF_REPORT_FRESH_S = 25      # Stop fires per turn; anything older is inference territory
 _steering_queue: dict = {}      # {session_name: [{"text": str, "queued_at": float, "id": str}]}
 _steering_lock = threading.Lock()
@@ -5471,6 +5509,12 @@ _rate_limit_last_responded: dict = {}
 # per-session dedupe so a recurring throw logs every ~10 min, not every scan.
 _rate_limit_scan_err: dict = {}
 _scan_demoted_last: dict = {}   # session -> last FULL scan while self-reporting (D1 demotion)
+# How long a self-report licenses scan demotion, and the liveness floor kept
+# underneath it. Policy in config (D3/D4 exit shape), not a constant that
+# silently becomes the ceiling: raise _HOOKS_LIVE_S as hooks get more reliable,
+# lower _SCAN_DEMOTE_S if a class of state change turns out to need faster eyes.
+_HOOKS_LIVE_S = int(os.environ.get("AMUX_HOOKS_LIVE_S", "1800"))
+_SCAN_DEMOTE_S = int(os.environ.get("AMUX_SCAN_DEMOTE_S", "60"))
 # Scan-demotion counters, exposed at GET /api/debug/scan. A skip that leaves no
 # trace is the ethos-#4 failure: when the demotion eventually hides a state
 # change, whoever looks must be able to SEE that scans were being skipped and
@@ -5605,19 +5649,29 @@ def _rate_limit_auto_respond():
                     continue
             # SCAN DEMOTION for self-reporting lanes (Ethan: do all 4, #1;
             # D1-exit step). A lane whose hooks reported state within the
-            # fresh window is TELLING us its truth — capturing its pane every
-            # tick is the poll the report endpoint exists to replace, and the
+            # window has PROVEN its hooks fire — capturing its pane every tick
+            # is the poll the report endpoint exists to replace, and the
             # per-tick tmux subprocess × 40 lanes fed both halves of the
-            # 08-02/03 wedge. Fresh report -> full capture at most every 60s
-            # (liveness + limit-banner detection keeps working with <=60s
-            # extra latency; a parked lane's report ages out of the 25s
-            # window anyway, restoring full-rate scans exactly when
-            # inference is needed). Hookless providers (gemini/codex) keep
-            # full-rate scans — the scraper is their only voice.
+            # 08-02/03 wedge.
+            #
+            # The gate is "hooks are live" (_HOOKS_LIVE_S), NOT "the report is
+            # fresh" (_SELF_REPORT_FRESH_S). Freshness is the right test for
+            # TRUSTING a report's contents — the status loop uses it that way.
+            # It is the wrong test for demoting the scan: an idle lane reports
+            # once on Stop and then says nothing until its next turn, so a
+            # freshness gate demotes exactly the 25s where the lane is least
+            # interesting and full-rate scans the hours where nothing can
+            # change without a hook firing. What licenses the demotion is that
+            # this lane's harness DOES report; a 60s floor still catches
+            # crashes, kills and limit banners.
+            #
+            # Hookless lanes (gemini/codex, or a lane whose hooks broke and
+            # aged past the window) keep full-rate scans — the scraper is
+            # their only voice, and losing hooks silently restores it.
             _rep_s = _session_reported.get(name)
             _sst = _scan_stats["by_session"].setdefault(name, {"full": 0, "demoted": 0})
-            if (_rep_s and (now - _rep_s.get("ts", 0)) < _SELF_REPORT_FRESH_S
-                    and (now - _scan_demoted_last.get(name, 0)) < 60):
+            if (_rep_s and (now - _rep_s.get("ts", 0)) < _HOOKS_LIVE_S
+                    and (now - _scan_demoted_last.get(name, 0)) < _SCAN_DEMOTE_S):
                 _scan_stats["demoted"] += 1; _sst["demoted"] += 1
                 continue
             _scan_demoted_last[name] = now
@@ -32326,7 +32380,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.398';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.399';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53508,7 +53562,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.398';
+const CACHE = 'amux-v0.9.399';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58893,17 +58947,19 @@ class CCHandler(BaseHTTPRequestHandler):
             _rows = []
             for _n, _v in sorted(_scan_stats["by_session"].items()):
                 _tot = _v["full"] + _v["demoted"]
+                _rp = _session_reported.get(_n)
                 _rows.append({"session": _n, "full": _v["full"], "demoted": _v["demoted"],
                               "demoted_pct": round(100.0 * _v["demoted"] / _tot, 1) if _tot else 0.0,
-                              "reporting": bool(_session_reported.get(_n))})
+                              "hooks_live": bool(_rp and (time.time() - _rp.get("ts", 0)) < _HOOKS_LIVE_S),
+                              "report_age_s": int(time.time() - _rp["ts"]) if _rp else None})
             _t = _scan_stats["full"] + _scan_stats["demoted"]
             return self._json({
                 "uptime_s": round(_up, 1),
                 "full": _scan_stats["full"], "demoted": _scan_stats["demoted"],
                 "demoted_pct": round(100.0 * _scan_stats["demoted"] / _t, 1) if _t else 0.0,
                 "full_per_min": round(60.0 * _scan_stats["full"] / _up, 1),
-                "self_report_fresh_s": _SELF_REPORT_FRESH_S,
-                "demote_interval_s": 60,
+                "hooks_live_s": _HOOKS_LIVE_S,
+                "demote_interval_s": _SCAN_DEMOTE_S,
                 "sessions": _rows})
 
         if method == "GET" and path == "/api/debug/threads":
@@ -63162,6 +63218,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                            "detail": str(body.get("detail") or "")[:200],
                                            "source": str(body.get("source") or "hook")[:40],
                                            "ts": time.time()}
+                _persist_session_reports()
                 return self._json({"ok": True, "state": st})
             if action == "apply-template":
                 body = self._read_body()
@@ -64724,6 +64781,7 @@ def main():
 
     # Initialize SQLite and migrate flat-file data on first run
     _init_db()
+    _hydrate_session_reports()
     _migrate_flat_to_sqlite()
     _init_default_sessions()
     threading.Thread(target=_attach_log_streaming, daemon=True).start()
