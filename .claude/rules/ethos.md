@@ -285,3 +285,73 @@ the card) is the report endpoint applied to WORK STATUS, not just liveness. The
 board is the source of truth because activity flows to it from the session's own
 model; amux never scrapes a terminal or summarizes with a pinned helper to fill
 a card. It compounds: better model -> better status, no harness change.
+
+**D1 exit, applied to the scan (2026-08-03):** the rate-limit/status loop
+captured every lane's tmux pane every ~13s, *including lanes whose hooks had
+just reported their state*. That is the poll the report endpoint exists to
+replace, running anyway. A lane with live hooks is now pane-captured at most
+once per 60s (`AMUX_SCAN_DEMOTE_S`), with hookless lanes — gemini, codex, or a
+lane whose hooks broke — silently restored to full-rate scraping, because for
+them the scraper is the only voice.
+
+Two things that pass a code read and fail the ethos, both caught by measuring
+the shipped path rather than reasoning about it:
+
+- **The first gate tested the wrong property.** It demoted while a report was
+  *fresh* (25s). But freshness is the right test for TRUSTING a report's
+  contents, not for licensing the demotion: an idle lane reports once on Stop
+  and is then silent for hours, so a freshness gate demoted the 25 seconds
+  after a turn and full-rate scanned the entire parked period — the inverse of
+  the intent, and the majority of the fleet. The property that licenses
+  demotion is *this lane's harness reports at all*. And an `idle` report does
+  not decay: the only exit from idle is a prompt, and every prompt fires
+  UserPromptSubmit, so idle gets a 24h window while active/waiting keep 30 min.
+- **In-memory state is fiction.** The report table lived only in memory, and
+  this process re-execs on every save of `amux-server.py`. A restart would have
+  dropped all 41 lanes back to full-rate capture until each happened to take a
+  turn — i.e. removed the optimisation most of the time, invisibly. Reports are
+  now persisted and hydrated at boot.
+
+`GET /api/debug/scan` exists because of rule 4: a skip that leaves no trace is
+indistinguishable from a scan that found nothing. When demotion eventually
+hides a transition, whoever looks must SEE which lanes were skipped and on what
+gate, not infer it from silence.
+
+---
+
+# Decisions taken, with the reasoning — so they are not re-litigated
+
+## Board state changes are delivered at turn boundaries, NOT via a global pub-sub (2026-08-03)
+
+Ethan asked, looking at cards stuck reading "captured" instead of decomposed:
+"because board issue statuses are so critical across amux maybe we have events
+and listen in on those events so everything can be updated/changed in real
+time." The answer is yes to events, no to a global bus. Recorded here because
+it is the kind of decision that looks obviously right the second time someone
+proposes it.
+
+**A session cannot consume an event faster than its next turn boundary.** A
+running agent is not an event loop; it is mid-turn, and anything delivered to
+it arrives when it next reads its input. So sub-turn delivery latency buys
+literally nothing at the consumer, while a bus costs a delivery guarantee, an
+ordering guarantee, a replay story, and a new class of "the listener was
+wedged" failure. The correct grain is the turn, and `_steer_enqueue` already
+delivers at exactly that grain.
+
+**What was actually missing was not transport but triggers.** The board write
+already happens; nothing was hanging a consequence off it. So the fix is
+per-case conversions — a card closing now nudges the lanes whose dependents it
+just freed; 2+ capture shells now provoke one decompose ask — each one a
+specific event with a named consumer and a dedupe key, rather than a firehose
+every lane must filter. Each conversion deletes a poll.
+
+**A global bus would also have to re-implement tag isolation, and would get it
+wrong.** Sessions see only same-tag lanes (untagged sees itself). A broadcast
+bus is scope-blind by construction, so isolation would have to be re-derived at
+every subscriber — the exact shape of leak that is easy to ship and hard to
+notice.
+
+**What to do instead, when this comes up again:** find the write that already
+happens, and hang the consequence off it, addressed to a named consumer, with a
+durable dedupe key. If you cannot name the consumer, you do not have an event —
+you have a log.
