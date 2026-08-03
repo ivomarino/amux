@@ -155,6 +155,27 @@ caps must be checked for which end they keep. The fix was to capture the
 measurement that ranks (`ps -M`, per-thread CPU) alongside the one that
 describes.
 
+**What does the detector COST, and is the cost paid in the same resource as the
+fault?** (orch's formulation of amux-cloud's spin-catcher, 2026-08-03. If yes, the
+detector is part of the incident.) The catcher tripped on `cpu >= 70` and each trip
+sent two SIGUSR1 stack dumps and wrote ~20KB into `server.log` — while the fault under
+investigation was contention on the `server.log` lock. 625 trips of self-inflicted log
+pressure, aimed precisely at the resource whose starvation it was hunting. This is
+worse than an ordinary false positive: a probe that matches itself in a `ps` listing
+manufactures a signal you can filter out, but this one AMPLIFIES the real fault, so the
+system genuinely gets sicker the harder you watch it and the resulting signal is REAL.
+The more it fires, the more it is right; the more it is right, the more it fires —
+unfalsifiable from the inside.
+
+Two rules fall out. First, **a threshold below the baseline is not a detector**: this
+server idles at 102.5% CPU with `store=ok`, so `>= 70` was reporting that the machine
+was ON. Adding a sustain requirement cut 625 trips to 53 without touching that — it
+made an uninformative level fire less often, which is not the same as making it
+informative. Second, **prefer the structurally-absent signal over the tuned
+parameter**. The fix was not a better threshold; it was DELETING the CPU trigger and
+keeping only what is absent in the healthy state — `/health` unanswered, `store=hung`,
+`degraded`. Picking a window or a threshold at all is the tell that you are guessing.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction
