@@ -5635,6 +5635,10 @@ _rate_limit_last_responded: dict = {}
 # Swallowed-exception ledger for the fleet scan loop (AMUX-2111 post-mortem):
 # per-session dedupe so a recurring throw logs every ~10 min, not every scan.
 _rate_limit_scan_err: dict = {}
+# How long a needs:you card stays quiet before the holder is asked whether the
+# ASK still holds (AMUX-2270). Config, not a constant, because the right value
+# depends on how fast the human actually answers — which is not amux's to guess.
+_NEEDSYOU_RENAG_DAYS = float(os.environ.get("AMUX_NEEDSYOU_RENAG_DAYS", "3"))
 _scan_demoted_last: dict = {}   # session -> last FULL scan while self-reporting (D1 demotion)
 # How long a self-report licenses scan demotion, and the liveness floor kept
 # underneath it. Policy in config (D3/D4 exit shape), not a constant that
@@ -10692,6 +10696,42 @@ def _advance_open_card(session_name: str) -> bool:
                 _advance_last[session_name] = time.time()
                 _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
                 slog(f"[advance] routed review of {row['id']} to reviewer {_rev}")
+            return bool(ok)
+        # NEEDS-YOU EDGE (AMUX-2270). Option 4 of the nudge below tells the
+        # session: "if it is blocked on a HUMAN decision, record that on the
+        # card and pick up the next unblocked one." A session that DOES exactly
+        # that — needsyou-tags the card with the question — got nagged again the
+        # next night, and the night after (MF-417 drew 5+ full nag prompts in
+        # 48h, each spending a whole turn to restate option 4). An instruction
+        # you can comply with and still be re-asked is the ethos-#3 shape: the
+        # loop was re-deriving a state the board already stored.
+        #
+        # The ask is not lost by going quiet — a needs:you card surfaces to the
+        # human in Focus and is:needsyou, which is where it belongs, since the
+        # only party who can unblock it is not the session. But silence forever
+        # would let a stale ask rot invisibly, so after _NEEDSYOU_RENAG_DAYS the
+        # holder gets ONE differently-shaped nudge: not "advance it" (they
+        # cannot) but "is this still the right ask?".
+        _tags_l = [str(t).lower() for t in (item.get("tags") or [])]
+        if any(t.startswith("needs:you") for t in _tags_l):
+            _asked_age = time.time() - float(item.get("updated") or 0)
+            if _asked_age < _NEEDSYOU_RENAG_DAYS * 86400:
+                slog(f"[advance] {session_name}: {row['id']} is needs:you "
+                     f"({int(_asked_age/3600)}h) — the human owes the answer, not the lane")
+                return False
+            ok, err = send_text(session_name,
+                f"[amux] {row['id']} has been waiting on a human answer for "
+                f"{int(_asked_age/86400)} days: {(row['title'] or '')[:90]}\n\n"
+                f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
+                f"right: is the question you recorded still the question? If it is, re-state it "
+                f"on the card so it resurfaces fresh. If it has been overtaken by events, clear "
+                f"the needs:you tag and move the card to whatever is now true.",
+                defer_if_busy=True)
+            if ok:
+                _advance_last[session_name] = time.time()
+                _cmd_hist_record(session_name, f"[amux] stale-ask check: {row['id']}", "system", "advance")
+                slog(f"[advance] {session_name}: {row['id']} needs:you for "
+                     f"{int(_asked_age/86400)}d — asked whether the ask still holds")
             return bool(ok)
         gate_next = "review" if row["status"] == "doing" else "done"
         gate = _effective_gate(item, gate_next) or []
@@ -32712,7 +32752,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.409';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.410';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53956,7 +53996,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.409';
+const CACHE = 'amux-v0.9.410';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
