@@ -10768,6 +10768,9 @@ def _caller_scope(headers):
     return (True, {t.lower() for t in (info.get("tags") or [])}, name)
 
 
+_pick_reviewer_last_unverified: dict = {}
+
+
 def _pick_reviewer(exclude_session: str) -> str | None:
     """Least-loaded LIVE agent lane, never the card's own session (throughput
     plan loop 1, Ethan go 2026-08-02): 189 review cards had 2 reviewers
@@ -10829,18 +10832,28 @@ def _pick_reviewer(exclude_session: str) -> str | None:
         # and a review by the context that wrote the change can only
         # confirm. The durable identity is the conversation id: a candidate
         # currently bound to the AUTHOR's transcript is the author.
+        _indep_unverified = False
         try:
             _a_conv = (_load_meta(exclude_session) or {}).get("cc_conversation_id", "")
             if _a_conv:
                 cands = [c for c in cands
                          if (_load_meta(c["name"]) or {}).get("cc_conversation_id", "") != _a_conv]
+            else:
+                # MF-429 measured the fail-open: 49 of 147 sessions carry no
+                # conversation id, and for their cards NO self-match check runs
+                # while looking armed from outside. Their cheap fix, applied:
+                # still assign (keep the loop running) but say so in the
+                # notice, so the reviewer knows independence is UNVERIFIED
+                # and can weigh judgment calls accordingly.
+                _indep_unverified = True
         except Exception:
-            pass
+            _indep_unverified = True
         if not cands:
             return None
         cands.sort(key=lambda s: (
             0 if (author_root and _root(s.get("dir") or "") == author_root) else 1,
             load.get(s["name"], 0), s["name"]))
+        _pick_reviewer_last_unverified[exclude_session] = _indep_unverified
         return cands[0]["name"]
     except Exception:
         return None
@@ -10865,11 +10878,20 @@ def _auto_assign_reviewer(bid: str, item: dict, notify: bool = True) -> str | No
             # spawned one settle-polling thread PER review-enter — 47 threads,
             # 192% CPU, 90-second board reads (2026-08-02 outage). The queue
             # delivers at the reviewer's next turn boundary with zero threads.
+            _iu = ""
+            try:
+                _iu = (" NOTE: the author's conversation id is unrecorded, so "
+                       "context-independence could NOT be verified — treat "
+                       "judgment calls with extra skepticism."
+                       if _pick_reviewer_last_unverified.get(item.get("session") or "")
+                       else "")
+            except Exception:
+                pass
             _steer_enqueue(rev, f"[amux peer-review] You are the reviewer for {bid} — "
                                 f"{(item.get('title') or '')[:100]}. Read it "
                                 f"(#issue={bid}), then either ack review→done honestly "
                                 f"via its gates, or comment on the card what blocks. "
-                                f"Never ack what you cannot verify.")
+                                f"Never ack what you cannot verify.{_iu}")
         return rev
     except Exception as e:
         slog(f"[review-loop] assign failed for {bid}: {e}")
@@ -31948,7 +31970,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.383';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.384';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53117,7 +53139,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.383';
+const CACHE = 'amux-v0.9.384';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
