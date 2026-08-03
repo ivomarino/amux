@@ -12453,14 +12453,25 @@ def _scheduler_loop():
             for row in due:
                 sched = dict(zip(cols, row))
                 # Per-schedule guard + per-schedule commit (MO-3058, from TG-3007).
-                # BEFORE: this body was unguarded and `db.commit()` sat AFTER the loop, so a
-                # single raise anywhere below aborted the entire due-batch. Two symptoms, one
-                # defect: schedules BEHIND the raiser were never attempted (fire late), and
-                # schedules AHEAD of it had ALREADY run via _run_schedule() but never committed
-                # their next_run — leaving them still-due, so they RE-FIRED on every 10s tick
-                # until some later clean batch flushed the pending write. The cron path does not
-                # consult _sched_last_fire (only the event path at ~:12135 does), so nothing
-                # suppressed that repeat. Guarding per schedule contains a poison entry to itself.
+                # BEFORE: this body was unguarded and `db.commit()` sat AFTER the loop, so one
+                # raise anywhere below aborted the whole due-batch while the outer handler logged
+                # a single line and continued. Consequences, each reproduced against this block
+                # extracted verbatim from git rather than paraphrased:
+                #   * Schedules BEHIND the raiser were never attempted -> they fire LATE.
+                #   * Schedules AHEAD of it had already run (their command WAS delivered) but
+                #     their next_run stayed UNCOMMITTED. They do NOT re-fire: get_db() caches one
+                #     connection per thread (:8345), and the next tick reads through that same
+                #     connection, which sees its own pending write. But the row is stale to every
+                #     OTHER reader — the HTTP API reports the schedule as never run — and if the
+                #     process dies before a later batch commits, the write is LOST and it fires
+                #     twice. (An earlier draft of this comment claimed a 10s re-fire loop; that
+                #     was measured on a second connection, which cannot see the pending write.
+                #     Correct instrument, wrong question.)
+                #   * The aborted tick leaves a WRITE TRANSACTION OPEN across ticks. Measured: a
+                #     second writer then gets `OperationalError: database is locked` (readers are
+                #     unaffected under WAL). Since lock contention on the UPDATEs below is itself
+                #     the leading raiser candidate, the defect can manufacture its own next raiser.
+                # Guarding per schedule contains a poison entry to itself and closes the txn.
                 try:
                     _run_schedule(sched, source="cron")
                     _sched_last_fire[sched["id"]] = now  # cron fire counts toward event cooldown
