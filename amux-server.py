@@ -3645,7 +3645,11 @@ def tmux_capture(session: str, lines: int = 500) -> str:
         return _iterm2_capture(iterm2_id)
     try:
         r = subprocess.run(
-            ["tmux", "capture-pane", "-t", tmux_target(session), "-p", "-e", "-S", f"-{lines}"],
+            ["tmux", "capture-pane", "-t", tmux_target(session), "-p", "-e",
+             # lines<=0 → VISIBLE SCREEN ONLY. An in-place-repainting TUI
+             # (Gemini) leaves every stale frame in scrollback; capturing any
+             # of it stacks repaints into garbage (Ethan 12:03).
+             *([] if lines <= 0 else ["-S", f"-{lines}"])],
             capture_output=True, text=True, timeout=5,
         )
         # Strip leading/trailing blank lines so content isn't cut off
@@ -13459,6 +13463,35 @@ def _has_running_subagent(raw_output: str) -> bool:
         if s[:1] == "◯" and (re.search(r"\d+\s*[hms]\b", s) or "tokens" in s.lower()):
             return True
     return False
+
+
+_GEMINI_CHROME_RES = [
+    re.compile(r"^\s*workspace \(/directory\)"),
+    re.compile(r"^\s*/model\s*$"),
+    re.compile(r"no sandbox"),
+    re.compile(r"^\s*Auto\s*$"),
+    re.compile(r"^\s*YOLO Ctrl\+Y"),
+    re.compile(r"^\s*\? for shortcuts"),
+    re.compile(r"^\s*\d+ GEMINI\.md file"),
+]
+
+
+def _clean_gemini_frame(text: str) -> str:
+    """Collapse Gemini-TUI repaint residue (Ethan 12:03, sherpa-execution):
+    the differential renderer under amux's normalized 220-col panes leaves
+    ORPHAN chrome rows on the real screen — six status bars on one frame.
+    Keep only the LAST instance of each chrome line class; body content is
+    untouched. Cosmetic-by-construction: only known chrome patterns are
+    eligible for dropping."""
+    lines = text.splitlines()
+    plain = [_STRIP_ANSI.sub("", l) for l in lines]
+    keep = [True] * len(lines)
+    for cre in _GEMINI_CHROME_RES:
+        idxs = [i for i, pl in enumerate(plain) if cre.search(pl)]
+        for i in idxs[:-1]:
+            keep[i] = False
+    out = [l for i, l in enumerate(lines) if keep[i]]
+    return "\n".join(out)
 
 
 def _detect_gemini_status(raw_output: str) -> str:
@@ -32031,7 +32064,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.386';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.390';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -42645,7 +42678,7 @@ function _bqIs(item, val, ix) {
   const idleDays = sess && sess.last_activity
     ? (Date.now() / 1000 - sess.last_activity) / 86400 : Infinity;
   switch (val) {
-    case 'open':     return !_BQ_CLOSED.has(st);
+    case 'open':     return !_BQ_CLOSED.has(st) && !item.archived;   // archived = cleared (Ethan 12:08): an archived card is open in STATUS (restorable) but never counts as open WORK
     case 'closed':   return _BQ_CLOSED.has(st);
     case 'active':   return st === 'doing' || st === 'review';
     case 'stale':    return !!item.stale;
@@ -42676,10 +42709,6 @@ function _bqIs(item, val, ix) {
     case 'sourcestale': return _bqIs(item, 'open', ix) && !!item.source_ref
                         && (!item.last_verified_at
                             || (Date.now()/1000 - item.last_verified_at) > 86400);
-    // needs:you IGNORES the archived flag deliberately: the age sweep
-    // archives untouched cards after 3d, and a decision owed to the human
-    // must survive that — archived organizes, it must not hide (Ethan
-    // 2026-08-02, both asks same day).
     case 'needsyou': return _bqIs(item, 'open', ix) && (
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
@@ -53200,7 +53229,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.386';
+const CACHE = 'amux-v0.9.390';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -61902,6 +61931,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _peek_live_cache[name] = (now, resp_live)
                     return self._json_etag(resp_live)
                 output = _strip_scroll_pill(tmux_capture(name, lines))
+                # Gemini frame hygiene for EVERY peek path (alt or not).
+                try:
+                    if (get_session_info(name) or {}).get("provider") == "gemini":
+                        output = _clean_gemini_frame(tmux_capture(name, 0))
+                except Exception:
+                    pass
                 tmux_lines = len(output.splitlines()) if output else 0
                 is_alt = _tmux_alt_screen(name)
                 # Alt-screen (Claude Code TUI): transcript for history,
@@ -61911,7 +61946,22 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         last_save = _last_log_save.get(name, 0)
                         if now - last_save >= _LOG_SAVE_INTERVAL:
                             threading.Thread(target=save_alt_capture, args=(name, output), daemon=True).start()
-                    transcript = _render_session_transcript(name, max_chars=120_000)
+                    # Provider parity (Ethan 12:03, sherpa-execution): Gemini's
+                    # TUI repaints IN PLACE, so anything reconstructed from
+                    # saved captures/scrollback is stacked stale frames — the
+                    # garbled peek in the report. There is no JSONL to render
+                    # either. For non-Claude alt-screen providers the LIVE
+                    # frame is the whole truthful state: history stays empty
+                    # (the Messages tab carries the dialog), live carries the
+                    # clean current screen.
+                    _prov = (get_session_info(name) or {}).get("provider", "claude")
+                    if _prov != "claude":
+                        transcript = ""
+                        # Re-capture VISIBLE screen only — the scrollback of a
+                        # repainting TUI is stacked stale frames.
+                        output = _clean_gemini_frame(tmux_capture(name, 0))
+                    else:
+                        transcript = _render_session_transcript(name, max_chars=120_000)
                     live = _strip_launch_noise(output.strip()) if output else ""
                     if transcript and live:
                         # The live frame re-shows the most recent messages the
