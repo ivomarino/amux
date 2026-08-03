@@ -1176,7 +1176,7 @@ for tag in item.get('tags',[]):
 import sys,json
 items=json.load(sys.stdin)
 for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
-    status_sym = {'done':'✓','doing':'▶','todo':'○','backlog':'·','discarded':'✗','review':'◎'}.get(i['status'],'?')
+    status_sym = {'done':'✓','verified':'✅','doing':'▶','todo':'○','backlog':'·','discarded':'✗','review':'◎','archived':'⌁'}.get(i['status'],'?')
     tags = ' '.join(f'[{t}]' for t in i.get('tags',[])) if i.get('tags') else ''
     print(f\"{status_sym} {i['id']:12s} {i['title'][:50]:50s} [{i['status']}] {tags}\")
 "
