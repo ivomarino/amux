@@ -32034,6 +32034,9 @@ function renderPeekIssues() {
   const list = document.getElementById('peek-issues-list');
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
+  // The per-session panel shows the lane's FULL record including archived, so
+  // it is the second consumer that needs the lazy set (AMUX-2271).
+  if (!allScope) _ensureArchived();
   const scoped = _bqHideArchived(
     // Per-session panel shows the FULL record — every column, archived
     // included (Ethan: "all columns visible when I click each session").
@@ -32458,7 +32461,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.404';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.405';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40892,6 +40895,45 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+// Archived cards are fetched LAZILY (AMUX-2271). They are 1577 of 1624 rows and
+// 97% of the payload, and the board hides them everywhere unless something asks
+// for them: `_bqWantsArchived` for the global board, the per-session peek panel
+// for one lane. Loading them up front cost 4.7MB on every client, forever, to
+// render nothing. `boardArchived` is kept SEPARATE from `boardItems` so the
+// ETag/lastBoardJSON comparison keeps working on the non-archived payload
+// alone; `_mergeArchived` re-joins them after each fetch, with the fresh
+// non-archived record winning on id so an un-archived card cannot show twice.
+let boardArchived = [];
+let _archivedAt = 0;
+let _archivedLoading = null;
+function _mergeArchived(data) {
+  if (!boardArchived.length) return data;
+  const have = new Set(data.map(i => i.id));
+  return data.concat(boardArchived.filter(i => !have.has(i.id)));
+}
+async function _ensureArchived() {
+  // One in-flight fetch at a time; refresh at most once a minute, since the
+  // age-archive sweep only moves cards every few hours.
+  if (_archivedLoading) return _archivedLoading;
+  if (boardArchived.length && (Date.now() - _archivedAt) < 60000) return;
+  _archivedLoading = (async () => {
+    try {
+      const r = await fetch(API + '/api/board?archived=1&done_limit=0');
+      const d = await r.json();
+      if (Array.isArray(d)) {
+        boardArchived = d.filter(i => i.archived);
+        _archivedAt = Date.now();
+        boardItems = _mergeArchived(boardItems.filter(i => !i.archived));
+        renderBoard();
+        if (typeof renderPeekIssues === 'function' && document.getElementById('peek-issues-list')) {
+          try { renderPeekIssues(); } catch (e) {}
+        }
+      }
+    } catch (e) { console.error('fetch archived:', e); }
+    finally { _archivedLoading = null; }
+  })();
+  return _archivedLoading;
+}
 let boardStatuses = [{id:'backlog',label:'Backlog'},{id:'todo',label:'To Do'},{id:'doing',label:'In Progress'},{id:'review',label:'In Review'},{id:'done',label:'Done'},{id:'verified',label:'Verified'},{id:'discarded',label:'Discarded'}];
 // Per-session gate overrides: { session: { status: [items] } }. Layer between the
 // global status default and the per-card override.
@@ -42815,7 +42857,9 @@ async function fetchBoard() {
     const boardHeaders = {};
     if (_boardEtag) boardHeaders['If-None-Match'] = _boardEtag;
     const [r, rs, rsg] = await Promise.all([
-      fetch(API + '/api/board', _boardEtag ? { headers: boardHeaders } : undefined),
+      // ?archived=0 (AMUX-2271): 4.7MB -> 129KB. Archived cards load lazily,
+      // only when something actually asks to see them.
+      fetch(API + '/api/board?archived=0', _boardEtag ? { headers: boardHeaders } : undefined),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
@@ -42839,7 +42883,7 @@ async function fetchBoard() {
     const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
       lastBoardJSON = j;
-      boardItems = data;
+      boardItems = _mergeArchived(data);
       _cacheBoardJSON(j);
       renderBoard();
     }
@@ -43181,7 +43225,14 @@ function _bqWantsArchived(q) {
   return /(^|\s)-?is:(\S*,)?archived\b/i.test(String(q || ''));
 }
 function _bqHideArchived(items, q) {
-  return _bqWantsArchived(q) ? items : items.filter(i => !i.archived);
+  if (!_bqWantsArchived(q)) return items.filter(i => !i.archived);
+  // The ONE place that decides archived visibility is also the right place to
+  // make sure the data exists (AMUX-2271). Asking for archived is what loads
+  // it; the fetch re-renders when it lands. Hooking the trigger anywhere else
+  // would be a second mechanism, which is exactly how the owner-filter and the
+  // query ended up disagreeing.
+  _ensureArchived();
+  return items;
 }
 
 // ── Filter bar (AMUX-2151, Linear-oriented) ────────────────────────────────
@@ -46253,7 +46304,18 @@ if (_cachedInit) {
 // console. The cache is an optimisation: a failed write must be silent, drop
 // the stale entry, and never poison the caller.
 function _cacheBoardJSON(j) {
-  try { _cacheBoardJSON(j); }
+  // This called ITSELF (43483bd, 2026-07-28). The commit mechanically replaced
+  // every `localStorage.setItem('amux_board_cache', ...)` with a call to the
+  // new wrapper — including the one INSIDE the wrapper. Every write recursed
+  // to a stack overflow, the catch swallowed the RangeError and deleted the
+  // entry, so the offline board cache silently never existed from that day on.
+  //
+  // Worse, that commit's own verification ("ZERO quota errors") PASSED because
+  // of the bug: nothing was ever written, so nothing could exceed quota. A
+  // check that confirms a symptom's absence cannot tell "fixed" from "the code
+  // no longer runs" (ethos #7). The check that would have caught it is reading
+  // back localStorage.getItem('amux_board_cache') after a fetch.
+  try { localStorage.setItem('amux_board_cache', j); }
   catch (e) { try { localStorage.removeItem('amux_board_cache'); } catch (e2) {} }
 }
 const _cachedBoard = localStorage.getItem('amux_board_cache');
@@ -46552,7 +46614,10 @@ function connectSSE() {
         const j = JSON.stringify(msg.payload);
         if (j !== lastBoardJSON) {
           lastBoardJSON = j;
-          boardItems = msg.payload;
+          // SSE carries the non-archived set only (AMUX-2271); re-join whatever
+          // archived cards were lazily loaded, or an SSE push would wipe them
+          // out from under an is:archived query.
+          boardItems = _mergeArchived(msg.payload);
           _cacheBoardJSON(j);
           // Mirror to IDB for full offline durability (iOS-safe)
           _idb.applyIssueDelta(msg.payload);
@@ -53640,7 +53705,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.404';
+const CACHE = 'amux-v0.9.405';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -54484,9 +54549,26 @@ class CCHandler(BaseHTTPRequestHandler):
                                 bc["time"] = time.time()
                         finally:
                             _sse_cache_lock.release()
-                if bc["json"] != last_board_json:
-                    last_board_json = bc["json"]
-                    self.wfile.write(f"data: {json.dumps({'type': 'board', 'payload': bc['data']})}\n\n".encode())
+                # Push the NON-ARCHIVED board only (AMUX-2271). This is the
+                # dominant board channel: the initial GET happens once, but SSE
+                # re-pushes on EVERY board change, to every connected client.
+                # It was shipping all 1624 cards — 1577 of them archived, which
+                # the client hides everywhere unless something explicitly asks
+                # — so 97% of the bytes rendered nothing. Archived cards load
+                # lazily client-side when the query or the per-session panel
+                # asks for them.
+                #
+                # Derived from bc["data"] and cached against bc["time"], so it
+                # can never disagree with the full payload the plain GET serves
+                # and no write site has to remember to maintain a second copy.
+                if bc.get("open_at") != bc.get("time"):
+                    _bopen = [i for i in (bc["data"] or []) if not i.get("archived")]
+                    bc["open_json"] = json.dumps(_bopen, sort_keys=True)
+                    bc["open_data"] = _bopen
+                    bc["open_at"] = bc.get("time")
+                if bc.get("open_json") != last_board_json:
+                    last_board_json = bc.get("open_json")
+                    self.wfile.write(f"data: {json.dumps({'type': 'board', 'payload': bc.get('open_data') or []})}\n\n".encode())
                     self.wfile.flush()
 
                 # Log events — push new entries from event ring buffer
