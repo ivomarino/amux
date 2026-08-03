@@ -10771,6 +10771,59 @@ def _age_archive_sweep():
         slog(f"[age-archive] failed: {e}")
 
 
+def _context_size_monitor():
+    """Standing per-lane context monitor (Ethan token audit + MA-57's ask,
+    2026-08-03): 98% of fleet tokens are CACHE READS — context re-sent per
+    turn. Five lanes sat at 650-853k/turn. This surfaces the number to the
+    lane ITSELF and lets its model decide (/compact, /reset, or carry on) —
+    the D5 exit shape: amux measures, the model manages its own context.
+    Nudges once per 6h per lane (durable event), threshold retunable via
+    AMUX_CONTEXT_NUDGE_TOKENS (default 500k), evaluated over the last 2h of
+    real turns so a single giant turn does not trip it."""
+    try:
+        db = get_db()
+        now = int(time.time())
+        last = 0
+        try:
+            row = db.execute("SELECT value FROM prefs WHERE key='ctx_monitor_last'").fetchone()
+            last = int(json.loads(row[0])) if row else 0
+        except Exception:
+            last = 0
+        if now - last < 3600:
+            return
+        db.execute("INSERT INTO prefs (key, value) VALUES ('ctx_monitor_last', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now),))
+        db.commit()
+        thresh = int(os.environ.get("AMUX_CONTEXT_NUDGE_TOKENS", "500000") or 500000)
+        rows = db.execute(
+            "SELECT session, SUM(cache_read)/MAX(COUNT(*),1) cpt, COUNT(*) n "
+            "FROM token_ledger WHERE ts >= ? GROUP BY session "
+            "HAVING n >= 8 AND cpt >= ?", (now - 2 * 3600, thresh)).fetchall()
+        for r in rows:
+            name = r["session"]
+            if not is_running(name):
+                continue
+            recent = db.execute(
+                "SELECT 1 FROM session_events WHERE session=? AND type='context.nudged' "
+                "AND ts > ? LIMIT 1", (name, now - 6 * 3600)).fetchone()
+            if recent:
+                continue
+            _emit_event(name, "context.nudged",
+                        {"cache_read_per_turn": int(r["cpt"]), "turns_2h": r["n"]},
+                        source="context-monitor")
+            _steer_enqueue(name,
+                f"[amux context monitor] Your average context is "
+                f"{int(r['cpt']/1000)}k tokens PER TURN over the last {r['n']} turns "
+                f"— every turn re-sends it as cache reads (98% of fleet cost). "
+                f"YOUR call, not amux's: /compact if the tail matters, a reset "
+                f"if it doesn't, or carry on if the context is genuinely earning "
+                f"its size. Threshold {int(thresh/1000)}k; this nudge repeats at "
+                f"most every 6h while you stay above it.")
+            slog(f"[ctx-monitor] {name}: {int(r['cpt']/1000)}k/turn over {r['n']} turns — nudged")
+    except Exception as e:
+        slog(f"[ctx-monitor] failed: {e}")
+
+
 def _verification_sweep():
     """Loop 2 (throughput plan, Ethan go 2026-08-02): done != verified, and
     NOTHING ever asked the owner to close the gap — 821 done cards, all
@@ -32211,7 +32264,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.394';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.395';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53376,7 +53429,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.394';
+const CACHE = 'amux-v0.9.395';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63693,6 +63746,7 @@ def _db_maintenance():
     # inside — cheap no-op on every other maintenance pass).
     _verification_sweep()
     _age_archive_sweep()
+    _context_size_monitor()
     # Single-char-tag canary (studio-plg, SP-539): a string tags value once
     # char-exploded silently, and the retro sweep's ">=5 singles" threshold was
     # blind to short tags ("wip" -> 3 singles). The STRUCTURAL predicate — a
