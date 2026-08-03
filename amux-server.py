@@ -22704,6 +22704,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   /* Board */
+  mark.search-hl { background: rgba(255,208,0,0.45); color: inherit; border-radius: 3px; padding: 0 1px; }
   .focus-overlay { position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.55);
     display: flex; align-items: center; justify-content: center; padding: 16px;
     padding-bottom: calc(16px + env(safe-area-inset-bottom)); backdrop-filter: blur(3px); }
@@ -32264,7 +32265,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.395';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.396';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -35990,6 +35991,23 @@ function _msgOrigin(e) { return _msgKind(e); }
 // Messages view and the peek Messages tab (AMUX-2153). Only ids that
 // resolve on the live board linkify: the pattern alone would catch
 // UTF-8-shaped tokens, and a link to nothing is worse than plain text.
+function _hlSearch(html, query) {
+  // Search-term highlighting (Ethan 16:20): wrap query terms in <mark> on
+  // ALREADY-BUILT html, skipping inside-tag text ((?![^<]*>) guard). Field
+  // terms (status:x, -neg) and <2-char terms never highlight.
+  if (!html || !query) return html;
+  try {
+    const terms = String(query).split(/\s+/).filter(t =>
+      t.length >= 2 && !t.includes(':') && !t.startsWith('-') && !/^["']/.test(t));
+    let out = html;
+    for (const t of terms.slice(0, 6)) {
+      const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')(?![^<]*>)', 'gi');
+      out = out.replace(re, '<mark class="search-hl">$1</mark>');
+    }
+    return out;
+  } catch (e) { return html; }
+}
+
 function _linkifyCardIds(safeHtml) {
   try {
     if (typeof boardItems === 'undefined' || !Array.isArray(boardItems) || !boardItems.length) return safeHtml;
@@ -43480,7 +43498,7 @@ function _issueRowHTML(item, opts) {
   return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
     dot +
     '<span class="peek-issue-key">' + esc(item.id) + '</span>' +
-    '<span class="peek-issue-title">' + owner + esc(item.title) + '</span>' +
+    '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</span>' +
     '<span class="peek-issue-meta">' + badge + due + '</span>' +
     '</div>';
 }
@@ -43501,7 +43519,7 @@ function _renderBoardCard(item) {
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
   h += '<div class="board-card-title">';
   if (boardViewMode === 'session') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
-  h += esc(item.title) + '</div>';
+  h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
   if (firstLine) h += '<div class="board-card-desc">' + esc(firstLine) + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
   if (boardViewMode !== 'session' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
@@ -50215,7 +50233,7 @@ function _messagesRender() {
           (sess ? '<span class="msg-sess">' + esc(sess) + '</span>' : '<span class="msg-sess" style="color:var(--dim);">(unknown)</span>') +
           '<span class="msg-ts">' + _msgsFmtTs(m.ts) + '</span>' + tag + cardChip +
         '</div>' +
-        '<div class="msg-text">' + _linkifyCardIds(esc(m.text || '')) + '</div>' +
+        '<div class="msg-text">' + _hlSearch(_linkifyCardIds(esc(m.text || '')), (document.getElementById('msgs-search') || {}).value || '') + '</div>' +
       '</div>' +
       '<button class="btn msg-copy" onclick="event.stopPropagation();_msgCopyBtn(this,\'' + enc + '\')" title="Copy message text">&#x1F4CB;</button>' +
       '<button class="btn msg-speak" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(\'' + enc + '\'),this)" title="Read aloud">&#x1F50A;</button>' +
@@ -53429,7 +53447,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.395';
+const CACHE = 'amux-v0.9.396';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
