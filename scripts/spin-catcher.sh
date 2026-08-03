@@ -55,14 +55,21 @@
 set -uo pipefail
 AMUX="${AMUX_URL:-https://localhost:8822}"
 POLL="${1:-3}"
-CPU_TRIP="${2:-70}"
+CPU_TRIP="${2:-0}"        # 0 = OFF. See below: this server idles at ~102%.
 SUSTAIN="${3:-5}"          # polls of sustained CPU before believing the gauge
 OUT="${HOME}/.amux/spin-dumps"
 mkdir -p "$OUT"
 
 echo "spin-catcher: polling ${AMUX}/health every ${POLL}s"
-echo "  trigger: store != ok  OR  degraded  OR  cpu >= ${CPU_TRIP} for ${SUSTAIN} consecutive polls"
-echo "  (CPU alone never trips: the gauge is process-wide and bursty — 625 single-sample trips found nothing)"
+# The banner must describe the ACTUAL trigger. It previously advertised "store != ok"
+# and a CPU threshold after both had been narrowed — a watcher that misreports its own
+# trigger is the same class of defect as one that cannot fire.
+echo "  trigger: /health unanswered  OR  store in (hung|error|unavailable)  OR  degraded"
+if [ "$CPU_TRIP" = "0" ]; then
+  echo "  cpu trigger: OFF (this server's normal state is ~102%; it cannot discriminate)"
+else
+  echo "  cpu trigger: >= ${CPU_TRIP}% for ${SUSTAIN} consecutive polls (explicitly enabled)"
+fi
 echo "  evidence -> ${OUT}/evidence-*.txt (ps -M per-thread CPU + WHOLE faulthandler dumps)"
 
 caught=0
@@ -95,7 +102,10 @@ print(d.get("pid",0), d.get("cpu_percent",0), d.get("store","?"),
   # store/degraded are the TRUSTWORTHY triggers: they are the symptom users
   # actually report (board and email hanging) and across 625 captured events they
   # never once fired. That is a real result — the wedge is not a store stall.
-  case "$STORE" in ok) ;; *) TRIP=1; WHY="store=$STORE" ;; esac
+  # Only `hung` — NOT `slow`. Baseline sampling caught store=slow/store_ms=260 during
+  # ordinary operation, so tripping on any non-ok simply re-imports the false-positive
+  # problem through a different field. The live wedge read store=hung, store_ms=800.
+  case "$STORE" in hung|error|unavailable) TRIP=1; WHY="store=$STORE" ;; esac
   [ "$DEG" = "1" ] && { TRIP=1; WHY="${WHY} degraded"; }
 
   # CPU is the UNTRUSTWORTHY one and must not trip alone. /health's cpu_percent is
@@ -105,7 +115,14 @@ print(d.get("pid",0), d.get("cpu_percent",0), d.get("store","?"),
   # and it costs a SIGUSR1 to the live server plus a 10KB log write every time.
   # SUSTAINED is the discriminator a single sample cannot express: require the
   # high reading to persist across consecutive polls before believing it.
-  if awk "BEGIN{exit !($CPU >= $CPU_TRIP)}"; then
+  # CPU trigger is OFF unless a threshold is passed explicitly. Measured baseline on
+  # this machine: a steady 102.5% with store=ok and store_ms=0-44. A threshold below
+  # that describes NORMAL OPERATION, so it cannot discriminate a fault — sustain only
+  # cut 625 trips to 53. Each trip costs the live server two SIGUSR1 stack dumps and
+  # ~20KB written into server.log, i.e. the instrument was adding load to the exact
+  # log-lock contention it had just diagnosed (AC-174). A detector that perturbs the
+  # system it measures, while never having produced a true positive, should be off.
+  if [ "$CPU_TRIP" != "0" ] && awk "BEGIN{exit !($CPU >= $CPU_TRIP)}"; then
     HOT=$((HOT+1))
     [ "$HOT" -ge "${SUSTAIN:-5}" ] && { TRIP=1; WHY="${WHY} cpu>=${CPU_TRIP} for ${HOT} polls"; }
   else
