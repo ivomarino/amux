@@ -10607,11 +10607,39 @@ def _board_project(items, slim: bool, f_sess: list, f_stat: list, f_arch: str):
         if slim:
             r = {k: v for k, v in it.items() if k not in _BOARD_SLIM_DROP}
             r["desc_len"] = len(it.get("desc") or "")
-            r["log_n"] = len(it.get("log") or [])
+            # `log` is a newline-delimited STRING (not a list) — len() on it
+            # returns a CHARACTER count, which would read as a plausible entry
+            # count and be wrong by ~50x. Count lines.
+            _lg = it.get("log")
+            r["log_n"] = (len([x for x in _lg.splitlines() if x.strip()])
+                          if isinstance(_lg, str) else len(_lg or []))
             out.append(r)
         else:
             out.append(it)
     return out
+
+
+def _validate_depends_on(dep, self_id: str):
+    """Normalise + validate a depends_on payload. Returns (list, error|None).
+
+    Shared by POST and PATCH deliberately. PATCH validated it; POST accepted it
+    and threw it away, so a card filed with its dependency in ONE call came
+    back unblocked and was told nothing — the same defect `reviewer` had, with
+    the same consequence: the autonomy loop treats a card with no depends_on as
+    pickable, so the dependency edge the caller asked for simply did not exist.
+    Accepting a field and dropping it is worse than rejecting it."""
+    if not isinstance(dep, list):
+        return None, "depends_on must be a list of card ids"
+    dep = [str(x).strip() for x in dep if str(x).strip()]
+    if self_id and self_id in dep:
+        return None, "a card cannot depend on itself"
+    db = get_db()
+    missing = [x for x in dep
+               if not db.execute("SELECT 1 FROM issues WHERE id=? AND deleted IS NULL",
+                                 (x,)).fetchone()]
+    if missing:
+        return None, f"unknown card id(s) in depends_on: {missing}"
+    return dep, None
 
 
 def _deps_blocking(item) -> list:
@@ -32430,7 +32458,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.401';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.404';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53612,7 +53640,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.401';
+const CACHE = 'amux-v0.9.404';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -57626,6 +57654,11 @@ class CCHandler(BaseHTTPRequestHandler):
                 item_id = _next_issue_id(prefix)
                 now = int(time.time())
                 status = _status_canon(body.get("status", "todo"))
+                # Validated with the SAME helper PATCH uses, so a bad edge is a
+                # 400 at create instead of a silently unblocked card.
+                _new_deps, _dep_err = _validate_depends_on(body.get("depends_on") or [], item_id)
+                if _dep_err:
+                    return self._json({"error": _dep_err}, 400)
                 due = body.get("due", "").strip() or None
                 due_time = body.get("due_time", "").strip() or None
                 # Creator attribution, AMUX-1812 recipe: the body value is a
@@ -57657,7 +57690,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 ).fetchone()
                 new_pos = (min_pos_row["m"] if min_pos_row else 0) - 1024.0
                 db.execute(
-                    # `reviewer` belongs in this INSERT. It was accepted by the
+                    # `reviewer` and `depends_on` belong in this INSERT. Both were accepted by the
                     # API and silently DISCARDED — the card read back
                     # reviewer=None and only a follow-up PATCH would set it. That
                     # mattered the moment AC-165 made a reviewer required for any
@@ -57669,12 +57702,13 @@ class CCHandler(BaseHTTPRequestHandler):
                     # reviewer at POST, the gate correctly did not fire, and the
                     # fix briefly looked broken. Accepting a field and dropping it
                     # is worse than rejecting it.
-                    """INSERT INTO issues (id, title, desc, status, session, shepherd, type, creator, due, due_time, created, updated, owner_type, pos, gate, reviewer)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO issues (id, title, desc, status, session, shepherd, type, creator, due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (item_id, title, desc, status, session or None, (body.get("shepherd") or None),
                      (body.get("type") or _DEFAULT_ITEM_TYPE), creator, due, due_time, now, now,
                      owner_type, new_pos, gate_json,
-                     ((body.get("reviewer") or "").strip() or None)),
+                     ((body.get("reviewer") or "").strip() or None),
+                     (json.dumps(_new_deps) if _new_deps else None)),
                 )
                 for tag in tags:
                     db.execute(
@@ -58182,6 +58216,46 @@ class CCHandler(BaseHTTPRequestHandler):
                         # was the one action leaving no trace, while claiming otherwise.
                         # An unauditable bypass that says it is audited is worse than an
                         # honest one, because it is trusted.
+                        if body.get("force") and not (
+                                (self.headers.get("X-Amux-Session", "") or "").strip()
+                                or (self.headers.get("X-Amux-User-Email", "") or "").strip()):
+                            # ATTRIBUTION IS REQUIRED FOR FORCE (ts-gke incident,
+                            # 2026-08-03). TG-3104 — a live watch card, re-armed an
+                            # hour earlier — was force-discarded by a caller with no
+                            # X-Amux-Session: `todo -> discarded (by unattributed/
+                            # session) [FORCED — gate bypassed]`. Force is the single
+                            # escape hatch from the entire gate system, and the whole
+                            # reason it is tolerable is that judgment stays with a
+                            # NAMED party. An anonymous force is an audit row that
+                            # records only that something happened, which is the
+                            # AMUX-1812 blind spot applied to the riskiest mutation
+                            # the board allows. Attribution is cheap to supply and
+                            # the error says exactly how.
+                            #
+                            # This fires on `force` ITSELF, NOT on `eff_gate and
+                            # force`. The first version of this check was gated on a
+                            # non-empty effective gate — and would therefore have
+                            # let the reported specimen straight through, because
+                            # TG-3104 is a `watch` card whose todo->discarded
+                            # transition has no gate to bypass, so eff_gate was
+                            # empty while `force` still stamped the History line and
+                            # skipped the dirt/WIP/reviewer checks. A check that
+                            # cannot fail on the specimen that motivated it is
+                            # theatre (ethos #7). Force means "bypass whatever is in
+                            # the way"; the requirement to be named goes with the
+                            # verb, not with what it happened to bypass.
+                            return self._json({
+                                "error": "force requires attribution",
+                                "why": ("force bypasses the checks; the judgment then rests with "
+                                        "whoever forced it, so the ledger must name them. An "
+                                        "unattributed force is an audit row that records only "
+                                        "that something happened."),
+                                "how": ("send X-Amux-Session: <your session> (the `amux board` CLI "
+                                        "does this for you), or X-Amux-User-Email for a human "
+                                        "caller. Or satisfy the gate honestly — if it does not fit "
+                                        "the work, the TYPE is wrong; fix the type, not the truth."),
+                                "gate": eff_gate,
+                            }, 400)
                         if eff_gate and body.get("force"):
                             _ilog("board", "gate_force",
                                   actor=_sched_mutation_by(self.headers, self.client_address, body),
@@ -58289,16 +58363,9 @@ class CCHandler(BaseHTTPRequestHandler):
                             body["type"] = _t
                     set_clauses, params = [], []
                     if "depends_on" in body:
-                        _dep = body.get("depends_on")
-                        if not isinstance(_dep, list):
-                            return self._json({"error": "depends_on must be a list of card ids"}, 400)
-                        _dep = [str(x).strip() for x in _dep if str(x).strip()]
-                        if bid in _dep:
-                            return self._json({"error": "a card cannot depend on itself"}, 400)
-                        _missing_dep = [x for x in _dep
-                                        if not db.execute("SELECT 1 FROM issues WHERE id=? AND deleted IS NULL", (x,)).fetchone()]
-                        if _missing_dep:
-                            return self._json({"error": f"unknown card id(s) in depends_on: {_missing_dep}"}, 400)
+                        _dep, _dep_err = _validate_depends_on(body.get("depends_on"), bid)
+                        if _dep_err:
+                            return self._json({"error": _dep_err}, 400)
                         set_clauses.append("depends_on = ?")
                         params.append(json.dumps(_dep) if _dep else None)
                     if "reviewer" in body:
