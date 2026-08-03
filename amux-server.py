@@ -3565,7 +3565,7 @@ def is_running(session: str) -> bool:
     try:
         r = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=5,
         )
         tmux_sess = tmux_name(session)
         if tmux_sess not in r.stdout.splitlines():
@@ -12485,7 +12485,15 @@ def _scheduler_loop():
         for job in _JOB_REGISTRY:
             if now >= job["next_run"]:
                 job["next_run"] = now + job["interval"]
-                threading.Thread(target=job["func"], daemon=True, name=job["name"]).start()
+                if job.get("_running"):
+                    continue
+                job["_running"] = True
+                def _guarded_run(_j=job):
+                    try:
+                        _j["func"]()
+                    finally:
+                        _j["_running"] = False
+                threading.Thread(target=_guarded_run, daemon=True, name=job["name"]).start()
 
         # ── 1b. Event-triggered schedules (closed-loop wake-ups) ──────────────
         # Runs every tick (not gated by the 10s DB-check) so events fire promptly.
