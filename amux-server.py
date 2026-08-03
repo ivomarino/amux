@@ -8878,17 +8878,23 @@ cmd="$1"; shift 2>/dev/null || true
 
 case "$cmd" in
   send)
-    # amux send <target-session> <message...>
+    # amux send <target-session> [--no-board] <message...>
     # Injects X-Amux-Session=$AMUX_SESSION so the server stamps the TRUE origin
     # (AMUX-1768): a relayed message can never be misattributed to another
     # session, even under a conversation-name collision. Prefer this over a raw
     # curl to /api/sessions/*/send — the raw form carries no verified origin.
+    # --no-board: skip board-card creation for one-off questions/status checks.
     target="$1"; shift 2>/dev/null || true
-    msg="$*"
+    _nb="false"
+    _parts=""
+    for _a in "$@"; do
+      if [ "$_a" = "--no-board" ]; then _nb="true"; else _parts="$_parts $_a"; fi
+    done
+    msg="${_parts# }"
     if [ -z "$target" ] || [ -z "$msg" ]; then
-      echo "usage: amux send <session> <message>" >&2; exit 1
+      echo "usage: amux send <session> [--no-board] <message>" >&2; exit 1
     fi
-    body=$(MSG="$msg" python3 -c "import json,os; print(json.dumps({'text': os.environ['MSG']}))")
+    body=$(MSG="$msg" NB="$_nb" python3 -c "import json,os; d={'text': os.environ['MSG']}; d['no_board']=os.environ['NB']=='true' or None; print(json.dumps({k:v for k,v in d.items() if v is not None}))")
     curl -sk -X POST -H 'Content-Type: application/json' \
       -H "X-Amux-Session: ${AMUX_SESSION:-}" \
       -d "$body" "$AMUX_URL/api/sessions/$target/send" | TGT="$target" python3 -c "
@@ -9025,6 +9031,7 @@ for s in json.load(sys.stdin): print(s['name'], '(running)' if s.get('running') 
     echo "amux board <done|doing|todo> <ITEM_ID>  — update board item status"
     echo "amux board add <title>                  — create a new board item"
     echo "amux board list                         — list board items"
+    echo "amux send <session> [--no-board] <msg>  — send without creating a board card"
     echo "amux crm add <name> [field=val ...]    — add a contact (fields: company email role phone linkedin)"
     echo "amux crm update <PPL-id> [field=val ..]  — update contact fields"
     echo "amux crm get <PPL-id>                   — show contact details"
@@ -9793,6 +9800,11 @@ def _autotask_enabled() -> bool:
 
 
 _AUTOTASK_MIN_CHARS = 12
+# Inline tag: a model (or human) can prefix a message with [no-board] to
+# explicitly skip board-card creation for one-off questions, status checks,
+# or other prompts that aren't tasks. Stripped before delivery so the
+# recipient never sees it. The API equivalent is {"no_board": true}.
+_NO_BOARD_RE = re.compile(r"^\s*\[no[_-]?board\]\s*", re.IGNORECASE)
 _AUTOTASK_SKIP = {
     # Control words that steer the CURRENT task rather than starting a new one.
     # A card for "continue" is noise that buries the cards that mean something.
@@ -9863,6 +9875,8 @@ def _autotask_from_command(session_name: str, text: str):
     if not _autotask_enabled():
         return
     try:
+        if _NO_BOARD_RE.search(text or ""):
+            return
         stripped = re.sub(r"^\[.*?\]\s*", "", text or "").strip().lower().rstrip(".!?")
         if len(stripped) < _AUTOTASK_MIN_CHARS or stripped in _AUTOTASK_SKIP:
             return
@@ -15229,6 +15243,82 @@ if CC_SESSIONS.is_dir():
             })
 
 
+def _compose_provider_harness_instructions(session_name: str) -> str:
+    """Compose harness instructions for non-Claude providers (Gemini, ChatGPT).
+
+    Claude sessions get these from the CLAUDE.md hierarchy (global + project).
+    Non-Claude providers have no equivalent automatic injection, so we compose
+    the essential harness knowledge here: how to use the board, send messages,
+    manage tasks, and work within the amux multi-session environment."""
+    return f"""# amux Harness Instructions
+
+You are running inside **amux**, a multi-session AI orchestrator. Your session
+name is available in `$AMUX_SESSION` and the API base is `$AMUX_URL`.
+Use `curl -sk` for all amux API calls (self-signed TLS cert).
+
+## Board (task tracking)
+
+The amux board is how all sessions track their work. Every non-trivial task
+should be reflected as a board card tagged to your session.
+
+```bash
+# List all board items
+curl -sk $AMUX_URL/api/board | python3 -c "import json,sys; [print(i['id'],i['status'],i['title'][:60]) for i in json.load(sys.stdin)]"
+
+# Create a task
+curl -sk -X POST -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
+  -d '{{"title":"Task title","status":"todo","session":"'$AMUX_SESSION'"}}' \\
+  $AMUX_URL/api/board
+
+# Update status (todo/doing/done/verified/discarded)
+curl -sk -X PATCH -H 'Content-Type: application/json' \\
+  -d '{{"status":"doing"}}' $AMUX_URL/api/board/ITEM-ID
+
+# Mark done with outcome
+curl -sk -X PATCH -H 'Content-Type: application/json' \\
+  -d '{{"status":"done","desc":"Result: what changed"}}' $AMUX_URL/api/board/ITEM-ID
+```
+
+### Board workflow
+1. Before starting work, check the board for existing/conflicting tasks
+2. Create a card in `todo` or `doing` for your task
+3. Keep exactly ONE card in `doing` at a time
+4. When finished, move to `done` with a description of the outcome
+5. Gates may block status transitions -- satisfy them or pass `"force":true`
+
+### Item types
+Cards have a `type` field that determines their gate requirements:
+- `code` (default): requires merge + tests for done/verified
+- `escalation`, `blocker`, `investigation`, `ops`, `research`, `chore`, `doc`:
+  lighter gates (outcome recorded)
+
+### No-board for one-off tasks
+Prefix your message with `[no-board]` to skip automatic card creation for
+quick questions or status checks that don't need tracking.
+
+## Inter-session communication
+
+```bash
+# Discover other sessions
+curl -sk $AMUX_URL/api/sessions | python3 -c "import json,sys; [print(s['name'],s.get('status','')) for s in json.load(sys.stdin)]"
+
+# Send a message to another session
+curl -sk -X POST -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
+  -d '{{"text":"your message"}}' \\
+  $AMUX_URL/api/sessions/OTHER/send
+
+# Peek at another session's output
+curl -sk "$AMUX_URL/api/sessions/OTHER/peek?lines=200" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('history') or d.get('output',''))"
+```
+
+## Commit after every completed task
+When you finish a piece of work, immediately `git add` + `git commit` with a
+concise message. Don't batch multiple tasks into one commit.
+"""
+
+
 def _compose_memory(global_content: str, session_content: str) -> str:
     """Compose the MEMORY.md index: a POINTER to shared context, then session memory.
 
@@ -15351,12 +15441,37 @@ def _write_claude_memory(name: str, work_dir: str):
         pass
 
 
+def _write_provider_memory(name: str):
+    """Write composed memory for non-Claude providers (Gemini, etc.).
+
+    Called alongside _write_claude_memory so Gemini sessions get updated
+    harness instructions + global + session memory on every send, not just
+    at start time."""
+    provider = _session_provider(name)
+    if provider == "gemini":
+        _gmem_dir = CC_MEMORY / "gemini" / name
+        try:
+            _gmem_dir.mkdir(parents=True, exist_ok=True)
+            parts = [_compose_provider_harness_instructions(name)]
+            _gmem_global = _GLOBAL_MEM_FILE.read_text(errors="replace").strip() if _GLOBAL_MEM_FILE.exists() else ""
+            if _gmem_global:
+                parts.append(_gmem_global)
+            _mem_src = CC_MEMORY / f"{name}.md"
+            if _mem_src.exists():
+                _s = _mem_src.read_text(errors="replace").strip()
+                if _s:
+                    parts.append("# Session Memory\n\n" + _s)
+            (_gmem_dir / "GEMINI.md").write_text("\n\n---\n\n".join(parts) + "\n")
+        except Exception:
+            pass
+
+
 def _ensure_memory(name: str, work_dir: str):
-    """Ensure per-session memory file exists and write composed memory for Claude.
+    """Ensure per-session memory file exists and write composed memory.
 
     Memory is keyed by session name (not project dir). Global memory from
     _global.md is composed above a marker so each session sees both.
-    """
+    Writes to both Claude and non-Claude provider memory paths."""
     mem_file = CC_MEMORY / f"{name}.md"
 
     _capture_claude_memory_changes(name, work_dir)
@@ -15367,6 +15482,7 @@ def _ensure_memory(name: str, work_dir: str):
         _GLOBAL_MEM_FILE.write_text("")
 
     _write_claude_memory(name, work_dir)
+    _write_provider_memory(name)
 
 
 # Permissive model-name validator. The negative lookahead (?!-) explicitly
@@ -16456,17 +16572,23 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 _gemini_opts += " --yolo"
             if "--skip-trust" not in _gemini_opts:
                 _gemini_opts += " --skip-trust"
-            # Memory parity (Ethan 16:58): Claude lanes get amux-composed
-            # memory via the CLAUDE.md hierarchy; Gemini reads GEMINI.md.
-            # Bridge WITHOUT touching any repo's own GEMINI.md: mirror the
-            # composed memory into a session-scoped dir and hand it to
-            # --include-directories, which Gemini walks for GEMINI.md files.
+            # Memory parity: Claude lanes get amux-composed memory via the
+            # CLAUDE.md hierarchy; Gemini reads GEMINI.md. Compose harness
+            # instructions + global memory + session memory so Gemini sessions
+            # know how to use the board, send messages, and work within amux.
             _gmem_dir = CC_MEMORY / "gemini" / name
             try:
                 _gmem_dir.mkdir(parents=True, exist_ok=True)
+                _gmem_parts = [_compose_provider_harness_instructions(name)]
+                _gmem_global = _GLOBAL_MEM_FILE.read_text(errors="replace").strip() if _GLOBAL_MEM_FILE.exists() else ""
+                if _gmem_global:
+                    _gmem_parts.append(_gmem_global)
                 _mem_src = CC_MEMORY / f"{name}.md"
                 if _mem_src.exists():
-                    (_gmem_dir / "GEMINI.md").write_text(_mem_src.read_text())
+                    _gmem_session = _mem_src.read_text(errors="replace").strip()
+                    if _gmem_session:
+                        _gmem_parts.append("# Session Memory\n\n" + _gmem_session)
+                (_gmem_dir / "GEMINI.md").write_text("\n\n---\n\n".join(_gmem_parts) + "\n")
             except Exception as _ge:
                 print(f"[start] {name}: gemini memory bridge failed: {_ge}")
             include_dirs = [str(CC_LOGS), str(_gmem_dir)]
@@ -26061,6 +26183,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
+    <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder session tabs" style="flex:0 0 auto;">&#x229E;</button>
     <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
@@ -30974,6 +31097,7 @@ function setPeekTab(tab) {
   document.getElementById('peek-tab-messages').classList.toggle('active', tab === 'messages');
   document.getElementById('peek-tab-cost').classList.toggle('active', tab === 'cost');
   document.getElementById('peek-tab-issues').classList.toggle('active', tab === 'issues');
+  document.getElementById('peek-tab-memory').classList.toggle('active', tab === 'memory');
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
   document.getElementById('peek-tab-schedules').classList.toggle('active', tab === 'schedules');
@@ -30981,6 +31105,9 @@ function setPeekTab(tab) {
   const dictPanel = document.getElementById('peek-dictation-panel');
   if (tab === 'dictation') { dictPanel.classList.add('active'); _dictLoad(); }
   else { dictPanel.classList.remove('active'); if (_dictRecording) _dictStopRec(); }
+  const memPanel = document.getElementById('peek-memory-panel');
+  if (tab === 'memory') { memPanel.classList.add('active'); loadPeekMemory(); }
+  else { memPanel.classList.remove('active'); }
   document.getElementById('peek-terminal-panel').style.display = tab === 'terminal' ? '' : 'none';
   document.getElementById('peek-split-wrap').style.display = tab === 'terminal' ? '' : 'none';
   const transcript = document.getElementById('peek-transcript-panel');
@@ -62386,14 +62513,10 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if body.get("record_history"):
                     _cmd_hist_record(name, text, "user",
                                      self.headers.get("X-Amux-User-Email", ""))
-                    # Same capture as /send (AMUX-2132): a QUEUED human prompt is
-                    # still an instruction — steering is a delivery mechanism, not
-                    # a different kind of message. This branch recorded history but
-                    # skipped autotask, so every prompt sent while its session was
-                    # BUSY left zero board trace (both 15:46 MHC dictations; the
-                    # busier the lane, the likelier its instructions vanished).
-                    _autotask_from_command(name, text)
-                    _summarize_task_bg(name, text)
+                    _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(text))
+                    if not _skip_board:
+                        _autotask_from_command(name, text)
+                        _summarize_task_bg(name, text)
                 return self._json({"ok": True, "id": msg_id, "message": "queued for next turn boundary"})
             return self._json({"error": "method not allowed"}, 405)
 
@@ -62465,15 +62588,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     # is load-bearing, because agents comply with prohibitions without
                     # re-deriving them — and the board outlives the conversation that
                     # would have corrected it (social-media, 2026-07-27).
-                    if not _defer_busy:
-                        # Every command lands on the board (toggle: board_autotask).
-                        # The throttled model-labeller below only updates the
-                        # session's task_summary label when autotask is on —
-                        # letting it also create cards double-filed every
-                        # prompt as raw-title + invented-title twins
-                        # (AMUX-2114).
+                    _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(_orig_text))
+                    if _skip_board and _NO_BOARD_RE.search(_orig_text):
+                        _orig_text = _NO_BOARD_RE.sub("", _orig_text).strip()
+                    if not _defer_busy and not _skip_board:
                         _autotask_from_command(name, _orig_text)
-                        _summarize_task_bg(name, _orig_text)  # the human's prompt
+                        _summarize_task_bg(name, _orig_text)
                     if not str(msg).startswith("queued"):   # steering enqueue emits message.queued itself
                         _emit_event(name, "message.sent",
                                     {"chars": len(text), "preview": text[:120],
