@@ -3300,7 +3300,7 @@ def _hydrate_session_reports() -> None:
             return
         now = time.time()
         for k, v in (json.loads(row["value"]) or {}).items():
-            if isinstance(v, dict) and (now - float(v.get("ts", 0))) < _HOOKS_LIVE_S:
+            if isinstance(v, dict) and _hooks_live(v, now):
                 _session_reported[k] = v
         slog(f"[report] hydrated {len(_session_reported)} self-report(s) across restart")
     except Exception as e:
@@ -5515,6 +5515,20 @@ _scan_demoted_last: dict = {}   # session -> last FULL scan while self-reporting
 # lower _SCAN_DEMOTE_S if a class of state change turns out to need faster eyes.
 _HOOKS_LIVE_S = int(os.environ.get("AMUX_HOOKS_LIVE_S", "1800"))
 _SCAN_DEMOTE_S = int(os.environ.get("AMUX_SCAN_DEMOTE_S", "60"))
+# An `idle` report is self-renewing: the only way a lane leaves idle is a
+# prompt, and every prompt fires UserPromptSubmit -> report. So an idle report
+# does not decay the way an `active` one does, and the lanes it covers (parked
+# ones) are exactly where per-tick pane capture buys least. `active`/`waiting`
+# reports keep the shorter window — those states DO go stale on their own.
+_HOOKS_LIVE_IDLE_S = int(os.environ.get("AMUX_HOOKS_LIVE_IDLE_S", "86400"))
+
+
+def _hooks_live(rep, now: float) -> bool:
+    """Does this lane's self-report still license demoting its pane scan?"""
+    if not rep:
+        return False
+    age = now - rep.get("ts", 0)
+    return age < (_HOOKS_LIVE_IDLE_S if rep.get("state") == "idle" else _HOOKS_LIVE_S)
 # Scan-demotion counters, exposed at GET /api/debug/scan. A skip that leaves no
 # trace is the ethos-#4 failure: when the demotion eventually hides a state
 # change, whoever looks must be able to SEE that scans were being skipped and
@@ -5670,7 +5684,7 @@ def _rate_limit_auto_respond():
             # their only voice, and losing hooks silently restores it.
             _rep_s = _session_reported.get(name)
             _sst = _scan_stats["by_session"].setdefault(name, {"full": 0, "demoted": 0})
-            if (_rep_s and (now - _rep_s.get("ts", 0)) < _HOOKS_LIVE_S
+            if (_hooks_live(_rep_s, now)
                     and (now - _scan_demoted_last.get(name, 0)) < _SCAN_DEMOTE_S):
                 _scan_stats["demoted"] += 1; _sst["demoted"] += 1
                 continue
@@ -32380,7 +32394,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.399';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.400';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53562,7 +53576,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.399';
+const CACHE = 'amux-v0.9.400';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58950,7 +58964,8 @@ class CCHandler(BaseHTTPRequestHandler):
                 _rp = _session_reported.get(_n)
                 _rows.append({"session": _n, "full": _v["full"], "demoted": _v["demoted"],
                               "demoted_pct": round(100.0 * _v["demoted"] / _tot, 1) if _tot else 0.0,
-                              "hooks_live": bool(_rp and (time.time() - _rp.get("ts", 0)) < _HOOKS_LIVE_S),
+                              "hooks_live": _hooks_live(_rp, time.time()),
+                              "state": (_rp or {}).get("state"),
                               "report_age_s": int(time.time() - _rp["ts"]) if _rp else None})
             _t = _scan_stats["full"] + _scan_stats["demoted"]
             return self._json({
@@ -58958,7 +58973,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 "full": _scan_stats["full"], "demoted": _scan_stats["demoted"],
                 "demoted_pct": round(100.0 * _scan_stats["demoted"] / _t, 1) if _t else 0.0,
                 "full_per_min": round(60.0 * _scan_stats["full"] / _up, 1),
-                "hooks_live_s": _HOOKS_LIVE_S,
+                "hooks_live_s": _HOOKS_LIVE_S, "hooks_live_idle_s": _HOOKS_LIVE_IDLE_S,
                 "demote_interval_s": _SCAN_DEMOTE_S,
                 "sessions": _rows})
 
