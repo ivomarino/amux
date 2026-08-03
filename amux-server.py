@@ -10578,6 +10578,42 @@ def _similar_open_cards(title: str, exclude_session: str, db=None, limit: int = 
     return out[:limit]
 
 
+_BOARD_SLIM_DROP = ("desc", "log")
+
+
+def _board_project(items, slim: bool, f_sess: list, f_stat: list, f_arch: str):
+    """Server-side filter + projection for GET /api/board (AMUX-2223).
+
+    The full board is 4.7MB / 1630 cards, of which desc is 75% and log 6%. A
+    session scanning its queue needs neither: it needs ids, titles, statuses
+    and owners, then ONE point read of the card it picks. Shipping the other
+    81% to every poller, fleet-wide, is the same known-state re-derivation as
+    the scan loop — pure cost that grows with board history, not with what the
+    caller asked.
+
+    `slim` keeps every field EXCEPT desc/log and adds desc_len/log_n, so no
+    caller breaks on a missing field and a caller that needs the body knows to
+    ask for the card. Filters are applied here rather than in SQL because the
+    board list is already materialised in the SSE cache; re-querying would
+    cost more than filtering the list."""
+    out = []
+    for it in items:
+        if f_sess and (it.get("session") or "") not in f_sess:
+            continue
+        if f_stat and str(it.get("status") or "").lower() not in f_stat:
+            continue
+        if f_arch != "" and bool(it.get("archived")) != (f_arch in ("1", "true", "yes")):
+            continue
+        if slim:
+            r = {k: v for k, v in it.items() if k not in _BOARD_SLIM_DROP}
+            r["desc_len"] = len(it.get("desc") or "")
+            r["log_n"] = len(it.get("log") or [])
+            out.append(r)
+        else:
+            out.append(it)
+    return out
+
+
 def _deps_blocking(item) -> list:
     """Card ids in item.depends_on that are still OPEN (deleted/absent do not
     block). This is the edge the autonomy loop traverses: prose like 'BLOCKS
@@ -32394,7 +32430,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.400';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.401';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53576,7 +53612,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.400';
+const CACHE = 'amux-v0.9.401';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55710,8 +55746,16 @@ class CCHandler(BaseHTTPRequestHandler):
                 "other_patch_keys": {
                     "override_doing": "true — deliberately hold more than one `doing` item (AMUX-1707)",
                 },
+                "reading_the_board": {
+                    "DEFAULT": "Scan with GET /api/board?slim=1, then ONE point read of the card you pick: GET /api/board/<id>. Never pull the full board to find a queue.",
+                    "slim=1": "Every field EXCEPT desc and log, plus desc_len/log_n so you know a body exists. desc is 75% of the payload and log 6%; a queue scan needs neither.",
+                    "filters": "?session=a,b  ?status=todo,doing  ?archived=0  — combine freely, applied server-side and composable with slim=1.",
+                    "why": "The unfiltered board is 4.7MB across 1630 cards and grows with history, not with what you asked for. Full-board GETs timed out under load (autopilot, 2026-08-03). Archived cards are 97% of rows and are never pickable — ?archived=0 drops them.",
+                    "single_card": "GET /api/board/<id> returns the full record with rev/ETag; that is the read to do before any PATCH.",
+                },
                 "views": {
                     "GET /api/board/contract": "this document",
+                    "GET /api/board?slim=1&status=todo&archived=0": "your pickable queue, minus every byte you do not need",
                     "GET /api/board/ownership": "doing items with nobody executing them (AMUX-1712)",
                     "GET /api/board/reconcile?session=X": "your stale/rotting doing items (AMUX-1707)",
                 },
@@ -57445,6 +57489,14 @@ class CCHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/api/board":
                 done_limit = int(qs.get("done_limit", ["100"])[0])
                 _scoped, _ctags, _cname = _caller_scope(self.headers)
+                # AMUX-2223: slim projection + server-side filters. Absent
+                # these params every path below is byte-for-byte what it was,
+                # including the pre-serialised cache fast path.
+                _slim = qs.get("slim", ["0"])[0].lower() in ("1", "true", "yes")
+                _f_sess = [x for x in (qs.get("session", [""])[0] or "").split(",") if x]
+                _f_stat = [x.lower() for x in (qs.get("status", [""])[0] or "").split(",") if x]
+                _f_arch = qs.get("archived", [""])[0].lower()
+                _projecting = bool(_slim or _f_sess or _f_stat or _f_arch != "")
                 if _scoped:
                     # Tag isolation (Ethan 2026-08-02): a session sees its OWN
                     # cards plus cards owned by same-tag sessions; untagged
@@ -57462,7 +57514,13 @@ class CCHandler(BaseHTTPRequestHandler):
                         if not _own or not _ctags:
                             return False
                         return bool(_tagmap.get(_own, set()) & _ctags)
-                    return self._json([it for it in _bd if _bvis(it)])
+                    return self._json(_board_project(
+                        [it for it in _bd if _bvis(it)], _slim, _f_sess, _f_stat, _f_arch))
+                if _projecting:
+                    # Same read-through-on-invalidation contract as the scoped
+                    # path: a write nulls the cached data, so this reloads.
+                    _bd = _sse_cache["board"]["data"] or _load_board(done_limit=done_limit or 100)
+                    return self._json(_board_project(_bd, _slim, _f_sess, _f_stat, _f_arch))
                 if done_limit == 0:
                     return self._json(_load_board(done_limit=0))
                 # Default done_limit=100 → use the shared SSE board cache
