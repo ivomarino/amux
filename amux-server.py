@@ -5562,7 +5562,18 @@ def _rate_limit_auto_respond():
             # Clear any stale/false flag (e.g. the weekly-limit phrase printed by
             # a tool or sitting in scrollback) so the badge stops contradicting
             # the live "working" status.
-            if _detect_claude_status(raw) == "active":
+            # Direct activity evidence, not just the classified status
+            # (social-media, 2026-08-03: WEEKLY-LIMIT badge lied for ~2.5h
+            # while the session visibly worked — the frame never classified
+            # 'active', so this clear never fired. A running spinner line or
+            # a ⏺/● turn marker in the live tail is proof of generation
+            # regardless of what the classifier makes of the whole frame).
+            _tail12 = "\n".join(clean.splitlines()[-12:])
+            _activity_evident = bool(
+                _detect_claude_status(raw) == "active"
+                or re.search(r"esc to interrupt|tokens\)\s*$", _tail12, re.M)
+                or any(_LIMIT_ACTIVITY_RE.match(l.strip()) for l in _tail12.splitlines()))
+            if _activity_evident:
                 if existing and (existing.get("rate_limit_reset_at")
                                  or existing.get("rate_limit_weekly")
                                  or existing.get("rate_limit_banner")
@@ -31970,7 +31981,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.384';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.385';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53139,7 +53150,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.384';
+const CACHE = 'amux-v0.9.385';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
