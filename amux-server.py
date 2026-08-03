@@ -12517,6 +12517,16 @@ def _scheduler_loop():
                         db.commit()
                     except Exception as _re:
                         slog(f"[sched] FIRE ERROR {_sid}: could not record error row: {_re}")
+                        # The handler itself can leave a write txn OPEN — e.g. the INSERT above
+                        # lands and the UPDATE then raises. That is the exact lock-holding state
+                        # this whole fix exists to prevent (a held write lock times out other
+                        # writers at busy_timeout, and lock contention on these UPDATEs is the
+                        # leading candidate for the raiser that got us here). Release it, or the
+                        # fix reproduces the defect from inside its own error path.
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
             if due:
                 db.commit()
         except Exception as e:
