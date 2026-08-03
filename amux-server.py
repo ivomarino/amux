@@ -12452,18 +12452,60 @@ def _scheduler_loop():
             cols = [d[0] for d in db.execute("SELECT * FROM schedules LIMIT 0").description]
             for row in due:
                 sched = dict(zip(cols, row))
-                _run_schedule(sched, source="cron")
-                _sched_last_fire[sched["id"]] = now  # cron fire counts toward event cooldown
-                now_ts = int(time.time())
-                if sched["sched_type"] == "once":
-                    db.execute("UPDATE schedules SET enabled=0, last_run=?, updated=? WHERE id=?",
-                               (now_ts, now_ts, sched["id"]))   # last_run = UTC unix (AMUX-1736)
-                    _sched_audit(sched["id"], "enabled", 1, 0, "run-once")
-                else:
-                    expr = sched.get("schedule_expr") or ""
-                    next_r = (_parse_next_run(expr) if expr else None) or _next_run_dt(sched)
-                    db.execute("UPDATE schedules SET last_run=?, next_run=?, updated=? WHERE id=?",
-                               (now_ts, next_r, now_ts, sched["id"]))   # last_run = UTC unix (AMUX-1736)
+                # Per-schedule guard + per-schedule commit (MO-3058, from TG-3007).
+                # BEFORE: this body was unguarded and `db.commit()` sat AFTER the loop, so a
+                # single raise anywhere below aborted the entire due-batch. Two symptoms, one
+                # defect: schedules BEHIND the raiser were never attempted (fire late), and
+                # schedules AHEAD of it had ALREADY run via _run_schedule() but never committed
+                # their next_run — leaving them still-due, so they RE-FIRED on every 10s tick
+                # until some later clean batch flushed the pending write. The cron path does not
+                # consult _sched_last_fire (only the event path at ~:12135 does), so nothing
+                # suppressed that repeat. Guarding per schedule contains a poison entry to itself.
+                try:
+                    _run_schedule(sched, source="cron")
+                    _sched_last_fire[sched["id"]] = now  # cron fire counts toward event cooldown
+                    now_ts = int(time.time())
+                    if sched["sched_type"] == "once":
+                        db.execute("UPDATE schedules SET enabled=0, last_run=?, updated=? WHERE id=?",
+                                   (now_ts, now_ts, sched["id"]))   # last_run = UTC unix (AMUX-1736)
+                        _sched_audit(sched["id"], "enabled", 1, 0, "run-once")
+                    else:
+                        expr = sched.get("schedule_expr") or ""
+                        next_r = (_parse_next_run(expr) if expr else None) or _next_run_dt(sched)
+                        db.execute("UPDATE schedules SET last_run=?, next_run=?, updated=? WHERE id=?",
+                                   (now_ts, next_r, now_ts, sched["id"]))   # last_run = UTC unix (AMUX-1736)
+                    db.commit()
+                except Exception as _fe:
+                    # A no-fire must leave a ROW, not silence. The pre-fix loop could only report
+                    # SUCCESS, so silence was its only way of saying it had broken (TG-3007).
+                    _sid = sched.get("id", "?")
+                    slog(f"[sched] FIRE ERROR {_sid}: {type(_fe).__name__}: {_fe}")
+                    try:
+                        db.rollback()   # discard only THIS schedule's partial writes
+                        db.execute(
+                            "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source) "
+                            "VALUES (?,?,?,?,?)",
+                            (_sid, int(time.time()), "error",
+                             f"fire aborted: {type(_fe).__name__}: {_fe}"[:500], "cron"))
+                        # Advance next_run even on error, so a poison entry cannot wedge the queue
+                        # by staying permanently due and re-raising on every tick.
+                        if sched.get("sched_type") != "once":
+                            try:
+                                _nr = (_parse_next_run(sched.get("schedule_expr") or "")
+                                       or _next_run_dt(sched))
+                            except Exception:
+                                _nr = None
+                            if not _nr:
+                                # Could not compute one: push out a fixed step rather than leave it
+                                # due. Stored next_run is LOCAL time "%Y-%m-%dT%H:%M" — matching the
+                                # writer above; do NOT compare it against SQLite datetime('now') (UTC).
+                                from datetime import timedelta as _td
+                                _nr = (datetime.now() + _td(minutes=15)).strftime("%Y-%m-%dT%H:%M")
+                            db.execute("UPDATE schedules SET next_run=?, updated=? WHERE id=?",
+                                       (_nr, int(time.time()), _sid))
+                        db.commit()
+                    except Exception as _re:
+                        slog(f"[sched] FIRE ERROR {_sid}: could not record error row: {_re}")
             if due:
                 db.commit()
         except Exception as e:
