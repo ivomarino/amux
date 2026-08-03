@@ -6199,6 +6199,65 @@ def _sms_bridge_gate(to: str, text: str) -> tuple[bool, str]:
 
 _urgent_alert_last = {}  # message-hash → ts, for a light flood guard
 
+# ── Owner-alert STORM guard (AMUX / MF-427) ──────────────────────────────────
+# MEASURED 2026-08-02/03: 38 identical owner pages, message '--help', one every
+# ~302s for 3h06m, every one a real push AND a real iMessage, deduped=false on
+# all 38. Nothing noticed.
+#
+# The 60s dedupe above is the wrong SHAPE for that failure, not merely too
+# short: a storm on a 302s cadence steps cleanly between 60s windows, so each
+# page is individually distinct and legitimate. A guard whose window is shorter
+# than the interval it must suppress suppresses nothing.
+#
+# Why this matters more than noise: the owner alert is the fire alarm, and its
+# entire value is that a page means act now. 38 empty pages in one night trains
+# the owner to ignore it, which destroys the signal exactly as thoroughly as a
+# dead alert path — the failure the canary existed to prevent, reached from the
+# other side.
+#
+# THE NEGATIVE CONTROL IS PART OF THE DESIGN, not an afterthought: the key
+# includes the message and the claimed session, so 38 DISTINCT genuine alerts
+# have 38 distinct keys, accumulate nothing, and all deliver. Collapsing real
+# incidents would be the remediation-riskier-than-the-defect version of this.
+_urgent_alert_hist: dict = {}   # key → [send timestamps within the window]
+_urgent_alert_mute: dict = {}   # key → mute expiry ts
+URGENT_STORM_THRESHOLD = 2      # identical sends in-window before collapsing
+URGENT_STORM_WINDOW = 1800.0    # 30m: comfortably wider than any plausible cadence
+URGENT_STORM_MUTE = 1800.0      # sliding — each suppressed attempt extends it
+
+
+def urgent_alert_decision(key, now, hist, mute_until, *, dedupe_last=None):
+    """Pure decision for one alert attempt. No I/O, so the 38-row storm can be
+    replayed exactly.
+
+    Returns (action, new_hist, new_mute_until) where action is one of:
+      'send'         deliver normally
+      'dedupe'       inside the existing 60s repeat window
+      'storm_notice' threshold crossed: deliver ONE 'storming' page, then mute
+      'muted'        storm already declared and still active; deliver nothing
+
+    The mute SLIDES: every suppressed attempt pushes the expiry out, so a storm
+    that keeps firing stays muted instead of resuming every window. A storm ends
+    by stopping, which is the only evidence that it ended.
+    """
+    # `dedupe_last` falsy means NEVER SENT. The old call site used .get(key, 0),
+    # which conflates "never" with "sent at epoch 0" — harmless against a real
+    # time.time() and wrong for anything that supplies its own clock, including
+    # the replay of the incident this guard exists for.
+    if dedupe_last and now - dedupe_last < 60:
+        return "dedupe", hist, mute_until
+
+    if mute_until and now < mute_until:
+        # Still storming. Extend rather than count down toward a resume.
+        return "muted", hist, now + URGENT_STORM_MUTE
+
+    recent = [t for t in (hist or []) if now - t < URGENT_STORM_WINDOW]
+    recent.append(now)
+    if len(recent) >= URGENT_STORM_THRESHOLD:
+        return "storm_notice", recent, now + URGENT_STORM_MUTE
+    return "send", recent, 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _record_owner_alert(origin: str, claimed: str, message: str, reason: str,
                         channels: dict, deduped: bool) -> None:
@@ -6240,10 +6299,36 @@ def _send_urgent_alert(message: str, session: str = "", reason: str = "", origin
         slog(f"[urgent-alert] PROVENANCE MISMATCH: verified origin={origin!r} but claimed session={session!r} — recording both")
     key = _hashlib.sha256((session + "|" + msg).encode()).hexdigest()[:16]
     now = time.time()
-    if now - _urgent_alert_last.get(key, 0) < 60:
+    action, _hist, _mute = urgent_alert_decision(
+        key, now, _urgent_alert_hist.get(key), _urgent_alert_mute.get(key, 0.0),
+        dedupe_last=_urgent_alert_last.get(key),
+    )
+    _urgent_alert_hist[key] = _hist
+    _urgent_alert_mute[key] = _mute
+
+    if action == "dedupe":
         _record_owner_alert(origin, session, msg, reason, {}, deduped=True)
         return {"ok": True, "deduped": True, "channels": {}, "message": msg,
                 "origin": origin, "claimed": session, "provenance_mismatch": _mismatch}
+
+    if action == "muted":
+        # Recorded, deliberately not delivered. The ledger still shows every
+        # attempt, so a storm remains fully visible at GET /api/alert/owner —
+        # the suppression must not also hide the evidence.
+        _record_owner_alert(origin, session, msg, reason, {}, deduped=True)
+        slog(f"[urgent-alert] STORM-MUTED key={key} origin={origin!r} msg={message[:80]!r}")
+        return {"ok": True, "deduped": True, "storm_muted": True, "channels": {},
+                "message": msg, "origin": origin, "claimed": session,
+                "provenance_mismatch": _mismatch}
+
+    if action == "storm_notice":
+        # One page saying it is storming, then silence. This page is the LAST
+        # one for this message until the storm stops, so it has to carry where
+        # to look rather than just repeating the alert.
+        n = len(_hist)
+        msg = (f"STORM: this alert has fired {n}x and is now MUTED for "
+               f"{int(URGENT_STORM_MUTE // 60)}m. Original: {msg}\n"
+               f"Full history: GET /api/alert/owner")
     _urgent_alert_last[key] = now
     channels = {}
     if os.environ.get("AMUX_URGENT_PUSH", "1") != "0":
@@ -10714,6 +10799,20 @@ def _pick_reviewer(exclude_session: str) -> str | None:
             return None
         cands = [c for c in cands
                  if {t.lower() for t in (c.get("tags") or [])} & author_tags]
+        # SAME-CONTEXT REFUSAL (mixpeek-frustrations, MG-1391, 2026-08-02):
+        # session NAME is a proxy for independent reasoning context, and the
+        # proxy goes silently false when a transcript moves panes via
+        # --resume — reviewer and author were two names, ONE conversation,
+        # and a review by the context that wrote the change can only
+        # confirm. The durable identity is the conversation id: a candidate
+        # currently bound to the AUTHOR's transcript is the author.
+        try:
+            _a_conv = (_load_meta(exclude_session) or {}).get("cc_conversation_id", "")
+            if _a_conv:
+                cands = [c for c in cands
+                         if (_load_meta(c["name"]) or {}).get("cc_conversation_id", "") != _a_conv]
+        except Exception:
+            pass
         if not cands:
             return None
         cands.sort(key=lambda s: (
@@ -16151,7 +16250,20 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 _gemini_opts += " --yolo"
             if "--skip-trust" not in _gemini_opts:
                 _gemini_opts += " --skip-trust"
-            include_dirs = [str(CC_LOGS)]
+            # Memory parity (Ethan 16:58): Claude lanes get amux-composed
+            # memory via the CLAUDE.md hierarchy; Gemini reads GEMINI.md.
+            # Bridge WITHOUT touching any repo's own GEMINI.md: mirror the
+            # composed memory into a session-scoped dir and hand it to
+            # --include-directories, which Gemini walks for GEMINI.md files.
+            _gmem_dir = CC_MEMORY / "gemini" / name
+            try:
+                _gmem_dir.mkdir(parents=True, exist_ok=True)
+                _mem_src = CC_MEMORY / f"{name}.md"
+                if _mem_src.exists():
+                    (_gmem_dir / "GEMINI.md").write_text(_mem_src.read_text())
+            except Exception as _ge:
+                print(f"[start] {name}: gemini memory bridge failed: {_ge}")
+            include_dirs = [str(CC_LOGS), str(_gmem_dir)]
             try:
                 _gr = subprocess.run(
                     ["git", "-C", work_dir, "rev-parse", "--show-toplevel"],
