@@ -18,17 +18,11 @@ Every board card sits in exactly one column:
 
 Custom columns can be added via `POST /api/board/statuses`.
 
-### done vs verified (critical distinction)
+### done vs verified
 
-`done` means the work is implemented. It does NOT mean it works in production.
+`done` is the normal terminal state for most cards -- the work is finished. Most cards stop here and that's fine.
 
-`verified` requires ALL of:
-1. CI/CD is green (full pipeline including e2e)
-2. Deployed to production
-3. Confirmed working in prod (exercised the real behavior)
-4. Zero regressions (existing checks still green)
-
-Evidence must be recorded on the card when verifying.
+`verified` is an optional stronger claim: confirmed working end-to-end in production. Use it when the stakes warrant it (deploys, infrastructure changes, customer-facing fixes). It requires CI green, deployed to prod, confirmed working, and no regressions. Evidence should be recorded on the card. Cards do NOT need to pass through `verified` -- it's opt-in.
 
 ## Card Types
 
