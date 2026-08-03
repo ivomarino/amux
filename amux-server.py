@@ -5470,6 +5470,12 @@ _rate_limit_last_responded: dict = {}
 # Swallowed-exception ledger for the fleet scan loop (AMUX-2111 post-mortem):
 # per-session dedupe so a recurring throw logs every ~10 min, not every scan.
 _rate_limit_scan_err: dict = {}
+_scan_demoted_last: dict = {}   # session -> last FULL scan while self-reporting (D1 demotion)
+# Scan-demotion counters, exposed at GET /api/debug/scan. A skip that leaves no
+# trace is the ethos-#4 failure: when the demotion eventually hides a state
+# change, whoever looks must be able to SEE that scans were being skipped and
+# for which lanes — not infer it from absence.
+_scan_stats: dict = {"full": 0, "demoted": 0, "by_session": {}, "since": time.time()}
 _rate_limit_last_drift_log: float = 0.0
 
 # Proof the session produced output on a line: an assistant message (⏺), an
@@ -5597,6 +5603,25 @@ def _rate_limit_auto_respond():
                 _ra = _existing_actions.get("rate_limit_reset_at")
                 if _ra and _ra > now and not _existing_actions.get("rate_limit_credits"):
                     continue
+            # SCAN DEMOTION for self-reporting lanes (Ethan: do all 4, #1;
+            # D1-exit step). A lane whose hooks reported state within the
+            # fresh window is TELLING us its truth — capturing its pane every
+            # tick is the poll the report endpoint exists to replace, and the
+            # per-tick tmux subprocess × 40 lanes fed both halves of the
+            # 08-02/03 wedge. Fresh report -> full capture at most every 60s
+            # (liveness + limit-banner detection keeps working with <=60s
+            # extra latency; a parked lane's report ages out of the 25s
+            # window anyway, restoring full-rate scans exactly when
+            # inference is needed). Hookless providers (gemini/codex) keep
+            # full-rate scans — the scraper is their only voice.
+            _rep_s = _session_reported.get(name)
+            _sst = _scan_stats["by_session"].setdefault(name, {"full": 0, "demoted": 0})
+            if (_rep_s and (now - _rep_s.get("ts", 0)) < _SELF_REPORT_FRESH_S
+                    and (now - _scan_demoted_last.get(name, 0)) < 60):
+                _scan_stats["demoted"] += 1; _sst["demoted"] += 1
+                continue
+            _scan_demoted_last[name] = now
+            _scan_stats["full"] += 1; _sst["full"] += 1
             # 300 lines is enough to catch the reset-time line, which can
             # appear ~10-20 lines above the menu in Claude Code's UI.
             raw = tmux_capture(name, 300)
@@ -32301,7 +32326,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.397';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.398';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53483,7 +53508,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.397';
+const CACHE = 'amux-v0.9.398';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58276,6 +58301,38 @@ class CCHandler(BaseHTTPRequestHandler):
                         new_session = updated_item.get("session") or ""
                         _prior_status = prior["status"] if prior else None
                         _assigned_now = ("session" in body and (body.get("session") or None) != prior_session)
+                        # Dependency-unblock event (do-all-4 #2): a card
+                        # closing frees its dependents NOW, via one steering
+                        # ask each — not at the next polling cycle. Durable
+                        # dep.freed events dedupe per dependent.
+                        if (updated_item.get("status") in ("done", "verified")
+                                and _prior_status not in ("done", "verified")):
+                            try:
+                                _dep_rows = get_db().execute(
+                                    "SELECT id, session, depends_on FROM issues WHERE deleted IS NULL "
+                                    "AND COALESCE(archived,0)=0 AND status IN ('todo','backlog') "
+                                    "AND depends_on LIKE ?", ('%"' + bid + '"%',)).fetchall()
+                                for _dr in _dep_rows:
+                                    _blk = _deps_blocking({"depends_on": _dr["depends_on"]})
+                                    if _blk or not _dr["session"]:
+                                        continue   # still blocked by others, or unowned
+                                    # Dedupe on the events table's UNIQUE idem
+                                    # index — exact, not a LIKE over JSON. It
+                                    # ages out with event retention, so a card
+                                    # left unpicked that long earns a re-nudge.
+                                    _idem = f"dep.freed:{_dr['id']}"
+                                    if get_db().execute(
+                                            "SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                                            (_idem,)).fetchone():
+                                        continue
+                                    _emit_event(_dr["session"], "dep.freed",
+                                                {"issue": _dr["id"], "freed_by": bid},
+                                                idem=_idem, source="board")
+                                    _steer_enqueue(_dr["session"],
+                                        f"[amux] {_dr['id']} just UNBLOCKED — its dependency {bid} "
+                                        f"closed and no other deps remain. It is pickable now.")
+                            except Exception as _de:
+                                slog(f"[dep-freed] {bid}: {_de}")
                         # Loop 1 (throughput plan): entering review with no
                         # reviewer -> a live peer is assigned automatically.
                         if (updated_item.get("status") == "review"
@@ -58827,6 +58884,28 @@ class CCHandler(BaseHTTPRequestHandler):
         # GET /api/debug/threads — live thread stacks (2026-08-02 outage: the
         # server pinned 2 cores with 47 threads and NOTHING could say which;
         # py-spy needs root on macOS. The instrument the next spin needs.)
+        # GET /api/debug/scan — is the status scan actually being demoted, and
+        # for whom? Answers "was this lane's pane read, or skipped?" directly,
+        # so a state change hidden by demotion is diagnosable from the data we
+        # keep (ethos #4) rather than inferred from silence.
+        if method == "GET" and path == "/api/debug/scan":
+            _up = max(1.0, time.time() - _scan_stats.get("since", time.time()))
+            _rows = []
+            for _n, _v in sorted(_scan_stats["by_session"].items()):
+                _tot = _v["full"] + _v["demoted"]
+                _rows.append({"session": _n, "full": _v["full"], "demoted": _v["demoted"],
+                              "demoted_pct": round(100.0 * _v["demoted"] / _tot, 1) if _tot else 0.0,
+                              "reporting": bool(_session_reported.get(_n))})
+            _t = _scan_stats["full"] + _scan_stats["demoted"]
+            return self._json({
+                "uptime_s": round(_up, 1),
+                "full": _scan_stats["full"], "demoted": _scan_stats["demoted"],
+                "demoted_pct": round(100.0 * _scan_stats["demoted"] / _t, 1) if _t else 0.0,
+                "full_per_min": round(60.0 * _scan_stats["full"] / _up, 1),
+                "self_report_fresh_s": _SELF_REPORT_FRESH_S,
+                "demote_interval_s": 60,
+                "sessions": _rows})
+
         if method == "GET" and path == "/api/debug/threads":
             import traceback as _tb
             _names = {t.ident: t.name for t in threading.enumerate()}
