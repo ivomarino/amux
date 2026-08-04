@@ -49,6 +49,29 @@ view meant to expose them and the sweep meant to fire them. Two independent auth
 same blind spot, one layer down. After adding a surfacing mechanism, ask what the
 mechanism itself filters out.
 
+**The sign does not matter; the disagreement does.** Five instances in one night, and
+the fifth is what fixes the rule's shape. Four over-filtered and hid real work
+(`is:armed`, the watch sweep, the advance re-nag, the owner digest — the last written
+*after* its author committed the rule about the first three). One UNDER-filtered and
+manufactured phantom work: the startup banner selected on status and session while
+auto-pickup also required `owner_type='agent'` and `archived=0`, so a lane was greeted
+with 199 queued items when 9 were real, most of the rest being cards it was
+specifically not permitted to touch. Same root, opposite sign — which means "be careful
+with archived filters" is the wrong lesson, since adding and removing the filter were
+each wrong half the time. **The invariant is narrower: a view must share the predicate
+of the mechanism it claims to describe.** A queue view that disagrees with the queue is
+wrong in whichever direction it disagrees, and it is worse than no view, because it is
+trusted and it is read first. When you write a view, do not re-derive its filter from
+what seems sensible — copy it from the code that acts, or the two drift the moment
+either changes.
+
+The corollary is about REMOVING a filter, which looks safe and is not: correcting one
+reclassifies a whole backlog as new. The owner digest dropped `archived` for good
+reasons and its next run pushed 92 cards — the entire archived backlog — into a single
+SMS, because "new since last time" has no cap and a delta can be a backlog-discharge
+rather than a day's work. Fixing a filter is a migration event; ask what the first run
+after the fix will emit.
+
 ## 2. Are you calling the model for something you could just compute?
 
 Getting out of the model's way is not the same as calling it more often.
