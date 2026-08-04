@@ -120,6 +120,20 @@ every function called, and inspect the callers.
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
 
+**A filter that silently matches EVERYTHING is the same defect as one that matches
+nothing — except it returns a confident wrong answer instead of silence.**
+`interaction_log.ts` is in MILLISECONDS. Two sessions the same evening wrote
+`datetime(ts,'unixepoch')` and compared against a seconds cutoff, so the filter was
+~1000x too small and matched the entire table. One of them nearly reported the whole
+historical backlog as post-fix regressions. The tell in both cases was the rendered
+timestamp column coming back empty — and it only caught one of us, because for that
+session the timestamp was load-bearing for the claim being made, while for the other it
+was decoration next to an actor tally that happened to be right. A broken instrument
+that hands you a usable answer is the most dangerous kind: nothing prompts the recheck,
+because the part you were looking at was fine. Before trusting a filtered query, confirm
+the filter EXCLUDED something — an unbounded match and a correct match look identical
+from the rows alone.
+
 **Test the fix against the incident's own artifact, not against the case that is easy
 to construct.** ts-gke reported a live watch card force-discarded by an unattributed
 caller. The fix — require attribution for `force` — was first written as
