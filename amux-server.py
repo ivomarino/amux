@@ -10873,24 +10873,18 @@ def _advance_open_card(session_name: str) -> bool:
                 return bool(ok)
             slog(f"[advance] {session_name}: {row['id']} blocked by {_dep_id} ({_dep.get('session') or 'unassigned'}) — not nudging the holder")
             return False
-        # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
-        # work now — pushing the author asks for a self-ack the transition refuses.
-        _rev = (item.get("reviewer") or "").strip()
-        if row["status"] == "review" and _rev and _rev != session_name:
-            if not is_running(_rev):
-                slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
-                return False
-            ok, err = send_text(_rev,
-                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in review and names YOU as "
-                f"reviewer. Review it: if the work holds, ack review->done yourself (your "
-                f"X-Amux-Session is the required sign-off); if not, say what fails on the card. "
-                f"The author cannot close it.",
-                defer_if_busy=True)
-            if ok:
-                _advance_last[session_name] = time.time()
-                _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
-                slog(f"[advance] routed review of {row['id']} to reviewer {_rev}")
-            return bool(ok)
+        # ORDER MATTERS, and it was wrong (general-canvas-apps, 2026-08-04).
+        # This block used to sit BELOW the reviewer edge, so a needs:you card in
+        # review routed to its reviewer and never reached the quiet path. The
+        # reviewer then got "ack review->done yourself" repeatedly — CD-51 three
+        # times, CD-52 twice — while the one action it asked for is the action
+        # that HIDES the decision: a needs:you card is dropped from the digest
+        # and from is:needsyou at status done. I had told that same reviewer
+        # "do not ack" on that same card. An instruction satisfiable only by
+        # doing the thing you were told not to do is the ethos #3 shape
+        # AMUX-2270 was written for; it simply reached them through the
+        # reviewer edge instead of the holder edge, because I fixed one caller
+        # and not the predicate's position.
         # NEEDS-YOU EDGE (AMUX-2270). Option 4 of the nudge below tells the
         # session: "if it is blocked on a HUMAN decision, record that on the
         # card and pick up the next unblocked one." A session that DOES exactly
@@ -10953,6 +10947,24 @@ def _advance_open_card(session_name: str) -> bool:
                 _cmd_hist_record(session_name, f"[amux] stale-ask check: {row['id']}", "system", "advance")
                 slog(f"[advance] {session_name}: {row['id']} needs:you for "
                      f"{int(_asked_age/86400)}d — asked whether the ask still holds")
+            return bool(ok)
+        # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
+        # work now — pushing the author asks for a self-ack the transition refuses.
+        _rev = (item.get("reviewer") or "").strip()
+        if row["status"] == "review" and _rev and _rev != session_name:
+            if not is_running(_rev):
+                slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
+                return False
+            ok, err = send_text(_rev,
+                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in review and names YOU as "
+                f"reviewer. Review it: if the work holds, ack review->done yourself (your "
+                f"X-Amux-Session is the required sign-off); if not, say what fails on the card. "
+                f"The author cannot close it.",
+                defer_if_busy=True)
+            if ok:
+                _advance_last[session_name] = time.time()
+                _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
+                slog(f"[advance] routed review of {row['id']} to reviewer {_rev}")
             return bool(ok)
         gate_next = "review" if row["status"] == "doing" else "done"
         gate = _effective_gate(item, gate_next) or []
@@ -33378,7 +33390,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.429';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.430';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54689,7 +54701,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.429';
+const CACHE = 'amux-v0.9.430';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
