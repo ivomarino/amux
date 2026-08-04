@@ -9492,6 +9492,29 @@ esac
     except Exception:
         pass  # may not have write permission on local dev machines
 
+    # IS THE CLI WE GENERATE THE ONE SESSIONS ACTUALLY RUN? (AC-183 root cause.)
+    # On this machine ~/.local/bin/amux is a symlink to the full 61KB repo CLI
+    # and ~/.local/bin precedes /usr/local/bin, so the 8.4KB stub written above
+    # is SHADOWED — permanently, since February. Every improvement made to this
+    # generator has been landing in a file nothing executes, which is how
+    # `amux send --no-board` came to be documented, present in the generator,
+    # and absent from the CLI a session invokes.
+    #
+    # Not "fixed" by writing elsewhere: in a cloud container there is no repo
+    # checkout and the stub IS the CLI, so both artifacts are legitimate in
+    # their own topology. What is not legitimate is not KNOWING which one wins.
+    # A generator whose output is never executed cannot be distinguished from
+    # one that works, from the generator's side — so say it out loud at boot.
+    try:
+        _live_cli = shutil.which("amux") or ""
+        if _live_cli and _pathlib.Path(_live_cli).resolve() != stub_path.resolve():
+            slog(f"[cli] NOTE: the amux CLI on PATH is {_live_cli} "
+                 f"(-> {_pathlib.Path(_live_cli).resolve()}), NOT the stub this server "
+                 f"generates at {stub_path}. Changes to the stub generator will NOT "
+                 f"reach sessions on this host; edit the CLI that PATH resolves.")
+    except Exception:
+        pass
+
 
 def _auto_trust_codex_dir(work_dir: str):
     """Pre-trust a directory in ~/.codex/config.toml so Codex starts noninteractively."""
@@ -33200,7 +33223,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.422';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.423';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54511,7 +54534,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.422';
+const CACHE = 'amux-v0.9.423';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
