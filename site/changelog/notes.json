@@ -1,5 +1,86 @@
 [
   {
+    "hash": "f211ef6ed62adc69e011748c76a71678117562de",
+    "short": "f211ef6",
+    "title": "Tag-scoped board — board list now says when it is showing a subset",
+    "date": "2026-08-04",
+    "type": "feat",
+    "tags": ["board", "tags", "fleet", "api"],
+    "description": "When you fetch the board filtered by tag, the response now includes an X-Amux-Scope header so CLI tools and API callers know they are seeing a scoped view, not the full board. Eliminates the ambiguity where a filtered list and an empty global board looked identical."
+  },
+  {
+    "hash": "ed22b8d4637c39f8028b3b7d645ce1871e234f72",
+    "short": "ed22b8d",
+    "title": "Startup banner — YOUR TODO count now matches what pickup actually queues",
+    "date": "2026-08-04",
+    "type": "fix",
+    "tags": ["board", "startup", "pickup"],
+    "description": "The YOUR TODO banner on startup was showing up to 199 items when pickup queues only held 9 real candidates — it filtered on status and session while pickup also required agent ownership and active status. The banner now uses the same predicate as pickup, so the number you see is the number that matters."
+  },
+  {
+    "hash": "c6f959e9ec05faf694d32236b84323ce6bdb0fb6",
+    "short": "c6f959e",
+    "title": "Owner digest — push and iMessage when something is waiting on you",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["notifications", "mobile", "board", "owner"],
+    "description": "When sessions are rate-limited, waiting for your approval, or have board items stuck at done-but-unverified, amux now sends a push notification and an iMessage to your phone listing exactly what needs attention. Includes a nudge to drive done items to verified once you confirm them running in production."
+  },
+  {
+    "hash": "8487f2ada65aa221138df9752028f319a9a63dd7",
+    "short": "8487f2a",
+    "title": "Activity log — full tool call payloads, searchable",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["activity", "debugging", "logs", "tools"],
+    "description": "The Activity tab now shows the complete request and response payload for every tool call your agents make. Payloads expand inline via accordion, and a search bar filters across all of them. Find the tool call that slowed an agent, read exactly what arguments it passed, and see what it got back — without digging through tmux scrollback."
+  },
+  {
+    "hash": "a6e6b7c0e570a505fd0b7e3a94d437eb8b86a691",
+    "short": "a6e6b7c",
+    "title": "Board safety — cross-lane destruction now requires authorization",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["board", "safety", "audit", "attribution"],
+    "description": "Closing or discarding another session's board cards now requires an authorized_by field. amux records whose word the action was taken on. Previously, cross-lane destructive mutations left no trace — now every one is auditable and attributed."
+  },
+  {
+    "hash": "41b03e4503be9e4c24562e4c56d98f0ee195955f",
+    "short": "41b03e4",
+    "title": "Watch cards now actually watch — armed watches have a real monitor",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["board", "watch", "automation", "monitoring"],
+    "description": "Previously, marking a watch card armed was a label with no listener attached — nothing evaluated the condition. Watch cards now have an active monitor that evaluates their condition and fires when it is met. Armed means monitored."
+  },
+  {
+    "hash": "f7a82ca4ed0ada3eae988457c9acd1b8a66515d6",
+    "short": "f7a82ca",
+    "title": "New board filters: is:armed and is:armedstale",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["board", "filters", "watch", "cli"],
+    "description": "Two new board query filters surface the watch cards your fleet is monitoring. is:armed lists every watch card currently armed and listening. is:armedstale finds watches that were armed but have gone quiet without firing. Run these to audit your tripwires without scrolling the full board."
+  },
+  {
+    "hash": "c567ff512f4c51167e6c539d72a60ad56744e6ba",
+    "short": "c567ff5",
+    "title": "Board list — server-side filters cut CLI payload from 4.7MB to instant",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["board", "performance", "cli", "api"],
+    "description": "The board list endpoint now filters server-side. Instead of the CLI downloading 4.7MB of JSON and filtering locally, you pass query parameters (status, type, tag, owner, session) and receive only the matching cards. Large boards are now fast; CLI startup is no longer a network bottleneck."
+  },
+  {
+    "hash": "a451a7c8a740206d30c8ba04755f15980e8e9c54",
+    "short": "a451a7c",
+    "title": "CLI PATH mismatch — amux now says out loud when the wrong binary is on PATH",
+    "date": "2026-08-03",
+    "type": "feat",
+    "tags": ["cli", "install", "diagnostics"],
+    "description": "When amux generates a CLI binary that does not match what `which amux` resolves to, it now prints a clear warning. Previously the wrong version could silently run with no indication — this surfaces the mismatch immediately so you know which binary is actually executing."
+  },
+  {
     "hash": "321b6a8a61f54b7fa2eb485e4d62eda15a8ad0dd",
     "short": "321b6a8",
     "title": "Read aloud — listen to your AI agents via Piper TTS, free and local",
