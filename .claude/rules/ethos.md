@@ -260,6 +260,25 @@ parameter**. The fix was not a better threshold; it was DELETING the CPU trigger
 keeping only what is absent in the healthy state — `/health` unanswered, `store=hung`,
 `degraded`. Picking a window or a threshold at all is the tell that you are guessing.
 
+**An empty grep FEELS like a measurement, and that is why silent probes get believed**
+(amux-cloud, three times in one night). The mechanism is not carelessness: running a
+command feels like doing an experiment, so the no-hit inherits the authority of the
+act. But a grep you typed and a grep that COULD have found the thing are different
+objects, and only the second is evidence. The three: `head -6` on a 16-line commit body
+concluded a passenger section did not exist (it was at line 10); `interaction_log.ts`
+read as seconds made a cutoff ~1000x too small so the filter matched the whole table;
+and a 44-line window anchored on a log line searched 40 lines UP when the code lived 11
+lines DOWN, producing a filed defect against a cap that was there the whole time. The
+third happened hours after writing the rule above, which is the part worth keeping:
+authoring a rule does not install the habit.
+
+**The precondition, which is cheaper than the prohibition: before believing a negative,
+say what a POSITIVE would have looked like, and confirm the probe could have produced
+it.** "If the cap existed, where would it be?" answers before "is it there?" does. Where
+a positive is cheap to construct, construct one — run the highlighter on text that
+should match before trusting that it did not match; check that a control row appears
+before concluding the treatment row was filtered.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction
