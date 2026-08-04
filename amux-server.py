@@ -43516,6 +43516,11 @@ function _statusCanon(s) {
 }
 
 const _BQ_CLOSED = new Set(['done', 'verified', 'discarded']);
+// Dormant item types: armed and waiting, never dispatchable work. Kept in sync
+// with the server-side exclusion in the auto-pickup queries (`type NOT IN
+// ('tripwire','watch')`) — if a type is added there, add it here or armed cards
+// of that type become invisible again, which is the bug this pair exists to fix.
+const _BQ_DORMANT = new Set(['tripwire', 'watch']);
 const _BQ_ROT_DAYS = 7;
 
 // Session state indexed by name, so every card can be judged against the
@@ -43547,6 +43552,22 @@ function _bqIs(item, val, ix) {
     // folding them in here made "Rotting" mostly mean "unowned", which is a
     // different problem with a different fix.
     case 'rotting':  return (st === 'doing' || st === 'review') && !!sess && idleDays > _BQ_ROT_DAYS;
+    // Armed dormant cards (AC-179). tripwire/watch are deliberately excluded from
+    // auto-pickup AND from rot detection — correctly, since a dormant card should
+    // not eat a lane's WIP-1 budget or be force-advanced. But those two exclusions
+    // were the ONLY things that ever surfaced a card, so an armed watch became
+    // findable only by scrolling past it: invisible to pickup, invisible to rot,
+    // with no view of its own. AMUX-2278 was armed to verify AMUX-2269's
+    // acceptance and would have waited there indefinitely.
+    // This does not change what a watch DOES — it makes the set inspectable, so
+    // "what am I currently waiting on, and has it been waiting too long?" is one
+    // query instead of a memory. Pair with is:armedstale below.
+    case 'armed':    return _BQ_DORMANT.has((item.type || '').toLowerCase()) && !_BQ_CLOSED.has(st);
+    // An armed card nobody has revisited. Rot detection skips dormant types, so
+    // without this a watch whose condition already fired — or became irrelevant —
+    // looks identical to one still legitimately waiting.
+    case 'armedstale': return _BQ_DORMANT.has((item.type || '').toLowerCase()) && !_BQ_CLOSED.has(st)
+                              && (Date.now() / 1000 - (item.updated || 0)) / 86400 > _BQ_ROT_DAYS;
     case 'working':  return !!sess && sess.status === 'active';
     case 'waiting':  return !!sess && sess.status === 'waiting';
     case 'gated':    return !!sess && !!(sess.credit_limited || sess.rate_limited_until);
@@ -43790,7 +43811,8 @@ function _bqFilter(items, q) {
 const _BOARD_BUILTIN_VIEWS = [
   { id: '_working',  name: 'Working now', q: 'is:working is:open',        hint: 'Cards whose session is running right now' },
   { id: '_needsyou', name: 'Needs you',   q: 'is:needsyou',  hint: 'Blocked on you: your own cards, cards a session marked needs-human, or a session at a prompt/model gate' },
-  { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+' },
+  { id: '_armed',    name: 'Armed',       q: 'is:armed',                  hint: 'Tripwires and watches: waiting on an event, never auto-picked. is:armedstale for ones nobody has revisited in 7d+' },
+  { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+'},
   { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no session can execute it' },
   { id: '_mine',     name: 'Mine',        q: 'owner:human is:open',       hint: 'Your own issues, not the agent cards' },
   { id: '_archived', name: 'Archived',    q: 'is:archived',               hint: 'Cards belonging to archived sessions' },
