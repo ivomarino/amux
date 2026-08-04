@@ -17482,6 +17482,12 @@ _AMUX_GUARD_SNIPPET = (
 )
 # Lines any previous install may have written (old + new forms) — stripped on
 # migration so re-installs never duplicate or leave a stale appended copy.
+# Lines any previous install may have written — stripped on migration so
+# re-installs never duplicate. MUST stay specific to amux's own lines: a
+# 2026-08-04 version briefly added generic shell to this set, including the
+# bare token "fi", and the migration then deleted EVERY `fi` from this repo's
+# real pre-commit hook — 12 ifs, 1 fi, syntax error, commits blocked. Never
+# put a shell keyword in a content-match strip set.
 _AMUX_GUARD_SNIPPET_LINES = {
     _AMUX_GUARD_MARKER,
     'g="$(dirname -- "$0")/amux-staged-guard"',
@@ -17520,6 +17526,42 @@ def _install_amux_precommit_guard(work_dir: str) -> None:
             with open(guard_path, "w") as fh:
                 fh.write(_AMUX_GUARD_BODY)
             os.chmod(guard_path, 0o755)
+        # RESPECT core.hooksPath (mixpeek, 2026-08-04). git reads hooks from
+        # core.hooksPath when set, and NOT from .git/hooks. mixpeek set it to
+        # .githooks on 07-23, so every shim amux wrote to .git/hooks/pre-commit
+        # after that date was inert — including amux's OWN staged guard, which
+        # has not run in that checkout for two weeks while appearing installed.
+        #
+        # We do NOT write into a redirected hooks dir: it is usually inside the
+        # work tree and version-controlled (mixpeek's .githooks/pre-commit is a
+        # tracked file), so writing there would silently modify the user's repo.
+        # The guard SCRIPT still goes in .git/hooks/ where it is untracked and
+        # harmless, so a repo-owned hook can chain to it — which is exactly what
+        # mixpeek's .githooks/pre-commit now does:
+        #     g="$(dirname -- "$0")/../.git/hooks/amux-staged-guard"
+        #
+        # What changes is that the inert case is now VISIBLE instead of looking
+        # installed. A guard that cannot fire reads exactly like a guard that
+        # found nothing.
+        try:
+            _hp = subprocess.run(["git", "-C", work_dir, "config", "--get", "core.hooksPath"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            _hp = ""
+        if _hp:
+            _live = _hp if os.path.isabs(_hp) else os.path.join(work_dir, _hp)
+            _shim = os.path.join(_live, "pre-commit")
+            _chained = False
+            try:
+                _chained = "amux-staged-guard" in open(_shim).read()
+            except Exception:
+                pass
+            slog(f"[guard] {work_dir}: core.hooksPath={_hp} — git does NOT read .git/hooks. "
+                 f"amux-staged-guard is {'CHAINED by' if _chained else 'NOT referenced by'} "
+                 f"{_shim}. The guard script is installed at .git/hooks/amux-staged-guard for a "
+                 f"repo-owned hook to call; amux will not write into a version-controlled hooks dir.")
+            return
+
         hook_path = os.path.join(hooks_dir, "pre-commit")
         if not os.path.exists(hook_path):
             with open(hook_path, "w") as fh:
@@ -33625,7 +33667,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.440';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.442';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54960,7 +55002,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.440';
+const CACHE = 'amux-v0.9.442';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
