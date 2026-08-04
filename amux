@@ -493,6 +493,12 @@ ${BOLD}amux send${RESET} — send a message to a session
   amux send <session> <text>         inline text (see the warning below)
   amux send <session> --keys 'C-c'   send a raw key sequence
 
+  ${BOLD}--no-board${RESET}  skip board-card creation for one-off questions and status
+              checks. Combines with any form above:
+                amux send <session> --no-board --stdin <<'EOF'
+              Equivalent to the API's {"no_board": true}, or prefixing the
+              message with [no-board] (which the server strips before delivery).
+
 ${BOLD}Why --stdin is preferred${RESET}
   With inline text your SHELL evaluates the string before amux ever sees it, so
   \`backticks\` and \$(...) inside the message are EXECUTED, not sent. That has
@@ -514,6 +520,13 @@ cmd_send() {
   local name
   name=$(resolve_session "${1:-}")
   shift
+  # --no-board (AC-183): skip board-card creation for one-off questions and status
+  # checks. The flag existed only in the thin /usr/local/bin stub the server writes,
+  # which is shadowed on PATH by THIS file (~/.local/bin comes first), so the
+  # documented invocation `amux send X --no-board ...` reached a CLI that had never
+  # heard of it. Consumed in a loop so it works before or after --stdin/--file.
+  local _nb=""
+  while [[ "${1:-}" == "--no-board" ]]; do _nb=1; shift; done
   need_tmux
 
   local tname
@@ -531,14 +544,14 @@ cmd_send() {
   if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then
     local msg; msg=$(cat)
     [[ -n "$msg" ]] || die "no message on stdin"
-    _send_via_api "$name" "$msg"; return $?
+    _send_via_api "$name" "$msg" "$_nb"; return $?
   fi
   if [[ "${1:-}" == "--file" ]]; then
     local f="${2:-}"
     [[ -n "$f" && -r "$f" ]] || die "usage: amux send <session> --file <path>"
     local msg; msg=$(cat "$f")
     [[ -n "$msg" ]] || die "file is empty: $f"
-    _send_via_api "$name" "$msg"; return $?
+    _send_via_api "$name" "$msg" "$_nb"; return $?
   fi
 
   # Check for --keys flag
@@ -558,7 +571,7 @@ cmd_send() {
       echo "${YELLOW}note:${RESET} long/multi-line payload sent as a shell argument — your shell already" >&2
       echo "      expanded any \`backticks\`/\$(...) in it. Prefer: amux send $name --stdin <<'EOF'" >&2
     fi
-    _send_via_api "$name" "$text"
+    _send_via_api "$name" "$text" "$_nb"
   fi
 }
 
@@ -569,11 +582,16 @@ cmd_send() {
 # 2026-07-22 ts-gke→mvs-infra→gtm-engine misroute happened (AMUX-1818). Raw
 # tmux is kept only as a loud last-resort fallback when the server is down.
 _send_via_api() {
-  local name="$1" text="$2"
+  local name="$1" text="$2" nb="${3:-}"
   local tname; tname=$(tmux_name "$name")
   local AMUX_API="${AMUX_API:-https://localhost:8822}"
   local body resp rc
-  body=$(MSG="$text" python3 -c "import json,os; print(json.dumps({'text': os.environ['MSG']}))")
+  body=$(MSG="$text" NB="$nb" python3 -c "
+import json, os
+d = {'text': os.environ['MSG']}
+if os.environ.get('NB'):
+    d['no_board'] = True          # AC-183: server skips autotask card creation
+print(json.dumps(d))")
   resp=$(curl -sk -m 15 -X POST -H 'Content-Type: application/json' \
     -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     -d "$body" "$AMUX_API/api/sessions/$name/send" 2>/dev/null) || resp=""
