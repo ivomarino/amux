@@ -17475,24 +17475,36 @@ sys.exit(main())
 # deleted guard can never fail-close commits, and it is INSERTED AFTER THE
 # SHEBANG of a foreign pre-commit (not appended) — appended snippets are dead
 # code in the many hooks that end with an explicit `exit 0`.
+# FAIL-OPEN BUT LOUD (mixpeek-orchestrator, 2026-08-04). The old form,
+#   if [ -x "$g" ]; then "$g" || exit 1; fi
+# is silent when the guard is ABSENT, so if amux ever moves or removes that
+# file, cross-session sweep protection vanishes with no signal. Not
+# hypothetical: in mixpeek the guard sat there executable the whole time while
+# its ONLY invoker (.git/hooks/pre-commit) had been dead since core.hooksPath
+# moved on Jul 23 -- and this morning an unrelated lane's `git add -A` swept
+# another session's mid-edit file into its commit and red-gated the fleet.
+# AMUX-1730's protection was off for two weeks and nothing said so.
+#
+# Deliberately ONE line: the multi-line version of this snippet is what put a
+# bare `fi` into the strip set below and deleted every `fi` from this repo's
+# real hook. A single self-contained line is safe to strip-match.
 _AMUX_GUARD_SNIPPET = (
     _AMUX_GUARD_MARKER + "\n"
     'g="$(dirname -- "$0")/amux-staged-guard"\n'
-    'if [ -x "$g" ]; then "$g" || exit 1; fi\n'
+    'if [ -x "$g" ]; then "$g" || exit 1; else echo "amux: staged-guard MISSING at $g - cross-session sweep protection is OFF (AMUX-1730)" >&2; fi\n'
 )
-# Lines any previous install may have written (old + new forms) — stripped on
-# migration so re-installs never duplicate or leave a stale appended copy.
-# Lines any previous install may have written — stripped on migration so
+# Lines any previous install may have written -- stripped on migration so
 # re-installs never duplicate. MUST stay specific to amux's own lines: a
-# 2026-08-04 version briefly added generic shell to this set, including the
-# bare token "fi", and the migration then deleted EVERY `fi` from this repo's
-# real pre-commit hook — 12 ifs, 1 fi, syntax error, commits blocked. Never
-# put a shell keyword in a content-match strip set.
+# 2026-08-04 version briefly added generic shell here, including the bare
+# token "fi", and the migration then deleted EVERY `fi` from this repo's real
+# pre-commit hook -- 12 ifs, 1 fi, syntax error, commits blocked. Never put a
+# shell keyword in a content-match strip set.
 _AMUX_GUARD_SNIPPET_LINES = {
     _AMUX_GUARD_MARKER,
     'g="$(dirname -- "$0")/amux-staged-guard"',
     'if [ -x "$g" ]; then "$g" || exit 1; fi',
     '[ -x "$g" ] && { "$g" || exit 1; }',
+    'if [ -x "$g" ]; then "$g" || exit 1; else echo "amux: staged-guard MISSING at $g - cross-session sweep protection is OFF (AMUX-1730)" >&2; fi',
 }
 
 
@@ -33667,7 +33679,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.442';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.443';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -55002,7 +55014,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.442';
+const CACHE = 'amux-v0.9.443';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
