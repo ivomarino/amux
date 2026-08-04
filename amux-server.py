@@ -14606,7 +14606,19 @@ def _session_recently_closed_issue(name: str) -> bool:
             "ORDER BY updated DESC LIMIT 1", (name,)).fetchone()
         if not row:
             return False
-        return (str(row["status"] or "").lower() in ("done", "verified", "discarded")
+        # `review` counts as HANDED OFF, not as work left dangling. When a card
+        # carries a `reviewer`, the author is structurally FORBIDDEN from closing
+        # it — review->done requires the reviewer's own X-Amux-Session — so
+        # parking at review is not the lane stopping short, it is the lane doing
+        # the only thing it is permitted to do. Without this, a session that
+        # finishes work, writes up the evidence and hands it to a peer gets told
+        # to "record it on the board" about a card it just recorded: an
+        # instruction you can comply with and still be re-asked, which is the
+        # ethos-#3 shape this guard's own docstring warns about, and the same
+        # defect AMUX-2270 fixed for needs:you cards. Found by dogfooding — it
+        # fired four times in a row on amux-cloud while every card was current,
+        # twice while reading this function.
+        return (str(row["status"] or "").lower() in ("done", "verified", "discarded", "review")
                 and (time.time() - (row["updated"] or 0)) < _TASK_GUARD_CLOSED_WINDOW)
     except Exception:
         return False
