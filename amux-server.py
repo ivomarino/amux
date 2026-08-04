@@ -7056,6 +7056,18 @@ def _steer_guard_stale(name: str, guard: str):
         if _deps_blocking(it):
             return True, f"{cid} blocked again before delivery"
         return False, ""
+    if guard.startswith("watch:"):
+        # Same lesson as dep: — a watch closed or stood down while its review
+        # nudge waited must not be announced as still armed.
+        cid = guard[6:]
+        it = _item_by_id(cid)
+        if not it or it.get("deleted"):
+            return True, f"{cid} no longer exists"
+        if it.get("archived"):
+            return True, f"{cid} archived before delivery"
+        if _status_canon(it.get("status")) not in ("todo", "backlog", "doing"):
+            return True, f"{cid} is {it.get('status')} before delivery"
+        return False, ""
     return False, ""
 
 
@@ -11220,6 +11232,81 @@ def _pickup_next_board_task(session_name: str):
                         f"'{session_name}' picked up queued task: {title[:80]}")
     except Exception as e:
         print(f"[board] pickup failed for {session_name}: {e}", flush=True)
+
+
+_WATCH_REVIEW_HOURS = float(os.environ.get("AMUX_WATCH_REVIEW_HOURS", "24"))
+
+
+def _watch_review_sweep():
+    """Make "armed and monitoring" TRUE for watch/tripwire cards.
+
+    THE DEFECT (amux-cloud, 2026-08-03): the watch type promised monitoring and
+    nothing monitored. Both auto-pickup queries exclude type IN
+    ('tripwire','watch') — correctly, since a dormant card should not consume
+    WIP — and so does the rot sweep. A comment said "a human or THE FIRING
+    EVENT moves it"; no firing event existed. The exemptions that make a watch
+    card cheap were the same ones that guaranteed nobody would ever be
+    reminded, so an armed watch was a note in the one place designed never to
+    nag anyone. Correct by construction, inert in practice.
+
+    WHY NOT A QUERY EVALUATOR. The obvious fix is a condition DSL amux
+    evaluates. That fails the compounding test twice: the DSL becomes the
+    ceiling on what a watch can express, and it puts amux back in the business
+    of INFERRING state rather than routing it (D1). So amux does the part it is
+    good at — remembering, pacing, and delivering at a turn boundary — and the
+    MODEL does the judging, with the card's own condition text in front of it.
+    A better model reads the condition better, with no harness change.
+
+    Paced like the nag loop: one card per lane per invocation, at most one
+    review per card per _WATCH_REVIEW_HOURS, deduped on a durable event so a
+    restart cannot re-fire it."""
+    try:
+        db = get_db()
+        rows = db.execute(
+            "SELECT id, title, desc, session, type FROM issues "
+            "WHERE deleted IS NULL AND COALESCE(archived,0)=0 "
+            "AND COALESCE(type,'') IN ('tripwire','watch') "
+            "AND status IN ('todo','backlog','doing') "
+            "AND COALESCE(session,'') != '' ORDER BY updated ASC").fetchall()
+    except Exception as e:
+        slog(f"[watch] sweep query failed: {e}")
+        return
+    now = time.time()
+    seen_lane = set()
+    fired = 0
+    for r in rows:
+        lane = r["session"]
+        if lane in seen_lane:
+            continue                      # one per lane per pass
+        if not is_running(lane):
+            continue
+        try:
+            last = db.execute(
+                "SELECT MAX(ts) AS t FROM session_events WHERE type='watch.review' "
+                "AND data LIKE ?", ('%"' + r["id"] + '"%',)).fetchone()
+            if last and last["t"] and (now - float(last["t"])) < _WATCH_REVIEW_HOURS * 3600:
+                continue
+        except Exception:
+            pass
+        seen_lane.add(lane)
+        _cond = (r["desc"] or "").strip()
+        if len(_cond) > 1200:
+            _cond = _cond[:1200] + "\n[...card truncated — read it with GET /api/board/" + r["id"] + "]"
+        _emit_event(lane, "watch.review", {"issue": r["id"]}, source="watch-sweep")
+        _steer_enqueue(lane,
+            f"[amux] WATCH CHECK — {r['id']} ({r['type']}): {(r['title'] or '')[:100]}\n\n"
+            f"You own this armed {r['type']}. amux cannot evaluate its condition; you can. "
+            f"Read it and decide:\n"
+            f"  - FIRED? Handle it, then close the card with what happened.\n"
+            f"  - Still armed and the condition is still worth watching? Say so on the card "
+            f"(a one-line status-update is enough) and leave it armed.\n"
+            f"  - Overtaken by events, or the thing it watched is gone? Stand it down and "
+            f"discard it with the reason.\n\n"
+            f"The card:\n{_cond}",
+            guard=f"watch:{r['id']}")
+        fired += 1
+    if fired:
+        slog(f"[watch] asked {fired} lane(s) to evaluate an armed watch/tripwire")
 
 
 def _age_archive_sweep():
@@ -32878,7 +32965,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.414';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.416';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54144,7 +54231,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.414';
+const CACHE = 'amux-v0.9.416';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -65662,6 +65749,11 @@ def main():
     # few file writes for non-Claude lanes only (currently 1 of 41), so 10
     # minutes costs nothing and closes the window.
     schedule_job(_refresh_provider_memory_all, interval=600,               name="provider_memory",    initial_delay=20)
+    # Armed watch/tripwire cards get asked, on a cadence, whether they fired.
+    # Hourly job, but at most one review per card per AMUX_WATCH_REVIEW_HOURS
+    # and one card per lane per pass — the population is 3, so this is nearly
+    # free; the cadence exists so it stays cheap if it grows.
+    schedule_job(_watch_review_sweep,          interval=3600,              name="watch_review",       initial_delay=90)
     # Hourly tick, but self-limited to one digest per session per UTC day.
     schedule_job(_board_doing_digest,       interval=3600,               name="board_doing_digest", initial_delay=900)
     schedule_job(_validate_api_key_job,     interval=300,                name="key_validate",       initial_delay=10)
