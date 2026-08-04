@@ -27,6 +27,28 @@ better as models get better at tool use, and it was wired to nothing.
 point nobody is enrolled in is decoration. Prefer opt-OUT over opt-IN for anything
 that expands what a session can do.
 
+**The code that makes something cheap can be the same code that makes it
+unreachable** (amux + amux-cloud, 2026-08-03). The `watch` type was excluded from
+auto-pickup and from rot detection, both correctly: a dormant card should not eat a
+lane's WIP-1 budget or be force-advanced. But those two exclusions were the only
+things that ever surfaced a card, so an armed watch became findable solely by
+scrolling past it — no view, no evaluator, and the pickup query's own comment
+promising "a human or the firing event moves it" while no firing event existed. Three
+were already inert, including the follow-up to the incident that motivated the type;
+one lane had restored and re-armed its card and been unmonitored since. The type
+promised monitoring and delivered a note.
+
+So **exemption lists deserve the same "who receives this by default" question as
+feature flags.** When you exempt something from a loop, name what still reaches it. If
+the answer is nothing, the exemption did not make it cheap, it made it invisible.
+
+The trap nests, which is how you know it is structural rather than a slip: the fix
+(`is:armed`) ran on a payload filtered to `archived=0`, and so did the review sweep
+built alongside it — so three ARCHIVED armed watches remained invisible to both the
+view meant to expose them and the sweep meant to fire them. Two independent authors,
+same blind spot, one layer down. After adding a surfacing mechanism, ask what the
+mechanism itself filters out.
+
 ## 2. Are you calling the model for something you could just compute?
 
 Getting out of the model's way is not the same as calling it more often.
