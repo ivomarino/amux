@@ -142,6 +142,20 @@ every function called, and inspect the callers.
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
 
+**Record which hypotheses are DEAD, not only which one was right.** A root-cause card
+that names the live cause is worth less than one that also names what was ruled out,
+because the ruled-out theories are the ones the next person will independently re-run.
+amux-cloud's AC-194 carried two of their own disproved theories — reviewer-routing
+returning first (only 2 of 19 cards carried a reviewer) and a wrong sort order (real, but
+a follow-on hazard rather than the cause) — and explicitly superseded an earlier note
+where they had reported the first as likely. That is what stopped the ordering bug being
+mistaken for the fix, and stopped a third session re-measuring reviewer routing at 1am.
+The same applies to a hypothesis that was WRONG BUT SPECIFIC: creative-dna's "the list
+serializer chokes on a legacy row" was false, and ruling it out required comparing both
+read paths — which is where the actual defect (one path scoped, one not) was sitting. A
+vague correct suspicion would not have produced that. Kill hypotheses in writing; a dead
+one is evidence, not embarrassment.
+
 **A filter that silently matches EVERYTHING is the same defect as one that matches
 nothing — except it returns a confident wrong answer instead of silence.**
 `interaction_log.ts` is in MILLISECONDS. Two sessions the same evening wrote
