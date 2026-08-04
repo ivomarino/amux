@@ -33120,7 +33120,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.418';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.419';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54386,7 +54386,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.418';
+const CACHE = 'amux-v0.9.419';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58979,6 +58979,55 @@ class CCHandler(BaseHTTPRequestHandler):
                         # was the one action leaving no trace, while claiming otherwise.
                         # An unauditable bypass that says it is audited is worse than an
                         # honest one, because it is trusted.
+                        # CROSS-LANE DESTRUCTION REQUIRES AN AUTHORIZER (AMUX-2283).
+                        # AMUX-2246 discarded 7 cards in one second; 5 belonged to
+                        # other lanes, one of them ts-gke's LIVE watch. The
+                        # operation was genuinely authorized — Ethan asked for it
+                        # twice — but the authorization lived only in chat, so the
+                        # ledger showed an unattributed process destroying five
+                        # sessions' work and a reviewer could not tell authorized
+                        # from runaway. Force answered "who did it"; this answers
+                        # "on whose word".
+                        #
+                        # Deliberately NOT volume-based. There is no bulk endpoint
+                        # — that clear was N individual PATCHes — so a burst
+                        # detector would need a threshold, and a threshold below
+                        # the baseline is not a detector. The property that made
+                        # it concerning is per-card and exact: a SESSION
+                        # terminating a card it does not own. A human caller
+                        # (X-Amux-User-Email, or the dashboard) is self-
+                        # authorizing; a lane closing its own card is untouched.
+                        _dest_new = _status_canon(body.get("status") or "") if "status" in body else ""
+                        _is_destructive = (_dest_new == "discarded"
+                                           or bool(body.get("archived")))
+                        _caller_sess = (self.headers.get("X-Amux-Session", "") or "").strip()
+                        _caller_human = (self.headers.get("X-Amux-User-Email", "") or "").strip()
+                        _owner = (gate_item.get("session") or "").strip()
+                        if (_is_destructive and _caller_sess and not _caller_human
+                                and _owner and _owner != _caller_sess
+                                and not str(body.get("authorized_by") or "").strip()):
+                            return self._json({
+                                "error": "cross-lane destruction requires authorized_by",
+                                "why": (f"{_caller_sess} is discarding/archiving {bid}, which belongs "
+                                        f"to {_owner}. The ledger records who ACTED; it must also "
+                                        f"record on whose word, or a later reviewer cannot tell an "
+                                        f"authorized sweep from a runaway one."),
+                                "how": ('add {"authorized_by": "<who asked>"} — a human name, or the '
+                                        'session that requested it. If nobody asked, do not do it: '
+                                        'ask the owning lane, or file a card against it.'),
+                                "card_owner": _owner,
+                            }, 400)
+                        if _is_destructive and str(body.get("authorized_by") or "").strip():
+                            _auth = str(body["authorized_by"]).strip()[:80]
+                            _ilog("board", "authorized_destroy",
+                                  actor=_caller_sess or _caller_human or "unattributed",
+                                  target=bid, ok=True,
+                                  detail={"authorized_by": _auth, "owner": _owner,
+                                          "to": _dest_new or "archived",
+                                          "title": (gate_item.get("title") or "")[:120]})
+                            _append_board_log(bid, f"{'discarded' if _dest_new == 'discarded' else 'archived'} "
+                                                   f"on the authority of {_auth} "
+                                                   f"(by {_caller_sess or _caller_human or 'unattributed'})")
                         if body.get("force") and not (
                                 (self.headers.get("X-Amux-Session", "") or "").strip()
                                 or (self.headers.get("X-Amux-User-Email", "") or "").strip()):
