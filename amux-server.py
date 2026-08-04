@@ -11494,7 +11494,17 @@ def _needsyou_digest():
         rows = db.execute(
             "SELECT i.id, i.title, i.session, i.desc, t.added_at FROM issues i "
             "JOIN issue_tags t ON t.issue_id = i.id "
-            "WHERE deleted IS NULL AND COALESCE(i.archived,0)=0 "
+            # NO archived filter — the same contract line that governs the
+            # re-nag governs this: "needs:you cards remain visible to Focus
+            # even when archived". Archiving clears WORK, not an ask.
+            #
+            # This filter was here, and it made the owner's digest reach 2 of
+            # 94 open asks. FOURTH instance of one pattern in one night — after
+            # is:armed, the watch sweep and the advance re-nag — and I wrote it
+            # into new code hours AFTER committing the ethos rule describing it.
+            # Knowing the rule is not the same as running the check; the check
+            # is "list what this filter EXCLUDES and see if you meant to".
+            "WHERE deleted IS NULL "
             "AND lower(t.tag) LIKE 'needs:you%' "
             "AND i.status NOT IN ('done','verified','discarded') "
             "ORDER BY t.added_at ASC").fetchall()
@@ -11519,11 +11529,19 @@ def _needsyou_digest():
         for ln in reversed((r["desc"] or "").splitlines()):
             if ln.strip().lower().startswith(("needs you:", "ask:", "question:", "blocked on")):
                 _ask = ln.strip()[:120]; break
-        lines.append(f"• {r['id']} ({r['session'] or 'unowned'}): {(r['title'] or '')[:70]}"
+        _age = ""
+        try:
+            _age = f"{int((time.time() - float(r['added_at'])) / 86400)}d "
+        except Exception:
+            pass
+        lines.append(f"• {_age}{r['id']} ({r['session'] or 'unowned'}): {(r['title'] or '')[:70]}"
                      + (f"\n    {_ask}" if _ask else ""))
     more = f"\n(+{len(fresh) - 12} more)" if len(fresh) > 12 else ""
     body = "\n".join(lines) + more
-    title = (f"{len(fresh)} thing(s) waiting on you"
+    # Oldest first, and say the depth. A 33-day-old ask is the actionable one;
+    # burying it under whatever happened to be tagged most recently is how a
+    # digest becomes noise.
+    title = (f"{len(fresh)} things waiting on you (oldest {int((time.time() - float(fresh[0]['added_at']))/86400)}d)"
              if len(fresh) > 1 else "1 thing waiting on you")
     try:
         _web_push_send_all(title, body, tag="needsyou", url="/#bq=is%3Aneedsyou")
@@ -33325,7 +33343,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.426';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.427';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54636,7 +54654,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.426';
+const CACHE = 'amux-v0.9.427';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
