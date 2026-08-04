@@ -11538,11 +11538,25 @@ def _needsyou_digest():
                      + (f"\n    {_ask}" if _ask else ""))
     more = f"\n(+{len(fresh) - 12} more)" if len(fresh) > 12 else ""
     body = "\n".join(lines) + more
+    # BACKLOG DISCHARGE vs a day's asks (amux-cloud, AC-197 — the valid half of
+    # that card). The first run after the archived filter came off reclassified
+    # a 20-day-old backlog as "newly blocked since the last digest" and titled
+    # it "94 things waiting on you", which reads as 94 things that happened.
+    # A digest's failure mode is not silence, it is being unreadable — and an
+    # urgent-sounding count attached to a month-old backlog is the same defect
+    # in a different direction. Say which kind of message this is.
+    _backlog = len(fresh) > 20
     # Oldest first, and say the depth. A 33-day-old ask is the actionable one;
     # burying it under whatever happened to be tagged most recently is how a
     # digest becomes noise.
-    title = (f"{len(fresh)} things waiting on you (oldest {int((time.time() - float(fresh[0]['added_at']))/86400)}d)"
-             if len(fresh) > 1 else "1 thing waiting on you")
+    _oldest_d = int((time.time() - float(fresh[0]["added_at"])) / 86400)
+    if _backlog:
+        title = (f"BACKLOG: {len(fresh)} asks waiting on you, oldest {_oldest_d}d "
+                 f"— not new, surfacing now")
+    elif len(fresh) > 1:
+        title = f"{len(fresh)} things waiting on you (oldest {_oldest_d}d)"
+    else:
+        title = "1 thing waiting on you"
     try:
         _web_push_send_all(title, body, tag="needsyou", url="/#bq=is%3Aneedsyou")
     except Exception as e:
@@ -11563,7 +11577,15 @@ def _needsyou_digest():
     for r in fresh:
         _emit_event(r["session"] or "", "needsyou.digested", {"issue": r["id"]},
                     idem=f"needsyou.digested:{r['id']}", source="needsyou-digest")
-    slog(f"[needsyou-digest] told the owner about {len(fresh)} newly-blocked card(s) — {_sms_note}")
+    # State what was SENT, not just what was eligible. "told the owner about 92
+    # newly-blocked card(s)" described the delta while the message enumerated 12
+    # with a "(+80 more)" tail — and a reviewer reasonably read the log as a
+    # 92-card SMS and filed it as an unbounded-send defect (AC-197). The cap was
+    # there; the instrument was not describing the artifact. A log line about a
+    # message should be checkable against the message.
+    slog(f"[needsyou-digest] owner digest: enumerated {len(lines)} of {len(fresh)} "
+         f"eligible ask(s){' [BACKLOG-DISCHARGE]' if _backlog else ''}, "
+         f"{len(body)} chars — {_sms_note}")
 
 
 def _watch_review_sweep():
@@ -33356,7 +33378,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.428';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.429';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54667,7 +54689,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.428';
+const CACHE = 'amux-v0.9.429';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
