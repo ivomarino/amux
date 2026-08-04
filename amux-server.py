@@ -7136,6 +7136,19 @@ def _steer_guard_stale(name: str, guard: str):
         if _status_canon(it.get("status")) != "done":
             return True, f"{cid} left done before delivery ({it.get('status')})"
         return False, ""
+    if guard.startswith("sched:"):
+        # Drop a failure nudge if the schedule has since run clean — the same
+        # delivery-time revalidation the dep:/watch: guards use.
+        sid = guard[6:]
+        try:
+            row = get_db().execute(
+                "SELECT status FROM schedule_runs WHERE schedule_id=? ORDER BY ran_at DESC LIMIT 1",
+                (sid,)).fetchone()
+            if row and row["status"] == "ok":
+                return True, f"{sid} has since run clean"
+        except Exception:
+            pass
+        return False, ""
     if guard.startswith("watch:"):
         # Same lesson as dep: — a watch closed or stood down while its review
         # nudge waited must not be announced as still armed.
@@ -13457,10 +13470,36 @@ def _run_schedule(sched, source: str = "cron"):
                 _act = "alert" if r.returncode != 0 else "noop"
             if _act == "alert" or (_act == "" and r.returncode != 0 and _amap):
                 status = "error"
-                note = (r.stderr or r.stdout or f"exit {r.returncode}")[:500]
+                _reason = (r.stderr or r.stdout or f"exit {r.returncode}")[:500]
+                # STAMP THE ACTION IN THE NOTE (mvs-infra, 2026-08-04). Only the
+                # noop/log branch marked itself, so an alert-dispatched run was
+                # byte-identical in the record to a generic shell failure. That
+                # is why they read "no action marker on exit-1 runs" as dispatch
+                # being bypassed — the dispatch ran; the instrument could not say
+                # so. Their conclusion was the only one the data supported.
+                note = f"exit {r.returncode} [{_act or 'alert-default'}] {_reason}"[:500]
                 _push_alert("schedule", sched.get("session") or "",
-                            f"'{sched['title']}' exit {r.returncode}: {note[:160]}")
-                slog(f"[sched] ALERT '{sched['title']}' exit {r.returncode}: {note[:120]}")
+                            f"'{sched['title']}' exit {r.returncode}: {_reason[:160]}")
+                # WAKE THE OWNING LANE. _push_alert writes an SSE blip and a Web
+                # Push broadcast — and push_subscriptions is EMPTY, so on this
+                # deployment "alert" reached nobody at all. mvs-infra logged 5
+                # exit-1 runs and zero wakes, which is exactly correct: the
+                # action named "alert" alerted no one. A schedule owned by a lane
+                # should tell that lane, at its next turn boundary, which is the
+                # one channel that provably reaches a session.
+                _owner = (sched.get("session") or "").strip()
+                if _owner and is_running(_owner):
+                    _steer_enqueue(_owner,
+                        f"[amux] SCHEDULE FAILED — '{sched['title']}' ({sched['id']}) "
+                        f"exited {r.returncode}.\n\n{_reason[:600]}\n\n"
+                        f"This is the `alert` exit action on your schedule. Investigate, fix, "
+                        f"or change the schedule's exit_actions if a non-zero exit is expected "
+                        f"here. If this is noise, say so on a card rather than silencing it "
+                        f"quietly — a schedule that alerts on a normal exit trains you to "
+                        f"ignore the channel.",
+                        guard=f"sched:{sched['id']}")
+                slog(f"[sched] ALERT '{sched['title']}' exit {r.returncode} "
+                     f"(woke {_owner or 'nobody — no owning session'}): {_reason[:120]}")
             elif _act in ("noop", "log") or (_amap and r.returncode == 0):
                 status = "ok"
                 note = ((f"exit {r.returncode} [{_act or 'ok'}] " if _act else "")
@@ -33397,7 +33436,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.430';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.431';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54708,7 +54747,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.430';
+const CACHE = 'amux-v0.9.431';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
