@@ -33200,7 +33200,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.420';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.421';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -36977,6 +36977,11 @@ function _cmdHistItemHTML(e) {
   const origin = typeof e === 'string' ? '' : (e.origin || '');
   const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
   const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Highlight the active PEEK message search (Ethan: "all search should have
+  // highlighting to show where it is"). Read from the input rather than a
+  // global, because this row builder is shared by the peek list and there is
+  // no per-render query argument threaded through it.
+  const _mq = (document.getElementById('peek-messages-search') || {}).value || '';
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
   const kind = _msgKind(e);
   const km = _MSG_KIND[kind] || _MSG_KIND.human;
@@ -36994,7 +36999,7 @@ function _cmdHistItemHTML(e) {
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
   const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
   const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
-  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_linkifyCardIds(safe)}</div>${copyBtn}${speakBtn}${locate}</div>`;
+  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div>${copyBtn}${speakBtn}${locate}</div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -37087,7 +37092,7 @@ function _peekMessagesRender() {
   if (q) pending = pending.filter(p => p.text.toLowerCase().includes(q));
   const pendingHTML = pending.map(p => {
     const ts = p.ts ? new Date(p.ts).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
-    const safe = p.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safe = _hlSearch(p.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'), q);
     return `<div style="padding:8px 12px;background:rgba(210,153,34,0.07);border:1px solid rgba(210,153,34,0.45);border-radius:6px;font-size:0.85rem;color:var(--text);display:flex;gap:10px;align-items:flex-start;">
       <div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">
         <div style="margin-bottom:4px;"><span style="display:inline-block;font-size:0.7rem;padding:1px 6px;border-radius:3px;background:rgba(210,153,34,0.16);color:#d29922;margin-right:6px;">&#x23F3; pending${p.kind==='steer'?' &middot; queue':''}</span><span style="color:var(--dim);font-size:0.7rem;">${ts} &mdash; not yet delivered${online?', sending soon':', waiting for connection'}</span></div>
@@ -44532,7 +44537,14 @@ function _issueRowHTML(item, opts) {
   return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
     dot +
     '<span class="peek-issue-key">' + esc(item.id) + '</span>' +
-    '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</span>' +
+    // The PEEK query, not the global board query. This read boardSearchQuery,
+    // so typing in a session's Board tab highlighted nothing — the search
+    // filtered correctly and looked broken, which is the failure Ethan
+    // reported for messages, sitting one tab over.
+    '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title),
+        (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
+          ? _peekIssuesQuery
+          : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '')) + '</span>' +
     '<span class="peek-issue-meta">' + badge + due + '</span>' +
     '</div>';
 }
@@ -44554,7 +44566,11 @@ function _renderBoardCard(item) {
   h += '<div class="board-card-title">';
   if (boardViewMode === 'session') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
-  if (firstLine) h += '<div class="board-card-desc">' + esc(firstLine) + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
+  // The board query matches DESC as well as title, so a desc-only hit showed a
+  // card with nothing highlighted and no visible reason for being in the
+  // results. Same class as the peek-board wrong-query bug: the filter was
+  // right and the feedback was missing.
+  if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
   if (boardViewMode !== 'session' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
   if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + esc(item.shepherd) + '</span>';
@@ -54495,7 +54511,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.420';
+const CACHE = 'amux-v0.9.421';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
