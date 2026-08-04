@@ -5694,6 +5694,7 @@ def _session_rate_limit_resume_text(cfg: dict) -> str:
 # where the prompt was injected via tmux send-keys without Enter and
 # stayed pinned in the input area.
 _RATE_LIMIT_COOLDOWN = 10
+_RATE_LIMIT_CREDIT_RECHECK_S = 120
 _RATE_LIMIT_DRIFT_TOLERANCE = 30  # seconds; reset times closer than this are "in sync"
 _RATE_LIMIT_DRIFT_LOG_COOLDOWN = 600  # don't repeat the drift warning more than every 10 min
 _rate_limit_last_responded: dict = {}
@@ -5856,6 +5857,10 @@ def _rate_limit_auto_respond():
             if _existing_actions:
                 _ra = _existing_actions.get("rate_limit_reset_at")
                 if _ra and _ra > now and not _existing_actions.get("rate_limit_credits"):
+                    continue
+                if (_existing_actions.get("rate_limit_credits")
+                        and now - _existing_actions.get("rate_limit_last_event_ts", 0)
+                        < _RATE_LIMIT_CREDIT_RECHECK_S):
                     continue
             # SCAN DEMOTION for self-reporting lanes (Ethan: do all 4, #1;
             # D1-exit step). A lane whose hooks reported state within the
@@ -6127,6 +6132,7 @@ def _rate_limit_auto_respond():
             if is_banner or is_credit:
                 _rate_limit_last_responded[name] = now  # cooldown; nothing to press
             actions = _session_auto_actions.setdefault(name, {})
+            _was_credit = bool(actions.get("rate_limit_credits"))
             actions["rate_limit_weekly"] = is_weekly
             actions["rate_limit_banner"] = is_banner
             actions["rate_limit_credits"] = is_credit
@@ -6145,13 +6151,14 @@ def _rate_limit_auto_respond():
                 actions["rate_limit_last_event_ts"] = int(now)
                 actions.pop("rate_limit_reset_at", None)
                 actions.pop("rate_limit_reset_at_fallback", None)
-                slog(f"[rate-limit] session={name} model/credit limit "
-                     f"(model={actions['rate_limit_model_name']!r}) — no reset, "
-                     f"needs model switch or credit top-up")
-                _posthog_emit("rate_limit_model_credit", {
-                    "session": name,
-                    "model": actions["rate_limit_model_name"],
-                }, distinct_id=name)
+                if not _was_credit:
+                    slog(f"[rate-limit] session={name} model/credit limit "
+                         f"(model={actions['rate_limit_model_name']!r}) — no reset, "
+                         f"needs model switch or credit top-up")
+                    _posthog_emit("rate_limit_model_credit", {
+                        "session": name,
+                        "model": actions["rate_limit_model_name"],
+                    }, distinct_id=name)
                 continue
             actions.pop("rate_limit_credits", None)
             actions.pop("rate_limit_model_name", None)
