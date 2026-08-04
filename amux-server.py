@@ -11083,6 +11083,24 @@ def _validate_depends_on(dep, self_id: str):
     the same consequence: the autonomy loop treats a card with no depends_on as
     pickable, so the dependency edge the caller asked for simply did not exist.
     Accepting a field and dropping it is worse than rejecting it."""
+    # Accept a JSON-encoded string as well as a list (general-canvas-apps,
+    # 2026-08-03). The field did not ROUND-TRIP: write required an array, the
+    # list endpoint returned a string, and PATCHing that value straight back
+    # 400'd. "Fetch a card, change one thing, PATCH it back" is the most
+    # ordinary shape there is, and it failed on this field alone, loudly, in
+    # someone else's code with no obvious cause.
+    #
+    # The read side is now fixed too (_load_board decodes it), so this is
+    # belt-and-braces rather than the primary fix — but a client holding a
+    # value fetched before that change, or read from the DB, still round-trips
+    # instead of hitting a 400 it cannot diagnose. An API that rejects its own
+    # output is a bug regardless of which side you correct.
+    if isinstance(dep, str):
+        try:
+            dep = json.loads(dep or "[]")
+        except Exception:
+            return None, ("depends_on must be a list of card ids (or a JSON-encoded "
+                          f"list); could not parse {dep[:60]!r}")
     if not isinstance(dep, list):
         return None, "depends_on must be a list of card ids"
     dep = [str(x).strip() for x in dep if str(x).strip()]
@@ -12334,6 +12352,33 @@ def _load_board(done_limit: int = 100) -> list:
             item["gate"] = json.loads(g) if g else []
         except Exception:
             item["gate"] = []
+        # depends_on is decoded HERE too, not only on the single-card path
+        # (general-canvas-apps, 2026-08-03). The column is TEXT holding JSON —
+        # correct for SQLite — and /api/board/<id> decoded it while /api/board
+        # handed back the raw string. Same field, same server, different TYPE
+        # depending on which endpoint you called, and the contract documents it
+        # as a list.
+        #
+        # The failure mode is the bad kind: len() on '["MG-1387"]' returns 11,
+        # and iterating yields characters. Both produce a plausible NUMBER
+        # rather than an error, so a consumer tested against the single-card
+        # path and run against the list path is quietly wrong. It already
+        # caught a peer mid-verification — "BACKE-3088 -> 11 dep(s)" is
+        # unremarkable enough to ship, and only a neighbouring card reading 128
+        # made them look.
+        #
+        # amux's own _deps_blocking survived it by defensively re-parsing
+        # strings, which is precisely why nobody noticed: the defensive branch
+        # masked the inconsistency for the one consumer that mattered while
+        # every other consumer got characters.
+        d = item.get("depends_on")
+        if isinstance(d, str):
+            try:
+                item["depends_on"] = json.loads(d) if d else []
+            except Exception:
+                item["depends_on"] = []
+        elif d is None:
+            item["depends_on"] = []
         # Cheap staleness flag (in-progress card on a non-working session, untouched
         # for a while) so the UI can surface it; uses the cached session-status view.
         if _board_item_stale(item, _now):
@@ -33223,7 +33268,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.423';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.425';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54534,7 +54579,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.423';
+const CACHE = 'amux-v0.9.425';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
