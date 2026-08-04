@@ -3460,6 +3460,7 @@ _session_auto_actions: dict = {} # {name: {"last_compact": ts, "last_restart": t
 # report outranks the pane scrape; a stale one falls through to it. The scrapers
 # stay as the fallback for crashes, subagents, and providers without hooks.
 _session_reported: dict = {}   # name -> {"state": ..., "detail": ..., "ts": epoch}
+_scrape_vs_report: dict = {}   # name -> last scrape/hook disagreement (ethos #4)
 
 
 def _persist_session_reports() -> None:
@@ -15589,7 +15590,21 @@ def list_sessions() -> list:
                 # A fresh self-report from the harness's own hooks beats pane
                 # inference — the hook KNOWS the turn ended; the regex guesses.
                 _rep = _session_reported.get(name)
-                if _rep and (time.time() - _rep.get("ts", 0)) < _SELF_REPORT_FRESH_S                         and _rep.get("state") in ("active", "idle", "waiting"):
+                # ASYMMETRIC FRESHNESS — the same reasoning as the scan demotion, which
+                # I applied there and not here. An `idle` report does NOT decay: the only
+                # exit from idle is a prompt, and every prompt fires UserPromptSubmit. A
+                # flat 25s window meant sherpa's 44-minute-old stop-hook `idle` was
+                # discarded and a misfiring regex won the tie. We HAVE the event; we were
+                # throwing it away and then guessing. active/waiting still decay on the
+                # short window, because those really do go stale on their own.
+                if _rep and _rep.get("state") in ("active", "idle", "waiting") \
+                        and _hooks_live(_rep, time.time()):
+                    if status != _rep["state"] and _rep["state"] == "idle":
+                        # Record the disagreement instead of resolving it silently: if
+                        # hooks ever break mid-turn, this is the line that explains a
+                        # lane stuck on idle (ethos #4).
+                        _scrape_vs_report[name] = {"scrape": status, "report": "idle",
+                                                   "ts": time.time()}
                     status = _rep["state"]
             # Detect session becoming idle → auto-complete board issue, then pick up next queued task
             prev = _session_prev_status.get(name)
@@ -33568,7 +33583,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.438';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.439';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54903,7 +54918,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.438';
+const CACHE = 'amux-v0.9.439';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
