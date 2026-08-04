@@ -33449,7 +33449,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.432';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.433';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44229,11 +44229,20 @@ function _bqIs(item, val, ix) {
 
 function _bqMatch(item, ast, ix) {
   for (const { t, neg } of ast.text) {
-    const hit = (item.title || '').toLowerCase().includes(t)
-      || (item.desc || '').toLowerCase().includes(t)
-      || (item.id || '').toLowerCase().includes(t)
-      || (item.session || '').toLowerCase().includes(t)
-      || (item.tags || []).some(x => x.toLowerCase().includes(t));
+    // EVERY field (Ethan, 2026-08-04). This covered 5; a card carries far more
+    // that a person searches by — who is reviewing it, who created it, what
+    // type it is, what it depends on, and the History, which is where the
+    // actual story of a card lives. Cheap: a client-side scan over the loaded
+    // set, and the payload already carries these.
+    const _hay = [
+      item.title, item.desc, item.id, item.session, item.status, item.type,
+      item.shepherd, item.reviewer, item.creator, item.source_ref, item.log,
+      item.due, item.gate_note,
+      ...(item.tags || []),
+      ...(Array.isArray(item.depends_on) ? item.depends_on : []),
+      ...(Array.isArray(item.gate) ? item.gate : []),
+    ];
+    const hit = _hay.some(v => v && String(v).toLowerCase().includes(t));
     if (hit === neg) return false;
   }
   for (const { key, vals, neg } of ast.terms) {
@@ -44267,8 +44276,13 @@ function _bqMatch(item, ast, ix) {
 function _bqWantsArchived(q) {
   return /(^|\s)-?is:(\S*,)?archived\b/i.test(String(q || ''));
 }
+// A bare card id in the query ("AMUX-2246") means "find me THAT card", not
+// "find it only if it happens to be un-archived". 97% of the board is archived,
+// so searching an id returned nothing for almost every card that exists — which
+// reads as search being broken for ids rather than as a visibility default.
+const _BQ_ID_RE = /\b[a-z][a-z0-9]*-\d+\b/i;
 function _bqHideArchived(items, q) {
-  if (!_bqWantsArchived(q)) return items.filter(i => !i.archived);
+  if (!_bqWantsArchived(q) && !_BQ_ID_RE.test(String(q || ''))) return items.filter(i => !i.archived);
   // The ONE place that decides archived visibility is also the right place to
   // make sure the data exists (AMUX-2271). Asking for archived is what loads
   // it; the fetch re-renders when it lands. Hooking the trigger anywhere else
@@ -54760,7 +54774,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.432';
+const CACHE = 'amux-v0.9.433';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
