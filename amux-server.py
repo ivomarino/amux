@@ -33200,7 +33200,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.421';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.422';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54511,7 +54511,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.421';
+const CACHE = 'amux-v0.9.422';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -59150,7 +59150,28 @@ class CCHandler(BaseHTTPRequestHandler):
                         _caller_sess = (self.headers.get("X-Amux-Session", "") or "").strip()
                         _caller_human = (self.headers.get("X-Amux-User-Email", "") or "").strip()
                         _owner = (gate_item.get("session") or "").strip()
-                        if (_is_destructive and _caller_sess and not _caller_human
+                        # The human exemption is honoured ONLY when there is no
+                        # X-Amux-Session (amux-cloud, adversarial review of this
+                        # guard). The first version exempted any caller asserting
+                        # X-Amux-User-Email — and a session can set that header
+                        # itself, so the guard was forgeable by exactly the caller
+                        # it excluded, silently: 200, card discarded, ZERO
+                        # authorized_destroy rows. The ledger looked identical to
+                        # before the guard shipped, which is the condition 4429ed8
+                        # existed to remove.
+                        #
+                        # The trust differs by TOPOLOGY, which is why this is not
+                        # just a bug. gateway.py stamps X-Amux-User-Email on
+                        # forwarded requests, so in cloud a container cannot forge
+                        # it. Locally there is no gateway and any caller asserts
+                        # it — and local is where the fleet runs and where
+                        # AMUX-2246 happened. Only X-Amux-Session is stamped
+                        # server-side per tmux. A real dashboard call carries no
+                        # session header; a session forging the email still
+                        # carries its own, so absence of the session header is the
+                        # honest discriminator in BOTH topologies.
+                        _human_exempt = bool(_caller_human and not _caller_sess)
+                        if (_is_destructive and _caller_sess
                                 and _owner and _owner != _caller_sess
                                 and not str(body.get("authorized_by") or "").strip()):
                             return self._json({
@@ -59164,6 +59185,17 @@ class CCHandler(BaseHTTPRequestHandler):
                                         'ask the owning lane, or file a card against it.'),
                                 "card_owner": _owner,
                             }, 400)
+                        if (_is_destructive and _human_exempt and _owner
+                                and not str(body.get("authorized_by") or "").strip()):
+                            # The hatch is open, so it is logged — the standard
+                            # force is now held to. An unaudited exemption gets
+                            # trusted precisely because it leaves no trace.
+                            _ilog("board", "exempt_destroy", actor=_caller_human,
+                                  target=bid, ok=True,
+                                  detail={"asserted_email": _caller_human, "owner": _owner,
+                                          "to": _dest_new or "archived",
+                                          "why": "human caller, no session header",
+                                          "title": (gate_item.get("title") or "")[:120]})
                         if _is_destructive and str(body.get("authorized_by") or "").strip():
                             _auth = str(body["authorized_by"]).strip()[:80]
                             _ilog("board", "authorized_destroy",
