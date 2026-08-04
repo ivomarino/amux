@@ -7141,7 +7141,20 @@ def _steer_guard_stale(name: str, guard: str):
         # delivery-time revalidation the dep:/watch: guards use.
         sid = guard[6:]
         try:
-            row = get_db().execute(
+            db = get_db()
+            # DELETED or DISABLED schedules first. I wrote this guard checking
+            # only "has it since run clean" and then proved the gap with my own
+            # fixture: I deleted the test schedule, and its failure nudge still
+            # delivered — announcing a failure of something that no longer
+            # exists. The dep: guard already checks non-existence; I applied the
+            # lesson to the operand that burned me and not to the new one, which
+            # is the exact habit-transfer failure in ethos rule 7.
+            srow = db.execute("SELECT deleted, enabled FROM schedules WHERE id=?", (sid,)).fetchone()
+            if not srow or srow["deleted"]:
+                return True, f"{sid} no longer exists"
+            if not srow["enabled"]:
+                return True, f"{sid} disabled before delivery"
+            row = db.execute(
                 "SELECT status FROM schedule_runs WHERE schedule_id=? ORDER BY ran_at DESC LIMIT 1",
                 (sid,)).fetchone()
             if row and row["status"] == "ok":
@@ -33436,7 +33449,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.431';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.432';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54747,7 +54760,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.431';
+const CACHE = 'amux-v0.9.432';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
