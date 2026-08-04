@@ -33449,7 +33449,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.433';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.434';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44431,7 +44431,17 @@ function _bqFilter(items, q) {
   const ast = _bqParse(s);
   if (!ast.terms.length && !ast.text.length) return items;
   const ix = _bqSessionIndex();
-  return items.filter(i => _bqMatch(i, ast, ix));
+  const out = items.filter(i => _bqMatch(i, ast, ix));
+  // If the query names a card exactly, that card goes first. Searching an id
+  // also matches every card that REFERENCES it (desc, History), which is
+  // usually wanted — but not at the cost of burying the card you typed.
+  const _idm = s.match(_BQ_ID_RE);
+  if (_idm) {
+    const want = _idm[0].toLowerCase();
+    out.sort((a, b) => ((b.id || '').toLowerCase() === want ? 1 : 0)
+                     - ((a.id || '').toLowerCase() === want ? 1 : 0));
+  }
+  return out;
 }
 
 // ── Saved views ────────────────────────────────────────────────────────────
@@ -54774,7 +54784,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.433';
+const CACHE = 'amux-v0.9.434';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
