@@ -11238,6 +11238,77 @@ def _deps_blocking(item) -> list:
         return []
 
 
+# Why did pickup decline for this lane? (Ethan, 2026-08-04.) He screenshotted a
+# board showing 4 todos on an IDLE session and asked why nothing moved. Answering
+# it required reading the pickup source, because every refusal was a bare
+# `return`. A loop that silently does nothing is indistinguishable from a loop
+# that is broken, from a loop that has nothing to do — and the actual cause was
+# an archived card holding WIP, which the board deliberately hides. Ethos #4:
+# when this goes wrong, what will someone SEE, and will they see it where they
+# already look?
+_pickup_skip: dict = {}
+
+
+def _pickup_note(session_name: str, reason: str, detail: str = "") -> None:
+    _pickup_skip[session_name] = {"reason": reason, "detail": detail, "ts": time.time()}
+
+
+_PICKUP_SWEEP_IDLE_MIN = float(os.environ.get("AMUX_PICKUP_SWEEP_IDLE_MIN", "10"))
+_pickup_sweep_last: dict = {}
+
+
+def _pickup_level_sweep():
+    """Give work to lanes that ARE idle, not only lanes that JUST BECAME idle.
+
+    THE DEFECT (Ethan, primis, 2026-08-04): pickup fires from
+    `if status == "idle" and prev in ("active","waiting")` — an EDGE. A lane
+    already parked on a full queue never gets another edge, so it waits for a
+    transition that may never come. primis sat IDLE for 142 minutes on 3
+    pickable todos.
+
+    Edge-triggering is fragile here for a reason specific to this process: it
+    re-execs on every save of this file, which clears _session_prev_status. On
+    the next scan an idle lane has prev=None, the condition cannot match, and
+    that lane is stranded until it takes a turn for some unrelated reason. The
+    harness restarting should not decide whether a session gets work.
+
+    So: level-triggered. If a lane IS idle, has been for _PICKUP_SWEEP_IDLE_MIN,
+    holds no doing card and has pickable work, run the SAME path the edge runs.
+    Every guard still applies because it is the same function — opt-out, WIP
+    cap, agent-only, freshness, re-claim cooldown, irreversible-op refusal.
+    This changes WHEN pickup is attempted, never WHAT may be picked up."""
+    try:
+        db = get_db()
+        now = time.time()
+        for f in sorted(CC_SESSIONS.glob("*.env")):
+            name = f.stem
+            try:
+                if _session_prev_status.get(name) == "active":
+                    continue                      # mid-turn; the edge will fire
+                if now - _pickup_sweep_last.get(name, 0) < _PICKUP_SWEEP_IDLE_MIN * 60:
+                    continue
+                if not is_running(name):
+                    continue
+                _rep = _session_reported.get(name)
+                if not (_rep and _rep.get("state") == "idle"
+                        and (now - _rep.get("ts", 0)) > _PICKUP_SWEEP_IDLE_MIN * 60):
+                    continue                      # only lanes whose own harness says idle, and settled
+                n = db.execute(
+                    "SELECT COUNT(*) FROM issues WHERE session=? AND status='todo' "
+                    "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
+                    "AND COALESCE(type,'') NOT IN ('tripwire','watch')", (name,)).fetchone()[0]
+                if not n:
+                    continue
+                _pickup_sweep_last[name] = now
+                slog(f"[pickup-sweep] {name}: idle with {n} queued — attempting pickup "
+                     f"(no idle EDGE would ever fire for this lane)")
+                _pickup_next_board_task(name)
+            except Exception:
+                continue
+    except Exception as e:
+        slog(f"[pickup-sweep] failed: {e}")
+
+
 def _pickup_next_board_task(session_name: str):
     """Pick up the next queued (todo) board task for this session — OPT-IN only.
     Called when a session goes idle; moves the oldest agent todo to 'doing' and
@@ -11265,6 +11336,7 @@ def _pickup_next_board_task(session_name: str):
         # re-claim cooldown, agent-only, and the irreversible-operation refusal —
         # so what changed is enrollment, not what may be auto-run.
         if cfg.get("CC_AUTO_PICKUP", "").strip().lower() in ("0", "false", "no", "off"):
+            _pickup_note(session_name, "opted-out", "CC_AUTO_PICKUP=0 in the session env")
             return  # explicitly opted out of the autonomous loop
         time.sleep(3)
         db = get_db()
@@ -11276,6 +11348,20 @@ def _pickup_next_board_task(session_name: str):
         _doing_n = db.execute(
             "SELECT COUNT(*) FROM issues WHERE session=? AND status='doing' "
             "AND deleted IS NULL "
+            # ARCHIVED CARDS DO NOT HOLD WIP (Ethan, primis, 2026-08-04). The
+            # SELECT twenty lines below carries "AND COALESCE(archived,0)=0"
+            # with a comment saying the filter "was missing here alone" — and
+            # this COUNT, the gate that runs FIRST, never got it. So an
+            # archived `doing` card consumed a lane's entire WIP-1 budget
+            # forever, pickup returned before even looking at the queue, and
+            # the board hid the card because archived cards are hidden. The
+            # lane rendered "IN PROGRESS 0" while being structurally unable to
+            # take work.
+            #
+            # primis: PRIMI-97 (archived, doing, 1 day) blocking 3 pickable
+            # todos. Six lanes were in this state fleet-wide. Archiving means
+            # CLEARED; a cleared card cannot be in progress.
+            "AND COALESCE(archived,0)=0 "
             # Dormant types don't consume WIP (MG follow-up): an armed
             # tripwire 'costs nothing until it fires' and can never be
             # completed by working it — one held a lane's entire WIP-1
@@ -11284,6 +11370,13 @@ def _pickup_next_board_task(session_name: str):
             "AND COALESCE(type,'') NOT IN ('tripwire','watch')",
             (session_name,)).fetchone()[0]
         if _doing_n >= _wip_cap:
+            _held = db.execute(
+                "SELECT id, COALESCE(archived,0) a FROM issues WHERE session=? AND status='doing' "
+                "AND deleted IS NULL AND COALESCE(archived,0)=0 "
+                "AND COALESCE(type,'') NOT IN ('tripwire','watch') LIMIT 3", (session_name,)).fetchall()
+            _pickup_note(session_name, "wip-cap",
+                         f"holding {_doing_n}/{_wip_cap} in doing: "
+                         + ", ".join(r["id"] for r in _held))
             return
         rows = db.execute(
             "SELECT id, title, desc, log FROM issues i "
@@ -33449,7 +33542,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.434';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.437';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54784,7 +54877,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.434';
+const CACHE = 'amux-v0.9.437';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60383,6 +60476,22 @@ class CCHandler(BaseHTTPRequestHandler):
         # for whom? Answers "was this lane's pane read, or skipped?" directly,
         # so a state change hidden by demotion is diagnosable from the data we
         # keep (ethos #4) rather than inferred from silence.
+        # GET /api/debug/pickup — why is a lane idle on a full queue? Answers
+        # the question Ethan had to read source for (primis, 2026-08-04).
+        if method == "GET" and path == "/api/debug/pickup":
+            _db = get_db()
+            _out = []
+            for _n, _v in sorted(_pickup_skip.items()):
+                _q = _db.execute(
+                    "SELECT COUNT(*) FROM issues WHERE session=? AND status='todo' "
+                    "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
+                    "AND COALESCE(type,'') NOT IN ('tripwire','watch')", (_n,)).fetchone()[0]
+                _out.append({"session": _n, "reason": _v["reason"], "detail": _v["detail"],
+                             "age_s": int(time.time() - _v["ts"]), "queued_todos": _q})
+            return self._json({"note": "last reason auto-pickup declined, per lane",
+                               "wip_cap": int(os.environ.get("AMUX_MAX_DOING_PER_SESSION", "1") or 1),
+                               "lanes": _out})
+
         if method == "GET" and path == "/api/debug/scan":
             _up = max(1.0, time.time() - _scan_stats.get("since", time.time()))
             _rows = []
@@ -66462,6 +66571,10 @@ def main():
     # and one card per lane per pass — the population is 3, so this is nearly
     # free; the cadence exists so it stays cheap if it grows.
     schedule_job(_watch_review_sweep,          interval=3600,              name="watch_review",       initial_delay=90)
+    # Level-triggered pickup: lanes that ARE idle on a queue, not only lanes
+    # that just became idle. Cheap (one COUNT per lane) and every guard inside
+    # _pickup_next_board_task still applies.
+    schedule_job(_pickup_level_sweep,          interval=300,               name="pickup_sweep",       initial_delay=45)
     # The owner's channel (Ethan, 2026-08-03). Runs often; SENDS only when
     # something is newly blocked on him, so the cadence is a latency bound, not
     # a message rate.
