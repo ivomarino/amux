@@ -37,6 +37,7 @@ def _steer_record_history(*a, **k): pass
 def _emit_event(*a, **k): pass
 # Commit-guard revalidation stubs (AMUX-1737)
 DIRTY = ["amux-server.py"]           # test flips this to simulate a commit
+GUARD_ITEM = {"id": "X-1", "status": "todo", "archived": 0}   # card the dep: guard reads
 def _session_work_dir(n): return "/tmp/wd"
 def _session_dirty_files(n, w): return DIRTY
 _commit_guard_nudged = {}
@@ -62,6 +63,14 @@ ns = {
     "_commit_guard_nudged": _commit_guard_nudged,
     "slog": lambda *a, **k: None,
     "os": os,
+    # dep:ID guard dependencies (AMUX-2275). _steer_try_deliver began calling
+    # _steer_guard_stale in e8caabb; the function was neither loaded nor stubbed, so
+    # the whole module failed at COLLECTION with NameError and every assertion below
+    # stopped running. Loading the REAL guard rather than faking it means the dep:
+    # branch is covered here too, instead of only in a live specimen.
+    "_item_by_id": lambda cid: GUARD_ITEM,
+    "_status_canon": lambda s: str(s or "").lower(),
+    "_deps_blocking": lambda it: bool(it.get("_blocked")) if isinstance(it, dict) else False,
 }
 # The delivery-timing assertions below (t=4 → hold, t=8 → deliver) are written for
 # a 6s settle. Pin it so the test is independent of the code's env-tunable default
@@ -70,7 +79,7 @@ ns = {
 os.environ["AMUX_STEER_SETTLE_SECS"] = "6"
 tree = ast.parse(open(SERVER, encoding="utf-8").read())
 _want_assign = {"_STEER_SETTLE_SECS", "_STRIP_ANSI"}
-_want_func = {"_steer_try_deliver", "_has_running_subagent"}
+_want_func = {"_steer_try_deliver", "_has_running_subagent", "_steer_guard_stale"}
 for node in tree.body:
     if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) \
             and node.targets[0].id in _want_assign:
