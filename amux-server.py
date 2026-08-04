@@ -10763,6 +10763,63 @@ def _advance_open_card(session_name: str) -> bool:
         if last and (time.time() - last) < _ADVANCE_COOLDOWN:
             return False
         db = get_db()
+        # STALE-ASK CHECK, ahead of the main selection (AC-194, amux-cloud).
+        # The >3d needs:you re-nag had never executed in production: 48 cycles,
+        # 0 fires. Two independent reasons, both here rather than in the branch
+        # itself, which is why fixing the clock (AC-178) was necessary and not
+        # sufficient.
+        #   1. The main query filters COALESCE(archived,0)=0, and EVERY eligible
+        #      card is archived — 74 asks >3d, 29 in doing/review, 24 agent-owned,
+        #      0 surviving the archived filter. Third instance tonight of an
+        #      archived filter hiding cards from the loop meant to handle them.
+        #   2. ORDER BY updated DESC picks the lane's FRESHEST card, while a >3d
+        #      ask is by construction among its stalest, so it would still almost
+        #      never be selected even with archived included.
+        #
+        # The contract already decides the policy: "needs:you cards remain
+        # visible to Focus even when archived." An archived ask is deliberately
+        # still shown to the human while the loop chasing stale asks ignored it —
+        # the human keeps seeing it and the system stopped asking.
+        #
+        # Done as a SEPARATE oldest-first query rather than by loosening the main
+        # one: the main selection keeps archived=0 so cleared work can never leak
+        # back into the advance/pickup path, and ordering is fixed by
+        # construction instead of by hoping the general sort cooperates.
+        _renag_cut = time.time() - _NEEDSYOU_RENAG_DAYS * 86400
+        _stale = db.execute(
+            "SELECT i.id, i.title, i.status, i.type, COALESCE(i.archived,0) AS archived, "
+            "       MIN(t.added_at) AS asked_at "
+            "FROM issues i JOIN issue_tags t ON t.issue_id = i.id "
+            "WHERE i.session=? AND i.deleted IS NULL AND i.owner_type='agent' "
+            "AND lower(t.tag) LIKE 'needs:you%' "
+            "AND i.status NOT IN ('done','verified','discarded') "
+            "GROUP BY i.id HAVING asked_at IS NOT NULL AND asked_at < ? "
+            "ORDER BY asked_at ASC LIMIT 1", (session_name, _renag_cut)).fetchone()
+        if _stale:
+            _seen = db.execute(
+                "SELECT MAX(ts) AS t FROM session_events WHERE type='needsyou.renag' AND data LIKE ?",
+                ('%"' + _stale["id"] + '"%',)).fetchone()
+            if not (_seen and _seen["t"] and (time.time() - float(_seen["t"])) < _NEEDSYOU_RENAG_DAYS * 86400):
+                _days = int((time.time() - float(_stale["asked_at"])) / 86400)
+                _emit_event(session_name, "needsyou.renag", {"issue": _stale["id"], "days": _days},
+                            source="advance")
+                ok, err = send_text(session_name,
+                    f"[amux] {_stale['id']} has been waiting on a human answer for at least "
+                    f"{_days} days: {(_stale['title'] or '')[:90]}\n\n"
+                    + ("This card is ARCHIVED, which does NOT clear the ask — needs:you stays "
+                       "visible to the human by design.\n\n" if _stale["archived"] else "")
+                    + f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
+                    f"right: is the question you recorded still the question? If it is, re-state it "
+                    f"on the card so it resurfaces fresh. If it has been overtaken by events, clear "
+                    f"the needs:you tag and move the card to whatever is now true.",
+                    defer_if_busy=True)
+                if ok:
+                    _advance_last[session_name] = time.time()
+                    _cmd_hist_record(session_name, f"[amux] stale-ask check: {_stale['id']}",
+                                     "system", "advance")
+                    slog(f"[advance] {session_name}: {_stale['id']} needs:you for {_days}d "
+                         f"(archived={_stale['archived']}) — asked whether the ask still holds")
+                    return True
         row = db.execute(
             "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' "
@@ -33268,7 +33325,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.425';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.426';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54579,7 +54636,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.425';
+const CACHE = 'amux-v0.9.426';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
