@@ -9105,7 +9105,7 @@ You are running inside an amux-managed session. Base URL: `$AMUX_URL` (default `
 
 ```bash
 curl -sk $AMUX_URL/api/board | python3 -m json.tool            # list
-curl -sk -X POST -H 'Content-Type: application/json' \\
+curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $AMUX_SESSION" \\
   -d '{"title":"...","status":"todo","session":"'$AMUX_SESSION'"}' $AMUX_URL/api/board   # add
 amux board doing ITEM-ID   # or: done / todo / backlog (CLI shorthand)
 ```
@@ -9149,7 +9149,7 @@ Target session: the first argument. Remaining arguments are an optional note fro
    - **Gotchas** — anything non-obvious that cost you time (env quirks, failing tests, decisions already made and why).
    - The user's note, if any.
 2. If there is a board item for this work, reassign it:
-   `curl -sk -X PATCH -H 'Content-Type: application/json' -d '{"session":"TARGET"}' $AMUX_URL/api/board/ITEM-ID`
+   `curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Session: $AMUX_SESSION" -d '{"session":"TARGET"}' $AMUX_URL/api/board/ITEM-ID`
 3. Send the brief: `amux send TARGET "<the brief>"` (origin-stamped; never impersonate).
 4. Confirm to the user: what was sent, to whom, and the board item moved (if any).
 
@@ -9269,6 +9269,7 @@ print('sent to '+os.environ['TGT']+' (origin-stamped): '+str(d.get('message','ok
         done
         for id in $ids; do
           curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Session: ${AMUX_SESSION:-}" \
             -d "{\"status\":\"$sub\"$force}" "$AMUX_URL/api/board/$id" | python3 -c "
 import json,sys
 iid=sys.argv[1]
@@ -9286,6 +9287,7 @@ print(iid+' -> '+str(d.get('status','?')))
       add)
         title="$*"
         curl -sk -X POST -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: ${AMUX_SESSION:-}" \
           -d "{\"title\":\"$title\",\"status\":\"todo\",\"session\":\"${AMUX_SESSION:-}\"}" "$AMUX_URL/api/board" ;;
       list|ls|"")
         curl -sk "$AMUX_URL/api/board" | python3 -c "
@@ -15376,13 +15378,15 @@ curl -sk -X POST -H 'Content-Type: application/json' \\
 ```bash
 # Create a board issue for yourself (always include your session name)
 amux board add "Task title"   # preferred — auto-associates with $AMUX_SESSION
-# Or via curl:
+# Or via curl — X-Amux-Session is REQUIRED, or the write records as `unattributed`:
 curl -sk -X POST -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
   -d "{\"title\":\"Task title\",\"session\":\"$AMUX_SESSION\"}" \\
   $AMUX_URL/api/board
 
 # Post task for a specific session
 curl -sk -X POST -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
   -d '{"title":"Do X","session":"worker-1","owner_type":"agent","status":"todo"}' \\
   $AMUX_URL/api/board
 
@@ -15395,12 +15399,14 @@ s=os.getenv('AMUX_SESSION','')
 
 # Claim a task atomically (prevents two sessions taking same task)
 curl -sk -X POST -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
   -d '{"session":"'"$AMUX_SESSION"'"}' \\
   $AMUX_URL/api/board/TASK-ID/claim
 
-# Mark task done
+# Mark task done. desc_append, not desc — a plain desc REPLACES the card body.
 curl -sk -X PATCH -H 'Content-Type: application/json' \\
-  -d '{"status":"done","desc":"Result: ..."}' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
+  -d '{"status":"done","desc_append":"Result: ..."}' \\
   $AMUX_URL/api/board/TASK-ID
 ```
 
@@ -15863,23 +15869,35 @@ Use `curl -sk` for all amux API calls (self-signed TLS cert).
 The amux board is how all sessions track their work. Every non-trivial task
 should be reflected as a board card tagged to your session.
 
-```bash
-# List all board items
-curl -sk $AMUX_URL/api/board | python3 -c "import json,sys; [print(i['id'],i['status'],i['title'][:60]) for i in json.load(sys.stdin)]"
+PREFER THE `amux board` CLI. It stamps X-Amux-Session for you, so your writes
+are attributed; it surfaces gate rejections loudly instead of silently bouncing.
+Raw curl is the fallback, and then YOU must send the header — an unattributed
+write is recorded as `unattributed` and nobody can tell who did it.
 
-# Create a task
+```bash
+amux board ls                      # your scope, open cards only (--all adds archived)
+amux board add "Task title"        # auto-tagged to $AMUX_SESSION
+amux board doing ITEM-ID           # or: todo / review / done / verified
+amux board claim ITEM-ID           # atomically take a queued card
+amux board progress ITEM-ID "..."  # append a progress note
+amux board needsyou ITEM-ID "the exact question"   # blocked on the human
+
+# Fallback — raw curl. The header is REQUIRED on every write.
+curl -sk $AMUX_URL/api/board?slim=1&archived=0     # scan (never pull the full board)
+curl -sk $AMUX_URL/api/board/ITEM-ID               # point read before any write
+
 curl -sk -X POST -H 'Content-Type: application/json' \\
   -H "X-Amux-Session: $AMUX_SESSION" \\
   -d '{{"title":"Task title","status":"todo","session":"'$AMUX_SESSION'"}}' \\
   $AMUX_URL/api/board
 
-# Update status (todo/doing/done/verified/discarded)
 curl -sk -X PATCH -H 'Content-Type: application/json' \\
+  -H "X-Amux-Session: $AMUX_SESSION" \\
   -d '{{"status":"doing"}}' $AMUX_URL/api/board/ITEM-ID
 
-# Mark done with outcome
 curl -sk -X PATCH -H 'Content-Type: application/json' \\
-  -d '{{"status":"done","desc":"Result: what changed"}}' $AMUX_URL/api/board/ITEM-ID
+  -H "X-Amux-Session: $AMUX_SESSION" \\
+  -d '{{"status":"done","desc_append":"Result: what changed"}}' $AMUX_URL/api/board/ITEM-ID
 ```
 
 ### Board workflow
@@ -15887,7 +15905,14 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \\
 2. Create a card in `todo` or `doing` for your task
 3. Keep exactly ONE card in `doing` at a time
 4. When finished, move to `done` with a description of the outcome
-5. Gates may block status transitions -- satisfy them or pass `"force":true`
+5. Gates may block a status transition. SATISFY THE GATE, or fix the item TYPE
+   -- a card with no code should not be typed `code`, and then the merge
+   criterion never applies. Do NOT reach for `"force":true`: it bypasses the
+   whole gate system, it is logged, and it now REQUIRES attribution. This line
+   used to read "satisfy them or pass force:true", and a lane that followed it
+   literally force-discarded a live watch card belonging to another session
+   (TG-3104, 2026-08-03). If no honest transition exists, say so on the card --
+   an honest blocker beats a false `done`.
 
 ### Item types
 Cards have a `type` field that determines their gate requirements:
@@ -16041,6 +16066,41 @@ def _write_claude_memory(name: str, work_dir: str):
         claude_mem_file.write_text(composed)
     except Exception:
         pass
+
+
+def _refresh_provider_memory_all() -> int:
+    """Recompose provider memory for LIVE non-Claude lanes (AMUX-2269).
+
+    _write_provider_memory runs at session launch. That means a fix to the
+    composed instructions reaches a lane only when it is next restarted — and
+    the lane that most needs the fix is the one already running with the old
+    text. The sherpa-execution memory told it to PATCH the board without
+    X-Amux-Session and, in the numbered workflow, to "satisfy the gate or pass
+    force:true". It followed both literally: 11 unattributed forces, one of
+    which discarded another session's live watch card. Correcting the generator
+    while the running lane keeps reading the old file fixes the next incident,
+    not this one.
+
+    Idempotent (a plain recompose + write), so it is safe to run on a timer."""
+    n = 0
+    try:
+        # Enumerate from the env files, NOT list_sessions() — that one captures
+        # every pane to build its rows, which is far too heavy for a timer and
+        # is exactly the kind of incidental cost the scan demotion just removed.
+        names = [f.stem for f in sorted(CC_SESSIONS.glob("*.env"))] if CC_SESSIONS.is_dir() else []
+        for row in names:
+            try:
+                if (_session_provider(row) or "claude") == "claude":
+                    continue
+                _write_provider_memory(row)
+                n += 1
+            except Exception:
+                continue
+        if n:
+            slog(f"[memory] recomposed provider memory for {n} live non-Claude lane(s)")
+    except Exception as e:
+        slog(f"[memory] provider refresh failed: {e}")
+    return n
 
 
 def _write_provider_memory(name: str):
@@ -32806,7 +32866,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.410';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.414';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54050,7 +54110,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.410';
+const CACHE = 'amux-v0.9.414';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -65561,6 +65621,13 @@ def main():
     schedule_job(_cleanup_logs,             interval=86400,              name="log_rotation",       initial_delay=120)
     schedule_job(_cleanup_recordings,       interval=86400,              name="recording_cleanup",  initial_delay=180)
     schedule_job(_db_maintenance,           interval=86400,              name="db_maintenance",     initial_delay=240)
+    # Provider memory gets its OWN cadence, not db_maintenance's (AMUX-2269).
+    # Hanging it off the daily job would have delivered a correction to the
+    # instructions up to 24h after the fix shipped — for a lane whose current
+    # instructions were actively producing unattributed forces. The work is a
+    # few file writes for non-Claude lanes only (currently 1 of 41), so 10
+    # minutes costs nothing and closes the window.
+    schedule_job(_refresh_provider_memory_all, interval=600,               name="provider_memory",    initial_delay=20)
     # Hourly tick, but self-limited to one digest per session per UTC day.
     schedule_job(_board_doing_digest,       interval=3600,               name="board_doing_digest", initial_delay=900)
     schedule_job(_validate_api_key_job,     interval=300,                name="key_validate",       initial_delay=10)

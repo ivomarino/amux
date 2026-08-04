@@ -1137,8 +1137,15 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
       [[ -n "$id" && -n "$msg" ]] || die "Usage: amux board progress <ISSUE-ID> <message>"
       # Append progress note to board task description (desc_append preserves prior content;
       # a plain {"desc":...} REPLACES and silently destroys the card body — see MC-1219)
+      # X-Amux-Session (AMUX-2269). This was the ONE mutating board verb in this
+      # CLI that did not stamp the caller, so every `amux board progress` wrote
+      # an `unattributed` row into the ledger — including mine, which is how it
+      # was found. The whole reason sessions are told to use `amux board` rather
+      # than raw curl is that it supplies attribution for you; a write verb that
+      # silently does not is the sanctioned-instruction-is-the-theatre shape.
       curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
         -d "{\"desc_append\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg")}" \
         "$AMUX_API/api/board/$id" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'— progress noted')" 2>/dev/null
       # Check if task has a gh: tag — if so, post comment to GH issue
