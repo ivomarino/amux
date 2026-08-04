@@ -10795,6 +10795,19 @@ def _advance_open_card(session_name: str) -> bool:
         last = _advance_last.get(session_name, 0)
         if last and (time.time() - last) < _ADVANCE_COOLDOWN:
             return False
+        # PER-CARD NUDGE BUDGET (token audit, 2026-08-04). _ADVANCE_COOLDOWN is
+        # per SESSION, so the same card could be re-nudged every 15 minutes
+        # forever. Measured over 24h: 182 advance wakes, 114 distinct cards, and
+        # 15 cards nudged 4+ times — MI-4554 and MI-4556 nine times each. Every
+        # one of those is a full model turn. MI-4554 was nudged nine times and
+        # then DISCARDED: nine turns spent pushing a card into the bin.
+        #
+        # A card that has ignored three nudges is not going to respond to a
+        # fourth; something else is wrong with it, and repeating the prompt is
+        # the accumulate-don't-discriminate failure (ethos #5). After the budget
+        # the loop goes quiet for that card and says so, leaving it for the
+        # human sweeps that already surface stuck work.
+        _nb = int(os.environ.get("AMUX_ADVANCE_CARD_BUDGET", "3"))
         db = get_db()
         # STALE-ASK CHECK, ahead of the main selection (AC-194, amux-cloud).
         # The >3d needs:you re-nag had never executed in production: 48 cycles,
@@ -11023,6 +11036,19 @@ def _advance_open_card(session_name: str) -> bool:
         )
         if not is_running(session_name):
             return False
+        try:
+            _seen_n = get_db().execute(
+                "SELECT COUNT(*) FROM session_events WHERE type='advance.nudged' "
+                "AND ts > ? AND data LIKE ?",
+                (time.time() - 86400, '%"' + row["id"] + '"%')).fetchone()[0]
+        except Exception:
+            _seen_n = 0
+        if _seen_n >= _nb:
+            slog(f"[advance] {session_name}: {row['id']} has ignored {_seen_n} nudges in 24h "
+                 f"— budget spent, going quiet (repeating the prompt is not the fix)")
+            return False
+        _emit_event(session_name, "advance.nudged", {"issue": row["id"], "n": _seen_n + 1},
+                    source="advance")
         # send_text returns (ok, err) and CAN fail or defer. Stamping the
         # cooldown and logging "pushed" without checking would claim a delivery
         # that never happened AND buy 15 minutes of silence for a lane that
@@ -33542,7 +33568,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.437';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.438';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54877,7 +54903,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.437';
+const CACHE = 'amux-v0.9.438';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
