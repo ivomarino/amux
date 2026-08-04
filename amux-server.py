@@ -63820,6 +63820,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 # relay, 2026-07-18). Human browser sends (record_history) exempt;
                 # a self-send (origin == recipient) needs no stamp.
                 _orig_text = text
+                _origin = ""
                 if _defer_busy:
                     _origin = (self.headers.get("X-Amux-Session", "")
                                or str(body.get("source_session") or "")).strip()[:64]
