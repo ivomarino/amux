@@ -33356,7 +33356,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.427';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.428';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54667,7 +54667,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.427';
+const CACHE = 'amux-v0.9.428';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -58608,8 +58608,25 @@ class CCHandler(BaseHTTPRequestHandler):
                         if not _own or not _ctags:
                             return False
                         return bool(_tagmap.get(_own, set()) & _ctags)
-                    return self._json(_board_project(
-                        [it for it in _bd if _bvis(it)], _slim, _f_sess, _f_stat, _f_arch))
+                    _vis = [it for it in _bd if _bvis(it)]
+                    # SAY THAT THIS IS A SCOPED VIEW (general-canvas-apps,
+                    # 2026-08-04). A tag-scoped list is indistinguishable from a
+                    # complete one: the caller gets a bare JSON array of 35 and
+                    # nothing says the other 1585 exist. Two sessions read that
+                    # as the endpoint truncating, and one of them had already
+                    # published three wrong measurements taken off it — a
+                    # dependency census, a card count, and a claim that ten
+                    # cards had been deleted when they were archived.
+                    #
+                    # The scoping is correct and deliberate (Ethan, 2026-08-02).
+                    # What was missing is that a filtered answer looked exactly
+                    # like a total one, which is ethos #4: the wrong reading was
+                    # not detectable from the data returned.
+                    return self._json(_board_project(_vis, _slim, _f_sess, _f_stat, _f_arch),
+                        headers={"X-Amux-Scope": f"tag-scoped:{_cname or 'unknown'}",
+                                 "X-Amux-Scope-Tags": ",".join(sorted(_ctags)) or "(untagged: own cards only)",
+                                 "X-Amux-Scope-Note": (f"{len(_vis)} of {len(_bd)} cards visible to this "
+                                                       f"session; the rest belong to other tags")})
                 if _projecting:
                     # Same read-through-on-invalidation contract as the scoped
                     # path: a write nulls the cached data, so this reloads.
