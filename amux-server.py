@@ -7056,6 +7056,14 @@ def _steer_guard_stale(name: str, guard: str):
         if _deps_blocking(it):
             return True, f"{cid} blocked again before delivery"
         return False, ""
+    if guard.startswith("verify:"):
+        cid = guard[7:]
+        it = _item_by_id(cid)
+        if not it or it.get("deleted"):
+            return True, f"{cid} no longer exists"
+        if _status_canon(it.get("status")) != "done":
+            return True, f"{cid} left done before delivery ({it.get('status')})"
+        return False, ""
     if guard.startswith("watch:"):
         # Same lesson as dep: — a watch closed or stood down while its review
         # nudge waited must not be announced as still armed.
@@ -11235,6 +11243,146 @@ def _pickup_next_board_task(session_name: str):
 
 
 _WATCH_REVIEW_HOURS = float(os.environ.get("AMUX_WATCH_REVIEW_HOURS", "24"))
+_NEEDSYOU_DIGEST_HOURS = float(os.environ.get("AMUX_NEEDSYOU_DIGEST_HOURS", "2"))
+
+
+def _verify_routing_sweep():
+    """Drive done -> verified. Nothing did (Ethan, 2026-08-03).
+
+    The gates enforce that done != verified, and the peer-review loop routes
+    cards INTO review — but no mechanism ever moved a card out of done. 37 sat
+    there against 4 verified. So "it stopped at some point before the output
+    was verified" was structural: the board could express the distinction and
+    nothing acted on it, which is a gate that measures something no loop
+    closes.
+
+    Reuses _pick_reviewer, so verification inherits the same-tag and
+    conversation-id independence rules the review loop already enforces — a
+    lane cannot be handed its own work to confirm. amux routes; the peer's
+    MODEL decides whether prod actually shows the change, which is the part
+    that compounds.
+
+    Paced: one card per verifier per pass, oldest first, deduped on a durable
+    event so a restart cannot re-ask."""
+    try:
+        db = get_db()
+        rows = db.execute(
+            "SELECT id, title, session, desc FROM issues "
+            "WHERE deleted IS NULL AND COALESCE(archived,0)=0 AND status='done' "
+            "AND COALESCE(type,'') NOT IN ('tripwire','watch') "
+            "AND COALESCE(session,'') != '' ORDER BY updated ASC LIMIT 60").fetchall()
+    except Exception as e:
+        slog(f"[verify-route] query failed: {e}")
+        return
+    asked, busy = 0, set()
+    for r in rows:
+        try:
+            if db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                          (f"verify.asked:{r['id']}",)).fetchone():
+                continue
+        except Exception:
+            pass
+        peer = _pick_reviewer(r["session"] or "")
+        if not peer or peer in busy or not is_running(peer):
+            continue
+        busy.add(peer)
+        _emit_event(peer, "verify.asked", {"issue": r["id"], "author": r["session"]},
+                    idem=f"verify.asked:{r['id']}", source="verify-route")
+        _steer_enqueue(peer,
+            f"[amux] VERIFY {r['id']} — {(r['title'] or '')[:90]}\n\n"
+            f"{r['session']} marked this DONE. done means implemented; verified means "
+            f"confirmed in production with evidence. You are the independent check.\n\n"
+            f"Confirm in PROD, not locally: CI green on the merged commit, the change is "
+            f"actually live, you exercised the real behaviour, and nothing else broke. "
+            f"Then move it to verified with that evidence on the card.\n"
+            f"If you cannot confirm it, say what is missing on the card and leave it done — "
+            f"an honest 'unverified' beats a verified you did not check.\n"
+            f"If verifying it is not possible at all (no prod surface, pure docs), say THAT "
+            f"on the card so nobody re-asks.",
+            guard=f"verify:{r['id']}")
+        asked += 1
+    if asked:
+        slog(f"[verify-route] asked {asked} peer(s) to verify a done card")
+
+
+def _needsyou_digest():
+    """Push + SMS the owner a BATCHED digest of what is newly waiting on them.
+
+    Ethan, 2026-08-03: "am I in a good spot to send ideas/commands and then
+    never think about them again? I'm constantly finding myself thinking what's
+    the status of this thing, and then I go to a session and it appears it's
+    waiting on me."
+
+    The honest diagnosis was that nothing PUSHED to him. needs:you worked, and
+    surfaced in Focus — a view he had to open. Every mechanism the fleet gained
+    was session-to-session; the owner was still polling. A status system the
+    owner has to poll has not closed his loop, it has moved it.
+
+    Batched deliberately (his choice over per-card): one message per
+    _NEEDSYOU_DIGEST_HOURS listing what became blocked since the last one, so
+    the channel stays worth reading. Silent when nothing is new — a digest that
+    arrives saying "nothing" trains you to ignore it.
+
+    NOT the urgent-alert path. That one is a fire alarm with a storm guard and
+    must stay rare; this is normal-priority and carries its own dedupe, so a
+    routine "waiting on you" can never dilute a real page."""
+    try:
+        db = get_db()
+        rows = db.execute(
+            "SELECT i.id, i.title, i.session, i.desc, t.added_at FROM issues i "
+            "JOIN issue_tags t ON t.issue_id = i.id "
+            "WHERE deleted IS NULL AND COALESCE(i.archived,0)=0 "
+            "AND lower(t.tag) LIKE 'needs:you%' "
+            "AND i.status NOT IN ('done','verified','discarded') "
+            "ORDER BY t.added_at ASC").fetchall()
+    except Exception as e:
+        slog(f"[needsyou-digest] query failed: {e}")
+        return
+    fresh = []
+    for r in rows:
+        try:
+            seen = db.execute(
+                "SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                (f"needsyou.digested:{r['id']}",)).fetchone()
+        except Exception:
+            seen = None
+        if not seen:
+            fresh.append(r)
+    if not fresh:
+        return
+    lines = []
+    for r in fresh[:12]:
+        _ask = ""
+        for ln in reversed((r["desc"] or "").splitlines()):
+            if ln.strip().lower().startswith(("needs you:", "ask:", "question:", "blocked on")):
+                _ask = ln.strip()[:120]; break
+        lines.append(f"• {r['id']} ({r['session'] or 'unowned'}): {(r['title'] or '')[:70]}"
+                     + (f"\n    {_ask}" if _ask else ""))
+    more = f"\n(+{len(fresh) - 12} more)" if len(fresh) > 12 else ""
+    body = "\n".join(lines) + more
+    title = (f"{len(fresh)} thing(s) waiting on you"
+             if len(fresh) > 1 else "1 thing waiting on you")
+    try:
+        _web_push_send_all(title, body, tag="needsyou", url="/#bq=is%3Aneedsyou")
+    except Exception as e:
+        slog(f"[needsyou-digest] push failed: {e}")
+    phone = os.environ.get("AMUX_OWNER_PHONE", "")
+    _sms_note = "no phone configured"
+    if phone:
+        try:
+            # Record the OUTCOME, not the attempt. This is the owner's only
+            # working channel right now (push_subscriptions is empty), so a
+            # silent send failure would put him back to polling without
+            # knowing the channel had gone quiet — the exact failure this
+            # digest exists to remove.
+            _ok, _detail = _send_sms(phone, f"amux — {title}\n{body}")
+            _sms_note = f"sms {'sent' if _ok else 'FAILED'}: {_detail}"
+        except Exception as e:
+            _sms_note = f"sms EXCEPTION: {str(e)[:120]}"
+    for r in fresh:
+        _emit_event(r["session"] or "", "needsyou.digested", {"issue": r["id"]},
+                    idem=f"needsyou.digested:{r['id']}", source="needsyou-digest")
+    slog(f"[needsyou-digest] told the owner about {len(fresh)} newly-blocked card(s) — {_sms_note}")
 
 
 def _watch_review_sweep():
@@ -11335,8 +11483,15 @@ def _age_archive_sweep():
         db.commit()
         cut = now - 3 * 86400
         rows = db.execute(
+            # tripwire/watch are exempt: being untouched for days is their
+            # DEFINING property, not evidence of rot. Auto-archiving them hid
+            # them from the very sweep meant to fire them — the same blind spot
+            # amux-cloud found in the archived=0 filters, one layer up. An
+            # anti-rot mechanism must not consume the cards that are supposed
+            # to sit still.
             "SELECT id, status, session, updated FROM issues WHERE deleted IS NULL "
-            "AND COALESCE(archived,0)=0 AND COALESCE(pinned,0)=0 AND updated < ? "
+            "AND COALESCE(archived,0)=0 AND COALESCE(pinned,0)=0 "
+            "AND COALESCE(type,'') NOT IN ('tripwire','watch') AND updated < ? "
             "LIMIT 2000", (cut,)).fetchall()
         for r in rows:
             _days = max(3, int((now - (r["updated"] or now)) / 86400))
@@ -32965,7 +33120,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.416';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.418';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54231,7 +54386,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.416';
+const CACHE = 'amux-v0.9.418';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -65754,6 +65909,14 @@ def main():
     # and one card per lane per pass — the population is 3, so this is nearly
     # free; the cadence exists so it stays cheap if it grows.
     schedule_job(_watch_review_sweep,          interval=3600,              name="watch_review",       initial_delay=90)
+    # The owner's channel (Ethan, 2026-08-03). Runs often; SENDS only when
+    # something is newly blocked on him, so the cadence is a latency bound, not
+    # a message rate.
+    schedule_job(_needsyou_digest,             interval=int(_NEEDSYOU_DIGEST_HOURS*3600),
+                 name="needsyou_digest",    initial_delay=60)
+    # done -> verified routing. Hourly; one card per verifier per pass, so the
+    # 37-card backlog drains steadily rather than landing at once.
+    schedule_job(_verify_routing_sweep,        interval=3600,              name="verify_routing",     initial_delay=150)
     # Hourly tick, but self-limited to one digest per session per UTC day.
     schedule_job(_board_doing_digest,       interval=3600,               name="board_doing_digest", initial_delay=900)
     schedule_job(_validate_api_key_job,     interval=300,                name="key_validate",       initial_delay=10)
