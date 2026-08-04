@@ -7547,7 +7547,10 @@ def _steering_fast_tick():
             # Gemini lane — this tick was hardwired to the Claude detector,
             # which reads '' for Gemini frames, so delivery never fired).
             _prov_t = (get_session_info(name) or {}).get("provider", "claude")
-            _steer_try_deliver(name, _detect_session_status(name, raw, provider=_prov_t), raw)
+            # Event-first (Ethan 2026-08-04): the hook knows the turn boundary;
+            # the regex infers it. _session_state falls back to the scrape for
+            # hookless lanes, so nothing regresses for gemini/codex.
+            _steer_try_deliver(name, _session_state(name, raw, provider=_prov_t), raw)
         except Exception:
             pass
 
@@ -14555,6 +14558,22 @@ def _build_system_metrics() -> dict:
     return result
 
 
+_PROMPT_GLYPHS = "\u276f\u203a>"        # ❯ › >  — the composer/echoed-prompt leads
+
+
+def _is_prompt_line(s: str) -> bool:
+    """A prompt/echoed-input line, which must never be read as UI chrome.
+
+    ❯ is U+276F, INSIDE the U+2700-27BF dingbat range both glyph tests use, so
+    a delivered prompt could satisfy either one:
+      - with a truncation "…" it read as an ACTIVE SPINNER (sherpa showed
+        WORKING for 44 minutes off `❯ [amux] VERIFY SE-14 — ...y…`);
+      - containing "for 30s" it satisfies _COMPLETED_TURN_RE and reads as a
+        COMPLETED TURN, the same bug inverted into a false idle.
+    Both are amux's OWN steering text being mistaken for Claude's chrome."""
+    return bool(s) and s[0] in _PROMPT_GLYPHS
+
+
 def _detect_claude_status(raw_output: str) -> str:
     """Detect Claude Code status from tmux output.
 
@@ -14584,6 +14603,8 @@ def _detect_claude_status(raw_output: str) -> str:
     # spinner ("idle") by the bottom-up scan below.
     for l in reversed(lines[-30:]):
         s = l.strip()
+        if _is_prompt_line(s):
+            continue
         if s and "✀" <= s[0] <= "➿" and "…" in s:
             return "active"
         if s.startswith("Running…") or re.match(r"Reading \d+ file", s):
@@ -14786,6 +14807,26 @@ def _detect_gemini_status(raw_output: str) -> str:
     return ""
 
 
+def _session_state(name: str, raw_output: str, provider: str = "claude") -> str:
+    """The lane's state, preferring the harness's OWN event over the scrape.
+
+    Ethan, 2026-08-04: "I thought we had events we capture... we should be
+    using the event things wherever possible." We do capture them — Stop and
+    UserPromptSubmit POST to /api/sessions/<n>/report — and until now exactly
+    ONE of ten call sites consulted them. Every other consumer re-derived state
+    from rendered UI while the answer sat in a table.
+
+    Same asymmetry as _hooks_live: an `idle` report does not decay (the only
+    exit from idle is a prompt, and every prompt fires a hook), while
+    active/waiting expire on the short window. Falls through to the scraper for
+    hookless lanes (gemini, codex, or a lane whose hooks broke), which is what
+    the scraper is for."""
+    rep = _session_reported.get(name)
+    if rep and rep.get("state") in ("active", "idle", "waiting") and _hooks_live(rep, time.time()):
+        return rep["state"]
+    return _detect_session_status(name, raw_output, provider=provider)
+
+
 def _detect_session_status(name: str, raw_output: str, provider: str = "claude") -> str:
     if provider == "gemini":
         g = _detect_gemini_status(raw_output)
@@ -14809,7 +14850,8 @@ def _detect_session_status(name: str, raw_output: str, provider: str = "claude")
             clean = _STRIP_ANSI.sub("", raw_output)
             for l in clean.splitlines()[-12:]:
                 ls = l.strip()
-                if (ls and "✀" <= ls[0] <= "➿" and "…" not in ls
+                if (ls and not _is_prompt_line(ls)
+                        and "✀" <= ls[0] <= "➿" and "…" not in ls
                         and _COMPLETED_TURN_RE.search(ls)):
                     definitive_idle = True
                     break
@@ -33583,7 +33625,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.439';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.440';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54918,7 +54960,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.439';
+const CACHE = 'amux-v0.9.440';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
