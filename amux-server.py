@@ -3290,9 +3290,70 @@ _event_log: "collections.deque[dict]" = collections.deque(maxlen=2000)
 _event_log_lock = threading.Lock()
 _req_tl = threading.local()  # per-request enrichment (set by handlers, read by _route)
 
+# Request/response payload capture for the Activity log (Ethan, AMUX-2281:
+# "add response to the logs, it should be request/response so I can see the
+# payloads via accordion, I should also be able to search it").
+_PAYLOAD_CAP = int(os.environ.get("AMUX_LOG_PAYLOAD_BYTES", "4096"))
+_PAYLOAD_LOG = os.environ.get("AMUX_LOG_PAYLOADS", "1") not in ("0", "false", "no")
+# Redacted by KEY NAME. Bodies carry credentials — the board API alone moves
+# session headers, and /api/prefs and the browser endpoints move tokens. Storing
+# payloads without this would turn the activity log into a credential store that
+# nobody thinks of as one. Key-name redaction is not complete (a secret pasted
+# into a `desc` is still a secret), which is why capture is switchable off with
+# AMUX_LOG_PAYLOADS=0 and capped rather than unbounded.
+_SECRET_KEY_RE = re.compile(
+    r"(pass|passwd|password|secret|token|api[_-]?key|apikey|auth|cookie|credential|"
+    r"private[_-]?key|session[_-]?id|bearer)", re.I)
+
+
+def _redact_payload(val):
+    """Recursively blank secret-looking values. Returns the same shape."""
+    if isinstance(val, dict):
+        out = {}
+        for k, v in val.items():
+            out[k] = "<redacted>" if _SECRET_KEY_RE.search(str(k)) else _redact_payload(v)
+        return out
+    if isinstance(val, list):
+        return [_redact_payload(v) for v in val[:50]]
+    return val
+
+
+def _capture_payload(raw, content_type: str = "") -> str:
+    """Cap + redact a body for the activity log. Never raises.
+
+    Non-JSON (HTML, images, the dashboard itself) is recorded as a shape marker
+    rather than content: a 3MB HTML blob in the log is noise that pushes the
+    payload you wanted out of the buffer."""
+    if not _PAYLOAD_LOG or raw is None:
+        return ""
+    try:
+        if isinstance(raw, bytes):
+            if len(raw) > _PAYLOAD_CAP * 8 and "json" not in (content_type or "").lower():
+                return f"<{content_type or 'binary'} {len(raw)/1024:.1f}KB — not captured>"
+            try:
+                raw = raw.decode("utf-8", errors="replace")
+            except Exception:
+                return f"<binary {len(raw)} bytes>"
+        txt = str(raw)
+        if txt[:1] in ("{", "["):
+            try:
+                obj = _redact_payload(json.loads(txt))
+                txt = json.dumps(obj, ensure_ascii=False)
+            except Exception:
+                pass
+        elif txt[:1] == "<":
+            return f"<html/text {len(txt)/1024:.1f}KB — not captured>"
+        if len(txt) > _PAYLOAD_CAP:
+            return txt[:_PAYLOAD_CAP] + f"\n… [truncated, {len(txt)} bytes total]"
+        return txt
+    except Exception:
+        return ""
+
+
 def _emit_http_event(etype: str, action: str, target: str = "", session: str = "",
                      detail: str = "", status: int = 200, ip: str = "",
-                     actor: str = "") -> None:
+                     actor: str = "", req: str = "", resp: str = "",
+                     method: str = "", ms: int = 0) -> None:
     # Don't emit semantic events (e.g. message-sent, started) for failed requests.
     # Downgrade to a plain http event so they don't spam the event log as false positives.
     if status >= 400 and etype != "http":
@@ -3309,6 +3370,10 @@ def _emit_http_event(etype: str, action: str, target: str = "", session: str = "
             "status": status,
             "ip": ip,
             "actor": actor,
+            "req": req,
+            "resp": resp,
+            "method": method,
+            "ms": ms,
         })
 
 def _classify_request(method: str, path: str) -> tuple:
@@ -23500,6 +23565,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
   }
   .log-evt-ts { color: var(--dim); font-size: 0.69rem; min-width: 52px; text-align: right; flex-shrink: 0; }
+/* Request/response payload accordion (AMUX-2281) */
+.log-evt-x { cursor: pointer; }
+.log-evt-x:hover { background: var(--hover, rgba(127,127,127,.07)); }
+.log-evt-caret { display:inline-block; width:1em; color:var(--dim); font-size:.8em; }
+.log-pay { display:none; margin:0 0 6px 40px; border-left:2px solid var(--border,#3334);
+           padding-left:10px; }
+.log-pay.open { display:block; }
+.log-pay-h { font-size:.65rem; letter-spacing:.08em; color:var(--dim); margin:6px 0 2px; }
+.log-pay-b { margin:0 0 4px; padding:8px 10px; background:var(--code-bg,rgba(127,127,127,.10));
+             border-radius:6px; font-size:.72rem; line-height:1.45; white-space:pre-wrap;
+             word-break:break-word; overflow-x:auto; max-height:340px; overflow-y:auto; }
+@media (max-width: 600px) {
+  .log-pay { margin-left:12px; }
+  .log-pay-b { font-size:.68rem; max-height:240px; }
+}
   .logs-day-divider {
     padding: 8px 8px 3px; font-size: 0.68rem; font-weight: 700; color: var(--dim);
     letter-spacing: 0.06em; text-transform: uppercase;
@@ -33120,7 +33200,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.419';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.420';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43000,6 +43080,16 @@ function renderRawLogs() {
   }).join('\n');
 }
 
+// Payload accordion toggle (AMUX-2281). The panel is the row's next sibling,
+// so no id lookup can go stale when the list re-renders under SSE.
+function _togglePayload(rowEl) {
+  const pay = rowEl.nextElementSibling;
+  if (!pay || !pay.classList.contains('log-pay')) return;
+  pay.classList.toggle('open');
+  const caret = rowEl.querySelector('.log-evt-caret');
+  if (caret) caret.textContent = pay.classList.contains('open') ? '\u25be' : '\u25b8';
+}
+
 function renderActivity() {
   const el = document.getElementById('logs-activity-body');
   if (!el) return;
@@ -43013,6 +43103,8 @@ function renderActivity() {
       (e.target||'').toLowerCase().includes(q) ||
       (e.session||'').toLowerCase().includes(q) ||
       (e.actor||'').toLowerCase().includes(q) ||
+      (e.req||'').toLowerCase().includes(q) ||
+      (e.resp||'').toLowerCase().includes(q) ||
       e.action.toLowerCase().includes(q) ||
       e.type.toLowerCase().includes(q)
     );
@@ -43042,17 +43134,34 @@ function renderActivity() {
       if (evt.session) meta.push('<span style="color:var(--accent)">' + escHtml(evt.session) + '</span>');
       if (evt.ip && evt.ip !== '127.0.0.1' && evt.ip !== '::1') meta.push(escHtml(evt.ip));
       if (isErr) meta.push('<span style="color:var(--red)">HTTP ' + evt.status + '</span>');
-      html += '<div class="log-evt">' +
+      // Payload accordion (AMUX-2281). Only rows that HAVE a payload are
+      // expandable — an affordance on a row with nothing behind it teaches you
+      // to stop clicking. Search matches inside payloads, so a row can match on
+      // body text alone; those auto-expand or the hit would be invisible.
+      const hasPay = !!(evt.req || evt.resp);
+      const qLow = (logsSearchQuery || '').toLowerCase();
+      const hitInPay = !!(qLow && ((evt.req||'').toLowerCase().includes(qLow) ||
+                                   (evt.resp||'').toLowerCase().includes(qLow)));
+      if (evt.ms) meta.push('<span style="color:var(--dim)" title="server time">' + evt.ms + 'ms</span>');
+      const eid = 'pay-' + Math.round(evt.ts*1000) + '-' + (evt.target||'').replace(/[^a-z0-9]/gi,'') + '-' + (evt.action||'');
+      html += '<div class="log-evt' + (hasPay ? ' log-evt-x' : '') + '"' +
+          (hasPay ? ' onclick="_togglePayload(this)" title="click for request/response"' : '') + '>' +
         '<div class="log-evt-icon">' + tc.icon + '</div>' +
         '<div class="log-evt-body">' +
-          '<div class="log-evt-title">' + escHtml(title) + '</div>' +
+          '<div class="log-evt-title">' + (hasPay ? '<span class="log-evt-caret">\u25b8</span>' : '') + escHtml(title) + '</div>' +
           '<div class="log-evt-meta">' +
-            '<span class="log-evt-badge" style="background:' + ac + '1a;color:' + ac + ';border:1px solid ' + ac + '55">' + escHtml(evt.action) + '</span>' +
+            '<span class="log-evt-badge" style="background:' + ac + '1a;color:' + ac + ';border:1px solid ' + ac + '55">' + escHtml(evt.method || evt.action) + '</span>' +
             meta.join('') +
           '</div>' +
         '</div>' +
         '<div class="log-evt-ts" title="' + escHtml(new Date(evt.ts*1000).toLocaleString()) + '">' + _relTime(evt.ts) + '</div>' +
       '</div>';
+      if (hasPay) {
+        html += '<div class="log-pay' + (hitInPay ? ' open' : '') + '" id="' + escHtml(eid) + '">' +
+          (evt.req ? '<div class="log-pay-h">REQUEST</div><pre class="log-pay-b">' + _hlSearch(escHtml(evt.req), logsSearchQuery) + '</pre>' : '') +
+          (evt.resp ? '<div class="log-pay-h">RESPONSE' + (isErr ? ' \u2014 HTTP ' + evt.status : '') + '</div><pre class="log-pay-b">' + _hlSearch(escHtml(evt.resp), logsSearchQuery) + '</pre>' : '') +
+        '</div>';
+      }
     }
   }
   el.innerHTML = html;
@@ -54386,7 +54495,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.419';
+const CACHE = 'amux-v0.9.420';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -55011,6 +55120,8 @@ class CCHandler(BaseHTTPRequestHandler):
 
     def _json(self, data, status=200, headers=None):
         body = json.dumps(data).encode()
+        try: _req_tl.resp_body = _capture_payload(body, "application/json")
+        except Exception: pass
         body, gz = self._gzip_out(body)
         self.send_response(status)
         self._cors()
@@ -55025,6 +55136,8 @@ class CCHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json_raw(self, json_str, status=200, etag=""):
+        try: _req_tl.resp_body = _capture_payload(json_str, "application/json")
+        except Exception: pass
         body = json_str.encode() if isinstance(json_str, str) else json_str
         if etag and self.headers.get("If-None-Match", "") == etag:
             self.send_response(304)
@@ -55305,6 +55418,12 @@ class CCHandler(BaseHTTPRequestHandler):
         if length == 0:
             return {}
         raw = self.rfile.read(length)
+        # Stash for the activity log (AMUX-2281). Captured here because this is
+        # the only place the raw body exists — the handlers get a parsed dict.
+        try:
+            _req_tl.req_body = _capture_payload(raw, self.headers.get("Content-Type", ""))
+        except Exception:
+            pass
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -55376,7 +55495,19 @@ class CCHandler(BaseHTTPRequestHandler):
                 # trust body claims here (AMUX-1768 provenance principle).
                 actor = (self.headers.get("X-Amux-Session", "").strip()
                          or self.headers.get("X-Amux-User-Email", "").strip())
-                _emit_http_event(etype, action, target, session, detail, self._resp_status, ip, actor)
+                # Payloads: always for mutations, and for any FAILED request —
+                # a 500 with no body is the case you most want to expand. Plain
+                # GET 200s are the bulk of traffic and their response is the
+                # thing already on screen, so capturing them would evict the
+                # interesting rows from the buffer.
+                _rq = getattr(_req_tl, "req_body", "") or ""
+                _rs = getattr(_req_tl, "resp_body", "") or ""
+                if method == "GET" and self._resp_status < 400:
+                    _rq = _rs = ""
+                _req_tl.req_body = ""; _req_tl.resp_body = ""
+                _emit_http_event(etype, action, target, session, detail, self._resp_status,
+                                 ip, actor, req=_rq, resp=_rs, method=method,
+                                 ms=int(dt_ms))
 
     def _check_auth(self, method: str, path: str) -> bool:
         """Return True if request is authorized. Sends 401 and returns False if not."""
@@ -63759,6 +63890,19 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if client_id and _send_dedup_seen(name, "steer:" + client_id):
                     return self._json({"ok": True, "deduped": True,
                                        "message": "duplicate retry ignored (already queued)"})
+                # Strip before ENQUEUE (AC-183) — the same defect /send had, one path
+                # over: the tag was detected below and never removed, so the queued row,
+                # the history record written under record_history, and the eventually
+                # delivered message all carried it. Decide first, then strip, because
+                # the regex is ^-anchored.
+                _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(text))
+                if _NO_BOARD_RE.search(text):
+                    text = _NO_BOARD_RE.sub("", text).strip()
+                    if not text:
+                        # "[no-board]" and nothing else. The emptiness check at the top
+                        # ran BEFORE the strip, so without this an empty message would be
+                        # queued and later delivered as a blank turn.
+                        return self._json({"error": "message is empty after removing [no-board]"}, 400)
                 msg_id = _steer_enqueue(name, text)
                 # Server-side history record (atomic, device-independent) — see the
                 # /send handler. A queued human message is still 'user' origin (the
@@ -63767,7 +63911,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if body.get("record_history"):
                     _cmd_hist_record(name, text, "user",
                                      self.headers.get("X-Amux-User-Email", ""))
-                    _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(text))
+                    # Do NOT recompute _skip_board here. `text` has already been
+                    # stripped above, so the ^-anchored regex can no longer match and a
+                    # recompute would silently downgrade the INLINE-TAG case to False —
+                    # creating exactly the card the tag asked to suppress, while the
+                    # API-param case kept working. The stale-operand trap: the value is
+                    # correct above and the same expression is wrong below.
                     if not _skip_board:
                         _autotask_from_command(name, text)
                         _summarize_task_bg(name, text)
@@ -63820,6 +63969,20 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 # relay, 2026-07-18). Human browser sends (record_history) exempt;
                 # a self-send (origin == recipient) needs no stamp.
                 _orig_text = text
+                # STRIP THE TAG BEFORE ANYTHING IS SENT (AC-183). The decision and the
+                # strip used to sit BELOW, after send_text, and touched only the
+                # `_orig_text` copy that feeds the autotask title — so the delivered
+                # string kept the marker and _NO_BOARD_RE's own docstring ("Stripped
+                # before delivery so the recipient never sees it") was false. Caught by
+                # receiving one: a probe arrived reading "[no-board] AMUX-2247 probe B".
+                # ORDER MATTERS TWICE. The regex is ^-anchored, so it has to run before
+                # the origin stamp is prepended below — otherwise the tag stops matching
+                # on any stamped inter-session message and leaks for exactly the traffic
+                # that most often carries it.
+                _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(text))
+                if _NO_BOARD_RE.search(text):
+                    text = _NO_BOARD_RE.sub("", text).strip()
+                    _orig_text = text
                 _origin = ""
                 if _defer_busy:
                     _origin = (self.headers.get("X-Amux-Session", "")
@@ -63843,9 +64006,11 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     # is load-bearing, because agents comply with prohibitions without
                     # re-deriving them — and the board outlives the conversation that
                     # would have corrected it (social-media, 2026-07-27).
-                    _skip_board = bool(body.get("no_board")) or bool(_NO_BOARD_RE.search(_orig_text))
-                    if _skip_board and _NO_BOARD_RE.search(_orig_text):
-                        _orig_text = _NO_BOARD_RE.sub("", _orig_text).strip()
+                    # _skip_board and the strip now happen ABOVE, before send_text, so
+                    # the recipient never sees the tag (AC-183). Deliberately not
+                    # recomputed here: a second `_NO_BOARD_RE.search(_orig_text)` would
+                    # always miss now that _orig_text is already stripped, which would
+                    # read as "the tag was absent" rather than "already handled".
                     if not _defer_busy and not _skip_board:
                         _autotask_from_command(name, _orig_text)
                         _summarize_task_bg(name, _orig_text)
