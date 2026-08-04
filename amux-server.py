@@ -15121,7 +15121,16 @@ def _board_digest(session_name: str = "") -> str:
     + this session's own queued TODOs. Skips done/verified — too verbose."""
     try:
         rows = get_db().execute(
-            "SELECT session, title, status FROM issues "
+            # owner_type/archived must match what AUTO-PICKUP actually queues, or this
+            # header lies to the session it greets (AC-196). It said "YOUR TODO (queued
+            # for amux-cloud): Secrets pasted into a session prompt..." — AC-160, which
+            # is owner_type=human AND archived=1, was reassigned to Ethan on Aug 1, and
+            # carries the note "no agent should re-claim it". Pickup correctly skips it;
+            # only this banner still advertised it, so a session opens the card, reads
+            # that it must not touch it, and has spent the turn the reassignment existed
+            # to save. A queue view that disagrees with the queue is worse than no view:
+            # it is trusted, and it is the first thing a session reads on startup.
+            "SELECT session, title, status, owner_type, COALESCE(archived,0) AS arch FROM issues "
             "WHERE deleted IS NULL AND status IN ('doing','todo') "
             "ORDER BY updated DESC"
         ).fetchall()
@@ -15134,7 +15143,11 @@ def _board_digest(session_name: str = "") -> str:
         sess = r["session"] or "-"
         if s == "doing" and len(doing) < 8:
             doing.append(f"  [{sess}] {r['title']}")
-        elif s == "todo" and sess == session_name and len(my_todo) < 6:
+        # DOING stays unfiltered on purpose: a human-owned card genuinely in flight is
+        # worth showing the fleet. Only the "queued for YOU" list has to agree with what
+        # pickup will actually hand over.
+        elif (s == "todo" and sess == session_name and len(my_todo) < 6
+                and (r["owner_type"] or "") == "agent" and not r["arch"]):
             my_todo.append(f"  {r['title']}")
     parts = []
     if doing:
