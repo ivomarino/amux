@@ -8391,6 +8391,19 @@ CREATE TABLE IF NOT EXISTS statuses (
     position    INTEGER NOT NULL DEFAULT 0,
     is_builtin  INTEGER NOT NULL DEFAULT 0
 );
+-- AMUX-2312: who opted in to a status whose mode is 'explicit'.
+-- scope_type is 'session' or 'tag' — deliberately the SAME shape the scope
+-- resolver designed on AMUX-2311 will read (global > tag > session), so this
+-- table becomes one of its layers rather than a sixth parallel mechanism.
+-- `global` needs no row: mode='implicit' IS the global "applies to everyone".
+CREATE TABLE IF NOT EXISTS status_scope (
+    status      TEXT NOT NULL,
+    scope_type  TEXT NOT NULL,
+    scope_value TEXT NOT NULL,
+    added_at    INTEGER NOT NULL DEFAULT 0,
+    added_by    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (status, scope_type, scope_value)
+);
 INSERT OR IGNORE INTO statuses (id, label, position, is_builtin) VALUES
     ('backlog',   'Backlog',      0, 1),
     ('todo',      'To Do',        1, 1),
@@ -10333,6 +10346,13 @@ def _init_db():
         # Guard tag must survive restarts: without it a restored commit-nudge
         # delivered as a REAL message (own turn, no revalidation/folding).
         "ALTER TABLE steering_queue ADD COLUMN guard TEXT",
+        # AMUX-2312: is a status EXPECTED of everyone, or only where opted in?
+        # 'implicit' (default) is today's behaviour — the status applies fleet
+        # wide. 'explicit' means it applies ONLY to scopes that opted in, so a
+        # lane that does not deploy anything is never told to advance a card to
+        # `verified`. Default 'implicit' keeps every existing status unchanged;
+        # a mode is never silently tightened or weakened by the migration.
+        "ALTER TABLE statuses ADD COLUMN mode TEXT NOT NULL DEFAULT 'implicit'",
     ]:
         try:
             db.execute(migration)
@@ -11500,13 +11520,19 @@ def _advance_open_card(session_name: str) -> bool:
         gate_next = "review" if row["status"] == "doing" else "done"
         gate = _effective_gate(item, gate_next) or []
         gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
+        # AMUX-2312: only name `verified` as the aim for lanes it applies to.
+        # Telling a lane that deploys nothing to drive every card to `verified`
+        # sets a target whose gate ("Deployed to prod", "Confirmed working in
+        # prod") it cannot satisfy truthfully — the ethos-3 shape, and the
+        # reason this nudge produced false 'verified' claims.
+        _term = "verified" if _status_applies("verified", session_name)[0] else "done"
         msg = (
             f"[amux] You went idle holding {row['id']} in '{row['status']}': "
             f"{(row['title'] or '')[:110]}\n\n"
             f"Keep driving it. Do exactly one of:\n"
             f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
             f"     Satisfy those honestly and move it, then continue to the next card.\n"
-            f"  2. If it is genuinely finished, close it out to verified with the evidence.\n"
+            f"  2. If it is genuinely finished, close it out to {_term} with the evidence.\n"
             f"  3. If it is BLOCKED, say what on — and if the blocker is another card, "
             f"go work that dependency instead of waiting.\n"
             f"  4. If it is blocked on a HUMAN decision, record that on the card and pick up "
@@ -11516,7 +11542,7 @@ def _advance_open_card(session_name: str) -> bool:
             f"DISCARD it with a note pointing at the closable units (or retype it "
             f"tripwire/watch if it is a real dormant watch).\n\n"
             f"You have {queued} more card(s) queued. Do not stall on a full queue: the aim is "
-            f"every card driven to verified, working dependencies first. Never --force a gate "
+            f"every card driven to {_term}, working dependencies first. Never --force a gate "
             f"you cannot satisfy — an honest blocker beats a false 'done'."
         )
         if not is_running(session_name):
@@ -12088,6 +12114,13 @@ def _verify_routing_sweep():
         return
     asked, busy = 0, set()
     for r in rows:
+        # AMUX-2312: route for verification only when `verified` applies to the
+        # CARD'S OWNER. The peer does the checking, but it is the author's lane
+        # that decides whether its work has a prod surface to confirm at all —
+        # routing a docs lane's card to a verifier asks two lanes to satisfy a
+        # gate neither can honestly meet.
+        if not _status_applies("verified", r["session"] or "")[0]:
+            continue
         try:
             if db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
                           (f"verify.asked:{r['id']}",)).fetchone():
@@ -12450,6 +12483,13 @@ def _verification_sweep():
         live = [s["name"] for s in list_sessions() if s.get("running") and not s.get("archived")]
         sent = 0
         for name in live:
+            # AMUX-2312: `verified` is explicit — do not sweep lanes it does not
+            # apply to. Asking a lane with no prod surface to close a done->verified
+            # "gap" manufactures a gap that does not exist for it, and the only
+            # exits it leaves are a false verified or a standing apology on every
+            # card. A sweep that cannot be satisfied honestly is not a sweep.
+            if not _status_applies("verified", name)[0]:
+                continue
             rows = db.execute(
                 "SELECT id, title FROM issues i WHERE session=? AND status='done' "
                 "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
@@ -13008,8 +13048,16 @@ def _board_stale_nudge():
             title = (item.get("title") or "")[:60]
             status = item.get("status", "")
             idle_min = int((now - (item.get("updated") or now)) / 60)
+            # Name only the terminal statuses that actually apply to THIS
+            # session (AMUX-2312). This line used to say "done/verified" to
+            # everyone, which is the implicit expectation Ethan asked to remove:
+            # a lane that deploys nothing was still told to push cards to
+            # `verified`, a status whose gate ("Deployed to prod", "Confirmed
+            # working in prod") it can never satisfy honestly — the ethos-3
+            # shape, a constraint with no truthful path forward.
+            _adv = "done/verified" if _status_applies("verified", sess)[0] else "done"
             msg = (f"[board] {iid} (\"{title}\") is still '{status}' but this session "
-                   f"is idle — advance it to done/verified per its gate, or move it back "
+                   f"is idle — advance it to {_adv} per its gate, or move it back "
                    f"to todo if blocked.")
             try:
                 msg_id = f"steer-{int(now * 1000)}"
@@ -13152,18 +13200,67 @@ def _load_board(done_limit: int = 100) -> list:
 def _load_board_statuses() -> list:
     """Load kanban statuses from SQLite (with parsed gate checklists)."""
     db = get_db()
-    rows = db.execute("SELECT id, label, gate FROM statuses ORDER BY position").fetchall()
+    rows = db.execute("SELECT id, label, gate, mode FROM statuses ORDER BY position").fetchall()
     if not rows:
         return list(_DEFAULT_STATUSES)
     out = []
     for r in rows:
-        d = {"id": r["id"], "label": r["label"]}
+        d = {"id": r["id"], "label": r["label"],
+             "mode": (r["mode"] if "mode" in r.keys() and r["mode"] else "implicit")}
         try:
             d["gate"] = json.loads(r["gate"]) if r["gate"] else []
         except Exception:
             d["gate"] = []
         out.append(d)
     return out
+
+
+def _load_status_scope() -> dict:
+    """{status: {"session": {...}, "tag": {...}}} — who opted in to each
+    explicit-mode status."""
+    out: dict = {}
+    try:
+        for r in get_db().execute(
+                "SELECT status, scope_type, scope_value FROM status_scope").fetchall():
+            out.setdefault(r["status"], {}).setdefault(r["scope_type"], set()).add(r["scope_value"])
+    except Exception:
+        pass
+    return out
+
+
+def _status_applies(status_id: str, session: str) -> tuple:
+    """Does `status_id` apply to `session`? -> (applies: bool, why: str).
+
+    AMUX-2312, Ethan: "we only require [cards] to satisfy the gate to go to
+    verified if we indicate it ... global board verified is explicit, and
+    sessions that deal with infra are the only ones that have verified."
+
+    'implicit' (every status today) means the status applies to everyone —
+    unchanged behaviour. 'explicit' means it applies ONLY where opted in, by
+    session or by tag. Returns WHY, not just whether, because "why is this lane
+    behaving differently" has to be answerable without reading source — the same
+    property `git config --show-origin` gives and that the AMUX-2311 resolver is
+    designed around.
+    """
+    st = next((s for s in _load_board_statuses() if s.get("id") == status_id), None)
+    if not st:
+        return (True, "unknown-status")
+    if (st.get("mode") or "implicit") != "explicit":
+        return (True, "implicit")
+    if not session:
+        return (False, "explicit/no-session")
+    sc = _load_status_scope().get(status_id, {})
+    if session in (sc.get("session") or set()):
+        return (True, "explicit/session")
+    try:
+        cfg = parse_env_file(CC_SESSIONS / f"{session}.env")
+        tags = {t.strip().lower() for t in (cfg.get("CC_TAGS", "") or "").split(",") if t.strip()}
+    except Exception:
+        tags = set()
+    hit = tags & {str(t).lower() for t in (sc.get("tag") or set())}
+    if hit:
+        return (True, "explicit/tag:" + sorted(hit)[0])
+    return (False, "explicit/not-opted-in")
 
 
 def _load_session_gates() -> dict:
@@ -13229,10 +13326,15 @@ def _item_by_id(bid: str) -> dict | None:
 def _effective_gate(item, target_status: str) -> list:
     """Resolve the effective gate checklist for moving `item` into `target_status`.
 
-    Mirrors the client's _effectiveGate resolution order:
-      1. card-level override (issues.gate, if non-empty)
-      2. per-session override (session_gates[session][status], if non-empty)
-      3. global status default (statuses.gate[status])
+    Resolution order, most specific first (AMUX-2330):
+      1. card-level override  (issues.gate, if non-empty)
+      2. type-derived gate    (_TYPE_GATES[item.type][status], if non-empty)
+      3. per-session override (session_gates[session][status], if non-empty)
+      4. global status default (statuses.gate[status])
+
+    The client's _gateResolve calls GET /api/board/gate, which calls this
+    function, so there is one rule and one owner. The client-side _effectiveGate
+    is kept only as an offline fallback and is intentionally missing layer 2.
 
     `item` may be an issue id (str) or a dict/row with at least `session` and
     (optionally) `gate`. Returns a list of criterion strings (possibly empty).
@@ -60031,6 +60133,77 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json({"item": bid, "status": st, "gate": _g,
                                    "source": _src,
                                    "item_type": (_it.get("type") or _DEFAULT_ITEM_TYPE)})
+
+            # GET/POST/DELETE /api/board/status-scope — explicit/implicit modes
+            # and who opted in (AMUX-2312). GET with ?session= answers the
+            # question a lane actually has: which statuses apply to ME, and WHY.
+            if path == "/api/board/status-scope":
+                if method == "GET":
+                    _sess_q = (qs.get("session", [""])[0] or "").strip()
+                    _scope = {k: {t: sorted(v) for t, v in d.items()}
+                              for k, d in _load_status_scope().items()}
+                    _out = {"statuses": [{"id": s["id"], "label": s["label"],
+                                          "mode": s.get("mode") or "implicit"}
+                                         for s in _load_board_statuses()],
+                            "scope": _scope}
+                    if _sess_q:
+                        _out["applies"] = {
+                            s["id"]: {"applies": _status_applies(s["id"], _sess_q)[0],
+                                      "why": _status_applies(s["id"], _sess_q)[1]}
+                            for s in _load_board_statuses()}
+                        _out["session"] = _sess_q
+                    return self._json(_out)
+                if method in ("POST", "DELETE"):
+                    # Read the BODY for DELETE too, then fall back to the query
+                    # string. The first cut read the body only for POST, so a
+                    # DELETE carrying JSON hit "status required" 400 and the
+                    # opt-OUT path was dead on arrival — caught by running an
+                    # opt-in/opt-out round trip rather than only the opt-in half.
+                    # A one-way door is not a configuration mechanism.
+                    body = self._read_body() or {}
+                    if not body.get("status"):
+                        body = {"status": (qs.get("status", [""])[0] or "").strip(),
+                                "scope_type": (qs.get("scope_type", [""])[0] or "").strip(),
+                                "scope_value": (qs.get("scope_value", [""])[0] or "").strip()}
+                    st_id = str(body.get("status") or "").strip()
+                    if not st_id:
+                        return self._json({"error": "status required"}, 400)
+                    _actor = ((self.headers.get("X-Amux-Session", "") or "").strip()
+                              or (self.headers.get("X-Amux-User-Email", "") or "").strip())
+                    db = get_db()
+                    # Mode change (global layer).
+                    if method == "POST" and body.get("mode") is not None:
+                        _m = str(body.get("mode")).strip().lower()
+                        if _m not in ("implicit", "explicit"):
+                            return self._json({"error": "mode must be implicit or explicit"}, 400)
+                        db.execute("UPDATE statuses SET mode=? WHERE id=?", (_m, st_id))
+                        db.commit()
+                        _ilog("board", "status_mode", actor=_actor or "unattributed",
+                              target=st_id, ok=True, detail={"mode": _m})
+                    # Opt-in / opt-out (session or tag layer).
+                    sc_t = str(body.get("scope_type") or "").strip().lower()
+                    sc_v = str(body.get("scope_value") or "").strip()
+                    if sc_t or sc_v:
+                        if sc_t not in ("session", "tag"):
+                            return self._json({"error": "scope_type must be session or tag"}, 400)
+                        if not sc_v:
+                            return self._json({"error": "scope_value required"}, 400)
+                        if method == "POST":
+                            db.execute("INSERT OR REPLACE INTO status_scope"
+                                       "(status, scope_type, scope_value, added_at, added_by)"
+                                       " VALUES(?,?,?,?,?)",
+                                       (st_id, sc_t, sc_v, int(time.time()), _actor))
+                        else:
+                            db.execute("DELETE FROM status_scope WHERE status=? AND"
+                                       " scope_type=? AND scope_value=?", (st_id, sc_t, sc_v))
+                        db.commit()
+                        _ilog("board", "status_scope", actor=_actor or "unattributed",
+                              target=st_id, ok=True,
+                              detail={"op": method, "scope_type": sc_t, "scope_value": sc_v})
+                    _board_changed()
+                    return self._json({"ok": True, "status": st_id,
+                                       "scope": {k: {t: sorted(v) for t, v in d.items()}
+                                                 for k, d in _load_status_scope().items()}})
 
             # GET/PATCH /api/board/session-gates — per-session gate overrides
             # (layer between the global status default and the per-card override).
