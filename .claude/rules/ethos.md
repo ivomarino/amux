@@ -145,6 +145,36 @@ it gets trusted.
 **Check:** grep for the thing the docstring promises. If the promise is not implemented,
 either implement it or delete the claim.
 
+**A constraint whose sanctioned escape is unwalkable from the audited path will be
+walked from an unaudited one** (AMUX-2325, 2026-08-04). `amux board <status>` sent only
+`{"status":...}` — no `gate_ack`, no `gate_checked`, no way to set `type`. So the moment
+a gate fired, which is most cards, the only way forward was a hand-rolled
+`curl -X PATCH`, and a hand-rolled curl omits `X-Amux-Session`. **The gate was
+manufacturing the unattributed writes the gate system depends on being attributed** —
+the same system whose one tolerable bypass is tolerable only because judgment stays with
+a NAMED party. The 409 body was well-designed and did publish the escape, but purely in
+HTTP terms (`gate_ack: true`, "GET /api/board/contract"), never naming an `amux board`
+command; an agent following it *literally and correctly* ended up off-trail. Reading the
+error did not help, because complying with it required leaving.
+
+Two lessons that generalize past this bug. First, the fix is never a rule telling people
+to remember the header — **make the honest path the easy path**, and route agents back
+onto the audited command rather than teaching them to hand-roll it better. That closes
+the whole class at once: mixpeek-orchestrator hit the same defect from the other side the
+same day, hand-rolling the *response* handling (`d.get('ok', True)` defaults True, so a
+`{"error":..., "blocked":true}` body read as success and a card was reported closed while
+untouched). Dropping to curl loses attribution AND outcome verification; restoring only
+one leaves the worse half. Second, **check whether the refusal destroys the evidence
+needed to satisfy it**: a PATCH is atomic, so `{"desc":...,"status":"done"}` that trips
+the gate discards the outcome text too, and the retry then fails for a *new* reason —
+which reads as the gate being capricious when it is doing exactly what it says. Record
+the outcome as its own write, before the transition.
+
+**Check:** for every constraint, walk its documented escape using ONLY the sanctioned
+tooling. If you cannot, the constraint has an unaudited back door and it is already in
+use. Related: rule 3 (can the model comply honestly) and AMUX-2140 (following the
+sanctioned instruction exactly is what produced the failure).
+
 ## 7. Can your check actually fail?
 
 A green check that cannot detect the bug is theatre, and it is worse than no check,
