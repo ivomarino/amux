@@ -10005,6 +10005,31 @@ esac
                  f"(-> {_pathlib.Path(_live_cli).resolve()}), NOT the stub this server "
                  f"generates at {stub_path}. Changes to the stub generator will NOT "
                  f"reach sessions on this host; edit the CLI that PATH resolves.")
+
+        # ...and knowing WHICH one wins is not enough if they quietly disagree
+        # about what they can DO. Both artifacts are legitimate (repo CLI here,
+        # stub in a cloud container) but they are two hand-maintained
+        # implementations of the same verbs, so the next person to add a flag
+        # will add it to one. That is not hypothetical: AMUX-2325 added the
+        # gate-satisfying flags to both by hand, and a session running the half
+        # without them is pushed straight back onto an unattributed raw curl —
+        # the exact defect that card fixed, silently reintroduced for whichever
+        # topology got missed. Compare the flag sets and say so.
+        _need = ("--checked", "--ack", "--type", "--override-doing", "--outcome")
+        _missing_stub = [f for f in _need if f not in _amux_stub]
+        _missing_live = []
+        if _live_cli:
+            try:
+                _live_src = _pathlib.Path(_live_cli).resolve().read_text()
+                _missing_live = [f for f in _need if f not in _live_src]
+            except Exception:
+                _missing_live = []
+        if _missing_stub or _missing_live:
+            slog(f"[cli] DRIFT: board gate flags present in one CLI but not the other — "
+                 f"stub missing {_missing_stub or 'none'}, "
+                 f"PATH CLI ({_live_cli or 'n/a'}) missing {_missing_live or 'none'}. "
+                 f"A session on the deficient one cannot satisfy a gate from the "
+                 f"attributed path and will fall back to raw curl (AMUX-2325).")
     except Exception:
         pass
 
