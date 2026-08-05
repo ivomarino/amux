@@ -27916,7 +27916,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div class="tab-bar-outer">
 <div class="tab-bar">
-  <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Sessions</span></button>
+  <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Workers</span></button>
   <button id="tab-board" onclick="switchView('board')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span></button>
   <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
   <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
@@ -27945,7 +27945,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="session-view">
 <div style="padding:0 12px;margin-top:4px;display:flex;align-items:center;gap:8px;">
   <div class="search-wrap" id="search-wrap" style="flex:1;">
-    <input class="search-input" id="search-input" type="text" placeholder="Search sessions..." autocomplete="off" autocorrect="off"
+    <input class="search-input" id="search-input" type="text" placeholder="Search workers..." autocomplete="off" autocorrect="off"
       oninput="searchQuery=this.value;document.getElementById('search-wrap').classList.toggle('has-value',!!this.value);onSearchInput()">
     <button class="search-clear" onclick="event.stopPropagation();clearSearch()">&#x2715;</button>
   </div>
@@ -27955,11 +27955,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </button>
   <div class="tile-controls">
     <div class="sort-wrap" style="position:relative;display:inline-block;">
-      <button class="tile-btn" id="tile-sort-btn" onclick="event.stopPropagation();toggleSortMenu()" title="Sort sessions" style="font-size:0.7rem;font-weight:700;">A&#x2193;</button>
+      <button class="tile-btn" id="tile-sort-btn" onclick="event.stopPropagation();toggleSortMenu()" title="Sort workers" style="font-size:0.7rem;font-weight:700;">A&#x2193;</button>
       <div class="sort-menu" id="sort-menu" style="display:none;"></div>
     </div>
-    <button class="tile-btn" id="tile-freeze-btn" onclick="toggleFreeze()" title="Freeze session order — click again to unfreeze and reset">&#x2744;</button>
-    <button class="tile-btn" id="tile-expand-btn" onclick="toggleExpand()" title="Expand active sessions — click again to collapse all">&#x26A1;</button>
+    <button class="tile-btn" id="tile-freeze-btn" onclick="toggleFreeze()" title="Freeze worker order — click again to unfreeze and reset">&#x2744;</button>
+    <button class="tile-btn" id="tile-expand-btn" onclick="toggleExpand()" title="Expand active workers — click again to collapse all">&#x26A1;</button>
   </div>
 </div>
 <div id="active-filters" class="active-filters"></div>
@@ -27979,18 +27979,18 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div class="board-toolbar">
     <div id="bf-chips" style="display:none;flex-basis:100%;order:3;flex-wrap:wrap;gap:6px;padding-top:6px;"></div>
     <div class="board-search-wrap" style="flex:1;">
-      <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -session:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';_bfSyncHash();renderBoard()">
+      <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -worker:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';_bfSyncHash();renderBoard()">
       <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';_boardActiveView='';_bfSyncHash();renderBoard()">&#x2715;</button>
       <button class="btn" id="bf-add" onclick="_bfOpenMenu(event)" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
     </div>
     <button class="btn primary board-new-btn" onclick="openBoardAdd('todo')"><span class="board-new-label">+ New issue</span><span class="board-new-icon">+</span></button>
     <div class="board-owner-toggle">
       <button id="bo-human" class="bv-btn" onclick="setBoardOwner('human')" title="Human issues">Human</button>
-      <button id="bo-agent" class="bv-btn" onclick="setBoardOwner('agent')" title="Session issues">Sessions</button>
+      <button id="bo-agent" class="bv-btn" onclick="setBoardOwner('agent')" title="Worker issues">Workers</button>
     </div>
     <div class="board-view-toggle">
       <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
-        <button id="bv-session" class="bv-btn" onclick="setBoardView('session')" title="Group by session">&#x25A4;</button>
+        <button id="bv-session" class="bv-btn" onclick="setBoardView('session')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
   </div>
@@ -28011,7 +28011,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div style="padding:8px 12px 0;">
     <div class="search-wrap" id="sched-search-wrap" style="width:100%;">
-      <input class="search-input" id="sched-search" type="text" placeholder="Search schedules — title, session, command, cadence…" autocomplete="off"
+      <input class="search-input" id="sched-search" type="text" placeholder="Search schedules — title, worker, command, cadence…" autocomplete="off"
         oninput="schedSearchQuery=this.value;document.getElementById('sched-search-wrap').classList.toggle('has-value',!!this.value);renderScheduler()">
       <button class="search-clear" onclick="document.getElementById('sched-search').value='';schedSearchQuery='';document.getElementById('sched-search-wrap').classList.remove('has-value');renderScheduler()">&#x2715;</button>
     </div>
@@ -28028,7 +28028,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
   <!-- Toolbar -->
   <div class="fe-toolbar">
-    <button class="fe-tb-btn" id="files-back-session-btn" onclick="closeExplore()" title="Return to session" style="display:none;background:var(--purple,#8957e5);color:#fff;border-color:var(--purple,#8957e5);font-size:0.72rem;white-space:nowrap;gap:4px;font-weight:600;">
+    <button class="fe-tb-btn" id="files-back-session-btn" onclick="closeExplore()" title="Return to worker" style="display:none;background:var(--purple,#8957e5);color:#fff;border-color:var(--purple,#8957e5);font-size:0.72rem;white-space:nowrap;gap:4px;font-weight:600;">
       &#x2190; <span id="files-back-session-label">Back</span>
     </button>
     <div id="files-breadcrumb" class="fe-breadcrumb"></div>
@@ -28061,7 +28061,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="fe-tb-btn" onclick="openInFinder()" title="Open in Finder">
         <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 2h4l1.5 1.5H11a1 1 0 011 1V10a1 1 0 01-1 1H2a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/><path d="M4 8.5h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
       </button>
-      <button class="fe-tb-btn" id="files-set-session-btn" onclick="setFilesSessionDir()" title="Set as session directory" style="display:none;background:var(--accent);color:#000;border-color:var(--accent);font-weight:600;font-size:0.72rem;white-space:nowrap;">
+      <button class="fe-tb-btn" id="files-set-session-btn" onclick="setFilesSessionDir()" title="Set as worker directory" style="display:none;background:var(--accent);color:#000;border-color:var(--accent);font-weight:600;font-size:0.72rem;white-space:nowrap;">
         <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M5.5 1 10 5.5 5.5 10 1 5.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
         <span id="files-set-session-label">Set dir</span>
       </button>
@@ -28153,7 +28153,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="files-library" style="display:none;flex-direction:column;flex:1;min-height:0;">
     <div style="padding:6px 10px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;align-items:center;background:var(--card);">
       <button onclick="_libClose()" title="Back to file list" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:0.72rem;padding:4px 9px;cursor:pointer;white-space:nowrap;">&#9776; Files</button>
-      <input id="lib-search" type="search" placeholder="Search title, author, tag&hellip;" autocomplete="off" oninput="_libRender()"
+      <input id="lib-search" type="search" placeholder="Search title, author, group&hellip;" autocomplete="off" oninput="_libRender()"
         style="flex:1;min-width:120px;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:0.8rem;color:var(--text);outline:none;">
       <select id="lib-author" onchange="_libRender()" class="lib-facet"></select>
       <select id="lib-format" onchange="_libRender()" class="lib-facet"></select>
@@ -28213,7 +28213,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">
       <button class="lf-btn active" data-cat="" onclick="logsSetFilter(this,'')">All</button>
       <button class="lf-btn" data-cat="board" onclick="logsSetFilter(this,'board')">Board</button>
-      <button class="lf-btn" data-cat="session" onclick="logsSetFilter(this,'session')">Sessions</button>
+      <button class="lf-btn" data-cat="session" onclick="logsSetFilter(this,'session')">Workers</button>
       <button class="lf-btn" data-cat="memory" onclick="logsSetFilter(this,'memory')">Memory</button>
       <button class="lf-btn" data-cat="files" onclick="logsSetFilter(this,'files')">Files</button>
       <button class="lf-btn" data-cat="http" onclick="logsSetFilter(this,'http')">HTTP</button>
@@ -28333,7 +28333,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="map-tag-chips" id="map-tag-list"></div>
     </div>
     <div class="map-search-section">
-      <input type="search" id="map-search" placeholder="Search pins, notes, tags&#x2026;" oninput="_mapSearch(this.value)" autocomplete="off">
+      <input type="search" id="map-search" placeholder="Search pins, notes, groups&#x2026;" oninput="_mapSearch(this.value)" autocomplete="off">
     </div>
     <div class="map-pinbar" id="map-pinbar">
       <select id="map-sort" class="map-sort-select" onchange="_mapSetSort(this.value)" title="Sort pin list">
@@ -28386,7 +28386,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div class="map-modal" id="map-tag-modal" onclick="if(event.target===this)_mapCloseTagModal()">
   <div class="map-modal-box">
     <div class="map-modal-title" id="map-tag-modal-title">New Tag</div>
-    <input id="map-tag-name" class="map-modal-input" placeholder="Tag name *" autocomplete="off">
+    <input id="map-tag-name" class="map-modal-input" placeholder="Group name *" autocomplete="off">
     <div class="map-tag-color-row">
       <label>Color:</label>
       <input type="color" id="map-tag-color" value="#58a6ff">
@@ -28451,14 +28451,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <!-- Sidebar: session list -->
   <div class="metrics-sidebar" id="metrics-sidebar">
     <div class="metrics-sidebar-hdr">
-      <span style="font-weight:600;font-size:0.85rem;">Sessions</span>
+      <span style="font-weight:600;font-size:0.85rem;">Workers</span>
       <button class="notes-toggle-btn" onclick="_metricsToggleSidebar()" title="Collapse sidebar"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
     </div>
     <div id="metrics-session-list" class="metrics-session-list"></div>
   </div>
   <!-- Main pane -->
   <div class="metrics-main" id="metrics-main">
-    <button class="metrics-expand-btn" onclick="_metricsToggleSidebar()" title="Show sessions list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
+    <button class="metrics-expand-btn" onclick="_metricsToggleSidebar()" title="Show workers list"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
     <div id="metrics-content"><div style="color:var(--dim);font-size:0.85rem;padding:40px;text-align:center;">Loading metrics&hellip;</div></div>
   </div>
 </div>
@@ -29029,7 +29029,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <label class="field-label">Session</label>
           <select id="sched-session" class="board-detail-session-select" style="width:100%;margin-bottom:0;"></select>
         </div>
-        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.72rem;color:var(--dim);white-space:nowrap;padding-bottom:7px;" title="Run a shell command on the host instead of sending to a Claude session">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.72rem;color:var(--dim);white-space:nowrap;padding-bottom:7px;" title="Run a shell command on the host instead of sending to a Claude worker">
           <input type="checkbox" id="sched-kind-shell" style="width:auto;accent-color:var(--accent);" onchange="updateSchedKindUI()">
           shell cmd
         </label>
@@ -29152,7 +29152,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="field-group">
       <label class="field-label">Tags <span class="field-optional">(optional)</span></label>
       <div class="be-tag-wrap" id="be-tag-wrap" onclick="document.getElementById('be-tag-input').focus()">
-        <input id="be-tag-input" class="be-tag-input" type="text" placeholder="Add tag…"
+        <input id="be-tag-input" class="be-tag-input" type="text" placeholder="Add group…"
           autocomplete="off" autocorrect="off" autocapitalize="none"
           oninput="_beTagInputUpdate('be')"
           onkeydown="_beTagKeydown(event,'be')">
@@ -29201,8 +29201,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="board-detail-row" id="bd-session-row">
       <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
-        <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this session's live progress, searched to this card">&#x2192; session</button>
-        <button id="bd-ask-status" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Ask the owning session to post a status update to this card">&#x1F4AC; Ask status</button>
+        <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; session</button>
+        <button id="bd-ask-status" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Ask the owning worker to post a status update to this card">&#x1F4AC; Ask status</button>
     </div>
     <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
@@ -29213,7 +29213,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Tags:</span>
       <div style="flex:1;">
         <div class="be-tag-wrap" id="bd-tag-wrap" onclick="document.getElementById('bd-tag-input').focus()">
-          <input id="bd-tag-input" class="be-tag-input" type="text" placeholder="Add tag…"
+          <input id="bd-tag-input" class="be-tag-input" type="text" placeholder="Add group…"
             autocomplete="off" autocorrect="off" autocapitalize="none"
             oninput="_beTagInputUpdate('bd')"
             onkeydown="_beTagKeydown(event,'bd')">
@@ -29401,15 +29401,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
-    <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
+    <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
-    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this session, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
+    <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this worker, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
-    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder session tabs" style="flex:0 0 auto;">&#x229E;</button>
+    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
     <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
   </div>
   <!-- Working directory bar -->
@@ -29538,7 +29538,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;align-items:center;">
         <span id="peek-instructions-status" style="flex:1;font-size:0.7rem;color:var(--dim);"></span>
         <button class="btn" style="font-size:0.75rem;padding:4px 12px;" onclick="savePeekInstructions(false)">Save</button>
-        <button class="btn primary" style="font-size:0.75rem;padding:4px 12px;" onclick="savePeekInstructions(true)" title="Save and send to the session now">Save &amp; apply now</button>
+        <button class="btn primary" style="font-size:0.75rem;padding:4px 12px;" onclick="savePeekInstructions(true)" title="Save and send to the worker now">Save &amp; apply now</button>
       </div>
     </div>
     <div class="peek-tasks-add" style="gap:10px;">
@@ -29569,7 +29569,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button id="piv-list" class="bv-btn" onclick="setPeekIssuesView('list')" title="List view">&#x2630;</button>
         <button id="piv-kanban" class="bv-btn" onclick="setPeekIssuesView('kanban')" title="Board view">&#x25A4;</button>
       </div>
-      <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this session's issues and all sessions'">This session</button>
+      <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This session</button>
       <span id="peek-issues-count" style="flex:1;font-size:0.82rem;color:var(--dim);align-self:center;"></span>
       <button class="btn primary" style="font-size:0.8rem;padding:5px 12px;" onclick="openBoardAdd('backlog')">+ New issue</button>
     </div>
@@ -29580,7 +29580,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="board-search-wrap" style="padding:0 10px 6px;display:flex;gap:6px;">
       <button class="btn" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
       <input id="peek-issues-search" class="search-input" type="text"
-             placeholder="Search or filter: is:rotting, status:doing, -session:none"
+             placeholder="Search or filter: is:rotting, status:doing, -worker:none"
              autocapitalize="off" autocorrect="off" spellcheck="false"
              oninput="_peekIssuesQuery=this.value;_bfTarget='peek';_bfRenderChips();renderPeekIssues()">
       <button class="search-clear" style="right:16px;"
@@ -29594,7 +29594,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div id="peek-messages-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
-      <input type="search" id="peek-messages-search" placeholder="Search messages sent to this session&hellip;" oninput="_peekMessagesRender()"
+      <input type="search" id="peek-messages-search" placeholder="Search messages sent to this worker&hellip;" oninput="_peekMessagesRender()"
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
     </div>
@@ -29641,7 +29641,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="board-detail-tabs" style="border-bottom:none;margin:0;">
         <button class="board-detail-tab active" id="pm-tab-edit" onclick="peekMemoryTab('edit')">Session</button>
         <button class="board-detail-tab" id="pm-tab-preview" onclick="peekMemoryTab('preview')">Preview</button>
-        <button class="board-detail-tab" id="pm-tab-global" onclick="peekMemoryTab('global')" title="Global memory shared by all sessions">Global</button>
+        <button class="board-detail-tab" id="pm-tab-global" onclick="peekMemoryTab('global')" title="Global memory shared by all workers">Global</button>
       </div>
       <div style="display:flex;gap:6px;">
         <button class="btn" id="peek-memory-pull" onclick="pullPeekMemory()" title="Pull latest from Claude's memory file">↻</button>
@@ -29649,10 +29649,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <textarea id="peek-memory-input" class="peek-memory-textarea"
-      placeholder="No memory yet. Add notes, context, or conventions that Claude should always remember for this session..."></textarea>
+      placeholder="No memory yet. Add notes, context, or conventions that Claude should always remember for this worker..."></textarea>
     <div id="peek-memory-preview" class="board-detail-preview md-content" style="display:none;flex:1;overflow-y:auto;min-height:0;"></div>
     <textarea id="peek-global-input" class="peek-memory-textarea" style="display:none;"
-      placeholder="Global memory — applied to ALL sessions. Add conventions, tools, or preferences shared across all your sessions..."></textarea>
+      placeholder="Global memory — applied to ALL workers. Add conventions, tools, or preferences shared across all your workers..."></textarea>
   </div>
   <!-- Git panel -->
   <div id="peek-git-panel" class="peek-git-panel">
@@ -29663,7 +29663,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <span id="peek-git-branch" style="font-family:monospace;font-size:0.88rem;font-weight:600;"></span>
         <span id="peek-git-worktree-badge" style="display:none;font-size:0.7rem;background:rgba(99,102,241,0.15);color:#818cf8;border-radius:4px;padding:2px 7px;">worktree</span>
         <span style="flex:1;"></span>
-        <button class="btn" id="peek-git-filter-btn" onclick="toggleGitFilter()" style="font-size:0.72rem;padding:3px 9px;display:none;" title="Toggle between session files and all changes">Session</button>
+        <button class="btn" id="peek-git-filter-btn" onclick="toggleGitFilter()" style="font-size:0.72rem;padding:3px 9px;display:none;" title="Toggle between worker files and all changes">Session</button>
         <button class="btn" id="peek-git-push-btn" onclick="peekGitPush()" style="font-size:0.75rem;padding:3px 9px;" title="Push branch">Push</button>
         <button class="btn" id="peek-git-pr-btn" onclick="peekGitOpenPR()" style="font-size:0.75rem;padding:3px 9px;" title="Open pull request">PR ↗</button>
       </div>
@@ -29908,7 +29908,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input type="search" id="cmd-history-search" placeholder="Search past messages..."
         oninput="_renderCmdHistoryList()"
         style="flex:1;min-width:0;box-sizing:border-box;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;outline:none;">
-      <select id="cmd-history-session-filter" onchange="_cmdHistRows=null;_cmdHistCounts=null;_renderCmdHistoryList();_cmdHistFetch()" title="Filter by session"
+      <select id="cmd-history-session-filter" onchange="_cmdHistRows=null;_cmdHistCounts=null;_renderCmdHistoryList();_cmdHistFetch()" title="Filter by worker"
         style="flex-shrink:0;max-width:200px;box-sizing:border-box;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;outline:none;cursor:pointer;">
         <option value="">All sessions</option>
       </select>
@@ -29977,7 +29977,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 
 <!-- Channel drawer (session-to-session DM) -->
 <div id="channel-drawer" class="channel-drawer" onmousedown="this.dataset.bdMousedown=event.target===this?'1':''" onclick="if(event.target===this&&this.dataset.bdMousedown==='1'&&!this.dataset.justOpened)channelClose();this.dataset.bdMousedown=''">
-  <div class="channel-panel" role="dialog" aria-label="Session channel">
+  <div class="channel-panel" role="dialog" aria-label="Worker channel">
     <div class="channel-header">
       <div class="channel-header-title">
         <span class="channel-header-icon">#</span>
@@ -34764,7 +34764,7 @@ function _commitsRenderList() {
     const shortHash = c.hash.slice(0, 7);
     const time = c.date ? c.date.slice(11, 16) : '';
     const sessBadge = c.amux_session
-      ? `<span class="commits-sess-badge" style="${_sessionBadgeStyle(c.amux_session)}" title="Committed by amux session: ${esc(c.amux_session)}">${esc(c.amux_session)}</span>`
+      ? `<span class="commits-sess-badge" style="${_sessionBadgeStyle(c.amux_session)}" title="Committed by amux worker: ${esc(c.amux_session)}">${esc(c.amux_session)}</span>`
       : '';
     html += `<div class="commits-item${active}" data-hash="${c.hash}" onclick="_commitsSelect('${c.hash}')">`;
     html += `<div class="commits-item-subject">${esc(c.subject)}</div>`;
@@ -35278,7 +35278,7 @@ function _renderPeekIssuesKanban(items, list) {
     if (_sgScoped) {
       const _sgHas = sessionGates[peekSession] && Array.isArray(sessionGates[peekSession][st]) && sessionGates[peekSession][st].length;
       const _sgSessJs = String(peekSession).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-      html += '<button class="col-gate-btn' + (_sgHas ? ' has-gate' : '') + '" onclick="event.stopPropagation();editSessionGate(\'' + _sgSessJs + '\',\'' + st + '\')" title="Edit this session&#39;s gate for ' + esc(stObj.label) + '">&#9745;&#xFE0E; Gate</button>';
+      html += '<button class="col-gate-btn' + (_sgHas ? ' has-gate' : '') + '" onclick="event.stopPropagation();editSessionGate(\'' + _sgSessJs + '\',\'' + st + '\')" title="Edit this worker&#39;s gate for ' + esc(stObj.label) + '">&#9745;&#xFE0E; Gate</button>';
     }
     html += '</span>';
     html += '</div>';
@@ -35617,7 +35617,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.451';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.452';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -37345,7 +37345,7 @@ async function _smRefresh() {
     const preview = (it.label && it.label.trim()) ? it.label : it.text;
     // In the all-sessions view, label each item with the session it came from.
     const badge = (_smScope === 'all')
-      ? '<span class="sm-sess" title="Saved from this session">' + esc(it.session || '—') + '</span>' : '';
+      ? '<span class="sm-sess" title="Saved from this worker">' + esc(it.session || '—') + '</span>' : '';
     return '<div class="sm-item" data-id="'+it.id+'" style="display:flex;gap:8px;align-items:flex-start;padding:10px 12px;border-radius:8px;cursor:pointer;border:1px solid var(--border);background:var(--card);">'
       + '<span style="flex:1;min-width:0;font-size:0.88rem;color:var(--text);white-space:pre-wrap;word-break:break-word;overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;">'+esc(preview)+'</span>'
       + badge
@@ -43112,7 +43112,7 @@ function _acShowSuggested() {
   }
   if (sessionDirs.length) {
     const offset = recents.length;
-    html += `<div class="ac-section">Sessions</div>`;
+    html += `<div class="ac-section">Workers</div>`;
     html += sessionDirs.slice(0, 7).map((item, i) =>
       `<div class="ac-item" onmousedown="acPick(${offset + i})">${esc(item)}</div>`
     ).join('');
@@ -45831,7 +45831,7 @@ function renderScheduler(opts) {
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
       const sessLink = s.session
-        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.session}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('sessions');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
+        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('sessions');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
         : `<span style="color:var(--dim);">(shell)</span>`;
       const nextRel = s.next_run ? `▶ <strong style="color:var(--text);" title="${s.next_run}">${relTime(s.next_run)}</strong>` : '';
       // Measured cost badge (MG audit #1): fires last 24h + fleet share; red
@@ -46419,13 +46419,20 @@ function _bqMatch(item, ast, ix) {
       // Aliased both sides, so `status:resolved` and `status:done` both find a
       // legacy `resolved` card rather than one of them silently missing it.
       case 'status':   hit = vals.map(_statusCanon).includes(_statusCanon(item.status)); break;
-      case 'session':  hit = vals.includes('none') ? !item.session
+      // `worker:` is the name the UI now uses; `session:` still works, the same
+      // both-sides aliasing `status:` uses above. Renaming the placeholder to
+      // say worker: while the parser only knew session: would have documented a
+      // filter that silently matches nothing — an instruction that cannot be
+      // followed, which is the AMUX-2140 shape.
+      case 'session':
+      case 'worker':   hit = vals.includes('none') ? !item.session
                              : vals.includes((item.session || '').toLowerCase()); break;
       case 'shepherd': hit = vals.includes((item.shepherd || '').toLowerCase()); break;
       case 'creator':  hit = vals.includes((item.creator || '').toLowerCase()); break;
       case 'owner':    hit = vals.includes(item.owner_type === 'agent' ? 'agent' : 'human'); break;
       case 'type':     hit = vals.includes((item.type || 'code').toLowerCase()); break;
-      case 'tag':      hit = (item.tags || []).some(t => vals.includes(t.toLowerCase())); break;
+      case 'tag':
+      case 'group':    hit = (item.tags || []).some(t => vals.includes(t.toLowerCase())); break;
       case 'id':       hit = vals.includes((item.id || '').toLowerCase()); break;
       case 'is':       hit = vals.some(v => _bqIs(item, v, ix)); break;
       case 'updated':  hit = _bqAgeMatch(vals, item.updated); break;
@@ -46576,7 +46583,7 @@ function _bfOpenMenu(ev, target) {
     grp('Status', statuses.map(v => opt(v, 'status:' + v)))
     + grp('Type', types.map(v => opt(v, 'type:' + v)))
     + grp('Tag', tags.map(v => opt(v, 'tag:' + v)))
-    + grp('Session', sessions.map(v => opt(v, 'session:' + v)))
+    + grp('Worker', sessions.map(v => opt(v, 'worker:' + v)))
     + grp('Quick (is:)', isPreds.map(v => opt(v, 'is:' + v)))
     + dateGrp('updated') + dateGrp('created');
   const m = document.createElement('div');
@@ -46793,7 +46800,7 @@ async function _focusAnswer() {
   const sess = item.session;
   const ok = await showFormModal('Answer ' + item.id + (sess ? ' \u2192 ' + sess : ''),
     '<textarea id="focus-ans" class="bw-in" style="width:100%;min-height:90px;box-sizing:border-box" '
-    + 'placeholder="Your reply — sent to the owning session and recorded on the card"></textarea>', 'Send');
+    + 'placeholder="Your reply — sent to the owning worker and recorded on the card"></textarea>', 'Send');
   const ans = (document.getElementById('focus-ans') || {}).value || '';
   if (!ok || !ans.trim()) return;
   if (sess) { try { await _focusSend(sess, '[Ethan, re ' + item.id + '] ' + ans); } catch(e) {} }
@@ -46840,7 +46847,7 @@ function _focusRender() {
     ov.addEventListener('click', e => { if (e.target === ov) _focusClose(); });
   }
   const sty = statusStyle(item.status || 'todo');
-  const sess = item.session ? '<span class="focus-sess" onclick="_focusClose();openPeek(\'' + escJs(item.session) + '\',{query:\'' + escJs(item.id) + '\'})" title="Open the session">' + esc(item.session) + ' \u2197</span>' : '';
+  const sess = item.session ? '<span class="focus-sess" onclick="_focusClose();openPeek(\'' + escJs(item.session) + '\',{query:\'' + escJs(item.id) + '\'})" title="Open the worker">' + esc(item.session) + ' \u2197</span>' : '';
   ov.querySelector('.focus-head').innerHTML =
     '<span class="focus-progress">' + (_focusIdx + 1) + ' / ' + _focusList.length + ' blocked on you</span>'
     + '<button class="focus-x" onclick="_focusClose()" title="Close (Esc)">\u2715</button>';
@@ -46856,7 +46863,7 @@ function _focusRender() {
     + '<button class="btn" style="color:var(--green);border-color:var(--green);" onclick="_focusDecide(\'approved\')" title="Approve (a)">\u2713 Approve</button>'
     + '<button class="btn" style="color:var(--red);border-color:var(--red);" onclick="_focusDecide(\'rejected\')" title="Reject (r)">\u2717 Reject</button>'
     + '<button class="btn" onclick="_focusUnblock()" title="Just clear the block (u)">Unblock</button>'
-    + '<button class="btn" onclick="_focusNudge()" title="Nudge the owning session (n)">\uD83D\uDC49 Nudge</button>'
+    + '<button class="btn" onclick="_focusNudge()" title="Nudge the owning worker (n)">\uD83D\uDC49 Nudge</button>'
     + '<button class="btn" onclick="_focusNext()" title="Skip (j)">Skip \u2192</button>';
 }
 
@@ -46864,7 +46871,7 @@ function _boardQueryHelp() {
   showFormModal('Board query syntax',
     '<div style="font-size:0.8rem;line-height:1.6">'
     + '<p style="margin:0 0 8px;color:var(--dim)">Terms are AND-ed. Comma-separate to OR within a key. Prefix <code>-</code> to negate. Quote phrases.</p>'
-    + '<p style="margin:0 0 4px"><b>Fields</b><br><code>status: session: owner: type: tag: id: shepherd: creator:</code></p>'
+    + '<p style="margin:0 0 4px"><b>Fields</b><br><code>status: worker: owner: type: group: id: shepherd: creator:</code></p>'
     + '<p style="margin:0 0 4px"><b>Derived</b> (joined against live session state)<br>'
     + '<code>is:open is:closed is:stale is:rotting is:working is:waiting is:gated is:offline is:orphan is:pinned is:overdue is:folded</code></p>'
     + '<p style="margin:0 0 4px"><b>Age</b><br><code>updated:&gt;7d created:&lt;3d updated:&gt;36h</code></p>'
@@ -46998,7 +47005,7 @@ function _renderBoardCard(item) {
   // (item in doing + that session's terminal is actively generating).
   const _liveNow = item.status === 'doing' && item.session &&
     (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
-  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
+  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.worker) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   h += '<div class="board-card-key">' + esc(item.id) + '</div>';
@@ -48224,7 +48231,7 @@ function editSessionGate(session, statusId) {
     + '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">One criterion per line. '+(hasOverride ? 'This session has a custom gate.' : 'Currently inheriting the global default (shown below to tweak).')+'</div>'
     + '<textarea id="_sgate-edit-ta" style="width:100%;min-height:150px;box-sizing:border-box;font-family:inherit;font-size:0.9rem;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);resize:vertical;"></textarea>'
     + '<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:14px;">'
-    + '<button class="btn" id="_sgate-edit-reset" title="Delete this session override and inherit the global default"'+(hasOverride ? '' : ' style="visibility:hidden;"')+'>Reset to default</button>'
+    + '<button class="btn" id="_sgate-edit-reset" title="Delete this worker override and inherit the global default"'+(hasOverride ? '' : ' style="visibility:hidden;"')+'>Reset to default</button>'
     + '<div style="display:flex;gap:8px;"><button class="btn" id="_sgate-edit-cancel">Cancel</button><button class="btn primary" id="_sgate-edit-save">Save</button></div></div>';
   bg.appendChild(box); document.body.appendChild(bg);
   const ta = box.querySelector('#_sgate-edit-ta');
@@ -49009,7 +49016,7 @@ function _renderGridChips() {
     const on = !!open[s.name];
     const dead = !s.running && on;   // pane open but the session went away
     const esc_ = s.name.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    const title = dead ? ' title="Session is not running — pane is stale"'
+    const title = dead ? ' title="Worker is not running — pane is stale"'
                        : (s.status ? ' title="' + esc(s.status) + '"' : '');
     return '<button class="gp-chip' + (on ? ' on' : '') + (dead ? ' gp-dead' : '') + '"'
       + title + ' onclick="toggleGridPane(\'' + esc_ + '\')">' + esc(s.name) + '</button>';
@@ -57049,7 +57056,7 @@ async function _jrnlSaveConfig() {
         <button onclick="wsApplyPreset('rows')"><span class="preset-icon">&#x2261;</span> Stacked Rows</button>
       </div>
     </div>
-    <button class="btn" onclick="wsExpandActive()" style="flex-shrink:0;font-size:0.75rem;padding:4px 10px;" title="Add all active/waiting sessions">&#x26A1; Active</button>
+    <button class="btn" onclick="wsExpandActive()" style="flex-shrink:0;font-size:0.75rem;padding:4px 10px;" title="Add all active/waiting workers">&#x26A1; Active</button>
     <button class="btn" onclick="wsClearWorkspace()" style="flex-shrink:0;font-size:0.75rem;padding:4px 10px;color:var(--dim);" title="Remove all panes">Clear</button>
     <button class="btn" id="ws-fullscreen-btn" onclick="wsToggleFullscreen()" style="flex-shrink:0;font-size:0.75rem;padding:4px 10px;" title="Toggle fullscreen">&#x26F6;</button>
     <button class="btn" onclick="exitGridMode()" style="flex-shrink:0;font-size:0.75rem;padding:4px 10px;">&#x2715; Exit</button>
@@ -57125,7 +57132,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.451';
+const CACHE = 'amux-v0.9.452';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
