@@ -27280,6 +27280,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     #messages-view .msg-ts { font-size:0.7rem; color:var(--dim); }
     #messages-view .msg-tag { font-size:0.66rem; padding:1px 6px; border-radius:3px; background:rgba(128,128,128,0.12); color:var(--dim); }
     #messages-view .msg-tag.steering { background:rgba(137,87,229,0.15); color:var(--purple,#8957e5); }
+    /* Peek messages multi-select (AMUX-2319) */
+    #pm-selbar { display:none; gap:8px; align-items:center; flex-wrap:wrap;
+      padding:8px 10px; margin:0 10px 6px; border:1px solid var(--accent);
+      border-radius:8px; background:rgba(88,166,255,0.08); }
+    .pm-check { flex:0 0 auto; align-self:flex-start; margin:2px 8px 0 0;
+      width:18px; height:18px; cursor:pointer; }
+    .pm-actions { position:relative; flex:0 0 auto; align-self:center; }
+    .pm-dots { min-width:44px; min-height:44px; font-size:1.1rem; line-height:1; }
     /* Multi-select + resend (AMUX-2318) */
     #msgs-selbar { display:none; gap:8px; align-items:center; flex-wrap:wrap;
       padding:8px 10px; margin:6px 0; border:1px solid var(--accent);
@@ -28280,6 +28288,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
     </div>
     <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;"></div>
+    <div id="pm-selbar" style="display:none;"></div>
     <div id="peek-messages-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:10px;"></div>
   </div>
   <!-- Dictation: speak → clean text. Audio goes to the amux server, which calls
@@ -34111,7 +34120,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.445';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.446';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -37883,6 +37892,7 @@ function _msgCardChip(cardId) {
 }
 
 function _cmdHistItemHTML(e) {
+  const _pk = _pmKey(e), _psel = _pmSel.has(_pk);
   const text = typeof e === 'string' ? e : e.text;
   const session = typeof e === 'string' ? '' : (e.session || '');
   const origin = typeof e === 'string' ? '' : (e.origin || '');
@@ -37910,7 +37920,7 @@ function _cmdHistItemHTML(e) {
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
   const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
   const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
-  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div>${copyBtn}${speakBtn}${locate}</div>`;
+  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="_pmSelToggle(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();_pmResend([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(peekSession)}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -38021,6 +38031,23 @@ function _peekMessagesRender() {
   const _empty = q ? 'No matches.'
     : (_fLbl ? 'No ' + _fLbl.toLowerCase() + ' messages for this session.'
              : 'No messages sent to this session yet.');
+  // Selection toolbar (AMUX-2319), mirroring the global tab. Only DELIVERED
+  // history is selectable - the pending block above is a separate render path
+  // and a message that has not arrived once cannot be re-sent.
+  const _pmKeys = items.map(_pmKey);
+  const _pmSelVis = _pmKeys.filter(k => _pmSel.has(k));
+  const pbar = document.getElementById('pm-selbar');
+  if (pbar) {
+    if (_pmSelVis.length) {
+      pbar.innerHTML =
+        '<span class="msgs-selcount">' + _pmSelVis.length + ' selected</span>' +
+        '<span class="msgs-sellanes">to ' + esc(peekSession) + '</span>' +
+        '<button class="btn primary" onclick="_pmResend(' + JSON.stringify(_pmSelVis).replace(/"/g, '&quot;') + ')">Resend ' + _pmSelVis.length + '</button>' +
+        '<button class="btn" onclick="_pmSelAll(' + JSON.stringify(_pmKeys).replace(/"/g, '&quot;') + ')">Select all ' + _pmKeys.length + '</button>' +
+        '<button class="btn" onclick="_pmSelNone()">Clear</button>';
+      pbar.style.display = 'flex';
+    } else { pbar.innerHTML = ''; pbar.style.display = 'none'; }
+  }
   list.innerHTML = (pendingHTML + histHTML)
     || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`;
   _peekMessagesBadge();
@@ -52201,31 +52228,62 @@ document.addEventListener('click', () => {
   document.querySelectorAll('.msg-menu.open').forEach(m => m.classList.remove('open'));
 });
 
-async function _msgResend(keys) {
-  const rows = _msgsData.filter(m => keys.includes(_msgKey(m)) && (m.session || ''));
-  if (!rows.length) { toast('Nothing to resend (messages with no target session are skipped)'); return; }
-  const lanes = [...new Set(rows.map(m => m.session))];
-  const preview = rows.slice(0, 3).map(m => '  \u2022 ' + (m.text || '').slice(0, 60)).join('\n');
+// Shared core so the global tab and the peek panel cannot drift apart. They
+// have DIFFERENT data shapes (_msgsData rows carry .session; peek items are
+// strings or {text,time} belonging to peekSession), so each surface builds the
+// {session,text} list and this does the rest.
+async function _resendRows(rows) {
+  rows = (rows || []).filter(r => r && r.session && r.text);
+  if (!rows.length) { showToast('Nothing to resend (messages with no target session are skipped)'); return; }
+  const lanes = [...new Set(rows.map(r => r.session))];
+  const preview = rows.slice(0, 3).map(r => '  \u2022 ' + r.text.slice(0, 60)).join('\n');
   const ok = await showConfirm(
     'Resend ' + rows.length + ' message' + (rows.length === 1 ? '' : 's') +
     ' to ' + lanes.length + ' session' + (lanes.length === 1 ? '' : 's') + '?\n\n' +
     lanes.join(', ') + '\n\n' + preview + (rows.length > 3 ? '\n  \u2026and ' + (rows.length - 3) + ' more' : '') +
     '\n\nEach resend wakes its session and costs it a turn.',
     'Resend', false);
-  if (!ok) return;
+  if (!ok) return false;
   let sent = 0, failed = 0;
-  for (const m of rows) {
+  for (const r of rows) {
     try {
-      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(m.session) + '/send', {
+      const resp = await fetch(API + '/api/sessions/' + encodeURIComponent(r.session) + '/send', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: m.text || '' }),
+        body: JSON.stringify({ text: r.text }),
       });
-      if (r.ok) sent++; else failed++;
+      if (resp.ok) sent++; else failed++;
     } catch (e) { failed++; }
   }
-  _msgSel.clear();
   showToast('Resent ' + sent + (failed ? ' \u00b7 ' + failed + ' failed' : '') + ' to ' + lanes.length + ' session(s)');
-  _messagesRender();
+  return true;
+}
+
+// ── Peek Messages panel selection (AMUX-2319) ───────────────────────────────
+// Separate set from _msgSel: different surface, different shape, and a stale
+// cross-surface selection would resend the wrong things.
+let _pmSel = new Set();
+const _pmKey = (e) => {
+  const t = typeof e === 'string' ? e : (e.text || '');
+  return ((typeof e === 'string' ? '' : (e.time || '')) + '|' + t.slice(0, 60));
+};
+function _pmSelToggle(key, ev) {
+  if (ev) ev.stopPropagation();
+  if (_pmSel.has(key)) _pmSel.delete(key); else _pmSel.add(key);
+  _peekMessagesRender();
+}
+function _pmSelAll(keys) { keys.forEach(k => _pmSel.add(k)); _peekMessagesRender(); }
+function _pmSelNone() { _pmSel.clear(); _peekMessagesRender(); }
+async function _pmResend(keys) {
+  const items = _peekMessagesFor().filter(e => keys.includes(_pmKey(e)));
+  const rows = items.map(e => ({ session: peekSession,
+                                 text: typeof e === 'string' ? e : (e.text || '') }));
+  if (await _resendRows(rows)) { _pmSel.clear(); _peekMessagesRender(); }
+}
+
+async function _msgResend(keys) {
+  const rows = _msgsData.filter(m => keys.includes(_msgKey(m)) && (m.session || ''))
+                        .map(m => ({ session: m.session, text: m.text || '' }));
+  if (await _resendRows(rows)) { _msgSel.clear(); _messagesRender(); }
 }
 
 function _messagesRender() {
@@ -55532,7 +55590,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.445';
+const CACHE = 'amux-v0.9.446';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
