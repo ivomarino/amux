@@ -15657,6 +15657,16 @@ def _staged_guard_window() -> float:
         return 21600.0
 
 
+# Paths mentioned in a shell command. Deliberately loose — the mtime check below
+# is what decides ownership, not this regex.
+_PATHLIKE_RE = re.compile(r"[\w./~-]*[\w-]+\.[A-Za-z0-9]{1,8}")
+# How far a file's mtime may sit from the command's timestamp and still count as
+# that command's write. Covers a long-running command and clock skew between the
+# transcript stamp and the filesystem; tight enough that an unrelated later edit
+# by a peer is not absorbed.
+_SHELL_WRITE_SLACK = float(os.environ.get("AMUX_SHELL_WRITE_SLACK", "180"))
+
+
 def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
     """{abs realpath: epoch ts} of files this session edited (Edit/Write/
     MultiEdit/NotebookEdit tool_use) within the window, parsed from its own
@@ -15668,6 +15678,14 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
     if cached and now - cached[0] < 30 and cached[1] == since_secs:
         return cached[2]
     out: dict[str, float] = {}
+    # Base for resolving RELATIVE paths named in shell commands. Without it the
+    # per-block `except Exception: continue` would swallow a NameError and the
+    # shell-write detection would be silently inert — a feature that looks
+    # shipped and does nothing.
+    try:
+        work_hint = _session_work_dir(name) or ""
+    except Exception:
+        work_hint = ""
     try:
         jf = _session_jsonl_path(name)
         if jf:
@@ -15685,6 +15703,49 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
                         continue
                     for blk in content:
                         if not (isinstance(blk, dict) and blk.get("type") == "tool_use"):
+                            continue
+                        if blk.get("name") == "Bash":
+                            # SHELL WRITES COUNT TOO (AMUX-2343). Only Edit/Write
+                            # tool_use was read, so a session that edits via
+                            # `python3 - <<PY`, sed -i, tee or a generator script
+                            # left no record and the guard classed its OWN files as
+                            # foreign — it blocked two of my commits on my own work.
+                            # AMUX-2337 made that far likelier by design: pairing by
+                            # repo root took mixpeek from 6 pairable lanes to 29, so
+                            # every shell-editing lane now has ~28 candidate owners.
+                            #
+                            # The evidence is already here — the transcript records
+                            # the command — so this needs no hook and no
+                            # settings.json change, which matters because that file's
+                            # ownership is an open question.
+                            #
+                            # MTIME IS WHAT KEEPS THIS HONEST. Naming a path is not
+                            # writing it: `grep x foo.py` and `git diff foo.py`
+                            # mention foo.py and change nothing. A path is only
+                            # claimed if the file actually changed at the time the
+                            # command ran, so read-only commands claim nothing.
+                            # Over-claiming here is the DANGEROUS direction — it
+                            # would let a real sweep through — so the test is
+                            # deliberately the narrow one.
+                            _c = (blk.get("input") or {}).get("command") or ""
+                            if isinstance(_c, str) and _c:
+                                for _cand in _PATHLIKE_RE.findall(_c):
+                                    _cand = _cand.strip("'\"),;:")
+                                    if not _cand or len(_cand) < 4:
+                                        continue
+                                    try:
+                                        _ap = os.path.realpath(
+                                            _cand if os.path.isabs(_cand)
+                                            else os.path.join(work_hint, _cand))
+                                        if not os.path.isfile(_ap):
+                                            continue
+                                        _mt = os.stat(_ap).st_mtime
+                                        # changed while this command was running
+                                        if abs(_mt - ts) <= _SHELL_WRITE_SLACK:
+                                            if _mt > out.get(_ap, 0):
+                                                out[_ap] = _mt
+                                    except Exception:
+                                        continue
                             continue
                         if blk.get("name") not in _EDIT_TOOL_NAMES:
                             continue
