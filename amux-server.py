@@ -15671,6 +15671,26 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
     return out
 
 
+_repo_root_memo: dict = {}
+
+
+def _repo_root(d: str) -> str:
+    """git toplevel for a directory, memoized. Called once per session per guard
+    check, and a commit is latency-sensitive — 44 subprocess calls per commit
+    would make the guard itself the reason people bypass it."""
+    if not d:
+        return ""
+    if d in _repo_root_memo:
+        return _repo_root_memo[d]
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        r = ""
+    _repo_root_memo[d] = r
+    return r
+
+
 def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
     """Which of `rel_paths` (staged, repo-relative) were recently edited by a
     DIFFERENT session sharing this checkout? A path the requesting session
@@ -15683,8 +15703,24 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
     except Exception:
         return {"ok": True, "foreign": [], "cotenants": []}
     all_dirs = _all_session_workdirs()
+    # Pair sessions by GIT REPO ROOT, not by CC_DIR string (AMUX-2337).
+    #
+    # `wd` is the committing repo's toplevel (the hook sends `rev-parse
+    # --show-toplevel`), but CC_DIR is wherever the lane happens to work. In a
+    # monorepo those are different paths, so `od == wd` never matched and the
+    # guard had NO cotenants to compare against — it returned foreign=[] and
+    # waved the commit through. Measured: 29 lanes share ~/Dev/mixpeek and the
+    # guard could pair 6 of them; 23 of 36 lanes were invisible to it. It worked
+    # in ~/Dev/amux only because those lanes' CC_DIR happens to equal the repo
+    # root, which is why it looked correct from here.
+    #
+    # So it protected the small single-directory repos and was structurally
+    # blind on the big shared checkout — the case with the most lanes and the
+    # most collisions. studio-plg swept 18 of mvs-infra's STAGED files into its
+    # commit and pushed, with the guard running and returning 200.
+    wd_root = _repo_root(wd) or wd
     cotenants = [other for other, od in all_dirs.items()
-                 if other != session and od == wd]
+                 if other != session and (_repo_root(od) or od) == wd_root]
     if not cotenants or not rel_paths:
         # Same keys on every return path: a caller that reads d["shared"] should
         # get [] here, not None. Shape-inconsistent returns are how a consumer
