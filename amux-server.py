@@ -34502,21 +34502,40 @@ async function loadPeekTranscript(showLoading) {
 // chain — gates resolve card > type > worker > group > global while memory and
 // env go global > group > worker, and pretending they share an order would be a
 // lie the UI tells confidently. The server sends the order per capability.
-async function _scopeLoad() {
+// Takes an explicit scope so the SAME renderer serves global, group and worker
+// (AMUX-2362). Threaded through first while every caller still passes a worker,
+// so the shell change is provably behaviour-preserving before a second caller
+// exists — the alternative is discovering the coupling from a group panel that
+// renders subtly differently, which is how three message renderers happened.
+async function _scopeLoad(scope) {
   const el = document.getElementById('peek-scope-body');
-  if (!el || !peekSession) return;
-  const w = peekSession;
+  const sc = scope || (peekSession ? { level: 'worker', name: peekSession } : null);
+  // Global has no name, and requiring one made _scopeLoad({level:'global'})
+  // return early — leaving whatever was rendered before still on screen, which
+  // reads as a successful render of the wrong scope. Caught by rendering all
+  // three in sequence and comparing; either one alone looks fine.
+  if (!el || !sc || (sc.level !== 'global' && !sc.name)) return;
+  const w = sc.name, lvl = sc.level;
   el.textContent = 'Loading\u2026';
   try {
-    const r = await fetch(API + '/api/scope?level=worker&name=' + encodeURIComponent(w),
+    const r = await fetch(API + '/api/scope?level=' + encodeURIComponent(lvl)
+                          + (lvl === 'global' ? '' : '&name=' + encodeURIComponent(w)),
                           { headers: _authHeaders() });
     if (!r.ok) throw new Error('scope ' + r.status);
     const d = await r.json();
-    const groups = d.groups || [];
+    // At worker level these are the groups it belongs to; at group level the
+    // server returns `members` instead. Inheritance only applies below global.
+    const groups = (lvl === 'worker') ? (d.groups || []) : [];
+    const members = (lvl === 'group') ? (d.members || []) : [];
     // Fetch the levels this worker inherits from, so a row can show WHERE a
     // value actually comes from rather than only whether it is set here.
+    // Only fetch the levels this scope actually inherits FROM: a worker
+    // inherits global + its groups, a group inherits global, and global
+    // inherits nothing. Fetching global while viewing global would report it as
+    // inheriting from itself and light the wrong level in the chain.
     const [gl, ...grp] = await Promise.all([
-      fetch(API + '/api/scope?level=global', { headers: _authHeaders() }).then(x => x.json()).catch(() => null),
+      lvl === 'global' ? Promise.resolve(null)
+        : fetch(API + '/api/scope?level=global', { headers: _authHeaders() }).then(x => x.json()).catch(() => null),
       ...groups.map(g => fetch(API + '/api/scope?level=group&name=' + encodeURIComponent(g),
         { headers: _authHeaders() }).then(x => x.json()).catch(() => null)),
     ]);
@@ -34536,16 +34555,18 @@ async function _scopeLoad() {
       if (typeof v === 'object') { const k = Object.keys(v).filter(x => v[x] && v[x].length); return k.length ? k.join(', ') : '\u2014'; }
       return String(v);
     };
+    const chips = (arr) => arr.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ');
     let h = '<div style="margin-bottom:10px;color:var(--text);font-size:0.86rem;">'
-          + '<b>' + esc(w) + '</b> \u00b7 groups: '
-          + (groups.length ? groups.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ') : '<i>none</i>')
+          + '<b>' + esc(lvl === 'global' ? 'Global' : w) + '</b>'
+          + (lvl === 'worker' ? ' \u00b7 groups: ' + (groups.length ? chips(groups) : '<i>none</i>') : '')
+          + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's') + ': ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') : '')
           + '</div>';
     d.capabilities.forEach((c, i) => {
       const here = c.set_here, gset = G[c.key] && G[c.key].set_here;
       const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
       // Which layer actually supplies it, following this capability's own order.
       let src = 'unset', srcC = 'var(--dim)';
-      if (here) { src = 'worker'; srcC = 'var(--accent)'; }
+      if (here) { src = lvl; srcC = 'var(--accent)'; }
       else if (grpHit.length) { src = 'group:' + grpHit[0]; srcC = '#d29922'; }
       else if (gset) { src = 'global'; srcC = 'var(--dim)'; }
       h += '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:7px;background:var(--card);">'
@@ -34557,7 +34578,9 @@ async function _scopeLoad() {
         // differ from that one" — showing only the winner cannot express it.
         + '<div style="font-size:0.68rem;color:var(--dim);margin-top:4px;">'
         + (c.order || []).map(l => {
-            const on = (l === 'worker' && here) || (l === 'group' && grpHit.length) || (l === 'global' && gset);
+            const on = (l === lvl && here)
+                    || (l === 'group' && (lvl === 'worker' ? grpHit.length : false))
+                    || (l === 'global' && (lvl === 'global' ? here : gset));
             return '<span style="opacity:' + (on ? '1' : '0.38') + ';">' + esc(l) + '</span>';
           }).join(' <span style="opacity:0.3;">&rsaquo;</span> ')
         + ' <span style="opacity:0.5;">\u00b7 ' + esc(c.merge) + '</span>'
