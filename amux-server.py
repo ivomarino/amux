@@ -18059,8 +18059,8 @@ def main():
     # hunks too, and their `git commit` then reports "nothing to commit".
     for f in (d.get("shared") or []):
         mins = int((f.get("age_secs") or 0) / 60)
-        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago; "
-          "your commit will include their uncommitted work too.\\n"
+        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago. "
+          "If they have uncommitted changes there, this commit takes them too.\\n"
           % (f.get("path"), f.get("owner"), mins))
     foreign = d.get("foreign") or []
     if not foreign:
