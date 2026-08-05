@@ -26764,7 +26764,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </button>
     </div>
     <input type="file" id="files-upload-input" multiple style="display:none;" onchange="handleFilesUpload(this.files)">
-    <span id="files-cache-status" style="font-size:0.7rem;color:var(--dim);white-space:nowrap;flex-shrink:0;"></span>
+    <span id="files-cache-status" style="font-size:0.7rem;color:var(--dim);white-space:nowrap;flex-shrink:0;"><span class="upq-badge" style="display:none;"></span></span>
     <!-- Overflow menu button (visible on mobile) -->
     <div class="fe-tb-overflow" id="files-overflow-wrap">
       <button class="fe-tb-btn" onclick="_filesOverflowToggle()" title="More actions" id="files-overflow-btn">
@@ -27280,6 +27280,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     #messages-view .msg-ts { font-size:0.7rem; color:var(--dim); }
     #messages-view .msg-tag { font-size:0.66rem; padding:1px 6px; border-radius:3px; background:rgba(128,128,128,0.12); color:var(--dim); }
     #messages-view .msg-tag.steering { background:rgba(137,87,229,0.15); color:var(--purple,#8957e5); }
+    /* Durable upload queue (AMUX-2317) */
+    .upq-badge { display:inline-block; margin-left:8px; font-size:0.72rem;
+      padding:2px 8px; border-radius:10px; background:rgba(210,153,34,0.16);
+      color:#d29922; border:1px solid rgba(210,153,34,0.45); }
     /* Peek messages multi-select (AMUX-2319) */
     #pm-selbar { display:none; gap:8px; align-items:center; flex-wrap:wrap;
       padding:8px 10px; margin:0 10px 6px; border:1px solid var(--accent);
@@ -28767,7 +28771,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="explore-breadcrumb" id="explore-breadcrumb" style="flex:1;margin-right:8px;"></div>
     <button class="btn" id="explore-hidden-btn" onclick="toggleExploreHidden()" style="font-size:0.7rem;padding:2px 8px;" title="Show hidden files">.*</button>
     <button class="btn" onclick="triggerExploreUpload()" style="font-size:0.7rem;padding:2px 8px;" title="Upload files to current directory">&#x2191; Upload</button>
-    <input type="file" id="explore-upload-input" multiple style="display:none;" onchange="handleExploreUpload(this.files)">
+    <input type="file" id="explore-upload-input" multiple style="display:none;" onchange="handleExploreUpload(this.files)"><span class="upq-badge" style="display:none;"></span>
     <button class="btn" onclick="closeExplore()">&#x2715;</button>
   </div>
   <div style="padding:6px 12px;border-bottom:1px solid var(--border);">
@@ -30103,6 +30107,107 @@ function updateConnectionStatus() {
   ops.innerHTML = html;
 }
 
+// ── Durable upload queue (AMUX-2317) ────────────────────────────────────────
+// The outbox refuses non-string bodies with the comment "FormData/Blob can't
+// persist". That was true of a JSON/localStorage store and is FALSE here: the
+// offline queue is backed by IndexedDB, which stores Blobs and Files natively
+// via structured clone. So audio recordings and directory-view uploads were
+// excluded from offline durability BY CONSTRUCTION, not by necessity - an
+// upload attempted offline simply failed and the bytes were gone.
+//
+// This keeps the actual bytes in IDB and replays the upload on reconnect, so a
+// recording made on a phone with no signal survives until it can be sent.
+const _UPQ_KEY = 'upload_queue';
+
+async function _upqList() {
+  try { return (await _idb.get(_UPQ_KEY)) || []; } catch (e) { return []; }
+}
+async function _upqAdd(file, dir, kind) {
+  const q = await _upqList();
+  q.push({ id: 'up-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+           name: file.name || (kind === 'audio' ? 'recording.webm' : 'upload.bin'),
+           mime: file.type || '', dir: dir || '', kind: kind || 'file',
+           size: file.size || 0, ts: Date.now(), blob: file });
+  await _idb.set(_UPQ_KEY, q);
+  _upqRenderBadge();
+  return q.length;
+}
+async function _upqRemove(id) {
+  const q = (await _upqList()).filter(x => x.id !== id);
+  await _idb.set(_UPQ_KEY, q);
+  _upqRenderBadge();
+}
+async function _upqCancel(id) {
+  await _upqRemove(id);
+  showToast('Removed from the upload queue (NOT uploaded)');
+}
+
+// Drain is idempotent and single-flight: a second call while draining is a
+// no-op rather than a double upload.
+let _upqDraining = false;
+async function _upqDrain() {
+  if (_upqDraining || !online) return;
+  const q = await _upqList();
+  if (!q.length) return;
+  _upqDraining = true;
+  let sent = 0, failed = 0;
+  try {
+    for (const item of q) {
+      try {
+        const fd = new FormData();
+        fd.append('dir', item.dir);
+        fd.append('file', item.blob, item.name);
+        const r = await fetch(API + '/api/fs/upload',
+                              { method: 'POST', body: fd, _skipOutbox: true });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && (d.saved || []).length) { await _upqRemove(item.id); sent++; }
+        else failed++;
+      } catch (e) { failed++; }
+    }
+  } finally { _upqDraining = false; }
+  if (sent) {
+    showToast('Uploaded ' + sent + ' queued file' + (sent === 1 ? '' : 's')
+              + (failed ? ' \u00b7 ' + failed + ' still queued' : ''));
+    if (typeof loadExplore === 'function' && typeof _explorePath !== 'undefined') {
+      try { loadExplore(_explorePath); } catch (e) {}
+    }
+  }
+  _upqRenderBadge();
+}
+
+// A pending upload must never be indistinguishable from a lost one.
+async function _upqRenderBadge() {
+  const q = await _upqList();
+  document.querySelectorAll('.upq-badge').forEach(el => {
+    if (!q.length) { el.style.display = 'none'; el.textContent = ''; return; }
+    const bytes = q.reduce((a, x) => a + (x.size || 0), 0);
+    el.style.display = '';
+    el.textContent = q.length + ' queued upload' + (q.length === 1 ? '' : 's')
+      + ' (' + (bytes / 1024 >= 1024 ? (bytes / 1048576).toFixed(1) + ' MB'
+                                     : Math.max(1, Math.round(bytes / 1024)) + ' KB') + ')'
+      + (online ? ' \u2014 sending\u2026' : ' \u2014 waiting for connection');
+  });
+}
+
+// One entry point for BOTH surfaces, so audio and file uploads cannot drift.
+async function _uploadOrQueue(files, dir, kind) {
+  let uploaded = 0, queued = 0, failed = 0;
+  for (const file of Array.from(files || [])) {
+    if (!online) { await _upqAdd(file, dir, kind); queued++; continue; }
+    try {
+      const fd = new FormData();
+      fd.append('dir', dir);
+      fd.append('file', file, file.name);
+      const r = await fetch(API + '/api/fs/upload',
+                            { method: 'POST', body: fd, _skipOutbox: true });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && (d.saved || []).length) uploaded++;
+      else { await _upqAdd(file, dir, kind); queued++; }   // server said no: keep the bytes
+    } catch (e) { await _upqAdd(file, dir, kind); queued++; }  // network died mid-flight
+  }
+  return { uploaded, queued, failed };
+}
+
 function setOnline(val) {
   const was = online;
   online = val;
@@ -30111,6 +30216,7 @@ function setOnline(val) {
   updateConnectionStatus();
   if (!was && val) {
     showToast('Reconnected — syncing...');
+    try { _upqDrain(); } catch (e) {}
     runSyncBanner();
     // Reconnect SSE (reset fallback so we can get back to Live mode)
     _sseFallback = false; _sseRetries = 0;
@@ -34120,7 +34226,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.446';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.447';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40558,28 +40664,14 @@ function triggerFilesUpload() {
 async function handleFilesUpload(files) {
   if (!files || !files.length) return;
   const statusEl = document.getElementById('files-cache-status');
-  let uploaded = 0, failed = 0;
-  for (const file of Array.from(files)) {
-    statusEl.textContent = `Uploading ${file.name}…`;
-    const fd = new FormData();
-    fd.append('dir', _filesPath);
-    fd.append('file', file, file.name);
-    try {
-      const r = await fetch(API + '/api/fs/upload', { method: 'POST', body: fd });
-      const d = await r.json();
-      if (r.ok && d.saved?.length) uploaded++;
-      else { failed++; showToast('Upload failed: ' + (d.error || r.status)); }
-    } catch(e) {
-      failed++;
-      showToast('Upload error: ' + e.message);
-    }
-  }
-  statusEl.textContent = '';
-  document.getElementById('files-upload-input').value = '';
-  if (uploaded) {
-    showToast(`Uploaded ${uploaded} file${uploaded !== 1 ? 's' : ''} to ${_filesPath}`);
-    loadFiles(_filesPath);
-  }
+  if (statusEl) statusEl.textContent = online ? 'Uploading\u2026' : 'Offline \u2014 queueing\u2026';
+  const { uploaded, queued } = await _uploadOrQueue(files, _filesPath, 'file');
+  if (statusEl) statusEl.textContent = '';
+  const inp = document.getElementById('files-upload-input');
+  if (inp) inp.value = '';
+  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' queued \u2014 will upload when back online');
+  if (uploaded) { showToast('Uploaded ' + uploaded + ' file' + (uploaded === 1 ? '' : 's')); loadFiles(_filesPath); }
+  _upqRenderBadge();
 }
 
 // ═══════ OFFLINE FILE CACHE ═══════
@@ -40736,20 +40828,12 @@ function triggerExploreUpload() {
 }
 async function handleExploreUpload(files) {
   if (!files || !files.length) return;
-  let uploaded = 0, failed = 0;
-  for (const file of Array.from(files)) {
-    const fd = new FormData();
-    fd.append('dir', _explorePath);
-    fd.append('file', file, file.name);
-    try {
-      const r = await fetch(API + '/api/fs/upload', { method: 'POST', body: fd });
-      const d = await r.json();
-      if (r.ok && d.saved?.length) uploaded++;
-      else { failed++; showToast('Upload failed: ' + (d.error || r.status)); }
-    } catch(e) { failed++; showToast('Upload error: ' + e.message); }
-  }
-  document.getElementById('explore-upload-input').value = '';
-  if (uploaded) { showToast(`Uploaded ${uploaded} file${uploaded !== 1 ? 's' : ''}`); loadExplore(_explorePath); }
+  const { uploaded, queued } = await _uploadOrQueue(files, _explorePath, 'file');
+  const inp = document.getElementById('explore-upload-input');
+  if (inp) inp.value = '';
+  if (queued) showToast(queued + ' file' + (queued === 1 ? '' : 's') + ' queued \u2014 will upload when back online');
+  if (uploaded) { showToast('Uploaded ' + uploaded + ' file' + (uploaded !== 1 ? 's' : '')); loadExplore(_explorePath); }
+  _upqRenderBadge();
 }
 function toggleExploreHidden() {
   _exploreShowHidden = !_exploreShowHidden;
@@ -55590,7 +55674,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.446';
+const CACHE = 'amux-v0.9.447';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
