@@ -34634,7 +34634,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.448';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.449';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38228,8 +38228,7 @@ async function _cmdHistFetch() {
       fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() }),
     ]);
     if (r.ok) {
-      const rows = (await r.json()).map(x => ({ text: x.text, type: x.type, session: x.session,
-        time: x.ts, id: x.id, origin: x.origin || '', kind: x.kind, queued: x.queued }));
+      const rows = (await r.json()).map(_msgNorm);
       _cmdHistRows = _mergeUnechoed(rows.reverse(), sess);
     }
     if (rc.ok) _cmdHistCounts = await rc.json();
@@ -38282,46 +38281,10 @@ function _renderCmdHistoryList() {
                   : (sessFilter ? 'No messages for ' + sessFilter + '.' : 'No history yet.')) + '</div>';
     return;
   }
-  list.innerHTML = filtered.map(e => {
-    const text = typeof e === 'string' ? e : e.text;
-    const type = typeof e === 'string' ? '' : (e.type || '');
-    const session = typeof e === 'string' ? '' : (e.session || '');
-    const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
-    const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
-    // Was: `type === 'steering' ? 'queued' : 'direct'` — which badged every
-    // session-to-session AND every scheduled message as "direct", i.e. as
-    // something you had typed. Same kind + origin the peek tab shows.
-    const kind = _msgKind(e);
-    const km = _MSG_KIND[kind] || _MSG_KIND.human;
-    const origin = typeof e === 'string' ? '' : (e.origin || '');
-    const tagSuffix = kind === 'human'
-      ? (_msgQueued(e) ? ' · queued' : ' · direct')
-      : (origin ? ' · ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,28) : '');
-    const meta = '<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 6px;border-radius:3px;background:'
-      + km.bg + ';color:' + km.color + ';margin-right:6px;border-left:3px solid ' + km.color + ';">'
-      + km.label + tagSuffix + '</span>'
-      + (session ? '<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">' + session.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</span>' : '')
-      + (ts ? '<span style="color:var(--dim);font-size:0.7rem;">' + ts + '</span>' : '');
-    const locSess = (session || peekSession || '').replace(/\u0027/g, '');
-    const copyBtn = '<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" '
-      + 'title="Copy message text" '
-      + 'onclick="event.stopPropagation();_msgCopyBtn(this,\u0027' + enc + '\u0027)">&#x1F4CB;</button>';
-    const locate = locSess
-      ? '<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" '
-        + 'title="Open the peek and scroll to where this was sent" '
-        + 'onclick="event.stopPropagation();_msgLocate(\u0027' + locSess + '\u0027,\u0027' + enc + '\u0027)">&#x2316;</button>'
-      : '';
-    return '<div onclick="_pickCmdHistory(decodeURIComponent(\u0027' + enc + '\u0027))" '
-      + 'style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;'
-      + 'font-size:0.85rem;color:var(--text);'
-      + 'transition:border-color 0.15s;display:flex;gap:10px;align-items:flex-start;" '
-      + 'onmouseenter="this.style.borderColor=\u0027var(--accent)\u0027" '
-      + 'onmouseleave="this.style.borderColor=\u0027var(--border)\u0027">'
-      + '<div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">'
-      + (meta ? '<div style="margin-bottom:4px;">' + meta + '</div>' : '')
-      + safe + '</div>' + copyBtn + locate + '</div>';
-  }).join('');
+  // Was a second hand-maintained copy of the row markup, which is why this
+  // list and the peek/Messages tabs showed the same rows with different
+  // badges, no card chip and no search highlighting (AMUX-2334).
+  list.innerHTML = filtered.map(e => _cmdHistItemHTML(e, _msgCtxHistory())).join('');
 }
 // ── Peek Messages tab: the message history, scoped to the open session ──
 // One entry → its card HTML (same look as the Message-history modal). Kept as a
@@ -38405,8 +38368,44 @@ function _msgCardChip(cardId) {
     + (lastCommit ? ' \u00B7 \u2318' : '') + '</span>';
 }
 
-function _cmdHistItemHTML(e) {
-  const _pk = _pmKey(e), _psel = _pmSel.has(_pk);
+// Canonical message row. THREE surfaces fetch /api/history and each kept its own
+// shape: the Messages tab holds raw server rows (ts), while command-history and
+// peek rename ts -> time. Same data, different field names, so no renderer could
+// be shared and the three drifted into looking like different content — which is
+// exactly what Ethan reported. Normalize once, at every fetch, and set BOTH names
+// so nothing downstream has to know which surface it came from.
+function _msgCtxPeek() {
+  return { sel: _pmSel, key: _pmKey, toggle: '_pmSelToggle', resend: '_pmResend',
+           searchId: 'peek-messages-search', rowClass: '',
+           target: () => (typeof peekSession !== 'undefined' ? peekSession : '') };
+}
+function _msgCtxHistory() {
+  return { sel: _msgSel, key: _msgKey, toggle: '_msgSelToggle', resend: '_msgResend',
+           searchId: 'cmd-history-search', rowClass: '',
+           target: (e) => (typeof e === 'string' ? '' : (e.session || '')) };
+}
+function _msgCtxMessages() {
+  return { sel: _msgSel, key: _msgKey, toggle: '_msgSelToggle', resend: '_msgResend',
+           searchId: 'msgs-search', rowClass: 'msg-row',
+           target: (e) => (typeof e === 'string' ? '' : (e.session || '')),
+           onOpen: (e, enc) => `_msgOpenInsert('${escJs((e && e.session) || '')}','${enc}')` };
+}
+function _msgNorm(x) {
+  if (typeof x === 'string') return x;
+  const t = (x.time !== undefined && x.time !== null) ? x.time : x.ts;
+  return { id: x.id, text: x.text, type: x.type, session: x.session,
+           time: t, ts: t, origin: x.origin || '', kind: x.kind,
+           queued: x.queued, card_id: x.card_id || '' };
+}
+// ONE row renderer for all three message surfaces. `ctx` carries only what
+// genuinely differs — which selection set the checkbox belongs to, which resend
+// to call, which search box to highlight against, and the wrapper class so each
+// surface keeps its own CSS. Everything a reader SEES (badge, origin, card chip,
+// timestamp, highlighting, actions) is now defined once, because three
+// hand-maintained copies is what made them diverge.
+function _cmdHistItemHTML(e, ctx) {
+  ctx = ctx || _msgCtxPeek();
+  const _pk = ctx.key(e), _psel = ctx.sel.has(_pk);
   const text = typeof e === 'string' ? e : e.text;
   const session = typeof e === 'string' ? '' : (e.session || '');
   const origin = typeof e === 'string' ? '' : (e.origin || '');
@@ -38416,7 +38415,7 @@ function _cmdHistItemHTML(e) {
   // highlighting to show where it is"). Read from the input rather than a
   // global, because this row builder is shared by the peek list and there is
   // no per-render query argument threaded through it.
-  const _mq = (document.getElementById('peek-messages-search') || {}).value || '';
+  const _mq = (document.getElementById(ctx.searchId) || {}).value || '';
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
   const kind = _msgKind(e);
   const km = _MSG_KIND[kind] || _MSG_KIND.human;
@@ -38430,11 +38429,12 @@ function _cmdHistItemHTML(e) {
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
   const meta = tag + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
-  const locSess = (session || peekSession || '').replace(/'/g,'');
+  const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
+  const _target = ctx.target(e) || locSess;
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
   const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
   const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
-  return `<div onclick="_pickCmdHistory(decodeURIComponent('${enc}'))" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="_pmSelToggle(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();_pmResend([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(peekSession)}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -38537,7 +38537,7 @@ function _peekMessagesRender() {
   }).join('');
   const cnt = document.getElementById('peek-messages-count');
   if (cnt) cnt.textContent = (pending.length ? pending.length + ' pending · ' : '') + items.length + (items.length === 1 ? ' message' : ' messages');
-  const histHTML = items.length ? items.map(_cmdHistItemHTML).join('') : '';
+  const histHTML = items.length ? items.map(e => _cmdHistItemHTML(e, _msgCtxPeek())).join('') : '';
   // Empty state must name the active filter. "No messages sent to this session
   // yet" is false when you are simply looking at the Scheduled slice of a
   // session that has plenty of human messages.
@@ -38589,8 +38589,7 @@ async function _peekMsgFetch(session) {
   const r = await fetch(API + '/api/history?limit=500&session=' + encodeURIComponent(session),
                         { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
-  const rows = (await r.json()).map(x => ({ text: x.text, type: x.type, session: x.session,
-    time: x.ts, id: x.id, origin: x.origin || '', kind: x.kind, queued: x.queued }));
+  const rows = (await r.json()).map(_msgNorm);
   return _mergeUnechoed(rows.reverse(), session);
 }
 
@@ -52706,7 +52705,7 @@ async function _messagesLoad(reset, presetSession) {
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
       .then(x => x.json()).then(c => { _msgsCounts = c; _msgsRenderChips(); }).catch(() => {});
     if (!Array.isArray(rows)) return;
-    _msgsData = _msgsData.concat(rows);
+    _msgsData = _msgsData.concat(rows.map(_msgNorm));
     _msgsOffset += rows.length;
     _msgsDone = rows.length < _MSGS_PAGE;
     // Session filter options (from loaded data)
@@ -52780,7 +52779,12 @@ function _msgsRenderChips() {
 // blast radius is shown BEFORE the click (how many messages, to how many
 // distinct lanes, named) rather than discovered afterwards.
 let _msgSel = new Set();
-const _msgKey = (m) => (m.session || '') + '|' + (m.ts || 0);
+// ONE key for every message surface. It used to read m.ts, which only exists on
+// the raw server rows the Messages tab keeps — the command-history and peek
+// surfaces rename ts -> time, so every row there keyed as "<session>|0" and a
+// single checkbox selected the whole session (AMUX-2334). Accept both.
+const _msgKey = (m) => (typeof m === 'string' ? '|' + m.slice(0, 60)
+  : (m.session || '') + '|' + (m.time || m.ts || 0) + '|' + String(m.text || '').slice(0, 40));
 
 function _msgSelToggle(key, ev) {
   if (ev) { ev.stopPropagation(); }
@@ -52915,46 +52919,16 @@ function _messagesRender() {
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
   let _prevTs = null;
+  // Third copy of the same row markup, now the shared renderer. The burst
+  // separator is genuinely this surface's own (it groups a human's rapid
+  // sends), so it stays here and wraps the shared row.
   list.innerHTML = rows.map(m => {
-    const enc = encodeURIComponent(m.text || '').replace(/'/g, '%27');
-    const sess = m.session || '';
     let burst = '';
-    if (_msgsKind === 'human' && _prevTs !== null && (_prevTs - m.ts) > 90000) {
-      burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(m.ts) + '</div>';
+    if (_msgsKind === 'human' && _prevTs !== null && (_prevTs - (m.time || m.ts)) > 90000) {
+      burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(m.time || m.ts) + '</div>';
     }
-    _prevTs = m.ts;
-    const cardChip = _msgCardChip(m.card_id || '');   // one chip definition (AMUX-2153)
-    // Was queued-only, so a session or scheduled message carried no marker at
-    // all here. Same badge the other two surfaces show.
-    const _k = _msgKind(m), _km = _MSG_KIND[_k] || _MSG_KIND.human;
-    const _sfx = _k === 'human' ? (_msgQueued(m) ? ' \u00B7 queued' : ' \u00B7 direct')
-                                : (m.origin ? ' \u00B7 ' + esc(String(m.origin).slice(0, 26)) : '');
-    const tag = '<span class="msg-tag" style="background:' + _km.bg + ';color:' + _km.color
-      + ';font-weight:600;border-left:3px solid ' + _km.color + ';">' + _km.label + _sfx + '</span>';
-    const _k2 = _msgKey(m), _seld = _msgSel.has(_k2);
-    return burst + '<div class="msg-row' + (_seld ? ' msg-row-sel' : '') + '" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
-      '<input type="checkbox" class="msg-check"' + (_seld ? ' checked' : '') +
-        ' onclick="_msgSelToggle(\'' + escJs(_k2) + '\',event)" title="Select for bulk resend">' +
-      '<div class="msg-main">' +
-        '<div class="msg-meta">' +
-          (sess ? '<span class="msg-sess">' + esc(sess) + '</span>' : '<span class="msg-sess" style="color:var(--dim);">(unknown)</span>') +
-          '<span class="msg-ts">' + _msgsFmtTs(m.ts) + '</span>' + tag + cardChip +
-        '</div>' +
-        '<div class="msg-text">' + _hlSearch(_linkifyCardIds(esc(m.text || '')), (document.getElementById('msgs-search') || {}).value || '') + '</div>' +
-      '</div>' +
-      // Ethan asked for an ellipsis per message. Folding copy/speak/locate in
-      // with Resend keeps ONE action affordance per row instead of four
-      // competing buttons, and leaves room for the checkbox.
-      '<div class="msg-actions">' +
-        '<button class="btn msg-dots" onclick="_msgMenu(this,event)" title="Actions">\u22ef</button>' +
-        '<div class="msg-menu">' +
-          '<button onclick="event.stopPropagation();_msgResend([\'' + escJs(_k2) + '\'])">Resend to ' + esc(sess || '?') + '</button>' +
-          '<button onclick="event.stopPropagation();_msgCopyBtn(this,\'' + enc + '\')">Copy text</button>' +
-          '<button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(\'' + enc + '\'),this)">Read aloud</button>' +
-          '<button onclick="event.stopPropagation();_msgLocate(\'' + escJs(sess) + '\',\'' + enc + '\')">Locate in session</button>' +
-        '</div>' +
-      '</div>' +
-    '</div>';
+    _prevTs = (m.time || m.ts);
+    return burst + _cmdHistItemHTML(m, _msgCtxMessages());
   }).join('');
 }
 
@@ -56163,7 +56137,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.448';
+const CACHE = 'amux-v0.9.449';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
