@@ -27280,6 +27280,32 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     #messages-view .msg-ts { font-size:0.7rem; color:var(--dim); }
     #messages-view .msg-tag { font-size:0.66rem; padding:1px 6px; border-radius:3px; background:rgba(128,128,128,0.12); color:var(--dim); }
     #messages-view .msg-tag.steering { background:rgba(137,87,229,0.15); color:var(--purple,#8957e5); }
+    /* Multi-select + resend (AMUX-2318) */
+    #msgs-selbar { display:none; gap:8px; align-items:center; flex-wrap:wrap;
+      padding:8px 10px; margin:6px 0; border:1px solid var(--accent);
+      border-radius:8px; background:rgba(88,166,255,0.08); }
+    .msgs-selcount { font-weight:600; font-size:0.82rem; }
+    .msgs-sellanes { font-size:0.75rem; color:var(--dim); flex:1; min-width:0;
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #messages-view .msg-check { flex:0 0 auto; align-self:flex-start; margin:2px 8px 0 0;
+      width:18px; height:18px; cursor:pointer; }
+    #messages-view .msg-row-sel { background:rgba(88,166,255,0.10);
+      border-color:var(--accent); }
+    .msg-actions { position:relative; flex:0 0 auto; align-self:flex-start; }
+    .msg-dots { min-width:44px; min-height:44px; font-size:1.1rem; line-height:1; }
+    .msg-menu { display:none; position:absolute; right:0; top:100%; z-index:40;
+      min-width:190px; background:var(--card); border:1px solid var(--border);
+      border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.35); padding:4px; }
+    .msg-menu.open { display:block; }
+    .msg-menu button { display:block; width:100%; text-align:left; border:none;
+      background:none; color:var(--text); font-size:0.82rem; padding:9px 10px;
+      min-height:44px; border-radius:6px; cursor:pointer; }
+    .msg-menu button:hover { background:var(--hover, rgba(127,127,127,.12)); }
+    @media (max-width: 600px) {
+      #msgs-selbar { position:sticky; top:0; z-index:30; }
+      .msgs-sellanes { flex-basis:100%; }
+      .msg-menu { right:auto; left:0; min-width:170px; }
+    }
     #messages-view .msg-text { font-size:0.84rem; color:var(--text); white-space:pre-wrap; word-break:break-word;
       line-height:1.45; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
     #messages-view .msg-locate { flex-shrink:0; font-size:0.72rem; padding:4px 10px; align-self:center; }
@@ -27296,6 +27322,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="msgs-controls" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-shrink:0;flex-wrap:wrap;">
     <div class="search-wrap" style="flex:1;min-width:180px;">
       <input class="search-input" id="msgs-search" type="text" placeholder="Search messages..." autocomplete="off" oninput="_messagesRender()">
+      <div id="msgs-selbar" style="display:none;"></div>
     </div>
     <select id="msgs-session-filter" onchange="_msgsCounts=null;_messagesLoad(true,this.value)" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
       <option value="">All sessions</option>
@@ -34084,7 +34111,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.444';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.445';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52148,6 +52175,59 @@ function _msgsRenderChips() {
   }).join('');
 }
 
+// ── Message multi-select + resend (AMUX-2318) ───────────────────────────────
+// A resend is not free: each one wakes a session and costs it a turn. So the
+// blast radius is shown BEFORE the click (how many messages, to how many
+// distinct lanes, named) rather than discovered afterwards.
+let _msgSel = new Set();
+const _msgKey = (m) => (m.session || '') + '|' + (m.ts || 0);
+
+function _msgSelToggle(key, ev) {
+  if (ev) { ev.stopPropagation(); }
+  if (_msgSel.has(key)) _msgSel.delete(key); else _msgSel.add(key);
+  _messagesRender();
+}
+function _msgSelAll(visibleKeys) { visibleKeys.forEach(k => _msgSel.add(k)); _messagesRender(); }
+function _msgSelNone() { _msgSel.clear(); _messagesRender(); }
+
+// The per-row overflow menu. One open at a time; click anywhere closes it.
+function _msgMenu(btn, ev) {
+  if (ev) ev.stopPropagation();
+  const open = btn.parentElement.querySelector('.msg-menu.open');
+  document.querySelectorAll('.msg-menu.open').forEach(m => m.classList.remove('open'));
+  if (!open) btn.parentElement.querySelector('.msg-menu').classList.add('open');
+}
+document.addEventListener('click', () => {
+  document.querySelectorAll('.msg-menu.open').forEach(m => m.classList.remove('open'));
+});
+
+async function _msgResend(keys) {
+  const rows = _msgsData.filter(m => keys.includes(_msgKey(m)) && (m.session || ''));
+  if (!rows.length) { toast('Nothing to resend (messages with no target session are skipped)'); return; }
+  const lanes = [...new Set(rows.map(m => m.session))];
+  const preview = rows.slice(0, 3).map(m => '  \u2022 ' + (m.text || '').slice(0, 60)).join('\n');
+  const ok = await showConfirm(
+    'Resend ' + rows.length + ' message' + (rows.length === 1 ? '' : 's') +
+    ' to ' + lanes.length + ' session' + (lanes.length === 1 ? '' : 's') + '?\n\n' +
+    lanes.join(', ') + '\n\n' + preview + (rows.length > 3 ? '\n  \u2026and ' + (rows.length - 3) + ' more' : '') +
+    '\n\nEach resend wakes its session and costs it a turn.',
+    'Resend', false);
+  if (!ok) return;
+  let sent = 0, failed = 0;
+  for (const m of rows) {
+    try {
+      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(m.session) + '/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: m.text || '' }),
+      });
+      if (r.ok) sent++; else failed++;
+    } catch (e) { failed++; }
+  }
+  _msgSel.clear();
+  showToast('Resent ' + sent + (failed ? ' \u00b7 ' + failed + ' failed' : '') + ' to ' + lanes.length + ' session(s)');
+  _messagesRender();
+}
+
 function _messagesRender() {
   const list = document.getElementById('msgs-list');
   if (!list) return;
@@ -52161,6 +52241,27 @@ function _messagesRender() {
   // handful — the same crowding that showed 48 human messages out of 6547.
   if (_msgsKind !== 'all') rows = rows.filter(m => _msgKind(m) === _msgsKind);
   if (q) rows = rows.filter(m => (m.text || '').toLowerCase().includes(q) || (m.session || '').toLowerCase().includes(q));
+  // Selection toolbar (AMUX-2318). Only rendered when something is selected,
+  // so the default view is unchanged - a persistent bar for a rare action is
+  // clutter, and this list is read far more often than it is acted on.
+  const _visKeys = rows.map(_msgKey);
+  const _selVis = _visKeys.filter(k => _msgSel.has(k));
+  const bar = document.getElementById('msgs-selbar');
+  if (bar) {
+    if (_selVis.length) {
+      const lanes = [...new Set(rows.filter(m => _msgSel.has(_msgKey(m)) && m.session).map(m => m.session))];
+      bar.innerHTML =
+        '<span class="msgs-selcount">' + _selVis.length + ' selected</span>' +
+        '<span class="msgs-sellanes">' + lanes.length + ' session' + (lanes.length === 1 ? '' : 's') + ': ' + esc(lanes.slice(0,3).join(', ')) + (lanes.length > 3 ? ' +' + (lanes.length - 3) : '') + '</span>' +
+        '<button class="btn primary" onclick="_msgResend(' + JSON.stringify(_selVis).replace(/"/g, '&quot;') + ')">Resend ' + _selVis.length + '</button>' +
+        '<button class="btn" onclick="_msgSelAll(' + JSON.stringify(_visKeys).replace(/"/g, '&quot;') + ')">Select all ' + _visKeys.length + '</button>' +
+        '<button class="btn" onclick="_msgSelNone()">Clear</button>';
+      bar.style.display = 'flex';
+    } else {
+      bar.innerHTML = '';
+      bar.style.display = 'none';
+    }
+  }
   const count = document.getElementById('msgs-count');
   if (count) count.textContent = rows.length + ' message' + (rows.length === 1 ? '' : 's') + (_msgsDone ? '' : ' (more available)');
   const more = document.getElementById('msgs-more-btn');
@@ -52199,7 +52300,10 @@ function _messagesRender() {
                                 : (m.origin ? ' \u00B7 ' + esc(String(m.origin).slice(0, 26)) : '');
     const tag = '<span class="msg-tag" style="background:' + _km.bg + ';color:' + _km.color
       + ';font-weight:600;border-left:3px solid ' + _km.color + ';">' + _km.label + _sfx + '</span>';
-    return burst + '<div class="msg-row" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
+    const _k2 = _msgKey(m), _seld = _msgSel.has(_k2);
+    return burst + '<div class="msg-row' + (_seld ? ' msg-row-sel' : '') + '" onclick="_msgOpenInsert(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open ' + esc(sess) + ' with this message in the composer">' +
+      '<input type="checkbox" class="msg-check"' + (_seld ? ' checked' : '') +
+        ' onclick="_msgSelToggle(\'' + escJs(_k2) + '\',event)" title="Select for bulk resend">' +
       '<div class="msg-main">' +
         '<div class="msg-meta">' +
           (sess ? '<span class="msg-sess">' + esc(sess) + '</span>' : '<span class="msg-sess" style="color:var(--dim);">(unknown)</span>') +
@@ -52207,9 +52311,18 @@ function _messagesRender() {
         '</div>' +
         '<div class="msg-text">' + _hlSearch(_linkifyCardIds(esc(m.text || '')), (document.getElementById('msgs-search') || {}).value || '') + '</div>' +
       '</div>' +
-      '<button class="btn msg-copy" onclick="event.stopPropagation();_msgCopyBtn(this,\'' + enc + '\')" title="Copy message text">&#x1F4CB;</button>' +
-      '<button class="btn msg-speak" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(\'' + enc + '\'),this)" title="Read aloud">&#x1F50A;</button>' +
-      '<button class="btn msg-locate" onclick="event.stopPropagation();_msgLocate(\'' + escJs(sess) + '\',\'' + enc + '\')" title="Open the peek and scroll to where this was sent">&#x2316; Locate</button>' +
+      // Ethan asked for an ellipsis per message. Folding copy/speak/locate in
+      // with Resend keeps ONE action affordance per row instead of four
+      // competing buttons, and leaves room for the checkbox.
+      '<div class="msg-actions">' +
+        '<button class="btn msg-dots" onclick="_msgMenu(this,event)" title="Actions">\u22ef</button>' +
+        '<div class="msg-menu">' +
+          '<button onclick="event.stopPropagation();_msgResend([\'' + escJs(_k2) + '\'])">Resend to ' + esc(sess || '?') + '</button>' +
+          '<button onclick="event.stopPropagation();_msgCopyBtn(this,\'' + enc + '\')">Copy text</button>' +
+          '<button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(\'' + enc + '\'),this)">Read aloud</button>' +
+          '<button onclick="event.stopPropagation();_msgLocate(\'' + escJs(sess) + '\',\'' + enc + '\')">Locate in session</button>' +
+        '</div>' +
+      '</div>' +
     '</div>';
   }).join('');
 }
@@ -55419,7 +55532,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.444';
+const CACHE = 'amux-v0.9.445';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
