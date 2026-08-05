@@ -15669,7 +15669,10 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
     cotenants = [other for other, od in all_dirs.items()
                  if other != session and od == wd]
     if not cotenants or not rel_paths:
-        return {"ok": True, "foreign": [], "cotenants": cotenants}
+        # Same keys on every return path: a caller that reads d["shared"] should
+        # get [] here, not None. Shape-inconsistent returns are how a consumer
+        # ends up special-casing one branch and silently mishandling the other.
+        return {"ok": True, "foreign": [], "shared": [], "cotenants": cotenants}
     window = _staged_guard_window()
     now = time.time()
     mine = _session_recent_edit_paths(session, window) if session else {}
@@ -15679,19 +15682,32 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
             cur = theirs.get(p)
             if not cur or ts > cur[1]:
                 theirs[p] = (other, ts)
-    foreign = []
+    foreign, shared = [], []
     for rel in rel_paths[:2000]:
         if not isinstance(rel, str) or not rel.strip():
             continue
         ap = os.path.realpath(os.path.join(wd, rel))
-        if ap in mine:
-            continue
         hit = theirs.get(ap)
+        if ap in mine:
+            # NOT foreign — both sessions edited it, so the committer has a
+            # legitimate claim and blocking here would deadlock a genuinely
+            # shared file. But silence is wrong too (AMUX-2332): amux is a
+            # SINGLE-FILE project, so on amux-server.py — the only file that
+            # matters — this exemption is satisfied essentially always, and the
+            # guard was inert by construction on exactly the highest-risk path.
+            # A peer's commit swept this session's uncommitted work at
+            # 22:58 on 2026-08-04 with the guard running and returning 200.
+            # File-level ownership cannot express per-hunk ownership, so report
+            # the overlap and let the human judge. Warn, never block.
+            if hit:
+                shared.append({"path": rel, "owner": hit[0],
+                               "age_secs": int(max(0, now - hit[1]))})
+            continue
         if hit:
             foreign.append({"path": rel, "owner": hit[0],
                             "age_secs": int(max(0, now - hit[1]))})
-    return {"ok": True, "foreign": foreign, "cotenants": cotenants,
-            "window_secs": int(window)}
+    return {"ok": True, "foreign": foreign, "shared": shared,
+            "cotenants": cotenants, "window_secs": int(window)}
 
 
 _orphan_git_alerted: dict[str, float] = {}  # checkout dir -> last alert ts
@@ -18034,10 +18050,21 @@ def main():
             d = json.loads(r.read().decode())
     except Exception:
         return 0  # fail open — the guard must never brick commits
+    w = sys.stderr.write
+    # SHARED paths are not blocked — both sessions edited them, so the committer
+    # has a legitimate claim and blocking would deadlock the file. But say it out
+    # loud (AMUX-2332): in a single-file project this is the NORMAL case on the
+    # only file that matters, so the guard was silent on exactly the sweeps most
+    # likely to happen. `git add -A` here takes the other session's in-flight
+    # hunks too, and their `git commit` then reports "nothing to commit".
+    for f in (d.get("shared") or []):
+        mins = int((f.get("age_secs") or 0) / 60)
+        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago; "
+          "your commit will include their uncommitted work too.\\n"
+          % (f.get("path"), f.get("owner"), mins))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
-    w = sys.stderr.write
     w("\\namux staged-guard: COMMIT BLOCKED — staged files were edited by "
       "OTHER amux sessions sharing this checkout:\\n\\n")
     for f in foreign:
@@ -18196,7 +18223,13 @@ sha=$(git rev-parse --short HEAD 2>/dev/null)
 # escaping and posted empty subjects (first live test of this hook).
 subj=$(git log -1 --format=%s 2>/dev/null | tr -d '"\\' | cut -c1-120)
 [ -n "$sha" ] || exit 0
-payload=$(printf '{"sha":"%s","subject":"%s"}' "$sha" "$subj")
+# Send the repo dir so the server can tell whose in-flight work this commit
+# just carried (AMUX-2332). On a shared single-file checkout a commit routinely
+# includes another session's uncommitted hunks, and that session's own `git
+# commit` then reports "nothing to commit, working tree clean" — it can report
+# work as shipped under a sha it never created unless someone tells it.
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+payload=$(printf '{"sha":"%s","subject":"%s","dir":"%s"}' "$sha" "$subj" "$top")
 curl -sk -m 3 -X POST -H 'Content-Type: application/json' \
   -H "X-Amux-Session: $AMUX_SESSION" -d "$payload" \
   "${AMUX_URL:-https://localhost:8822}/api/sessions/$AMUX_SESSION/commit-report" >/dev/null 2>&1
@@ -66033,6 +66066,49 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 subj = str(body.get("subject") or "").strip()[:140]
                 if not sha:
                     return self._json({"error": "sha required"}, 400)
+                # Did this commit carry ANOTHER session's uncommitted work?
+                # (AMUX-2332.) On a shared single-file checkout that is the
+                # normal case, not the exception: the staged-guard deliberately
+                # does not block a file both sessions edited, so the sweep is
+                # silent on both ends — the swept session's own `git commit`
+                # returns "nothing to commit, working tree clean" and it can
+                # report work as shipped under a sha it never created.
+                # Hung off the commit-report write that ALREADY happens, with a
+                # named consumer and a durable dedupe key (sha+session) — no new
+                # bus, per the no-global-pub-sub decision.
+                try:
+                    _cdir = str(body.get("dir") or "").strip()
+                    if _cdir:
+                        _files = subprocess.run(
+                            ["git", "-C", _cdir, "show", "--name-only", "--format=", sha],
+                            capture_output=True, text=True, timeout=6).stdout.split("\n")
+                        _abs = {os.path.realpath(os.path.join(_cdir, f.strip()))
+                                for f in _files if f.strip()}
+                        _wd = str(Path(_cdir).expanduser().resolve())
+                        for _other, _od in _all_session_workdirs().items():
+                            if _other == name or _od != _wd:
+                                continue
+                            _touch = {p: t for p, t in
+                                      _session_recent_edit_paths(
+                                          _other, _staged_guard_window()).items() if p in _abs}
+                            if not _touch:
+                                continue
+                            _rel = sorted(os.path.relpath(p, _wd) for p in _touch)[:5]
+                            _steer_enqueue(_other,
+                                f"[amux] Commit {sha} by session '{name}' touched files you "
+                                f"also edited recently: {', '.join(_rel)}.\n"
+                                f"\"{subj}\"\n"
+                                f"If you had UNCOMMITTED changes there, they are in that commit "
+                                f"now — not lost, but shipped under another session's message, "
+                                f"and your next `git commit` will say \"nothing to commit, working "
+                                f"tree clean\". Check `git log -1 --stat {sha}` and confirm your "
+                                f"change is in HEAD before reporting it. Do not report a sha you "
+                                f"did not create.",
+                                guard=f"swept:{sha}:{_other}")
+                            _ilog("git", "sweep_notice", actor=name, target=_other, ok=True,
+                                  detail={"sha": sha, "paths": _rel})
+                except Exception as _se:
+                    slog(f"[commit-report] sweep check failed for {sha}: {_se}")
                 row = get_db().execute(
                     "SELECT id FROM issues WHERE session=? AND deleted IS NULL "
                     "AND COALESCE(archived,0)=0 AND status IN ('doing','review') "
