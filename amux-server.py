@@ -11523,6 +11523,23 @@ def _advance_open_card(session_name: str) -> bool:
             if not is_running(_rev):
                 slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
                 return False
+            # Charge the SAME per-card budget the holder edge uses (AC-220,
+            # reported by amux-cloud after being nudged three times for one
+            # card). This edge returned before ever reaching the cap below, so
+            # it never counted and never emitted advance.nudged: the budget was
+            # enforced on one of two symmetric paths. Counting is by card id and
+            # the query already filters that way, so no new storage.
+            try:
+                _rn = get_db().execute(
+                    "SELECT COUNT(*) FROM session_events WHERE type='advance.nudged' "
+                    "AND ts > ? AND data LIKE ?",
+                    (time.time() - 86400, '%"' + row["id"] + '"%')).fetchone()[0]
+            except Exception:
+                _rn = 0
+            if _rn >= _nb:
+                slog(f"[advance] {row['id']}: reviewer {_rev} has been nudged {_rn} times in 24h "
+                     f"— budget spent, going quiet")
+                return False
             ok, err = send_text(_rev,
                 f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in review and names YOU as "
                 f"reviewer. Review it: if the work holds, ack review->done yourself (your "
@@ -11530,9 +11547,17 @@ def _advance_open_card(session_name: str) -> bool:
                 f"The author cannot close it.",
                 defer_if_busy=True)
             if ok:
-                _advance_last[session_name] = time.time()
+                _emit_event(_rev, "advance.nudged", {"issue": row["id"], "n": _rn + 1},
+                            source="advance-review")
+                # Stamp the REVIEWER's cooldown, not the holder's. This wrote
+                # _advance_last[session_name] — the card's OWNER — while the
+                # message went to _rev, so the reviewer's own cooldown was never
+                # touched and the wrong lane was silenced. Two cards in review
+                # naming one reviewer could nudge it twice in a row untouched.
+                _advance_last[_rev] = time.time()
                 _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
-                slog(f"[advance] routed review of {row['id']} to reviewer {_rev}")
+                slog(f"[advance] routed review of {row['id']} to reviewer {_rev} "
+                     f"(nudge {_rn + 1}/{_nb})")
             return bool(ok)
         gate_next = "review" if row["status"] == "doing" else "done"
         gate = _effective_gate(item, gate_next) or []
