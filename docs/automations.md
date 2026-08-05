@@ -12,7 +12,7 @@ amux already orchestrates a fleet of *coding* agents. Automations extend that to
 
 A **robot** is a saved, MD-defined automation. It has a trigger (manual / schedule / webhook), a target (a browser profile or the local desktop), and a body describing the SOP. Running it produces a **run** with a recording, a pass/fail, and a place it stopped.
 
-The differentiator is **composition**, not the automation itself (browser-agents are a crowded space). In amux these are first-class citizens next to coding agents: schedulable, phone-monitorable, and able to hand off to/from a Claude Code session (robot scrapes a dashboard → coding agent acts on the result). Nobody else has that in one pane.
+The differentiator is **composition**, not the automation itself (browser-agents are a crowded space). In amux these are first-class citizens next to coding agents: schedulable, phone-monitorable, and able to hand off to/from a Claude Code worker (robot scrapes a dashboard → coding agent acts on the result). Nobody else has that in one pane.
 
 ## 2. Core principle — intent, re-resolved every run
 
@@ -152,7 +152,7 @@ Per `CLAUDE.md`, `amux-server.py` is identical local and cloud — no `IS_CLOUD`
 
 **Phase 2 — desktop computer-use (local only).** cliclick/pyautogui actuator behind capability detection; Claude vision loop for native apps.
 
-**Phase 3 — composition.** Handoff to/from coding sessions; webhook triggers; robots that call other robots; board integration (each run optionally logs an issue).
+**Phase 3 — composition.** Handoff to/from coding workers; webhook triggers; robots that call other robots; board integration (each run optionally logs an issue).
 
 ## 11. Open questions
 

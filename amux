@@ -80,14 +80,14 @@ resolve_session() {
       ((i++))
     done
   fi
-  die "session '$query' not found"
+  die "worker '$query' not found"
 }
 
 # Load session config into env vars
 load_session() {
   local name="$1"
   local file="$CC_SESSIONS/$name.env"
-  [[ -f "$file" ]] || die "session '$name' not found"
+  [[ -f "$file" ]] || die "worker '$name' not found"
   # shellcheck disable=SC1090
   source "$file"
 }
@@ -339,7 +339,7 @@ cmd_start() {
   # the wrong tree. Refuse instead. Re-register with --dir to fix.
   case "$dir" in
     /*) ;;
-    *) die "CC_DIR is not absolute ('$dir'). Re-register the session with: amux register $name --dir /absolute/path" ;;
+    *) die "CC_DIR is not absolute ('$dir'). Re-register the worker with: amux register $name --dir /absolute/path" ;;
   esac
   [[ -d "$dir" ]] || die "directory not found: $dir"
 
@@ -465,7 +465,7 @@ cmd_attach() {
   need_tmux
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running. Start with: amux start $name"
+  is_running "$name" || die "worker '$name' is not running. Start with: amux start $name"
   tmux attach-session -t "=$tname"
 }
 
@@ -477,7 +477,7 @@ cmd_peek() {
 
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running"
+  is_running "$name" || die "worker '$name' is not running"
 
   echo "${BOLD}── $name ──${RESET}"
   tmux capture-pane -t "=$tname:" -p -S "-$lines" 2>/dev/null || echo "${DIM}(no output)${RESET}"
@@ -488,14 +488,14 @@ _send_usage() {
   cat <<USAGE
 ${BOLD}amux send${RESET} — send a message to a session
 
-  amux send <session> --stdin        read the message from stdin ${GREEN}(preferred)${RESET}
-  amux send <session> --file <path>  read the message from a file
-  amux send <session> <text>         inline text (see the warning below)
-  amux send <session> --keys 'C-c'   send a raw key sequence
+  amux send <worker> --stdin        read the message from stdin ${GREEN}(preferred)${RESET}
+  amux send <worker> --file <path>  read the message from a file
+  amux send <worker> <text>         inline text (see the warning below)
+  amux send <worker> --keys 'C-c'   send a raw key sequence
 
   ${BOLD}--no-board${RESET}  skip board-card creation for one-off questions and status
               checks. Combines with any form above:
-                amux send <session> --no-board --stdin <<'EOF'
+                amux send <worker> --no-board --stdin <<'EOF'
               Equivalent to the API's {"no_board": true}, or prefixing the
               message with [no-board] (which the server strips before delivery).
 
@@ -531,7 +531,7 @@ cmd_send() {
 
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "session '$name' is not running"
+  is_running "$name" || die "worker '$name' is not running"
 
   # ── Payload via --stdin / --file: the text NEVER transits a shell-evaluated
   # string (AMUX-1888). Passing a message as a double-quoted argument lets the
@@ -548,7 +548,7 @@ cmd_send() {
   fi
   if [[ "${1:-}" == "--file" ]]; then
     local f="${2:-}"
-    [[ -n "$f" && -r "$f" ]] || die "usage: amux send <session> --file <path>"
+    [[ -n "$f" && -r "$f" ]] || die "usage: amux send <worker> --file <path>"
     local msg; msg=$(cat "$f")
     [[ -n "$msg" ]] || die "file is empty: $f"
     _send_via_api "$name" "$msg" "$_nb"; return $?
@@ -1044,7 +1044,7 @@ types: code task chore doc research ops investigation decision escalation blocke
       return $?
       ;;
     ask|status-request)
-      # Ask the owning session to report a card's status onto the board.
+      # Ask the owning worker to report a card's status onto the board.
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board ask <ISSUE-ID> [question]"
       shift 2>/dev/null || true
       local q="$*" body result
@@ -1317,13 +1317,13 @@ for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
       cat <<EOF
 ${BOLD}amux board${RESET} — manage board issues from the CLI
 
-  amux whoami                      Live session identity vs inherited env (mismatch warns)
+  amux whoami                      Live worker identity vs inherited env (mismatch warns)
   amux board ls [--all]            List open issues (--all includes archived)
   amux board add <title>           Create a new todo issue
-  amux board claim <ID>            Atomically claim a todo/backlog card for this session
+  amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board needsyou <ID>         Mark a card as blocked on the human (surfaces in Needs-you)
-  amux board ask <ID> [question]   Ask the owning session to post a status update
-  amux board status-update <ID> …  (for the owning session) post status to the board
+  amux board ask <ID> [question]   Ask the owning worker to post a status update
+  amux board status-update <ID> …  (for the owning worker) post status to the board
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
@@ -1401,11 +1401,11 @@ cmd_help() {
 ${BOLD}amux${RESET} — phone-friendly Claude Code session manager ${DIM}v${CC_VERSION}${RESET}
 
 ${BOLD}Session management:${RESET}
-  amux register <name> [flags]   Register a session with Claude Code flags
+  amux register <name> [flags]   Register a worker with Claude Code flags
   amux start <name> [--detach]   Start a registered session in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
-  amux stop <name>               Stop a running session
+  amux stop <name>               Stop a running worker
   amux rm <name>                 Remove a session (stops if running)
   amux start-all                 Start all registered sessions
   amux stop-all                  Stop all running sessions

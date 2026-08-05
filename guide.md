@@ -1,6 +1,6 @@
 # amux Board System Guide
 
-The board is amux's task-tracking system -- a kanban board that every session reads and writes to, making work visible across the entire fleet. It is the shared source of truth for what is being done, by whom, and in what state.
+The board is amux's task-tracking system -- a kanban board that every worker reads and writes to, making work visible across the entire fleet. It is the shared source of truth for what is being done, by whom, and in what state.
 
 ## Columns (Statuses)
 
@@ -10,7 +10,7 @@ Every board card sits in exactly one column:
 |---|---|---|
 | **backlog** | Acknowledged but not yet prioritized | No |
 | **todo** | Ready to be picked up | No |
-| **doing** | Actively being worked on by a session | No |
+| **doing** | Actively being worked on by a worker | No |
 | **review** | Work complete, awaiting peer review | No |
 | **done** | Implemented/merged (NOT yet confirmed in prod) | Yes |
 | **verified** | Confirmed working end-to-end in production | Yes |
@@ -41,7 +41,7 @@ Every card has a `type` that determines what gates apply. The default is `code` 
 | `tripwire` | Armed watch condition | Trigger-specific gates |
 | `watch` | Monitoring condition | Trigger-specific gates |
 
-Set the type to match the work. A mistyped card forces the session to lie to its gates -- if a decision card is typed `code`, the only way to close it is to falsely assert a merge. Fix the type, not the truth.
+Set the type to match the work. A mistyped card forces the worker to lie to its gates -- if a decision card is typed `code`, the only way to close it is to falsely assert a merge. Fix the type, not the truth.
 
 ## Gates
 
@@ -52,7 +52,7 @@ Gates are checklists that must be acknowledged before a card can move to a gated
 When moving a card to a new status, the gate is resolved in this order:
 1. **Card-level override** -- a gate set directly on the card
 2. **Type-derived gate** -- determined by the card's `type` field
-3. **Per-session override** -- custom gates configured per session
+3. **Per-worker override** -- custom gates configured per worker
 4. **Global status default** -- the column's default gate checklist
 
 ### Acknowledging gates
@@ -82,15 +82,15 @@ For all other types, gates are lighter but still honest:
 
 Gates can be configured at three levels:
 - **Per-column**: click the gate icon on a column header in the dashboard
-- **Per-session**: `PATCH /api/board/session-gates`
+- **Per-worker**: `PATCH /api/board/session-gates`
 - **Per-card**: include `"gate"` in the card's PATCH body
 
 ## Peer Review
 
-Cards can optionally name a `reviewer` -- another session responsible for sign-off.
+Cards can optionally name a `reviewer` -- another worker responsible for sign-off.
 
 When a reviewer is set:
-- Moving to `done` or `verified` requires the ack to come FROM the reviewer session (identified by `X-Amux-Session` header)
+- Moving to `done` or `verified` requires the ack to come FROM the reviewer worker (identified by `X-Amux-Session` header)
 - The author cannot self-ack their own review (this is enforced server-side)
 - `force: true` bypasses this (logged)
 
@@ -101,7 +101,7 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \
   $AMUX_URL/api/board/ITEM-ID
 ```
 
-The reviewer acks by moving the card to done/verified with their session header:
+The reviewer acks by moving the card to done/verified with their worker header:
 ```bash
 curl -sk -X PATCH -H 'Content-Type: application/json' \
   -H "X-Amux-Session: other-session" \
@@ -109,7 +109,7 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \
   $AMUX_URL/api/board/ITEM-ID
 ```
 
-## Tags
+## Groups
 
 Cards can be tagged for filtering and organization:
 
@@ -125,10 +125,10 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \
   $AMUX_URL/api/board/ITEM-ID
 ```
 
-Tags are free-form strings. Common conventions:
+Groups are free-form strings. Common conventions:
 - `needs:you` -- requires human (Ethan) action
 - `p0`, `p1`, `p2` -- priority levels
-- Topic tags matching the session's focus area
+- Topic groups matching the worker's focus area
 
 ## Dependencies
 
@@ -145,14 +145,14 @@ A card with unresolved dependencies (cards not in done/verified/discarded) will 
 ## Owner Types
 
 Cards track who owns them:
-- `agent` -- owned by an AI session (can be auto-managed, picked up, reassigned)
+- `agent` -- owned by an AI worker (can be auto-managed, picked up, reassigned)
 - `human` -- owned by a person (never auto-reassigned, never hijacked by autotask)
 
 This distinction prevents automation from overwriting human commitments.
 
 ## Auto-Task Creation
 
-When `board_autotask` is enabled (default: on), every human prompt sent to a session automatically creates a board card. This ensures the board captures what was actually asked.
+When `board_autotask` is enabled (default: on), every human prompt sent to a worker automatically creates a board card. This ensures the board captures what was actually asked.
 
 ### Skip rules
 
@@ -169,7 +169,7 @@ Card titles are derived from the prompt's first clause -- no model call needed. 
 
 ## WIP Limits
 
-Each session is soft-capped at **1 card in `doing`** at a time. Taking a second requires `override_doing: true`. This prevents the "164 items in doing" state where the status means nothing.
+Each worker is soft-capped at **1 card in `doing`** at a time. Taking a second requires `override_doing: true`. This prevents the "164 items in doing" state where the status means nothing.
 
 ## Staleness Detection
 
@@ -177,7 +177,7 @@ Cards in `doing` for more than 3 days without board updates AND without evidence
 
 ## Auto-Pickup
 
-Idle sessions can automatically pick up `todo` cards assigned to them. The pickup system:
+Idle workers can automatically pick up `todo` cards assigned to them. The pickup system:
 - Respects dependencies (blocked cards are skipped)
 - Skips `tripwire` and `watch` types (not workable tasks)
 - Skips cards that are just prompt captures without real task content
@@ -249,7 +249,7 @@ The log is never exposed to PATCH -- it cannot be accidentally overwritten.
 
 For one-off questions, status checks, or other prompts that don't represent tasks:
 
-**Inline tag** (works from any model):
+**Inline group** (works from any model):
 ```
 [no-board] What's the status of the deploy?
 ```

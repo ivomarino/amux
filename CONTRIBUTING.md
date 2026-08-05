@@ -54,7 +54,7 @@ amux is becoming the **durable operating system around agents**: it owns executi
 
 The big architectural pieces are built **seams-first**:
 
-- **Seams (maintainer-owned):** the two interfaces everything else plugs into — the [agent runtime contract + capability registry](https://github.com/mixpeek/amux/issues/47) and [event-sourced session state](https://github.com/mixpeek/amux/issues/48). These land first.
+- **Seams (maintainer-owned):** the two interfaces everything else plugs into — the [agent runtime contract + capability registry](https://github.com/mixpeek/amux/issues/47) and [event-sourced worker state](https://github.com/mixpeek/amux/issues/48). These land first.
 - **Leaves (great for contributors):** once a seam exists, the work it unlocks is naturally parallel and self-contained — **provider adapters, verification runners, MCP tools, eval scenarios, policy hooks**. If a leaf issue is blocked on a seam, it says so; watch the epic for when it opens up.
 
 If you want to help, comment on a `help wanted` roadmap issue to claim it, or propose a smaller sub-task on the epic.
