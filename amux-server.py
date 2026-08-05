@@ -12159,13 +12159,23 @@ def _verify_routing_sweep():
         slog(f"[verify-route] query failed: {e}")
         return
     asked, busy = 0, set()
+    # Which workers a SCOPE decision excluded, and under which rule (AMUX-2349).
+    # Ethan: every action a worker takes should be logged along with the
+    # permission scope that allowed it — and the inverse matters just as much.
+    # These `continue`s change behaviour (a card is never routed for review) and
+    # left no trace, so a lane silently dropped out of verification and the log
+    # could not distinguish that from there being nothing to route. Aggregated
+    # to one row per pass: per-card logging here would flood a loop over 60 rows.
+    _skipped_scope: dict = {}
     for r in rows:
         # AMUX-2312: route for verification only when `verified` applies to the
         # CARD'S OWNER. The peer does the checking, but it is the author's lane
         # that decides whether its work has a prod surface to confirm at all —
         # routing a docs lane's card to a verifier asks two lanes to satisfy a
         # gate neither can honestly meet.
-        if not _status_applies("verified", r["session"] or "")[0]:
+        _sa = _status_applies("verified", r["session"] or "")
+        if not _sa[0]:
+            _skipped_scope.setdefault(_sa[1], set()).add(r["session"] or "?")
             continue
         try:
             if db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
@@ -12192,6 +12202,13 @@ def _verify_routing_sweep():
             f"on the card so nobody re-asks.",
             guard=f"verify:{r['id']}")
         asked += 1
+    # Outside `if asked:` deliberately. A pass that skipped every candidate asked
+    # nobody, and that is precisely the pass whose silence is indistinguishable
+    # from "there was nothing to route" — the case this log exists for.
+    if _skipped_scope:
+        _ilog("scope", "routing_skipped", actor="amux", ok=True,
+              detail={"rule": {k: sorted(v) for k, v in _skipped_scope.items()},
+                      "status": "verified"})
     if asked:
         slog(f"[verify-route] asked {asked} peer(s) to verify a done card")
 
@@ -12512,6 +12529,11 @@ def _verification_sweep():
     terminal state). verify.requested events (durable) stop re-nagging a
     card within 7 days. The verdict is model-authored by the owner —
     compounds; amux only routes."""
+    # Bound BEFORE the try that fills it: it is referenced after the except,
+    # and an early failure would turn this audit line into a NameError inside
+    # the very handler meant to record what happened. First cut bound it in
+    # _verify_routing_sweep — a different function entirely (AMUX-2349).
+    _swept_scope: dict = {}   # scope rule -> workers it excluded
     try:
         db = get_db()
         now = int(time.time())
@@ -12534,7 +12556,9 @@ def _verification_sweep():
             # "gap" manufactures a gap that does not exist for it, and the only
             # exits it leaves are a false verified or a standing apology on every
             # card. A sweep that cannot be satisfied honestly is not a sweep.
-            if not _status_applies("verified", name)[0]:
+            _sa2 = _status_applies("verified", name)
+            if not _sa2[0]:
+                _swept_scope.setdefault(_sa2[1], set()).add(name)
                 continue
             rows = db.execute(
                 "SELECT id, title FROM issues i WHERE session=? AND status='done' "
@@ -12563,6 +12587,11 @@ def _verification_sweep():
     except Exception as e:
         slog(f"[verify-sweep] failed: {e}")
 
+
+    if _swept_scope:
+        _ilog("scope", "sweep_skipped", actor="amux", ok=True,
+              detail={"rule": {k: sorted(v) for k, v in _swept_scope.items()},
+                      "status": "verified"})
 
 def _caller_scope(headers):
     """(scoped, tags, name) for the requesting SESSION; dashboard/no-header is
