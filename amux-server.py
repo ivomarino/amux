@@ -46745,6 +46745,13 @@ function _statusGateDefault(statusId) {
   const s = (typeof boardStatuses !== 'undefined' ? boardStatuses : []).find(x => x.id === statusId);
   return (s && Array.isArray(s.gate)) ? s.gate : [];
 }
+// LOCAL FALLBACK ONLY — this is card > session > global and is MISSING the
+// TYPE layer the server enforces (card > TYPE > session > global). It was the
+// live resolver until AMUX-2330, which is why the dialog showed the global gate
+// ("Implemented and merged") for 9 of 13 live card types while the server
+// enforced the type gate ("Outcome recorded in the item"). Never call it as the
+// primary answer; _gateResolve asks the server. Kept only so an offline client
+// can still show SOMETHING, and it says so when it does.
 function _effectiveGate(item, statusId) {
   if (item && Array.isArray(item.gate) && item.gate.length) return item.gate;
   const sess = item && item.session;
@@ -46752,10 +46759,31 @@ function _effectiveGate(item, statusId) {
     return sessionGates[sess][statusId];
   return _statusGateDefault(statusId);
 }
+// Resolve the gate the SERVER will actually enforce. One rule, one owner —
+// duplicating precedence in the client is what produced AMUX-2330.
+async function _gateResolve(item, statusId) {
+  // An explicit gate handed in by a caller IS the card layer (highest
+  // precedence), and for an unsaved edit the server does not know it yet.
+  if (item && Array.isArray(item.gate) && item.gate.length)
+    return { gate: item.gate, source: 'card', stale: false };
+  const id = item && item.id;
+  if (id) {
+    try {
+      const r = await fetch(API + '/api/board/gate?item=' + encodeURIComponent(id)
+                            + '&status=' + encodeURIComponent(statusId));
+      if (r.ok) {
+        const d = await r.json();
+        if (Array.isArray(d.gate)) return { gate: d.gate, source: d.source || '', stale: false };
+      }
+    } catch (e) { /* offline — fall through, and SAY so rather than lying */ }
+  }
+  return { gate: _effectiveGate(item, statusId), source: 'local', stale: true };
+}
 // Returns a Promise<boolean>: true = confirmed move, false = cancelled.
-function _gateConfirm(item, targetStatusId) {
-  const gate = _effectiveGate(item, targetStatusId);
-  if (!gate.length) return Promise.resolve(true);
+async function _gateConfirm(item, targetStatusId) {
+  const _res = await _gateResolve(item, targetStatusId);
+  const gate = _res.gate;
+  if (!gate.length) return true;
   return new Promise(resolve => {
     const label = ((typeof boardStatuses !== 'undefined' ? boardStatuses : []).find(x => x.id === targetStatusId) || {}).label || targetStatusId;
     const bg = document.createElement('div');
@@ -46766,6 +46794,13 @@ function _gateConfirm(item, targetStatusId) {
     box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:440px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);max-height:88vh;overflow:auto;';
     box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Move to '+esc(label)+'</div>'
       + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:10px;">Confirm this card meets the gate for '+esc(label)+':</div>'
+      // Say which layer set these criteria, and say it LOUDLY when we could not
+      // reach the server and are showing the local fallback — that fallback is
+      // missing the type layer, so it can differ from what will be enforced.
+      // A dialog that silently shows the wrong checklist is exactly AMUX-2330.
+      + (_res.stale
+          ? '<div style="font-size:0.75rem;color:var(--warn,#e0a33e);border:1px solid var(--warn,#e0a33e);border-radius:7px;padding:7px 9px;margin-bottom:10px;">Offline — these are the column defaults, not the criteria the server will enforce for this card&rsquo;s type. The move may still be refused.</div>'
+          : (_res.source ? '<div style="font-size:0.72rem;color:var(--dim);margin:-6px 0 10px;">criteria from: '+esc(_res.source)+'</div>' : ''))
       + '<div id="_gate-list" style="margin-bottom:14px;">'+rows+'</div>'
       + '<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;">'
       + '<span id="_gate-count" style="font-size:0.75rem;color:var(--dim);"></span>'
@@ -59950,6 +59985,52 @@ class CCHandler(BaseHTTPRequestHandler):
                     db.execute("UPDATE statuses SET position = ? WHERE id = ?", (pos, sid))
                 db.commit()
                 return self._json({"ok": True})
+
+            # GET /api/board/gate?item=<id>&status=<s> — THE authoritative gate.
+            # The client used to resolve precedence itself and got it wrong: its
+            # _effectiveGate implemented card > session > global with NO TYPE
+            # LAYER, while the server enforces card > TYPE > session > global.
+            # `_item_type_gate` returns [] only for type `code`, so for every
+            # other type — 159 of 802 open cards when measured, ~20% — the
+            # move-confirm dialog listed the GLOBAL status gate while the server
+            # evaluated the TYPE gate. The user ticked boxes for criteria that
+            # were not the gate (AMUX-2330).
+            #
+            # The duplicated precedence WAS the bug, so the fix is not a fourth
+            # layer in the client — it is one answer with one owner. Same class
+            # as the two hand-maintained CLIs (AMUX-2325): when two
+            # implementations of one rule exist, they diverge, and each looks
+            # correct on its own. Returns `source` so a wrong answer is
+            # attributable to a layer instead of inferred from behaviour.
+            if path == "/api/board/gate":
+                bid = (qs.get("item", [""])[0] or "").strip()
+                st = (qs.get("status", [""])[0] or "").strip()
+                if not bid or not st:
+                    return self._json({"error": "missing item or status"}, 400)
+                _it = _item_by_id(bid)
+                if not _it:
+                    return self._json({"error": "no such item", "item": bid}, 404)
+                _g = _effective_gate(_it, st)
+                # Which layer answered — same order the resolver applies.
+                _src = "none"
+                if _g:
+                    _card_g = _it.get("gate")
+                    if isinstance(_card_g, str):
+                        try:
+                            _card_g = json.loads(_card_g)
+                        except Exception:
+                            _card_g = None
+                    if isinstance(_card_g, list) and [x for x in _card_g if str(x).strip()]:
+                        _src = "card"
+                    elif _item_type_gate(_it, st):
+                        _src = "type"
+                    elif (_load_session_gates().get(_it.get("session") or "", {}) or {}).get(st):
+                        _src = "session"
+                    else:
+                        _src = "global"
+                return self._json({"item": bid, "status": st, "gate": _g,
+                                   "source": _src,
+                                   "item_type": (_it.get("type") or _DEFAULT_ITEM_TYPE)})
 
             # GET/PATCH /api/board/session-gates — per-session gate overrides
             # (layer between the global status default and the per-card override).
