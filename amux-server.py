@@ -62305,7 +62305,13 @@ class CCHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "dir required"}, 400)
             res = _staged_guard_check(session, wd, paths)
             if res.get("foreign"):
-                slog(f"[staged-guard] {session}: blocked commit in {wd} — "
+                # The op is NOT always a commit: the same check now backs the
+                # path-scoped DISCARD guard (AC-212), and a discard logged as
+                # "blocked commit" points whoever reads this log at the wrong
+                # git operation entirely. Callers that send no op keep the old
+                # wording, so existing log lines stay readable.
+                _op = str(body.get("op", "") or "commit").strip()[:24]
+                slog(f"[staged-guard] {session}: blocked {_op} in {wd} — "
                      + ", ".join(f"{f['path']} (owned by {f['owner']})" for f in res["foreign"][:5]))
             return self._json(res)
 
