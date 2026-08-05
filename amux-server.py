@@ -16593,6 +16593,87 @@ _MEM_COMPOSED_TAG = "<!-- amux:composed -->"
 # Topic file holding the shared amux-API block, written beside MEMORY.md. Keeps
 # ~239 lines of call shapes OUT of a 200-line-limited index (see _compose_memory).
 _MEM_TOPIC_FILE = "amux-api.md"
+# How many lines of MEMORY.md the agent will actually READ. Not a cap amux
+# enforces — a property of the reader it must account for. Config, not a code
+# constant (deviation D4: context-scarcity policy hardcoded becomes the ceiling
+# as windows grow). 200 is Claude Code's default file-read limit today.
+_MEM_READ_LIMIT = int(os.environ.get("AMUX_MEM_READ_LIMIT", "200") or 200)
+
+
+def _context_audit(name: str) -> dict:
+    """What amux INJECTS into this lane, and whether the agent can actually read
+    it (AMUX-2336).
+
+    The distinction is the whole point. amux has a documented history of
+    injecting context that was never read: 201 of 215 MEMORY.md indexes exceeded
+    the reader's 200-line limit, median 241 lines of which 240 was preamble, so
+    the NEWEST entries — which sort to the bottom — were silently dropped. Bytes
+    written is not bytes read, and nothing measured the difference.
+
+    Reports the overflow explicitly rather than a size, because "13KB" is not
+    actionable and "41 lines past the limit, and they are the newest ones" is.
+    """
+    wd = _session_work_dir(name) or ""
+    idx = CLAUDE_HOME / "projects" / _project_name(wd) / "memory" / "MEMORY.md" if wd else None
+    out = {"session": name, "provider": _session_provider(name),
+           "read_limit_lines": _MEM_READ_LIMIT}
+    if idx and idx.exists():
+        try:
+            txt = idx.read_text(errors="replace")
+        except Exception:
+            txt = ""
+        lines = txt.splitlines()
+        n = len(lines)
+        # Where the session's OWN entries begin. Everything above the marker is
+        # composed preamble; if the preamble alone reaches the limit, none of the
+        # session's memory is read at all — the failure that actually happened.
+        head = next((i for i, l in enumerate(lines) if _MEM_MARKER in l), -1)
+        # Use the SAME predicate as the code that ACTS. My first cut measured
+        # lines against the reader's 200 only, and reported mixpeek-cicd (45
+        # lines but 18,001 bytes) as fitting — while _fold_memory_overflow, which
+        # tests lines OR bytes, had been calling it over-ceiling for months. A
+        # view that disagrees with the mechanism it describes is worse than no
+        # view, because it is trusted and read first. Copied from the fold rather
+        # than re-derived, so the two cannot drift.
+        _src = CC_MEMORY / f"{name}.md"
+        try:
+            _sb = _src.read_text(errors="replace") if _src.exists() else ""
+        except Exception:
+            _sb = ""
+        _sl = _sb.splitlines()
+        _entries = len([l for l in _sl if _MEM_ENTRY_RE.match(l)])
+        _over_lines = len(_sl) > _MEM_MAX_LINES
+        _over_bytes = len(_sb.encode()) > _MEM_MAX_BYTES
+        out["index"] = {
+            "path": str(idx), "bytes": len(txt), "lines": n,
+            "preamble_lines": head if head >= 0 else None,
+            # Reader-limit view: what the agent never sees.
+            "fits_read_limit": n <= _MEM_READ_LIMIT,
+            "unread_tail_lines": max(0, n - _MEM_READ_LIMIT),
+            "preamble_exceeds_limit": (head >= _MEM_READ_LIMIT) if head >= 0 else False,
+            # Fold-ceiling view: the predicate _fold_memory_overflow enforces.
+            "store_bytes": len(_sb.encode()), "store_lines": len(_sl),
+            "index_entries": _entries,
+            "over_ceiling": _over_lines or _over_bytes,
+            "over_ceiling_why": ("lines+bytes" if (_over_lines and _over_bytes)
+                                 else "lines" if _over_lines
+                                 else "bytes" if _over_bytes else ""),
+            # If it is over the ceiling and the bulk is NOT index entries, the
+            # fold has already given up on it and said so 490 times in
+            # server.log, where nobody reads it. That is the state that needs a
+            # human, and it is why this endpoint exists.
+            "needs_manual_attention": (_over_lines or _over_bytes) and _entries < len(_sl) / 2,
+        }
+    else:
+        out["index"] = None
+    gem = CC_MEMORY / "gemini" / name / "GEMINI.md"
+    if gem.exists():
+        try:
+            gtxt = gem.read_text(errors="replace")
+            out["gemini"] = {"bytes": len(gtxt), "lines": len(gtxt.splitlines())}
+        except Exception:
+            pass
+    return out
 # The documented MEMORY.md index-entry shape: "- [Title](file.md) — hook".
 _MEM_ENTRY_RE = re.compile(r"^\s*[-*]\s*\[[^\]]+\]\([^)]+\.md\)")
 # Archive store for index entries that no longer fit the read ceiling, and the
@@ -61899,6 +61980,47 @@ class CCHandler(BaseHTTPRequestHandler):
             return self._json({"note": "last reason auto-pickup declined, per lane",
                                "wip_cap": int(os.environ.get("AMUX_MAX_DOING_PER_SESSION", "1") or 1),
                                "lanes": _out})
+
+        if method == "GET" and path == "/api/debug/context":
+            # Fleet view of what amux injects vs what gets READ (AMUX-2336).
+            # Deliberately fleet-wide and sorted worst-first: the MEMORY.md
+            # overflow went unnoticed for months because it was only visible one
+            # session at a time, and nobody opens 44 sessions. A defect that is
+            # only visible per-lane is a defect nobody sees (ethos 4).
+            _rows = []
+            for _s in list_sessions():
+                if _s.get("archived"):
+                    continue
+                try:
+                    _rows.append(_context_audit(_s["name"]))
+                except Exception as _ce:
+                    _rows.append({"session": _s.get("name"), "error": str(_ce)[:120]})
+            _with = [r for r in _rows if r.get("index")]
+            _over = [r for r in _with if not r["index"]["fits_read_limit"]]
+            _blind = [r for r in _with if r["index"].get("preamble_exceeds_limit")]
+            _ceil = [r for r in _with if r["index"].get("over_ceiling")]
+            _manual = [r for r in _with if r["index"].get("needs_manual_attention")]
+            return self._json({
+                "read_limit_lines": _MEM_READ_LIMIT,
+                "sessions": len(_rows),
+                "with_index": len(_with),
+                "over_read_limit": len(_over),
+                "preamble_alone_exceeds_limit": len(_blind),
+                "over_fold_ceiling": len(_ceil),
+                "needs_manual_attention": sorted(r["session"] for r in _manual),
+                "worst": sorted(
+                    [{"session": r["session"], "lines": r["index"]["lines"],
+                      "store_bytes": r["index"]["store_bytes"],
+                      "index_entries": r["index"]["index_entries"],
+                      "over_ceiling_why": r["index"]["over_ceiling_why"],
+                      "unread_tail_lines": r["index"]["unread_tail_lines"],
+                      "needs_manual_attention": r["index"]["needs_manual_attention"]}
+                     for r in _with],
+                    key=lambda x: (-x["unread_tail_lines"], -x["store_bytes"]))[:15],
+                "note": ("over_limit counts indexes whose tail — the NEWEST entries — "
+                         "the agent never reads. preamble_alone_exceeds_limit is worse: "
+                         "none of that session's own memory is reached at all."),
+            })
 
         if method == "GET" and path == "/api/debug/scan":
             _up = max(1.0, time.time() - _scan_stats.get("since", time.time()))
