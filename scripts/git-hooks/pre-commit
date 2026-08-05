@@ -111,18 +111,28 @@ if echo "$STAGED" | grep -q "^${FILE}$"; then
 import re, subprocess, sys, tempfile, os
 with open('$ROOT/$FILE') as f:
     content = f.read()
-m = re.search(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
-if not m:
+blocks = re.findall(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
+if not blocks:
     print('WARNING: no <script> block found'); sys.exit(0)
-fd, path = tempfile.mkstemp(suffix='.js')
-os.write(fd, m.group(1).encode())
-os.close(fd)
-r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
-os.unlink(path)
-if r.returncode != 0:
-    print('JS syntax error:')
-    print(r.stderr)
+# This was re.search, which matches the FIRST block only: 2,379 of 1,296,891
+# bytes, 0.2% of the client. The board/gate/session client is block 4 of 6 at
+# 1.07MB and had NEVER been parsed here, while the step printed 'Syntax checks
+# passed' on every commit that touched it (AMUX-2331). A green check that
+# cannot see the code it claims to check is worse than no check.
+fail = 0
+for i, b in enumerate(blocks):
+    fd, path = tempfile.mkstemp(suffix='.js')
+    os.write(fd, b.encode())
+    os.close(fd)
+    r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
+    os.unlink(path)
+    if r.returncode != 0:
+        print('JS syntax error in <script> block %d of %d (%d bytes):' % (i + 1, len(blocks), len(b)))
+        print(r.stderr)
+        fail = 1
+if fail:
     sys.exit(1)
+print('  %d script block(s) parsed, %d bytes' % (len(blocks), sum(len(b) for b in blocks)))
 "
   echo "Syntax checks passed."
 fi
