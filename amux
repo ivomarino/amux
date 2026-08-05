@@ -593,8 +593,8 @@ if os.environ.get('NB'):
     d['no_board'] = True          # AC-183: server skips autotask card creation
 print(json.dumps(d))")
   resp=$(curl -sk -m 15 -X POST -H 'Content-Type: application/json' \
-    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-    -d "$body" "$AMUX_API/api/sessions/$name/send" 2>/dev/null) || resp=""
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
   if [[ -n "$resp" ]]; then
     rc=0
     RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
@@ -642,7 +642,7 @@ PYEOF
   echo "${YELLOW}injected${RESET} into $name via raw tmux — DELIVERY UNVERIFIED, no origin stamp, no audit." >&2
   echo "  Keystrokes reached the pane. If a picker/modal was open they went there instead." >&2
   echo "  Confirm it arrived, or re-send with \`amux send\` once the server is back:" >&2
-  echo "    curl -sk \"\$AMUX_URL/api/sessions/$name/peek?lines=200\"" >&2
+  echo "    curl -sk \"\$AMUX_URL/api/workers/$name/peek?lines=200\"" >&2
   return 0
 }
 
@@ -883,7 +883,7 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--o
     local _obody
     _obody=$(O="$outcome" python3 -c 'import json,os;print(json.dumps({"desc_append":os.environ["O"]}))')
     curl -sk -X PATCH -H 'Content-Type: application/json' \
-      -H "X-Amux-Session: ${AMUX_SESSION:-}" -d "$_obody" \
+      -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$_obody" \
       "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
   fi
   local body
@@ -899,7 +899,7 @@ if crit: b["gate_checked"] = crit
 print(json.dumps(b))' ${checked[@]+"${checked[@]}"})
   curl -sk -X PATCH \
     -H 'Content-Type: application/json' \
-    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
     -d "$body" \
     "${AMUX_API:-https://localhost:8822}/api/board/$id"
 }
@@ -983,7 +983,7 @@ cmd_board() {
       [[ -n "$cur" ]] || die "card $id not found"
       local body
       body=$(TAGS="$cur" ASK="$ask" python3 -c "import os,json; b={'tags':json.loads(os.environ['TAGS'])}; a=os.environ['ASK'].strip(); b['desc_append']=('NEEDS-YOU: '+a) if a else b.get('desc_append'); print(json.dumps({k:v for k,v in b.items() if v is not None}))")
-      result=$(curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+      result=$(curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome; return $?
       ;;
@@ -1016,7 +1016,7 @@ types: code task chore doc research ops investigation decision escalation blocke
       local result
       result=$(T="$new_type" python3 -c 'import json,os;print(json.dumps({"type":os.environ["T"]}))' \
         | curl -sk -X PATCH -H 'Content-Type: application/json' \
-            -H "X-Amux-Session: ${AMUX_SESSION:-}" -d @- "$AMUX_API/api/board/$id")
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome
       return $?
       ;;
@@ -1037,7 +1037,7 @@ types: code task chore doc research ops investigation decision escalation blocke
         "import json,os; print(json.dumps({'title': os.environ['T'].strip(), 'status':'todo', 'session': os.environ['S']}))")
       result=$(curl -sk -X POST \
         -H 'Content-Type: application/json' \
-        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" \
         "$AMUX_API/api/board")
       echo "$result" | _board_outcome
@@ -1049,7 +1049,7 @@ types: code task chore doc research ops investigation decision escalation blocke
       shift 2>/dev/null || true
       local q="$*" body result
       body=$(Q="$q" python3 -c "import os,json;print(json.dumps({'question':os.environ['Q'].strip()}))")
-      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" "$AMUX_API/api/board/$id/status-request")
       echo "$result" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('message') or d.get('reason') or json.dumps(d)); sys.exit(0 if d.get('delivered') else 1)"
       return $?
@@ -1063,7 +1063,7 @@ types: code task chore doc research ops investigation decision escalation blocke
       [[ -n "$text" ]] || die "status text required"
       local body result
       body=$(T="$text" python3 -c "import os,json;print(json.dumps({'text':os.environ['T'].strip()}))")
-      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+      result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" "$AMUX_API/api/board/$id/status-update")
       echo "$result" | _board_outcome; return $?
       ;;
@@ -1074,7 +1074,7 @@ types: code task chore doc research ops investigation decision escalation blocke
       local result
       result=$(curl -sk -X POST \
         -H 'Content-Type: application/json' \
-        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "{\"session\":\"${AMUX_SESSION:-}\"}" \
         "$AMUX_API/api/board/$id/claim")
       echo "$result" | _board_outcome
@@ -1261,7 +1261,7 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
       # silently does not is the sanctioned-instruction-is-the-theatre shape.
       curl -sk -X PATCH \
         -H 'Content-Type: application/json' \
-        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "{\"desc_append\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg")}" \
         "$AMUX_API/api/board/$id" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'— progress noted')" 2>/dev/null
       # Check if task has a gh: tag — if so, post comment to GH issue
@@ -1578,7 +1578,7 @@ This is a FIRE ALARM — only for things that need the owner immediately
   # identity) into the owner_alerts ledger — the body 'session' is only a CLAIM.
   # This is what makes a safety-critical alert first-hand verifiable (AMUX-1795).
   curl -sk -X POST -H 'Content-Type: application/json' \
-    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
     -d "$(python3 -c 'import json,sys; print(json.dumps({"message":sys.argv[1],"reason":sys.argv[2],"session":sys.argv[3]}))' "$msg" "$reason" "$sess")" \
     "$AMUX_API/api/alert/owner" | python3 -c "
 import sys, json
