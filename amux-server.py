@@ -25081,6 +25081,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .col-gate-btn:hover, .col-gate-btn:active { opacity: 1; color: var(--accent); border-color: var(--border); }
   .col-gate-btn.has-gate { color: var(--accent); opacity: 0.95; }
   @media (max-width: 600px) { .col-gate-btn { font-size: 0.9rem; padding: 5px 8px; } }
+  /* Entry criteria shown ON the column (AMUX-2313) — deliberately always
+     visible, not behind the Gate button. Kept visually quiet so it reads as
+     the column's contract rather than competing with the cards. */
+  .col-gate-crit { margin: 6px 0 8px; padding: 7px 9px; border-radius: 8px;
+    border: 1px solid var(--border); background: rgba(255,255,255,0.02);
+    font-size: 0.72rem; line-height: 1.35; color: var(--dim); }
+  .col-gate-crit-h { color: var(--text); opacity: 0.85; margin-bottom: 4px; }
+  .col-gate-crit-l { margin: 0 0 4px; padding-left: 15px; }
+  .col-gate-crit-l li { margin: 1px 0; overflow-wrap: anywhere; }
+  .col-gate-crit-n { font-style: italic; opacity: 0.7; margin-bottom: 4px; }
+  .col-gate-crit-f { font-size: 0.66rem; opacity: 0.65; }
+  .col-gate-optin { color: var(--accent); }
+  /* Mobile is the constrained surface and amux is mobile-first: bump the type
+     so the criteria stay legible at 375px rather than shrinking to decoration. */
+  @media (max-width: 600px) {
+    .col-gate-crit { font-size: 0.8rem; padding: 8px 10px; }
+    .col-gate-crit-f { font-size: 0.72rem; }
+  }
   .board-add-col-btn {
     flex-shrink: 0; align-self: flex-start; min-width: 120px; padding: 10px 14px;
     font-size: 0.8rem; font-weight: 500; border: 1px dashed rgba(255,255,255,0.1);
@@ -34404,7 +34422,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.447';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.448';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -46004,6 +46022,36 @@ function renderBoard() {
       html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete column">&#x2715;</button>';
     }
     html += '</span></div>';
+    // ENTRY CRITERIA, visible on the board (AMUX-2313). Ethan: "the gate
+    // configurations not hidden but easily accessible, and it should be obvious
+    // that gates are criteria for passing to the next column." The criteria used
+    // to live behind the Gate button, and nothing said a gate is an ENTRY
+    // condition for the column rather than a property of cards already in it —
+    // which is the misreading that makes people force past them.
+    //
+    // This renders the GLOBAL column default and LABELS it as that, rather than
+    // claiming to be the effective gate: the type layer is per-card and cannot
+    // be known from a column. Re-deriving full precedence in the client is
+    // exactly what produced AMUX-2330, so it is not done here — the move dialog
+    // asks the server (GET /api/board/gate) for the real, per-card answer.
+    if (!collapsed) {
+      const _g = Array.isArray(stObj.gate) ? stObj.gate : [];
+      const _explicit = (stObj.mode || 'implicit') === 'explicit';
+      if (_g.length || _explicit) {
+        html += '<div class="col-gate-crit">';
+        html += '<div class="col-gate-crit-h">To move a card <b>into ' + esc(stObj.label) + '</b>:</div>';
+        if (_g.length) {
+          html += '<ul class="col-gate-crit-l">'
+                + _g.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul>';
+        } else {
+          html += '<div class="col-gate-crit-n">No criteria set for this column.</div>';
+        }
+        html += '<div class="col-gate-crit-f">column default'
+             + (_explicit ? ' &middot; <span class="col-gate-optin">opt-in only</span>' : '')
+             + ' &middot; a card&rsquo;s type may require different criteria</div>';
+        html += '</div>';
+      }
+    }
     if (stCol.length === 0) {
       html += '<div class="board-empty">Nothing here</div>';
     }
@@ -48569,8 +48617,24 @@ _idb.pruneFiles(_FILE_CACHE_TTL_MS).then(n => {
 // IDB fallback: restore statuses from IndexedDB (preserves column order across reloads)
 _idb.getAll('statuses').then(items => {
   if (items && items.length) {
+    // Do NOT whitelist fields here. putStatuses saves the whole object
+    // ({...s}), and this restore used to rebuild each status as
+    // {id, label, gate} — so `mode` (AMUX-2312) was silently dropped and the
+    // board never rendered the explicit/opt-in state, even though the API
+    // returned it. Any field added server-side would fail the same way, and
+    // the symptom is a correct-looking board rather than an error. Strip only
+    // the internal _pos and normalize gate; carry everything else through.
     items.sort((a, b) => (a._pos || 0) - (b._pos || 0));
-    boardStatuses = items.map(s => ({ id: s.id, label: s.label, gate: Array.isArray(s.gate) ? s.gate : [] }));
+    // ...and do not clobber a FRESHER network fetch. This restore is async and
+    // was racing fetchBoard: when IDB landed second it overwrote live statuses
+    // with the cached copy, which is how the stripped shape survived a reload.
+    if (lastStatusesJSON) return;
+    boardStatuses = items.map(s => {
+      const o = Object.assign({}, s);
+      delete o._pos;
+      o.gate = Array.isArray(o.gate) ? o.gate : [];
+      return o;
+    });
     lastStatusesJSON = JSON.stringify(boardStatuses);
     if (activeView === 'board') renderBoard();
   }
@@ -55887,7 +55951,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.447';
+const CACHE = 'amux-v0.9.448';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60146,6 +60210,21 @@ class CCHandler(BaseHTTPRequestHandler):
                                           "mode": s.get("mode") or "implicit"}
                                          for s in _load_board_statuses()],
                             "scope": _scope}
+                    # Column-level entry criteria, resolved SERVER-SIDE for this
+                    # scope (AMUX-2313). The client must not re-derive precedence
+                    # — that duplication was AMUX-2330. Column level is
+                    # global-or-session only; the TYPE layer is per-card and
+                    # cannot be known from a column, which the UI says out loud
+                    # rather than implying these are the final word.
+                    _sg_all = _load_session_gates()
+                    for s in _out["statuses"]:
+                        _sg = (_sg_all.get(_sess_q, {}) or {}).get(s["id"]) if _sess_q else None
+                        if _sg:
+                            s["column_gate"], s["gate_source"] = list(_sg), "session"
+                        else:
+                            _gg = next((x.get("gate") or [] for x in _load_board_statuses()
+                                        if x["id"] == s["id"]), [])
+                            s["column_gate"], s["gate_source"] = list(_gg), "global"
                     if _sess_q:
                         _out["applies"] = {
                             s["id"]: {"applies": _status_applies(s["id"], _sess_q)[0],
@@ -61774,13 +61853,22 @@ class CCHandler(BaseHTTPRequestHandler):
                 except Exception:
                     item["gate"] = []
                 issues.append(item)
+            # ONE producer for statuses. This used to run its own
+            # "SELECT id, label, position, gate" and hand-build the dicts, so
+            # when `mode` was added (AMUX-2312) it silently did not appear here
+            # — and because _runDeltaSync overwrites boardStatuses AND
+            # _idb.putStatuses from this payload, the stale shape won over the
+            # correct /api/board/statuses response and persisted into IndexedDB.
+            # The board rendered a column that looked right and was missing a
+            # field. Third hand-maintained duplicate of one rule found today
+            # (two CLIs, two gate resolvers, this): when two implementations of
+            # one rule exist they diverge, and each looks correct alone.
             statuses = []
-            for r in db.execute("SELECT id, label, position, gate FROM statuses ORDER BY position").fetchall():
-                sd = {"id": r["id"], "label": r["label"], "position": r["position"]}
-                try:
-                    sd["gate"] = json.loads(r["gate"]) if r["gate"] else []
-                except Exception:
-                    sd["gate"] = []
+            _pos = {r["id"]: r["position"] for r in
+                    db.execute("SELECT id, position FROM statuses").fetchall()}
+            for sd in _load_board_statuses():
+                sd = dict(sd)
+                sd["position"] = _pos.get(sd["id"], 0)
                 statuses.append(sd)
             return self._json({
                 "ts": int(time.time()),
