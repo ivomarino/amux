@@ -13369,6 +13369,67 @@ def _item_by_id(bid: str) -> dict | None:
     return item
 
 
+def _gate_layers(item, target_status: str) -> list:
+    """EVERY scope layer's contribution to this transition, not just the winner.
+
+    Ethan, 2026-08-05: "if the board issue is going from done to verified and
+    there's a global level gate that does X, a worker level gate that does Y, and
+    a group level gate that does Z, all of those should be individually logged."
+
+    _effective_gate returns the winning list and discards the rest, so the log
+    could say WHAT was enforced but never WHICH scope granted or imposed it, or
+    what the other layers would have said. That is the difference between an
+    audit trail and a result.
+
+    Returns least-specific-first: global -> group:<g> -> worker:<w> -> type ->
+    card, each with `applied` marking the one that won under the precedence
+    _effective_gate implements. Ordering is presentation; `applied` is truth.
+    """
+    out = []
+    if isinstance(item, str):
+        item = _item_by_id(item) or {}
+    item = dict(item or {})
+    worker = (item.get("session") or "").strip()
+
+    def _norm(v):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v) if v else []
+            except Exception:
+                v = []
+        return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else []
+
+    # global
+    _g = next((_norm(x.get("gate")) for x in _load_board_statuses()
+               if x.get("id") == target_status), [])
+    out.append({"scope": "global", "source": "statuses.gate", "criteria": _g})
+    # group — NEW. Gates had no group tier at all: card > type > worker > global.
+    _sg = _load_session_gates()
+    for _grp in _session_tags_of(worker) if worker else []:
+        _gg = _norm((_sg.get("group:" + _grp, {}) or {}).get(target_status))
+        out.append({"scope": f"group:{_grp}", "source": "session_gates[group:*]",
+                    "criteria": _gg})
+    # worker
+    out.append({"scope": f"worker:{worker}" if worker else "worker:(unassigned)",
+                "source": "session_gates", "criteria":
+                _norm((_sg.get(worker, {}) or {}).get(target_status)) if worker else []})
+    # type (intrinsic to the card, outranks worker/group)
+    out.append({"scope": "type:" + str(item.get("type") or _DEFAULT_ITEM_TYPE),
+                "source": "_TYPE_GATES", "criteria": _item_type_gate(item, target_status)})
+    # card override
+    out.append({"scope": "card", "source": "issues.gate", "criteria": _norm(item.get("gate"))})
+
+    _win = _effective_gate(item, target_status)
+    _marked = False
+    for _l in reversed(out):          # most specific first, matching precedence
+        _l["applied"] = (not _marked and _l["criteria"] == _win and bool(_win))
+        if _l["applied"]:
+            _marked = True
+    if not _marked and out:           # nothing set -> the global default answered
+        out[0]["applied"] = (out[0]["criteria"] == _win)
+    return out
+
+
 def _effective_gate(item, target_status: str) -> list:
     """Resolve the effective gate checklist for moving `item` into `target_status`.
 
@@ -13409,13 +13470,26 @@ def _effective_gate(item, target_status: str) -> list:
     tg = _item_type_gate(item, target_status)
     if tg:
         return tg
-    # 2. Per-session override for the target status
+    # 2. Per-WORKER override for the target status
     session = item.get("session")
     if session:
         sg = _load_session_gates().get(session, {})
         gs = sg.get(target_status)
         if isinstance(gs, list) and gs:
             return [str(x) for x in gs if str(x).strip()]
+    # 2b. Per-GROUP override (Ethan, 2026-08-05: gates scope at global, group and
+    # worker). Gates had no group tier — the chain was card > type > worker >
+    # global — so a policy that belongs to a whole group had to be copied onto
+    # every worker in it and drifted the moment one was missed. Sits BELOW the
+    # worker (a worker's own setting is more specific) and ABOVE global. Stored in
+    # the same session_gates table under a `group:<name>` key, so it needs no new
+    # storage and _load_session_gates already reads it.
+    if session:
+        _all = _load_session_gates()
+        for _grp in _session_tags_of(session):
+            _gg = _all.get("group:" + _grp, {}).get(target_status)
+            if isinstance(_gg, list) and _gg:
+                return [str(x) for x in _gg if str(x).strip()]
     # 3. Global status default
     for st in _load_board_statuses():
         if st.get("id") == target_status:
@@ -61963,6 +62037,30 @@ class CCHandler(BaseHTTPRequestHandler):
                                 if "status" in _chg:
                                     _frm = _audit_prior.get("status") or "?"
                                     _to = _chg["status"]
+                                    # SCOPE-ATTRIBUTED AUDIT (Ethan, 2026-08-05):
+                                    # "all of those should be individually logged".
+                                    # The History line records WHAT was enforced;
+                                    # this records WHICH SCOPE imposed it and what
+                                    # every other layer would have said. Without it
+                                    # the log can show a card passed a gate but not
+                                    # under whose authority — and "which permission
+                                    # scope allowed this action" is unanswerable
+                                    # from the data, which is the defect, not the
+                                    # inconvenience.
+                                    try:
+                                        for _gl in _gate_layers(updated_item, _to):
+                                            if not _gl["criteria"] and not _gl["applied"]:
+                                                continue   # a layer that said nothing
+                                            _ilog("board", "gate_layer", actor=_actor,
+                                                  target=bid, ok=True,
+                                                  detail={"transition": f"{_frm}->{_to}",
+                                                          "scope": _gl["scope"],
+                                                          "source": _gl["source"],
+                                                          "criteria": _gl["criteria"],
+                                                          "applied": _gl["applied"],
+                                                          "forced": bool(body.get("force"))})
+                                    except Exception as _gle:
+                                        slog(f"[board] gate-layer audit failed {bid}: {_gle}")
                                     # Verbose entry (AMUX-2175): the actor, the
                                     # transition, and HOW it passed the gate —
                                     # which criteria were acknowledged, or the
