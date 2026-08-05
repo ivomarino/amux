@@ -844,6 +844,66 @@ cmd_start_all() {
   done
 }
 
+# Build and send a status transition, INCLUDING the gate-satisfying fields.
+# AMUX-2325: the status verbs used to send only {"status":...}. There was no
+# CLI way to pass gate_ack / gate_checked / type / override_doing, so the
+# moment a gate fired — which is most cards — the only way forward was a
+# hand-rolled `curl -X PATCH`, and a hand-rolled curl usually omits
+# X-Amux-Session. The gate system was therefore MANUFACTURING the unattributed
+# writes it depends on being attributed (found by the Claude/Gemini test pair
+# on ATC-1, reproduced fleet-wide on RH-* and GE-*). The honest path has to be
+# the easy path; a rule saying "remember the header" is not a fix.
+_board_transition() {
+  local id="$1" status="$2"; shift 2
+  local ack="" newtype="" override="" rev="" outcome=""
+  local checked=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --outcome) outcome="${2:-}"; [[ -n "$outcome" ]] || die "--outcome needs text"; shift 2 ;;
+      --ack) ack=1; shift ;;
+      --checked)
+        shift
+        # Consume criteria until the next flag. Quote each one; they are the
+        # gate strings the server handed back verbatim.
+        while [[ $# -gt 0 && "$1" != --* ]]; do checked+=("$1"); shift; done ;;
+      --type) newtype="${2:-}"; [[ -n "$newtype" ]] || die "--type needs a value"; shift 2 ;;
+      --override-doing) override=1; shift ;;
+      --rev) rev="${2:-}"; shift 2 ;;
+      *) die "amux board: unknown flag '$1'
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]" ;;
+    esac
+  done
+  # Record the outcome as its OWN write, BEFORE attempting the transition.
+  # A PATCH is atomic, so `{"desc":...,"status":"done"}` that trips the gate
+  # discards the outcome text TOO — and the retry then has nothing to satisfy
+  # "Outcome recorded in the item" with, so it fails again for a new reason.
+  # mixpeek-orchestrator hit this three times on 2026-08-04 (MO-3076 x2,
+  # MO-3077). Two writes, not one: the outcome survives a refused transition.
+  if [[ -n "$outcome" ]]; then
+    local _obody
+    _obody=$(O="$outcome" python3 -c 'import json,os;print(json.dumps({"desc_append":os.environ["O"]}))')
+    curl -sk -X PATCH -H 'Content-Type: application/json' \
+      -H "X-Amux-Session: ${AMUX_SESSION:-}" -d "$_obody" \
+      "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
+  fi
+  local body
+  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" python3 -c '
+import json, os, sys
+b = {"status": os.environ["S"]}
+if os.environ.get("A"): b["gate_ack"] = True
+if os.environ.get("T"): b["type"] = os.environ["T"]
+if os.environ.get("O"): b["override_doing"] = True
+if os.environ.get("R"): b["rev"] = int(os.environ["R"])
+crit = sys.argv[1:]
+if crit: b["gate_checked"] = crit
+print(json.dumps(b))' ${checked[@]+"${checked[@]}"})
+  curl -sk -X PATCH \
+    -H 'Content-Type: application/json' \
+    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -d "$body" \
+    "${AMUX_API:-https://localhost:8822}/api/board/$id"
+}
+
 # Outcome-based exit for board mutations (AMUX-2140): the CLI used to report
 # the TRANSPORT (curl ok = exit 0) while the server refused the write — every
 # `$?` caller and every `&& echo moved` printed success on blocked mutations,
@@ -852,8 +912,13 @@ cmd_start_all() {
 # 5 rev mismatch · 1 other refusal or malformed response. Refusals print the
 # server body to STDERR so pipelines keep clean stdout.
 _board_outcome() {
+  # Optional args: the id and status the CALLER attempted. Not decoration —
+  # the WIP-limit 409 body carries no `attempted_status`, so a hint derived
+  # only from the response could never fire on the refusal that needs it most
+  # (caught by running it, not by reading it). The caller always knows.
   python3 -c '
 import sys, json
+_argv = sys.argv[1:]
 raw = sys.stdin.read()
 try:
     d = json.loads(raw)
@@ -868,13 +933,37 @@ if ok:
     sys.exit(0)
 sys.stderr.write(json.dumps(d) + "\n")
 e = err.lower()
+# Name the ATTRIBUTED command that gets past this refusal (AMUX-2325). The
+# server body explains the escape in HTTP terms (gate_ack / override_doing),
+# which is how a blocked agent ends up hand-rolling an unattributed curl.
+# Print the honest `amux board` form instead, quoting the gate criteria the
+# server just handed back so they can be acknowledged individually rather
+# than blanket-acked.
+def _q(s):
+    return "\"" + str(s).replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+iid = d.get("item") or d.get("id") or (_argv[0] if _argv else "<ID>")
+tgt = d.get("attempted_status") or (_argv[1] if len(_argv) > 1 else "")
 if "gate" in e:
+    gate = d.get("gate") or []
+    if tgt and gate:
+        sys.stderr.write(
+            "\nSatisfy these, then acknowledge the ones that are TRUE:\n"
+            + "".join("   [ ] " + str(g) + "\n" for g in gate)
+            + "\n  amux board " + tgt + " " + iid + " --checked "
+            + " ".join(_q(g) for g in gate) + "\n"
+            "\nIf a criterion does not apply because the card is mistyped "
+            "(item_type=" + str(d.get("item_type") or "?") + "), correct the TYPE "
+            "rather than acking something untrue:\n"
+            "  amux board type " + iid + " <chore|task|doc|research|ops|decision|investigation>\n")
     sys.exit(3)
 if "holding" in e or "doing" in e or "wip" in e:
+    if tgt:
+        sys.stderr.write("\nFinish or demote the held card, or hold both deliberately:\n"
+                         "  amux board " + tgt + " " + iid + " --override-doing\n")
     sys.exit(4)
 if "rev mismatch" in e:
     sys.exit(5)
-sys.exit(1)'
+sys.exit(1)' "${1:-}" "${2:-}"
 }
 
 cmd_board() {
@@ -898,27 +987,36 @@ cmd_board() {
         -d "$body" "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome; return $?
       ;;
-    done|doing|todo|backlog|discarded|review)
+    done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID>"
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]"
+      shift
       local result
-      result=$(curl -sk -X PATCH \
-        -H 'Content-Type: application/json' \
-        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-        -d "{\"status\":\"$status\"}" \
-        "$AMUX_API/api/board/$id")
-      echo "$result" | _board_outcome
+      result=$(_board_transition "$id" "$status" "$@")
+      echo "$result" | _board_outcome "$id" "$status"
       return $?
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
-      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status>"
+      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]"
+      shift 2
       local result
-      result=$(curl -sk -X PATCH \
-        -H 'Content-Type: application/json' \
-        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-        -d "{\"status\":\"$new_status\"}" \
-        "$AMUX_API/api/board/$id")
+      result=$(_board_transition "$id" "$new_status" "$@")
+      echo "$result" | _board_outcome "$id" "$new_status"
+      return $?
+      ;;
+    type)
+      # The gate is DERIVED from the type, so correcting a mistyped card is the
+      # honest exit from a gate that does not fit — not --force (ethos rule 3).
+      # Without this verb the only way to retype was raw curl, which is how the
+      # attribution was being lost in the first place (AMUX-2325).
+      local id="${1:-}"; local new_type="${2:-}"
+      [[ -n "$id" && -n "$new_type" ]] || die "Usage: amux board type <ISSUE-ID> <type>
+types: code task chore doc research ops investigation decision escalation blocker watch"
+      local result
+      result=$(T="$new_type" python3 -c 'import json,os;print(json.dumps({"type":os.environ["T"]}))' \
+        | curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Session: ${AMUX_SESSION:-}" -d @- "$AMUX_API/api/board/$id")
       echo "$result" | _board_outcome
       return $?
       ;;
@@ -1232,6 +1330,18 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board todo <ID>             Move issue to todo
   amux board backlog <ID>          Move issue to backlog
   amux board status <ID> <status>  Set any status
+  amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
+
+  Every status verb above takes the gate-satisfying flags, so a gated move
+  never needs a hand-rolled curl (which is how attribution gets lost):
+    --checked "crit" ["crit" ...]  acknowledge the criteria that are TRUE
+    --ack                          acknowledge the whole gate at once
+    --outcome "what happened"      record the outcome FIRST, as its own write,
+                                   so a refused transition cannot discard it
+    --type T                       retype in the same write
+    --override-doing               hold a second card in doing deliberately
+  e.g.  amux board review AC-12 --checked "Findings written up" "Ready for eyes"
+
   amux board import gh:owner/repo#N [--workspace W] [--project P]
                                    Import GH issue as board task(s)
   amux board progress <ID> <msg>   Add progress note (posts to GH if linked)

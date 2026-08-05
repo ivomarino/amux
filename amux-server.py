@@ -9788,28 +9788,79 @@ print('sent to '+os.environ['TGT']+' (origin-stamped): '+str(d.get('message','ok
     case "$sub" in
       done|doing|todo|backlog|review|verified|discarded)
         # The server enforces per-status gates: a move into a gated status returns
-        # 409 unless acknowledged. Surface that gate to the agent so it can satisfy
-        # the criteria; pass --force to override (same escape hatch as the UI).
-        force=""; ids=""
-        for a in "$@"; do
-          if [ "$a" = "--force" ]; then force=",\"force\":true"; else ids="$ids $a"; fi
+        # 409 unless acknowledged. Carry the gate-SATISFYING fields, not just the
+        # status (AMUX-2325): without --checked/--ack/--type here, a blocked agent's
+        # only way forward was a hand-rolled `curl -X PATCH`, which usually omits
+        # X-Amux-Session — so the gate system was manufacturing the unattributed
+        # writes it depends on being attributed. This block also used to tell the
+        # agent, on EVERY gate block, to "re-run with --force": it made the one
+        # audited escape hatch the sanctioned first response to a routine refusal.
+        # --force still works; it is no longer the advice.
+        ack=""; newtype=""; override=""; force=""; ids=""; checked=""; outcome=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --outcome) outcome="$2"; shift 2 ;;
+            --ack) ack=1; shift ;;
+            --force) force=1; shift ;;
+            --override-doing) override=1; shift ;;
+            --type) newtype="$2"; shift 2 ;;
+            --checked) shift
+              while [ $# -gt 0 ] && case "$1" in --*) false;; *) true;; esac; do
+                checked="$checked$1
+"; shift; done ;;
+            *) ids="$ids $1"; shift ;;
+          esac
         done
         for id in $ids; do
-          curl -sk -X PATCH -H 'Content-Type: application/json' \
+          # Outcome first, as its OWN write: a PATCH is atomic, so bundling the
+          # outcome with a status that trips the gate discards the outcome too —
+          # and the retry then cannot satisfy "Outcome recorded in the item"
+          # (mixpeek-orchestrator, MO-3076/3077, 2026-08-04).
+          if [ -n "$outcome" ]; then
+            O2="$outcome" python3 -c "
+import json,os
+print(json.dumps({'desc_append':os.environ['O2']}))" | curl -sk -X PATCH \
+              -H 'Content-Type: application/json' \
+              -H "X-Amux-Session: ${AMUX_SESSION:-}" -d @- \
+              "$AMUX_URL/api/board/$id" >/dev/null
+          fi
+          CHK="$checked" A="$ack" T="$newtype" O="$override" F="$force" S="$sub" python3 -c "
+import json,os
+b={'status':os.environ['S']}
+if os.environ.get('A'): b['gate_ack']=True
+if os.environ.get('F'): b['force']=True
+if os.environ.get('T'): b['type']=os.environ['T']
+if os.environ.get('O'): b['override_doing']=True
+c=[x for x in os.environ.get('CHK','').split(chr(10)) if x]
+if c: b['gate_checked']=c
+print(json.dumps(b))" | curl -sk -X PATCH -H 'Content-Type: application/json' \
             -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-            -d "{\"status\":\"$sub\"$force}" "$AMUX_URL/api/board/$id" | python3 -c "
+            -d @- "$AMUX_URL/api/board/$id" | python3 -c "
 import json,sys
-iid=sys.argv[1]
+iid=sys.argv[1]; tgt=sys.argv[2]
 try: d=json.load(sys.stdin)
 except Exception: print(iid+': (no/invalid response)'); sys.exit(0)
-if d.get('error')=='gate not acknowledged':
-    print(iid+': BLOCKED — \''+str(d.get('attempted_status',d.get('status','')))+'\' has an unmet gate. Satisfy these, then re-run with --force:')
-    for g in d.get('gate',[]): print('   [ ] '+str(g))
+def q(s): return '\"'+str(s).replace('\\\\','\\\\\\\\').replace('\"','\\\\\"')+'\"'
+err=str(d.get('error') or '')
+if err=='gate not acknowledged':
+    g=d.get('gate',[])
+    print(iid+': BLOCKED — \''+tgt+'\' has an unmet gate. Satisfy these, then acknowledge the ones that are TRUE:')
+    for x in g: print('   [ ] '+str(x))
+    print('')
+    print('  amux board '+tgt+' '+iid+' --checked '+' '.join(q(x) for x in g))
+    print('')
+    print('If a criterion cannot be true because the card is mistyped (item_type='+str(d.get('item_type') or '?')+'),')
+    print('correct the TYPE rather than acking something untrue:')
+    print('  amux board '+tgt+' '+iid+' --type <chore|task|doc|research|ops|decision|investigation>')
     sys.exit(2)
-if d.get('error'):
-    print(iid+': error: '+str(d.get('error'))); sys.exit(1)
+if 'holding' in err.lower() or 'wip' in err.lower():
+    print(iid+': BLOCKED — '+str(d.get('message') or err))
+    print('  amux board '+tgt+' '+iid+' --override-doing')
+    sys.exit(2)
+if err:
+    print(iid+': error: '+err); sys.exit(1)
 print(iid+' -> '+str(d.get('status','?')))
-" "$id"
+" "$id" "$sub"
         done ;;
       add)
         title="$*"
@@ -60201,6 +60252,10 @@ class CCHandler(BaseHTTPRequestHandler):
                                         f"(limit {_STALE_DOING_MAX_PER_SESSION}). Finish or demote "
                                         f"one first, or pass override_doing:true to hold both "
                                         f"deliberately. See GET /api/board/reconcile?session={_ds}"),
+                                    # Name the ATTRIBUTED command (AMUX-2325). Explaining the
+                                    # escape only as a JSON field is what sends a blocked agent
+                                    # to a hand-rolled curl, which drops X-Amux-Session.
+                                    "cli": f"amux board doing {bid} --override-doing",
                                 }, 409)
                     # Verify-gate: 'verified' means the work is committed & deployed, so block
                     # the transition while the owning session's tree is dirty. The orchestrator
@@ -60507,6 +60562,18 @@ class CCHandler(BaseHTTPRequestHandler):
                                                         "— the gate is DERIVED from the type. Never ack a merge "
                                                         "that did not happen."),
                                     },
+                                    # ...but publishing it ONLY as HTTP fields is what made the
+                                    # honest exit unwalkable from the attributed path (AMUX-2325):
+                                    # `amux board <status>` had no --checked/--ack/--type, so an
+                                    # agent following how_to_ack literally hand-rolled a curl and
+                                    # dropped X-Amux-Session. The gate was manufacturing the
+                                    # unattributed writes the gate system depends on being
+                                    # attributed. Name the attributed command, not just the field.
+                                    "cli": ("amux board " + str(new_status) + " " + str(bid)
+                                            + " --checked "
+                                            + " ".join(json.dumps(str(g)) for g in eff_gate)),
+                                    "cli_wrong_type": ("amux board type " + str(bid)
+                                                       + " <chore|task|doc|research|ops|decision|investigation>"),
                                 }, 409)
                         if eff_gate:
                             _chk = body.get("gate_checked")
