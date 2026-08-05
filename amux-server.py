@@ -3778,6 +3778,23 @@ def _write_env(path: Path, cfg: dict):
     preventing world-readable .env files that may contain secrets like
     ANTHROPIC_API_KEY or per-session credentials.
     """
+    # AUDIT every env mutation at the ONE choke point (AMUX-2314). Ethan's
+    # reasoning is the right one: env vars are the mechanism by which a session
+    # acts on the world, so an unaudited env is an unaudited blast radius.
+    # Recorded per KEY — added / removed / changed — and NEVER the values: an
+    # audit log that captures secrets is a second copy of the credential in a
+    # place nobody is guarding. `changed` names the key whose value moved, which
+    # is what forensics needs; the value itself is in the file, under 0600.
+    try:
+        _prior = parse_env_file(path) if path.exists() else {}
+        _added = sorted(set(cfg) - set(_prior))
+        _removed = sorted(set(_prior) - set(cfg))
+        _changed = sorted(k for k in set(cfg) & set(_prior) if _prior[k] != cfg[k])
+        if _added or _removed or _changed:
+            _ilog("env", "write", target=str(path), ok=True,
+                  detail={"added": _added, "removed": _removed, "changed": _changed})
+    except Exception as _ae:
+        slog(f"[env-audit] failed for {path}: {_ae!r}")
     lines = [f'# updated: {__import__("datetime").datetime.now().isoformat()}']
     for k, v in cfg.items():
         lines.append(f'{k}="{v}"')
@@ -17293,6 +17310,52 @@ curl -sk "$AMUX_URL/api/sessions/OTHER/peek?lines=200" | python3 -c "import json
 When you finish a piece of work, immediately `git add` + `git commit` with a
 concise message. Don't batch multiple tasks into one commit.
 """
+
+
+def _env_layers(name: str) -> list:
+    """Every env layer for `name`, least specific first: global -> tag -> session.
+
+    MERGE, not replace (AMUX-2314): a more specific layer overrides individual
+    KEYS, it does not discard the layers above it. That is the `resolve_all`
+    read mode from the AMUX-2311 design — env is the canonical merge consumer,
+    which is why merge-vs-replace is a property of the READ there and not a
+    per-key registry.
+
+    Returns layer descriptors carrying KEY NAMES ONLY. Values never leave this
+    function. A diagnostic that prints secrets is a credential leak with a nice
+    UI, and this card exists *because* a key reached a session that should not
+    have had it.
+    """
+    out = []
+
+    def _add(layer: str, path):
+        try:
+            keys = sorted(parse_env_file(path).keys()) if path.exists() else []
+        except Exception:
+            keys = []
+        out.append({"layer": layer, "path": str(path), "exists": path.exists(),
+                    "keys": keys})
+
+    _add("global", CC_AMUX_ENV)
+    for t in _session_tags_of(name):
+        _add(f"tag:{t}", CC_HOME / "env" / f"{t}.env")
+    _add(f"session:{name}", CC_SESSIONS / f"{name}.env")
+    return out
+
+
+def _env_resolve(name: str) -> dict:
+    """{KEY: {"layer": <winning layer>, "shadowed": [layers it overrode]}}.
+
+    Names and provenance only — no values, ever.
+    """
+    winner: dict = {}
+    for l in _env_layers(name):
+        for k in l["keys"]:
+            if k in winner:
+                winner[k]["shadowed"].append(winner[k]["layer"])
+            winner.setdefault(k, {"layer": l["layer"], "shadowed": []})
+            winner[k]["layer"] = l["layer"]
+    return winner
 
 
 def _session_tags_of(name: str) -> list:
@@ -65236,6 +65299,41 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             if action == "tasks":
                 # Claude Code's native task list (read-only) — the agent's live plan.
                 return self._json(_session_cc_tasks(name))
+            if action == "env-explain":
+                # "Which variables can this session see, and from which layer?"
+                # (AMUX-2314.) NAMES AND PROVENANCE ONLY — never values. A
+                # diagnostic that prints secrets is a credential leak with a nice
+                # UI, and this card exists because a tubescience key reached a
+                # sherpa session.
+                #
+                # It also reports what it CANNOT account for, which is the honest
+                # part: amux knows what it INJECTS, but a session inherits the
+                # server's ambient environment and can read any file the user can
+                # (AMUX-2310 established CC_DIR is a working directory, not a
+                # sandbox). A view that showed only the managed layers would
+                # imply those are the blast radius. They are not.
+                _lyr = _env_layers(name)
+                _res = _env_resolve(name)
+                _forwarded = ["ANTHROPIC_API_KEY", "ANTHROPIC_API_BASE", "OPENAI_API_KEY",
+                              "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI",
+                              "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"]
+                return self._json({
+                    "session": name,
+                    "tags": _session_tags_of(name),
+                    "layers": _lyr,
+                    "resolved": _res,
+                    "shadowed": {k: v["shadowed"] for k, v in _res.items() if v["shadowed"]},
+                    "forwarded_from_server_env": [k for k in _forwarded if os.environ.get(k)],
+                    "unmanaged": {
+                        "ambient_inheritance": ("The session shell inherits the amux server's "
+                                                "environment; amux does not enumerate or gate it."),
+                        "filesystem": ("CC_DIR is a working directory passed to tmux -c, NOT a "
+                                       "sandbox. The session can read any .env the user can read "
+                                       "(AMUX-2310). Nothing here constrains that."),
+                        "note": "These are NOT audited. Treat this view as what amux GRANTS, "
+                                "not as the session's full reach.",
+                    },
+                })
             if action == "memory-explain":
                 # "Which rules is this session actually operating under, and from
                 # which layer?" — answerable without reading the composed file
