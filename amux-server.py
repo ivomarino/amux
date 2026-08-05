@@ -16869,6 +16869,55 @@ def _fold_memory_overflow(name: str, session_content: str) -> str:
         slog(f"[memory] {name}: over the index ceiling and entry-folding cannot fix it "
              f"({len(lines)} lines, {len(session_content.encode())}B, only {len(entry_idx)} "
              f"index entries) — the bulk is prose, needs manual attention")
+        # TELL THE LANE (AMUX-2338). This branch has fired 490 times into
+        # server.log, which nobody reads — the detection was correct and the
+        # surfacing did not exist (ethos rule 4: a tag in a store the reader
+        # never opens is the same failure as no tag).
+        #
+        # Hung off the write that ALREADY happens, addressed to a named consumer,
+        # with a durable dedupe key — no sweep, no new loop (the no-global-pub-sub
+        # decision). The key carries the LINE COUNT, so a lane is told once and
+        # then not again until the number actually changes: 490 log lines is
+        # precisely the volume this must not reproduce as messages.
+        #
+        # It tells, it does not trim. Which of this lane's notes matter is that
+        # lane's call, not amux's (ethos rule 8).
+        try:
+            _unread = max(0, len(lines) - _MEM_READ_LIMIT)
+            # NOTIFY ONLY ON REAL, PRESENT HARM. The fold gives up when over
+            # lines OR bytes, but only the LINE overflow has a reader-visible
+            # consequence — an unread tail. My first cut notified on the
+            # give-up branch itself, so `backend` (41 lines, over on BYTES only)
+            # was told "the LAST ~0 lines are never loaded", which is nonsense
+            # and false. That is the card's own acceptance criterion violated:
+            # the notice must share the predicate of what it claims. A byte-only
+            # overflow predicts future harm and is visible in
+            # GET /api/debug/context; it does not warrant waking a lane.
+            _idem = f"memfold:{name}:{len(lines)}"
+            _db = get_db()
+            if _unread > 0 and not _db.execute(
+                    "SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                    (_idem,)).fetchone():
+                _steer_enqueue(name,
+                    f"[amux] Your memory index is past what the agent will read: "
+                    f"{len(lines)} lines against a {_MEM_READ_LIMIT}-line read limit, "
+                    f"so the LAST ~{_unread} lines — your newest entries — are never "
+                    f"loaded.\n\n"
+                    f"amux cannot fix this for you: only {len(entry_idx)} of those lines "
+                    f"are index entries, so auto-folding the oldest ones out buys nothing "
+                    f"and it declined rather than churn them out of sight. The bulk is "
+                    f"prose.\n\n"
+                    f"Your file is {CC_MEMORY}/{name}.md. Move the long-form parts into "
+                    f"the archive or a topic file and leave one-line index entries "
+                    f"pointing at them — that is what the index is for. "
+                    f"GET /api/sessions/{name}/memory-explain shows every layer and what "
+                    f"each contributes.",
+                    guard=_idem)
+                _emit_event(name, "memory.overflow", {"lines": len(lines),
+                            "entries": len(entry_idx), "unread": _unread},
+                            idem=_idem, source="memory-fold")
+        except Exception as _me:
+            slog(f"[memory] {name}: overflow notice failed: {_me}")
         return session_content
 
     # Drop headings orphaned by the fold (no entry before the next heading/EOF).
