@@ -16664,6 +16664,11 @@ _MEM_TOPIC_FILE = "amux-api.md"
 # as windows grow). 200 is Claude Code's default file-read limit today.
 _MEM_READ_LIMIT = int(os.environ.get("AMUX_MEM_READ_LIMIT", "200") or 200)
 
+# Inline an image as a base64 data_url up to this size; stream anything larger
+# via /api/file/raw. Config, not a constant — the right threshold depends on the
+# client and the link, and hardcoding it is what produced a hard 5MB refusal.
+_IMG_INLINE_MAX = int(os.environ.get("AMUX_IMG_INLINE_MAX", "2000000") or 2000000)
+
 
 def _context_audit(name: str) -> dict:
     """What amux INJECTS into this lane, and whether the agent can actually read
@@ -35213,7 +35218,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.449';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.450';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -35742,7 +35747,7 @@ async function _psfViewFile(filePath) {
     if (data.is_image) {
       content.className = 'file-overlay-body file-image';
       const img = document.createElement('img');
-      img.src = data.data_url;
+      img.src = data.data_url || _authUrl(API + (data.raw_url || ''));
       img.style.cssText = 'max-width:100%;height:auto;border-radius:4px;display:block;margin:auto;';
       content.appendChild(img);
     } else if (data.is_markdown) {
@@ -40533,7 +40538,9 @@ function _renderFileBody(data, mode) {
     const wrap = document.createElement('div');
     wrap.className = 'img-zoom-wrap';
     const img = document.createElement('img');
-    img.src = data.data_url;
+    // data_url for small images, streamed raw_url for large ones (AMUX-2344).
+    // Reading only data_url is what made a >5MB photo render as a broken image.
+    img.src = data.data_url || _authUrl(API + (data.raw_url || ''));
     img.alt = data.path ? data.path.split('/').pop() : '';
     img.className = 'img-zoomable';
     wrap.appendChild(img);
@@ -40845,6 +40852,9 @@ async function openFilePreview(path) {
     // the last-opened time — the 30-day pruner (_idb.pruneFiles, run at startup)
     // evicts anything not opened in 30 days. Streaming media (video/audio) has
     // no data_url/content so it's naturally skipped — it can't live in IDB.
+    // A streamed image has no inline bytes, so it contributes 0 here and is
+    // naturally skipped by the cache — correct, since caching a URL that needs
+    // the server would promise offline access it cannot deliver.
     const _payload = (data.data_url ? data.data_url.length : 0) + (data.content ? data.content.length : 0);
     if (_payload > 0 && _payload <= _FILE_CACHE_MAX) {
       await _idb.setFile(path, { type: 'file', data });
@@ -56716,7 +56726,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.449';
+const CACHE = 'amux-v0.9.450';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -59908,12 +59918,31 @@ class CCHandler(BaseHTTPRequestHandler):
                     ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
                 }
                 if ext in IMAGE_MIMES:
-                    raw = p.read_bytes()
-                    if len(raw) > 5_000_000:
-                        return self._json({"error": "Image too large (>5 MB)"}, 400)
+                    # Large images STREAM instead of being refused (AMUX-2344).
+                    # This returned 400 "Image too large (>5 MB)" — and an iPhone
+                    # photo is routinely over 5MB, so on the mobile dashboard amux
+                    # is mobile-first about, the viewer failed on the single most
+                    # common image a user has. The cap existed because the bytes
+                    # were base64'd into a JSON field, which inflates by 33%: a 5MB
+                    # photo became a ~6.7MB JSON string held entirely in memory on
+                    # both ends.
+                    #
+                    # /api/file/raw already streams with the right Content-Type and
+                    # is what video, audio, downloads and ebook covers use. Images
+                    # were the lone holdout. Small ones keep the inline data_url —
+                    # it renders instantly and is what the offline IDB cache stores
+                    # — and anything larger gets a raw_url the browser fetches
+                    # itself, which also gets progressive rendering and HTTP caching
+                    # for free.
                     mime = IMAGE_MIMES[ext]
-                    data_url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
-                    return self._json({"path": str(p), "is_image": True, "data_url": data_url, "mime": mime})
+                    _sz = p.stat().st_size
+                    _out = {"path": str(p), "is_image": True, "mime": mime, "size": _sz}
+                    if _sz <= _IMG_INLINE_MAX:
+                        _out["data_url"] = (f"data:{mime};base64,"
+                                            f"{base64.b64encode(p.read_bytes()).decode()}")
+                    else:
+                        _out["raw_url"] = "/api/file/raw?path=" + urllib.parse.quote(str(p))
+                    return self._json(_out)
                 if ext == ".pdf":
                     raw = p.read_bytes()
                     if len(raw) > 10_000_000:
