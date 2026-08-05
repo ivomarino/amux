@@ -13369,6 +13369,104 @@ def _item_by_id(bid: str) -> dict | None:
     return item
 
 
+# ── ONE scope contract for every scopable capability ─────────────────────────
+# Ethan, 2026-08-05: "consistent UX that allows us to configure the attributes for
+# global, group level and worker level across the different capabilities like
+# memory, board column, gates, etc."
+#
+# A consistent UX needs a consistent MODEL first. Today each capability has its
+# own storage (session_gates table, .env files, memory .md files, the prefs
+# table) AND its own layer order — gates resolve card > type > worker > group >
+# global, while memory and env go global > group > worker. A single screen
+# rendered over four incompatible backends is four screens wearing a trenchcoat,
+# and it would have to either flatten the orders (a lie) or expose them
+# inconsistently (the thing this is meant to fix).
+#
+# So: one descriptor per capability, naming where it is stored, which levels it
+# accepts, and its OWN declared order. The UI renders the same widget for every
+# row and never has to know the difference; a capability that does not support a
+# level says so instead of silently ignoring a write.
+_SCOPE_CAPS = [
+    {"key": "memory",  "label": "Memory",
+     "levels": ["global", "group", "worker"], "kind": "text",
+     "order": ["global", "group", "worker"], "merge": "concat",
+     "explain": "/api/sessions/{worker}/memory-explain"},
+    {"key": "rules",   "label": "Rules (binding)",
+     "levels": ["global", "group", "worker"], "kind": "text",
+     "order": ["global", "group", "worker"], "merge": "concat",
+     "explain": "/api/sessions/{worker}/memory-explain"},
+    {"key": "env",     "label": "Environment",
+     "levels": ["global", "group", "worker"], "kind": "keys",
+     "order": ["global", "group", "worker"], "merge": "merge-by-key",
+     "explain": "/api/sessions/{worker}/env-explain"},
+    {"key": "gates",   "label": "Board gates",
+     "levels": ["global", "group", "worker"], "kind": "list-per-status",
+     # card and type outrank all three and are NOT settable here: they are
+     # intrinsic to a card, not to a scope. Saying so beats a UI that offers a
+     # control which the resolver will silently outrank.
+     "order": ["global", "group", "worker", "type", "card"], "merge": "replace",
+     "explain": "/api/board/gate?item={id}&status={status}"},
+    {"key": "status_mode", "label": "Status availability",
+     "levels": ["global", "group", "worker"], "kind": "mode",
+     "order": ["global", "group", "worker"], "merge": "replace",
+     "explain": "/api/board/status-scope?session={worker}"},
+]
+
+
+def _scope_read(level: str, name: str) -> dict:
+    """What is set AT this level, for every capability — the uniform read behind
+    one configuration surface. Reports each capability even when unset, because
+    "nothing is set here" is the answer a configuration screen most needs and a
+    view listing only what it found cannot say it."""
+    out = {"level": level, "name": name, "capabilities": []}
+    for cap in _SCOPE_CAPS:
+        row = {k: cap[k] for k in ("key", "label", "kind", "order", "merge")}
+        row["supported"] = level in cap["levels"]
+        row["value"] = None
+        row["set_here"] = False
+        try:
+            if not row["supported"]:
+                pass
+            elif cap["key"] in ("memory", "rules"):
+                suf = ".rules.md" if cap["key"] == "rules" else ".md"
+                f = (CC_MEMORY / ("_rules.md" if cap["key"] == "rules" else "_global.md")
+                     if level == "global" else
+                     CC_MEMORY / "tags" / f"{name}{suf}" if level == "group" else
+                     CC_MEMORY / f"{name}{suf}")
+                row["value"] = {"path": str(f), "bytes": f.stat().st_size if f.exists() else 0}
+                row["set_here"] = f.exists() and f.stat().st_size > 0
+            elif cap["key"] == "env":
+                f = (CC_AMUX_ENV if level == "global" else
+                     CC_HOME / "env" / f"{name}.env" if level == "group" else
+                     CC_SESSIONS / f"{name}.env")
+                keys = sorted(parse_env_file(f).keys()) if f.exists() else []
+                row["value"] = {"path": str(f), "keys": keys}
+                row["set_here"] = bool(keys)
+            elif cap["key"] == "gates":
+                if level == "global":
+                    g = {s["id"]: s.get("gate") or [] for s in _load_board_statuses()}
+                else:
+                    key = ("group:" + name) if level == "group" else name
+                    g = _load_session_gates().get(key, {}) or {}
+                row["value"] = {k: v for k, v in g.items() if v}
+                row["set_here"] = bool(row["value"])
+            elif cap["key"] == "status_mode":
+                if level == "global":
+                    row["value"] = {s["id"]: (s.get("mode") or "implicit")
+                                    for s in _load_board_statuses()}
+                    row["set_here"] = any(v == "explicit" for v in row["value"].values())
+                else:
+                    sc = _load_status_scope()
+                    lv = "tag" if level == "group" else "session"
+                    row["value"] = sorted(st for st, d in sc.items()
+                                          if name in (d.get(lv) or set()))
+                    row["set_here"] = bool(row["value"])
+        except Exception as e:
+            row["error"] = str(e)[:120]
+        out["capabilities"].append(row)
+    return out
+
+
 def _gate_layers(item, target_status: str) -> list:
     """EVERY scope layer's contribution to this transition, not just the winner.
 
@@ -62715,6 +62813,32 @@ class CCHandler(BaseHTTPRequestHandler):
             return self._json({"note": "last reason auto-pickup declined, per lane",
                                "wip_cap": int(os.environ.get("AMUX_MAX_DOING_PER_SESSION", "1") or 1),
                                "lanes": _out})
+
+        # GET /api/scope?level=global|group|worker&name=<x> — the uniform
+        # read behind one configuration surface (Ethan, 2026-08-05). Same
+        # shape for every capability, so the UI renders one widget per row
+        # and never has to know that gates live in SQLite while memory lives
+        # in a file. `levels`/`supported` are explicit so a capability that
+        # does not accept a level SAYS SO, rather than the UI offering a
+        # control whose write is silently ignored or outranked.
+        if path == "/api/scope":
+            _lv = (qs.get("level", ["global"])[0] or "global").strip()
+            _nm = (qs.get("name", [""])[0] or "").strip()
+            if _lv not in ("global", "group", "worker"):
+                return self._json({"error": "level must be global, group or worker"}, 400)
+            if _lv != "global" and not _nm:
+                return self._json({"error": f"name required for level={_lv}"}, 400)
+            _out = _scope_read(_lv, _nm)
+            if _lv == "worker":
+                _out["groups"] = _session_tags_of(_nm)
+            elif _lv == "group":
+                _out["members"] = sorted(
+                    s["name"] for s in list_sessions()
+                    if not s.get("archived") and _nm in (s.get("tags") or []))
+            else:
+                _out["groups"] = sorted({t for s in list_sessions()
+                                         for t in (s.get("tags") or [])})
+            return self._json(_out)
 
         if method == "GET" and path == "/api/debug/context":
             # Fleet view of what amux injects vs what gets READ (AMUX-2336).
