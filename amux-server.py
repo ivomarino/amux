@@ -29371,6 +29371,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
+    <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this session"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
@@ -29559,6 +29560,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="peek-tasks-list" id="peek-issues-list"></div>
   </div>
 
+  <div id="peek-scope-panel" class="peek-tasks-panel" style="padding:10px;gap:0;overflow-y:auto;">
+    <div id="peek-scope-body" style="font-size:0.82rem;color:var(--dim);">Loading&hellip;</div>
+  </div>
   <div id="peek-messages-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
       <input type="search" id="peek-messages-search" placeholder="Search messages sent to this session&hellip;" oninput="_peekMessagesRender()"
@@ -34380,6 +34384,86 @@ async function loadPeekTranscript(showLoading) {
   }
 }
 
+// ── Scope tab: what this worker operates under, and which layer set it ──────
+// Ethan: "a very easy way in the user experience to understand each of these
+// scoped characteristics." The provenance existed across five API surfaces and
+// nobody opens five surfaces to answer one question.
+//
+// Renders each capability with ITS OWN declared order rather than one flattened
+// chain — gates resolve card > type > worker > group > global while memory and
+// env go global > group > worker, and pretending they share an order would be a
+// lie the UI tells confidently. The server sends the order per capability.
+async function _scopeLoad() {
+  const el = document.getElementById('peek-scope-body');
+  if (!el || !peekSession) return;
+  const w = peekSession;
+  el.textContent = 'Loading\u2026';
+  try {
+    const r = await fetch(API + '/api/scope?level=worker&name=' + encodeURIComponent(w),
+                          { headers: _authHeaders() });
+    if (!r.ok) throw new Error('scope ' + r.status);
+    const d = await r.json();
+    const groups = d.groups || [];
+    // Fetch the levels this worker inherits from, so a row can show WHERE a
+    // value actually comes from rather than only whether it is set here.
+    const [gl, ...grp] = await Promise.all([
+      fetch(API + '/api/scope?level=global', { headers: _authHeaders() }).then(x => x.json()).catch(() => null),
+      ...groups.map(g => fetch(API + '/api/scope?level=group&name=' + encodeURIComponent(g),
+        { headers: _authHeaders() }).then(x => x.json()).catch(() => null)),
+    ]);
+    const byKey = (o) => Object.fromEntries((o && o.capabilities || []).map(c => [c.key, c]));
+    const G = byKey(gl), Gr = grp.map(byKey);
+    const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const sum = (c) => {
+      const v = c && c.value;
+      if (!v) return '\u2014';
+      // Array check FIRST: an empty list is [] and `v.keys` on it is undefined,
+      // but the object branch below rendered it as "0 keys" — a keyed summary
+      // for something that has no keys, which reads as a real but empty setting
+      // rather than an unset one. Order the branches by specificity.
+      if (Array.isArray(v)) return v.length ? v.join(', ') : '\u2014';
+      if (v.keys) return v.keys.length + ' key' + (v.keys.length === 1 ? '' : 's');
+      if (typeof v.bytes === 'number') return v.bytes ? v.bytes + ' bytes' : '\u2014';
+      if (typeof v === 'object') { const k = Object.keys(v).filter(x => v[x] && v[x].length); return k.length ? k.join(', ') : '\u2014'; }
+      return String(v);
+    };
+    let h = '<div style="margin-bottom:10px;color:var(--text);font-size:0.86rem;">'
+          + '<b>' + esc(w) + '</b> \u00b7 groups: '
+          + (groups.length ? groups.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ') : '<i>none</i>')
+          + '</div>';
+    d.capabilities.forEach((c, i) => {
+      const here = c.set_here, gset = G[c.key] && G[c.key].set_here;
+      const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
+      // Which layer actually supplies it, following this capability's own order.
+      let src = 'unset', srcC = 'var(--dim)';
+      if (here) { src = 'worker'; srcC = 'var(--accent)'; }
+      else if (grpHit.length) { src = 'group:' + grpHit[0]; srcC = '#d29922'; }
+      else if (gset) { src = 'global'; srcC = 'var(--dim)'; }
+      h += '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:7px;background:var(--card);">'
+        + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">'
+        + '<span style="color:var(--text);font-weight:600;font-size:0.84rem;">' + esc(c.label) + '</span>'
+        + '<span style="font-size:0.7rem;color:' + srcC + ';">from ' + esc(src) + '</span></div>'
+        + '<div style="font-size:0.78rem;margin-top:3px;">' + esc(sum(c)) + '</div>'
+        // The layers that did NOT win are the answer to "why does this worker
+        // differ from that one" — showing only the winner cannot express it.
+        + '<div style="font-size:0.68rem;color:var(--dim);margin-top:4px;">'
+        + (c.order || []).map(l => {
+            const on = (l === 'worker' && here) || (l === 'group' && grpHit.length) || (l === 'global' && gset);
+            return '<span style="opacity:' + (on ? '1' : '0.38') + ';">' + esc(l) + '</span>';
+          }).join(' <span style="opacity:0.3;">&rsaquo;</span> ')
+        + ' <span style="opacity:0.5;">\u00b7 ' + esc(c.merge) + '</span>'
+        + (c.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at worker level</span>')
+        + '</div></div>';
+    });
+    h += '<div style="font-size:0.68rem;color:var(--dim);margin-top:8px;">'
+      + 'Each capability shows its OWN precedence order \u2014 they genuinely differ. '
+      + 'Dimmed levels have nothing set. Read-only for now.</div>';
+    el.innerHTML = h;
+  } catch (e) {
+    el.textContent = 'Could not load scope: ' + e.message;
+  }
+}
+
 function setPeekTab(tab) {
   _peekTab = tab;
   // Flush peek notes save when switching away
@@ -34394,6 +34478,10 @@ function setPeekTab(tab) {
   document.getElementById('peek-tab-messages').classList.toggle('active', tab === 'messages');
   document.getElementById('peek-tab-cost').classList.toggle('active', tab === 'cost');
   document.getElementById('peek-tab-issues').classList.toggle('active', tab === 'issues');
+  document.getElementById('peek-tab-scope').classList.toggle('active', tab === 'scope');
+  const scopePanel = document.getElementById('peek-scope-panel');
+  if (tab === 'scope') { scopePanel.classList.add('active'); _scopeLoad(); }
+  else { scopePanel.classList.remove('active'); }
   document.getElementById('peek-tab-memory').classList.toggle('active', tab === 'memory');
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
@@ -35500,7 +35588,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.450';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.451';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57008,7 +57096,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.450';
+const CACHE = 'amux-v0.9.451';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
