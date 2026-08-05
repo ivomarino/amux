@@ -1201,6 +1201,49 @@ _ILOG_MAX = 200_000          # rows kept; ~weeks of fleet activity
 _ILOG_BLOB_CAP = 4000        # per-field cap so one huge eval cannot bloat the table
 _ilog_seq_lock = threading.Lock()
 
+_depr_hits: dict = {}          # old-name usage since boot (AMUX-2352)
+_depr_last_report = [0.0]
+
+
+def _hdr_worker(headers) -> str:
+    """The calling worker's identity, from either header spelling (AMUX-2352).
+
+    X-Amux-Worker is canonical; X-Amux-Session still works and is COUNTED, so
+    the old header can be retired on evidence rather than on a guess about who
+    has migrated. Every attribution path — board writes, sends, schedules, env
+    mutations, the staged-guard — goes through this, so neither spelling can
+    silently produce an unattributed write.
+    """
+    try:
+        w = (headers.get("X-Amux-Worker", "") or "").strip()
+        if w:
+            return w
+        old = (headers.get("X-Amux-Session", "") or "").strip()
+        if old:
+            _depr_hits["header"] = _depr_hits.get("header", 0) + 1
+        return old
+    except Exception:
+        return ""
+
+
+def _depr_report():
+    """Report old-name usage periodically. A counter nobody reads is the same as
+    no counter (ethos rule 4) — the point is to know when /api/sessions and
+    X-Amux-Session have actually stopped being called, not to accumulate a number
+    in memory that dies with the process."""
+    try:
+        now = time.time()
+        if now - _depr_last_report[0] < 3600 or not _depr_hits:
+            return
+        _depr_last_report[0] = now
+        snap = dict(_depr_hits)
+        _depr_hits.clear()
+        _ilog("deprecation", "old_names_used", actor="amux", ok=True, detail=snap)
+        slog(f"[deprecation] old session/tag names used in the last hour: {snap}")
+    except Exception:
+        pass
+
+
 def _ilog(kind, action, actor="", target="", url="", detail=None,
           before=None, result=None, ok=True, ms=0):
     """Record one interaction. Best-effort: logging must never break the action.
@@ -12598,7 +12641,7 @@ def _caller_scope(headers):
     unscoped (Ethan tag-isolation policy, 2026-08-02): a session sees only
     same-tag sessions and same-tag board cards; an untagged session sees only
     itself and its own cards. The dashboard (no X-Amux-Session) sees all."""
-    name = (headers.get("X-Amux-Session") or "").strip()
+    name = _hdr_worker(headers)
     if not name:
         return (False, set(), "")
     try:
@@ -19930,6 +19973,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                     ["tmux", "new-session", "-d", "-s", tmux_sess, "-n", name, "-c", work_dir,
                      "-x", str(_TMUX_COLS), "-y", str(_TMUX_ROWS),
                      "-e", "TMUX_SESSION_NAME=" + name,
+                     # Both spellings exported (AMUX-2352). AMUX_WORKER is
+                     # canonical; AMUX_SESSION stays because the CLI, both git
+                     # hooks, the commit-msg trailer, the destroy guard and every
+                     # curl recipe in every CLAUDE.md read it today. Dropping it
+                     # would break all of them on the next worker start.
+                     "-e", "AMUX_WORKER=" + name,
                      "-e", "AMUX_SESSION=" + name,
                      "-e", ("AMUX_URL=http" if "--no-tls" in sys.argv else "AMUX_URL=https") + "://localhost:8822",
                      *_env_args,
@@ -58080,6 +58129,27 @@ class CCHandler(BaseHTTPRequestHandler):
             _server_request_count += 1
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        # ── worker/group aliases (AMUX-2352) ─────────────────────────────────
+        # /api/workers* is the canonical spelling; /api/sessions* keeps working.
+        # Done as ONE rewrite here rather than 144 route edits: every handler
+        # below still matches the old path, so there is no second set of routes
+        # to drift out of sync — the failure mode that produced two CLI copies,
+        # two gate resolvers and three message renderers this week.
+        #
+        # Additive on purpose. 40+ workers, the installed git hooks, the CLI and
+        # the mobile app all speak the old names right now; a hard rename would
+        # break every one of them on the same restart.
+        if path.startswith("/api/workers"):
+            path = "/api/sessions" + path[len("/api/workers"):]
+        elif path.startswith("/api/groups"):
+            path = "/api/tags" + path[len("/api/groups"):]
+        else:
+            # Count OLD-name traffic so retirement is driven by MEASURED zero
+            # usage rather than a guess about who has migrated. Sampled: this
+            # runs on every request and an ilog row per call would bury the
+            # ledger that makes it readable.
+            if path.startswith("/api/sessions"):
+                _depr_hits["api"] = _depr_hits.get("api", 0) + 1
         qs = parse_qs(parsed.query)
         self._resp_status = 200
         t0 = time.monotonic()
@@ -58130,7 +58200,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 # Attribution: which principal acted. An agent session's verified
                 # header wins; a cloud human is the gateway-stamped email. Never
                 # trust body claims here (AMUX-1768 provenance principle).
-                actor = (self.headers.get("X-Amux-Session", "").strip()
+                actor = (_hdr_worker(self.headers).strip()
                          or self.headers.get("X-Amux-User-Email", "").strip())
                 # Payloads: always for mutations, and for any FAILED request —
                 # a 500 with no body is the case you most want to expand. Plain
@@ -58290,7 +58360,7 @@ class CCHandler(BaseHTTPRequestHandler):
             # origin = the SERVER-VERIFIED sender (tmux identity via X-Amux-Session);
             # body 'session' is only the CLAIMED origin. The ledger records both so a
             # safety-critical alert's provenance is first-hand verifiable (AMUX-1795).
-            _origin = (self.headers.get("X-Amux-Session", "") or "").strip()[:64]
+            _origin = _hdr_worker(self.headers)[:64]
             return self._json(_send_urgent_alert(
                 body.get("message", ""), body.get("session", ""), body.get("reason", ""),
                 origin=_origin))
@@ -59576,7 +59646,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     added = [nm]
                 reg.parent.mkdir(parents=True, exist_ok=True)
                 reg.write_text(json.dumps({"mcpServers": cur}, indent=2) + "\n")
-                _ilog("mcp", "import", actor=self.headers.get("X-Amux-Session", "") or "human",
+                _ilog("mcp", "import", actor=_hdr_worker(self.headers) or "human",
                       target="registry", detail={"added": added})
                 # Running sessions launched with the OLD file. Say so rather than
                 # implying a live change — the flag is read once, at start.
@@ -59599,7 +59669,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     return self._json({"error": "not found"}, 404)
                 srv.pop(nm)
                 reg.write_text(json.dumps({"mcpServers": srv}, indent=2) + "\n")
-                _ilog("mcp", "delete", actor=self.headers.get("X-Amux-Session", "") or "human",
+                _ilog("mcp", "delete", actor=_hdr_worker(self.headers) or "human",
                       target="registry", detail={"removed": nm})
                 return self._json({"ok": True, "removed": nm, "servers": sorted(srv.keys())})
             except Exception as e:
@@ -61216,7 +61286,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 # deliberately unassigned card — is always respected, and the
                 # header-less dashboard path is unchanged.
                 if "session" not in body:
-                    session = (self.headers.get("X-Amux-Session", "") or "").strip()[:64]
+                    session = _hdr_worker(self.headers)[:64]
                 prefix = _prefix_from_session(session)
                 item_id = _next_issue_id(prefix)
                 now = int(time.time())
@@ -61234,7 +61304,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 # on GV-620: a session's raw curl left creator empty). No ip:
                 # fallback here — creator is a display field, not an audit row.
                 creator = (body.get("creator") or "").strip()[:64]
-                _chdr = (self.headers.get("X-Amux-Session", "") or "").strip()[:64]
+                _chdr = _hdr_worker(self.headers)[:64]
                 if _chdr and creator and _chdr != creator:
                     creator = f"{_chdr} (claimed {creator})"
                 elif not creator:
@@ -61447,7 +61517,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     st_id = str(body.get("status") or "").strip()
                     if not st_id:
                         return self._json({"error": "status required"}, 400)
-                    _actor = ((self.headers.get("X-Amux-Session", "") or "").strip()
+                    _actor = (_hdr_worker(self.headers)
                               or (self.headers.get("X-Amux-User-Email", "") or "").strip())
                     db = get_db()
                     # Mode change (global layer).
@@ -61617,7 +61687,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 if not it:
                     return self._json({"error": "item not found"}, 404)
                 sess = (it.get("session") or "").strip()
-                requester = (self.headers.get("X-Amux-Session", "")
+                requester = (_hdr_worker(self.headers)
                              or self.headers.get("X-Amux-User-Email", "") or "Ethan").strip()
                 if not sess:
                     return self._json({"ok": False, "delivered": False,
@@ -61662,7 +61732,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 txt = (body.get("text") or "").strip()[:1200]
                 if not txt:
                     return self._json({"error": "text required"}, 400)
-                actor = (self.headers.get("X-Amux-Session", "") or "session").strip()
+                actor = (_hdr_worker(self.headers) or "session").strip()
                 _append_board_log(bid, f"STATUS ({actor}): {txt}")
                 _ilog("board", "status_update", actor=actor, target=bid, detail={"text": txt}, ok=True)
                 return self._json({"ok": True, "id": bid})
@@ -61904,7 +61974,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         _rev = (gate_item.get("reviewer") or "").strip()
                         if (_rev and new_status in ("done", "verified")
                                 and not body.get("force")):
-                            _acker = (self.headers.get("X-Amux-Session", "") or "").strip()
+                            _acker = _hdr_worker(self.headers)
                             if _acker != _rev:
                                 return self._json({
                                     "error": "review sign-off required from the reviewer",
@@ -61940,7 +62010,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         _dest_new = _status_canon(body.get("status") or "") if "status" in body else ""
                         _is_destructive = (_dest_new == "discarded"
                                            or bool(body.get("archived")))
-                        _caller_sess = (self.headers.get("X-Amux-Session", "") or "").strip()
+                        _caller_sess = _hdr_worker(self.headers)
                         _caller_human = (self.headers.get("X-Amux-User-Email", "") or "").strip()
                         _owner = (gate_item.get("session") or "").strip()
                         # The human exemption is honoured ONLY when there is no
@@ -62001,7 +62071,7 @@ class CCHandler(BaseHTTPRequestHandler):
                                                    f"on the authority of {_auth} "
                                                    f"(by {_caller_sess or _caller_human or 'unattributed'})")
                         if body.get("force") and not (
-                                (self.headers.get("X-Amux-Session", "") or "").strip()
+                                _hdr_worker(self.headers)
                                 or (self.headers.get("X-Amux-User-Email", "") or "").strip()):
                             # ATTRIBUTION IS REQUIRED FOR FORCE (ts-gke incident,
                             # 2026-08-03). TG-3104 — a live watch card, re-armed an
@@ -62242,7 +62312,7 @@ class CCHandler(BaseHTTPRequestHandler):
                                              "due", "due_time", "pinned", "archived")
                             _chg = {k: updated_item.get(k) for k in _AUDIT_FIELDS
                                     if k in body and _audit_prior.get(k) != updated_item.get(k)}
-                            _actor = (self.headers.get("X-Amux-Session", "")
+                            _actor = (_hdr_worker(self.headers)
                                       or self.headers.get("X-Amux-User-Email", "")
                                       or "unattributed")
                             if _chg:
@@ -62984,6 +63054,13 @@ class CCHandler(BaseHTTPRequestHandler):
             _ceil = [r for r in _with if r["index"].get("over_ceiling")]
             _manual = [r for r in _with if r["index"].get("needs_manual_attention")]
             return self._json({
+                # Old-name usage since boot (AMUX-2352). Retirement of
+                # /api/sessions and X-Amux-Session should be driven by this
+                # reading zero across a full fleet cycle, not by a guess about
+                # who has migrated. Surfaced here as well as in the hourly
+                # report, so it is readable NOW rather than only in a log line
+                # that fires on a schedule.
+                "deprecated_name_hits": dict(_depr_hits),
                 "read_limit_lines": _MEM_READ_LIMIT,
                 "sessions": len(_rows),
                 "with_index": len(_with),
@@ -63219,7 +63296,7 @@ class CCHandler(BaseHTTPRequestHandler):
         if path == "/api/git/staged-guard" and method == "POST":
             body = self._read_body()
             # Server-verified origin wins over the claimed body session.
-            origin = (self.headers.get("X-Amux-Session", "") or "").strip()[:64]
+            origin = _hdr_worker(self.headers)[:64]
             session = origin or str(body.get("session", "")).strip()[:64]
             wd = str(body.get("dir", "")).strip()
             paths = body.get("paths") if isinstance(body.get("paths"), list) else []
@@ -63431,7 +63508,7 @@ class CCHandler(BaseHTTPRequestHandler):
             return self._json({"panes": panes})
 
         if method == "GET" and path == "/api/sessions/self":
-            sname = qs.get("session", [None])[0] or self.headers.get("X-Amux-Session", "")
+            sname = qs.get("session", [None])[0] or _hdr_worker(self.headers)
             if not sname:
                 return self._json({"error": "session param required"}, 400)
             sessions = list_sessions()
@@ -67023,7 +67100,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _orig_text = text
                 _origin = ""
                 if _defer_busy:
-                    _origin = (self.headers.get("X-Amux-Session", "")
+                    _origin = (_hdr_worker(self.headers)
                                or str(body.get("source_session") or "")).strip()[:64]
                     if _origin and _origin != name:
                         text = (f"[amux-origin: {_origin} — server-verified from the sender's session "
@@ -69164,6 +69241,7 @@ def main():
     schedule_job(_steering_fast_tick,    interval=2,                    name="steering_fast", initial_delay=8)
     schedule_job(_index_token_ledger,    interval=60,                   name="token_ledger",  initial_delay=12)
     schedule_job(_ilog_prune,            interval=3600,                 name="ilog_prune",    initial_delay=300)
+    schedule_job(_depr_report,           interval=3600,                 name="depr_report",   initial_delay=600)
     # initial_delay is deliberately SHORT. This file live-reloads on save and is a
     # shared checkout — observed restarting every ~2 minutes while several sessions
     # were editing it. Every restart resets initial_delay, so a long one on a busy
