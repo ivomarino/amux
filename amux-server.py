@@ -16567,6 +16567,12 @@ def _live_conv_id(name: str, work_dir: str = "") -> str:
 
 _GLOBAL_MEM_FILE = CC_MEMORY / "_global.md"
 _MEM_MARKER = "<!-- amux:session-memory -->"
+# Marks a line THIS composer emitted, so _capture_claude_memory_changes never
+# rescues it back into the session's own store (AMUX-2315). The topic pointer
+# had this exact bug and was fixed by name-matching one string; the tag pointer
+# then reproduced it verbatim, because a per-line special case does not cover
+# the NEXT composed line. Structural marker, not another special case.
+_MEM_COMPOSED_TAG = "<!-- amux:composed -->"
 # Topic file holding the shared amux-API block, written beside MEMORY.md. Keeps
 # ~239 lines of call shapes OUT of a 200-line-limited index (see _compose_memory).
 _MEM_TOPIC_FILE = "amux-api.md"
@@ -17289,7 +17295,79 @@ concise message. Don't batch multiple tasks into one commit.
 """
 
 
-def _compose_memory(global_content: str, session_content: str) -> str:
+def _session_tags_of(name: str) -> list:
+    """A session's tags, in DECLARED ORDER (CC_TAGS is ordered, and that order
+    is the documented tie-break when two tags supply conflicting values —
+    AMUX-2311)."""
+    try:
+        cfg = parse_env_file(CC_SESSIONS / f"{name}.env")
+        return [t.strip() for t in (cfg.get("CC_TAGS", "") or "").split(",") if t.strip()]
+    except Exception:
+        return []
+
+
+def _memory_layers(name: str) -> list:
+    """Every memory/rules layer for `name`, least specific first.
+
+    ONE resolver, called by every consumer (AMUX-2315). Memory used to be
+    composed in two hand-maintained places — _write_provider_memory and, again
+    verbatim, the session launch path — so a layer added to one silently did not
+    exist in the other. That is the same defect as the two CLIs (AMUX-2325) and
+    the two gate resolvers (AMUX-2330): two implementations of one rule diverge,
+    and each looks correct alone.
+
+    Adds the TAG layer Ethan asked for: global -> tag -> session, matching the
+    scope order designed on AMUX-2311.
+
+    `kind` separates RULES from MEMORY, which is the second half of the ask:
+    memory is prose a model may act on; rules are constraints it must. They are
+    different contracts, so they compose into different sections — rules first,
+    under a heading that says they are binding.
+
+    Returns dicts so the diagnostic can report provenance without re-deriving
+    any of this: {layer, kind, path, exists, bytes, text}.
+    """
+    out = []
+
+    def _add(layer: str, kind: str, path):
+        try:
+            txt = path.read_text(errors="replace").strip() if path.exists() else ""
+        except Exception:
+            txt = ""
+        out.append({"layer": layer, "kind": kind, "path": str(path),
+                    "exists": bool(txt), "bytes": len(txt), "text": txt})
+
+    _add("global", "rules", CC_MEMORY / "_rules.md")
+    for t in _session_tags_of(name):
+        _add(f"tag:{t}", "rules", CC_MEMORY / "tags" / f"{t}.rules.md")
+    _add(f"session:{name}", "rules", CC_MEMORY / f"{name}.rules.md")
+    _add("global", "memory", _GLOBAL_MEM_FILE)
+    for t in _session_tags_of(name):
+        _add(f"tag:{t}", "memory", CC_MEMORY / "tags" / f"{t}.md")
+    _add(f"session:{name}", "memory", CC_MEMORY / f"{name}.md")
+    return out
+
+
+def _compose_rules_block(layers: list) -> str:
+    """The binding section. Rules are labelled with the layer that set them, so
+    a session can see WHY it is constrained without reading source — and so can
+    whoever is debugging it (the GEMINI.md that told a lane to bypass gates was
+    invisible for exactly this reason)."""
+    rules = [l for l in layers if l["kind"] == "rules" and l["exists"]]
+    if not rules:
+        return ""
+    body = "\n\n".join(f"<!-- from {l['layer']} -->\n{l['text']}" for l in rules)
+    return ("# Rules — binding\n\n"
+            "These are constraints, not notes. They are composed from your scope "
+            "(global, then any tags, then this session); a more specific layer adds "
+            "to the ones above it rather than replacing them. If a rule here "
+            "conflicts with something you infer, the rule wins — and if a rule "
+            "cannot be followed honestly, say so rather than working around it.\n\n"
+            + body)
+
+
+def _compose_memory(global_content: str, session_content: str,
+                    layers: list | None = None) -> str:
     """Compose the MEMORY.md index: a POINTER to shared context, then session memory.
 
     The shared block used to be inlined above the marker. It is ~239 lines, and
@@ -17311,6 +17389,33 @@ def _compose_memory(global_content: str, session_content: str) -> str:
         parts.append(f"- [amux inter-session API]({_MEM_TOPIC_FILE}) — "
                      f"sessions/peek/send, board, notes, CRM, browser, Drive. Read it when you "
                      f"need the call shapes; it is also in ~/.claude/CLAUDE.md.")
+    # Scoped layers for Claude lanes too (AMUX-2315) — Ethan asked for
+    # global/tag/session memory, and most lanes are Claude.
+    #
+    # RULES are INLINED above the marker: they are binding, and a constraint
+    # behind a pointer is one the model has to choose to go read.
+    # TAG MEMORY gets a POINTER, not an inline dump — the shared block was moved
+    # out of this index precisely because it blew the 200-line read limit (201 of
+    # 215 indexes over it, median 241 lines of which 240 was preamble). Inlining a
+    # second unbounded layer here would rebuild that exact failure.
+    #
+    # Everything added here sits ABOVE _MEM_MARKER, and that is NOT sufficient on
+    # its own: _capture_claude_memory_changes also RESCUES index-shaped lines from
+    # above the marker, so composed pointers get captured into the session's own
+    # store and re-emitted forever. Observed: deleting a tag file left its pointer
+    # in MEMORY.md because the pointer had already been rescued into session
+    # memory. Composed lines therefore carry _MEM_COMPOSED_TAG and the rescue
+    # skips them.
+    if layers:
+        _r = _compose_rules_block(layers)
+        if _r:
+            parts.append(_r)
+        for _l in layers:
+            if _l["kind"] == "memory" and _l["layer"].startswith("tag:") and _l["exists"]:
+                parts.append(f"- [{_l['layer']} memory]({Path(_l['path']).name}) — "
+                             f"shared by every session tagged `{_l['layer'][4:]}` "
+                             f"({_l['bytes']} bytes). Read it when acting in that scope."
+                             f" {_MEM_COMPOSED_TAG}")
     parts.append(_MEM_MARKER)
     if session_content.strip():
         parts.append(session_content.strip())
@@ -17351,6 +17456,7 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
             # it every cycle.
             _orphans = [l.rstrip() for l in _above.splitlines()
                         if _MEM_ENTRY_RE.match(l) and _MEM_TOPIC_FILE not in l
+                        and _MEM_COMPOSED_TAG not in l
                         and l.strip() not in _gl and l.strip() not in session_part]
             if _orphans:
                 # Full fidelity backup beside MEMORY.md: the shape filter is a
@@ -17389,7 +17495,7 @@ def _write_claude_memory(name: str, work_dir: str):
             session_content = folded
         except Exception:
             pass
-    composed = _compose_memory(global_content, session_content)
+    composed = _compose_memory(global_content, session_content, _memory_layers(name))
     claude_mem_dir = CLAUDE_HOME / "projects" / pname / "memory"
     claude_mem_file = claude_mem_dir / "MEMORY.md"
     try:
@@ -17404,6 +17510,14 @@ def _write_claude_memory(name: str, work_dir: str):
         _arch = CC_MEMORY / f"{name}.archive.md"
         if _arch.exists():
             (claude_mem_dir / _MEM_ARCHIVE_FILE).write_text(_arch.read_text(errors="replace"))
+        # Same rule for the tag layer: the index points at `<tag>.md`, so that
+        # file has to exist BESIDE MEMORY.md or the pointer is a dead link — and
+        # a pointer to a file the session cannot open is worse than no pointer,
+        # because it reads as available context. (Verify the mechanism, not just
+        # that the line renders.)
+        for _l in _memory_layers(name):
+            if _l["kind"] == "memory" and _l["layer"].startswith("tag:") and _l["exists"]:
+                (claude_mem_dir / Path(_l["path"]).name).write_text(_l["text"] + "\n")
         if claude_mem_file.is_symlink():
             claude_mem_file.unlink()
         claude_mem_file.write_text(composed)
@@ -17457,15 +17571,22 @@ def _write_provider_memory(name: str):
         _gmem_dir = CC_MEMORY / "gemini" / name
         try:
             _gmem_dir.mkdir(parents=True, exist_ok=True)
+            _layers = _memory_layers(name)
             parts = [_compose_provider_harness_instructions(name)]
-            _gmem_global = _GLOBAL_MEM_FILE.read_text(errors="replace").strip() if _GLOBAL_MEM_FILE.exists() else ""
-            if _gmem_global:
-                parts.append(_gmem_global)
-            _mem_src = CC_MEMORY / f"{name}.md"
-            if _mem_src.exists():
-                _s = _mem_src.read_text(errors="replace").strip()
-                if _s:
-                    parts.append("# Session Memory\n\n" + _s)
+            # Rules FIRST: they are binding, and a constraint buried under prose
+            # is a constraint the model has to go looking for.
+            _rules = _compose_rules_block(_layers)
+            if _rules:
+                parts.append(_rules)
+            for _l in _layers:
+                if _l["kind"] != "memory" or not _l["exists"]:
+                    continue
+                if _l["layer"] == "global":
+                    parts.append(_l["text"])
+                elif _l["layer"].startswith("tag:"):
+                    parts.append(f"# Memory — {_l['layer']}\n\n" + _l["text"])
+                else:
+                    parts.append("# Session Memory\n\n" + _l["text"])
             (_gmem_dir / "GEMINI.md").write_text("\n\n---\n\n".join(parts) + "\n")
         except Exception:
             pass
@@ -18654,17 +18775,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
             # know how to use the board, send messages, and work within amux.
             _gmem_dir = CC_MEMORY / "gemini" / name
             try:
-                _gmem_dir.mkdir(parents=True, exist_ok=True)
-                _gmem_parts = [_compose_provider_harness_instructions(name)]
-                _gmem_global = _GLOBAL_MEM_FILE.read_text(errors="replace").strip() if _GLOBAL_MEM_FILE.exists() else ""
-                if _gmem_global:
-                    _gmem_parts.append(_gmem_global)
-                _mem_src = CC_MEMORY / f"{name}.md"
-                if _mem_src.exists():
-                    _gmem_session = _mem_src.read_text(errors="replace").strip()
-                    if _gmem_session:
-                        _gmem_parts.append("# Session Memory\n\n" + _gmem_session)
-                (_gmem_dir / "GEMINI.md").write_text("\n\n---\n\n".join(_gmem_parts) + "\n")
+                # Call the ONE composer rather than repeating it (AMUX-2315).
+                # This block used to be a verbatim copy of _write_provider_memory,
+                # so the two drifted the moment either changed — a layer added to
+                # one applied on refresh but not at launch, or vice versa, and
+                # each path looked correct on its own.
+                _write_provider_memory(name)
             except Exception as _ge:
                 print(f"[start] {name}: gemini memory bridge failed: {_ge}")
             include_dirs = [str(CC_LOGS), str(_gmem_dir)]
@@ -65120,6 +65236,34 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             if action == "tasks":
                 # Claude Code's native task list (read-only) — the agent's live plan.
                 return self._json(_session_cc_tasks(name))
+            if action == "memory-explain":
+                # "Which rules is this session actually operating under, and from
+                # which layer?" — answerable without reading the composed file
+                # (AMUX-2315). Built first because the motivating incident was a
+                # composed GEMINI.md that told a lane to bypass gates, and nobody
+                # could see what any session was running under. Reports every
+                # layer including the EMPTY ones, because "the tag file you think
+                # is applying does not exist" is the answer you usually need, and
+                # a view that lists only what it found cannot express it.
+                _lyr = _memory_layers(name)
+                _full = (qs.get("full", ["0"])[0] or "") in ("1", "true", "yes")
+                _composed = CC_MEMORY / "gemini" / name / "GEMINI.md"
+                return self._json({
+                    "session": name,
+                    "provider": _session_provider(name),
+                    "tags": _session_tags_of(name),
+                    "layers": [{k: v for k, v in l.items() if k != "text" or _full}
+                               for l in _lyr],
+                    "rules_layers": [l["layer"] for l in _lyr
+                                     if l["kind"] == "rules" and l["exists"]],
+                    "memory_layers": [l["layer"] for l in _lyr
+                                      if l["kind"] == "memory" and l["exists"]],
+                    "empty_layers": [f"{l['kind']}:{l['layer']}" for l in _lyr
+                                     if not l["exists"]],
+                    "composed": {"path": str(_composed), "exists": _composed.exists(),
+                                 "bytes": (_composed.stat().st_size
+                                           if _composed.exists() else 0)},
+                })
             if action == "peek":
                 lines = int(qs.get("lines", ["80"])[0])
                 # live=1 → return ONLY the live tmux frame and skip the ~120KB JSONL
