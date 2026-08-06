@@ -8,6 +8,7 @@
 import base64
 import difflib
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -16009,6 +16010,8 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
     _edit_paths_cache[name] = (now, since_secs, out)
     return out
 
+
+_desc_stamp: dict = {}   # (worker, desc-hash) -> (card id, ts) — bulk-close detector
 
 _repo_root_memo: dict = {}
 
@@ -62530,6 +62533,39 @@ class CCHandler(BaseHTTPRequestHandler):
                             _actor = (_hdr_worker(self.headers)
                                       or self.headers.get("X-Amux-User-Email", "")
                                       or "unattributed")
+                            # BULK-CLOSE MISATTRIBUTION GUARD (reported by
+                            # tubescience, 2026-08-05). An end-of-turn sweep that
+                            # PATCHes every open card with ONE desc string makes
+                            # the ledger lie: TUBES-1410 carried 1409's outcome,
+                            # 1413/1414 carried 1412's. A reviewer then attributes
+                            # work to the wrong unit, and the board cannot tell a
+                            # specific outcome from a stamped one.
+                            #
+                            # That exact signature — same worker, same desc text,
+                            # different cards, seconds apart — has no legitimate
+                            # use: two cards with genuinely identical outcomes are
+                            # two cards that should have been one. Warn loudly
+                            # rather than reject: the write is not WRONG, it is
+                            # unlikely to be intended, and refusing it outright
+                            # would block a lane mid-sweep with no way to say
+                            # "yes, really".
+                            try:
+                                _d_new = (body.get("desc") or "").strip()
+                                if _d_new and len(_d_new) > 80:
+                                    _k = (_actor, hashlib.sha1(_d_new.encode()).hexdigest()[:12])
+                                    _seen = _desc_stamp.get(_k)
+                                    if _seen and _seen[0] != bid and (time.time() - _seen[1]) < 300:
+                                        slog(f"[board] DESC REUSE: '{_actor}' wrote the same "
+                                             f"desc onto {_seen[0]} and now {bid} within "
+                                             f"{int(time.time() - _seen[1])}s — is one of them "
+                                             f"carrying the other's outcome? (tubescience, "
+                                             f"bulk-close misattribution)")
+                                        _ilog("board", "desc_reuse", actor=_actor, target=bid,
+                                              ok=True, detail={"also_on": _seen[0],
+                                                               "secs_apart": int(time.time() - _seen[1])})
+                                    _desc_stamp[_k] = (bid, time.time())
+                            except Exception as _dre:
+                                slog(f"[board] desc-reuse check failed for {bid}: {_dre!r}")
                             if _chg:
                                 _ilog("board", "patch", actor=_actor, target=bid,
                                       detail=_chg,
