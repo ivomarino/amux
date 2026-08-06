@@ -930,15 +930,45 @@ def _write_compose(user_id, port):
     open(os.path.join(d, "litestream.yml"), "w").write(
         yml.replace("${USER_ID}", user_id))
 
+def _resolve_ctr(user_id):
+    """The workspace container's ACTUAL name, which is not always the expected one.
+
+    docker renames a container to `<shorthash>_<name>` when it recreates one whose
+    name is still held by another container. The prefix then sticks. On 2026-08-06
+    the admin workspace was running as
+    `3dabeb9214a6_amux-user-user_3AP4n5hreSZdTsJbhIt22Xv6LDh` and was perfectly
+    healthy, but `docker inspect amux-user-<id>` matched nothing, so
+    container_healthy() returned False on an empty stdout and the gateway served
+    the "Starting" page on every request, forever. Nothing recovers from that on
+    its own: the wake path starts a container that is already up, the health check
+    keeps missing it, and the user sees Starting or 502 indefinitely.
+
+    Falling back to a suffix match costs one extra subprocess ONLY on the path
+    where the exact name already failed — i.e. only when we are otherwise about to
+    be wrong. The suffix must be the full `amux-user-<id>` so sidecars
+    (`amux-litestream-user_<id>`, `amux-sync-…`, `amux-watchdog-…`) cannot match.
+    """
+    exact = f"amux-user-{user_id}"
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", exact],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return exact
+    r = subprocess.run(["docker", "ps", "-a", "--filter", f"name={exact}",
+                        "--format", "{{.Names}}"], capture_output=True, text=True)
+    for n in r.stdout.split():
+        if n == exact or n.endswith("_" + exact):
+            return n
+    return exact
+
 def container_running(user_id):
     r = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Running}}", f"amux-user-{user_id}"],
+        ["docker", "inspect", "-f", "{{.State.Running}}", _resolve_ctr(user_id)],
         capture_output=True, text=True)
     return r.stdout.strip() == "true"
 
 def container_healthy(user_id):
     r = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Health.Status}}", f"amux-user-{user_id}"],
+        ["docker", "inspect", "-f", "{{.State.Health.Status}}", _resolve_ctr(user_id)],
         capture_output=True, text=True)
     return r.stdout.strip() == "healthy"
 

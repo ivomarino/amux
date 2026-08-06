@@ -16,12 +16,27 @@ services:
     # A cap does not stop a container using too much; it makes that container the
     # thing that dies instead of the box. A dead workspace is a bug; a dead host is
     # an outage — the same reasoning already written on the watchdog below.
-    # 1.5g against an observed working set of ~160-185MB RSS per claude process
-    # (total-vm read ~5.9GB, which is reservation and mostly noise — RSS is the
-    # figure that matters). memswap_limit equal to mem_limit denies swap, so a
-    # runaway fails fast rather than thrashing the shared disk on its way down.
-    mem_limit: 1500m
-    memswap_limit: 1500m
+    # RAISED 1500m -> 3g the same day, because 1500m produced a DIFFERENT outage.
+    # The workspace sat pinned at 1.465GiB/1.465GiB (99.98%) with OOMKilled=false:
+    # it never exceeded the cap, so nothing was killed and nothing restarted. It
+    # just lived at the ceiling, reclaiming constantly, too slow to answer the 3s
+    # healthcheck — 78 consecutive failures, permanently "unhealthy", and the
+    # gateway served the Starting page / 502 to every request. Raising the cap
+    # live dropped it to 485MiB (15.79%) and it went healthy within 45s.
+    #
+    # So the steady state is ~485MB and the original sizing was not wrong about
+    # RSS; what it missed is a transient startup spike ABOVE 1.5g that the
+    # container could never complete while pinned. The failure mode is worth
+    # naming: a cap set just under a spike does not kill the container, it
+    # SUSPENDS it — which is harder to diagnose than an OOM kill, because there
+    # is no kill to find and the container looks up the whole time.
+    #
+    # 3g keeps the original property (a runaway workspace dies before the host
+    # does) with real headroom over the spike. Host is 7.9GB, so ~2 concurrent
+    # workspaces fit; the AC-231 herd-break means containers start on demand
+    # rather than all at boot, which is what makes that budget hold.
+    mem_limit: 3g
+    memswap_limit: 3g
     volumes:
       - root-home:/root
       - amux-data:/root/.amux
