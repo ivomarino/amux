@@ -17289,8 +17289,25 @@ def _session_is_blocked_not_idle(name: str) -> bool:
             "AND deleted IS NULL AND COALESCE(archived,0)=0 LIMIT 1", (name,)).fetchone()
         if actionable:
             return False
+        # `backlog` counts as PARKED here, and the reason is specific to this guard
+        # rather than a claim about backlog generally (amux, reviewing AC-240:
+        # 3 lanes — gtm-media-assets, mixpeek-autopilot, studio-plg — held only
+        # backlog cards and were still nudged to record work already recorded).
+        #
+        # This guard asks exactly one question: did this lane do work it never
+        # wrote down? A backlog card IS written down. Whether it is also
+        # *dispatchable* is a different question with a different answer, which is
+        # why the callers legitimately disagree — _advance_open_card selects
+        # ('todo','backlog') because both can be advanced, while the pickup sweep
+        # selects 'todo' only because backlog is deliberately not auto-claimed.
+        #
+        # Deliberately NOT unifying those into one shared constant. The sets differ
+        # by PURPOSE, not by accident; forcing one classification would either make
+        # pickup start claiming backlog or stop advance from touching it. A single
+        # definition would look tidier and be wrong in one of the two callers.
         parked = db.execute(
-            "SELECT 1 FROM issues WHERE session=? AND status IN ('needsyou','review','blocked') "
+            "SELECT 1 FROM issues WHERE session=? AND status IN "
+            "('needsyou','review','blocked','backlog') "
             "AND deleted IS NULL AND COALESCE(archived,0)=0 LIMIT 1", (name,)).fetchone()
         return bool(parked)
     except Exception:
