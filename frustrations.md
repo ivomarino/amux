@@ -605,3 +605,34 @@ NOTE: the rule against inline double-quoted text is already written down in CLAU
   was unwalkable from the audited path. Also the same habit-transfer failure ethos rule 7
   names: I had used --stdin correctly for `amux send` twice in this session and did not
   carry it to the adjacent verb.
+
+## Editing amux-server.py silently disables the guard that protects amux-server.py commits
+AREA: git
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-261
+SYMPTOM: `_has_cotenants` in the generated staged-guard hook does `except Exception:
+  return False`. When the amux server is unreachable the co-tenant check is skipped and
+  nothing is printed — output identical to "checked, you have no co-tenants". The server
+  re-execs on every save of `amux-server.py`, so editing that file is itself what makes the
+  server briefly unreachable. The file where a co-edit sweep is most likely on this shared
+  checkout is the one whose editing turns off the check for it.
+COST: `b1c3e93` swept ~93 lines of another session's uncommitted work (their
+  `_inherited_instruction_files` and memory-inherited handler) into my commit under my
+  message and my `Amux-Session` trailer, with no warning shown. Not recoverable by rewrite:
+  `git reset --soft HEAD~1` is the right tool and the shared-checkout guard correctly
+  refuses it, because moving shared HEAD decapitates other sessions' commits. So the peer
+  gets a disclosure and a misattributed commit instead of a clean history.
+FIX: `5865401` — the skip now announces itself, naming what was not checked and what to run
+  instead. Fail-open preserved deliberately: blocking every lane when the server is down is
+  worse than missing a warning. The change is visibility, not behaviour.
+NOTE: the AC-241 numstat was already on screen when I did this. It printed "114 insertions"
+  against an edit I knew was ~20 lines and I committed anyway. That is the argument for why
+  the fix here is a SKIP NOTICE rather than a better number: a figure the reader has learned
+  to skim does not become informative by being correct. What was missing was not a more
+  accurate measurement but a statement that the measurement had not been taken. Same family
+  as the ethos rule-4 point that a skip leaving no trace is indistinguishable from a scan
+  that found nothing — and this is the third entry today whose root is that a signal could
+  not distinguish two sessions or two states (see AC-256).
