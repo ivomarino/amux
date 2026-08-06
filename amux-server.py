@@ -13557,6 +13557,157 @@ def _scope_read(level: str, name: str) -> dict:
     return out
 
 
+def _scope_write_allowed(level: str, name: str, actor: str) -> tuple:
+    """Who may write which scope layer -> (allowed, why).
+
+    THE DEFAULT IS RESTRICTIVE ON PURPOSE, and it is a POLICY CHOICE rather than
+    a technical limit — flagged for Ethan under ethos #8 rather than decided
+    quietly, because loosening it is one line and tightening it after something
+    escapes is not.
+
+    A session that could write the GROUP or GLOBAL layer could grant ITSELF
+    whatever that layer confers — env vars, memory, rules, a laxer gate — and
+    every other worker wearing the tag inherits it on their next compose. The
+    blast radius of a group write is every lane in the group; of a global write,
+    the fleet. That is the escalation shape behind the tubescience credential
+    incident, and it is exactly the kind of thing an agent should not be able to
+    do to its peers without a human in the loop.
+
+    A session writing its OWN worker layer is fine: it is already the thing that
+    layer configures, so it grants itself nothing it did not already have.
+
+    Convention for "human": no X-Amux-Session/X-Amux-Worker header means the
+    dashboard, which is the same rule _caller_scope already uses for tag
+    isolation. Set AMUX_SCOPE_WRITE_AGENTS=1 to let sessions write every level.
+    """
+    if os.environ.get("AMUX_SCOPE_WRITE_AGENTS", "").strip() in ("1", "true", "yes"):
+        return True, "AMUX_SCOPE_WRITE_AGENTS=1 (all levels open to sessions)"
+    if not actor:
+        return True, "human (no session header — dashboard)"
+    if level == "worker" and name == actor:
+        return True, f"session writing its own worker layer ({actor})"
+    if level == "worker":
+        return False, (f"'{actor}' may not configure another worker ('{name}'). "
+                       f"A session reconfiguring a peer is a human's call.")
+    return False, (f"'{actor}' may not write the {level} layer. Everything wearing "
+                   f"it inherits the change, so a session could grant itself and "
+                   f"its peers new capability. Do it from the dashboard, or set "
+                   f"AMUX_SCOPE_WRITE_AGENTS=1 if you want sessions to have this.")
+
+
+def _scope_cap(key: str) -> dict:
+    return next((c for c in _SCOPE_CAPS if c["key"] == key), {})
+
+
+def _scope_write(level: str, name: str, key: str, value, actor: str) -> dict:
+    """Write ONE capability at ONE level. Descriptor-driven, so the UI never has
+    to know that gates live in SQLite while memory lives in a .md file — the
+    whole point of the card: if the client knew the backend, every new
+    capability would mean touching the client, and the two would drift.
+
+    Refuses an unsupported (level, capability) pair loudly instead of accepting
+    a value the resolver would silently outrank — the AMUX-2140 shape, where an
+    instruction you can follow exactly does nothing."""
+    cap = _scope_cap(key)
+    if not cap:
+        return {"error": f"unknown capability '{key}'", "status": 400}
+    if level not in cap["levels"]:
+        return {"error": (f"'{cap['label']}' is not settable at {level} level "
+                          f"(settable at: {', '.join(cap['levels'])}). Its "
+                          f"precedence order is {' > '.join(reversed(cap['order']))}, "
+                          f"and levels outside that list are intrinsic to the item, "
+                          f"not to a scope."), "status": 409}
+    ok, why = _scope_write_allowed(level, name, actor)
+    if not ok:
+        return {"error": why, "status": 403}
+
+    before = _scope_read(level, name)
+    _b = next((c for c in before["capabilities"] if c["key"] == key), {})
+
+    if key in ("memory", "rules"):
+        suf = ".rules.md" if key == "rules" else ".md"
+        f = (CC_MEMORY / ("_rules.md" if key == "rules" else "_global.md")
+             if level == "global" else
+             CC_MEMORY / "tags" / f"{name}{suf}" if level == "group" else
+             CC_MEMORY / f"{name}{suf}")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        text = value if isinstance(value, str) else (value or {}).get("text", "")
+        f.write_text(text)
+    elif key == "env":
+        f = (CC_AMUX_ENV if level == "global" else
+             CC_HOME / "env" / f"{name}.env" if level == "group" else
+             CC_SESSIONS / f"{name}.env")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(value, str):
+            f.write_text(value if value.endswith("\n") else value + "\n")
+        else:
+            cur = parse_env_file(f) if f.exists() else {}
+            for k, v in (value or {}).items():
+                if v is None:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = str(v)
+            f.write_text("".join(f"{k}={v}\n" for k, v in sorted(cur.items())))
+        try:
+            os.chmod(f, 0o600)   # env files carry credentials
+        except OSError:
+            pass
+    elif key == "gates":
+        db = get_db()
+        if level == "global":
+            for st, items in (value or {}).items():
+                db.execute("UPDATE statuses SET gate=? WHERE id=?",
+                           (json.dumps(items) if items else None, st))
+        else:
+            skey = ("group:" + name) if level == "group" else name
+            for st, items in (value or {}).items():
+                if items:
+                    db.execute(
+                        "INSERT INTO session_gates (session, status, gate) VALUES (?,?,?) "
+                        "ON CONFLICT(session, status) DO UPDATE SET gate=excluded.gate",
+                        (skey, st, json.dumps(items)))
+                else:
+                    db.execute("DELETE FROM session_gates WHERE session=? AND status=?",
+                               (skey, st))
+        db.commit()
+    elif key == "status_mode":
+        db = get_db()
+        if level == "global":
+            for st, mode in (value or {}).items():
+                if mode not in ("implicit", "explicit"):
+                    return {"error": f"mode must be implicit or explicit, got '{mode}'",
+                            "status": 400}
+                db.execute("UPDATE statuses SET mode=? WHERE id=?", (mode, st))
+        else:
+            lv = "tag" if level == "group" else "session"
+            wanted = set(value or [])
+            have = {st for st, d in _load_status_scope().items()
+                    if name in (d.get(lv) or set())}
+            for st in wanted - have:
+                db.execute("INSERT OR REPLACE INTO status_scope (status, scope_type, scope_value) "
+                           "VALUES (?,?,?)", (st, lv, name))
+            for st in have - wanted:
+                db.execute("DELETE FROM status_scope WHERE status=? AND scope_type=? "
+                           "AND scope_value=?", (st, lv, name))
+        db.commit()
+    else:
+        return {"error": f"capability '{key}' has no write path", "status": 501}
+
+    after = _scope_read(level, name)
+    _a = next((c for c in after["capabilities"] if c["key"] == key), {})
+    # A scope MUTATION with no actor is the same gap as an unlogged gate bypass,
+    # in the other direction: 565e23c/213282a made scope DECISIONS auditable
+    # (which layer granted, which was excluded), and this makes the changes to
+    # those layers auditable too.
+    _ilog("scope", f"write:{key}", actor=actor or "human",
+          target=f"{level}:{name or 'global'}",
+          detail={"capability": key, "level": level, "name": name, "why_allowed": why},
+          before=_b.get("value"), result=_a.get("value"), ok=True)
+    return {"ok": True, "level": level, "name": name, "capability": key,
+            "set_here": _a.get("set_here"), "value": _a.get("value"),
+            "actor": actor or "human", "why_allowed": why}
+
+
 def _gate_layers(item, target_status: str) -> list:
     """EVERY scope layer's contribution to this transition, not just the winner.
 
@@ -63597,6 +63748,41 @@ class CCHandler(BaseHTTPRequestHandler):
         # in a file. `levels`/`supported` are explicit so a capability that
         # does not accept a level SAYS SO, rather than the UI offering a
         # control whose write is silently ignored or outranked.
+        # PUT /api/scope  {level, name, capability, value}
+        # The WRITE half (AMUX-2359). Same descriptor-driven shape as the read:
+        # the caller names a capability and a level, never a backend. Refuses an
+        # unsupported (level, capability) pair with 409 rather than accepting a
+        # value the resolver would outrank. Authorization is deliberately
+        # restrictive by default — see _scope_write_allowed.
+        if path == "/api/scope" and method == "PUT":
+            _b = self._read_body()
+            _lv = (_b.get("level") or "").strip()
+            _nm = (_b.get("name") or "").strip()
+            _cap = (_b.get("capability") or "").strip()
+            # A level naming a real PRECEDENCE layer that is not SETTABLE (gates
+            # list `type` and `card` in their order but not their levels) falls
+            # through to _scope_write, which explains WHY rather than returning a
+            # flat "level must be global, group or worker". Someone reading the
+            # order and trying `level=type` is reasoning correctly from what the
+            # read half told them; the answer should teach, not just refuse.
+            # Without this the 409 branch below is unreachable — an
+            # unfalsifiable guard, which ethos #7 counts as no guard at all.
+            _known_layers = {l for c in _SCOPE_CAPS for l in (c.get("order") or [])}
+            if _lv not in ("global", "group", "worker") and _lv not in _known_layers:
+                return self._json({"error": "level must be global, group or worker",
+                                   "precedence_layers": sorted(_known_layers)}, 400)
+            # Only group/worker are NAMED. Requiring a name for every non-global
+            # level sent `type` down the "name required" path and never reached
+            # the 409 that explains it is not settable — the guard existed and
+            # was still unreachable, one layer further in than the first fix.
+            if _lv in ("group", "worker") and not _nm:
+                return self._json({"error": f"name required for level={_lv}"}, 400)
+            if not _cap:
+                return self._json({"error": "capability required",
+                                   "capabilities": [c["key"] for c in _SCOPE_CAPS]}, 400)
+            _r = _scope_write(_lv, _nm, _cap, _b.get("value"), _hdr_worker(self.headers))
+            return self._json(_r, _r.pop("status", 200) if _r.get("error") else 200)
+
         if path == "/api/scope":
             _lv = (qs.get("level", ["global"])[0] or "global").strip()
             _nm = (qs.get("name", [""])[0] or "").strip()
