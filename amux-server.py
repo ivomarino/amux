@@ -19939,9 +19939,27 @@ def main():
     # hunks too, and their `git commit` then reports "nothing to commit".
     for f in (d.get("shared") or []):
         mins = int((f.get("age_secs") or 0) / 60)
-        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago. "
-          "If they have uncommitted changes there, this commit takes them too.\\n"
-          % (f.get("path"), f.get("owner"), mins))
+        # Report the STAGED SIZE, not a hypothetical (AC-241). The old text said
+        # "IF they have uncommitted changes" — a condition the committer cannot
+        # resolve at that moment, so the natural check is the wrong one: checking
+        # `git status` AFTER committing shows a clean tree, which is equally
+        # consistent with having swept everything. That is how amux-cloud shipped
+        # 36 lines of another session's work in 24a294b with this very warning on
+        # screen. The number it needed was already computable here.
+        _n = ""
+        try:
+            _ns = subprocess.run(
+                ["git", "diff", "--cached", "--numstat", "--", f.get("path") or ""],
+                capture_output=True, text=True, timeout=5).stdout.split()
+            if len(_ns) >= 2 and _ns[0].isdigit():
+                _n = " This commit stages %s insertions / %s deletions there — if that is " \\
+                     "MORE than you wrote, their work is in it." % (_ns[0], _ns[1])
+        except Exception:
+            _n = ""
+        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago.%s\\n"
+          "  Stage only your hunks:  git diff -U0 %s > /tmp/mine.patch  "
+          "(trim to yours)  &&  git apply --cached /tmp/mine.patch\\n"
+          % (f.get("path"), f.get("owner"), mins, _n, f.get("path")))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
