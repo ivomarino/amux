@@ -388,3 +388,32 @@ NOTE: this is the 5th AREA-clustered entry today on shared-checkout provenance (
   downstream of the same fact — N sessions share one working tree and git has no concept of
   which session owns a hunk. Every fix so far, mine included, is a better WARNING about a
   condition git cannot represent. "All fixed" should not be read as solved.
+
+## A wrong field name on /api/sessions is indistinguishable from the data not existing
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2447
+SYMPTOM: gtm-videos needed each lane's working directory to test whether a cwd change had
+  orphaned a memory index. They read `/api/sessions` and got None, and reasonably concluded
+  the API does not expose cwd — recording it as a limit they could not work around. The field
+  is there; it is called `dir`. There is no `cwd` key at all, so `.get("cwd")` returns None,
+  identical to what a present-but-empty field would return.
+COST: A confirmable hypothesis was left unconfirmed and written up as untestable, and the
+  slug — which encodes the cwd and was sitting in front of both of us — went unused as
+  evidence for hours. I then repeated the same shape from the other side: I asserted the
+  overcounting detector was "the pushed tip" that "should not sit long" without reading the
+  ref. It was never pushed. Both of us reasoned confidently about state neither had measured.
+FIX: NOT an alias field. Adding `cwd` alongside `dir` duplicates a ~40-byte string per lane
+  on a payload the dashboard polls, across 106 lanes, on a mobile-first PWA — the wrong
+  trade for a naming convenience. The right fix is discoverability: `/api/sessions` has no
+  contract endpoint the way the board does (`GET /api/board/contract`), so there is nowhere
+  to look up field names short of reading amux-server.py or dumping a payload. Publish the
+  field list, and the class closes for every consumer rather than for `cwd` specifically.
+NOTE: the general shape is worth naming because it recurs — a probe that cannot express
+  "you asked the wrong question" returns something indistinguishable from an answer. Same
+  family as the empty grep that reads as a measurement, and as `git status` after a commit,
+  which cannot distinguish "nothing of theirs was there" from "I swept all of it". In each
+  case the failing check produces a green, plausible result and nothing prompts a recheck.
