@@ -46,6 +46,19 @@ and fix it at its root**, not as an obstacle to route around in your own task.
 The bar: after you are done, could someone hit the same problem again? If yes, you fixed
 your task, not the platform.
 
+**Log the friction, not just the fix: [`frustrations.md`](frustrations.md).** When amux
+gets in your way — a command that reports success and does nothing, a notice that names
+the wrong session, a gate you cannot satisfy honestly, a probe that cannot express the
+answer — append an entry there. The format is fixed so it greps (`grep '^STATUS: open'`,
+`grep '^AREA: attribution'`), and the rule for when to log is
+[`.claude/rules/frustrations.md`](.claude/rules/frustrations.md).
+
+This exists because a single frustration is a complaint and a cluster is an argument.
+No one entry proves a subsystem needs rebuilding; three entries sharing an `AREA` do,
+and that pattern is invisible unless the entries are counted. Link a card on every one —
+a frustration without a `CARD:` is something to grumble about, with one it is work
+somebody can pick up.
+
 ## Structure
 
 - `amux-server.py` — the server + dashboard (single file)
