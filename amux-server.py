@@ -68919,8 +68919,33 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         _abs = {os.path.realpath(os.path.join(_cdir, f.strip()))
                                 for f in _files if f.strip()}
                         _wd = str(Path(_cdir).expanduser().resolve())
+                        # ATTRIBUTE TO WHOEVER SIGNED THE COMMIT, NOT WHOEVER REPORTED IT
+                        # (AC-230). `name` is the REPORTING session, and on a shared
+                        # checkout the reporter is routinely not the author: a rebase or a
+                        # prefix push pulls a peer's commit into your view and your own
+                        # post-commit hook reports it. Naming the reporter told amux-cloud
+                        # that 1b743ec — whose trailer reads amux-cloud — was written by
+                        # amux-homepage, in the same message that ends "do not report a sha
+                        # you did not create". Following it literally means disowning your
+                        # own work; the mirror case is claiming someone else's.
+                        # prepare-commit-msg stamps this trailer on every commit and
+                        # amux-push-guard already attributes from it. This was the one
+                        # consumer still guessing. Falls back to the reporter only for
+                        # pre-stamp commits, and says so rather than asserting silently.
+                        _author = ""
+                        try:
+                            _author = subprocess.run(
+                                ["git", "-C", _cdir, "log", "-1",
+                                 "--format=%(trailers:key=Amux-Session,valueonly)", sha],
+                                capture_output=True, text=True, timeout=6
+                            ).stdout.strip().splitlines()[0].strip()
+                        except Exception:
+                            _author = ""
+                        _by = _author or f"{name} (reporter; commit carries no Amux-Session trailer)"
                         for _other, _od in _all_session_workdirs().items():
-                            if _other == name or _od != _wd:
+                            # Skip the AUTHOR (it is their own commit) and the reporter,
+                            # which is who was skipped before this fix.
+                            if _other in (_author or name, name) or _od != _wd:
                                 continue
                             _touch = {p: t for p, t in
                                       _session_recent_edit_paths(
@@ -68929,7 +68954,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                 continue
                             _rel = sorted(os.path.relpath(p, _wd) for p in _touch)[:5]
                             _steer_enqueue(_other,
-                                f"[amux] Commit {sha} by session '{name}' touched files you "
+                                f"[amux] Commit {sha} by session '{_by}' touched files you "
                                 f"also edited recently: {', '.join(_rel)}.\n"
                                 f"\"{subj}\"\n"
                                 f"If you had UNCOMMITTED changes there, they are in that commit "
@@ -68939,8 +68964,12 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                 f"change is in HEAD before reporting it. Do not report a sha you "
                                 f"did not create.",
                                 guard=f"swept:{sha}:{_other}")
-                            _ilog("git", "sweep_notice", actor=name, target=_other, ok=True,
-                                  detail={"sha": sha, "paths": _rel})
+                            # actor = the commit's AUTHOR; reporter kept alongside it so a
+                            # later reader can tell the two apart (they differ on a shared
+                            # checkout, which is what AC-230 was).
+                            _ilog("git", "sweep_notice", actor=(_author or name), target=_other,
+                                  ok=True, detail={"sha": sha, "paths": _rel,
+                                                   "reporter": name, "author": _author or None})
                 except Exception as _se:
                     slog(f"[commit-report] sweep check failed for {sha}: {_se}")
                 row = get_db().execute(
