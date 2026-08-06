@@ -70516,7 +70516,26 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                                   f"not established, not asserting")
                                     continue
                                 _pr = os.path.relpath(_p, _wd)
-                                _edit = int(_touch.get(_p) or 0)
+                                # TAKE THE TIMESTAMP FROM THE MAP WHOSE AUTHORSHIP IS
+                                # ESTABLISHED (AMUX-2456, round 3). Gating MEMBERSHIP on
+                                # _firsthand while reading the TIME from _touch closed
+                                # only half the hole: _touch is the inferred map and its
+                                # builder keeps the LATEST mtime it sees, so for a path
+                                # the recipient really did edit AND a peer later wrote,
+                                # membership passes on the recipient's real edit while
+                                # the time reported is the peer's. That is enough to
+                                # reproduce the original false notice verbatim —
+                                # firsthand 14:5x, _touch 15:52 (a peer's write claimed
+                                # via one of 5,185 read commands), own commit 14:58:
+                                # 15:52 <= 14:58 is False, so it ALARMS and prints the
+                                # peer's timestamp as the recipient's edit.
+                                #
+                                # Both the assertion AND the comparison that decides
+                                # routine-vs-alarm must rest on the same established
+                                # evidence. Splitting them across two maps is how a fix
+                                # passes its own membership test and still emits the
+                                # thing it was written to prevent.
+                                _edit = int(_firsthand.get(_p) or 0)
                                 # EXACT trailer match, not `--grep`. `--grep` is a
                                 # substring search, so a session whose name is a PREFIX
                                 # of another's matches the other's commits: with
