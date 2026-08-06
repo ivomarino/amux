@@ -26571,8 +26571,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background:rgba(88,166,255,0.14); color:var(--accent); border:1px solid transparent;
     -webkit-tap-highlight-color:transparent; }
   .grp-chip:hover, .grp-chip:active { border-color:var(--accent); }
+  /* Its own band between the pills and the worker list. It used to live INSIDE
+     #cards, which on >=1100px is a grid — so the panel became a single grid
+     cell, squeezed to one column's width beside a worker card, and it scrolled
+     away with the list. Out here it spans the full width at every breakpoint. */
+  #grp-scope-strip:empty { display:none; }
+  #grp-scope-strip { margin:0 0 10px; }
   .grp-scope-panel { border:1px solid var(--accent); border-radius:10px; padding:10px 12px;
-    margin:0 0 8px; background:var(--card); position:relative; }
+    margin:0; background:var(--card); position:relative; }
+  /* Horizontal on anything with room: identity on the left, configs taking the
+     rest, actions trailing. Mobile keeps the stack — 375px cannot carry three
+     columns without the tiles becoming unreadable (css-mobile rule). */
+  @media (min-width: 760px) {
+    .grp-scope-row { display:flex; align-items:center; gap:14px; }
+    .grp-scope-row > .grp-scope-ident { flex:0 0 auto; max-width:34%; }
+    .grp-scope-row > .grp-scope-tiles { flex:1 1 auto; min-width:0; }
+  }
   .grp-scope-close { position:absolute; top:4px; right:4px; background:none; border:none;
     color:var(--dim); font-size:1.1rem; line-height:1; cursor:pointer;
     min-width:44px; min-height:44px; -webkit-tap-highlight-color:transparent; }
@@ -28357,6 +28371,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="active-filters" class="active-filters"></div>
 <div id="tag-filters" class="tag-filters"></div>
+<div id="grp-scope-strip"></div>
 <div id="offline-banner" class="offline-banner">
   <div class="offline-banner-header">
     <span id="offline-banner-title">&#x26A0; Offline</span>
@@ -32731,11 +32746,9 @@ function _restoreCardFocus(focusedId, savedInputs) {
   if (d && inp.tagName === 'TEXTAREA') { inp.selectionStart = d.start; inp.selectionEnd = d.end; }
 }
 
-let _grpEmitted = false;   // one group panel per render pass, not one per member
 let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render keeps it
 
 function render() {
-  _grpEmitted = false;
   // Skip render if a menu or edit overlay is open to prevent DOM clobbering
   if (openMenu || editState || document.getElementById('edit-overlay').classList.contains('active')) return;
   updatePeekStatus();
@@ -32766,6 +32779,24 @@ function render() {
     ).join('');
   } else {
     tagEl.innerHTML = '';
+  }
+  // The group panel is its OWN band between the pills and the workers. It used
+  // to be emitted inside the worker-card template behind a once-per-render
+  // flag, so its position depended on which worker happened to sort first and
+  // it scrolled away with the list. Ethan: "the group thing should be
+  // horizontal above the workers below the pills."
+  const stripEl = document.getElementById('grp-scope-strip');
+  if (stripEl) {
+    if (_grpOpen) {
+      const gid = escJs(_grpOpen);
+      const want = `<div class="grp-scope-panel" id="grp-scope-${gid}" onclick="event.stopPropagation();">`
+        + `<button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${gid}')">&#215;</button>`
+        + `<div class="grp-scope-body" id="grp-scope-body-${gid}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
+      // Only touch the DOM when the markup actually changes: an unconditional
+      // innerHTML write on every render would wipe a scroll position and
+      // interrupt a tap mid-gesture.
+      if (stripEl._want !== want) { stripEl.innerHTML = want; stripEl._want = want; }
+    } else if (stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
   }
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
@@ -32839,7 +32870,6 @@ function render() {
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
     return `
-    ${(_grpOpen && (_grpOpen === _GLOBAL_SCOPE || (s.tags||[]).includes(_grpOpen)) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${escJs(_grpOpen)}')">&#215;</button><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
@@ -35090,12 +35120,17 @@ async function _scopeLoad(scope, targetId) {
     };
     const chips = (arr) => arr.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ');
     let detail = '';
-    let h = '<div style="margin-bottom:8px;color:var(--text);font-size:0.86rem;">'
+    // Identity and tiles sit side by side on anything with room (Ethan: "the
+    // group thing should be horizontal above the workers below the pills"), and
+    // stack on a phone. The wrapper classes carry that; the tile row itself was
+    // already horizontal.
+    let h = '<div class="grp-scope-row">'
+          + '<div class="grp-scope-ident" style="color:var(--text);font-size:0.86rem;">'
           + '<b>' + esc(lvl === 'global' ? 'Global' : w) + '</b>'
           + (lvl === 'worker' ? ' \u00b7 groups: ' + (groups.length ? chips(groups) : '<i>none</i>') : '')
           + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's') + ': ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') : '')
           + '</div>'
-          + '<div class="scope-tiles">';
+          + '<div class="grp-scope-tiles"><div class="scope-tiles">';
     d.capabilities.forEach((c, i) => {
       const here = c.set_here, gset = G[c.key] && G[c.key].set_here;
       const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
@@ -35117,7 +35152,7 @@ async function _scopeLoad(scope, targetId) {
         + '<span class="scope-tile-val">' + esc(sum(c)) + '</span>'
         + '</button>';
     });
-    h += '</div>';
+    h += '</div></div></div>';   // .scope-tiles, .grp-scope-tiles, .grp-scope-row
     // Detail for the tapped tile only. Everything a reader SCANS is in the row;
     // everything they CONSULT is here, one at a time.
     const _selCap = d.capabilities.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
@@ -36386,7 +36421,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.470';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.471';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58019,7 +58054,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.470';
+const CACHE = 'amux-v0.9.471';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
