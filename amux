@@ -1167,6 +1167,19 @@ cmd_board() {
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> [\"the question / decision needed\"]"
       shift 2>/dev/null || true
       local ask="$*"
+      # A FLAG IS NOT AN ASK. This verb takes free prose, so an unrecognised
+      # `--flag` was silently adopted AS the question: `amux board needsyou <id>
+      # --stdin < file` printed "tagged needs:you", discarded the file entirely,
+      # and wrote the literal ask "NEEDS-YOU: --stdin" onto the card. I did it
+      # twice (AMUX-2446, AMUX-2454) before noticing, and the second one buried
+      # the herdr measurement that was the whole point of the card.
+      # Reporting success while recording garbage is worse than refusing: the
+      # ledger looks written-to and a reviewer believes it.
+      case "$ask" in
+        --*) die "amux board needsyou: '$ask' looks like a flag, not a question.
+This verb takes free prose only:  amux board needsyou $id \"the decision needed\"
+For long text use:                amux board progress $id \"\$(cat file)\"" ;;
+      esac
       local cur result
       cur=$(curl -sk "$AMUX_API/api/board/$id" | python3 -c "import sys,json;d=json.load(sys.stdin);i=d.get('item') or d;print(json.dumps(sorted(set((i.get('tags') or [])+['needs:you']))))" 2>/dev/null)
       [[ -n "$cur" ]] || die "card $id not found"

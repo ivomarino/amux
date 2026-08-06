@@ -481,3 +481,30 @@ NOTE: this is the ethos rule-7 shape where the SANCTIONED INSTRUCTION is the the
   exited 0. That one was worse because it reported success; this one fails loudly, which is
   why it cost minutes rather than a wrong belief. Both come from the same source: text telling
   an agent what to run, never exercised against the thing that runs it.
+
+## `amux board needsyou` adopted a --flag as the question and reported success
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2455
+SYMPTOM: `amux board needsyou <id> --stdin < file` printed `AMUX-2454 → tagged needs:you`,
+  exit 0. The verb takes a free-prose ask as `$*`, so the unrecognised flag became the ask:
+  it discarded the piped file entirely and wrote the literal line `NEEDS-YOU: --stdin` onto
+  the card. Every status verb in this CLI takes `--stdin`/flags, so reaching for it here is
+  the obvious move, and nothing said otherwise.
+COST: Two cards (AMUX-2446, AMUX-2454) carried a garbage ask, and on AMUX-2454 it destroyed
+  the herdr measurement that was the entire point of the card — the deliverable was gone
+  and the card looked written-to. I did it TWICE before noticing, and only noticed because
+  a fingerprint check I ran for an unrelated reason showed the desc at 18 bytes. Reporting
+  success while recording garbage is worse than refusing: the ledger looks populated and a
+  reviewer believes it.
+FIX: In `amux`, needsyou now refuses an ask beginning with `--`, naming the two correct
+  forms (prose inline, or `amux board progress <id> "$(cat file)"` for long text). Exercised
+  both directions: `--stdin` refuses with usage; a real prose ask still records. Both
+  polluted cards cleaned, with the measurement verified intact afterwards.
+NOTE: this is the sibling of AC-222, where the same verb printed a status arrow for a write
+  that changes no status. Two entries now on `needsyou` specifically, both about the command
+  reporting something other than what it did — which is the argument for auditing its
+  output contract rather than patching the next symptom.
