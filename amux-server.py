@@ -26274,7 +26274,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color:transparent; }
   .grp-chip:hover, .grp-chip:active { border-color:var(--accent); }
   .grp-scope-panel { border:1px solid var(--accent); border-radius:10px; padding:10px 12px;
-    margin:0 0 8px; background:var(--card); }
+    margin:0 0 8px; background:var(--card); position:relative; }
+  .grp-scope-close { position:absolute; top:4px; right:4px; background:none; border:none;
+    color:var(--dim); font-size:1.1rem; line-height:1; cursor:pointer;
+    min-width:44px; min-height:44px; -webkit-tap-highlight-color:transparent; }
+  .grp-scope-close:hover, .grp-scope-close:active { color:var(--text); }
   .grp-scope-body { font-size:0.8rem; color:var(--dim); }
   /* Mobile: 44px touch target without making the chip huge inline — pad the hit
      area rather than the visual box (css-mobile rule). */
@@ -32516,7 +32520,7 @@ function render() {
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
     return `
-    ${(_grpOpen && (s.tags||[]).includes(_grpOpen) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
+    ${(_grpOpen && (s.tags||[]).includes(_grpOpen) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${escJs(_grpOpen)}')">&#215;</button><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
@@ -34555,19 +34559,7 @@ function _grpScopeRehydrate() {
   }
 }
 
-function toggleGroupScope(g) {
-  if (_grpOpen !== g) _grpScopeHtml = '';   // switching groups must not show the previous one's data
-  _grpOpen = (_grpOpen === g) ? null : g;
-  if (!_grpOpen) _grpScopeHtml = '';
-  render();
-  if (_grpOpen) {
-    const host = document.getElementById('grp-scope-' + _grpOpen);
-    if (host) {
-      _scopeLoad({ level: 'group', name: _grpOpen }, 'grp-scope-body-' + _grpOpen);
-      host.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-  }
-}
+function toggleGroupScope(g) { _selectGroup(g); }
 
 async function _scopeLoad(scope, targetId) {
   // Explicit target. The first cut had the group panel temporarily RENAME its
@@ -35789,7 +35781,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.455';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.456';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40547,8 +40539,23 @@ function cardSlashAcHighlight(name) {
 
 // ── Search clear helpers ──
 function toggleTagFilter(tag) {
-  activeTag = activeTag === tag ? '' : tag;
+  _selectGroup(tag);
+}
+
+// Select a group: filter the list to it AND show what it scopes. Entered from
+// the tag pills or from a group chip on a worker card — both land here, so the
+// two cannot drift into doing different things.
+function _selectGroup(g) {
+  const closing = (activeTag === g && _grpOpen === g);
+  activeTag = closing ? '' : g;
+  if (_grpOpen !== g) _grpScopeHtml = '';    // never show the previous group's data
+  _grpOpen = closing ? null : g;
+  if (!_grpOpen) _grpScopeHtml = '';
   render();
+  if (_grpOpen) {
+    const el = document.getElementById('grp-scope-body-' + _grpOpen);
+    if (el) _scopeLoad({ level: 'group', name: _grpOpen }, el.id);
+  }
 }
 function toggleTagGroup(tag) {
   _tagGroupCollapsed[tag] = !_tagGroupCollapsed[tag];
@@ -57334,7 +57341,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.455';
+const CACHE = 'amux-v0.9.456';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
