@@ -36421,7 +36421,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.473';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.474';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50562,11 +50562,9 @@ const _cachedBoard = localStorage.getItem('amux_board_cache');
 if (_cachedBoard) {
   try { boardItems = JSON.parse(_cachedBoard); lastBoardJSON = _cachedBoard; } catch(e) {}
 }
-// Load cached notes list from localStorage
-const _cachedNotes = localStorage.getItem('amux_notes_cache');
-if (_cachedNotes) {
-  try { _notesAllNotes = JSON.parse(_cachedNotes); } catch(e) {}
-}
+// (Cached notes list was hydrated here from localStorage 'amux_notes_cache'.
+// Nothing writes that key any more — the writer went with the notes feature —
+// so this only ever restored a stale list into a variable nothing reads.)
 if (sessions.length || drafts.length) render();
 updateConnectionStatus();
 
@@ -55006,64 +55004,15 @@ async function _sqlRun() {
 }
 
 // ── Notes tab ─────────────────────────────────────────────────────────────────
-let _notesActive = null; // { path, title }
-let _notesTrashOpen = false;
 
 
-function _notesTrashToggle() {
-  _notesTrashOpen = !_notesTrashOpen;
-  document.getElementById('notes-trash-chevron').classList.toggle('open', _notesTrashOpen);
-  document.getElementById('notes-trash-body').style.display = _notesTrashOpen ? '' : 'none';
-}
 
 
-let _notesSaveTimer = null;
-let _notesAllNotes = [];
-let _notesSidebarOpen = localStorage.getItem('amux_notes_sidebar') !== 'closed';
-let _notesOpenAbort = null;
-let _notesLoadingContent = false;
-let _notesMode = 'preview';
-let _notesRawContent = '';
 
-function _notesGetEditor() { return document.getElementById('notes-editor'); }
 
-function _notesPreviewBindCheckboxes(container) {
-  container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-    cb.onclick = (e) => {
-      const editor = _notesGetEditor();
-      if (!editor || !_notesActive) return;
-      const lines = editor.value.split('\n');
-      const label = cb.parentElement?.textContent?.trim() || '';
-      for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^(\s*[-*]\s*)\[([ xX])\]\s*(.*)/);
-        if (m && m[3].trim() === label.replace(/^\s*/, '').trim()) {
-          lines[i] = m[1] + '[' + (cb.checked ? 'x' : ' ') + '] ' + m[3];
-          break;
-        }
-      }
-      editor.value = lines.join('\n');
-      _notesSaveDebounce();
-    };
-  });
-}
 
 // Tap-to-edit: clicking anywhere in the rendered preview switches to edit mode
 // (Obsidian/Bear-style — no explicit "Edit" button needed)
-function _notesPreviewBindTapToEdit(container) {
-  if (container._tapToEditBound) return;
-  container._tapToEditBound = true;
-  // Make all links open in a new tab so dbl-click-to-edit doesn't navigate away.
-  container.querySelectorAll('a[href]').forEach(a => {
-    a.setAttribute('target', '_blank');
-    a.setAttribute('rel', 'noopener noreferrer');
-  });
-  container.addEventListener('dblclick', (e) => {
-    if (e.target.closest('a')) return;
-    if (e.target.closest('input[type="checkbox"]')) return;
-    _notesSwitchMode('edit');
-    setTimeout(() => { const ed = _notesGetEditor(); if (ed) ed.focus(); }, 30);
-  });
-}
 
 // Swipe-from-left-edge to open the notes sidebar on mobile (Bear/Apple Notes pattern)
 
@@ -55222,58 +55171,12 @@ function _tpKeyHandler(e) {
   else if (e.key === 'r' || e.key === 'R') { _tpRestart(); _tpShowToolbar(); }
 }
 
-function _notesSwitchMode(mode) {
-  _notesMode = mode;
-  document.getElementById('notes-tab-edit').classList.toggle('active', mode === 'edit');
-  document.getElementById('notes-tab-preview').classList.toggle('active', mode === 'preview');
-  const editorWrap = document.getElementById('notes-editor-wrap');
-  const preview = document.getElementById('notes-preview');
-  const searchBar = document.getElementById('notes-preview-search');
-  if (mode === 'preview') {
-    const editor = _notesGetEditor();
-    const content = editor ? editor.value : _notesRawContent;
-    preview.innerHTML = renderMarkdown(content) || '<span style="color:var(--dim);font-size:0.85rem;">Empty note</span>';
-    preview.classList.add('md-content');
-    _notesPreviewBindCheckboxes(preview);
-    _notesPreviewBindTapToEdit(preview);
-    preview.classList.add('active');
-    editorWrap.style.display = 'none';
-    _previewSearchOrigHTML = preview.innerHTML;
-    if (searchBar) searchBar.style.display = 'flex';
-  } else {
-    _notesPreviewSearchClear();
-    preview.classList.remove('active');
-    editorWrap.style.display = 'flex';
-    if (searchBar) searchBar.style.display = 'none';
-  }
-}
 
 // ── Preview search (find-in-page for rendered notes) ──
 let _previewSearchHits = [];
 let _previewSearchIdx = -1;
 let _previewSearchOrigHTML = '';
 
-function _notesPreviewSearch(query) {
-  const preview = document.getElementById('notes-preview');
-  if (!preview) return;
-  // Restore original HTML before each search to avoid compounding marks
-  if (_previewSearchOrigHTML) preview.innerHTML = _previewSearchOrigHTML;
-  else _previewSearchOrigHTML = preview.innerHTML;
-  _previewSearchHits = [];
-  _previewSearchIdx = -1;
-  const countEl = document.getElementById('notes-preview-search-count');
-  if (!query || query.length < 2) {
-    if (countEl) countEl.textContent = '';
-    return;
-  }
-  // Walk text nodes and wrap matches in <mark>
-  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp('(' + escaped + ')', 'gi');
-  _highlightTextNodes(preview, regex);
-  _previewSearchHits = Array.from(preview.querySelectorAll('mark.search-hit'));
-  if (countEl) countEl.textContent = _previewSearchHits.length ? '0/' + _previewSearchHits.length : 'no results';
-  if (_previewSearchHits.length) _notesPreviewSearchNav(1);
-}
 
 function _highlightTextNodes(root, regex) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -55301,259 +55204,42 @@ function _highlightTextNodes(root, regex) {
   });
 }
 
-function _notesPreviewSearchNav(dir) {
-  if (!_previewSearchHits.length) return;
-  if (_previewSearchIdx >= 0 && _previewSearchIdx < _previewSearchHits.length)
-    _previewSearchHits[_previewSearchIdx].classList.remove('current');
-  _previewSearchIdx = (_previewSearchIdx + dir + _previewSearchHits.length) % _previewSearchHits.length;
-  const hit = _previewSearchHits[_previewSearchIdx];
-  hit.classList.add('current');
-  hit.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  const countEl = document.getElementById('notes-preview-search-count');
-  if (countEl) countEl.textContent = (_previewSearchIdx + 1) + '/' + _previewSearchHits.length;
-}
 
-// Cmd/Ctrl+F in preview mode focuses the search input
-document.addEventListener('keydown', function(e) {
-  if ((e.metaKey || e.ctrlKey) && e.key === 'f' && _notesMode === 'preview') {
-    const input = document.getElementById('notes-preview-search-input');
-    if (input && input.offsetParent !== null) {
-      e.preventDefault();
-      input.focus();
-      input.select();
-    }
-  }
-  // Escape closes preview search
-  if (e.key === 'Escape' && _notesMode === 'preview') {
-    const input = document.getElementById('notes-preview-search-input');
-    if (input && input.value) { _notesPreviewSearchClear(); e.preventDefault(); }
-  }
-});
-
-function _notesPreviewSearchClear() {
-  const preview = document.getElementById('notes-preview');
-  if (preview && _previewSearchOrigHTML) {
-    preview.innerHTML = _previewSearchOrigHTML;
-    _notesPreviewBindCheckboxes(preview);
-  }
-  _previewSearchOrigHTML = '';
-  _previewSearchHits = [];
-  _previewSearchIdx = -1;
-  const input = document.getElementById('notes-preview-search-input');
-  if (input) input.value = '';
-  const countEl = document.getElementById('notes-preview-search-count');
-  if (countEl) countEl.textContent = '';
-}
+// (A global keydown listener for notes preview search lived here. Both of its
+// branches were gated on `_notesMode === 'preview'`, which nothing can set any
+// more, and it called the deleted _notesPreviewSearchClear. It was intercepting
+// Cmd/Ctrl+F on EVERY view to do nothing.)
 
 
 
-let _notesEditorReady = false;
-
-let _notesSourceInfo = null;
 
 
-let _notesCurrentNotes = [];
-let _notesFolderCreating = false;
 
-function _notesFolderOpen(name) {
-  try { return JSON.parse(localStorage.getItem('amux_notes_folders') || '{}')[name] !== false; }
-  catch { return true; }
-}
-function _notesFolderSetOpen(name, open) {
-  const state = JSON.parse(localStorage.getItem('amux_notes_folders') || '{}');
-  state[name] = open;
-  localStorage.setItem('amux_notes_folders', JSON.stringify(state));
-}
+
+
 // Collect every folder path (including nested) from the current note set
-function _notesAllFolderPaths() {
-  const set = new Set();
-  for (const n of (_notesCurrentNotes || _notesAllNotes || [])) {
-    const parts = (n.path || '').split('/');
-    let pre = '';
-    for (let i = 0; i < parts.length - 1; i++) {
-      pre = pre ? pre + '/' + parts[i] : parts[i];
-      set.add(pre);
-    }
-  }
-  return [...set];
-}
 // Toggle: collapse all folders; if everything is already collapsed, expand all.
-function _notesCollapseAllFolders() {
-  const all = _notesAllFolderPaths();
-  if (!all.length) return;
-  const anyOpen = all.some(f => _notesFolderOpen(f));
-  const state = JSON.parse(localStorage.getItem('amux_notes_folders') || '{}');
-  for (const f of all) state[f] = anyOpen ? false : true;
-  localStorage.setItem('amux_notes_folders', JSON.stringify(state));
-  const btn = document.getElementById('notes-collapse-all-btn');
-  if (btn) btn.title = anyOpen ? 'Expand all folders' : 'Collapse all folders';
-  _notesRenderList(_notesCurrentNotes);
-}
-function _notesNewFolder() {
-  _notesFolderCreating = true;
-  _notesRenderList(_notesCurrentNotes);
-  setTimeout(() => { document.getElementById('notes-folder-input')?.focus(); }, 30);
-}
-function _notesFolderCancel() {
-  _notesFolderCreating = false;
-  _notesRenderList(_notesCurrentNotes);
-}
-async function _notesFolderConfirm(name) {
-  name = (name || '').trim().replace(/[^a-zA-Z0-9_\-. ]/g, '-').replace(/\s+/g, '-');
-  _notesFolderCreating = false;
-  if (!name) { _notesRenderList(_notesCurrentNotes); return; }
-  _notesFolderSetOpen(name, true);
-}
-function _notesFolderInputKey(e) {
-  if (e.key === 'Enter') { e.preventDefault(); _notesFolderConfirm(e.target.value); }
-  else if (e.key === 'Escape') { e.preventDefault(); _notesFolderCancel(); }
-}
 
-// ── Notes keyboard shortcuts ──
-document.addEventListener('keydown', e => {
-  if (activeView !== 'notes') return;
-  const mod = e.metaKey || e.ctrlKey;
-  if (mod && e.key === 's') { e.preventDefault(); if (_notesSaveTimer) { clearTimeout(_notesSaveTimer); _notesSaveTimer = null; } _notesSave(); }
-  if (mod && e.key === 'p') { e.preventDefault(); _notesQuickOpen(); }
-});
+// (Notes keyboard shortcuts lived here — Cmd+S / Cmd+P, gated on
+// `activeView !== 'notes'` and calling the deleted _notesSave/_notesQuickOpen.)
 
-function _notesQuickOpen() {
-  const q = prompt('Open note:');
-  if (!q) return;
-  const match = _notesAllNotes.find(n => n.name.toLowerCase().includes(q.toLowerCase()) || n.path.toLowerCase().includes(q.toLowerCase()));
-}
 
 // ── Notes drag-and-drop ──
-let _notesDraggingPath = null;
 
-function _notesDragOverRoot(e, el) {
-  if (!_notesDraggingPath || !_notesDraggingPath.includes('/')) return;
-  e.preventDefault(); e.dataTransfer.dropEffect = 'move';
-  el.classList.add('notes-drop-target');
-}
-async function _notesDropOnRoot(e, el) {
-  e.preventDefault();
-  el.classList.remove('notes-drop-target');
-  const path = e.dataTransfer.getData('text/plain') || _notesDraggingPath;
-  if (!path || !path.includes('/')) return;
-  const filename = path.split('/').pop();
-  await _notesMoveNote(path, filename);
-}
-function _notesItemHtml(n, depth) {
-  const active = _notesActive && _notesActive.path === n.path ? ' active' : '';
-  const pinned = n.pinned ? ' pinned' : '';
-  const dt = n.updated ? new Date(n.updated * 1000).toLocaleDateString() : '';
-  const stem = n.path.replace(/\.md$/, '').split('/').pop();
-  const rawName = n.name || stem;
-  const displayName = /^untitled(-\d+)?$/.test(rawName) ? 'Untitled' : rawName;
-  // Indent to match nesting depth (depth 0 = root, uses default CSS padding)
-  const indent = depth ? `padding-left:${12 + depth * 14}px;` : '';
-  return `<div class="notes-list-item${active}${pinned}" data-path="${esc(n.path)}" draggable="true"
-    ondragstart="_notesDragStart(event,this)" ondragend="_notesDragEnd(event)"
-    onclick="_notesOpen(this.dataset.path)" style="display:flex;align-items:center;gap:4px;${indent}">
-    <span class="nli-drag"><svg width="8" height="12" viewBox="0 0 8 12" fill="currentColor"><circle cx="2" cy="2" r="1.2"/><circle cx="6" cy="2" r="1.2"/><circle cx="2" cy="6" r="1.2"/><circle cx="6" cy="6" r="1.2"/><circle cx="2" cy="10" r="1.2"/><circle cx="6" cy="10" r="1.2"/></svg></span>
-    <div style="flex:1;min-width:0;">
-      <div class="nli-title">${esc(displayName)}</div>
-      <div class="nli-date">${dt}</div>
-    </div>
-  </div>`;
-}
 
 // Count all notes within a tree node (including nested folders)
-function _notesCountFiles(node) {
-  let c = node.files.length;
-  for (const k in node.dirs) c += _notesCountFiles(node.dirs[k]);
-  return c;
-}
 
 // Recursively render folder sections. Folder open-state is keyed by FULL path
 // (e.g. "Self/Therapy") so nested folders collapse independently.
-function _notesRenderFolders(dirs, prefix, depth) {
-  let html = '';
-  for (const name of Object.keys(dirs).sort((a,b)=>a.localeCompare(b))) {
-    const node = dirs[name];
-    const fullPath = prefix ? prefix + '/' + name : name;
-    const open = _notesFolderOpen(fullPath);
-    const count = _notesCountFiles(node);
-    const pad = 10 + depth * 14;
-    html += `<div class="notes-folder-section">
-      <div class="notes-folder-hdr" data-folder="${esc(fullPath)}" style="padding-left:${pad}px;" onclick="_notesFolderToggle('${esc(fullPath)}')"
-        ondragover="_notesDragOverFolder(event,this)" ondragleave="_notesDragLeave(event,this)" ondrop="_notesDropOnFolder(event,this)">
-        <svg class="notes-folder-chevron${open?' open':''}" width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M1 3h3.5l1.5 1.5H11v5.5H1V3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
-        <span class="notes-folder-name">${esc(name)}</span>
-        <span class="notes-folder-count">${count}</span>
-        <button class="notes-folder-add" onclick="event.stopPropagation();_notesNew('${esc(fullPath)}')" title="New note in ${esc(name)}"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M1 5h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
-      </div>
-      ${open ? `<div class="notes-folder-items">${_notesRenderFolders(node.dirs, fullPath, depth+1)}${node.files.map(n => _notesItemHtml(n, depth+1)).join('')}</div>` : ''}
-    </div>`;
-  }
-  return html;
-}
 
-function _notesSidebarUpdateActive(path) {
-  document.querySelectorAll('#notes-list .notes-list-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.path === path);
-  });
-}
 
-// Flush unsaved changes when tab/window loses visibility
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden && _notesSaveTimer) {
-    clearTimeout(_notesSaveTimer);
-    _notesSaveTimer = null;
-    _notesSave();
-  }
-});
+// (A visibilitychange handler flushed unsaved note edits here. _notesSaveTimer
+// is never assigned now that the debounce is gone, so the body was unreachable
+// — which is the only reason its call to the deleted _notesSave never threw on
+// every tab switch.)
 
-function _notesSearchFilter(q) {
-  if (!q.trim()) { _notesRenderList(_notesAllNotes); return; }
-  const lq = q.toLowerCase();
-  _notesRenderList(_notesAllNotes.filter(n =>
-    (n.name || '').toLowerCase().includes(lq) || n.path.toLowerCase().includes(lq)
-  ));
-}
 
-function _notesRenderContent(data) {
-  _notesActive = { path: data.path };
-  _notesRawContent = data.content || '';
-  localStorage.setItem('amux_last_note', data.path);
-  const h1md = data.content.match(/^#\s+(.+)$/m);
-  const titleFromContent = h1md ? h1md[1] : '';
-  const titleFromPath = data.path.replace(/\.md$/, '').split('/').pop();
-  _notesActive.title = titleFromContent || titleFromPath;
-  document.getElementById('notes-title').value = _notesActive.title;
-  const listEntry = _notesAllNotes.find(n => n.path === data.path);
-  if (listEntry) listEntry.name = _notesActive.title;
-  const editor = _notesGetEditor();
-  if (editor) {
-    _notesLoadingContent = true;
-    editor.value = data.content || '';
-    setTimeout(() => { _notesLoadingContent = false; }, 0);
-  }
-  document.getElementById('notes-empty-state').style.display = 'none';
-  document.getElementById('notes-mode-tabs').style.display = 'flex';
-  _notesSwitchMode('preview');
-  _notesSidebarUpdateActive(data.path);
-  _notesUpdatePinBtn();
-  _notesUpdateSessionBadge(data.path);
-}
 
-function _notesUpdateSessionBadge(path) {
-  const badge = document.getElementById('notes-session-badge');
-  if (!badge) return;
-  // Session-scoped notes live in _sessions/<sessionname>/<note>.md
-  const m = (path || '').match(/^_sessions\/([^/]+)\//);
-  if (m) {
-    const session = m[1];
-    badge.textContent = '⌘ ' + session;
-    badge.style.display = '';
-    badge.onclick = () => openPeek(session);
-  } else {
-    badge.style.display = 'none';
-    badge.onclick = null;
-  }
-}
 
 
 // Reload the currently-open note's content from disk (e.g. after an external
@@ -55561,69 +55247,14 @@ function _notesUpdateSessionBadge(path) {
 // Guarded so it never clobbers unsaved local edits or in-progress typing.
 
 
-function _notesTitleChange() {
-  const editor = _notesGetEditor();
-  if (!_notesActive || !editor) return;
-  const newTitle = document.getElementById('notes-title').value;
-  _notesActive.title = newTitle;
-  const lines = editor.value.split('\n');
-  if (lines[0] && lines[0].match(/^#\s/)) {
-    lines[0] = '# ' + newTitle;
-  } else {
-    lines.unshift('# ' + newTitle);
-  }
-  editor.value = lines.join('\n');
-  const activeEl = document.querySelector('#notes-list .notes-list-item.active');
-  if (activeEl) {
-    const titleEl = activeEl.querySelector('.nli-title');
-    if (titleEl) titleEl.textContent = newTitle || _notesActive.path.replace(/\.md$/, '');
-  }
-  const listEntry = _notesAllNotes.find(n => n.path === _notesActive.path);
-  if (listEntry) listEntry.name = newTitle || listEntry.path.replace(/\.md$/, '');
-  _notesSaveDebounce();
-}
 
-function _notesSaveDebounce() {
-  if (_notesSaveTimer) clearTimeout(_notesSaveTimer);
-  _notesSaveTimer = setTimeout(_notesSave, 400);
-}
 
 
 const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
 
-function _notesShowEmpty() {
-  document.getElementById('notes-empty-state').style.display = 'flex';
-  document.getElementById('notes-editor-wrap').style.display = 'none';
-  document.getElementById('notes-mode-tabs').style.display = 'none';
-  document.getElementById('notes-preview').classList.remove('active');
-  document.getElementById('notes-title').value = '';
-  const editor = _notesGetEditor();
-  if (editor) editor.value = '';
-  _notesMode = 'edit';
-  // On mobile, show sidebar when no note is open
-  if (window.innerWidth <= 600 && !_notesSidebarOpen) {
-    _notesSidebarOpen = true;
-  }
-}
 
-function _notesUpdatePinBtn() {
-  const btn = document.getElementById('notes-pin-btn');
-  if (!btn) return;
-  const entry = _notesActive && _notesAllNotes.find(n => n.path === _notesActive.path);
-  const pinned = entry && entry.pinned;
-  btn.classList.toggle('pinned', !!pinned);
-  btn.title = pinned ? 'Unpin' : 'Pin to top';
-}
-async function _notesTogglePinActive() {
-  if (!_notesActive) return;
-  await _notesTogglePin(_notesActive.path);
-}
 
 // ── Pinned notes on home screen ──────────────────────────────────────────────
-let _pinnedNotesCache = [];
-async function _pinnedNoteUnpin(path) {
-  await _notesTogglePin(path);
-}
 
 // ── CRM / People ──────────────────────────────────────────────────────────────
 // (state vars hoisted before switchView — see above)
@@ -58063,7 +57694,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.473';
+const CACHE = 'amux-v0.9.474';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
