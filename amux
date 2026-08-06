@@ -928,7 +928,12 @@ except Exception:
 err = (d.get("error") or "") if isinstance(d, dict) else ""
 ok = isinstance(d, dict) and not err and d.get("ok") is not False
 if ok:
-    label = d.get("status") or d.get("title") or "ok"
+    # A caller whose write is NOT a status transition passes its own label
+    # (argv[2]). Without it this printed "<id> -> <current status>" for a
+    # tag-only write, which reads as a transition that silently did not
+    # happen \u2014 AC-222: I filed a bug against `needsyou` on exactly that
+    # misread, then routed around a working command with a raw PATCH.
+    label = (_argv[2] if len(_argv) > 2 else "") or d.get("status") or d.get("title") or "ok"
     print(d.get("id", "?"), "\u2192", label)
     sys.exit(0)
 sys.stderr.write(json.dumps(d) + "\n")
@@ -963,7 +968,7 @@ if "holding" in e or "doing" in e or "wip" in e:
     sys.exit(4)
 if "rev mismatch" in e:
     sys.exit(5)
-sys.exit(1)' "${1:-}" "${2:-}"
+sys.exit(1)' "${1:-}" "${2:-}" "${3:-}"
 }
 
 cmd_board() {
@@ -985,7 +990,10 @@ cmd_board() {
       body=$(TAGS="$cur" ASK="$ask" python3 -c "import os,json; b={'tags':json.loads(os.environ['TAGS'])}; a=os.environ['ASK'].strip(); b['desc_append']=('NEEDS-YOU: '+a) if a else b.get('desc_append'); print(json.dumps({k:v for k,v in b.items() if v is not None}))")
       result=$(curl -sk -X PATCH -H 'Content-Type: application/json' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" "$AMUX_API/api/board/$id")
-      echo "$result" | _board_outcome; return $?
+      # Label it as the TAG write it is. Without this the printer rendered the
+      # card's unchanged status ("AC-221 -> todo"), which reads as a failed
+      # transition (AC-222).
+      echo "$result" | _board_outcome "$id" "" "tagged needs:you"; return $?
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
@@ -1065,7 +1073,10 @@ types: code task chore doc research ops investigation decision escalation blocke
       body=$(T="$text" python3 -c "import os,json;print(json.dumps({'text':os.environ['T'].strip()}))")
       result=$(curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "$body" "$AMUX_API/api/board/$id/status-update")
-      echo "$result" | _board_outcome; return $?
+      # Same shape as the needsyou path: posting a status-UPDATE does not move
+      # the card, so printing its current status behind an arrow invites the
+      # same misread (AC-222).
+      echo "$result" | _board_outcome "$id" "" "status update posted"; return $?
       ;;
     claim)
       # Atomic claim (the assignment notifications tell every session to run
