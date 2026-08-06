@@ -31821,12 +31821,30 @@ const remoteHostname = remoteHost ? location.hostname : null;
 
 // Toast system
 let toastTimer = null;
+// Motion helper (AMUX-2430). Vanilla motion.dev, loaded from CDN. No-ops when
+// the CDN is unreachable (offline PWA) or the OS asks for reduced motion —
+// animation is a statement about what changed, never a dependency.
+function _anim(el, keyframes, opts) {
+  try {
+    if (!el || !window.Motion || !Motion.animate) return null;
+    if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) return null;
+    return Motion.animate(el, keyframes, Object.assign({ duration: 0.18, ease: 'easeOut' }, opts || {}));
+  } catch (e) { return null; }
+}
 function showToast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
+  const fresh = !el.classList.contains('visible');
   el.classList.add('visible');
+  if (fresh) _anim(el, { opacity: [0, 1], transform: ['translateY(8px)', 'translateY(0)'] });
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('visible'), 3000);
+  toastTimer = setTimeout(() => {
+    const a = _anim(el, { opacity: [1, 0] }, { duration: 0.22 });
+    // classList is the source of truth; the fade is decoration over it, so a
+    // missing Motion still hides the toast exactly as before.
+    if (a && a.finished) a.finished.then(() => { el.classList.remove('visible'); el.style.opacity = ''; });
+    else el.classList.remove('visible');
+  }, 3000);
 }
 
 // Modal: replaces confirm() / alert() — both blocked in PWA standalone mode
@@ -33166,8 +33184,16 @@ function _grpSetCollapsed(v) {
   if (strip) strip._want = '';   // force the guarded re-render to repaint
 }
 function _grpAccToggle() {
+  const expanding = _grpCollapsed;
   _grpSetCollapsed(!_grpCollapsed);
   render();
+  // Entrance only, applied AFTER render re-created the node (animating the old
+  // node is animating a corpse — render() replaces it). Collapse stays instant:
+  // the user asked to hide it, delay there is friction not information.
+  if (expanding) {
+    const b = document.querySelector('.grp-scope-body');
+    if (b) _anim(b, { opacity: [0, 1], transform: ['translateY(-5px)', 'translateY(0)'] });
+  }
 }
 
 function render() {
@@ -34234,6 +34260,7 @@ async function loadLayoutPreset(name) {
 async function deleteLayoutPreset(name) {
   if (!confirm('Delete preset "' + name + '"?')) return;
   await fetch('/api/layout-presets/' + encodeURIComponent(name), {method:'DELETE'});
+  showToast('Preset "' + name + '" deleted');
   _renderTabCustomizerMenu();
 }
 
@@ -36913,7 +36940,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.491';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.492';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41424,6 +41451,7 @@ function _dictModalToggle() {
 function _dictEditWord(id) { const w = _dictWords.find(x => x.id === id); if (w) _dictAddWord(w); }
 async function _dictDelWord(id) {
   await fetch(API + '/api/dictation/dict/' + id, { method: 'DELETE', headers: _authHeaders() });
+  showToast('Word removed from dictionary');
   _dictLoad();
 }
 
@@ -47321,7 +47349,7 @@ function renderScheduler(opts) {
       const trigLabel = s.trigger_on ? `&nbsp;&middot;&nbsp;<span style="color:var(--accent);font-size:0.65rem;">&#x26A1; ${esc((s.trigger_on||'').split(',').map(t=>t==='session_idle'?'idle':t==='board'?'board':t).join('+')).trim()}</span>` : '';
       const watchLabel = s.watch ? `&nbsp;&middot;&nbsp;<span style="color:var(--dim);font-size:0.65rem;">&#x1F441; watch</span>` : '';
       const doneLabel = s.done_pattern ? `&nbsp;&middot;&nbsp;<span style="color:var(--dim);font-size:0.65rem;">stop: <code style="font-size:0.6rem;">${esc(s.done_pattern.length > 20 ? s.done_pattern.slice(0,20)+'…' : s.done_pattern)}</code></span>` : '';
-      return `<div class="card sched-item" style="padding:9px 12px;">
+      return `<div class="card sched-item" data-sched-id="${esc(s.id)}" style="padding:9px 12px;">
         <div style="display:flex;align-items:flex-start;gap:8px;">
           <label class="sched-toggle-label" title="${s.enabled ? 'Disable' : 'Enable'}">
             <input type="checkbox" ${s.enabled ? 'checked' : ''}
@@ -47365,7 +47393,7 @@ function renderScheduler(opts) {
       const recLabel = s.schedule_expr || (s.sched_type === 'once' ? 'once' : (s.recurrence || 'recurring'));
       const runs = runMap[s.id] || [];
       const dots = runs.map(r => `<span class="sched-run-dot ${r.status === 'ok' ? 'ok' : 'err'}" title="${esc(r.status)}"></span>`).join('');
-      return `<div class="card sched-item" style="padding:8px 12px;">
+      return `<div class="card sched-item" data-sched-id="${esc(s.id)}" style="padding:8px 12px;">
         <div style="display:flex;align-items:flex-start;gap:8px;">
           <label class="sched-toggle-label" title="Enable">
             <input type="checkbox" onchange="toggleSchedEnabled('${esc(s.id)}', this.checked)"
@@ -49202,7 +49230,16 @@ async function saveSchedModal() {
 }
 async function deleteSchedule(id) {
   if (!confirm('Delete this schedule?')) return;
+  // Collapse the row FIRST — an instant repaint swallows the removal and reads
+  // as "where did it go / did I misclick" (Ethan: "deleting a schedule nothing
+  // is displayed and it just silently works"). Then say it worked: confirm()
+  // before is not feedback after.
+  const row = document.querySelector('[data-sched-id="' + CSS.escape(id) + '"]')
+    || document.getElementById('sched-row-' + id);
+  const a = row && _anim(row, { opacity: [1, 0], height: [row.offsetHeight + 'px', '0px'] }, { duration: 0.16 });
+  if (a && a.finished) { try { await a.finished; } catch (e) {} }
   await apiCall(API + '/api/schedules/' + id + '?by=dashboard', { method: 'DELETE' });
+  showToast('Schedule deleted (soft — restorable from the audit trail)');
   await fetchSchedules();
   renderCalendar();
   renderScheduler();
@@ -50186,7 +50223,7 @@ async function saveEvent(id) {
 }
 async function deleteEvent(id) {
   if (!confirm('Delete this event?')) return;
-  try { await fetch(API + '/api/cal-events/' + id, { method: 'DELETE' }); } catch (e) {}
+  try { await fetch(API + '/api/cal-events/' + id, { method: 'DELETE' }); showToast('Event deleted'); } catch (e) { showToast('Delete failed'); }
   closeEventModal();
   await fetchCalEvents();
 }
@@ -53090,6 +53127,7 @@ async function loadTeamSection() {
 
 async function deleteInvite(token) {
   await fetch('/api/org/invites/' + token, {method: 'DELETE'}).catch(() => {});
+  showToast('Invite revoked');
   loadTeamSection();
 }
 
@@ -54590,6 +54628,7 @@ async function _torrentAdd() {
 
 async function _torrentRemove(gid) {
   await fetch(API + '/api/torrents/' + gid, { method: 'DELETE' });
+  showToast('Torrent removed');
   _torrentLoad();
 }
 
@@ -57969,6 +58008,7 @@ async function _jrnlSave() {
 async function _jrnlDelete(id) {
   if (!confirm('Delete this journal entry?')) return;
   await fetch('/api/journal/' + id, { method: 'DELETE' });
+  showToast('Journal entry deleted');
   _jrnlActiveId = null;
   await _journalLoad();
 }
@@ -58206,6 +58246,7 @@ async function _jrnlSaveConfig() {
 <script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/quilljs-markdown@latest/dist/quilljs-markdown.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/motion@11.11.17/dist/motion.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gridstack@7/dist/gridstack-all.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
@@ -58317,7 +58358,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.491';
+const CACHE = 'amux-v0.9.492';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
