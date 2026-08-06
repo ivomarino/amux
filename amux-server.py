@@ -26271,20 +26271,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      visible, not behind the Gate button. Kept visually quiet so it reads as
      the column's contract rather than competing with the cards. */
   /* Group chips on a worker card, and the panel they expand (AMUX-2362). */
-  /* Composer on an expanded worker card (AMUX-2368). */
-  .card-send { display:flex; gap:6px; align-items:flex-end; margin:6px 0 2px; }
-  .card-send-input { flex:1; min-width:0; resize:none; border-radius:8px;
-    border:1px solid var(--border); background:var(--bg); color:var(--text);
-    font-size:0.82rem; padding:7px 9px; font-family:inherit; }
-  .card-send-input:focus { outline:none; border-color:var(--accent); }
-  .card-send-btn { flex-shrink:0; min-width:44px; min-height:36px; border-radius:8px;
-    border:1px solid var(--border); background:var(--card); color:var(--accent);
-    cursor:pointer; font-size:0.95rem; -webkit-tap-highlight-color:transparent; }
-  .card-send-btn:hover, .card-send-btn:active { border-color:var(--accent); }
-  @media (max-width: 600px) {
-    .card-send-input { font-size:0.9rem; padding:9px 10px; }
-    .card-send-btn { min-height:44px; }
-  }
   .grp-chip { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
     font-size:0.66rem; font-weight:600; cursor:pointer; vertical-align:middle;
     background:rgba(88,166,255,0.14); color:var(--accent); border:1px solid transparent;
@@ -32588,11 +32574,7 @@ function render() {
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${(s.sched_on || s.sched_off) ? `<span class="sched-count-chip" title="${s.sched_on} enabled / ${s.sched_off} disabled schedule(s)" onclick="event.stopPropagation();openPeek('${esc(s.name)}');setTimeout(()=>setPeekTab('schedules'),400)" style="cursor:pointer;font-size:0.66rem;border:1px solid var(--border);border-radius:8px;padding:0 6px;font-family:var(--font-mono);"><span style="color:var(--green);font-weight:700;">${s.sched_on}</span><span style="color:var(--dim);">/</span><span style="color:${s.sched_off ? '#d29922' : 'var(--dim)'};">${s.sched_off}</span></span>` : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
-      ${isExp ? `<div class="card-send" onclick="event.stopPropagation();">
-        <textarea class="card-send-input" id="card-send-${escJs(s.name)}" rows="1" placeholder="Message ${esc(s.name)}\u2026"
-          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();_cardSend('${escJs(s.name)}');}"></textarea>
-        <button class="card-send-btn" onclick="_cardSend('${escJs(s.name)}')" title="Send (queues while offline)">${online ? '&#x27A4;' : '&#x23F3;'}</button>
-      </div>` : ''}
+
       ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
       ${!isExp && (schedOn + schedOff) ? `<div class="card-sched-count" onclick="event.stopPropagation();switchView('scheduler')" title="${schedOn} enabled, ${schedOff} disabled">&#x23F2; ${[schedOn ? `<span class="sched-on">${schedOn} on</span>` : '', schedOff ? `<span class="sched-off">${schedOff} off</span>` : ''].filter(Boolean).join(' &middot; ')}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
@@ -34323,29 +34305,6 @@ function hidePeekLoading() {
   if (ind) ind.style.display = 'none';
 }
 
-// Send from the worker list without opening the peek. Delegates to doSend(),
-// which already handles queueing, msg_id dedupe and the offline path — this adds
-// an entry point, not a second send.
-async function _cardSend(name) {
-  const el = document.getElementById('card-send-' + name);
-  if (!el) return;
-  const text = el.value.trim();
-  if (!text) { el.focus(); return; }
-  el.value = '';
-  el.disabled = true;
-  try {
-    await doSend(name, text);
-    // Say what happened. An action whose success changes nothing on screen must
-    // say so — the scheduler Run-now bug (AMUX-2363) was exactly this, and
-    // "queued" vs "sent" is the distinction the user actually needs offline.
-    if (typeof showToast === 'function') {
-      showToast(online ? ('Sent to ' + name) : ('Offline \u2014 queued for ' + name));
-    }
-  } finally {
-    el.disabled = false;
-  }
-}
-
 async function doSend(name, text) {
   showSendingIndicator();
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
@@ -34530,9 +34489,30 @@ async function sendFromInput(name) {
   inp.value = '';
   _draftClear(name);          // it left the composer — a restored copy would be a ghost
   inp.style.height = 'auto';
+  const wasOnline = online;
   await doSend(name, _expandAtMentions(text));
-  inp.style.borderColor = 'var(--green)';
-  setTimeout(() => { inp.style.borderColor = ''; }, 400);
+  // Same queue/send semantics as the peek composer. doSend() has always queued
+  // correctly when offline; the worker list just never SAID which happened — a
+  // 400ms green border reads identically for "delivered" and "sitting in a local
+  // queue until the server comes back". Those are different facts and the second
+  // one is the one you need.
+  inp.style.borderColor = wasOnline ? 'var(--green)' : '#d29922';
+  setTimeout(() => { inp.style.borderColor = ''; }, 600);
+  if (typeof showToast === 'function') {
+    showToast(wasOnline ? ('Sent to ' + name) : ('Offline \u2014 queued for ' + name));
+  }
+  _cardQueuedBadge(name);
+}
+
+// Mirror the peek's "queued" pill onto the card, so a worker with locally-queued
+// messages looks the same in both places rather than only in the peek.
+function _cardQueuedBadge(name) {
+  try {
+    const n = (offlineQueue || []).filter(op =>
+      (op.url || '').indexOf('/api/sessions/' + encodeURIComponent(name) + '/send') !== -1).length;
+    const btn = document.querySelector('#input-' + CSS.escape(name) + ' ~ button, .card[data-session="' + CSS.escape(name) + '"] .send-row button');
+    if (btn) btn.textContent = n ? ('\u23F3 ' + n) : 'Send';
+  } catch (e) {}
 }
 
 let _peekTab = 'terminal';
@@ -35845,7 +35825,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.458';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.459';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57405,7 +57385,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.458';
+const CACHE = 'amux-v0.9.459';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
