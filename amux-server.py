@@ -31732,10 +31732,10 @@ function _showUpgradeModal(d) {
       '<div style="font-size:1.15rem;font-weight:700;margin-bottom:6px;">' +
         (isBudget ? 'Your trial budget is used up' : 'Your trial has ended') + '</div>' +
       (isBudget && spent ? '<div style="color:#f0b429;font-size:1.05rem;font-weight:600;margin-bottom:10px;">$' + spent + ' of $' + budget + ' used</div>' : '') +
-      '<div style="color:#999;font-size:0.86rem;margin-bottom:16px;line-height:1.5;">Your workspace and sessions are safe. Upgrade to keep your agents running.</div>' +
+      '<div style="color:#999;font-size:0.86rem;margin-bottom:16px;line-height:1.5;">Your workspace and workers are safe. Upgrade to keep your agents running.</div>' +
       '<div style="background:#0f0f22;border:1px solid #2a2a4a;border-radius:10px;padding:14px 16px;text-align:left;margin-bottom:18px;">' +
         '<div style="color:#c4b5fd;font-size:0.82rem;font-weight:600;margin-bottom:8px;">What you get when you upgrade</div>' +
-        ['Your sessions made production-grade, with our team onboarding you',
+        ['Your workers made production-grade, with our team onboarding you',
          'A dedicated, isolated machine for your workloads',
          'Support and maintenance from the amux team',
          'Ongoing workflow creation, tuning, and teaching'].map(f =>
@@ -31767,7 +31767,7 @@ async function _loadCloudPlan() {
     sec.style.display = '';
     const lines = [];
     if (d.plan === 'pro') {
-      lines.push('<span style="color:#3fb950;font-weight:600;">Pro</span> — unlimited sessions');
+      lines.push('<span style="color:#3fb950;font-weight:600;">Pro</span> — unlimited workers');
     } else {
       lines.push('<span style="font-weight:600;color:var(--text);">Trial</span>');
       if (d.trial_ends_at) {
@@ -32229,7 +32229,7 @@ async function apikeySetupLogin() {
     if (sent) {
       showToast('Follow the URL in the terminal to authenticate');
     } else {
-      showToast('Session started — type /login in the terminal');
+      showToast('Worker started — type /login in the terminal');
     }
     // Poll for OAuth completion
     _pollForOAuth();
@@ -32252,7 +32252,7 @@ function _pollForOAuth() {
       const d = await r.json();
       if (d.has_oauth) {
         clearInterval(_oauthPollTimer);
-        showToast('Logged in successfully! Sessions will use your Claude account.');
+        showToast('Logged in successfully! Workers will use your Claude account.');
         // Hide banner if visible
         const banner = document.getElementById('no-apikey-banner');
         if (banner) banner.style.display = 'none';
@@ -32281,7 +32281,7 @@ async function apikeySetupSave() {
     if (m) m.style.display = 'none';
     const banner = document.getElementById('no-apikey-banner');
     if (banner) banner.style.display = 'none';
-    showToast('API key saved — sessions are ready to use.');
+    showToast('API key saved — workers are ready to use.');
   } catch(e) {
     if (err) err.textContent = 'Failed to save — try again';
     if (btn) btn.textContent = 'Save API key';
@@ -32708,7 +32708,7 @@ function openBulkActions() {
         + `</div>`;
     });
     html += `</div>`;
-    html += `<button class="btn primary" style="width:100%;" onclick="bulkSendContinueApiErr()">Send "continue" to ${apiErr.length} session${apiErr.length>1?'s':''}</button>`;
+    html += `<button class="btn primary" style="width:100%;" onclick="bulkSendContinueApiErr()">Send "continue" to ${apiErr.length} worker${apiErr.length>1?'s':''}</button>`;
     html += `</div>`;
   }
   // Bottom: one button to resume every LIMITED session at once (rate + credit).
@@ -32721,13 +32721,13 @@ function openBulkActions() {
   const _n = allLimited.length;
   if (_n) {
     html += `<div style="padding:12px 14px;border:1px solid var(--border);border-radius:10px;margin-bottom:10px;">`;
-    html += `<div style="font-weight:600;font-size:0.9rem;margin-bottom:8px;color:var(--dim);">&#x25B6; Continue all limited sessions</div>`;
-    html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:12px;">Send "continue" to every limited session (${_n}) at once. Rate-limited resume immediately; credit-limited resume only if you've already switched model or topped up credits (otherwise use the switch above).</div>`;
-    html += `<button class="btn" style="width:100%;" onclick="bulkContinueLimited()">Send &quot;continue&quot; to ${_n} limited session${_n === 1 ? '' : 's'}</button>`;
+    html += `<div style="font-weight:600;font-size:0.9rem;margin-bottom:8px;color:var(--dim);">&#x25B6; Continue all limited workers</div>`;
+    html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:12px;">Send "continue" to every limited worker (${_n}) at once. Rate-limited resume immediately; credit-limited resume only if you've already switched model or topped up credits (otherwise use the switch above).</div>`;
+    html += `<button class="btn" style="width:100%;" onclick="bulkContinueLimited()">Send &quot;continue&quot; to ${_n} limited worker${_n === 1 ? '' : 's'}</button>`;
     html += `</div>`;
   }
   if (!limited.length && !creditLimited.length) {
-    html += `<div style="padding:8px 0;text-align:center;color:var(--dim);font-size:0.82rem;">No limited sessions.</div>`;
+    html += `<div style="padding:8px 0;text-align:center;color:var(--dim);font-size:0.82rem;">No limited workers.</div>`;
   }
   body.innerHTML = html;
   document.getElementById('bulk-actions-overlay').classList.add('open');
@@ -32736,7 +32736,7 @@ async function bulkSwitchModel(model) {
   const matched = sessions.filter(s => s.credit_limited);
   if (!matched.length) { closeBulkActions(); return; }
   closeBulkActions();
-  showToast(`Switching ${matched.length} session${matched.length>1?'s':''} to ${model}…`);
+  showToast(`Switching ${matched.length} worker${matched.length>1?'s':''} to ${model}…`);
   const _send = (name, text) => fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
     method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
     body: JSON.stringify({ text })
@@ -32750,7 +32750,7 @@ async function bulkSwitchModel(model) {
   }));
   await new Promise(r => setTimeout(r, 1500));
   await Promise.all(matched.map(s => _send(s.name, 'continue')));
-  showToast(`Switched ${switched} session${switched>1?'s':''} to ${model} & resumed`);
+  showToast(`Switched ${switched} worker${switched>1?'s':''} to ${model} & resumed`);
 }
 function closeBulkActions() {
   document.getElementById('bulk-actions-overlay').classList.remove('open');
@@ -32766,7 +32766,7 @@ async function bulkContinueLimited() {
     if (!lim || seen.has(s.name)) return false;
     seen.add(s.name); return true;
   });
-  if (!targets.length) { showToast('No limited sessions to continue'); return; }
+  if (!targets.length) { showToast('No limited workers to continue'); return; }
   closeBulkActions();
   showToast(`Sending "continue" to ${targets.length} limited…`);
   const results = await Promise.all(targets.map(s =>
@@ -32777,7 +32777,7 @@ async function bulkContinueLimited() {
   ));
   const sent = results.filter(Boolean).length;
   const failed = results.length - sent;
-  showToast(`Sent "continue" to ${sent} limited session${sent === 1 ? '' : 's'}` + (failed ? ` — ${failed} failed` : ''));
+  showToast(`Sent "continue" to ${sent} limited worker${sent === 1 ? '' : 's'}` + (failed ? ` — ${failed} failed` : ''));
 }
 
 async function bulkSendContinue(cappedOnly) {
@@ -32797,7 +32797,7 @@ async function bulkSendContinue(cappedOnly) {
       sent++;
     } catch(e) {}
   }
-  showToast(`Sent "continue" to ${sent} session${sent>1?'s':''}`);
+  showToast(`Sent "continue" to ${sent} worker${sent>1?'s':''}`);
 }
 
 // Retry every session stopped on a transient API error. Sent through the normal
@@ -32820,7 +32820,7 @@ async function bulkSendContinueApiErr() {
       if (r.ok && !d.error) sent++; else failed++;
     } catch(e) { failed++; }
   }
-  showToast(`Sent "continue" to ${sent} session${sent === 1 ? '' : 's'}`
+  showToast(`Sent "continue" to ${sent} worker${sent === 1 ? '' : 's'}`
     + (failed ? ` — ${failed} failed` : ''));
 }
 
@@ -33713,7 +33713,7 @@ async function fetchSessions() {
       if (!window._peekEmbed) _fetchGitBranches(sessions);
     }
   } catch(e) {
-    console.error('fetch sessions:', e);
+    console.error('fetch workers:', e);
     consecutiveFailures++;
     if (consecutiveFailures >= 2 || navigator.onLine === false) {
       setOnline(false);
@@ -33741,7 +33741,7 @@ function updatePeekStatus() {
   const cmdInp = document.getElementById('peek-cmd-input');
   if (cmdInp) {
     cmdInp.placeholder = s.status === 'active'
-      ? 'Type a message (session is working)...'
+      ? 'Type a message (worker is working)...'
       : 'Type a message or drop a file...';
   }
   // Model badge (+ reasoning effort, Claude only)
@@ -33990,8 +33990,8 @@ function render() {
     if (_initialLoad) {
       el.innerHTML = '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
     } else {
-      el.innerHTML = '<div class="empty">No sessions yet.<br>Tap <strong>+</strong> to create one.' +
-        (!online ? '<br><span style="color:var(--yellow)">You\'re offline — sessions created now will sync when connected.</span>' : '') + '</div>';
+      el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
+        (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
@@ -34031,7 +34031,7 @@ function render() {
   if (filterModels.size) filtered = filtered.filter(s => filterModels.has(_modelClass(sessionConfiguredModel(s))));
   if (filterStatuses.size) filtered = filtered.filter(s => filterStatuses.has(_sessStatusKey(s)));
   if ((q || activeTag || filterProviders.size || filterModels.size || filterStatuses.size) && !filtered.length) {
-    el.innerHTML = '<div class="empty">No matching sessions.</div>';
+    el.innerHTML = '<div class="empty">No matching workers.</div>';
     _renderArchivedSection();
     _restoreCardFocus(focusedId);
     return;
@@ -34076,7 +34076,7 @@ function render() {
           ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Tags</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','groups','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
@@ -34132,7 +34132,7 @@ function render() {
       <div class="panel" onclick="event.stopPropagation()">
         ${isExp && s.task_name ? `<div class="card-task-name${taskDim ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span class="tn-label">Task:</span><span onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" style="cursor:pointer;">${esc(s.task_name)}</span>${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
-          ${s.session_created ? `<div class="timing-item"><span class="timing-label">Session</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
+          ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
           ${s.last_activity ? `<div class="timing-item"><span class="timing-label">Last interaction</span><span class="timing-value">${timeAgo(s.last_activity)}</span></div>` : ''}
         </div>` : ''}
@@ -34419,7 +34419,7 @@ function _renderBranchBadge(name, sessionBranch) {
   if (!displayBranch) return '';
   const isMain = _isBranchMain(displayBranch);
   const cls = gi && gi._conflict ? 'conflict' : isMain ? 'on-main' : 'on-branch';
-  const tip = gi && gi._conflict ? 'Another session shares this branch — risk of conflicts' : isMain ? 'On main — click to create a session branch' : 'Session branch';
+  const tip = gi && gi._conflict ? 'Another worker shares this branch — risk of conflicts' : isMain ? 'On main — click to create a worker branch' : 'Worker branch';
   const conflictWarn = gi && gi._conflict ? ' ⚠' : '';
   return `<div class="card-dir"><span class="branch-badge ${cls}" onclick="event.stopPropagation();showBranchPopover('${name}',event)" title="${tip}">⎇ ${esc(displayBranch)}${conflictWarn}</span></div>`;
 }
@@ -34477,8 +34477,8 @@ function _peekUpdateBranch() {
   const isMain = _isBranchMain(b), conflict = gi && gi._conflict;
   el.className = 'peek-dir-branch ' + (conflict ? 'conflict' : isMain ? 'on-main' : 'on-branch');
   el.textContent = '\u2387 ' + b + (conflict ? ' \u26A0' : '');
-  el.title = conflict ? 'Another session shares this branch — conflict risk'
-           : isMain ? ('On ' + b + ' — tap to make a session branch') : 'Session branch';
+  el.title = conflict ? 'Another worker shares this branch — conflict risk'
+           : isMain ? ('On ' + b + ' — tap to make a worker branch') : 'Worker branch';
   el.onclick = (e) => { e.stopPropagation(); showBranchPopover(peekSession, e); };
   el.style.display = '';
 }
@@ -34498,13 +34498,13 @@ function showBranchPopover(name, e) {
   if (hasBranch) {
     pop.innerHTML = `
       <div style="font-size:0.75rem;color:var(--dim);margin-bottom:6px;font-weight:600;">⎇ ${esc(displayBranch)}</div>
-      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another session shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated on session branch</div>'}
+      ${gi._conflict ? '<div style="font-size:0.78rem;color:var(--red);margin-bottom:6px;">⚠ Another worker shares this branch — conflicts possible</div>' : '<div style="font-size:0.78rem;color:var(--green);margin-bottom:6px;">✓ Isolated on worker branch</div>'}
       <button class="btn" style="width:100%;" onclick="document.querySelectorAll('.branch-popover').forEach(p=>p.remove())">Close</button>`;
   } else {
     const suggested = 'session/' + name;
     pop.innerHTML = `
-      <div style="font-size:0.75rem;color:var(--dim);margin-bottom:8px;font-weight:600;">⎇ Create session branch</div>
-      <div style="font-size:0.78rem;color:var(--dim);margin-bottom:8px;">Isolate changes from other sessions on <strong>${esc(gi.branch || 'main')}</strong></div>
+      <div style="font-size:0.75rem;color:var(--dim);margin-bottom:8px;font-weight:600;">⎇ Create worker branch</div>
+      <div style="font-size:0.78rem;color:var(--dim);margin-bottom:8px;">Isolate changes from other workers on <strong>${esc(gi.branch || 'main')}</strong></div>
       <input class="search-input" id="bp-input-${name}" value="${esc(suggested)}" style="font-size:0.82rem;margin-bottom:8px;">
       <div class="branch-popover-actions">
         <button class="btn primary" style="flex:1;" onclick="doCreateBranch('${name}')">Create &amp; checkout</button>
@@ -35221,7 +35221,7 @@ function toggleActiveDropdown() {
   }
   const running = sessions.filter(s => s.running);
   if (!running.length) {
-    dd.innerHTML = '<div class="active-dropdown-empty">No active sessions</div>';
+    dd.innerHTML = '<div class="active-dropdown-empty">No active workers</div>';
   } else {
     dd.innerHTML = running.map(s => `
       <div class="active-dropdown-item" onclick="event.stopPropagation();closeActiveDropdown();openPeek('${s.name}')">
@@ -35277,7 +35277,7 @@ function updateRateLimitPill() {
       (credit.length ? ' · ' + credit.length + ' model-limited' : '');
   } else {
     // Credit/model limits only — no reset time; the fix is a model switch.
-    txt.textContent = credit.length + ' session' + (credit.length>1?'s':'') +
+    txt.textContent = credit.length + ' worker' + (credit.length>1?'s':'') +
       ' hit a model limit — switch model (Bulk actions)';
   }
   pill.title = blocked.concat(credit).map(s => s.name).join(', ');
@@ -35314,8 +35314,8 @@ if (window._AMUX_DEFAULT_MODEL) {
 let editState = null;  // {session, field, current}
 function editField(session, field, current, provider) {
   closeAllMenus();
-  const titles = { name: 'Rename session', provider: 'Change provider', model: 'Change model', effort: 'Reasoning effort', dir: 'Change directory', desc: 'Set description', tags: 'Edit tags', task: 'Edit task label', duplicate: 'Duplicate session', clone: 'Clone & continue' };
-  const placeholders = { name: 'Session name', model: 'e.g. opus, sonnet, haiku', dir: window._cloudEmail ? '/root' : '/path/to/project', desc: 'Brief description...', tags: 'e.g. work, frontend, urgent', task: 'e.g. Fix login bug (blank to auto-generate)', duplicate: 'New session name', clone: 'New session name' };
+  const titles = { name: 'Rename worker', provider: 'Change provider', model: 'Change model', effort: 'Reasoning effort', dir: 'Change directory', desc: 'Set description', tags: 'Edit groups', task: 'Edit task label', duplicate: 'Duplicate worker', clone: 'Clone & continue' };
+  const placeholders = { name: 'Worker name', model: 'e.g. opus, sonnet, haiku', dir: window._cloudEmail ? '/root' : '/path/to/project', desc: 'Brief description...', tags: 'e.g. work, frontend, urgent', task: 'e.g. Fix login bug (blank to auto-generate)', duplicate: 'New worker name', clone: 'New worker name' };
   document.getElementById('edit-title').textContent = titles[field] || 'Edit';
   const inp = document.getElementById('edit-input');
   const sel = document.getElementById('edit-select');
@@ -35656,7 +35656,7 @@ function cloneSession(session) {
 
 async function newConversation(session) {
   closeAllMenus();
-  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\nThe next time you start this session, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
+  if (!await showConfirm('Start a fresh conversation for "' + worker + '"?\n\nThe next time you start this worker, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
   await apiCall(API + '/api/sessions/' + session + '/config', {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ new_conversation: true })
@@ -35695,7 +35695,7 @@ async function shareSession(session) {
 
 async function deleteSession(session) {
   closeAllMenus();
-  if (!await showConfirm('Delete session "' + session + '"?', 'Delete', true)) return;
+  if (!await showConfirm('Delete worker "' + worker + '"?', 'Delete', true)) return;
   await apiCall(API + '/api/sessions/' + session + '/delete', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
   expanded.delete(session);
   await fetchSessions();
@@ -35773,7 +35773,7 @@ async function doRestart(name) {
       if (pre.status === 404) sessionGone = true;
       else if (pre.ok) { const data = await pre.json(); if (!data.running) alreadyStopped = true; }
     } catch (e) {}
-    if (sessionGone) { showToast('Session no longer exists'); return; }
+    if (sessionGone) { showToast('Worker no longer exists'); return; }
     if (alreadyStopped) { await fetchSessions(); await doStart(name); return; }
     const stopResp = await apiCall(STOP_URL, { method: 'POST' });
     if (!stopResp) return;
@@ -35783,7 +35783,7 @@ async function doRestart(name) {
     while (Date.now() < deadline) {
       try {
         const r = await _fetchTimeout(INFO_URL, 3000);
-        if (r.status === 404) { showToast('Session no longer exists'); return; }
+        if (r.status === 404) { showToast('Worker no longer exists'); return; }
         if (r.ok) { const data = await r.json(); if (!data.running) { stopped = true; break; } }
       } catch (e) {}
       if (Date.now() >= deadline) break;
@@ -35883,7 +35883,7 @@ async function doSend(name, text) {
       const msg = d.message || 'not running';
       if (msg === 'not running') {
         const start = await showConfirm(
-          `Session "${name}" is not running.\n\nStart it and resend?`, 'Start & Send', false);
+          `Worker "${name}" is not running.\n\nStart it and resend?`, 'Start & Send', false);
         if (start) {
           await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/start', { method: 'POST' });
           showToast('Starting ' + name + '...');
@@ -36099,7 +36099,7 @@ async function loadPeekTranscript(showLoading) {
     const d = await r.json();
     if (_peekTab !== 'transcript' || peekSession !== name) return;
     if (d.empty || !d.output) {
-      body.innerHTML = '<div style="color:var(--dim);padding:20px;">No JSONL transcript found for this session.</div>';
+      body.innerHTML = '<div style="color:var(--dim);padding:20px;">No JSONL transcript found for this worker.</div>';
       if (status) status.textContent = '';
       return;
     }
@@ -36786,7 +36786,7 @@ async function savePeekInstructions(apply) {
   });
   if (r && status) {
     const d = await r.json().catch(() => ({}));
-    status.textContent = d.applied ? 'Saved & sent to session' : 'Saved';
+    status.textContent = d.applied ? 'Saved & sent to worker' : 'Saved';
     setTimeout(() => { if (status) status.textContent = ''; }, 3000);
   }
 }
@@ -36803,7 +36803,7 @@ function _steeringRender() {
   const list = document.getElementById('peek-steering-list');
   countEl.textContent = queue.length ? queue.length + ' queued' : 'No queued messages';
   if (!queue.length) {
-    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:20px 0;text-align:center;">No steering messages queued.<br>Send a message while the session is active to queue it.</div>';
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:20px 0;text-align:center;">No steering messages queued.<br>Send a message while the worker is active to queue it.</div>';
   } else {
     list.innerHTML = queue.map(m => {
       const ago = timeAgo(m.queued_at);
@@ -37412,12 +37412,12 @@ function renderPeekIssues() {
   const items = _bqFilter(scoped, _peekIssuesQuery);
   const _q = (_peekIssuesQuery || '').trim();
   count.textContent = !scoped.length ? ''
-    : _q ? items.length + ' of ' + scoped.length + (allScope ? ' · all sessions' : '')
-         : scoped.length + ' issue' + (scoped.length === 1 ? '' : 's') + (allScope ? ' · all sessions' : '');
+    : _q ? items.length + ' of ' + scoped.length + (allScope ? ' · all workers' : '')
+         : scoped.length + ' issue' + (scoped.length === 1 ? '' : 's') + (allScope ? ' · all workers' : '');
   // Scope toggle label/active state
   const scopeBtn = document.getElementById('piv-scope');
   if (scopeBtn) {
-    scopeBtn.textContent = allScope ? 'All sessions' : 'This session';
+    scopeBtn.textContent = allScope ? 'All workers' : 'This worker';
     scopeBtn.classList.toggle('primary', allScope);
   }
   // Tab badge always reflects THIS session's count, regardless of view scope.
@@ -37446,7 +37446,7 @@ function renderPeekIssues() {
     // empty when a query simply matched nothing sends you looking for a bug.
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 4px;">' +
       (_q ? 'No issues match <b>' + esc(_q) + '</b>' + (scoped.length ? ' (' + scoped.length + ' hidden)' : '')
-          : allScope ? 'No issues on the board yet.' : 'No issues for this session yet.') + '</div>';
+          : allScope ? 'No issues on the board yet.' : 'No issues for this worker yet.') + '</div>';
     return;
   }
 
@@ -37855,7 +37855,7 @@ async function saveGlobalMemory() {
     });
     _globalMemLoaded = false; // force reload next open
     save.textContent = 'Saved!';
-    showToast('Global memory saved — all sessions will see it');
+    showToast('Global memory saved — all workers will see it');
     setTimeout(() => { save.disabled = false; save.textContent = 'Save'; }, 1500);
   } catch(e) {
     save.disabled = false; save.textContent = 'Save';
@@ -37904,7 +37904,7 @@ async function _offlineCapSet(n) {
   } catch(e) {}
   await _offlineTrimToCap();      // shrinking the cap must evict NOW, not next sync
   _offlineInfoRefresh();
-  showToast('Offline cache limit: ' + n + ' sessions');
+  showToast('Offline cache limit: ' + n + ' workers');
 }
 // FIFO eviction by last-touched time. Shared by the post-sync prune and the
 // settings change, so both use one definition of "oldest".
@@ -38003,7 +38003,7 @@ async function _offlinePrefetch(manual) {
   _prefetchRunning = false;
   if (manual) {
     _offlineSyncStatus('');
-    showToast(`Offline ready: ${Object.keys(_peekIndex).length} sessions` +
+    showToast(`Offline ready: ${Object.keys(_peekIndex).length} workers` +
               (fetched ? ` · ${(bytes/1024).toFixed(0)}KB new` : ' · already current'));
   }
   render();   // repaint cached badges
@@ -39161,7 +39161,7 @@ function _peekEarlierHTML() {
   const bar = _peekEarlier.done
     ? '<div class="peek-earlier-bar">&mdash; beginning of log &mdash;</div>'
     : '<div class="peek-earlier-bar" onclick="_peekLoadEarlier()">&#x25B2; Load earlier output' +
-      (_peekEarlier.chunks.length ? '' : ' (session log)') + '</div>';
+      (_peekEarlier.chunks.length ? '' : ' (worker log)') + '</div>';
   const blocks = _peekEarlier.chunks.length
     ? '<div class="peek-earlier-block">' + _peekEarlier.chunks.join('') + '</div>' +
       '<div class="peek-earlier-bar">&mdash; end of log &middot; live view below &mdash;</div>'
@@ -39178,7 +39178,7 @@ async function _peekLoadEarlier() {
       { headers: _authHeaders() });
     if (peekSession !== name) return;
     if (!r.ok) {
-      showToast('No saved log for this session');
+      showToast('No saved log for this worker');
       if (r.status === 404) _peekEarlier.hidden = true;
     } else {
       const text = await r.text();
@@ -39591,7 +39591,7 @@ async function _smRefresh() {
   }
   if (!Array.isArray(items) || !items.length) {
     listEl.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px 12px;text-align:center;">'
-      + (_smScope === 'all' ? 'No saved messages on any session yet.' : 'No saved messages for this session yet.')
+      + (_smScope === 'all' ? 'No saved messages on any worker yet.' : 'No saved messages for this worker yet.')
       + '<br>Type above and tap Save.</div>';
     return;
   }
@@ -39969,8 +39969,8 @@ function _showSteerPrompt(text) {
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:400;display:flex;align-items:center;justify-content:center;';
     const box = document.createElement('div');
     box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:400px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,0.4);';
-    box.innerHTML = `<div style="font-weight:600;margin-bottom:8px;">Session is working</div>
-      <div style="font-size:0.85rem;color:var(--dim);margin-bottom:12px;">This session is actively running. How should your message be delivered?</div>
+    box.innerHTML = `<div style="font-weight:600;margin-bottom:8px;">Worker is working</div>
+      <div style="font-size:0.85rem;color:var(--dim);margin-bottom:12px;">This worker is actively running. How should your message be delivered?</div>
       <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:0.82rem;margin-bottom:16px;max-height:60px;overflow:hidden;word-break:break-word;">${text.length > 120 ? text.slice(0,120) + '…' : text}</div>
       <div style="display:flex;gap:8px;justify-content:flex-end;">
         <button class="btn" id="steer-cancel" style="font-size:0.82rem;">Cancel</button>
@@ -40025,12 +40025,12 @@ async function peekLoadLogIntoSession() {
       if (d && typeof d.size === 'number') {
         const mb = d.size / (1024 * 1024);
         sizeNote = mb >= 1 ? ` (~${mb.toFixed(1)} MB)` : ` (~${Math.round(d.size/1024)} KB)`;
-        if (mb > 5 && !confirm('Your session log is ' + mb.toFixed(1) + ' MB. Loading it will eat a lot of context. Continue?')) return;
+        if (mb > 5 && !confirm('Your worker log is ' + mb.toFixed(1) + ' MB. Loading it will eat a lot of context. Continue?')) return;
       }
     }
   } catch(e) {}
-  const msg = 'Please use your Read tool to read your full session log at ' + logPath + sizeNote +
-    ' — this is the complete terminal history (ANSI-stripped) of everything you have done in this amux session. ' +
+  const msg = 'Please use your Read tool to read your full worker log at ' + logPath + sizeNote +
+    ' — this is the complete terminal history (ANSI-stripped) of everything you have done in this amux worker. ' +
     'Use it as context for what we work on next. If the file is large, read it in chunks.';
   await doSend(sess, msg);
   showToast('Asked ' + sess + ' to read its full log');
@@ -40085,7 +40085,7 @@ let _channelLastTs = 0;
 
 function channelOpen(me, other, prefillText) {
   if (!me || !other || me === other) {
-    showToast('Cannot open channel: ' + (!me?'no source':!other?'no target':'same session'));
+    showToast('Cannot open channel: ' + (!me?'no source':!other?'no target':'same worker'));
     return;
   }
   _channelMe = me;
@@ -40260,7 +40260,7 @@ function _expandAtMentions(text) {
   const hints = mentioned.map(n =>
     `  @${n} → POST ${base}/api/sessions/${n}/send  {"text":"<msg>"}`
   ).join('\n');
-  return rewritten + '\n\n[amux: @-mentions above are amux sessions, NOT files. Reach them via HTTP API, never tmux directly]\n' + hints;
+  return rewritten + '\n\n[amux: @-mentions above are amux workers, NOT files. Reach them via HTTP API, never tmux directly]\n' + hints;
 }
 
 // ── @mention helpers ──
@@ -40394,7 +40394,7 @@ const _ACTION_CHIPS = [
     { id: 'yes', label: 'Yes', action: 'send', value: 'yes', desc: 'Send "yes"' },
     { id: 'no', label: 'No', action: 'send', value: 'no', desc: 'Send "no"' },
     { id: 'log', label: '\uD83D\uDCC4 Log', action: 'special', value: 'downloadLog', desc: 'Download terminal log' },
-    { id: 'sendlog', label: '\uD83D\uDCE5 Load log', action: 'special', value: 'sendLog', desc: 'Tell the session to read its full ~/.amux/logs file as context' },
+    { id: 'sendlog', label: '\uD83D\uDCE5 Load log', action: 'special', value: 'sendLog', desc: 'Tell the worker to read its full ~/.amux/logs file as context' },
     { id: 'transcripts', label: '\uD83D\uDCBE Transcripts', action: 'special', value: 'showTranscripts', desc: 'Conversation transcripts' },
 ];
 function _getAllChips() {
@@ -40966,7 +40966,7 @@ async function _voiceStart() {
   const apiKey = window._GOOGLE_API_KEY;
   if (!apiKey) { showToast('Set GOOGLE_API_KEY in ~/.amux/server.env'); return; }
   const session = peekSession;
-  if (!session) { showToast('Open a session first'); return; }
+  if (!session) { showToast('Open a worker first'); return; }
 
   // Request mic
   try {
@@ -41003,16 +41003,16 @@ async function _voiceStart() {
         },
         systemInstruction: { parts: [{ text:
           'You are a voice assistant for amux, a terminal multiplexer. '
-          + 'The user is interacting with session "' + session + '". '
-          + 'You can send commands or messages to their terminal session using the send_to_session tool. '
+          + 'The user is interacting with worker "' + worker + '". '
+          + 'You can send commands or messages to their terminal worker using the send_to_session tool. '
           + 'Keep responses concise and conversational. '
-          + 'Here is recent session output for context:\\n' + recentOutput.replace(/"/g, '\\"').slice(0, 1500)
+          + 'Here is recent worker output for context:\\n' + recentOutput.replace(/"/g, '\\"').slice(0, 1500)
         }] },
         tools: [{ functionDeclarations: [{
           name: 'send_to_session',
-          description: "Send a text message or command to the user's active terminal session. Use this when the user asks you to run a command, type something, or send input to their session.",
+          description: "Send a text message or command to the user's active terminal worker. Use this when the user asks you to run a command, type something, or send input to their worker.",
           parameters: { type: 'OBJECT', properties: {
-            message: { type: 'STRING', description: 'The text/command to send to the session' }
+            message: { type: 'STRING', description: 'The text/command to send to the worker' }
           }, required: ['message'] }
         }] }]
       }
@@ -41050,7 +41050,7 @@ async function _voiceStart() {
           _voiceWs.send(JSON.stringify({
             toolResponse: { functionResponses: [{
               id: fc.id, name: fc.name,
-              response: { result: { success: true, message: 'Sent to session' } }
+              response: { result: { success: true, message: 'Sent to worker' } }
             }] }
           }));
         }
@@ -41462,7 +41462,7 @@ function _populateCmdHistorySessions(presetSession) {
   const desired = (presetSession != null) ? presetSession : sel.value;
   const names = [...new Set(_cmdHistory.map(e => typeof e === 'string' ? '' : (e.session || '')).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b));
-  sel.innerHTML = '<option value="">All sessions</option>' + names.map(n => {
+  sel.innerHTML = '<option value="">All workers</option>' + names.map(n => {
     const safe = n.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     return '<option value="' + safe + '">' + safe + '</option>';
   }).join('');
@@ -41625,7 +41625,7 @@ function _msgCardChip(cardId) {
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
   const st = c ? (c.status || 'todo') : '';
-  const undec = c && ((c.log || '').indexOf('capture: session prompt') !== -1) && st === 'todo';
+  const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
   return '<span class="msg-card-chip" onclick="event.stopPropagation();switchView(\'board\');setTimeout(() => openBoardDetail(\'' + escJs(cardId) + '\'), 250);" '
     + 'title="' + esc(c ? (c.title || '') : 'card no longer on the board') + (lastCommit ? '\n' + esc(lastCommit) : '') + '" '
@@ -41810,8 +41810,8 @@ function _peekMessagesRender() {
   // session that has plenty of human messages.
   const _fLbl = (_MSG_KIND[_peekMsgFilter] || {}).label;
   const _empty = q ? 'No matches.'
-    : (_fLbl ? 'No ' + _fLbl.toLowerCase() + ' messages for this session.'
-             : 'No messages sent to this session yet.');
+    : (_fLbl ? 'No ' + _fLbl.toLowerCase() + ' messages for this worker.'
+             : 'No messages sent to this worker yet.');
   // Selection toolbar (AMUX-2319), mirroring the global tab. Only DELIVERED
   // history is selectable - the pending block above is a separate render path
   // and a message that has not arrived once cannot be re-sent.
@@ -42326,7 +42326,7 @@ function _dictRenderDict() {
   let html = '<div class="dict-dictbar"><span class="dict-dicthint">Terms and names amux should always spell correctly '
     + 'in your dictation.</span><button class="btn primary" onclick="_dictAddWord()">Add new</button></div>';
   if (!_dictWords.length) {
-    html += '<div class="dict-empty">No words yet.<br><span style="font-size:0.78rem">Add jargon, session names, '
+    html += '<div class="dict-empty">No words yet.<br><span style="font-size:0.78rem">Add jargon, worker names, '
       + 'people — or fix a misspelling the model keeps making.</span></div>';
   } else {
     html += _dictWords.map(w => '<div class="dict-wordrow">'
@@ -42429,7 +42429,7 @@ function _peekCostLoad() {
     .then(d => {
       if (peekSession !== sess) return;   // switched away
       if (d.error) { body.innerHTML = '<div style="color:var(--red);padding:16px;">' + esc(d.error) + '</div>'; return; }
-      if (!d.total_turns) { body.innerHTML = '<div style="color:var(--dim);padding:16px;">No token usage recorded for this session in this window.</div>'; return; }
+      if (!d.total_turns) { body.innerHTML = '<div style="color:var(--dim);padding:16px;">No token usage recorded for this worker in this window.</div>'; return; }
       body.innerHTML = _costRender(d, { perSession: true });
     })
     .catch(() => { body.innerHTML = '<div style="color:var(--dim);padding:16px;">Failed to load.</div>'; });
@@ -42477,7 +42477,7 @@ function _msgCopyBtn(btn, encText) {
 // Global Messages view: clicking a row opens that session's peek AND inserts the
 // message into its composer (prefix-stripped), ready to edit/resend.
 function _msgOpenInsert(sess, encText) {
-  if (!sess) { showToast('No session recorded for this message'); return; }
+  if (!sess) { showToast('No worker recorded for this message'); return; }
   const text = _msgStripPrefix(decodeURIComponent(encText));
   openPeek(sess);
   setTimeout(() => {
@@ -42748,7 +42748,7 @@ function setLogSearchMode(on) {
   const btn = document.getElementById('log-search-btn');   // legacy toolbar button (may be absent)
   if (btn) btn.classList.toggle('active', logSearchMode);
   const si = document.getElementById('search-input');
-  if (si) si.placeholder = logSearchMode ? 'Search session logs...' : 'Search sessions...';
+  if (si) si.placeholder = logSearchMode ? 'Search worker logs...' : 'Search workers...';
   _logMatches = {};
   if (logSearchMode && searchQuery) {
     clearTimeout(_logSearchTimer);
@@ -42790,7 +42790,7 @@ function renderFilterOptions() {
       const on = filterStatuses.has(k);
       const n = live.filter(x => _sessStatusKey(x) === k).length;
       return `<button class="filter-chip${on?' on':''}" onclick="toggleStatusFilter('${k}')">${_STATUS_LABELS[k]}<span class="filter-chip-n">${n}</span></button>`;
-    }).join('') : '<span class="filter-hint">No sessions.</span>';
+    }).join('') : '<span class="filter-hint">No workers.</span>';
   }
   // Provider chips — options are the providers actually present, plus any selected.
   const provs = [...new Set(live.map(sessionProvider))].filter(Boolean);
@@ -42801,7 +42801,7 @@ function renderFilterOptions() {
     const on = filterProviders.has(p);
     const n = live.filter(s => sessionProvider(s) === p).length;
     return `<button class="filter-chip${on?' on':''}" onclick="toggleProviderFilter('${escJs(p)}')">${esc(_PROVIDER_LABELS[p]||p)}<span class="filter-chip-n">${n}</span></button>`;
-  }).join('') : '<span class="filter-hint">No sessions.</span>';
+  }).join('') : '<span class="filter-hint">No workers.</span>';
   // Model-type chips
   const mods = [...new Set(live.map(s => _modelClass(sessionConfiguredModel(s))))].filter(Boolean);
   filterModels.forEach(m => { if (!mods.includes(m)) mods.push(m); });
@@ -42811,7 +42811,7 @@ function renderFilterOptions() {
     const on = filterModels.has(m);
     const n = live.filter(s => _modelClass(sessionConfiguredModel(s)) === m).length;
     return `<button class="filter-chip${on?' on':''}" onclick="toggleModelFilter('${escJs(m)}')">${esc(_mLabel(m))}<span class="filter-chip-n">${n}</span></button>`;
-  }).join('') : '<span class="filter-hint">No sessions.</span>';
+  }).join('') : '<span class="filter-hint">No workers.</span>';
 }
 function toggleProviderFilter(p) {
   if (filterProviders.has(p)) filterProviders.delete(p); else filterProviders.add(p);
@@ -43947,7 +43947,7 @@ async function _libOpen() {
     _libData = d; _libOpenedPath = _filesPath;
     _libBuildFacet('lib-author', d.facets.authors, 'All authors');
     _libBuildFacet('lib-format', d.facets.formats, 'All formats');
-    _libBuildFacet('lib-tag', d.facets.tags, 'All tags');
+    _libBuildFacet('lib-tag', d.facets.tags, 'All groups');
     document.getElementById('files-library').style.display = 'flex';
     document.getElementById('fe-scroll').style.display = 'none';
     document.getElementById('fe-status').style.display = 'none';
@@ -45062,7 +45062,7 @@ async function openConnect() {
       </div>`
     ).join('');
   } catch(e) {
-    el.innerHTML = '<div class="connect-empty">Failed to load sessions.</div>';
+    el.innerHTML = '<div class="connect-empty">Failed to load workers.</div>';
   }
 }
 function closeConnect() {
@@ -45134,7 +45134,7 @@ function closeConnectIterm2() {
 async function connectIterm2Pane() {
   if (!_iterm2SelectedPaneId) return;
   const name = document.getElementById('iterm2-session-name').value.trim();
-  if (!name) { showToast('Enter a session name'); return; }
+  if (!name) { showToast('Enter a worker name'); return; }
   const btn = document.getElementById('iterm2-connect-btn');
   btn.disabled = true;
   btn.textContent = 'Connecting…';
@@ -45440,7 +45440,7 @@ async function submitCreate() {
   }
   if (r.status === 409) {
     const nameEl = document.getElementById('create-name');
-    showToast('A session named “' + name + '” already exists — pick another name');
+    showToast('A worker named “' + name + '” already exists — pick another name');
     if (nameEl) { nameEl.focus({ preventScroll: true }); nameEl.select && nameEl.select(); }
     return;   // leave the dialog open so the name can be changed
   }
@@ -46094,7 +46094,7 @@ function setLayoutMode(mode) {
 // can sit at the top looking busy. Sorting by the last thing a PERSON sent
 // answers "where did I leave off", which is a different question.
 const _SORT_OPTS = [
-  { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other sessions' },
+  { id: 'natural', label: 'Recent activity',     hint: 'Any traffic, including schedules and other workers' },
   { id: 'human',   label: 'Last message from me', hint: 'Ignores schedulers and session-to-session' },
   { id: 'alpha',   label: 'Name (A–Z)',      hint: 'Stable — the order stops shifting under you' },
   { id: 'status',  label: 'Status',               hint: 'Active, then waiting, then idle, then stopped' },
@@ -47115,7 +47115,7 @@ function _mapRenderTags() {
   if (_mapFilterTags.size >= 2) {
     const andMode = _mapSettings.tagMode === 'and';
     html += '<button class="map-tag-chip map-tag-mode" onclick="_mapToggleTagMode()" title="' +
-      (andMode ? 'Matching pins with ALL selected tags — click for ANY' : 'Matching pins with ANY selected tag — click for ALL') +
+      (andMode ? 'Matching pins with ALL selected groups — click for ANY' : 'Matching pins with ANY selected group — click for ALL') +
       '" style="font-weight:700;letter-spacing:0.5px;">' + (andMode ? 'AND' : 'OR') + '</button>';
   }
   el.innerHTML = html;
@@ -47461,7 +47461,7 @@ function _mapOpenPinModal(id, latlng) {
   const pinTags = pin ? (pin.tags||[]) : [];
   const tagsRow = document.getElementById('map-pin-tags-row');
   if (_mapTags.length === 0) {
-    tagsRow.innerHTML = '<span style="font-size:0.78rem;color:var(--dim)">No tags yet \u2014 add from sidebar</span>';
+    tagsRow.innerHTML = '<span style="font-size:0.78rem;color:var(--dim)">No groups yet \u2014 add from sidebar</span>';
   } else {
     tagsRow.innerHTML = _mapTags.map(function(tag) {
       const checked = pinTags.includes(tag.id);
@@ -47539,7 +47539,7 @@ function _mapEditTag(id) { _mapOpenTagModal(id); }
 function _mapOpenTagModal(id) {
   _mapEditingTag = id;
   const tag = id ? _mapTags.find(function(t) { return t.id === id; }) : null;
-  document.getElementById('map-tag-modal-title').textContent = tag ? 'Edit Tag' : 'New Tag';
+  document.getElementById('map-tag-modal-title').textContent = tag ? 'Edit Group' : 'New Group';
   document.getElementById('map-tag-name').value = tag ? tag.name : '';
   document.getElementById('map-tag-color').value = tag ? tag.color : '#' + Math.floor(Math.random()*0xffffff).toString(16).padStart(6,'0');
   document.getElementById('map-tag-delete-btn').style.display = tag ? '' : 'none';
@@ -47566,7 +47566,7 @@ function _mapSaveTag() {
 }
 
 function _mapDeleteTag() {
-  if (!_mapEditingTag || !confirm('Delete this tag? It will be removed from all pins.')) return;
+  if (!_mapEditingTag || !confirm('Delete this group? It will be removed from all pins.')) return;
   _mapPins.forEach(function(pin) { pin.tags = (pin.tags||[]).filter(function(t) { return t !== _mapEditingTag; }); });
   _mapTags = _mapTags.filter(function(t) { return t.id !== _mapEditingTag; });
   _mapFilterTags.delete(_mapEditingTag);
@@ -48038,7 +48038,7 @@ function renderStats() {
     {label:'Total tracked',   value:_logsEvents.length,        icon:'&#x1F4CA;'},
     {label:'Errors (24h)',    value:errCount,                  icon:'&#x274C;', hi: errCount>0},
     {label:'Board created',   value:boardCreates,              icon:'&#x1F4CB;'},
-    {label:'Sessions started',value:sessionStarts,             icon:'&#x25B6;'},
+    {label:'Workers started',value:sessionStarts,             icon:'&#x25B6;'},
     {label:'Messages sent',   value:msgSent,                   icon:'&#x1F4AC;'},
   ];
   let html = '<div class="stats-grid">';
@@ -48051,7 +48051,7 @@ function renderStats() {
   const topSessions = Object.entries(sessionActivity).sort((a,b)=>b[1]-a[1]).slice(0,6);
   if (topSessions.length) {
     html += '<div class="stat-card" style="margin-top:0;">';
-    html += '<div style="font-size:0.73rem;font-weight:700;color:var(--text);margin-bottom:10px;">Most Active Sessions (24h)</div>';
+    html += '<div style="font-size:0.73rem;font-weight:700;color:var(--text);margin-bottom:10px;">Most Active Workers (24h)</div>';
     const maxVal = topSessions[0][1];
     for (const [s, cnt] of topSessions) {
       const pct = Math.round((cnt/maxVal)*100);
@@ -48243,7 +48243,7 @@ function renderScheduler(opts) {
     listEl.innerHTML = `<div style="text-align:center;padding:40px 0;color:var(--dim);">
       <div style="font-size:2rem;margin-bottom:10px;">&#x23F0;</div>
       <div style="font-weight:600;font-size:0.9rem;margin-bottom:6px;color:var(--text);">No schedules yet</div>
-      <div style="font-size:0.82rem;">Create a schedule to run commands in sessions on a recurring timer.</div>
+      <div style="font-size:0.82rem;">Create a schedule to run commands in workers on a recurring timer.</div>
     </div>`;
   } else {
     const renderCard = (s) => {
@@ -48256,7 +48256,7 @@ function renderScheduler(opts) {
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
       const sessLink = s.session
-        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('sessions');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
+        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
         : `<span style="color:var(--dim);">(shell)</span>`;
       const nextRel = s.next_run ? `▶ <strong style="color:var(--text);" title="${s.next_run}">${relTime(s.next_run)}</strong>` : '';
       // Measured cost badge (MG audit #1): fires last 24h + fleet share; red
@@ -48643,7 +48643,7 @@ function _beTagRenderChips(prefix) {
     chip.innerHTML = esc(t) + '<span class="be-tag-chip-remove" onclick="event.stopPropagation();_beTagRemove(' + JSON.stringify(prefix) + ',' + JSON.stringify(t) + ')">\u00d7</span>';
     wrap.insertBefore(chip, inp);
   });
-  inp.placeholder = tags.length ? '' : 'Add tag\u2026';
+  inp.placeholder = tags.length ? '' : 'Add group\u2026';
 }
 
 function _beTagInputUpdate(prefix) {
@@ -49102,13 +49102,13 @@ function _bqFilter(items, q) {
 // not data, so they cannot be deleted or drift. User views sync via /api/prefs
 // so a view saved on the desktop is there on the phone.
 const _BOARD_BUILTIN_VIEWS = [
-  { id: '_working',  name: 'Working now', q: 'is:working is:open',        hint: 'Cards whose session is running right now' },
-  { id: '_needsyou', name: 'Needs you',   q: 'is:needsyou',  hint: 'Blocked on you: your own cards, cards a session marked needs-human, or a session at a prompt/model gate' },
+  { id: '_working',  name: 'Working now', q: 'is:working is:open',        hint: 'Cards whose worker is running right now' },
+  { id: '_needsyou', name: 'Needs you',   q: 'is:needsyou',  hint: 'Blocked on you: your own cards, cards a worker marked needs-human, or a worker at a prompt/model gate' },
   { id: '_armed',    name: 'Armed',       q: 'is:armed',                  hint: 'Tripwires and watches: waiting on an event, never auto-picked. is:armedstale for ones nobody has revisited in 7d+' },
   { id: '_rotting',  name: 'Rotting',     q: 'is:rotting',                hint: 'Claimed in-flight, session idle 7d+'},
-  { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no session can execute it' },
+  { id: '_orphan',   name: 'Unowned',     q: 'is:orphan is:open',         hint: 'Open, but no worker can execute it' },
   { id: '_mine',     name: 'Mine',        q: 'owner:human is:open',       hint: 'Your own issues, not the agent cards' },
-  { id: '_archived', name: 'Archived',    q: 'is:archived',               hint: 'Cards belonging to archived sessions' },
+  { id: '_archived', name: 'Archived',    q: 'is:archived',               hint: 'Cards belonging to archived workers' },
 ];
 let _boardViews = [];        // user-saved: [{id,name,q}]
 let _boardActiveView = '';   // id of the applied view, '' = none
@@ -49349,10 +49349,10 @@ function _boardQueryHelp() {
     '<div style="font-size:0.8rem;line-height:1.6">'
     + '<p style="margin:0 0 8px;color:var(--dim)">Terms are AND-ed. Comma-separate to OR within a key. Prefix <code>-</code> to negate. Quote phrases.</p>'
     + '<p style="margin:0 0 4px"><b>Fields</b><br><code>status: worker: owner: type: group: id: shepherd: creator:</code></p>'
-    + '<p style="margin:0 0 4px"><b>Derived</b> (joined against live session state)<br>'
+    + '<p style="margin:0 0 4px"><b>Derived</b> (joined against live worker state)<br>'
     + '<code>is:open is:closed is:stale is:rotting is:working is:waiting is:gated is:offline is:orphan is:pinned is:overdue is:folded</code></p>'
     + '<p style="margin:0 0 4px"><b>Age</b><br><code>updated:&gt;7d created:&lt;3d updated:&gt;36h</code></p>'
-    + '<p style="margin:8px 0 0;color:var(--dim)">Example: <code>status:doing -session:none updated:&gt;14d</code></p>'
+    + '<p style="margin:8px 0 0;color:var(--dim)">Example: <code>status:doing -worker:none updated:&gt;14d</code></p>'
     + '</div>', 'Close');
 }
 
@@ -49377,9 +49377,9 @@ function renderBoardFilters() {
   const topTags = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).slice(0, 12);
   let html = '';
   if (topTags.length) {
-    html += '<span class="board-filter-label">Tag:</span>';
+    html += '<span class="board-filter-label">Group:</span>';
     topTags.forEach(([t, n]) => {
-      html += "<button class='board-filter-chip' onclick='_bfTarget=\"board\";_bfAppend(" + JSON.stringify('tag:' + t) + ")'>" + esc(t) + " <span style='color:var(--dim)'>" + n + "</span></button>";
+      html += "<button class='board-filter-chip' onclick='_bfTarget=\"board\";_bfAppend(" + JSON.stringify('group:' + t) + ")'>" + esc(t) + " <span style='color:var(--dim)'>" + n + "</span></button>";
     });
   }
   el.innerHTML = html;
@@ -49475,13 +49475,13 @@ function _issueRowHTML(item, opts) {
 }
 
 function _renderBoardCard(item) {
-  const tags = item.tags || [];
+  const groups = item.tags || [];
   const firstLine = (item.desc || '').split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
   // LIVE emphasis: this card is what its owning session is working on right now
   // (item in doing + that session's terminal is actively generating).
   const _liveNow = item.status === 'doing' && item.session &&
-    (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
+    (typeof workers !== 'undefined') && (workers || []).some(s => s.name === item.session && s.status === 'active');
   let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.worker) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
@@ -49489,7 +49489,7 @@ function _renderBoardCard(item) {
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
   h += '<div class="board-card-title">';
-  if (boardViewMode === 'session') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
+  if (boardViewMode === 'worker') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
   // The board query matches DESC as well as title, so a desc-only hit showed a
   // card with nothing highlighted and no visible reason for being in the
@@ -49497,7 +49497,7 @@ function _renderBoardCard(item) {
   // right and the feedback was missing.
   if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
-  if (boardViewMode !== 'session' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
+  if (boardViewMode !== 'worker' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
   if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + esc(item.shepherd) + '</span>';
   tags.forEach(function(t) { h += '<span class="board-card-tag" data-tag="' + esc(t) + '">' + esc(t) + '</span>'; });
   if (item.due) { const today = new Date().toISOString().slice(0,10); const overdue = item.due < today && item.status !== 'done'; h += '<span class="board-card-time" style="' + (overdue ? 'color:var(--red)' : 'color:var(--accent)') + '">&#x1F4C5; ' + item.due + '</span>'; }
@@ -49632,7 +49632,7 @@ function renderBoard() {
   var bvS = document.getElementById('bv-session');
   var bvC = document.getElementById('bv-status');
   var bvL = document.getElementById('bv-list');
-  if (bvS) bvS.classList.toggle('active', boardViewMode === 'session');
+  if (bvS) bvS.classList.toggle('active', boardViewMode === 'worker');
   if (bvC) bvC.classList.toggle('active', boardViewMode === 'status');
   if (bvL) bvL.classList.toggle('active', boardViewMode === 'list');
   var boH = document.getElementById('bo-human');
@@ -49677,7 +49677,7 @@ function renderBoard() {
     return;
   }
   container.classList.remove('board-list-mode');
-  if (boardViewMode === 'session') {
+  if (boardViewMode === 'worker') {
     container.classList.remove('board-columns');
     container.classList.add('board-columns-list');
     _renderBoardBySession(visible, container);
@@ -49922,14 +49922,14 @@ function renderBoard() {
 
 // Event delegation for board tag + session clicks (cards + detail)
 document.getElementById('board-columns').addEventListener('click', function(e) {
-  const tag = e.target.closest('.board-card-tag[data-tag]');
-  if (tag) { e.stopPropagation(); e.preventDefault(); toggleBoardTag(tag.dataset.tag); return; }
+  const group = e.target.closest('.board-card-tag[data-tag]');
+  if (group) { e.stopPropagation(); e.preventDefault(); toggleBoardTag(tag.dataset.tag); return; }
   const sess = e.target.closest('.board-card-session[data-session]');
   if (sess) { e.stopPropagation(); e.preventDefault(); toggleBoardSession(sess.dataset.session); }
 });
 document.getElementById('board-detail-overlay').addEventListener('click', function(e) {
-  const tag = e.target.closest('.board-card-tag[data-tag]');
-  if (tag) { e.stopPropagation(); e.preventDefault(); closeBoardDetail(); toggleBoardTag(tag.dataset.tag); return; }
+  const group = e.target.closest('.board-card-tag[data-tag]');
+  if (group) { e.stopPropagation(); e.preventDefault(); closeBoardDetail(); toggleBoardTag(tag.dataset.tag); return; }
   const sess = e.target.closest('.board-card-session[data-session]');
   if (sess) { e.stopPropagation(); e.preventDefault(); closeBoardDetail(); toggleBoardSession(sess.dataset.session); }
 });
@@ -50031,7 +50031,7 @@ function openSchedModal(editId) {
   const overlay = document.getElementById('sched-overlay');
   // Populate session list
   const sel = document.getElementById('sched-session');
-  sel.innerHTML = (sessions || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  sel.innerHTML = (workers || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   // Reset all fields to defaults
   const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
   const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = v; };
@@ -50113,10 +50113,10 @@ async function saveSchedModal() {
   const title = document.getElementById('sched-title').value.trim();
   const shell = document.getElementById('sched-kind-shell').checked;
   const kind = shell ? 'shell' : 'tmux';
-  const session = shell ? '' : document.getElementById('sched-session').value;
+  const worker = shell ? '' : document.getElementById('sched-session').value;
   const command = document.getElementById('sched-command').value.trim();
   if (!title || !command) { showToast && showToast('Title and command are required'); return; }
-  if (!shell && !session) { showToast && showToast('Pick a session'); return; }
+  if (!shell && !worker) { showToast && showToast('Pick a worker'); return; }
 
   const v = (id) => (document.getElementById(id).value || '').trim();
   const mode = _schedMode;
@@ -50148,7 +50148,7 @@ async function saveSchedModal() {
   }
 
   const watchTimeout = parseInt(v('sched-watch-timeout')) || 120;
-  const payload = { title, session, kind, command, sched_type: stype, recurrence: null, run_at,
+  const payload = { title, worker, kind, command, sched_type: stype, recurrence: null, run_at,
                     schedule_expr: schedExpr || null,
                     watch, done_pattern: donePattern || null, done_action: doneAction, watch_timeout: watchTimeout,
                     trigger_on: trig.join(','), trigger_cooldown: triggerCooldown, trigger_sessions: triggerSessions,
@@ -50222,8 +50222,8 @@ async function saveBoardEdit() {
   const desc = document.getElementById('be-desc').value.trim();
   const status = document.getElementById('be-status').value;
   const sel = document.getElementById('be-session-add');
-  const session = sel ? sel.value : '';
-  const tags = [..._tagState['be']];
+  const worker = sel ? sel.value : '';
+  const groups = [..._tagState['be']];
   const dueEl = document.getElementById('be-due');
   const due = dueEl ? dueEl.value : '';
   const dueTimeEl = document.getElementById('be-due-time');
@@ -50237,8 +50237,8 @@ async function saveBoardEdit() {
     if (!ok) return;  // abort — leave the modal open
   }
   closeBoardEdit();
-  const ownerType = session ? 'agent' : 'human';
-  await addBoardItem(title, desc, status, session, tags, due, ownerType, dueTime, gate);
+  const ownerType = worker ? 'agent' : 'human';
+  await addBoardItem(title, desc, status, worker, groups, due, ownerType, dueTime, gate);
   if (_peekTab === 'issues') renderPeekIssues();
 }
 
@@ -50450,7 +50450,7 @@ function closeBoardDetail() {
       const due_time = dueTimeEl2 ? dueTimeEl2.value : (item.due_time || '');
       // Only save draft if something actually differs from saved state
       if (t !== (item.title || '') || d !== (item.desc || '') || s !== (item.session || '') || st !== (item.status || 'todo') || due !== (item.due || '') || due_time !== (item.due_time || '')) {
-        _boardDrafts[boardDetailId] = { title: t, desc: d, session: s, status: st, due, due_time };
+        _boardDrafts[boardDetailId] = { title: t, desc: d, worker: s, status: st, due, due_time };
         _boardDraftsPersist();
       } else {
         delete _boardDrafts[boardDetailId];
@@ -50503,7 +50503,7 @@ async function boardDetailSave() {
   if (!title) return;
   const desc = document.getElementById('bd-desc').value.trim();
   const sel = document.getElementById('bd-session');
-  const session = sel ? sel.value : undefined;
+  const worker = sel ? sel.value : undefined;
   const gateEl = document.getElementById('bd-gate');
   const gate = gateEl ? gateEl.value.split('\n').map(s => s.trim()).filter(Boolean) : [];
   const _cur = boardItems.find(i => i.id === boardDetailId);
@@ -50518,8 +50518,8 @@ async function boardDetailSave() {
   document.getElementById('bd-save-status').textContent = 'Saving...';
   const dueInput = document.getElementById('bd-due');
   const dueTimeInput = document.getElementById('bd-due-time');
-  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', tags: [..._tagState['bd']], gate };
-  if (session !== undefined) changes.session = session;
+  const changes = { title, desc, status: boardDetailStatus, due: dueInput ? dueInput.value : '', due_time: dueTimeInput ? dueTimeInput.value : '', groups: [..._tagState['bd']], gate };
+  if (worker !== undefined) changes.session = worker;
   // The server enforces status gates: forward acknowledgement from _gateConfirm.
   if (_gateAck) { changes.gate_ack = true; if (Array.isArray(_gateAck)) changes.gate_checked = _gateAck; }
   await updateBoardItem(boardDetailId, changes);
@@ -50552,18 +50552,18 @@ function saveBoardCache() {
   _cacheBoardJSON(lastBoardJSON);
 }
 
-async function addBoardItem(title, desc, status, session, tags, due, ownerType, dueTime, gate) {
-  ownerType = ownerType || (session ? 'agent' : 'human');
+async function addBoardItem(title, desc, status, worker, groups, due, ownerType, dueTime, gate) {
+  ownerType = ownerType || (worker ? 'agent' : 'human');
   gate = gate || [];
   const tempId = Math.random().toString(16).slice(2, 8);
   const now = Math.floor(Date.now() / 1000);
-  const tempItem = { id: tempId, title, desc, status, session: session || '', tags: tags || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
+  const tempItem = { id: tempId, title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType, created: now, updated: now, _pending: true };
   boardItems.push(tempItem);
   saveBoardCache();
   renderBoard();
   const r = await apiCall(API + '/api/board', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ title, desc, status, session: session || '', tags: tags || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
+    body: JSON.stringify({ title, desc, status, worker: worker || '', groups: groups || [], due: due || '', due_time: dueTime || '', gate: gate, creator: _getDeviceName(), owner_type: ownerType })
   });
   if (r) {
     const item = await r.json();
@@ -50718,20 +50718,20 @@ function editStatusGate(statusId) {
 }
 // Per-session gate editor (opened from a session's peek board column header).
 // Scoped to one (session, status): overrides the global default for that session only.
-function editSessionGate(session, statusId) {
+function editSessionGate(worker, statusId) {
   const st = (typeof boardStatuses !== 'undefined' ? boardStatuses : []).find(x => x.id === statusId);
   const label = (st && st.label) || statusId;
-  const hasOverride = sessionGates[session] && Array.isArray(sessionGates[session][statusId]) && sessionGates[session][statusId].length;
+  const hasOverride = sessionGates[worker] && Array.isArray(sessionGates[worker][statusId]) && sessionGates[worker][statusId].length;
   // Prefill from the session override if set, else from the global default as a starting point.
-  const cur = hasOverride ? sessionGates[session][statusId] : _statusGateDefault(statusId);
+  const cur = hasOverride ? sessionGates[worker][statusId] : _statusGateDefault(statusId);
   const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const bg = document.createElement('div');
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
   box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);max-height:88vh;overflow:auto;';
-  box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Session gate — '+esc(label)+'</div>'
-    + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:4px;">For session <b>'+esc(session)+'</b> only. Overrides the global default gate for '+esc(label)+' on this session\'s cards.</div>'
-    + '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">One criterion per line. '+(hasOverride ? 'This session has a custom gate.' : 'Currently inheriting the global default (shown below to tweak).')+'</div>'
+  box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Worker gate — '+esc(label)+'</div>'
+    + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:4px;">For worker <b>'+esc(worker)+'</b> only. Overrides the global default gate for '+esc(label)+' on this worker\'s cards.</div>'
+    + '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">One criterion per line. '+(hasOverride ? 'This worker has a custom gate.' : 'Currently inheriting the global default (shown below to tweak).')+'</div>'
     + '<textarea id="_sgate-edit-ta" style="width:100%;min-height:150px;box-sizing:border-box;font-family:inherit;font-size:0.9rem;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);resize:vertical;"></textarea>'
     + '<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:14px;">'
     + '<button class="btn" id="_sgate-edit-reset" title="Delete this worker override and inherit the global default"'+(hasOverride ? '' : ' style="visibility:hidden;"')+'>Reset to default</button>'
@@ -50744,7 +50744,7 @@ function editSessionGate(session, statusId) {
   const persist = async (items) => {
     await apiCall(API + '/api/board/session-gates', {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ session: session, status: statusId, gate: items })
+      body: JSON.stringify({ worker: worker, status: statusId, gate: items })
     });
     try {
       const rsg = await fetch(API + '/api/board/session-gates');
@@ -51422,7 +51422,7 @@ function enterGridMode() {
   view.classList.add('active');
   _torrentStopTimer();
   // Mark Grid tab as active, deactivate others
-  ['sessions','board','calendar','scheduler','files','logs','email','notes','crm'].forEach(t => document.getElementById('tab-' + t)?.classList.remove('active'));
+  ['workers','board','calendar','scheduler','files','logs','email','notes','crm'].forEach(t => document.getElementById('tab-' + t)?.classList.remove('active'));
   document.getElementById('tab-grid').classList.add('active');
   _renderGridChips();
   _wsRenderProfileBar();
@@ -51492,7 +51492,7 @@ function exitGridMode() {
   }
   gv.classList.remove('active');
   document.getElementById('tab-grid').classList.remove('active');
-  document.getElementById('tab-' + (activeView || 'sessions')).classList.add('active');
+  document.getElementById('tab-' + (activeView || 'workers')).classList.add('active');
 }
 
 function _renderGridChips() {
@@ -51509,7 +51509,7 @@ function _renderGridChips() {
   // then needs-input, then by most recent activity.
   const open = _gridPanes || {};
   const rank = s => (open[s.name] ? 0 : s.status === 'active' ? 1 : s.status === 'waiting' ? 2 : 3);
-  const list = (sessions || [])
+  const list = (workers || [])
     .filter(s => s.running || open[s.name])
     .sort((a, b) => rank(a) - rank(b)
                  || (b.last_activity || 0) - (a.last_activity || 0)
@@ -51526,7 +51526,7 @@ function _renderGridChips() {
 }
 
 function wsExpandActive() {
-  (sessions || []).filter(s => s.running && s.status !== 'idle').forEach(s => addGridPane(s.name));
+  (workers || []).filter(s => s.running && s.status !== 'idle').forEach(s => addGridPane(s.name));
 }
 function toggleGridPane(name) {
   if (_gridPanes[name]) removeGridPane(name);
@@ -51595,7 +51595,7 @@ function _updateGridPane(name) {
   const frame = document.getElementById(sid + '-frame');
   if (!dot && !frame) { removeGridPane(name); return; }  // pane was removed
   if (dot) {
-    const s = (sessions || []).find(s => s.name === name);
+    const s = (workers || []).find(s => s.name === name);
     dot.className = 'gp-dot' + (!s || !s.running ? '' : s.status === 'active' ? ' working' : s.status === 'waiting' ? ' waiting' : ' idle');
   }
 }
@@ -51621,7 +51621,7 @@ function _gridRestoreLayout() {
       // attempted at all.
       if (item.id.startsWith('ws-term:')) {
         wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
-      } else if ((sessions || []).find(s => s.name === item.id)) {
+      } else if ((workers || []).find(s => s.name === item.id)) {
         addGridPane(item.id, item.x, item.y, item.w, item.h);
       }
     });
@@ -51718,7 +51718,7 @@ function wsLoadProfile(name) {
     if (!item.id) return;
     if (item.id.startsWith('ws-term:')) {
       wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
-    } else if ((sessions || []).find(s => s.name === item.id)) {
+    } else if ((workers || []).find(s => s.name === item.id)) {
       addGridPane(item.id, item.x, item.y, item.w, item.h);
     }
   });
@@ -51770,10 +51770,10 @@ function wsApplyPreset(preset) {
   if (!names.length) {
     if (preset === 'auto') {
       // Auto: prefer running/active sessions, fall back to all
-      const running = (sessions || []).filter(s => s.running || s.status === 'active' || s.status === 'waiting');
-      names = running.length ? running.map(s => s.name) : (sessions || []).map(s => s.name);
+      const running = (workers || []).filter(s => s.running || s.status === 'active' || s.status === 'waiting');
+      names = running.length ? running.map(s => s.name) : (workers || []).map(s => s.name);
     } else {
-      names = (sessions || []).map(s => s.name);
+      names = (workers || []).map(s => s.name);
     }
   }
   if (!names.length) return;
@@ -52126,7 +52126,7 @@ async function sendGridCmd(name) {
 // Load cached sessions immediately so offline startup renders content
 const _cachedInit = localStorage.getItem('amux_sessions_cache');
 if (_cachedInit) {
-  try { sessions = JSON.parse(_cachedInit); } catch(e) {}
+  try { workers = JSON.parse(_cachedInit); } catch(e) {}
 }
 // Load cached board from localStorage (fast, synchronous)
 // The board payload is multi-MB (3.16MB measured) and localStorage caps around
@@ -52172,7 +52172,7 @@ const _idb = (() => {
       if (!d.objectStoreNames.contains('issues')) {
         const s = d.createObjectStore('issues', { keyPath: 'id' });
         s.createIndex('by_updated', 'updated');
-        s.createIndex('by_session', 'session');
+        s.createIndex('by_session', 'worker');
         s.createIndex('by_status', 'status');
       }
       if (!d.objectStoreNames.contains('statuses')) {
@@ -52439,12 +52439,12 @@ function connectSSE() {
     }
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'sessions') {
+      if (msg.type === 'workers') {
         const j = JSON.stringify(msg.payload);
         if (j !== lastSessionsJSON) {
           const firstLoad = !lastSessionsJSON;
           lastSessionsJSON = j;
-          sessions = msg.payload;
+          workers = msg.payload;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -52800,7 +52800,7 @@ function renderDebugInfo() {
     ['Mode', mode],
     ['Last data', _timeSince(_lastDataTime)],
     ['Server', location.host],
-    ['Sessions', sessions.length + ' loaded'],
+    ['Workers', sessions.length + ' loaded'],
     ['SSE retries', _sseRetries],
     ['Queue', offlineQueue.length + ' pending'],
   ];
@@ -53062,7 +53062,7 @@ function openAbout() {
   fetch(API + '/api/stats/daily').then(r => r.json()).then(data => {
     let html = '<div style="font-size:0.8rem;font-weight:600;margin-bottom:8px;">Today\'s Tokens</div>';
     html += '<div style="display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:6px;">';
-    html += '<span>amux sessions</span><span style="font-weight:600;">' + fmtTokens(data.amux_tokens) + '</span></div>';
+    html += '<span>amux workers</span><span style="font-weight:600;">' + fmtTokens(data.amux_tokens) + '</span></div>';
     html += '<div style="display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border);">';
     html += '<span>All Claude Code</span><span style="font-weight:600;">' + fmtTokens(data.total_tokens) + '</span></div>';
     if (data.sessions && data.sessions.length) {
@@ -53470,7 +53470,7 @@ async function _offlineInfoRefresh() {
     ? `<br>Browser grant: ${_fmtBytes(_storageEstimate.usage || 0)} of ${_fmtBytes(_storageEstimate.quota)}`
     : '';
   el.innerHTML =
-    `<b>${n}</b> of ${running} running sessions saved (${_fmtBytes(kb * 1024)})<br>`
+    `<b>${n}</b> of ${running} running workers saved (${_fmtBytes(kb * 1024)})<br>`
     + `Files: ${filesTxt}<br>`
     + `<span style="display:inline-block;width:100%;height:4px;background:rgba(139,148,158,0.25);border-radius:2px;margin:4px 0;">`
     + `<span style="display:block;width:${pct}%;height:100%;background:${pct>90?'#f85149':'var(--accent)'};border-radius:2px;"></span></span>`
@@ -53506,7 +53506,7 @@ async function _mcpRefresh() {
   const ready = servers.filter(s => s.ready).length;
   const sub = document.getElementById('mcp-sub');
   if (sub) sub.textContent = servers.length
-    ? `${ready} of ${servers.length} ready · every session gets these unless CC_MCP=off`
+    ? `${ready} of ${servers.length} ready · every worker gets these unless CC_MCP=off`
     : 'No servers configured.';
   list.innerHTML = servers.map(s => {
     const badge = s.ready
@@ -53532,7 +53532,7 @@ async function _mcpRefresh() {
     envEl.innerHTML = `Credentials file: <code>${esc(d.env_file || '')}</code> `
       + (d.env_exists ? `(${(d.env_keys || []).length} key${(d.env_keys||[]).length===1?'':'s'} defined)` : '<b>not created</b>')
       + `<br>Registry: <code>${esc(d.path || '')}</code>`
-      + `<br><span style="opacity:0.8;">Running sessions keep the registry they started with — restart a session to pick up changes.</span>`;
+      + `<br><span style="opacity:0.8;">Running workers keep the registry they started with — restart a worker to pick up changes.</span>`;
   }
 }
 async function _mcpImport() {
@@ -53688,7 +53688,7 @@ async function loadUsage() {
     const limits = (d.limits || []).filter(l => typeof l.percent === 'number');
     if (!limits.length) { el.innerHTML = '<span style="color:var(--dim);">No usage limits reported</span>'; return; }
     const label = l => {
-      if (l.kind === 'session') return '5-hour session';
+      if (l.kind === 'worker') return '5-hour worker';
       const m = l.scope && l.scope.model && l.scope.model.display_name;
       if (m) return m + ' · weekly';
       if (l.group === 'weekly' || l.kind.indexOf('weekly') === 0) return 'Weekly (all models)';
@@ -53703,7 +53703,7 @@ async function loadUsage() {
       return 'resets ' + (dys >= 1 ? 'in ' + dys + 'd' : (h >= 1 ? 'in ' + h + 'h' : 'in <1h'));
     };
     // session first, then weekly-all, then per-model scoped
-    const order = l => l.kind === 'session' ? 0 : (l.scope && l.scope.model ? 2 : 1);
+    const order = l => l.kind === 'worker' ? 0 : (l.scope && l.scope.model ? 2 : 1);
     limits.sort((a, b) => order(a) - order(b));
     el.innerHTML = limits.map(l => {
       const used = Math.max(0, Math.min(100, Math.round(l.percent)));
@@ -53744,7 +53744,7 @@ async function sendTestAlert(btn) {
   if (btn) btn.disabled = true;
   try {
     const r = await fetch(API + '/api/alert/owner', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: 'Test urgent alert from Settings', session: 'amux', reason: 'settings test' }) });
+      body: JSON.stringify({ message: 'Test urgent alert from Settings', worker: 'amux', reason: 'settings test' }) });
     const d = await r.json();
     if (st) st.textContent = d.deduped ? 'Deduped (sent in the last 60s)'
       : (d.channels ? ('Sent → ' + Object.entries(d.channels).map(([k, v]) => k + ': ' + v).join('; ')) : 'Sent');
@@ -53924,7 +53924,7 @@ function _renderPeekCommitGuardBtn(enabled, override, globalEnabled) {
   if (!btn) return;
   btn.style.opacity = enabled ? '1' : '0.35';
   btn.style.color = enabled ? 'var(--green, #3fb950)' : '';
-  const overrideLabel = override === null ? 'following global (' + (globalEnabled ? 'on' : 'off') + ')' : (override ? 'on for this session' : 'off for this session');
+  const overrideLabel = override === null ? 'following global (' + (globalEnabled ? 'on' : 'off') + ')' : (override ? 'on for this worker' : 'off for this worker');
   btn.title = 'Commit guard: ' + overrideLabel + ' — click to toggle';
 }
 
@@ -53961,7 +53961,7 @@ async function loadCommitGuard() {
     const t = document.getElementById('settings-commitguard-toggle');
     const st = document.getElementById('settings-commitguard-status');
     if (t) t.checked = !!d.enabled;
-    if (st) st.textContent = d.enabled ? 'On — sessions are nudged to commit on idle' : 'Off';
+    if (st) st.textContent = d.enabled ? 'On — workers are nudged to commit on idle' : 'Off';
   } catch(e) {}
 }
 async function saveCommitGuard(enabled) {
@@ -53972,14 +53972,14 @@ async function saveCommitGuard(enabled) {
       body: JSON.stringify({enabled})
     });
     if (r.ok) {
-      if (st) st.textContent = enabled ? 'On — sessions are nudged to commit on idle' : 'Off';
+      if (st) st.textContent = enabled ? 'On — workers are nudged to commit on idle' : 'Off';
       showToast('Commit guard ' + (enabled ? 'enabled' : 'disabled'));
     } else if (st) { st.textContent = 'Save failed'; }
   } catch(e) { if (st) st.textContent = 'Error: ' + e.message; }
 }
 
 // ── Board awareness (task guard) ──────────────────────────────────────────────
-const _taskGuardStatusOn = 'On — idle sessions are nudged to log tasks; new sessions get an all-board briefing';
+const _taskGuardStatusOn = 'On — idle workers are nudged to log tasks; new workers get an all-board briefing';
 async function loadTaskGuard() {
   try {
     const r = await fetch('/api/settings/task-guard');
@@ -54135,7 +54135,7 @@ async function loadBillingSection() {
         '<div style="display:flex;flex-direction:column;gap:8px;">' +
           '<div style="background:var(--card,#1e1e2e);border:1px solid var(--border,#333);border-radius:8px;padding:12px;">' +
             '<div style="font-weight:600;color:var(--text);margin-bottom:4px;">Pro Monthly \u2014 $20/mo</div>' +
-            '<div style="font-size:0.72rem;color:var(--dim);margin-bottom:8px;">Unlimited sessions \u00b7 No idle timeout \u00b7 Team workspaces</div>' +
+            '<div style="font-size:0.72rem;color:var(--dim);margin-bottom:8px;">Unlimited workers \u00b7 No idle timeout \u00b7 Team workspaces</div>' +
             '<button class="btn primary" style="font-size:0.78rem;padding:5px 16px;" onclick="startCheckout(\'monthly\')">Start free trial</button>' +
           '</div>' +
           (d.has_annual ? '<div style="background:var(--card,#1e1e2e);border:1px solid var(--accent,#7c6fcd);border-radius:8px;padding:12px;">' +
@@ -54210,7 +54210,7 @@ async function _handleDeeplink(hash) {
       if (m) tab = decodeURIComponent(m[1]);
     }
     const tryOpen = (attempt) => {
-      if (typeof sessions !== 'undefined' && sessions.some(s => s.name === target)) {
+      if (typeof workers !== 'undefined' && sessions.some(s => s.name === target)) {
         openPeek(target);
         // Let openPeek finish its own async setup before switching tabs.
         if (tab) setTimeout(() => { try { setPeekTab(tab); } catch(e) {} }, 350);
@@ -54307,7 +54307,7 @@ function _restoreScreen() {
       // switchView had already set activeView, leaving a half-switched UI. This
       // is the general case, not a notes special-case — any view we remove later
       // is stale in someone's localStorage the moment it ships.
-      if (_v && _v.v && _v.v !== 'sessions' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)
+      if (_v && _v.v && _v.v !== 'workers' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)
           && document.getElementById('tab-' + _v.v)) {
         try { switchView(_v.v); } catch(e) {}
       }
@@ -54675,7 +54675,7 @@ async function pullFromRemote(btn) {
         body: 'The Workspace grid shows every terminal side-by-side — drag, resize, save layouts. Mission control for a dozen agents.' },
       { target: '#filters-btn', targetFallback: '.tab-bar-outer', pos: 'bottom',
         title: 'Slice the fleet',
-        body: 'Filter sessions by model or provider, and flip on log search to grep INSIDE every agent\u2019s terminal output at once — “which agent touched the billing code?” is one search.' }
+        body: 'Filter workers by model or provider, and flip on log search to grep INSIDE every agent\u2019s terminal output at once — “which agent touched the billing code?” is one search.' }
     ]},
     phone: { label: '\u{1F4F1} Your business, from your phone', steps: [
       { target: '.cards', pos: 'top', padX: 20, padY: 10,
@@ -54686,7 +54686,7 @@ async function pullFromRemote(btn) {
         body: 'An agent hit a permission prompt while you\u2019re at lunch? Push alert → open the peek → answer. Sends queue safely, survive offline, and land in the shared history so every device sees them.' },
       { target: '#tab-messages', targetFallback: '.tab-bar-outer', pos: 'bottom',
         title: 'Nothing gets lost',
-        body: 'Every message to every agent is recorded server-side — browse and search the full history from any device, filtered to the session you came from.' }
+        body: 'Every message to every agent is recorded server-side — browse and search the full history from any device, filtered to the worker you came from.' }
     ]},
     auto: { label: '\u{1F916} Automate the business itself', steps: [
       { target: '#tab-scheduler', targetFallback: '.tab-bar-outer', pos: 'bottom',
@@ -54731,7 +54731,7 @@ async function pullFromRemote(btn) {
       { action: function() { try { closeEventModal(); } catch(e) {} switchView('crm'); }, wait: 450, revealTab: 'crm',
         target: '#crm-view', targetFallback: '.tab-bar-outer', pos: 'top',
         title: 'Your people live here',
-        body: 'CRM is now on your tab bar. Agents log contacts, interactions, and follow-ups here as they run outreach and support \u2014 tap \u201C+ contact\u201D to add your first. Finish to return to Sessions with your command center set up.' }
+        body: 'CRM is now on your tab bar. Agents log contacts, interactions, and follow-ups here as they run outreach and support \u2014 tap \u201C+ contact\u201D to add your first. Finish to return to Workers with your command center set up.' }
     ]}
   };
   var _wtSteps = _WT_CORE;
@@ -54998,7 +54998,7 @@ function _costRender(d, opts) {
   const sec = (title, body) => `<div class="cost-section"><div class="cost-section-h">${title}</div>${body}</div>`;
   let html = cards;
   html += sec('By task', _costBars(d.by_task, 'title', { limit: 20, emptyLabel: 'Ambient (untasked)' }));
-  if (!opts.perSession) html += sec('By session', _costBars(d.by_session, 'session', { limit: 20, onSession: true, emptyLabel: '(ad-hoc)' }));
+  if (!opts.perSession) html += sec('By worker', _costBars(d.by_session, 'session', { limit: 20, onSession: true, emptyLabel: '(ad-hoc)' }));
   html += sec('By model', _costBars(d.by_model, 'model', { limit: 8 }));
   // by-day sparkline bars
   const days = d.by_day || [];
@@ -55007,7 +55007,7 @@ function _costRender(d, opts) {
     `<div class="cost-day" title="${x.day}: ${_fmtUsd(x.cost)}"><div class="cost-day-fill" style="height:${Math.max(3,Math.round(100*(x.cost||0)/dmax))}%;"></div></div>`
   ).join('') + '</div>' + `<div class="cost-day-labels"><span>${days[0]?.day||''}</span><span>${days[days.length-1]?.day||''}</span></div>` : '<div style="color:var(--dim);font-size:0.82rem;">No data.</div>';
   html += sec('By day', dayBars);
-  html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that session; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
+  html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that worker; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
   return html;
 }
 // ── Messages > Trends (AMUX-2179 relocated) ────────────────────────────────
@@ -55097,7 +55097,7 @@ function _trendsRender() {
       + '</span></div>'
       // WHO is responsible — owners inline, no drilling.
       + '<div class="tr-owners"><span class="tr-owners-l">Owners:</span> ' + ([...g.sessions].slice(0,8).map(sn =>
-          '<span class="tr-sess" onclick="switchView(\'sessions\');setTimeout(()=>openPeek(\'' + escJs(sn) + '\'),150)">' + esc(sn) + '</span>').join('') || '<span style="color:var(--dim)">\u2014</span>')
+          '<span class="tr-sess" onclick="switchView(\'workers\');setTimeout(()=>openPeek(\'' + escJs(sn) + '\'),150)">' + esc(sn) + '</span>').join('') || '<span style="color:var(--dim)">\u2014</span>')
       + ' <span class="tr-owners-meta">' + g.msgs.length + ' directives \u00B7 ' + cards.length + ' cards</span></div>';
     if (exp) {
       // board issues for this theme
@@ -55338,7 +55338,7 @@ function _metricsRender() {
   const listEl = document.getElementById('metrics-session-list');
   if (listEl) {
     if (!sessions.length) {
-      listEl.innerHTML = '<div style="padding:16px 12px;font-size:0.8rem;color:var(--dim);">No sessions found</div>';
+      listEl.innerHTML = '<div style="padding:16px 12px;font-size:0.8rem;color:var(--dim);">No workers found</div>';
     } else {
       listEl.innerHTML = sessions.map(s => {
         const cls = _metricsGaugeCls(s.cpu_percent);
@@ -55382,7 +55382,7 @@ function _metricsRender() {
 
   if (!sys.psutil) {
     html += `<div class="metrics-no-psutil">
-      \u26A0\uFE0F Process-level CPU &amp; RAM per session requires psutil &mdash;
+      \u26A0\uFE0F Process-level CPU &amp; RAM per worker requires psutil &mdash;
       run <code>pip3 install psutil</code> then restart the server.
       System metrics are shown via fallback commands.
     </div>`;
@@ -55499,13 +55499,13 @@ function _metricsRender() {
     </div>`;
 
   // Session breakdown table
-  html += '<div class="metrics-section-title">Session Breakdown</div>';
+  html += '<div class="metrics-section-title">Worker Breakdown</div>';
   html += '<div class="metrics-table-wrap"><table class="metrics-table"><thead><tr>';
-  html += '<th>Session</th><th>Status</th><th>CPU %</th><th>RAM (MB)</th><th>Memory File</th><th>Tokens Today</th><th>Last Active</th><th>Processes</th>';
+  html += '<th>Worker</th><th>Status</th><th>CPU %</th><th>RAM (MB)</th><th>Memory File</th><th>Tokens Today</th><th>Last Active</th><th>Processes</th>';
   html += '</tr></thead><tbody>';
 
   if (!sessions.length) {
-    html += '<tr><td colspan="8" style="text-align:center;color:var(--dim);padding:20px;">No sessions found</td></tr>';
+    html += '<tr><td colspan="8" style="text-align:center;color:var(--dim);padding:20px;">No workers found</td></tr>';
   } else {
     const sorted = [...sessions].sort((a, b) => (b.cpu_percent - a.cpu_percent) || (b.rss_mb - a.rss_mb));
     sorted.forEach(s => {
@@ -56267,7 +56267,7 @@ async function _messagesLoad(reset, presetSession) {
       // plain refresh/paginate calls (no presetSession) keep the current choice.
       const cur = (presetSession != null && presetSession !== '') ? presetSession : sel.value;
       const names = [...new Set(_msgsData.map(m => m.session).filter(Boolean))].sort();
-      sel.innerHTML = '<option value="">All sessions</option>' +
+      sel.innerHTML = '<option value="">All workers</option>' +
         names.map(n => '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>').join('');
       // A preset session with no messages in the loaded page has no <option>;
       // the select then falls back to "All sessions" on its own.
@@ -56290,7 +56290,7 @@ function _msgsFmtTs(ts) {
 // peek search with a short snippet (the terminal hard-wraps long lines, so only
 // a SHORT prefix can match the rendered pane) — same jump flow as card log-hits.
 function _msgLocate(session, encText) {
-  if (!session) { showToast('No session recorded for this message'); return; }
+  if (!session) { showToast('No worker recorded for this message'); return; }
   const text = decodeURIComponent(encText);
   const snippet = (text.split('\n')[0] || '').slice(0, 32).trim();
   if (typeof closeCmdHistoryModal === 'function') closeCmdHistoryModal();
@@ -56363,14 +56363,14 @@ document.addEventListener('click', () => {
 // {session,text} list and this does the rest.
 async function _resendRows(rows) {
   rows = (rows || []).filter(r => r && r.session && r.text);
-  if (!rows.length) { showToast('Nothing to resend (messages with no target session are skipped)'); return; }
+  if (!rows.length) { showToast('Nothing to resend (messages with no target worker are skipped)'); return; }
   const lanes = [...new Set(rows.map(r => r.session))];
   const preview = rows.slice(0, 3).map(r => '  \u2022 ' + r.text.slice(0, 60)).join('\n');
   const ok = await showConfirm(
     'Resend ' + rows.length + ' message' + (rows.length === 1 ? '' : 's') +
-    ' to ' + lanes.length + ' session' + (lanes.length === 1 ? '' : 's') + '?\n\n' +
+    ' to ' + lanes.length + ' worker' + (lanes.length === 1 ? '' : 's') + '?\n\n' +
     lanes.join(', ') + '\n\n' + preview + (rows.length > 3 ? '\n  \u2026and ' + (rows.length - 3) + ' more' : '') +
-    '\n\nEach resend wakes its session and costs it a turn.',
+    '\n\nEach resend wakes its worker and costs it a turn.',
     'Resend', false);
   if (!ok) return false;
   let sent = 0, failed = 0;
@@ -56383,7 +56383,7 @@ async function _resendRows(rows) {
       if (resp.ok) sent++; else failed++;
     } catch (e) { failed++; }
   }
-  showToast('Resent ' + sent + (failed ? ' \u00b7 ' + failed + ' failed' : '') + ' to ' + lanes.length + ' session(s)');
+  showToast('Resent ' + sent + (failed ? ' \u00b7 ' + failed + ' failed' : '') + ' to ' + lanes.length + ' worker(s)');
   return true;
 }
 
@@ -56439,7 +56439,7 @@ function _messagesRender() {
       const lanes = [...new Set(rows.filter(m => _msgSel.has(_msgKey(m)) && m.session).map(m => m.session))];
       bar.innerHTML =
         '<span class="msgs-selcount">' + _selVis.length + ' selected</span>' +
-        '<span class="msgs-sellanes">' + lanes.length + ' session' + (lanes.length === 1 ? '' : 's') + ': ' + esc(lanes.slice(0,3).join(', ')) + (lanes.length > 3 ? ' +' + (lanes.length - 3) : '') + '</span>' +
+        '<span class="msgs-sellanes">' + lanes.length + ' worker' + (lanes.length === 1 ? '' : 's') + ': ' + esc(lanes.slice(0,3).join(', ')) + (lanes.length > 3 ? ' +' + (lanes.length - 3) : '') + '</span>' +
         '<button class="btn primary" onclick="_msgResend(' + JSON.stringify(_selVis).replace(/"/g, '&quot;') + ')">Resend ' + _selVis.length + '</button>' +
         '<button class="btn" onclick="_msgSelAll(' + JSON.stringify(_visKeys).replace(/"/g, '&quot;') + ')">Select all ' + _visKeys.length + '</button>' +
         '<button class="btn" onclick="_msgSelNone()">Clear</button>';
@@ -57068,14 +57068,14 @@ function _crmRenderTagsRow(tags) {
   const el = document.getElementById('crm-tags-row');
   el.innerHTML = tags.map(t =>
     '<span class="crm-tag-chip" onclick="_crmRemoveTag(\'' + esc(t) + '\')" title="Click to remove">' + esc(t) + '</span>'
-  ).join('') + '<span class="crm-add-tag" onclick="_crmStartAddTag()">+ tag</span>';
+  ).join('') + '<span class="crm-add-tag" onclick="_crmStartAddTag()">+ group</span>';
 }
 
 function _crmStartAddTag() {
   const el = document.getElementById('crm-tags-row');
   const inp = document.createElement('input');
   inp.className = 'crm-tag-inp';
-  inp.placeholder = 'tag name';
+  inp.placeholder = 'group name';
   inp.onkeydown = async (e) => {
     if (e.key === 'Enter') { e.preventDefault(); await _crmAddTag(inp.value.trim()); }
     if (e.key === 'Escape') { _crmRenderTagsRow(_crmActiveTags); }
@@ -58230,7 +58230,7 @@ function _graphOpenPanel(node) {
       ${node.task ? esc(node.task) : 'no card in flight'}</div>`;
     html += `<button id="graph-side-open"
       style="width:100%;min-height:34px;padding:7px 10px;background:var(--accent);color:#fff;border:none;
-      border-radius:6px;font-size:0.75rem;font-family:inherit;cursor:pointer;">Open session</button>`;
+      border-radius:6px;font-size:0.75rem;font-family:inherit;cursor:pointer;">Open worker</button>`;
     body.innerHTML = html;
     // The session name is passed through a closure, never interpolated into an
     // onclick attribute. esc() deliberately does NOT escape "'" (see its own
@@ -58657,7 +58657,7 @@ async function _bwNewProfile() {
     + '<input id="bwp-url" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:8px" placeholder="Sign-in URL" value="' + esc(url) + '">'
     + '<div style="margin-top:10px;font-size:0.76rem;color:var(--dim);line-height:1.5">'
     + 'A real browser window opens. Sign in there — including any CAPTCHA or 2FA — then <b>close the window</b>. '
-    + 'Closing is what saves the session. The profile is then usable from the browser API.</div>', 'Open sign-in');
+    + 'Closing is what saves the worker. The profile is then usable from the browser API.</div>', 'Open sign-in');
   const name = (document.getElementById('bwp-name') || {}).value || '';
   const surl = (document.getElementById('bwp-url') || {}).value || '';
   if (!ok || !name.trim()) return;
@@ -58920,7 +58920,7 @@ function _jrnlRenderEditor() {
   html += '<input type="hidden" id="jrnl-ed-lng" value="' + (entry.lng || '') + '">';
 
   // Tags
-  html += '<label>Tags (comma-separated)</label>';
+  html += '<label>Groups (comma-separated)</label>';
   html += '<input type="text" id="jrnl-ed-tags" value="' + esc(entry.tags || '') + '" placeholder="travel, work, personal">';
 
   // Media
