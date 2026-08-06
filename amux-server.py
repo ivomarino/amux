@@ -20842,7 +20842,27 @@ def _has_cotenants(run_dir):
         ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=4, context=ctx) as r:
             return bool((json.loads(r.read().decode()) or {}).get("cotenants"))
-    except Exception:
+    except Exception as _e:
+        # Fail-open stays (see docstring): blocking every lane when the server
+        # is down is worse than missing a warning. What changes is that the skip
+        # is no longer SILENT. A quiet False is indistinguishable from "checked,
+        # and you have no co-tenants" — so a session reads clean output as
+        # verification it never received.
+        #
+        # This is not hypothetical and the coincidence is the point: the server
+        # re-execs on every save of amux-server.py, so editing THAT file takes
+        # the guard offline for a few seconds at a time. The one file where a
+        # co-edit sweep is most likely on this checkout is the one whose editing
+        # disables the check. On 2026-08-06 a commit swept ~93 lines of a peer's
+        # work with no warning shown, during exactly such a window.
+        try:
+            sys.stderr.write("amux staged-guard: SKIPPED — could not reach the "
+                             "amux server (" + type(_e).__name__ + "). Co-tenant "
+                             "attribution was NOT checked; if you are committing a "
+                             "shared file, run `git diff --cached --numstat` and "
+                             "confirm the size matches what you wrote.\n")
+        except Exception:
+            pass
         return False
 
 
