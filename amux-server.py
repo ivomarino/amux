@@ -7643,6 +7643,33 @@ def _steer_guard_stale(name: str, guard: str):
         if _status_canon(it.get("status")) != "done":
             return True, f"{cid} left done before delivery ({it.get('status')})"
         return False, ""
+    if guard.startswith("decompose:"):
+        # Drop the "N prompts captured, not yet decomposed" ask once the shells
+        # it NAMES have been decomposed. Observed live on amux-cloud 2026-08-06:
+        # emitted 14:53:07 naming AC-243/244/246 (all genuinely todo then), the
+        # three were closed at 15:03:17, 15:03:32 and 15:19:41, and the nudge
+        # delivered ~26min after the last one — true when written, false when
+        # read.
+        #
+        # This one is worth guarding above all the others because of what it
+        # TELLS the worker to do: "PATCH THESE IDS SPECIFICALLY". Followed
+        # literally against closed cards, it stamps a fresh outcome onto work
+        # that already carries its own — which is precisely the misattribution
+        # the message's own last line warns against. A stale nudge here does not
+        # merely waste a turn, it corrupts the ledger it exists to protect.
+        ids = [c.strip() for c in guard[len("decompose:"):].split(",") if c.strip()]
+        if not ids:
+            return False, ""
+        live = []
+        for cid in ids:
+            it = _item_by_id(cid)
+            if not it or it.get("deleted") or it.get("archived"):
+                continue
+            if _status_canon(it.get("status")) == "todo":
+                live.append(cid)
+        if not live:
+            return True, f"all {len(ids)} shells decomposed before delivery"
+        return False, ""
     if guard.startswith("sched:"):
         # Drop a failure nudge if the schedule has since run clean — the same
         # delivery-time revalidation the dep:/watch: guards use.
@@ -13343,7 +13370,11 @@ def _capture_decompose_fastpath(session_name: str):
             f"decompose them; the board does not.\n"
             f"PATCH THESE IDS SPECIFICALLY. Do not sweep whatever is open and do not "
             f"write one outcome onto several cards: each carries its own, or the "
-            f"ledger records work against the wrong unit and a reviewer believes it.")
+            f"ledger records work against the wrong unit and a reviewer believes it.",
+            # Revalidate the NAMED ids at delivery. The queue delivers at the
+            # next turn boundary, which for a lane mid-task can be tens of
+            # minutes, and this nudge asserts a fact with a short shelf life.
+            guard="decompose:" + ",".join(r["id"] for r in _rows))
     except Exception as e:
         slog(f"[capture-fastpath] {session_name}: {e}")
 
