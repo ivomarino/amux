@@ -30775,6 +30775,30 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Confirm / alert modal -->
+<!-- Scope editor: the REAL editor UX for a group/global capability (AMUX-2436).
+     Same shape as the peek Memory panel — full-height textarea, Preview, Save —
+     rather than the cramped inline box the tiles used to open. env and gates get
+     a real editor here for the first time; before, the panel said "edited where
+     it lives" and offered nothing. -->
+<div id="scope-edit-backdrop" class="modal-backdrop" onclick="if(event.target===this)_scopeEditClose()">
+  <div class="modal-box" style="max-width:820px;width:94vw;height:78vh;display:flex;flex-direction:column;gap:8px;padding:14px;">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex-shrink:0;">
+      <span id="scope-edit-title" style="font-weight:700;font-size:0.95rem;color:var(--text);"></span>
+      <span id="scope-edit-src" style="font-size:0.7rem;color:var(--dim);"></span>
+      <span style="margin-left:auto;display:flex;gap:6px;">
+        <button class="btn" id="scope-edit-preview-btn" style="font-size:0.72rem;min-height:36px;" onclick="_scopeEditPreview()">Preview</button>
+        <button class="btn primary" style="font-size:0.72rem;min-height:36px;" onclick="_scopeEditSave()">Save</button>
+        <button class="btn" style="font-size:0.72rem;min-height:36px;" onclick="_scopeEditClose()">Close</button>
+      </span>
+    </div>
+    <div id="scope-edit-hint" style="font-size:0.68rem;color:var(--dim);flex-shrink:0;"></div>
+    <textarea id="scope-edit-input" class="peek-memory-textarea" spellcheck="false"
+      style="flex:1;min-height:0;" oninput="_scopeEditDirty=true"></textarea>
+    <div id="scope-edit-render" class="board-detail-preview md-content" style="display:none;flex:1;overflow-y:auto;min-height:0;"></div>
+    <div id="scope-edit-msg" style="font-size:0.7rem;color:var(--dim);flex-shrink:0;min-height:1em;"></div>
+  </div>
+</div>
+
 <div id="modal-backdrop" class="modal-backdrop" onclick="_modalBgClick(event)">
   <div class="modal-box">
     <div id="modal-msg" class="modal-msg"></div>
@@ -35640,6 +35664,143 @@ function _scopeEditorHTML(lvl, name, cap) {
     + '</div>';
 }
 
+// ── Scope editor (AMUX-2436) ──────────────────────────────────────────────
+// Ethan: "when I click memory, environment, board gates in the expandable group
+// bar I should be able to see/override/edit group level overrides ... same ux as
+// the actual memory environment and board gates pages."
+//
+// Every capability edits as TEXT here, because that is what each one actually is
+// on disk: memory/rules are .md, env is a KEY=VALUE file, and gates are a
+// per-status list. Rendering three bespoke widgets would be three things to keep
+// in sync with the resolver; one honest text surface per storage format is the
+// same call the server made in _scope_write, which accepts exactly these shapes.
+let _scopeEditCtx = null, _scopeEditDirty = false;
+
+function _scopeEditClose() {
+  if (_scopeEditDirty && !confirm('Discard unsaved changes to this scope?')) return;
+  document.getElementById('scope-edit-backdrop').classList.remove('open');
+  _scopeEditCtx = null; _scopeEditDirty = false;
+}
+
+const _SCOPE_EDIT_HINT = {
+  memory: 'Markdown. Composed ABOVE each member worker’s own memory — global › group › worker.',
+  rules:  'Markdown. Binding rules, composed the same way as memory.',
+  env:    'KEY=VALUE per line, shell style. Merged by key; a worker’s own .env wins on a clash.',
+  gates:  'JSON: {"status": ["criterion", ...]}. Replaces this level’s gate for the statuses named; omit a status to inherit.',
+  status_mode: 'JSON array of status ids this level opts into, e.g. ["verified"].',
+};
+
+async function _scopeEditOpen(lvl, name, key) {
+  const bd = document.getElementById('scope-edit-backdrop');
+  const ta = document.getElementById('scope-edit-input');
+  const label = (lvl === 'global') ? 'Global' : name;
+  _scopeEditCtx = { lvl, name, key };
+  _scopeEditDirty = false;
+  document.getElementById('scope-edit-title').textContent = label + ' · ' + key;
+  document.getElementById('scope-edit-src').textContent = 'loading…';
+  document.getElementById('scope-edit-hint').textContent = _SCOPE_EDIT_HINT[key] || '';
+  document.getElementById('scope-edit-msg').textContent = '';
+  document.getElementById('scope-edit-render').style.display = 'none';
+  ta.style.display = ''; ta.value = 'Loading…'; ta.disabled = true;
+  bd.classList.add('open');
+  _anim(bd.querySelector('.modal-box'), { opacity: [0, 1], transform: ['scale(0.98)', 'scale(1)'] });
+  try {
+    const r = await fetch(API + '/api/scope?level=' + encodeURIComponent(lvl)
+                          + (lvl === 'global' ? '' : '&name=' + encodeURIComponent(name)),
+                          { headers: _authHeaders() });
+    const d = await r.json();
+    const cap = (d.capabilities || []).find(c => c.key === key) || {};
+    const v = cap.value || {};
+    let text = '';
+    if (key === 'memory' || key === 'rules') {
+      if (v.truncated) {
+        // Never hand back a capped read as editable — saving it would replace
+        // the file with its own first N bytes (the AMUX-2359 lesson).
+        ta.value = ''; ta.disabled = true;
+        document.getElementById('scope-edit-msg').textContent =
+          'Too large to edit here (' + (v.bytes || 0) + ' bytes, shown truncated). Edit ' + (v.path || '') + ' directly.';
+        document.getElementById('scope-edit-src').textContent = 'set at this level';
+        return;
+      }
+      text = v.text || '';
+    } else if (key === 'env') {
+      const keys = v.keys || [];
+      text = keys.length
+        ? keys.map(k => k + '=').join('\n')
+        : '';
+      document.getElementById('scope-edit-msg').textContent = keys.length
+        ? 'Values are not shown (secrets). Re-enter a value to change it; a bare KEY= is ignored.'
+        : '';
+    } else {
+      text = JSON.stringify(v && Object.keys(v).length ? v : (Array.isArray(v) ? v : {}), null, 2);
+    }
+    ta.value = text; ta.disabled = false;
+    document.getElementById('scope-edit-src').textContent =
+      (cap.set_here ? 'set at this level' : 'not set here — inherits ' + ((cap.order || []).filter(x => x !== lvl).join(' › ')))
+      + (cap.supported ? '' : ' · NOT settable at this level');
+    if (!cap.supported) ta.disabled = true;
+  } catch (e) {
+    ta.value = ''; ta.disabled = true;
+    document.getElementById('scope-edit-msg').textContent = 'Could not load: ' + e.message;
+  }
+}
+
+function _scopeEditPreview() {
+  const ta = document.getElementById('scope-edit-input');
+  const pv = document.getElementById('scope-edit-render');
+  const showing = pv.style.display !== 'none';
+  if (showing) { pv.style.display = 'none'; ta.style.display = ''; return; }
+  // renderMarkdown() is the one the peek Memory Preview uses — reuse it rather
+  // than inventing a second renderer with different sanitization.
+  pv.innerHTML = (typeof renderMarkdown === 'function') ? renderMarkdown(ta.value || '') : esc(ta.value || '');
+  pv.style.display = ''; ta.style.display = 'none';
+}
+
+async function _scopeEditSave() {
+  if (!_scopeEditCtx) return;
+  const { lvl, name, key } = _scopeEditCtx;
+  const ta = document.getElementById('scope-edit-input');
+  const msg = document.getElementById('scope-edit-msg');
+  let value;
+  if (key === 'memory' || key === 'rules') value = { text: ta.value };
+  else if (key === 'env') {
+    // Only lines with an actual value are sent — a bare KEY= from the masked
+    // read would otherwise BLANK the secret it was standing in for.
+    const out = {};
+    (ta.value || '').split('\n').forEach(l => {
+      const m = l.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+      if (m && m[2].trim() !== '') out[m[1]] = m[2].trim();
+    });
+    value = out;
+  } else {
+    try { value = JSON.parse(ta.value || '{}'); }
+    catch (e) { msg.textContent = 'Not valid JSON: ' + e.message; msg.style.color = '#f85149'; return; }
+  }
+  msg.textContent = 'Saving…'; msg.style.color = 'var(--dim)';
+  try {
+    const r = await fetch(API + '/api/scope', {
+      method: 'PUT',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify({ level: lvl, name: name, capability: key, value: value }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      // Show the server's REASON verbatim — a 403 here is a real policy answer
+      // ("a session may not write the group layer"), not a glitch.
+      msg.textContent = d.error || ('save failed (' + r.status + ')');
+      msg.style.color = '#f85149';
+      return;
+    }
+    _scopeEditDirty = false;
+    msg.textContent = 'Saved'; msg.style.color = 'var(--green)';
+    showToast(key + ' saved at ' + (lvl === 'global' ? 'global' : lvl + ' ' + name));
+    const host = document.getElementById('grp-scope-body-' + (lvl === 'global' ? _GLOBAL_SCOPE : name));
+    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name }, host ? host.id : undefined);
+  } catch (e) {
+    msg.textContent = 'Save failed: ' + e.message; msg.style.color = '#f85149';
+  }
+}
+
 async function _scopeSave(lvl, name, key, elId) {
   const ta = document.getElementById(elId);
   const msg = document.getElementById(elId + '-msg');
@@ -35796,7 +35957,13 @@ async function _scopeLoad(scope, targetId) {
         + ' <span style="opacity:0.6;">\u00b7 ' + esc(_l.merge) + '</span>'
         + (_l.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
         + '</div>'
-        + _scopeEditorHTML(lvl, w, _l)
+        + ((lvl === 'group' || lvl === 'global') && _l.supported
+            ? '<div style="margin-top:7px;"><button class="btn primary" '
+              + 'style="font-size:0.7rem;min-height:36px;padding:5px 11px;" '
+              + 'onclick="event.stopPropagation();_scopeEditOpen(\'' + escJs(lvl) + '\',\''
+              + escJs(w || '') + '\',\'' + escJs(_l.key) + '\')">Edit ' + esc(_l.label)
+              + ' at this level</button></div>'
+            : _scopeEditorHTML(lvl, w, _l))
         + '</div>';
     }
     h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">'
@@ -36988,7 +37155,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.494';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.495';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58449,7 +58616,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.494';
+const CACHE = 'amux-v0.9.495';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
