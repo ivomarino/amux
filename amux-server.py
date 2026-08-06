@@ -26267,6 +26267,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Entry criteria shown ON the column (AMUX-2313) — deliberately always
      visible, not behind the Gate button. Kept visually quiet so it reads as
      the column's contract rather than competing with the cards. */
+  /* Group chips on a worker card, and the panel they expand (AMUX-2362). */
+  .grp-chip { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
+    font-size:0.66rem; font-weight:600; cursor:pointer; vertical-align:middle;
+    background:rgba(88,166,255,0.14); color:var(--accent); border:1px solid transparent;
+    -webkit-tap-highlight-color:transparent; }
+  .grp-chip:hover, .grp-chip:active { border-color:var(--accent); }
+  .grp-scope-panel { border:1px solid var(--accent); border-radius:10px; padding:10px 12px;
+    margin:0 0 8px; background:var(--card); }
+  .grp-scope-body { font-size:0.8rem; color:var(--dim); }
+  /* Mobile: 44px touch target without making the chip huge inline — pad the hit
+     area rather than the visual box (css-mobile rule). */
+  @media (max-width: 600px) {
+    .grp-chip { font-size:0.72rem; padding:4px 9px; margin-left:5px; }
+    .grp-scope-panel { padding:12px; }
+  }
   .col-gate-crit { margin: 6px 0 8px; padding: 7px 9px; border-radius: 8px;
     border: 1px solid var(--border); background: rgba(255,255,255,0.02);
     font-size: 0.72rem; line-height: 1.35; color: var(--dim); }
@@ -32395,7 +32410,11 @@ function _restoreCardFocus(focusedId, savedInputs) {
   if (d && inp.tagName === 'TEXTAREA') { inp.selectionStart = d.start; inp.selectionEnd = d.end; }
 }
 
+let _grpEmitted = false;   // one group panel per render pass, not one per member
+let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render keeps it
+
 function render() {
+  _grpEmitted = false;
   // Skip render if a menu or edit overlay is open to prevent DOM clobbering
   if (openMenu || editState || document.getElementById('edit-overlay').classList.contains('active')) return;
   updatePeekStatus();
@@ -32497,11 +32516,12 @@ function render() {
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
     return `
+    ${(_grpOpen && (s.tags||[]).includes(_grpOpen) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
+          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}${(s.tags||[]).map(g => `<span class="grp-chip" title="Group ${esc(g)} — what this group scopes" onclick="event.stopPropagation();toggleGroupScope('${escJs(g)}')">${esc(g)}</span>`).join('')}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
@@ -32696,6 +32716,7 @@ function render() {
       if (name) renderChips(el, name, false);
     });
   });
+  try { _grpScopeRehydrate(); } catch(e) {}
 }
 
 
@@ -34512,8 +34533,48 @@ async function loadPeekTranscript(showLoading) {
 // so the shell change is provably behaviour-preserving before a second caller
 // exists — the alternative is discovering the coupling from a group panel that
 // renders subtly differently, which is how three message renderers happened.
-async function _scopeLoad(scope) {
-  const el = document.getElementById('peek-scope-body');
+let _grpOpen = null;   // which group's scope panel is expanded in the worker list
+
+// Ethan: "when I click a group in the session list page I should have a new
+// thing that opens or that is expandable, right below it, and indicates the
+// different configuration that I can scope."
+//
+// It renders through _scopeLoad({level:'group'}) — the SAME function the peek
+// Scope tab uses. That is the whole point of threading the scope through first
+// (AMUX-2362): a group panel written separately would drift from the worker
+// one, which is how three message renderers happened.
+// Re-hydrate an open group panel after the worker list re-renders. render()
+// runs on SSE updates and polls, and it rebuilds the panel node from the
+// template — so without this the panel would revert to "Loading group scope…"
+// and sit there, which reads as a hung fetch rather than a wiped node.
+function _grpScopeRehydrate() {
+  if (!_grpOpen) return;
+  const el = document.getElementById('grp-scope-body-' + _grpOpen);
+  if (el && /Loading group scope/.test(el.textContent || '')) {
+    _scopeLoad({ level: 'group', name: _grpOpen }, el.id);
+  }
+}
+
+function toggleGroupScope(g) {
+  if (_grpOpen !== g) _grpScopeHtml = '';   // switching groups must not show the previous one's data
+  _grpOpen = (_grpOpen === g) ? null : g;
+  if (!_grpOpen) _grpScopeHtml = '';
+  render();
+  if (_grpOpen) {
+    const host = document.getElementById('grp-scope-' + _grpOpen);
+    if (host) {
+      _scopeLoad({ level: 'group', name: _grpOpen }, 'grp-scope-body-' + _grpOpen);
+      host.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+}
+
+async function _scopeLoad(scope, targetId) {
+  // Explicit target. The first cut had the group panel temporarily RENAME its
+  // own node to 'peek-scope-body' so this function could find it — two elements
+  // answering to one id, which is how a render lands in the wrong place and
+  // reads as a stale cache. Pass the element instead.
+  const el = document.getElementById(targetId || 'peek-scope-body');
   const sc = scope || (peekSession ? { level: 'worker', name: peekSession } : null);
   // Global has no name, and requiring one made _scopeLoad({level:'global'})
   // return early — leaving whatever was rendered before still on screen, which
@@ -34595,9 +34656,12 @@ async function _scopeLoad(scope) {
     h += '<div style="font-size:0.68rem;color:var(--dim);margin-top:8px;">'
       + 'Each capability shows its OWN precedence order \u2014 they genuinely differ. '
       + 'Dimmed levels have nothing set. Read-only for now.</div>';
-    el.innerHTML = h;
+    const dst = document.getElementById(targetId || 'peek-scope-body') || el;
+    dst.innerHTML = h;
+    if (targetId && targetId.indexOf('grp-scope-body-') === 0) _grpScopeHtml = h;
   } catch (e) {
-    el.textContent = 'Could not load scope: ' + e.message;
+    const dst = document.getElementById(targetId || 'peek-scope-body') || el;
+    dst.textContent = 'Could not load scope: ' + e.message;
   }
 }
 
@@ -35725,7 +35789,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.454';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.455';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57270,7 +57334,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.454';
+const CACHE = 'amux-v0.9.455';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
