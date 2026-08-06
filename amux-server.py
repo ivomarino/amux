@@ -29395,7 +29395,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
         <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; session</button>
-        <button id="bd-ask-status" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Ask the owning worker to post a status update to this card">&#x1F4AC; Ask status</button>
+
     </div>
     <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
@@ -29421,8 +29421,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <div class="board-detail-tabs">
-      <button class="board-detail-tab active" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
-      <button class="board-detail-tab" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
+      <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
+      <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
       <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">History<span id="bd-hist-n" class="bd-hist-n"></span></button>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
@@ -35923,7 +35923,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.460';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.461';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -48135,11 +48135,6 @@ function openBoardDetail(id) {
       try { closeBoardDetail(); } catch (err) {}
       openPeek(_sess, { query: item.id });
     };
-    const askBtn = document.getElementById('bd-ask-status');
-    if (askBtn) {
-      askBtn.style.display = _sess ? '' : 'none';
-      askBtn.onclick = (e) => { e.stopPropagation(); _askCardStatus(item.id, _sess); };
-    }
   }
   const dueEl = document.getElementById('bd-due');
   if (dueEl) dueEl.value = draft ? (draft.due || '') : (item.due || '');
@@ -48147,7 +48142,7 @@ function openBoardDetail(id) {
   if (dueTimeEl) dueTimeEl.value = draft ? (draft.due_time || '') : (item.due_time || '');
   const gateEl = document.getElementById('bd-gate');
   if (gateEl) gateEl.value = (Array.isArray(item.gate) ? item.gate : []).join('\n');
-  boardDetailTab('edit');
+  boardDetailTab('preview');
   _tagState['bd'] = [...(item.tags || [])];
   _beTagRenderChips('bd');
   _beTagInputUpdate('bd');
@@ -57483,7 +57478,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.460';
+const CACHE = 'amux-v0.9.461';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
