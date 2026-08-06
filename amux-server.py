@@ -35597,7 +35597,15 @@ async function _scopeLoad(scope, targetId) {
           + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's') + ': ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') : '')
           + '</div>'
           + '<div class="grp-scope-tiles"><div class="scope-tiles">';
-    d.capabilities.forEach((c, i) => {
+    // Group/global panel shows ONLY memory, board gates and env (Ethan,
+    // 2026-08-06: "remove rules(binding) from group configs. it should just be
+    // memory, board gates and env variables for now"). A DISPLAY trim, not a
+    // capability removal: _SCOPE_CAPS, GET/PUT /api/scope and the worker peek
+    // Scope tab still carry rules and status_mode — "for now" means the panel,
+    // and hiding a tile must not silently delete the API behind it.
+    const _visCaps = (lvl === 'worker') ? d.capabilities
+      : d.capabilities.filter(c => ['memory', 'gates', 'env'].includes(c.key));
+    _visCaps.forEach((c, i) => {
       const here = c.set_here, gset = G[c.key] && G[c.key].set_here;
       const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
       // Which layer actually supplies it, following this capability's own order.
@@ -35633,7 +35641,10 @@ async function _scopeLoad(scope, targetId) {
     h += '</div></div></div>';   // .scope-tiles, .grp-scope-tiles, .grp-scope-row
     // Detail for the tapped tile only. Everything a reader SCANS is in the row;
     // everything they CONSULT is here, one at a time.
-    const _selCap = d.capabilities.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
+    // Search the VISIBLE set, not all capabilities: a rules/status_mode row left
+    // open in _scopeRowOpen from before the trim would otherwise render a detail
+    // panel for a tile that no longer exists above it.
+    const _selCap = _visCaps.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
     if (_selCap) {
       const _l = _selCap;
       h += '<div class="scope-detail">'
@@ -36838,7 +36849,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.488';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.489';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58204,7 +58215,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.488';
+const CACHE = 'amux-v0.9.489';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
