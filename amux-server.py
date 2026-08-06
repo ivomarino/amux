@@ -17451,6 +17451,50 @@ def _session_mem_file(name: str) -> Path:
     return CC_MEMORY / f"{name}.md"
 
 
+def _memory_shared_with(name: str) -> list:
+    """Other sessions whose work dir resolves to the SAME Claude project dir.
+
+    The file above is keyed by SESSION NAME, but the content written into it by
+    _capture_claude_memory_changes is read from
+    ~/.claude/projects/<_project_name(work_dir)>/memory/MEMORY.md — which Claude
+    keys by DIRECTORY. So every session sharing a work dir captures the same
+    MEMORY.md into its own separate file, and the UI then presents that shared
+    content as "this session's memory".
+
+    Measured 2026-08-05: 58 of 89 non-empty session memory files were
+    byte-identical to another session's, only 47 distinct contents across them,
+    and 52 carried a "# custom-plugins session memory" header naming a session
+    that no longer exists. That header is not a bug in the header — it is
+    whatever the last writer put at the top of the SHARED file, faithfully
+    copied into every sibling.
+
+    This does not fix the sharing (Claude owns that key, not amux). It makes the
+    sharing VISIBLE, which is the part amux got wrong: a directory-scoped value
+    presented under a session's name, with nothing saying so, is ethos #4 — the
+    wrong reading was not detectable from the data shown."""
+    wd = _session_work_dir(name)
+    if not wd:
+        return []
+    try:
+        pname = _project_name(wd)
+    except Exception:
+        return []
+    out = []
+    for env_file in sorted(CC_SESSIONS.glob("*.env")):
+        other = env_file.stem
+        if other == name:
+            continue
+        owd = _session_work_dir(other)
+        if not owd:
+            continue
+        try:
+            if _project_name(owd) == pname:
+                out.append(other)
+        except Exception:
+            continue
+    return out
+
+
 def _session_work_dir(name: str) -> str:
     """Return the CC_DIR for a session, or empty string if not configured."""
     env_file = CC_SESSIONS / f"{name}.env"
@@ -29858,6 +29902,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="btn primary" id="peek-memory-save" onclick="savePeekMemory()">Save</button>
       </div>
     </div>
+    <div id="peek-memory-shared" style="display:none;flex-shrink:0;font-size:0.7rem;line-height:1.35;
+      color:#d29922;background:rgba(210,153,34,0.09);border:1px solid rgba(210,153,34,0.32);
+      border-radius:6px;padding:6px 8px;margin:6px 0 0;"></div>
     <textarea id="peek-memory-input" class="peek-memory-textarea"
       placeholder="No memory yet. Add notes, context, or conventions that Claude should always remember for this worker..."></textarea>
     <div id="peek-memory-preview" class="board-detail-preview md-content" style="display:none;flex:1;overflow-y:auto;min-height:0;"></div>
@@ -35985,6 +36032,25 @@ function peekMemoryTab(tab) {
     }
   }
 }
+// Say out loud when "session" memory is actually shared. Claude keys memory by
+// DIRECTORY (~/.claude/projects/<dir>/memory/MEMORY.md); amux stores it per
+// session NAME. So every worker in the same work dir captures the same file into
+// its own, and the tab then labels shared text as this worker's own — which is
+// how tubescience displayed "# custom-plugins session memory".
+function _peekMemorySharedBanner(data) {
+  const el = document.getElementById('peek-memory-shared');
+  if (!el) return;
+  const others = (data && data.shared_with) || [];
+  if (!others.length) { el.style.display = 'none'; el.textContent = ''; return; }
+  el.style.display = '';
+  el.innerHTML = '<b>Shared, not per-worker.</b> Claude keys memory by directory, so this text is the '
+    + 'same for ' + others.length + ' other worker' + (others.length === 1 ? '' : 's')
+    + ' in <code>' + esc(data.work_dir || '') + '</code>: '
+    + others.map(n => '<b>' + esc(n) + '</b>').join(', ')
+    + '. Editing it here changes what all of them see, and a header naming another worker is '
+    + 'expected rather than a mix-up.';
+}
+
 async function loadPeekMemory() {
   const inp = document.getElementById('peek-memory-input');
   const save = document.getElementById('peek-memory-save');
@@ -35994,6 +36060,7 @@ async function loadPeekMemory() {
     const r = await fetch(API + '/api/sessions/' + peekSession + '/memory');
     const data = await r.json();
     inp.value = data.content || '';
+    _peekMemorySharedBanner(data);
   } catch(e) { inp.value = ''; }
   inp.disabled = false; save.disabled = false;
   inp.focus();
@@ -36077,7 +36144,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.467';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.468';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57677,7 +57744,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.467';
+const CACHE = 'amux-v0.9.468';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -67453,7 +67520,17 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if wd:
                     _ensure_memory(name, wd)
                 content = mem_file.read_text(errors="replace") if mem_file.exists() else ""
-                return self._json({"content": content, "path": str(mem_file)})
+                # Say when this "session" memory is really directory-scoped. The
+                # content is captured from Claude's project-keyed MEMORY.md, so
+                # siblings in the same work dir all show the same text under
+                # their own names — which is how a lane came to display
+                # "# custom-plugins session memory".
+                _shared = _memory_shared_with(name)
+                return self._json({"content": content, "path": str(mem_file),
+                                   "work_dir": _session_work_dir(name),
+                                   "claude_project": (_project_name(_session_work_dir(name))
+                                                      if _session_work_dir(name) else ""),
+                                   "shared_with": _shared})
             if action == "steer":
                 if qs.get("history", ["0"])[0] == "1":
                     rows = get_db().execute(
