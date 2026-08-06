@@ -101,7 +101,7 @@ COST: Blocked my own push, asked a peer for permission they did not need to give
   last week's duplicate and shipping something genuinely unreviewed.
 FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
   comparison step to identify cherry-picks/rebases before asking about foreign commits.
-  Awaiting validation by amux-cloud.
+  Validated by amux-cloud.
 
 ## The co-edit sweep notice named the reporting session, not the commit's author
 AREA: attribution
@@ -135,7 +135,7 @@ COST: A caller scoping to one field and counting rows gets a confident wrong ans
 FIX: Already fixed in amux-server.py lines 64680-64710: `?field=` is now honoured as a
   WHERE clause filter, unknown params are rejected with 400, and large old/new values are
   truncated in list view (unless `?full=1` or `?id=` is provided).
-  Awaiting validation by amux-cloud.
+  Validated by amux-cloud.
 
 ## The browser driver drops to `backend: cli` mid-session and every eval returns null
 AREA: browser
@@ -153,8 +153,10 @@ COST: A UI review that needs more than ~4 steps cannot be completed. Two of the 
 FIX: `_bu_eval` now checks if a driver existed and died (`session in _bu_drivers` but
   `_bu_active_driver` returns None) and returns an explicit error with `backend:
   "dead-driver"` instead of silently falling back to CLI. The error tells the caller to
-  restart with POST /api/browser/start.
-  Awaiting validation by amux-cloud.
+  restart with POST /api/browser/start. Code correct by inspection (amux-cloud validated
+  the logic) but the loud path has not been exercised — reproducing it requires a driver
+  that existed and died, and the only live driver belongs to another session.
+  STATUS NOTE: fixed-unverified — awaiting next natural driver death to confirm.
 
 ## A reviewer who BLOCKS a card is re-nudged forever
 AREA: notices
@@ -174,7 +176,7 @@ FIX: e20a112 — the advance loop now checks interaction_log for deliberate revi
   than any other party's, the nudge is suppressed ("ball is with the author"). Fail-open
   on errors so a broken check never silences real review requests. AC-234 reviewed and
   closed by amux-frustrations.
-  Awaiting validation by amux-cloud.
+  Validated by amux-cloud.
 
 ## The `verified` gate requires e2e, and every e2e path runs against the cloud host
 AREA: gates
@@ -193,7 +195,7 @@ COST: Ten `done` cards were unverifiable at once, for a reason none of them had 
 FIX: Gate text changed from "CI/CD green (incl. e2e)" to "CI/CD green (if e2e infra is
   unavailable, note why -- that is not a failure)". A session can now honestly satisfy the
   gate when e2e cannot run by noting the reason, rather than being blocked.
-  Awaiting validation by amux-cloud.
+  Validated by amux-cloud.
 
 ## Board issues do not auto-progress during idle periods
 AREA: board
@@ -212,7 +214,7 @@ FIX: By design. The advance loop (`_advance_open_card`) already fires when sessi
   nudged (no running process to send to). This is correct per ethos (D1/D5): the model
   reports its own state, amux routes but does not decide for it. A stopped session's cards
   are visible on the board for human triage.
-  Awaiting validation by amux.
+  Awaiting validation by amux (sent).
 
 ## Auto-deploy only fires on `amux board done`, not on session idle/stop
 AREA: board
@@ -235,7 +237,7 @@ FIX: Already fixed. `.claude/settings.json` now has a Stop hook calling
   `auto-deploy.sh --on-stop`, which pushes unconditionally on session end/idle (bypassing
   the board-done trigger check). The PostToolUse Bash hook remains for immediate push on
   board-done.
-  Awaiting validation by amux-homepage.
+  Awaiting validation by amux-homepage (idle).
 
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
@@ -260,4 +262,4 @@ FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` w
   that would erase the author's content now returns 409 with a pointer to `desc_append`.
   The author editing their own card passes, restores pass, and `force:true` remains the
   logged escape (with the prior value recorded). AC-236 already marked done on the board.
-  Awaiting validation by amux-cloud.
+  Validated by amux-cloud.
