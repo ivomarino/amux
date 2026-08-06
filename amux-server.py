@@ -35923,7 +35923,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.461';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.462';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -39874,12 +39874,22 @@ function _mergeUnechoed(serverRows, session) {
   return serverRows.concat(local).sort((a, b) => (a.time || a.ts || 0) - (b.time || b.ts || 0));
 }
 
-async function _peekMsgFetch(session) {
-  const r = await fetch(API + '/api/history?limit=500&session=' + encodeURIComponent(session),
-                        { headers: _authHeaders() });
+// Takes a SCOPE, not a session (AMUX-2366). Threaded through while every caller
+// still passes a worker, so the change is provably behaviour-preserving before a
+// group or global caller exists — the sequencing amux-cloud called the most
+// valuable paragraph on the original card, and the same order that made the
+// Scope tab's second caller a one-liner instead of a second renderer.
+async function _peekMsgFetch(scope) {
+  const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
+  const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
+          : sc.level === 'global' ? ''
+          : '&session=' + encodeURIComponent(sc.name);
+  const r = await fetch(API + '/api/history?limit=500' + q, { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
   const rows = (await r.json()).map(_msgNorm);
-  return _mergeUnechoed(rows.reverse(), session);
+  // Locally-queued sends belong to a WORKER; merging them into a group or global
+  // view would attribute one worker's unsent messages to the whole scope.
+  return _mergeUnechoed(rows.reverse(), sc.level === 'worker' ? sc.name : '');
 }
 
 async function _peekMessagesLoad() {
@@ -57478,7 +57488,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.461';
+const CACHE = 'amux-v0.9.462';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60155,6 +60165,26 @@ class CCHandler(BaseHTTPRequestHandler):
                 if session:
                     where.append("session=?")
                     params.append(session)
+                # ?group=<g> — history across every worker in a group (AMUX-2366).
+                # Ethan: "a worker message history, group message history and
+                # global message history ... same UX, obviously calling upon
+                # different data." Resolved to members HERE rather than the
+                # client sending a session list, so group membership means the
+                # same thing to this endpoint as it does everywhere else. Global
+                # is simply no filter, which this already did.
+                _grp = (qs.get("group", [""])[0] or "").strip()
+                if _grp and not session:
+                    _members = [x["name"] for x in list_sessions()
+                                if _grp in (x.get("tags") or [])]
+                    if _members:
+                        where.append("session IN (%s)" % ",".join("?" * len(_members)))
+                        params.extend(_members)
+                    else:
+                        # An empty group must return NOTHING, not everything.
+                        # Falling through with no predicate would render the whole
+                        # fleet's history under a group name — a wrong answer that
+                        # looks like a working feature.
+                        where.append("1=0")
                 if want:
                     ors = []
                     for k in want:
