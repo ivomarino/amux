@@ -25076,7 +25076,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<link id="hljs-theme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<link id="hljs-theme" rel="stylesheet" crossorigin="anonymous" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -38485,7 +38485,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.499';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.500';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43892,6 +43892,8 @@ function _hljsEnsureLang(lang) {
   if (_hljsLangLoads[lang]) return _hljsLangLoads[lang];
   _hljsLangLoads[lang] = new Promise(res => {
     const sc = document.createElement('script');
+    // crossorigin so the response is NOT opaque — see the hljs offline note.
+    sc.crossOrigin = 'anonymous';
     sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/'
            + lang + '.min.js';
     sc.onload = () => res(!!hljs.getLanguage(lang));
@@ -59899,7 +59901,7 @@ async function _jrnlSaveConfig() {
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
@@ -60006,7 +60008,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.499';
+const CACHE = 'amux-v0.9.500';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60116,6 +60118,18 @@ self.addEventListener('fetch', e => {
     caches.open(CACHE).then(cache =>
       cache.match(e.request).then(cached => {
         const networkUpdate = fetch(e.request).then(response => {
+          // `response.ok` is FALSE for an OPAQUE cross-origin response (status 0),
+          // so this gate silently declined to cache every CDN asset — which is why
+          // an offline PWA got no syntax highlighting despite the cache-first
+          // strategy looking like it covered everything (AMUX-2460).
+          //
+          // Fixed at the request, not here: the hljs <script>, its theme <link>
+          // and the lazily loaded grammars now carry crossorigin="anonymous", and
+          // cdnjs serves access-control-allow-origin:* on all three (verified), so
+          // the responses are real and this gate stores them. Deliberately NOT
+          // relaxed to cache opaque responses — an opaque 404 is indistinguishable
+          // from an opaque 200, so that would cache failures as confidently as
+          // successes.
           if (response.ok) cache.put(e.request, response.clone());
           return response;
         }).catch(() => null);
