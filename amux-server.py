@@ -36940,7 +36940,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.492';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.493';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58358,7 +58358,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.492';
+const CACHE = 'amux-v0.9.493';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63095,6 +63095,38 @@ class CCHandler(BaseHTTPRequestHandler):
                             _old_desc = (_audit_prior.get("desc") or "").rstrip()
                             body["desc"] = (_old_desc + "\n" + _new_txt).strip()
                         body.pop("desc_append", None)
+                    # ── Another session's desc is not yours to erase (AC-236) ──
+                    # amux-gtm reviewed two cards with {"desc": "REVIEWED..."} and
+                    # silently DELETED the OOM root-cause analysis and the
+                    # dockerd-wedge diagnosis — the only copy outside the author's
+                    # context. `desc` is the obvious key and it replaces; the
+                    # author was never notified and nothing on the card said
+                    # content had been removed. Blocked only when it is LOSSY:
+                    # a cross-session write whose new desc still CONTAINS the old
+                    # text (a restore, a full-edit that preserves) passes, the
+                    # author editing their own card passes, the dashboard passes.
+                    # force=true remains the logged escape, and the prior value is
+                    # recorded then — an overwrite that leaves no trace is
+                    # unauditable.
+                    if "desc" in body and isinstance(body.get("desc"), str):
+                        _dw_actor = _hdr_worker(self.headers)
+                        _dw_owner = (_audit_prior.get("session") or "").strip()
+                        _dw_old = (_audit_prior.get("desc") or "").strip()
+                        _lossy = (_dw_old and _dw_old not in body["desc"])
+                        if (_dw_actor and _dw_owner and _dw_actor != _dw_owner and _lossy
+                                and not body.get("force")):
+                            return self._json({
+                                "error": (f"'{_dw_actor}' would ERASE {len(_dw_old)} chars of "
+                                          f"'{_dw_owner}'s card content — desc REPLACES. Use "
+                                          f"desc_append for reviews/notes on another session's "
+                                          f"card; it keeps the author's evidence and adds yours."),
+                                "blocked": True, "use": {"desc_append": "<your text>"},
+                                "or": "force:true (logged, prior value recorded)",
+                            }, 409)
+                        if _dw_actor and _dw_owner and _dw_actor != _dw_owner and _lossy:
+                            _ilog("board", "desc_replace_forced", actor=_dw_actor, target=bid,
+                                  before=_dw_old, result=body["desc"][:500], ok=True,
+                                  detail={"owner": _dw_owner, "erased_chars": len(_dw_old)})
                     # ── One-doing-per-session soft cap (AMUX-1707) ──────────────
                     # `doing` is only meaningful if it's HARD TO HOLD. Taking a 2nd
                     # doing item is how 164 of them accumulated. Soft by design:
