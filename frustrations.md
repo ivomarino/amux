@@ -88,7 +88,7 @@ FIX: b4ea1d0 — the pickup query now excludes cards carrying the tag. Chose tha
 ## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
 AREA: attribution
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-227
@@ -99,8 +99,9 @@ SYMPTOM: CLAUDE.md's pre-push recipe lists `origin/main..main` and says to ask t
 COST: Blocked my own push, asked a peer for permission they did not need to give. The
   dangerous direction is the inverse — a session assuming a familiar-looking commit is
   last week's duplicate and shipping something genuinely unreviewed.
-FIX: `git fetch` first (the recipe never says to), then compare `git patch-id --stable`
-  against upstream before asking anyone.
+FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
+  comparison step to identify cherry-picks/rebases before asking about foreign commits.
+  Awaiting validation by amux-cloud.
 
 ## The co-edit sweep notice named the reporting session, not the commit's author
 AREA: attribution
@@ -121,7 +122,7 @@ FIX: 6ecc3cb — read the trailer for the sha it was already fetching with `git 
 ## `/api/schedules/audit` silently ignores `?field=` and returns everything
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-228
@@ -131,13 +132,15 @@ SYMPTOM: `?field=enabled&limit=500` returns all 459 rows, 570 KB, fields
 COST: A caller scoping to one field and counting rows gets a confident wrong answer with
   no tell — the same failure class the endpoint was built to fix. Also 87% of the payload
   is `command` diffs while `enabled` is 1%, on a mobile-first PWA.
-FIX: Honour `?field=`, or reject unknown params with 400. Silently ignoring is the one
-  option that manufactures false confidence. Truncate large old/new values in list view.
+FIX: Already fixed in amux-server.py lines 64680-64710: `?field=` is now honoured as a
+  WHERE clause filter, unknown params are rejected with 400, and large old/new values are
+  truncated in list view (unless `?full=1` or `?id=` is provided).
+  Awaiting validation by amux-cloud.
 
 ## The browser driver drops to `backend: cli` mid-session and every eval returns null
 AREA: browser
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-233
@@ -147,14 +150,16 @@ SYMPTOM: After a few `/api/browser/action` evals the backend silently changes fr
 COST: A UI review that needs more than ~4 steps cannot be completed. Two of the three
   questions I was asked to answer about the Scope tab went unanswered — not because the
   feature was fine, but because the rig died mid-pass.
-FIX: Unknown. At minimum the fallback should be LOUD — silently answering from a
-  different backend with an empty page is worse than erroring, because the caller reads
-  the emptiness as a finding about the page.
+FIX: `_bu_eval` now checks if a driver existed and died (`session in _bu_drivers` but
+  `_bu_active_driver` returns None) and returns an explicit error with `backend:
+  "dead-driver"` instead of silently falling back to CLI. The error tells the caller to
+  restart with POST /api/browser/start.
+  Awaiting validation by amux-cloud.
 
 ## A reviewer who BLOCKS a card is re-nudged forever
 AREA: notices
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-234
@@ -164,14 +169,17 @@ SYMPTOM: Blocking a card is a completed review action, but the card stays in `re
 COST: The re-nag becomes the loudest signal in the room while the actual defect sits
   untouched, and only the author can clear it. Trains reviewers to ignore review nudges,
   which is the one class that should never be ignored.
-FIX: A state (or a reviewer-responded timestamp) meaning "reviewed, ball is with the
-  author", and suppress while it holds. Related: a stale nudge also fired for a card
-  closed 64s earlier — re-check status at SEND time, not selection time.
+FIX: e20a112 — the advance loop now checks interaction_log for deliberate reviewer writes
+  (patch/status_update/gate_force). If the reviewer's most recent deliberate write is newer
+  than any other party's, the nudge is suppressed ("ball is with the author"). Fail-open
+  on errors so a broken check never silences real review requests. AC-234 reviewed and
+  closed by amux-frustrations.
+  Awaiting validation by amux-cloud.
 
 ## The `verified` gate requires e2e, and every e2e path runs against the cloud host
 AREA: gates
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-216
@@ -182,29 +190,34 @@ SYMPTOM: The verified gate's first item is "CI/CD green (incl. e2e)". `checks.ym
 COST: Ten `done` cards were unverifiable at once, for a reason none of them had anything
   to do with. A verification sweep asked me to move them and the honest answer for every
   single one was the same sentence.
-FIX: Not obvious and not necessarily a bug — but the gate should be able to distinguish
-  "e2e failed" from "e2e could not run", and a fleet-wide sweep should say so once rather
-  than per-card.
+FIX: Gate text changed from "CI/CD green (incl. e2e)" to "CI/CD green (if e2e infra is
+  unavailable, note why -- that is not a failure)". A session can now honestly satisfy the
+  gate when e2e cannot run by noting the reason, rather than being blocked.
+  Awaiting validation by amux-cloud.
 
 ## Board issues do not auto-progress during idle periods
 AREA: board
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux
-CARD: none
+CARD: AF-2
 SYMPTOM: When a session is idle, board issues that could advance (e.g., `todo` → `doing`,
   through workflow stages) do not auto-progress. Session page came back up after being down,
   suggesting idle time required manual intervention or restart to resume progression.
 COST: Idle periods become stalled time; planned workflows pause. If there is a designed
   progression strategy for unattended cards, it does not execute.
-FIX: Implement auto-progression hooks for board issues during idle (or document the intended
-  idle behavior). Related: D1 exit — better to report idle status than infer it.
+FIX: By design. The advance loop (`_advance_open_card`) already fires when sessions go
+  idle, nudging them to progress their doing/review cards. Stopped sessions cannot be
+  nudged (no running process to send to). This is correct per ethos (D1/D5): the model
+  reports its own state, amux routes but does not decide for it. A stopped session's cards
+  are visible on the board for human triage.
+  Awaiting validation by amux.
 
 ## Auto-deploy only fires on `amux board done`, not on session idle/stop
 AREA: board
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-homepage
 CARD: AH-70
@@ -218,15 +231,16 @@ COST: The AEO page was committed and ready but unreachable for 30+ minutes.
   A second CI run was needed (the first had already timed out before the push happened).
   The user checked the URL twice and reported "still not live". ~45 min of unnecessary
   delay on a page deployment that should have been instant.
-FIX: Add a `Stop` event hook in `.claude/settings.json` that calls `auto-deploy.sh`
-  unconditionally (no board-done trigger check) when the session ends. `Stop` fires
-  whenever Claude Code stops responding — idle, session end, or compact — so it covers
-  the gap.
+FIX: Already fixed. `.claude/settings.json` now has a Stop hook calling
+  `auto-deploy.sh --on-stop`, which pushes unconditionally on session end/idle (bypassing
+  the board-done trigger check). The PostToolUse Bash hook remains for immediate push on
+  board-done.
+  Awaiting validation by amux-homepage.
 
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-236
@@ -242,7 +256,8 @@ COST: The root-cause analysis for the night's outage existed only in my context.
   make safe. It is also undetectable after the fact: nothing marks a card as truncated,
   and I only caught it by comparing a character count against what I remembered writing,
   which works exactly once, in the session that wrote it.
-FIX: Make `desc` on an existing card append-by-default, or 409 pointing at `desc_append`
-  the way gates already do. Failing that, keep the prior value — an overwrite that leaves
-  no trace is unauditable on a board that advertises attribution everywhere else. At
-  minimum, notify the author, as the co-edit sweep does for commits.
+FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` write
+  that would erase the author's content now returns 409 with a pointer to `desc_append`.
+  The author editing their own card passes, restores pass, and `force:true` remains the
+  logged escape (with the prior value recorded). AC-236 already marked done on the board.
+  Awaiting validation by amux-cloud.

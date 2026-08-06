@@ -2442,6 +2442,18 @@ def _bu_eval(session: str, js: str, timeout_s: int = 20) -> dict:
         if r.get("ok"):
             return {"ok": True, "result": r.get("value"), "backend": "driver"}
         return {"error": r.get("error") or "driver eval failed", "backend": "driver"}
+    # AC-233: a driver that EXISTED and DIED is not a silent fallback — it is a
+    # broken session. Returning cli results from about:blank looks like a finding
+    # about the page, which is worse than an error. Only fall through to cli when
+    # no driver was ever started for this session.
+    with _bu_driver_lock:
+        _had_driver = session in _bu_drivers
+    if _had_driver:
+        slog(f"[browser] driver for '{session}' died — refusing silent cli fallback (AC-233)")
+        return {"error": f"browser driver for '{session}' has died — restart with "
+                         f"POST /api/browser/start. Refusing silent fallback to cli "
+                         f"(which would return results from about:blank).",
+                "backend": "dead-driver", "had_driver": True}
     r = _bu_call(["eval", js], session=session, timeout_s=timeout_s)
     if isinstance(r, dict) and r.get("error"):
         return {"error": r["error"], "backend": "cli"}
@@ -10879,7 +10891,7 @@ def _init_db():
         "doing":    ["Scope & acceptance criteria are clear", "No blocking dependency", "Has an owner"],
         "review":   ["Implemented and self-tested", "Diff / PR is up", "Ready for another set of eyes"],
         "done":     ["Implemented and merged", "Tests / lint pass"],
-        "verified": ["CI/CD green (incl. e2e)", "Deployed to prod", "Confirmed working in prod", "Zero regressions"],
+        "verified": ["CI/CD green (if e2e infra is unavailable, note why — that is not a failure)", "Deployed to prod", "Confirmed working in prod", "Zero regressions"],
     }.items():
         try:
             db.execute("UPDATE statuses SET gate=? WHERE id=? AND (gate IS NULL OR gate='')", (json.dumps(_items), _sid))
