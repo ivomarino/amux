@@ -19238,6 +19238,100 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
         pass
 
 
+_MEM_PTR_RE = re.compile(r"^[ \t]*[-*][ \t]*\[[^\]]+\]\(([^)/]+\.md)\)", re.M)
+_mem_file_index_cache = {"ts": 0.0, "map": {}}
+_MEM_INDEX_TTL = 30.0
+
+
+def _mem_file_index() -> dict:
+    """filename -> [dirs holding it], across every project memory dir.
+
+    Cached briefly on purpose: a POST to /api/memory/global recomposes for EVERY
+    registered worker in a loop, so an uncached scan would turn one edit into
+    ~100 x 218 directory listings. One listdir per dir, not a stat per candidate
+    — the naive form is 137 missing files x 218 dirs of stat() calls."""
+    now = time.time()
+    if _mem_file_index_cache["map"] and now - _mem_file_index_cache["ts"] < _MEM_INDEX_TTL:
+        return _mem_file_index_cache["map"]
+    m: dict = {}
+    try:
+        for d in (CLAUDE_HOME / "projects").glob("*/memory"):
+            try:
+                for f in os.listdir(d):
+                    if f.endswith(".md"):
+                        m.setdefault(f, []).append(d)
+            except OSError:
+                continue
+    except Exception:
+        pass
+    _mem_file_index_cache.update({"ts": now, "map": m})
+    return m
+
+
+def _resolve_memory_pointers(composed: str, mem_dir) -> str:
+    """Make the index say where its memories actually are, computed each sync.
+
+    THE BUG (AMUX-2446, found by gtm-videos). Claude Code's memory is keyed by
+    cwd; amux's is keyed by worker. A worker whose cwd is a SUBDIRECTORY gets its
+    own project slug, but the memory FILES stay in the project dir they were
+    written into. Lane mixpeek-security loaded a 138-entry index in a directory
+    holding two .md files: 137 pointers dangled and it could open one line of its
+    own memory, silently. ~950 violations fleet-wide were this shape.
+
+    WHY A COMPUTED HINT AND NOT REWRITTEN PATHS. Measured on that lane's real
+    index — 138 entries, 16242 B against a 16800 B read ceiling, 558 B of
+    headroom. Rewriting each pointer to `../../<slug>/memory/x.md` adds 5244 B and
+    absolute paths add 8556 B, both far over, and the fold that would normally
+    absorb that has ALREADY RUN by this point in the flow. So per-pointer
+    rewriting does not just cost bytes, it silently pushes the tail of the index
+    past what the agent reads — trading unopenable pointers for unread ones. A
+    computed location line costs ~96 B and fits.
+
+    What makes this generation-time rather than a static hint: the directory is
+    LOOKED UP from the live filesystem on every sync, so it follows the files. If
+    a worker's cwd moves — the mechanism we could not confirm but also cannot rule
+    out, since CC_DIR is editable — the next sync recomputes and the line stays
+    true. That is the property a hardcoded path or a baked relative link cannot
+    have, and it is why this is not the 96-byte variant I first proposed.
+
+    Cheap in the healthy case: pointers that already resolve locally cost one
+    os.path.exists each and the scan never runs."""
+    try:
+        targets = {m.group(1) for m in _MEM_PTR_RE.finditer(composed)}
+        missing = [t for t in targets if not (mem_dir / t).exists()]
+        if not missing:
+            return composed
+        idx = _mem_file_index()
+        homes: dict = {}
+        for t in missing:
+            for d in idx.get(t, []):
+                if d != mem_dir:
+                    homes[d] = homes.get(d, 0) + 1
+        if not homes:
+            return composed
+        # Rank by how many of THIS index's missing files a directory holds. The
+        # winner is the home; report the rest too rather than pretending one
+        # directory explains everything.
+        ranked = sorted(homes.items(), key=lambda kv: -kv[1])
+        # COUNT DISTINCT FILES, not per-directory hits. Summing the ranked counts
+        # double-counts any file present in two dirs, which made this line report
+        # "138 of 138" for a directory with 137 unresolved pointers — a summary
+        # overstating its own denominator, in the one sentence whose entire job is
+        # to state it accurately.
+        found = len({t for t in missing if any(d != mem_dir for d in idx.get(t, []))})
+        lines = ["", "> **Where these memories live.** %d of the %d entries below are not files in "
+                 "this directory. Open them at their real path:" % (found, len(targets))]
+        for d, n in ranked[:3]:
+            lines.append(">   - `%s/` (%d entries)" % (d, n))
+        if len(missing) > found:
+            lines.append(">   - %d entr(ies) resolve nowhere on disk — they are genuinely gone."
+                         % (len(missing) - found))
+        lines.append("> Resolved at write time from the live filesystem, so it follows the files.")
+        return composed.rstrip() + "\n" + "\n".join(lines) + "\n"
+    except Exception:
+        return composed
+
+
 def _write_claude_memory(name: str, work_dir: str):
     """Write composed (global + session) memory to Claude's project memory dir."""
     pname = _project_name(work_dir)
@@ -19304,6 +19398,8 @@ def _write_claude_memory(name: str, work_dir: str):
         for _l in _memory_layers(name):
             if _l["kind"] == "memory" and _l["layer"].startswith("tag:") and _l["exists"]:
                 (claude_mem_dir / Path(_l["path"]).name).write_text(_l["text"] + "\n")
+        # RESOLVE POINTERS AT GENERATION TIME (AMUX-2446, Ethan's call).
+        composed = _resolve_memory_pointers(composed, claude_mem_dir)
         if claude_mem_file.is_symlink():
             claude_mem_file.unlink()
         claude_mem_file.write_text(composed)
