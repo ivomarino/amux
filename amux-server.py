@@ -18080,7 +18080,15 @@ def _fold_memory_overflow(name: str, session_content: str) -> str:
     it deliberately.
     """
     lines = session_content.splitlines()
-    entry_idx = [i for i, l in enumerate(lines) if _MEM_ENTRY_RE.match(l)]
+    # The archive POINTER is not a foldable entry. It matches the entry shape, so
+    # the fold happily moved `- [Archived memories](memory-archive.md)` into the
+    # archive — the index's own signpost to the archive, filed inside the archive.
+    # Harmless only because the fold re-adds it afterwards; the visible cost is a
+    # junk line in every archive, which is how tubescience's count came out 24
+    # against my 23 and cost a reconciliation. Found by their counted denominator,
+    # not by reading this code.
+    entry_idx = [i for i, l in enumerate(lines)
+                 if _MEM_ENTRY_RE.match(l) and _MEM_ARCHIVE_FILE not in l]
 
     ptr = f"- [Archived memories]({_MEM_ARCHIVE_FILE}) — older entries folded out of this index to fit the read ceiling; read it when the index has no answer."
     # Budget the pointer line UP FRONT. Measuring the kept lines alone stopped the
@@ -19201,6 +19209,35 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
     session_file = CC_MEMORY / f"{name}.md"
     if not claude_mem_file.exists() or claude_mem_file.is_symlink():
         return
+    # FRESHNESS GATE (AMUX-2449, tubescience). This is a ONE-WAY copy
+    # MEMORY.md -> the worker's store, and _ensure_memory runs it BEFORE the
+    # compose that would have propagated the store outward. So a stale MEMORY.md
+    # beat a hand-edited store: tubescience compacted their index 232 -> 111 by
+    # hand, and the next sync restored the pre-fold body from a MEMORY.md written
+    # before the edit. They re-applied the fold and it was queued to happen a
+    # THIRD time — a 242-line body waiting against their 117-line source.
+    #
+    # The discriminator is which side moved last. MEMORY.md newer means the agent
+    # wrote memories there and they are the thing to capture — the case this
+    # function exists for. The STORE newer means a human or a lane edited it
+    # directly, and there is nothing in MEMORY.md worth restoring over that.
+    #
+    # Skipping is safe precisely because of the ordering that caused the bug:
+    # _write_claude_memory runs later in the same call and composes FROM the
+    # store, so a skipped capture still propagates the newer content outward on
+    # the same pass. The edit is not stranded, it wins.
+    try:
+        if session_file.exists() and \
+                os.path.getmtime(claude_mem_file) <= os.path.getmtime(session_file):
+            # Say so (rule 4). A silent skip is indistinguishable from a capture
+            # that found nothing, and this one has a visible consequence: the
+            # index the agent sees is about to be rebuilt from the store instead.
+            slog(f"[memory] {name}: store is newer than MEMORY.md "
+                 f"({int(os.path.getmtime(session_file) - os.path.getmtime(claude_mem_file))}s) "
+                 f"— skipping capture so a direct edit is not overwritten")
+            return
+    except OSError:
+        pass
     try:
         content = claude_mem_file.read_text(errors="replace")
         if _MEM_MARKER in content:
