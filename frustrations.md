@@ -449,3 +449,35 @@ NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for som
   answer arrives, looks plausible, and nothing prompts a recheck. When adding a route
   namespace, add its catch-all in the same commit; the fallthrough target is whatever
   happens to sit below, and here that was a side-effecting container start.
+
+## The gate's own "wrong type?" hint recommends two types the server rejects
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-249
+SYMPTOM: A blocked transition prints `cli_wrong_type: amux board type <ID>
+  <chore|task|doc|research|ops|decision|investigation>`, and `amux board --help` prints the
+  same set. Two of those seven are not valid types. `amux board type AC-248 decision`
+  returns `{"error":"unknown type 'decision'","valid_types":["code","escalation","blocker",
+  "investigation","ops","research","chore","doc","tripwire","watch"]}`. `task` is not in the
+  valid list either. Conversely `escalation`, `blocker`, `tripwire` and `watch` are valid but
+  never suggested, so the hint is wrong in both directions at once.
+COST: Retyping a card is the sanctioned escape from a gate that does not fit — rule 3's
+  "fix the type, not the truth". I followed the hint verbatim, it failed, and the failure was
+  silent in a way that mattered: `amux board type` errored while the `amux board done` in the
+  same breath had ALREADY written its `--outcome` (outcome writes before the gate check, by
+  design). So the card sat typed `code`, gated on "Implemented and merged", with its outcome
+  text already committed — and the obvious retry would have appended the whole outcome a
+  second time. I checked the card before re-running and avoided it, but the safe move is not
+  discoverable from the error.
+FIX: Not fixed. Derive the hint from the same `valid_types` list the validator uses instead of
+  a hardcoded string — the two have already drifted, which is the tell. Suggesting the full
+  valid set would also surface `escalation`/`blocker`/`tripwire`/`watch`, which today an agent
+  only learns by triggering the error.
+NOTE: this is the ethos rule-7 shape where the SANCTIONED INSTRUCTION is the theatre — same
+  family as `amux board claim` (AMUX-2140), which did not exist, fell through to help text and
+  exited 0. That one was worse because it reported success; this one fails loudly, which is
+  why it cost minutes rather than a wrong belief. Both come from the same source: text telling
+  an agent what to run, never exercised against the thing that runs it.
