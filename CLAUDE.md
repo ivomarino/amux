@@ -23,6 +23,47 @@ still fights the ethos, each with a status and an exit condition. Check it befor
 touching state detection, auto-answers, helper-model calls, observation caps, or
 auto-compact; move the deviation toward its exit rather than deepening it.
 
+## Build on the primitives — never reinvent or abstract them
+
+**The primitives are: board, workers, schedulers, filesystem, groups, memories,
+environment, messages.** Ethan's conviction on this set is high and it governs every
+new feature: *"I'd encourage us to just build on top of them… I don't suggest
+introducing a new feature in order to effectively re-invent, or abstract the
+primitives."*
+
+Improving the UX of a primitive, or the integration between two of them, is always in
+scope and is most of the good work available. Adding a ninth thing that sits above
+them and re-expresses them is not.
+
+**The test, when a capability is requested: name it in terms of the primitives.** A
+"chief of staff" is not a subsystem to build — it is a configured environment, backend
+and frontend: *these tabs, these board gates, this group, these workers, these
+memories, these environment variables (the 3p APIs it can reach).* Ethan's own worked
+example: "on receipt of a command from the user, coordinate with workers within this
+group to do xyz" is **a gate on a group**, not a new coordination engine. If the
+request decomposes cleanly into primitives that already exist, the work is
+configuration and UX — which is the work.
+
+Two shapes to reject:
+
+- **A wrapper that re-expresses a primitive under a new name.** If it stores units of
+  work, it is the board. If it runs something later, it is a scheduler. If it holds
+  per-scope config, it is environment or memory. If it moves text between lanes, it is
+  messages. A second spelling of an existing primitive doubles the surface that must
+  be kept in step forever — see D6 in `ethos.md` for what a single duplicated seam
+  already costs.
+- **An abstraction layer over several primitives.** This one fails the compounding
+  question directly: a better model can compose primitives it can see, but it cannot
+  see past a layer that has already decided how they compose. The abstraction becomes
+  the ceiling at exactly the moment the model gets good enough to have done better.
+
+A genuinely absent primitive is legitimately new, but the bar is that **no
+composition of the existing eight expresses it** — not that the composition is
+awkward. Awkward composition is a UX defect *in* the primitives, and fixing it there
+is worth more than routing around it, because every other composition gets the fix
+too. When you are unsure which case you are in, say so in the commit message and name
+the primitives you considered.
+
 ## You are dogfooding — fix it at the root
 
 You run *inside* amux. Every rough edge you hit while working is a rough edge a user
@@ -46,12 +87,20 @@ and fix it at its root**, not as an obstacle to route around in your own task.
 The bar: after you are done, could someone hit the same problem again? If yes, you fixed
 your task, not the platform.
 
-**Log the friction, not just the fix: [`frustrations.md`](frustrations.md).** When amux
-gets in your way — a command that reports success and does nothing, a notice that names
-the wrong session, a gate you cannot satisfy honestly, a probe that cannot express the
-answer — append an entry there. The format is fixed so it greps (`grep '^STATUS: open'`,
-`grep '^AREA: attribution'`), and the rule for when to log is
-[`.claude/rules/frustrations.md`](.claude/rules/frustrations.md).
+**MANDATORY: log the friction, not just the fix — [`frustrations.md`](frustrations.md).**
+**Any issue you experience with amux gets an entry, whether or not you fixed it, and
+whether or not it blocked you.** A command that reports success and does nothing, a
+notice that names the wrong session, a gate you cannot satisfy honestly, a probe that
+cannot express the answer, a peek that hides output, two components disagreeing about
+the same fact — append an entry. The format is fixed so it greps
+(`grep '^STATUS: open'`, `grep '^AREA: attribution'`), and the full rule for what
+counts is [`.claude/rules/frustrations.md`](.claude/rules/frustrations.md).
+
+The entry is owed even when you fixed it in the same breath. You know the fix; the
+file is how the *pattern* becomes visible to everyone else, and a fix you made
+silently teaches nobody that the subsystem keeps producing that shape. The only
+things that do not belong there are your own mistakes with no amux involvement and
+one-off environment noise.
 
 This exists because a single frustration is a complaint and a cluster is an argument.
 No one entry proves a subsystem needs rebuilding; three entries sharing an `AREA` do,

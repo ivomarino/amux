@@ -265,3 +265,42 @@ FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` w
   The author editing their own card passes, restores pass, and `force:true` remains the
   logged escape (with the prior value recorded). AC-236 already marked done on the board.
   Validated by amux-cloud.
+
+## `git add amux-server.py` on a shared checkout ships another session's uncommitted hunk under your message
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2443
+SYMPTOM: I made an edit, ran the checks, and went to stage it — `git status --porcelain`
+  came back EMPTY and `git diff amux-server.py` showed nothing, seconds after a probe had
+  confirmed my change was in the working tree and not in HEAD. It had been committed by
+  someone else: `24a294b` "fix(task-guard): a lane whose whole queue is blocked is not
+  delinquent (AC-240)" by amux-cloud, 79 insertions, of which ~30 were my unrelated
+  advance-sweep change (AMUX-2442). Their `git add amux-server.py` takes the whole file,
+  not their hunks.
+COST: No lost work and the combined commit is green (224 tests), so the cost is entirely
+  in the trail: `git log -S` on the advance sweep lands on a commit message about
+  task-guard, and the two changes — both touching the idle/nudge path — were never tested
+  independently of each other. Also ~10 minutes reading git state that looked like the
+  "lost edit" failure from earlier in this session before the real cause was clear. The
+  mirror case is what makes it structural rather than a one-off: I had used
+  `git apply --cached` earlier the same day specifically to avoid doing this to
+  amux-cloud's in-flight AC-233 work in this same file, so the discipline is real, it is
+  just not enforced anywhere and one session forgetting it is enough.
+FIX: amux ALREADY KNOWS the answer — the co-edit notice ("Commit <sha> by session <X>
+  touched files you also edited recently") is generated from data the server holds. It
+  just fires AFTER the commit, which is the one moment it cannot help. Move the same
+  check earlier: `scripts/git-hooks/pre-commit` asks the amux API which other sessions
+  have edited the staged paths recently, and warns (not blocks) when you are staging a
+  whole file that someone else is live in, naming them and pointing at the
+  `git apply --cached` recipe already in CLAUDE.md. No new primitive — filesystem plus
+  messages, surfaced at the moment of the decision instead of after it.
+NOTE: This is the THIRD `AREA: attribution` entry filed on 2026-08-06, after AC-227
+  (passenger check reads an upstream cherry-pick as foreign forever) and AC-230 (co-edit
+  notice named the reporting session, not the author). All three are shared-checkout
+  commit provenance, and all three are downstream of one fact: N sessions share one
+  working tree and git has no concept of which session owns a hunk. Per this file's own
+  thesis, three entries in one AREA is the argument that the thing needs designing rather
+  than patching — that design is worth doing before a fourth.
