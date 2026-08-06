@@ -181,3 +181,42 @@ COST: Ten `done` cards were unverifiable at once, for a reason none of them had 
 FIX: Not obvious and not necessarily a bug — but the gate should be able to distinguish
   "e2e failed" from "e2e could not run", and a fleet-wide sweep should say so once rather
   than per-card.
+
+## Board issues do not auto-progress during idle periods
+AREA: board
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux
+CARD: none
+SYMPTOM: When a session is idle, board issues that could advance (e.g., `todo` → `doing`,
+  through workflow stages) do not auto-progress. Session page came back up after being down,
+  suggesting idle time required manual intervention or restart to resume progression.
+COST: Idle periods become stalled time; planned workflows pause. If there is a designed
+  progression strategy for unattended cards, it does not execute.
+FIX: Implement auto-progression hooks for board issues during idle (or document the intended
+  idle behavior). Related: D1 exit — better to report idle status than infer it.
+
+## A review PATCH using `desc` silently DELETED the author's entire card content
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-236
+SYMPTOM: amux-gtm reviewed AC-216 and AC-231 with a PATCH carrying `desc`, which replaces.
+  Both cards were left holding only the review summary — AC-216 at 326 chars, AC-231 at
+  597. Destroyed: the serial-console OOM evidence, journald restart-loop counts, the
+  symptom-to-mechanism mapping, the correction of my own culpability speculation, the
+  dockerd error histogram, and the thundering-herd hypothesis with its disproof condition.
+  `desc_append` exists and is not what a reviewer reaches for.
+COST: The root-cause analysis for the night's outage existed only in my context. Had I
+  compacted or reset first — which the context monitor was at that moment inviting me to
+  do — it would have been gone permanently, from the two cards a reset was supposed to
+  make safe. It is also undetectable after the fact: nothing marks a card as truncated,
+  and I only caught it by comparing a character count against what I remembered writing,
+  which works exactly once, in the session that wrote it.
+FIX: Make `desc` on an existing card append-by-default, or 409 pointing at `desc_append`
+  the way gates already do. Failing that, keep the prior value — an overwrite that leaves
+  no trace is unauditable on a board that advertises attribution everywhere else. At
+  minimum, notify the author, as the co-edit sweep does for commits.
