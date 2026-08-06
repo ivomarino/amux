@@ -6,15 +6,24 @@ memory file still EXISTS and is still CORRECT but is pointed at by neither MEMOR
 memory-archive.md, so nothing loads it and nothing explains why. Nothing is deleted; it becomes
 unreachable, and unreachable is what a reader experiences as deleted.
 
-Two assertions, both with their denominator printed:
+Two assertions, both with their denominator printed, and note they are scoped DIFFERENTLY:
 
-  A. Every index pointer resolves to a file.
-  B. Every memory file appears in EXACTLY ONE of MEMORY.md or memory-archive.md.
+  A. Every pointer in this dir's index resolves FROM THIS DIR. Scoped locally on purpose: a
+     pointer the reader cannot open is unopenable regardless of what exists elsewhere. This is
+     the assertion that found the severe bug (a lane whose index carried 138 pointers and could
+     open 1, its files sitting one directory up).
+  B. Every memory file is referenced by SOME index, anywhere. Scoped globally, and it was
+     scoped locally and WRONG when first written. Files in a cwd-derived pool are shared by many
+     lanes while each lane's index is written to its own projects/<slug>/memory, so "absent from
+     this dir's index" conflated genuinely-unreferenced with referenced-fine-from-another-project.
+     On the mixpeek pool that inflated the orphan count 151 -> 267. Files indexed only elsewhere
+     are reported as a note, not a violation: paired with DANGLING in that other dir, they are the
+     fingerprint of the split-index bug.
+  B also catches the inverse — a file in BOTH index and archive, simultaneously live and retired,
+  which a presence-only check cannot see.
 
-B is the one that matters. Without it, "absent from the index" is ambiguous between "retired on
-purpose" and "silently lost", and a state you cannot interrogate is one nobody fixes. It also
-catches the inverse (a file listed in BOTH, simultaneously live and retired) which a
-presence-only check cannot see.
+Without B, "absent from the index" is ambiguous between "retired on purpose" and "silently lost",
+and a state you cannot interrogate is one nobody fixes.
 
 Why the denominators are printed and not just the failures: "0 violations" and "scoped to nothing"
 produce identical output. `checked 472, 0 bad` self-refutes at 472=0 where a bare `0 bad` does not.
@@ -59,34 +68,67 @@ def is_memory(d, f):
     return SKIP_HEADER not in read(os.path.join(d, f))[:400]
 
 
-def audit(d):
+def all_claims(dirs):
+    """filename -> {projects whose index/archive points at it}.
+
+    Needed because assertion B was WRONG when first written (found 2026-08-06 while chasing
+    AMUX-2446, after amux surfaced the shared-pool layout). It asked "is this file in THIS
+    dir's index?", which assumes a directory's files belong to that directory's index. They
+    do not: many lanes share one cwd-derived pool for FILES while each lane's INDEX is written
+    to its own projects/<slug>/memory. So "absent from this index" conflated two states —
+    genuinely unreferenced, and referenced perfectly well from another project. On the mixpeek
+    pool that inflated the orphan count from 151 to 267. Scope the question to every index, and
+    report indexed-elsewhere separately, because that is the fingerprint of the cause-2 bug
+    (files here, index over there, pointers dangling from where the index lives).
+    """
+    claims = {}
+    for d in dirs:
+        proj = os.path.basename(os.path.dirname(d))
+        for t in set(PTR.findall(read(os.path.join(d, INDEX)))) | set(PTR.findall(read(os.path.join(d, ARCHIVE)))):
+            claims.setdefault(os.path.basename(t), set()).add(proj)
+    return claims
+
+
+def audit(d, claims=None):
     idx, arch = read(os.path.join(d, INDEX)), read(os.path.join(d, ARCHIVE))
     if not idx:
         print(f"{d}\n  no {INDEX} — not a memory dir, skipping")
         return None
     files = sorted(f for f in os.listdir(d) if f.endswith(".md") and is_memory(d, f))
+    proj = os.path.basename(os.path.dirname(d))
 
-    # A: pointers resolve. The archive is a legitimate pointer target from the index.
+    # A: pointers resolve FROM WHERE THE INDEX LIVES. Correctly scoped to this dir — a pointer
+    # the reader cannot open is unopenable no matter what exists elsewhere. This is the
+    # assertion that found the severe bug; keep it local.
     ptrs = PTR.findall(idx)
     dangling = [p for p in ptrs if not os.path.exists(os.path.join(d, p))]
 
-    # B: exactly one home. Match on the pointer target, never on a substring of the whole
-    # file — a filename can appear inside prose, which would read as indexed when it is not.
-    idx_targets = set(ptrs)
-    arch_targets = set(PTR.findall(arch))
+    # B: is each file referenced anywhere at all? Match on the pointer target, never on a
+    # substring of the file — a filename can appear in prose and would read as indexed.
+    idx_targets, arch_targets = set(ptrs), set(PTR.findall(arch))
     both = [f for f in files if f in idx_targets and f in arch_targets]
-    neither = [f for f in files if f not in idx_targets and f not in arch_targets]
+    unref = [f for f in files if f not in idx_targets and f not in arch_targets]
+    if claims is None:
+        claims = {}
+    elsewhere = {f: sorted(claims.get(f, set()) - {proj}) for f in unref}
+    orphaned = [f for f in unref if not elsewhere[f]]
+    remote = [f for f in unref if elsewhere[f]]
 
-    bad = len(dangling) + len(both) + len(neither)
+    bad = len(dangling) + len(both) + len(orphaned)
     print(f"{d}")
-    print(f"  A. index pointers resolving:        {len(ptrs) - len(dangling)}/{len(ptrs)}")
-    print(f"  B. memories with exactly one home:  {len(files) - len(both) - len(neither)}/{len(files)}")
+    print(f"  A. index pointers resolving here:   {len(ptrs) - len(dangling)}/{len(ptrs)}")
+    print(f"  B. files referenced by some index:  {len(files) - len(orphaned)}/{len(files)}")
     for f in dangling:
-        print(f"     DANGLING  {f}  (index points at a file that does not exist)")
+        print(f"     DANGLING  {f}  (this index points at a file it cannot open)")
     for f in both:
         print(f"     IN BOTH   {f}  (simultaneously live and retired)")
-    for f in neither:
-        print(f"     ORPHANED  {f}  (unreachable: nothing points at it)")
+    for f in orphaned:
+        print(f"     ORPHANED  {f}  (no index anywhere references it)")
+    if remote:
+        print(f"     note: {len(remote)} file(s) here are indexed only by other project(s), "
+              f"e.g. {remote[0]} <- {', '.join(elsewhere[remote[0]][:2])}")
+        print(f"           not counted as violations; combined with DANGLING there, that pair is "
+              f"the shared-pool/split-index signature")
     print(f"  -> {'clean' if not bad else str(bad) + ' violation(s)'}")
     return bad
 
@@ -103,19 +145,19 @@ def self_test():
         open(os.path.join(t, INDEX), "w").write(f"- [A](a.md) — hook\n- [Archived]({ARCHIVE}) — hook\n")
         open(os.path.join(t, ARCHIVE), "w").write("- [B](b.md) — hook\n")
         print("[self-test] clean dir, expect 0:")
-        if audit(t) != 0:
+        if audit(t, all_claims([t])) != 0:
             print("  FAIL: cried wolf on a clean directory"); ok = False
 
         # seeded: c.md exists but nothing points at it -> must fire
         open(os.path.join(t, "c.md"), "w").write("---\nname: c\n---\nbody\n")
         print("[self-test] seeded orphan, expect >=1:")
-        if (audit(t) or 0) < 1:
+        if (audit(t, all_claims([t])) or 0) < 1:
             print("  FAIL: missed a seeded orphan — the detector is inert"); ok = False
 
         # seeded: b.md in BOTH -> must fire
         open(os.path.join(t, INDEX), "a").write("- [B](b.md) — hook\n")
         print("[self-test] seeded in-both, expect >=2:")
-        if (audit(t) or 0) < 2:
+        if (audit(t, all_claims([t])) or 0) < 2:
             print("  FAIL: missed a file listed live AND retired"); ok = False
     print(f"[self-test] {'PASS' if ok else 'FAIL'}")
     return ok
@@ -131,9 +173,13 @@ def main():
     dirs = a.dir or sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/memory")))
     if not dirs:
         print("no memory dirs found"); sys.exit(0)
+    # Assertion B is scoped to EVERY index, so it always needs the global claim map, even when
+    # auditing one dir with --dir. Building it from only the audited dirs would reintroduce the
+    # exact mis-scoping this map exists to fix.
+    claims = all_claims(sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/memory"))))
     total, audited = 0, 0
     for d in dirs:
-        r = audit(d)
+        r = audit(d, claims)
         if r is not None:
             total += r; audited += 1
     print(f"\n{audited} memory dir(s) audited, {total} violation(s) total")
