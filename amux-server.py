@@ -32037,7 +32037,6 @@ let lastSessionsJSON = '';
 const _prevSessionState = {};  // name → {status, running}
 let _notifsNative = localStorage.getItem('amux_notifs') === '1';
 let _notifBanners = localStorage.getItem('amux_notif_banners') !== '0';  // in-app pop-ups, default on
-let _notesDirty = false;  // set by SSE invalidate when not on notes tab
 let _notifItems = JSON.parse(localStorage.getItem('amux_notif_items') || '[]').slice(0, 100);
 let _notifUnread = _notifItems.filter(n => !n.read).length;
 let _notifPanelOpen = false;
@@ -34954,10 +34953,13 @@ async function _scopeLoad(scope, targetId) {
 
 function setPeekTab(tab) {
   _peekTab = tab;
-  // Flush peek notes save when switching away
-  if (tab !== 'notes' && _peekNotesSaveTimer) {
-    clearTimeout(_peekNotesSaveTimer); _peekNotesSaveTimer = null; _peekNotesSave();
-  }
+  // The notes tab is gone; this flushed its pending save and called
+  // _peekNotesSave(), which went with it. The branch never fired only because
+  // _peekNotesSaveTimer is now never assigned non-null — so a single line
+  // reintroducing that assignment would have turned a tab switch into a
+  // ReferenceError that aborts the rest of this function, leaving every tab
+  // button visually unchanged. Same shape as the closePeek() breakage in
+  // ethos #7, found by diffing functions defined against functions called.
   // Stop transcript auto-refresh when leaving the tab
   if (tab !== 'transcript' && _transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   document.getElementById('peek-tab-terminal').classList.toggle('active', tab === 'terminal');
@@ -35932,7 +35934,6 @@ async function _peekNewSchedule() {
 // ── Peek notes ──
 let _peekNotesAll = [];
 let _peekNotesActive = null;
-let _peekNotesSaveTimer = null;
 let _peekNotesLoading = false;
 let _peekNotesMode = 'preview';
 let _peekNotesSidebarOpen = true;
@@ -36076,7 +36077,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.466';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.467';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -44863,13 +44864,15 @@ function switchView(view) {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}
     if (view === 'sessions') _exploreSession = null;
   }
-  if (view === 'notes') {
-    _notesInitQuill(); _notesApplySidebarState(); _notesBindSwipeGestures();
-    _notesDirty = false;
-    _notesLoad(); // always refresh list on tab switch
-    _notesReloadActive(); // refresh open note content if it changed on disk (Obsidian)
-    _notesLoadSource(); // show which folder notes are syncing with
-  }
+  // The notes view is gone and so are all six functions this branch called
+  // (_notesInitQuill, _notesApplySidebarState, _notesBindSwipeGestures,
+  // _notesLoad, _notesReloadActive, _notesLoadSource). There is no tab-notes
+  // button, but the view is PERSISTED: this function writes amux_ui_view below
+  // and boot restores it through `try { switchView(_v.v) } catch(e) {}`. So a
+  // user whose stored view was still 'notes' threw at the first call, the catch
+  // swallowed it, and switchView aborted having already set activeView='notes' —
+  // a half-switched UI with nothing rendered and no error shown. Deleted rather
+  // than repaired: there is no notes feature left to dispatch to.
   if (view === 'logs') { fetchLogs(); _startLogsTimer(); } else { _stopLogsTimer(); }
   if (view === 'board') {
     renderBoard();
@@ -50510,10 +50513,12 @@ function connectSSE() {
         }
       } else if (msg.type === 'invalidate') {
         for (const key of (msg.keys || [])) {
-          if (key === 'notes') {
-            if (activeView === 'notes') { _notesLoad(); _notesReloadActive(); }
-            else _notesDirty = true;
-          } else if (key === 'crm') {
+          // 'notes' was handled here until the notes view was removed; both
+          // functions it called are gone, so this branch could only throw —
+          // inside the SSE message loop, taking the rest of the invalidate
+          // payload with it. The server may still emit the key; ignoring it is
+          // correct, because nothing in this client can render a note.
+          if (key === 'crm') {
             if (activeView === 'crm') _crmLoad();
             else _crmDirty = true;
           } else if (key === 'journal') {
@@ -52319,7 +52324,15 @@ function _restoreScreen() {
   if (!_hasDeeplink) {
     try {
       const _v = JSON.parse(localStorage.getItem('amux_ui_view') || 'null');
-      if (_v && _v.v && _v.v !== 'sessions' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)) {
+      // Only restore a view whose nav tab still EXISTS. localStorage outlives
+      // the feature it names: when the notes view was deleted, browsers that had
+      // last been on it kept restoring 'notes' into a dispatcher that no longer
+      // had a branch for it. The catch below then hid the failure while
+      // switchView had already set activeView, leaving a half-switched UI. This
+      // is the general case, not a notes special-case — any view we remove later
+      // is stale in someone's localStorage the moment it ships.
+      if (_v && _v.v && _v.v !== 'sessions' && (Date.now() - (_v.ts || 0) < _UI_RESTORE_MAX_AGE)
+          && document.getElementById('tab-' + _v.v)) {
         try { switchView(_v.v); } catch(e) {}
       }
     } catch(e) {}
@@ -57664,7 +57677,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.466';
+const CACHE = 'amux-v0.9.467';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
