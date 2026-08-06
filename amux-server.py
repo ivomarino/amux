@@ -36421,7 +36421,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.472';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.473';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49888,11 +49888,10 @@ function exitGridMode() {
   // Save current layout, then pause timers — keep grid alive to avoid re-init bugs
   _gridSaveLayout();
   Object.values(_gridPanes).forEach(p => { if (p.timer) { clearInterval(p.timer); p.timer = null; } });
-  // Flush pending note saves
-  Object.keys(_notePanes).forEach(nid => {
-    const pane = _notePanes[nid];
-    if (pane.saveTimer) { clearTimeout(pane.saveTimer); pane.saveTimer = null; _saveNotePaneContent(nid); }
-  });
+  // (The note-pane save flush lived here. _notePanes can no longer be
+  // populated — nothing assigns to it since the notes feature was removed — so
+  // the loop body was unreachable, which is the only reason its call to the
+  // deleted _saveNotePaneContent never threw.)
   // Exit fullscreen if active
   const gv = document.getElementById('grid-view');
   if (gv.classList.contains('ws-fullscreen')) {
@@ -50020,15 +50019,22 @@ function _gridRestoreLayout() {
     const saved = JSON.parse(localStorage.getItem('amux_grid_layout') || '[]');
     saved.forEach(item => {
       if (!item.id) return;
-      const notePath = _notePathFromId(item.id);
-      if (notePath) {
-      } else if (item.id.startsWith('ws-term:')) {
+      // The note-pane branch is gone with the notes feature (f08a545 removed it
+      // "entirely"). Its BODY was deleted but the `_notePathFromId(item.id)`
+      // call was left as the first statement here — and that function went with
+      // the feature, so this threw ReferenceError on the FIRST saved item, note
+      // pane or not, taking the whole layout restore with it. Verified in the
+      // browser: `_notePathFromId("ws-term:abc")` -> ReferenceError.
+      // The `catch(e){}` below is what hid it: a workspace simply came back
+      // empty, with no error and nothing to suggest a restore had been
+      // attempted at all.
+      if (item.id.startsWith('ws-term:')) {
         wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
       } else if ((sessions || []).find(s => s.name === item.id)) {
         addGridPane(item.id, item.x, item.y, item.w, item.h);
       }
     });
-  } catch(e) {}
+  } catch(e) { console.warn('[amux] grid layout restore failed:', e); }
 }
 
 // ── Workspace Profiles (device-scoped) ──
@@ -50099,9 +50105,10 @@ function wsSaveProfileConfirm() {
 
 function wsClearWorkspace() {
   Object.keys(_gridPanes).slice().forEach(n => removeGridPane(n));
-  Object.keys(_notePanes).slice().forEach(nid => {
-    const path = _notePathFromId(nid);
-  });
+  // The note-pane removal loop is gone with the feature. What was left of it
+  // computed `_notePathFromId(nid)` into an unused local and did nothing else —
+  // a call to a deleted function whose only protection was that _notePanes can
+  // never be populated.
   Object.keys(_wsTerm).slice().forEach(pid => wsRemoveTermPane(pid));
 }
 
@@ -50109,14 +50116,16 @@ function wsLoadProfile(name) {
   const profiles = _wsLoadProfiles();
   const layout = profiles[name];
   if (!layout) return;
-  // Clear current panes (sessions + notes)
+  // Clear current panes
   Object.keys(_gridPanes).forEach(n => removeGridPane(n));
-  // Load profile panes
+  // Load profile panes. Same removed note branch as _gridRestoreLayout: the
+  // _notePathFromId call outlived the function, so loading ANY saved profile
+  // threw on its first item. Unlike the restore path this one is not wrapped in
+  // a catch, so it failed loudly-but-uselessly — the profile chip simply did
+  // nothing after wiping the current panes on line above.
   layout.forEach(item => {
     if (!item.id) return;
-    const notePath = _notePathFromId(item.id);
-    if (notePath) {
-    } else if (item.id.startsWith('ws-term:')) {
+    if (item.id.startsWith('ws-term:')) {
       wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
     } else if ((sessions || []).find(s => s.name === item.id)) {
       addGridPane(item.id, item.x, item.y, item.w, item.h);
@@ -58054,7 +58063,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.472';
+const CACHE = 'amux-v0.9.473';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
