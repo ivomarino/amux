@@ -17495,6 +17495,145 @@ def _memory_shared_with(name: str) -> list:
     return out
 
 
+_RG_BIN = shutil.which("rg") or ""
+_SEARCH_MAX_RESULTS = int(os.environ.get("AMUX_SEARCH_MAX_RESULTS", "300") or 300)
+_SEARCH_TIMEOUT_S = float(os.environ.get("AMUX_SEARCH_TIMEOUT_S", "20") or 20)
+# Was 2M, which silently excluded amux-server.py (3.5MB) — THE file of this
+# project — so searching this worker for a symbol that occurs 11 times returned
+# zero, in 60ms, with no indication anything had been skipped. Caught by a
+# known-positive control, not by reading the code: the query was chosen because
+# it MUST match, so the empty result was a failure rather than a plausible
+# answer. rg detects and skips binaries by content already; this cap only needs
+# to stop pathological blobs, so it is generous and REPORTED in every response.
+_SEARCH_MAX_FILESIZE = os.environ.get("AMUX_SEARCH_MAX_FILESIZE", "20M") or "20M"
+
+
+def _session_file_search(name: str, q: str, limit: int = 0, literal: bool = True,
+                         case: str = "smart", include_ignored: bool = False,
+                         globs: list | None = None) -> dict:
+    """Full-text search across every file in a worker's work dir (AMUX-2394).
+
+    LIVE, NOT INDEXED — deliberately. An FTS5 index would answer in milliseconds
+    instead of ~1.4s on the largest tree here (37,783 files), but these are
+    ACTIVE git checkouts: every commit, branch switch and file write invalidates
+    it. A stale index answers "no matches" for a file that exists, which is a
+    wrong answer wearing the costume of a working feature — the failure mode
+    ethos #4 and #7 are both about. Measured before choosing: 0.06s on amux
+    (635 files), 1.37-1.57s on mixpeek (37,783). That is affordable for a search
+    the user submits, and it cannot go stale.
+
+    What the result SAYS about itself matters as much as the hits. ripgrep skips
+    .gitignore'd and hidden files by default, so "no matches" can mean "not
+    present" OR "present but ignored" — two very different answers that look
+    identical. The response therefore always reports `searched_ignored`,
+    `engine`, and whether it was `truncated`, so a caller can tell which kind of
+    empty it got."""
+    t0 = time.time()
+    out = {"session": name, "query": q, "root": "", "engine": "", "results": [],
+           "files": 0, "matches": 0, "truncated": False,
+           "searched_ignored": bool(include_ignored),
+           "searched_hidden": bool(include_ignored),
+           "limit": limit or _SEARCH_MAX_RESULTS}
+    if not q:
+        out["error"] = "missing query"
+        return out
+    root = _session_work_dir(name)
+    if not root:
+        out["error"] = "worker has no CC_DIR configured"
+        return out
+    rp = Path(root)
+    if not _is_path_allowed(rp) or not rp.is_dir():
+        out["error"] = "access denied or not a directory"
+        return out
+    out["root"] = str(rp)
+    cap = limit or _SEARCH_MAX_RESULTS
+
+    if not _RG_BIN:
+        # Say so rather than silently returning nothing. A search that reports
+        # zero because its ENGINE is missing is indistinguishable from one that
+        # genuinely found nothing.
+        out["engine"] = "none"
+        out["error"] = ("ripgrep (rg) not found on PATH — install it, or set "
+                        "AMUX_SEARCH_RG to its path")
+        return out
+
+    out["max_filesize"] = _SEARCH_MAX_FILESIZE
+    cmd = [_RG_BIN, "--json", "--line-number", "--max-columns", "400",
+           "--max-filesize", _SEARCH_MAX_FILESIZE, "--threads", "4"]
+    if literal:
+        cmd.append("--fixed-strings")
+    if case == "sensitive":
+        cmd.append("--case-sensitive")
+    elif case == "insensitive":
+        cmd.append("--ignore-case")
+    else:
+        cmd.append("--smart-case")
+    if include_ignored:
+        cmd += ["--no-ignore", "--hidden"]
+    for g in (globs or []):
+        cmd += ["--glob", g]
+    # -e marks the query as a PATTERN. Without it a query starting with '-' is
+    # re-read as a flag — the same defect that silently disabled the private-key
+    # rule in the pre-commit secret scan for its entire life.
+    cmd += ["-e", q, "--", str(rp)]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=_SEARCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        out["engine"] = "ripgrep"
+        out["error"] = f"search timed out after {_SEARCH_TIMEOUT_S:.0f}s"
+        out["truncated"] = True
+        return out
+    except Exception as e:
+        out["engine"] = "ripgrep"
+        out["error"] = str(e)
+        return out
+
+    out["engine"] = "ripgrep"
+    seen_files = set()
+    for line in proc.stdout.splitlines():
+        if len(out["results"]) >= cap:
+            out["truncated"] = True
+            break
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("type") != "match":
+            continue
+        d = ev.get("data") or {}
+        pth = ((d.get("path") or {}).get("text") or "")
+        txt = ((d.get("lines") or {}).get("text") or "").rstrip("\n")
+        try:
+            rel = str(Path(pth).relative_to(rp))
+        except Exception:
+            rel = pth
+        seen_files.add(rel)
+        out["results"].append({
+            "path": rel,
+            "abs": pth,
+            "line": d.get("line_number"),
+            "text": txt[:400],
+            "spans": [[s.get("start"), s.get("end")] for s in (d.get("submatches") or [])],
+        })
+    out["files"] = len(seen_files)
+    out["matches"] = len(out["results"])
+    out["elapsed_ms"] = int((time.time() - t0) * 1000)
+    # rg exits 1 on "no matches" — that is not an error. Anything above 1 is.
+    if proc.returncode > 1 and not out["results"]:
+        out["error"] = (proc.stderr or "").strip()[:400] or f"rg exit {proc.returncode}"
+    if not out["results"]:
+        # Name every filter that could be responsible for the zero. An empty
+        # result set is the one answer a caller cannot debug from the rows.
+        _why = [f"files over {_SEARCH_MAX_FILESIZE} and binaries were skipped"]
+        if not include_ignored:
+            _why.insert(0, ".gitignore'd and hidden files were NOT searched "
+                           "(retry with ignored=1)")
+        out["note"] = "No matches. " + "; ".join(_why) + "."
+    return out
+
+
 def _session_work_dir(name: str) -> str:
     """Return the CC_DIR for a session, or empty string if not configured."""
     env_file = CC_SESSIONS / f"{name}.env"
@@ -67564,6 +67703,30 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                    "claude_project": (_project_name(_session_work_dir(name))
                                                       if _session_work_dir(name) else ""),
                                    "shared_with": _shared})
+            # GET /api/sessions/<n>/search?q=...&limit=&literal=0&case=&ignored=1&glob=
+            # Full-text search across every file in the worker's work dir. Live
+            # ripgrep, not an index — see _session_file_search for why.
+            # Exposed as an HTTP endpoint, not only in the UI, so a SESSION can
+            # search its own tree (ethos #1: capability that only the dashboard
+            # can reach never reaches the model).
+            if action == "search":
+                _q = (qs.get("q", [""])[0] or "").strip()
+                # Clamp only a limit the caller ACTUALLY sent. `max(1, ...)` on
+                # the unset sentinel 0 turned "no limit given" into "return 1
+                # result", so the default search reported a single match and
+                # looked like a working search with a thin index behind it.
+                _lim_raw = (qs.get("limit", [""])[0] or "").strip()
+                try:
+                    _lim = max(1, min(2000, int(_lim_raw))) if _lim_raw else 0
+                except Exception:
+                    _lim = 0
+                _res = _session_file_search(
+                    name, _q, limit=_lim,
+                    literal=qs.get("literal", ["1"])[0].lower() not in ("0", "false", "no"),
+                    case=(qs.get("case", ["smart"])[0] or "smart").lower(),
+                    include_ignored=qs.get("ignored", ["0"])[0].lower() in ("1", "true", "yes"),
+                    globs=[g for g in qs.get("glob", []) if g])
+                return self._json(_res, 400 if _res.get("error") == "missing query" else 200)
             if action == "steer":
                 if qs.get("history", ["0"])[0] == "1":
                     rows = get_db().execute(
