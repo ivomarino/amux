@@ -26271,6 +26271,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      visible, not behind the Gate button. Kept visually quiet so it reads as
      the column's contract rather than competing with the cards. */
   /* Group chips on a worker card, and the panel they expand (AMUX-2362). */
+  /* Scope config tiles: a horizontal, swipeable row rather than a vertical
+     stack of full-width cards. On a phone the stack needed the whole screen to
+     show five facts; the row shows all five and drills in on tap (AMUX-2362). */
+  .scope-tiles { display:flex; gap:6px; overflow-x:auto; padding:2px 0 6px;
+    -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  .scope-tiles::-webkit-scrollbar { display:none; }
+  .scope-tile { flex:0 0 auto; min-width:104px; max-width:150px; text-align:left;
+    display:flex; flex-direction:column; gap:1px; padding:7px 9px; border-radius:9px;
+    border:1px solid var(--border); background:var(--card); cursor:pointer;
+    min-height:44px; -webkit-tap-highlight-color:transparent; }
+  .scope-tile.sel { border-color:var(--accent); background:rgba(88,166,255,0.08); }
+  .scope-tile-label { color:var(--text); font-weight:600; font-size:0.74rem;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .scope-tile-src { font-size:0.64rem; }
+  .scope-tile-val { font-size:0.66rem; color:var(--dim);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .scope-detail { border-top:1px solid var(--border); padding-top:7px; margin-top:2px; }
+  @media (max-width: 600px) {
+    .scope-tile { min-width:118px; padding:9px 10px; }
+    .scope-tile-label { font-size:0.8rem; }
+    .scope-tile-src, .scope-tile-val { font-size:0.72rem; }
+  }
   .grp-chip { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
     font-size:0.66rem; font-weight:600; cursor:pointer; vertical-align:middle;
     background:rgba(88,166,255,0.14); color:var(--accent); border:1px solid transparent;
@@ -34649,11 +34671,13 @@ async function _scopeLoad(scope, targetId) {
       return String(v);
     };
     const chips = (arr) => arr.map(g => '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);">' + esc(g) + '</span>').join(' ');
-    let h = '<div style="margin-bottom:10px;color:var(--text);font-size:0.86rem;">'
+    let detail = '';
+    let h = '<div style="margin-bottom:8px;color:var(--text);font-size:0.86rem;">'
           + '<b>' + esc(lvl === 'global' ? 'Global' : w) + '</b>'
           + (lvl === 'worker' ? ' \u00b7 groups: ' + (groups.length ? chips(groups) : '<i>none</i>') : '')
           + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's') + ': ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') : '')
-          + '</div>';
+          + '</div>'
+          + '<div class="scope-tiles">';
     d.capabilities.forEach((c, i) => {
       const here = c.set_here, gset = G[c.key] && G[c.key].set_here;
       const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
@@ -34662,36 +34686,37 @@ async function _scopeLoad(scope, targetId) {
       if (here) { src = lvl; srcC = 'var(--accent)'; }
       else if (grpHit.length) { src = 'group:' + grpHit[0]; srcC = '#d29922'; }
       else if (gset) { src = 'global'; srcC = 'var(--dim)'; }
-      // Accordion, default CONTRACTED (Ethan). The summary line — capability,
-      // where it comes from, and its value — is what you scan; the precedence
-      // chain and merge semantics are what you consult. Collapsing the second
-      // keeps the panel readable at a glance without hiding the answer.
+      // HORIZONTAL tiles, mobile-first (Ethan: "this should be horizontal below
+      // the group pills and mobile optimized, each one should give me the
+      // ability to click into it"). A vertical stack of five full-width cards
+      // ate the whole phone screen to show five facts; a scrollable row shows
+      // all five at once and drills in on tap.
       const _ck = lvl + ':' + w + ':' + c.key;
       const _open = !!_scopeRowOpen[_ck];
-      h += '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:7px;background:var(--card);cursor:pointer;" onclick="_scopeRowToggle(\'' + escJs(_ck) + '\')">'
-        + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">'
-        + '<span style="color:var(--text);font-weight:600;font-size:0.84rem;">'
-        + '<span style="display:inline-block;width:9px;color:var(--dim);transform:rotate(' + (_open ? '90' : '0') + 'deg);transition:transform 0.12s;">&#9656;</span> '
-        + esc(c.label) + '</span>'
-        + '<span style="font-size:0.7rem;color:' + srcC + ';">from ' + esc(src) + '</span></div>'
-        + '<div style="font-size:0.78rem;margin-top:3px;">' + esc(sum(c)) + '</div>'
-        // The layers that did NOT win are the answer to "why does this worker
-        // differ from that one" — showing only the winner cannot express it.
-        + (!_open ? '' : '<div style="font-size:0.68rem;color:var(--dim);margin-top:4px;">'
-        + (c.order || []).map(l => {
-            const on = (l === lvl && here)
-                    || (l === 'group' && (lvl === 'worker' ? grpHit.length : false))
-                    || (l === 'global' && (lvl === 'global' ? here : gset));
-            return '<span style="opacity:' + (on ? '1' : '0.38') + ';">' + esc(l) + '</span>';
-          }).join(' <span style="opacity:0.3;">&rsaquo;</span> ')
-        + ' <span style="opacity:0.5;">\u00b7 ' + esc(c.merge) + '</span>'
-        + (c.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
-        + '</div>')
-        + '</div>';
+      h += '<button class="scope-tile' + (_open ? ' sel' : '') + '" onclick="event.stopPropagation();_scopeRowToggle(\'' + escJs(_ck) + '\')">'
+        + '<span class="scope-tile-label">' + esc(c.label) + '</span>'
+        + '<span class="scope-tile-src" style="color:' + srcC + ';">' + esc(src) + '</span>'
+        + '<span class="scope-tile-val">' + esc(sum(c)) + '</span>'
+        + '</button>';
     });
-    h += '<div style="font-size:0.68rem;color:var(--dim);margin-top:8px;">'
-      + 'Each capability shows its OWN precedence order \u2014 they genuinely differ. '
-      + 'Dimmed levels have nothing set. Read-only for now.</div>';
+    h += '</div>';
+    // Detail for the tapped tile only. Everything a reader SCANS is in the row;
+    // everything they CONSULT is here, one at a time.
+    const _selCap = d.capabilities.find(c => _scopeRowOpen[lvl + ':' + w + ':' + c.key]);
+    if (_selCap) {
+      const _l = _selCap;
+      h += '<div class="scope-detail">'
+        + '<div style="color:var(--text);font-weight:600;font-size:0.8rem;margin-bottom:3px;">' + esc(_l.label) + '</div>'
+        + '<div style="font-size:0.75rem;margin-bottom:4px;">' + esc(sum(_l)) + '</div>'
+        + '<div style="font-size:0.7rem;color:var(--dim);">'
+        + (_l.order || []).map(x => '<span style="opacity:' + (x === (_selCap._src || '') ? '1' : '0.45') + ';">' + esc(x) + '</span>').join(' <span style="opacity:0.3;">&rsaquo;</span> ')
+        + ' <span style="opacity:0.6;">\u00b7 ' + esc(_l.merge) + '</span>'
+        + (_l.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
+        + '</div></div>';
+    }
+    h += '<div style="font-size:0.66rem;color:var(--dim);margin-top:6px;">'
+      + (_selCap ? 'Tap the tile again to close.' : 'Tap a config to see its precedence order.')
+      + '</div>';
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
     dst.innerHTML = h;
     if (targetId && targetId.indexOf('grp-scope-body-') === 0) _grpScopeHtml = h;
@@ -35825,7 +35850,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.459';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.460';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57385,7 +57410,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.459';
+const CACHE = 'amux-v0.9.460';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
