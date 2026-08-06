@@ -6,6 +6,22 @@ services:
     image: ghcr.io/mixpeek/amux:latest
     container_name: amux-user-${USER_ID}
     restart: unless-stopped
+    # MEMORY CAP (AC-229). On 2026-08-06 the host OOM-killed `claude` four times
+    # between 03:40 and 13:09, every event `constraint=CONSTRAINT_NONE` — a GLOBAL
+    # kill, because nothing in this file capped anything. Under a global OOM the
+    # kernel picks by badness score, not by culpability, so at 09:41 it took
+    # amux-gateway.service — the process fronting EVERY tenant. One tenant's memory
+    # became a fleet-wide outage: TLS never completed, sshd accepted then dropped,
+    # tailscaled died, and journald hung >122s so nothing even reached Cloud Logging.
+    # A cap does not stop a container using too much; it makes that container the
+    # thing that dies instead of the box. A dead workspace is a bug; a dead host is
+    # an outage — the same reasoning already written on the watchdog below.
+    # 1.5g against an observed working set of ~160-185MB RSS per claude process
+    # (total-vm read ~5.9GB, which is reservation and mostly noise — RSS is the
+    # figure that matters). memswap_limit equal to mem_limit denies swap, so a
+    # runaway fails fast rather than thrashing the shared disk on its way down.
+    mem_limit: 1500m
+    memswap_limit: 1500m
     volumes:
       - root-home:/root
       - amux-data:/root/.amux
@@ -36,6 +52,11 @@ services:
   watchdog:
     image: ghcr.io/mixpeek/amux:latest
     container_name: amux-watchdog-${USER_ID}
+    # Capped for the same reason its restart policy is (AC-162/AC-163): this
+    # sidecar has already taken the host down once. A python health loop needs
+    # nothing like this much.
+    mem_limit: 192m
+    memswap_limit: 192m
     # on-failure:5, NOT unless-stopped. A sidecar that fails instantly under
     # unless-stopped is a self-DoS on the shared daemon: this one exited 1 on
     # every start, was restarted with no backoff 4318 times, and the
@@ -62,6 +83,9 @@ services:
   litestream:
     image: litestream/litestream:latest
     container_name: amux-litestream-${USER_ID}
+    # SQLite WAL replication — steady, small, and bounded by design.
+    mem_limit: 192m
+    memswap_limit: 192m
     restart: unless-stopped
     volumes:
       - amux-data:/root/.amux
@@ -78,6 +102,10 @@ services:
   sync:
     image: amazon/aws-cli:latest
     container_name: amux-sync-${USER_ID}
+    # aws-cli in a sleep loop. s3 sync streams, so this does not grow with the
+    # size of the workspace being synced.
+    mem_limit: 192m
+    memswap_limit: 192m
     restart: unless-stopped
     volumes:
       - amux-data:/root/.amux
