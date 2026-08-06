@@ -39938,7 +39938,7 @@ async function _peekMessagesLoad() {
   if (_peekMsgRowsFor !== sess) { _peekMsgRows = null; _peekMsgRowsFor = sess; }
   _peekMessagesRender();                       // paint from local cache instantly
   try {
-    const rows = await _peekMsgFetch(sess);
+    const rows = await _peekMsgFetch({ level: 'worker', name: sess });
     if (peekSession !== sess) return;          // user moved on mid-flight
     _peekMsgRows = rows;
   } catch(e) {
@@ -61530,6 +61530,21 @@ class CCHandler(BaseHTTPRequestHandler):
                 _f_sess = [x for x in (qs.get("session", [""])[0] or "").split(",") if x]
                 _f_stat = [x.lower() for x in (qs.get("status", [""])[0] or "").split(",") if x]
                 _f_arch = qs.get("archived", [""])[0].lower()
+                # ?group=<g> — the board at group scope (AMUX-2385). Resolved to
+                # members HERE, with the SAME predicate /api/history uses, so
+                # "who is in this group" cannot mean one thing to the board and
+                # another to message history. Global is simply no filter.
+                _f_grp = (qs.get("group", [""])[0] or "").strip()
+                if _f_grp and not _f_sess:
+                    _f_sess = [x["name"] for x in list_sessions()
+                               if _f_grp in (x.get("tags") or [])]
+                    # An empty group must return NOTHING, not everything. Falling
+                    # through with no predicate renders the whole fleet under a
+                    # group name — a wrong answer that looks like a working
+                    # feature, and the exact shape that made a tag-scoped board
+                    # read as a truncated one (see the scoped branch below).
+                    if not _f_sess:
+                        _f_sess = ["\x00none\x00"]
                 _projecting = bool(_slim or _f_sess or _f_stat or _f_arch != "")
                 if _scoped:
                     # Tag isolation (Ethan 2026-08-02): a session sees its OWN
