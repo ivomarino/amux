@@ -12029,6 +12029,23 @@ def _pickup_next_board_task(session_name: str):
             "AND NOT EXISTS (SELECT 1 FROM session_events e "
             "                WHERE e.type='task.claimed' AND e.ts > ? "
             "                AND e.data LIKE '%\"' || i.id || '\"%') "
+            # BLOCKED ON A HUMAN means blocked on a human (AC-223 / AMUX-2396).
+            # `amux board needsyou` writes a needs:you TAG — it is the sanctioned
+            # way to say "this needs the owner", and 137 cards use it against 10
+            # using the needsyou STATUS. This query never joined the tags table,
+            # so the dominant representation reached the dispatcher not at all
+            # and marked cards were handed to agents as ordinary queued work.
+            # Reproduced twice in one evening, once on the card that reported it
+            # and once on AMUX-2392, ~40 minutes after it was tagged.
+            #
+            # Excluding on the TAG rather than converting tags to a status is the
+            # quiet fix: it exempts ~137 mostly-archived, inert cards and emits
+            # nothing. Converting would move all 137 into a status that surfaces
+            # in Needs-you, so the first run after the fix would discharge a
+            # 137-item backlog into a human queue — a filter change is a
+            # migration event, and this is the direction that has none.
+            "AND NOT EXISTS (SELECT 1 FROM issue_tags t "
+            "                WHERE t.issue_id = i.id AND t.tag = 'needs:you') "
             # Board drag order IS the priority queue (AMUX-2128): pos is what
             # the user reorders in the UI, so dragging a card up prioritizes
             # it for pickup. created breaks ties for never-dragged cards.
@@ -13649,6 +13666,21 @@ def _scope_write(level: str, name: str, key: str, value, actor: str) -> dict:
         f.parent.mkdir(parents=True, exist_ok=True)
         text = value if isinstance(value, str) else (value or {}).get("text", "")
         f.write_text(text)
+        # PUSH a worker-level edit straight into Claude's project memory.
+        # Without this the edit is TRANSIENT: _ensure_memory runs capture
+        # (Claude -> amux) BEFORE compose (amux -> Claude), so the next read of
+        # this worker's memory would overwrite what was just typed with the
+        # older content still sitting in Claude's MEMORY.md. The editor would
+        # have looked like it saved — the response said so, and the re-read
+        # right after confirmed it — and the value would revert minutes later
+        # with nothing to explain it.
+        if level == "worker":
+            try:
+                _wd = _session_work_dir(name)
+                if _wd:
+                    _write_claude_memory(name, _wd)
+            except Exception as _e:
+                slog(f"[scope] memory push for {name} failed: {_e}")
     elif key == "env":
         f = (CC_AMUX_ENV if level == "global" else
              CC_HOME / "env" / f"{name}.env" if level == "group" else
@@ -26754,6 +26786,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .grp-scope-row > .grp-scope-ident { flex:0 0 auto; max-width:34%; }
     .grp-scope-row > .grp-scope-tiles { flex:1 1 auto; min-width:0; }
   }
+  /* Accordion toggle. Sits in flow at the top-right rather than overlapping the
+     content the way the old absolute X did — it overlapped the member list, which
+     is why the close control landed on top of the worker names. */
+  .grp-scope-acc { float:right; background:none; border:1px solid var(--border);
+    border-radius:6px; color:var(--dim); font-size:0.66rem; line-height:1;
+    padding:6px 9px; min-height:32px; cursor:pointer; margin-left:8px;
+    -webkit-tap-highlight-color:transparent; }
+  .grp-scope-acc:hover, .grp-scope-acc:active { color:var(--text); border-color:var(--accent); }
   .grp-scope-close { position:absolute; top:4px; right:4px; background:none; border:none;
     color:var(--dim); font-size:1.1rem; line-height:1; cursor:pointer;
     min-width:44px; min-height:44px; -webkit-tap-highlight-color:transparent; }
@@ -32914,6 +32954,21 @@ function _restoreCardFocus(focusedId, savedInputs) {
 }
 
 let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render keeps it
+// The panel is an ACCORDION, not a dismissable card (Ethan: "make sure the
+// scope row thing is accordion (expand/contract) its right now an X which isnt
+// right"). The X called _selectGroup, which also DESELECTED the group — so the
+// only way to hide the panel was to lose the filter you were using. Collapsing
+// keeps the group selected and is remembered across renders and reloads.
+let _grpCollapsed = (function() {
+  try { return localStorage.getItem('amux_grp_collapsed') === '1'; } catch (e) { return false; }
+})();
+function _grpAccToggle() {
+  _grpCollapsed = !_grpCollapsed;
+  try { localStorage.setItem('amux_grp_collapsed', _grpCollapsed ? '1' : '0'); } catch (e) {}
+  const strip = document.getElementById('grp-scope-strip');
+  if (strip) strip._want = '';   // force the guarded re-render to repaint
+  render();
+}
 
 function render() {
   // Skip render if a menu or edit overlay is open to prevent DOM clobbering
@@ -32957,8 +33012,8 @@ function render() {
     if (_grpOpen) {
       const gid = escJs(_grpOpen);
       const want = `<div class="grp-scope-panel" id="grp-scope-${gid}" onclick="event.stopPropagation();">`
-        + `<button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${gid}')">&#215;</button>`
-        + `<div class="grp-scope-body" id="grp-scope-body-${gid}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
+        + `<button class="grp-scope-acc" title="${_grpCollapsed ? 'Expand' : 'Collapse'}" onclick="event.stopPropagation();_grpAccToggle()">${_grpCollapsed ? '▸' : '▾'} ${_grpCollapsed ? 'Expand' : 'Collapse'}</button>`
+        + `<div class="grp-scope-body" id="grp-scope-body-${gid}"${_grpCollapsed ? ' style="display:none;"' : ''}>${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
       // Only touch the DOM when the markup actually changes: an unconditional
       // innerHTML write on every render would wipe a scroll position and
       // interrupt a tap mid-gesture.
@@ -35130,7 +35185,7 @@ function _grpViewHead(label, view, g) {
   return '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:7px;flex-wrap:wrap;">'
     + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(label) + ' \u00b7 ' + esc(view) + '</span>'
     + '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
-    + tab('config', '\u2699') + tab('messages', '\u2709') + tab('board', '\u25a4') + tab('cost', '$')
+    + tab('config', 'Config') + tab('messages', 'Messages') + tab('board', 'Board') + tab('cost', 'Cost')
     + '</span></div>';
 }
 
@@ -35420,7 +35475,7 @@ async function _scopeLoad(scope, targetId) {
               const _b = (k, t) => '<button class="btn" style="font-size:0.7rem;min-height:32px;padding:4px 9px;flex:0 0 auto;"'
                 + ' onclick="event.stopPropagation();_grpViewOpen(\'' + _g + '\',\'' + k + '\')">' + t + '</button>';
               return '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
-                + _b('messages', '\u2709') + _b('board', '\u25a4') + _b('cost', '$') + '</span>';
+                + _b('messages', 'Messages') + _b('board', 'Board') + _b('cost', 'Cost') + '</span>';
             })()
           : '')
       + '</div>';
@@ -36664,7 +36719,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.475';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.476';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57937,7 +57992,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.475';
+const CACHE = 'amux-v0.9.476';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
