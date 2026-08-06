@@ -304,3 +304,46 @@ NOTE: This is the THIRD `AREA: attribution` entry filed on 2026-08-06, after AC-
   working tree and git has no concept of which session owns a hunk. Per this file's own
   thesis, three entries in one AREA is the argument that the thing needs designing rather
   than patching — that design is worth doing before a fourth.
+
+## The staged-guard was never tracked, and the installed pre-commit was months stale
+AREA: attribution
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2444
+SUPERSEDES: the FIX field of the entry above (AMUX-2443), which proposed building a
+  pre-commit cross-session warning. That warning already existed and had been running the
+  whole time — I found out by committing and watching it fire at me. The entry's SYMPTOM
+  and COST stand; its FIX was written from a wrong premise and this entry replaces it.
+SYMPTOM: Three defects stacked, each hiding the next.
+  1. `amux-staged-guard` existed ONLY in `.git/hooks/` — which git does not track. It was
+     absent from `scripts/git-hooks/`, so a fresh clone runs install-hooks.sh, gets a
+     pre-commit whose guard call finds nothing beside it, and proceeds.
+  2. The tracked pre-commit's guard call was `if [ -x "$g" ]; then ...; fi` — no else. So
+     that clone's cross-session protection is off SILENTLY. The installed copy had a loud
+     "staged-guard MISSING ... protection is OFF" warning; the tracked copy had regressed it.
+  3. `.git/hooks/pre-commit` differed from `scripts/git-hooks/pre-commit`, and the drift was
+     security-relevant: the AC-239 secret patterns added to the tracked hook earlier TODAY
+     (`sk_(test|live)_`, R2/AWS secrets, CLERK_SECRET_KEY, Slack, GitLab) were `installed=0`
+     for all of them. install-hooks.sh had not been re-run.
+COST: My commit 8e102eb printed "Security scan passed" from a scanner that could not match
+  a Clerk key, a Slack token, or a GitLab PAT — i.e. the exact class of credential AC-239
+  was filed for, where four real ones including live R2 keys sat committed in a public repo
+  since 2026-03-11. The fix for that leak was written, tested, committed, and inactive on
+  the machine where commits are actually made. CI had it; the first line of defence did not,
+  and it said PASSED. That is the "check that cannot fail" shape at its worst, because the
+  green came from the gate itself.
+  Defect 1 is also a textbook one-level-down repeat: the tracked hook's own comment explains
+  that the guard CALL was made unconditional because it had previously been hand-added to
+  the installed copy only — the author fixed the caller and left the callee untracked, so
+  the identical failure survived directly underneath the comment describing it.
+FIX: card AMUX-2444, landed with this entry — `amux-staged-guard` is now tracked in
+  `scripts/git-hooks/`; install-hooks.sh
+  installs BOTH files and then `cmp`s each against its source, failing loudly on drift
+  rather than printing a success line; the tracked hook's else branch announces a missing
+  guard. Verified by running the conditional with the guard absent (warning fires) and
+  present (silent, exits 0), and by confirming all four AC-239 patterns are now
+  `installed=1`. The remaining gap is AMUX-2443: on a single-file project amux-server.py is
+  always "shared", which the guard only NOTEs, so the sweep that started all this is still
+  possible — that one is open on purpose.

@@ -6,12 +6,28 @@ ROOT="$(git rev-parse --show-toplevel)"
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
 # amux-staged-guard — blocks committing another session's WIP out of this
-# shared checkout. It lives beside this hook and is a no-op when absent, so the
-# call is unconditional here on purpose: it was previously hand-added to the
-# INSTALLED copy only, which left re-running install-hooks.sh one command away
-# from silently disabling it while the guard file sat there looking installed.
+# shared checkout. The call is unconditional here on purpose: it was previously
+# hand-added to the INSTALLED copy only, which left re-running install-hooks.sh
+# one command away from silently disabling it while the guard file sat there
+# looking installed.
+#
+# ABSENCE IS LOUD, and that is not optional (2026-08-06). The same defect the
+# comment above describes had simply moved one level down: the CALL was tracked
+# but the guard SCRIPT was not — `amux-staged-guard` existed only in
+# .git/hooks/, which git does not track, so a fresh clone ran install-hooks.sh,
+# got this hook, found no guard beside it, and silently had cross-session sweep
+# protection OFF. Fixing the caller and not the callee is how a fix looks
+# complete while the hole stays open. The guard is now tracked in
+# scripts/git-hooks/ and installed by install-hooks.sh; this else branch is the
+# backstop for the case where it goes missing again, because a protection that
+# disappears quietly is worse than one that was never claimed.
 g="$(dirname -- "$0")/amux-staged-guard"
-if [ -x "$g" ]; then "$g" || exit 1; fi
+if [ -x "$g" ]; then
+  "$g" || exit 1
+else
+  echo "amux: staged-guard MISSING at $g — cross-session sweep protection is OFF (AMUX-1730)." >&2
+  echo "amux: run ./scripts/install-hooks.sh to restore it." >&2
+fi
 
 # ── 1. Security scan (runs on every commit) ─────────────────────────────────
 

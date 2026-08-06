@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# amux-staged-guard — blocks a commit whose staged set contains files that a
+# DIFFERENT amux session edited in this shared checkout (staged-state sweep,
+# AMUX-1730: two sessions share one git index, so `git add -A` in one sweeps
+# the other's in-flight WIP into an unrelated commit). Fail-open by design:
+# any error, missing server, or timeout lets the commit proceed. Outside amux
+# ($AMUX_SESSION unset) it is a no-op — the human is always allowed.
+# Intentional cross-session commit: AMUX_ALLOW_FOREIGN=1 git commit ...
+import json, os, ssl, subprocess, sys, urllib.request
+
+
+def main():
+    sess = os.environ.get("AMUX_SESSION", "")
+    if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
+        return 0
+    try:
+        staged = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"],
+                                capture_output=True, text=True, timeout=10)
+        paths = [p for p in staged.stdout.split("\0") if p.strip()]
+        if not paths:
+            return 0
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True,
+                             timeout=10).stdout.strip() or os.getcwd()
+        url = os.environ.get("AMUX_URL", "https://localhost:8822").rstrip("/") \
+            + "/api/git/staged-guard"
+        body = json.dumps({"session": sess, "dir": top, "paths": paths}).encode()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Content-Type": "application/json", "X-Amux-Session": sess})
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+            d = json.loads(r.read().decode())
+    except Exception:
+        return 0  # fail open — the guard must never brick commits
+    w = sys.stderr.write
+    # SHARED paths are not blocked — both sessions edited them, so the committer
+    # has a legitimate claim and blocking would deadlock the file. But say it out
+    # loud (AMUX-2332): in a single-file project this is the NORMAL case on the
+    # only file that matters, so the guard was silent on exactly the sweeps most
+    # likely to happen. `git add -A` here takes the other session's in-flight
+    # hunks too, and their `git commit` then reports "nothing to commit".
+    for f in (d.get("shared") or []):
+        mins = int((f.get("age_secs") or 0) / 60)
+        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago. "
+          "If they have uncommitted changes there, this commit takes them too.\n"
+          % (f.get("path"), f.get("owner"), mins))
+    foreign = d.get("foreign") or []
+    if not foreign:
+        return 0
+    w("\namux staged-guard: COMMIT BLOCKED — staged files were edited by "
+      "OTHER amux sessions sharing this checkout:\n\n")
+    for f in foreign:
+        mins = int((f.get("age_secs") or 0) / 60)
+        w("  %s   (edited by session '%s' %dm ago)\n"
+          % (f.get("path"), f.get("owner"), mins))
+    w("\nUnstage them:   git restore --staged "
+      + " ".join(f.get("path", "") for f in foreign) + "\n")
+    w("If this cross-session commit is intentional: "
+      "AMUX_ALLOW_FOREIGN=1 git commit ...\n\n")
+    return 1
+
+
+sys.exit(main())
