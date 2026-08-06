@@ -33200,7 +33200,7 @@ function render() {
             oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
             onkeydown="cardSlashAcKeydown('${s.name}',event)"
             onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
-          <div class="send-split"><button class="btn primary send-split-main" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">Send</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
+          <div class="send-split${_sendMode === 'queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">${_sendMode === 'queue' ? 'Queue' : 'Send'}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
         </div>` : ''}
       </div>
     </div>`;
@@ -33310,12 +33310,12 @@ function render() {
       if (name) renderChips(el, name, false);
     });
   });
-  // Re-apply the send/queue mode to the splits this render just created. The
-  // cards are rebuilt from a template that hardcodes "Send", so without this a
-  // list re-render silently reset every card to Send while _sendMode was still
-  // 'queue' — the button lied about what pressing it would do, and every render
-  // (SSE tick, card toggle, filter change) re-broke it. Caught by measuring the
-  // rendered label against the mode after a toggle, not by reading the code.
+  // Belt-and-braces only: the card TEMPLATE now emits the correct label and
+  // mode class directly, which is the actual fix. Syncing here alone was wrong —
+  // render() has early returns AFTER the cards are rebuilt (a focused card
+  // input, an open menu), so the sync was skipped on exactly the paths that had
+  // just re-created the buttons. Correct-by-construction beats a post-pass that
+  // any early return can bypass.
   try { _updateSendSplit(); } catch(e) {}
   try { _grpScopeRehydrate(); } catch(e) {}
 }
@@ -36762,7 +36762,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.478';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.479';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58040,7 +58040,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.478';
+const CACHE = 'amux-v0.9.479';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
