@@ -37,6 +37,17 @@ SECRET_PATTERNS=(
   "github_pat_[A-Za-z0-9_]+"                              # GitHub fine-grained PATs
   "AIza[0-9A-Za-z_-]{35}"                                 # Google API keys
   "sk-[a-zA-Z0-9]{48}"                                    # OpenAI-style keys
+  # AC-239: FOUR credentials sat committed in cloud/setup-cloud.sh since
+  # 2026-03-11 — Clerk sk_test_, R2 access+secret, CF account id — and this
+  # scanner matched NONE of them. The R2 pair is what litestream uses to
+  # replicate every per-user database, in a PUBLIC repo. Every pattern below
+  # was added by testing it against that exact block first; a secret scanner
+  # whose patterns were never run against a real leak is theatre.
+  "sk_(test|live)_[A-Za-z0-9]{20,}"                       # Clerk / Stripe secret keys
+  "(R2|AWS)_SECRET(_ACCESS)?_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9/+]{32,}"   # R2/S3 secrets
+  "CLERK_SECRET_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9_-]{20,}"
+  "xox[baprs]-[A-Za-z0-9-]{10,}"                          # Slack tokens
+  "glpat-[A-Za-z0-9_-]{20,}"                              # GitLab PATs
 )
 
 SECRETS_FOUND=0

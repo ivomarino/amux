@@ -19,22 +19,64 @@ jobs:
         with: { node-version: '22' }
       - name: Python syntax (amux-server.py parses)
         run: python3 -c "import ast; ast.parse(open('amux-server.py').read())"
-      - name: JS syntax (inline dashboard script parses)
+      - name: JS syntax (ALL inline dashboard script blocks parse)
         run: |
           python3 - <<'PY'
           import re, subprocess, sys, tempfile, os
           content = open('amux-server.py').read()
-          m = re.search(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
-          if not m:
-              print('WARNING: no <script> block found'); sys.exit(0)
-          fd, path = tempfile.mkstemp(suffix='.js')
-          os.write(fd, m.group(1).encode()); os.close(fd)
-          r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
-          os.unlink(path)
-          if r.returncode != 0:
-              print(r.stderr); sys.exit(1)
-          print('JS OK')
+          # findall, NOT search: search parsed the FIRST block only — 2,379 of
+          # 1,296,891 bytes — so the 1.07MB dashboard block was never parsed by
+          # CI while this step printed green (AMUX-2331; the local pre-commit
+          # hook was fixed months before this CI copy was).
+          blocks = re.findall(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
+          if not blocks:
+              print('FAIL: no <script> block found — extraction broke'); sys.exit(1)
+          fail = 0
+          for i, b in enumerate(blocks):
+              fd, path = tempfile.mkstemp(suffix='.js')
+              os.write(fd, b.encode()); os.close(fd)
+              r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
+              os.unlink(path)
+              if r.returncode != 0:
+                  print('JS syntax error in block %d of %d:' % (i + 1, len(blocks)))
+                  print(r.stderr); fail = 1
+          if fail: sys.exit(1)
+          print('%d blocks parsed, %d bytes' % (len(blocks), sum(len(b) for b in blocks)))
           PY
+      - name: Client refs resolve (deleted-function class)
+        run: python3 tests/check_client_refs.py
+      - name: Secret scan (the pre-commit hook, in CI)
+        # The hook only runs where it is installed. AC-239: four credentials
+        # sat committed in a PUBLIC repo since 2026-03-11 because the local
+        # hook was the ONLY gate and it did not match them. CI has no such
+        # excuse — same patterns, every push, no install step to forget.
+        run: |
+          set -euo pipefail
+          PATTERNS=(
+            "sk-ant-api[0-9a-zA-Z-]{20,}" "AKIA[0-9A-Z]{16}" "ghp_[A-Za-z0-9]{36}"
+            "sk_(test|live)_[A-Za-z0-9]{20,}"
+            "(R2|AWS)_SECRET(_ACCESS)?_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9/+]{32,}"
+            "CLERK_SECRET_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9_-]{20,}"
+            "xox[baprs]-[A-Za-z0-9-]{10,}" "glpat-[A-Za-z0-9_-]{20,}"
+          )
+          # Self-test FIRST: a planted secret must be caught, or a green run
+          # here means nothing (the scanner that missed AC-239 was also green).
+          # Built at RUNTIME, never written literally in this file — a literal
+          # here would be found by the scan below and fail the repo on its own
+          # self-test, forever. (Caught before shipping: the first cut did
+          # exactly that.)
+          printf 'CLERK_SECRET_KEY=sk_%s_%s\n' "test" "$(printf 'A%.0s' $(seq 28))" > /tmp/_probe
+          grep -Eq -e "sk_(test|live)_[A-Za-z0-9]{20,}" /tmp/_probe \
+            || { echo "SELF-TEST FAILED: scanner cannot catch a planted secret"; exit 1; }
+          rm -f /tmp/_probe
+          fail=0
+          for p in "${PATTERNS[@]}"; do
+            if out=$(grep -REn -e "$p" --include='*.py' --include='*.sh' --include='*.yml' \
+                      --include='*.yaml' --include='*.json' --include='*.ts' --include='*.js' . 2>/dev/null); then
+              echo "SECRET PATTERN MATCHED: $p"; echo "$out" | head -3 | cut -c1-120; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "secret scan clean" || exit 1
       - name: Tests
         run: |
           pip install -q pytest psutil
