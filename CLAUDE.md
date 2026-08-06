@@ -210,6 +210,16 @@ When the user says **"deploy"**, run the full pipeline:
 
 Persistent env vars for the server. Loaded at startup via `os.environ.setdefault` so process-level env always wins. Survives `os.execv` auto-restarts.
 
+**Credential VALUES live here and only here — never in this repo (it is PUBLIC), never in
+a board card, never in a prompt. [`docs/credentials.md`](docs/credentials.md) is the
+committed inventory of what exists: NAMES and purpose only.** Read it before concluding
+you lack a credential and asking a human for one. On 2026-08-06 a session asked Ethan to
+create a Clerk account and to decide about handing over an `sk_live_` key while
+`E2E_CLERK_SECRET_KEY` and a full `AMUX_QA_*` god-mode login were already in this file —
+the same file that session had been reading `E2E_COOKIE_SECRET` out of all day. Grepping
+one key never reveals the other 34, so a credential nobody can enumerate is one nobody
+has.
+
 Example `~/.amux/server.env`:
 ```
 AMUX_S3_BUCKET=ethan-personal
