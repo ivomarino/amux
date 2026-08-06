@@ -17953,6 +17953,9 @@ def _live_conv_id(name: str, work_dir: str = "") -> str:
 
 _GLOBAL_MEM_FILE = CC_MEMORY / "_global.md"
 _MEM_MARKER = "<!-- amux:session-memory -->"
+# Header of the generated pointer-resolution block. Named so the capture can
+# strip it: generated presentation must never become the worker's memory.
+_MEM_RESOLVE_HDR = "**Where these memories live.**"
 # Marks a line THIS composer emitted, so _capture_claude_memory_changes never
 # rescues it back into the session's own store (AMUX-2315). The topic pointer
 # had this exact bug and was fixed by name-matching one string; the tag pointer
@@ -19203,6 +19206,19 @@ def _capture_claude_memory_changes(name: str, work_dir: str):
         if _MEM_MARKER in content:
             _above, session_part = content.split(_MEM_MARKER, 1)
             session_part = session_part.strip()
+            # HEAL EXISTING POLLUTION. The resolution block now goes above the
+            # marker, but one store already captured it from below before that was
+            # fixed, and a store that has it would otherwise keep it forever —
+            # recomposed and re-captured on every sync. Strip it on the way in, so
+            # the fix reaches stores that were already hit instead of only
+            # preventing new ones. Cheap, idempotent, and matches only the exact
+            # generated block.
+            if _MEM_RESOLVE_HDR in session_part:
+                session_part = "\n".join(
+                    l for l in session_part.splitlines()
+                    if not (l.lstrip().startswith(">") and
+                            (_MEM_RESOLVE_HDR in l or "Resolved at write time" in l
+                             or l.lstrip().startswith(">   - ")))).strip()
             # RESCUE index entries written ABOVE the marker. Only the part below
             # was ever captured, so anything a session added above it was
             # discarded on the next send — silent, and now load-bearing, because
@@ -19336,7 +19352,22 @@ def _resolve_memory_pointers(composed: str, mem_dir) -> str:
             lines.append(">   - %d entr(ies) resolve nowhere on disk — they are genuinely gone."
                          % (len(missing) - found))
         lines.append("> Resolved at write time from the live filesystem, so it follows the files.")
-        return composed.rstrip() + "\n" + "\n".join(lines) + "\n"
+        block = "\n".join(lines).strip() + "\n"
+        # INSERT ABOVE _MEM_MARKER, never at the end (tubescience, 2026-08-06).
+        # _capture_claude_memory_changes copies MEMORY.md's BELOW-marker section
+        # back over ~/.amux/memory/<name>.md, so a block appended to the end is
+        # not decoration — it is written into the worker's own memory store on the
+        # next capture, and then recomposed and re-appended, round-tripping
+        # forever. It reached one store before this was caught.
+        #
+        # This is generated presentation, not the worker's memory. Above the
+        # marker it renders for the reader and the capture never sees it. The
+        # rescue that pulls index entries back down from above matches `- [..](..)`
+        # lines only, so a blockquote is not eligible and cannot be dragged under.
+        if _MEM_MARKER in composed:
+            _a, _b = composed.split(_MEM_MARKER, 1)
+            return _a.rstrip() + "\n\n" + block + "\n" + _MEM_MARKER + _b
+        return composed.rstrip() + "\n\n" + block
     except Exception:
         return composed
 
