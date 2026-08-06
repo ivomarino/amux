@@ -17814,8 +17814,30 @@ def _session_file_search(name: str, q: str, limit: int = 0, literal: bool = True
     identical. The response therefore always reports `searched_ignored`,
     `engine`, and whether it was `truncated`, so a caller can tell which kind of
     empty it got."""
+    root = _session_work_dir(name)
+    if not root:
+        return {"session": name, "query": q, "root": "", "engine": "", "results": [],
+                "files": 0, "matches": 0, "truncated": False,
+                "searched_ignored": bool(include_ignored),
+                "searched_hidden": bool(include_ignored),
+                "limit": limit or _SEARCH_MAX_RESULTS,
+                "error": "worker has no CC_DIR configured"}
+    out = _fs_search(root, q, limit=limit, literal=literal, case=case,
+                     include_ignored=include_ignored, globs=globs)
+    out["session"] = name
+    return out
+
+
+def _fs_search(root: str, q: str, limit: int = 0, literal: bool = True,
+               case: str = "smart", include_ignored: bool = False,
+               globs: list | None = None) -> dict:
+    """The path-scoped core behind both search surfaces: the worker endpoint
+    above (root = the worker's CC_DIR) and GET /api/fs/search (root = whatever
+    directory the Files view is browsing, or its home for 'everywhere'). One
+    engine, one honesty contract — splitting them would fork the max-filesize
+    and unset-limit lessons into two places to re-learn (AMUX-2420)."""
     t0 = time.time()
-    out = {"session": name, "query": q, "root": "", "engine": "", "results": [],
+    out = {"query": q, "root": "", "engine": "", "results": [],
            "files": 0, "matches": 0, "truncated": False,
            "searched_ignored": bool(include_ignored),
            "searched_hidden": bool(include_ignored),
@@ -17823,14 +17845,11 @@ def _session_file_search(name: str, q: str, limit: int = 0, literal: bool = True
     if not q:
         out["error"] = "missing query"
         return out
-    root = _session_work_dir(name)
-    if not root:
-        out["error"] = "worker has no CC_DIR configured"
-        return out
-    rp = Path(root)
+    rp = Path(root).expanduser()
     if not _is_path_allowed(rp) or not rp.is_dir():
         out["error"] = "access denied or not a directory"
         return out
+    rp = rp.resolve()
     out["root"] = str(rp)
     cap = limit or _SEARCH_MAX_RESULTS
 
@@ -28861,11 +28880,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button id="files-bm-add" onclick="_filesAddBookmark()" style="background:none;border:1px dashed var(--border);border-radius:4px;color:var(--dim);font-size:0.7rem;padding:2px 6px;cursor:pointer;white-space:nowrap;flex-shrink:0;" title="Bookmark current folder">+</button>
     <button id="files-lib-btn" onclick="_libOpen()" style="display:none;margin-left:auto;background:var(--accent);color:#000;border:none;border-radius:4px;font-size:0.7rem;font-weight:600;padding:3px 9px;cursor:pointer;white-space:nowrap;flex-shrink:0;" title="View this folder as a searchable library">&#x1F4DA; Library</button>
   </div>
-  <!-- Search -->
-  <div style="padding:5px 10px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--card);">
+  <!-- Search: name filter by default; Contents = ripgrep FTS (AMUX-2420) -->
+  <div style="padding:5px 10px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--card);display:flex;gap:6px;align-items:center;">
     <input id="files-search" type="search" placeholder="Search in this folder…" autocomplete="off"
-      style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:0.8rem;color:var(--text);outline:none;"
-      oninput="_filesSearchFilter(this.value)">
+      style="flex:1;min-width:0;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 9px;font-size:0.8rem;color:var(--text);outline:none;"
+      oninput="_filesSearchInput(this.value)"
+      onkeydown="if(event.key==='Enter'&&_filesFtsMode){event.preventDefault();_filesFtsRun();}">
+    <button class="fe-tb-btn" id="files-fts-btn" onclick="_filesFtsToggle()"
+      title="Search file CONTENTS (full-text) instead of filtering names"
+      style="flex:0 0 auto;font-size:0.7rem;white-space:nowrap;min-height:32px;padding:4px 9px;">Contents</button>
+    <label id="files-fts-scope" style="display:none;flex:0 0 auto;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim);white-space:nowrap;">
+      <input type="checkbox" id="files-fts-all" style="margin:0;">everywhere</label>
   </div>
   <!-- Header + rows share ONE horizontal-scroll container so on a narrow
        (mobile) screen you scroll sideways to reveal Size/Modified with the
@@ -30140,7 +30165,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
-    <button class="peek-tab" id="peek-tab-search" onclick="setPeekTab('search')" title="Full-text search across every file in this worker's directory"><span class="tab-ico">&#128269;</span><span class="tab-lbl">Search</span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
     <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
   </div>
@@ -30324,22 +30348,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="peek-scope-panel" class="peek-tasks-panel" style="padding:10px;gap:0;overflow-y:auto;">
     <div id="peek-scope-body" style="font-size:0.82rem;color:var(--dim);">Loading&hellip;</div>
   </div>
-  <div id="peek-search-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
-    <div class="peek-tasks-add" style="gap:6px;padding:8px 10px;flex-wrap:wrap;">
-      <input type="search" id="peek-search-input" placeholder="Search every file in this worker&hellip;"
-        onkeydown="if(event.key==='Enter'){event.preventDefault();_fileSearchRun();}"
-        style="flex:1 1 160px;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
-      <button class="btn primary" style="flex:0 0 auto;min-height:32px;" onclick="_fileSearchRun()">Search</button>
-      <label style="display:flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim);flex:0 0 auto;">
-        <input type="checkbox" id="peek-search-regex" style="margin:0;">regex</label>
-      <label style="display:flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim);flex:0 0 auto;"
-        title="Also search .gitignore'd and hidden files">
-        <input type="checkbox" id="peek-search-ignored" style="margin:0;">ignored</label>
-    </div>
-    <div id="peek-search-body" style="flex:1;overflow-y:auto;padding:0 10px 10px;font-size:0.8rem;color:var(--dim);">
-      Search the whole working directory of this worker. Enter to run.
-    </div>
-  </div>
+  
   <div id="peek-messages-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
       <input type="search" id="peek-messages-search" placeholder="Search messages sent to this worker&hellip;" oninput="_peekMessagesRender()"
@@ -34035,7 +34044,6 @@ const PEEK_TABS = [
   { id: 'transcript', label: 'Transcript' },
   { id: 'commits',    label: 'Commits' },
   { id: 'git',        label: 'Worktree' },
-  { id: 'search',     label: 'Search' },
 ];
 let peekHiddenTabs = (function() {
   try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
@@ -35681,14 +35689,6 @@ function setPeekTab(tab) {
   const scopePanel = document.getElementById('peek-scope-panel');
   if (tab === 'scope') { scopePanel.classList.add('active'); _scopeLoad(); }
   else { scopePanel.classList.remove('active'); }
-  document.getElementById('peek-tab-search').classList.toggle('active', tab === 'search');
-  const searchPanel = document.getElementById('peek-search-panel');
-  if (tab === 'search') {
-    searchPanel.classList.add('active');
-    // Do NOT auto-run: an empty query would render the "no matches" note as if
-    // a search had happened. Focus and wait for a real one.
-    setTimeout(() => { const i = document.getElementById('peek-search-input'); if (i) i.focus(); }, 40);
-  } else { searchPanel.classList.remove('active'); }
   document.getElementById('peek-tab-memory').classList.toggle('active', tab === 'memory');
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
@@ -36721,64 +36721,6 @@ function _peekMemorySharedBanner(data) {
     + 'expected rather than a mix-up.';
 }
 
-// ── File search (peek Search tab) ──
-// Renders what the server SAYS about the search, not just its hits: engine,
-// elapsed, and every filter that could explain a zero. An empty result is the
-// one answer a reader cannot debug from the rows on screen.
-let _fileSearchSeq = 0;
-
-async function _fileSearchRun() {
-  const inp = document.getElementById('peek-search-input');
-  const body = document.getElementById('peek-search-body');
-  if (!inp || !body || !peekSession) return;
-  const q = inp.value.trim();
-  if (!q) { body.textContent = 'Type something to search for.'; return; }
-  const seq = ++_fileSearchSeq;
-  const sess = peekSession;
-  body.innerHTML = '<span style="color:var(--dim);">Searching ' + esc(sess) + '…</span>';
-  const p = new URLSearchParams({ q: q });
-  if (document.getElementById('peek-search-regex').checked) p.set('literal', '0');
-  if (document.getElementById('peek-search-ignored').checked) p.set('ignored', '1');
-  let d;
-  try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(sess) + '/search?' + p.toString(),
-                          { headers: _authHeaders() });
-    d = await r.json();
-  } catch (e) {
-    if (seq === _fileSearchSeq) body.innerHTML = '<span style="color:#f85149;">Search failed: ' + esc(e.message) + '</span>';
-    return;
-  }
-  // Late response from a previous query must not overwrite a newer one.
-  if (seq !== _fileSearchSeq || peekSession !== sess) return;
-  if (d.error) {
-    body.innerHTML = '<span style="color:#f85149;">' + esc(d.error) + '</span>';
-    return;
-  }
-  const head = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;margin:6px 0 8px;">'
-    + '<b style="color:var(--text);font-size:0.8rem;">' + d.matches + ' match' + (d.matches === 1 ? '' : 'es')
-    + ' in ' + d.files + ' file' + (d.files === 1 ? '' : 's') + '</b>'
-    + '<span style="font-size:0.64rem;color:var(--dim);">' + esc(d.engine || '?') + ' · ' + (d.elapsed_ms || 0) + 'ms'
-    + (d.truncated ? ' · <span style="color:#d29922;">truncated at ' + d.limit + '</span>' : '')
-    + (d.searched_ignored ? ' · incl. ignored+hidden' : '')
-    + '</span></div>';
-  if (!d.results.length) {
-    body.innerHTML = head + '<div style="color:#d29922;font-size:0.74rem;line-height:1.4;">' + esc(d.note || 'No matches.') + '</div>';
-    return;
-  }
-  // Group by file so 50 hits in one file do not read as 50 files.
-  const byFile = {};
-  d.results.forEach(r => { (byFile[r.path] = byFile[r.path] || []).push(r); });
-  body.innerHTML = head + Object.keys(byFile).map(fp => {
-    const rows = byFile[fp].map(r =>
-      '<div style="display:flex;gap:8px;align-items:baseline;padding:1px 0;">'
-      + '<span style="flex:0 0 46px;text-align:right;font-size:0.62rem;color:var(--dim);">' + r.line + '</span>'
-      + '<code style="flex:1 1 auto;font-size:0.68rem;white-space:pre-wrap;word-break:break-word;color:var(--text);">'
-      + _fileSearchHi(r.text, r.spans) + '</code></div>').join('');
-    return '<div style="margin-bottom:10px;">'
-      + '<div style="font-size:0.7rem;color:var(--accent);margin-bottom:2px;word-break:break-all;">' + esc(fp)
-      + ' <span style="color:var(--dim);">(' + byFile[fp].length + ')</span></div>' + rows + '</div>';
-  }).join('');
-}
 
 // Highlight using the server's byte spans. Built from the ORIGINAL string and
 // escaped per segment — escaping first would shift every offset past the first
@@ -36891,7 +36833,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.485';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.486';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43372,6 +43314,84 @@ function _filesSearchFilter(q) {
   if (!body || !_filesLastData) return;
   const { path, data, cacheTs } = _filesLastData;
   _renderFilesEntries(body, path, data, cacheTs);
+}
+
+// ── Content search in the Files view (AMUX-2420) ──
+// Ethan: "the FTS search you made a new tab in worker page should be in the
+// file directory, there should be an optional filter for FTS across it all."
+// Name filter stays the instant default; Contents mode runs ripgrep server-side
+// on Enter, scoped to the folder being browsed — or, with "everywhere" checked,
+// to the Files home directory (_filesCwd), which is "across it all" without
+// pretending that searching / from a browser is a feature.
+let _filesFtsMode = false;
+let _filesFtsSeq = 0;
+
+function _filesSearchInput(v) {
+  // In contents mode typing must NOT re-filter names — the list under the box
+  // is search RESULTS, and live-filtering them by name would silently mix two
+  // different search semantics in one view.
+  if (!_filesFtsMode) _filesSearchFilter(v);
+}
+
+function _filesFtsToggle() {
+  _filesFtsMode = !_filesFtsMode;
+  const btn = document.getElementById('files-fts-btn');
+  const scope = document.getElementById('files-fts-scope');
+  const inp = document.getElementById('files-search');
+  if (btn) { btn.style.borderColor = _filesFtsMode ? 'var(--accent)' : ''; btn.style.color = _filesFtsMode ? 'var(--accent)' : ''; }
+  if (scope) scope.style.display = _filesFtsMode ? 'flex' : 'none';
+  if (inp) inp.placeholder = _filesFtsMode ? 'Search file contents… (Enter to run)' : 'Search in this folder…';
+  if (!_filesFtsMode) {
+    // Leaving contents mode restores the plain listing so stale results never
+    // sit under a name-filter box that no longer describes them.
+    _filesSearchFilter(inp ? inp.value : '');
+  } else if (inp) inp.focus();
+}
+
+async function _filesFtsRun() {
+  const inp = document.getElementById('files-search');
+  const body = document.getElementById('files-body');
+  if (!inp || !body) return;
+  const q = inp.value.trim();
+  if (!q) { body.innerHTML = '<div style="padding:16px;color:var(--dim)">Type something to search for.</div>'; return; }
+  const all = !!document.getElementById('files-fts-all')?.checked;
+  const root = all ? (_filesCwd || '/') : (_filesPath || '/');
+  const seq = ++_filesFtsSeq;
+  body.innerHTML = '<div style="padding:16px;color:var(--dim)">Searching ' + esc(root) + '…</div>';
+  let d;
+  try {
+    const r = await fetch(API + '/api/fs/search?path=' + encodeURIComponent(root) + '&q=' + encodeURIComponent(q));
+    d = await r.json();
+  } catch (e) {
+    if (seq === _filesFtsSeq) body.innerHTML = '<div style="padding:16px;color:#f85149">Search failed: ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (seq !== _filesFtsSeq) return;   // a newer query superseded this one
+  if (d.error) { body.innerHTML = '<div style="padding:16px;color:#f85149">' + esc(d.error) + '</div>'; return; }
+  const head = '<div style="padding:10px 16px 4px;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;">'
+    + '<b style="font-size:0.8rem;color:var(--text)">' + d.matches + ' match' + (d.matches === 1 ? '' : 'es')
+    + ' in ' + d.files + ' file' + (d.files === 1 ? '' : 's') + '</b>'
+    + '<span style="font-size:0.64rem;color:var(--dim)">' + esc(d.engine || '?') + ' · ' + (d.elapsed_ms || 0) + 'ms · '
+    + esc(d.root || root) + (d.truncated ? ' · <span style="color:#d29922">truncated at ' + d.limit + '</span>' : '') + '</span>'
+    + '<button class="fe-tb-btn" style="margin-left:auto;font-size:0.68rem;min-height:32px;" '
+    + 'onclick="_filesSearchFilter(\'\')">Back to folder</button></div>';
+  if (!d.results.length) {
+    body.innerHTML = head + '<div style="padding:8px 16px;color:#d29922;font-size:0.74rem;">' + esc(d.note || 'No matches.') + '</div>';
+    return;
+  }
+  const byFile = {};
+  d.results.forEach(r => { (byFile[r.abs] = byFile[r.abs] || []).push(r); });
+  body.innerHTML = head + Object.keys(byFile).map(fp => {
+    const rel = byFile[fp][0].path;
+    const rows = byFile[fp].map(r =>
+      '<div onclick="openFilePreview(\'' + escJs(fp) + '\')" style="display:flex;gap:8px;align-items:baseline;padding:2px 0;cursor:pointer;">'
+      + '<span style="flex:0 0 44px;text-align:right;font-size:0.62rem;color:var(--dim)">' + r.line + '</span>'
+      + '<code style="flex:1;font-size:0.7rem;white-space:pre-wrap;word-break:break-word;color:var(--text)">'
+      + _fileSearchHi(r.text, r.spans) + '</code></div>').join('');
+    return '<div style="padding:6px 16px;">'
+      + '<div onclick="openFilePreview(\'' + escJs(fp) + '\')" style="font-size:0.72rem;color:var(--accent);cursor:pointer;word-break:break-all;">'
+      + esc(rel) + ' <span style="color:var(--dim)">(' + byFile[fp].length + ')</span></div>' + rows + '</div>';
+  }).join('');
 }
 
 async function _filesNewFolder() {
@@ -58175,7 +58195,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.485';
+const CACHE = 'amux-v0.9.486';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -61925,6 +61945,28 @@ class CCHandler(BaseHTTPRequestHandler):
                 })
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
+
+        # GET /api/fs/search?path=<dir>&q=...&literal=0&case=&ignored=1&glob=&limit=
+        # Content search scoped to a DIRECTORY, for the Files view (AMUX-2420:
+        # "the FTS search ... should be in the file directory"). Same engine and
+        # honesty contract as /api/sessions/<n>/search — one core, _fs_search.
+        if method == "GET" and path == "/api/fs/search":
+            _sp = (qs.get("path", [""])[0] or "").strip()
+            _sq = (qs.get("q", [""])[0] or "").strip()
+            if not _sp:
+                return self._json({"error": "missing 'path'"}, 400)
+            _lr = (qs.get("limit", [""])[0] or "").strip()
+            try:
+                _sl = max(1, min(2000, int(_lr))) if _lr else 0
+            except Exception:
+                _sl = 0
+            _res = _fs_search(
+                _sp, _sq, limit=_sl,
+                literal=qs.get("literal", ["1"])[0].lower() not in ("0", "false", "no"),
+                case=(qs.get("case", ["smart"])[0] or "smart").lower(),
+                include_ignored=qs.get("ignored", ["0"])[0].lower() in ("1", "true", "yes"),
+                globs=[g for g in qs.get("glob", []) if g])
+            return self._json(_res, 400 if _res.get("error") == "missing query" else 200)
 
         if method == "GET" and path == "/api/fs/list":
             target_path = (qs.get("path", [""])[0] or "").strip()
