@@ -19541,14 +19541,34 @@ def _discard_verdict(cmd, scrubbed, run_dir):
                                           "X-Amux-Session": sess})
     res = json.load(urllib.request.urlopen(req, timeout=4, context=ctx))
     foreign = res.get("foreign") or []
-    if not foreign:
+    shared = res.get("shared") or []
+    # BLOCK ON shared AS WELL AS foreign (AC-221). The two consumers of this
+    # endpoint cannot share one verdict:
+    #   COMMIT  a co-edited file -> you have a real claim, and the peer's work
+    #           survives in the object store either way. `shared` = warn is right.
+    #   DESTROY a co-edited file -> the peer's uncommitted half is gone whether or
+    #           not you also touched it. No object, no reflog entry. Having edited
+    #           it too grants NO claim to delete it.
+    # "Both of us wrote this" is a reason to let you commit it and a reason to stop
+    # you deleting it. f85b162 correctly widened `mine` to count shell writes, which
+    # moved co-edited files from foreign -> shared, and this consumer — keyed on
+    # foreign alone — silently stopped blocking the exact command that motivated
+    # AC-212. Keying on both is what makes the widening safe here.
+    if not foreign and not shared:
         return None
-    who = ", ".join(sorted({f.get("owner", "?") for f in foreign}))
-    what = ", ".join(f.get("path", "?") for f in foreign[:5])
-    return ("discarding UNCOMMITTED work that belongs to another session — "
+    hits = foreign + shared
+    who = ", ".join(sorted({f.get("owner", "?") for f in hits}))
+    what = ", ".join(f.get("path", "?") for f in hits[:5])
+    # Distinct wording: "also edited" is a different fact from "is theirs", and a
+    # guard that says the wrong one gets argued with instead of obeyed.
+    lead = ("discarding UNCOMMITTED work that belongs to another session"
+            if foreign else
+            "discarding a file ANOTHER SESSION HAS ALSO EDITED")
+    return (lead + " — "
             f"{what} (recently edited by {who}). Naming a path does NOT make this "
             "yours in a shared checkout: in a single-file repo that one path holds "
-            "every session's edits. Unlike a bad commit or push, this is "
+            "every session's edits, and editing it too is not a claim to destroy "
+            "their half. Unlike a bad commit or push, this is "
             "UNRECOVERABLE — no object, no reflog entry. Make it recoverable "
             "instead: `git stash push -- <paths>` keeps the content, or revert only "
             "your own hunks (`git diff` then a sliced `git apply -R`), or ask "
