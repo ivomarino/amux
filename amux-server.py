@@ -32540,7 +32540,9 @@ function render() {
   const allTags = [...new Set(sessions.filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
   if (activeTag && !allTags.includes(activeTag)) activeTag = null;
   if (allTags.length) {
-    tagEl.innerHTML = allTags.map(t =>
+    tagEl.innerHTML =
+      `<span class="tag-filter scope-global${_grpOpen === '\u2609global' ? ' active' : ''}" title="What every worker inherits" onclick="_selectGlobalScope()">&#9673; Global</span>`
+      + allTags.map(t =>
       `<span class="tag-filter${activeTag === t ? ' active' : ''}" onclick="toggleTagFilter('${escJs(t)}')">${esc(t)}</span>`
     ).join('');
   } else {
@@ -32618,7 +32620,7 @@ function render() {
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
     return `
-    ${(_grpOpen && (s.tags||[]).includes(_grpOpen) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${escJs(_grpOpen)}')">&#215;</button><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
+    ${(_grpOpen && (_grpOpen === _GLOBAL_SCOPE || (s.tags||[]).includes(_grpOpen)) && !_grpEmitted && (_grpEmitted = true)) ? `<div class="grp-scope-panel" id="grp-scope-${escJs(_grpOpen)}" onclick="event.stopPropagation();"><button class="grp-scope-close" title="Close" onclick="event.stopPropagation();_selectGroup('${escJs(_grpOpen)}')">&#215;</button><div class="grp-scope-body" id="grp-scope-body-${escJs(_grpOpen)}">${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>` : ''}
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
@@ -35957,7 +35959,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.463';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.464';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40731,6 +40733,24 @@ function toggleTagFilter(tag) {
 // Select a group: filter the list to it AND show what it scopes. Entered from
 // the tag pills or from a group chip on a worker card — both land here, so the
 // two cannot drift into doing different things.
+const _GLOBAL_SCOPE = '\u2609global';   // sentinel: cannot collide with a real group name
+
+// Global scope panel, rendered by the same _scopeLoad and into the same slot as
+// a group's. Deliberately does NOT touch activeTag — global is not a filter over
+// the worker list, it is the layer every worker inherits, and filtering the list
+// to "global" would mean nothing.
+function _selectGlobalScope() {
+  const closing = (_grpOpen === _GLOBAL_SCOPE);
+  _grpScopeHtml = '';
+  _grpOpen = closing ? null : _GLOBAL_SCOPE;
+  _grpMsgOpen = false;
+  render();
+  if (_grpOpen) {
+    const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
+    if (el) _scopeLoad({ level: 'global' }, el.id);
+  }
+}
+
 function _selectGroup(g) {
   const closing = (activeTag === g && _grpOpen === g);
   activeTag = closing ? '' : g;
@@ -57522,7 +57542,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.463';
+const CACHE = 'amux-v0.9.464';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
