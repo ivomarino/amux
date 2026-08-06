@@ -26924,6 +26924,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     gap:10px; }
   .grp-scope-title { color:var(--text); font-weight:600; font-size:0.82rem;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* The at-a-glance line lives in the header so it reads in BOTH states — the
+     collapsed bar was dead space (Ethan's screenshot). min-width:0 + ellipsis
+     keeps it from pushing the Expand handle off a 375px screen. */
+  .grp-scope-sum { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; font-size:0.7rem; color:var(--dim); margin:0 10px; }
   .grp-scope-sub { color:var(--dim); font-weight:400; }
   /* NOT float. A float is not contained by a parent whose only other child is
      display:none, so collapsing dropped the button out of the panel and left an
@@ -33096,6 +33101,64 @@ let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render kee
 let _grpCollapsed = (function() {
   try { return localStorage.getItem('amux_grp_collapsed') !== '0'; } catch (e) { return true; }
 })();
+// At-a-glance group summary in the panel HEADER, visible collapsed or not
+// (Ethan, with a screenshot of the empty collapsed bar: "you can put some kind
+// of summary of the workers in the group, like # of workers across each status,
+// active schedules, etc."). Built from state the client already holds (sessions,
+// boardItems via SSE) so it costs nothing per render; only the schedules count
+// needs a fetch, cached 60s per group and folded into the next render rather
+// than patched into the DOM — a DOM patch would be wiped by the very next
+// guarded re-render.
+let _grpSchedCache = {};   // group -> {n, ts}
+function _grpMembers(g) {
+  const all = (sessions || []).filter(s => !s.archived);
+  return g === _GLOBAL_SCOPE ? all : all.filter(s => (s.tags || []).includes(g));
+}
+function _grpSummary(g) {
+  const m = _grpMembers(g);
+  if (!m.length) return '';
+  const by = { active: 0, waiting: 0, idle: 0 };
+  m.forEach(s => { by[s.status] = (by[s.status] || 0) + 1; });
+  const names = new Set(m.map(s => s.name));
+  let doing = 0, todo = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && names.has(c.session)) {
+      if (c.status === 'doing') doing++;
+      else if (c.status === 'todo') todo++;
+    }
+  });
+  const bit = (n, label, color) => n
+    ? `<span style="color:${color || 'var(--dim)'};">${n} ${label}</span>` : '';
+  const sched = _grpSchedCache[g];
+  const parts = [
+    `<span style="color:var(--text);">${m.length} worker${m.length === 1 ? '' : 's'}</span>`,
+    bit(by.active, 'active', 'var(--green)'),
+    bit(by.waiting, 'waiting', '#d29922'),
+    bit(by.idle, 'idle'),
+    (doing || todo) ? `<span>${doing} doing · ${todo} todo</span>` : '',
+    sched ? `<span>${sched.n} schedule${sched.n === 1 ? '' : 's'} on</span>` : '',
+  ].filter(Boolean);
+  return '<span class="grp-scope-sum">' + parts.join('<span style="opacity:0.35;"> · </span>') + '</span>';
+}
+async function _grpSchedFetch(g) {
+  const c = _grpSchedCache[g];
+  if (c && Date.now() - c.ts < 60000) return;
+  try {
+    const r = await fetch(API + '/api/schedules', { headers: _authHeaders() });
+    const d = await r.json();
+    const names = new Set(_grpMembers(g).map(s => s.name));
+    const n = (d || []).filter(s => s.enabled && names.has(s.session)).length;
+    const prev = _grpSchedCache[g];
+    _grpSchedCache[g] = { n, ts: Date.now() };
+    // Fold into the template via a re-render only when the NUMBER changed —
+    // rendering unconditionally would repaint the whole list for a cache tick.
+    if (!prev || prev.n !== n) {
+      const strip = document.getElementById('grp-scope-strip');
+      if (strip) strip._want = '';
+      render();
+    }
+  } catch (e) {}
+}
 function _grpSetCollapsed(v) {
   _grpCollapsed = !!v;
   try { localStorage.setItem('amux_grp_collapsed', _grpCollapsed ? '1' : '0'); } catch (e) {}
@@ -33157,6 +33220,7 @@ function render() {
       const want = `<div class="grp-scope-panel" id="grp-scope-${gid}" onclick="event.stopPropagation();">`
         + `<div class="grp-scope-head">`
         +   `<span class="grp-scope-title">${esc(glabel)}<span class="grp-scope-sub"> · scope</span></span>`
+        +   _grpSummary(_grpOpen)
         +   `<button class="grp-scope-acc" title="${_grpCollapsed ? 'Expand' : 'Collapse'}" onclick="event.stopPropagation();_grpAccToggle()">${_grpCollapsed ? '▸ Expand' : '▾ Collapse'}</button>`
         + `</div>`
         + `<div class="grp-scope-body" id="grp-scope-body-${gid}"${_grpCollapsed ? ' style="display:none;"' : ''}>${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
@@ -36849,7 +36913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.489';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.490';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41672,6 +41736,7 @@ function _selectGlobalScope() {
   _grpScopeHtml = '';
   _grpOpen = closing ? null : _GLOBAL_SCOPE;
   _grpView = 'config';
+  if (_grpOpen) _grpSchedFetch(_grpOpen);
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
@@ -41690,6 +41755,7 @@ function _selectGroup(g) {
   // button whose cause is invisible, because the panel it would have opened is
   // already what you are looking at.
   _grpView = 'config';
+  if (_grpOpen) _grpSchedFetch(_grpOpen);   // summary's async half, cached 60s
   // Deliberately does NOT force-expand. That was my over-correction to "I cant
   // use the group scope stuff": the real cause was AMUX-2406, where a collapsed
   // panel rendered as an empty box with NO visible handle. With the header fixed
@@ -58215,7 +58281,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.489';
+const CACHE = 'amux-v0.9.490';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
