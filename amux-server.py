@@ -7670,6 +7670,56 @@ def _steer_guard_stale(name: str, guard: str):
         if not live:
             return True, f"all {len(ids)} shells decomposed before delivery"
         return False, ""
+    if guard.startswith("unverified:"):
+        # "N of your done cards await the done->verified gap: <ids>". Same shape
+        # as decompose: it NAMES ids and tells the lane to act on each. If they
+        # were verified (or moved) while the nudge waited, it asks for work that
+        # is finished — and the honest exits it offers (move to verified, or
+        # append why it stays done) both mean writing to a card that already
+        # says so. Kept while ANY named card is still sitting in done.
+        ids = [c.strip() for c in guard[len("unverified:"):].split(",") if c.strip()]
+        if not ids:
+            return False, ""
+        for cid in ids:
+            it = _item_by_id(cid)
+            if not it or it.get("deleted") or it.get("archived"):
+                continue
+            if _status_canon(it.get("status")) == "done":
+                return False, ""
+        return True, f"all {len(ids)} cards left done before delivery"
+    if guard.startswith("review:"):
+        # "You are the reviewer for <id>". Perishable three ways: the card can
+        # be closed, the reviewer can be reassigned, or the card can leave
+        # review entirely. A reviewer nudge for a card someone else already
+        # reviewed sends a lane to read a closed item and, worse, invites an ack
+        # on work that is no longer theirs to ack.
+        cid = guard[len("review:"):]
+        it = _item_by_id(cid)
+        if not it or it.get("deleted"):
+            return True, f"{cid} no longer exists"
+        if it.get("archived"):
+            return True, f"{cid} archived before delivery"
+        if _status_canon(it.get("status")) != "review":
+            return True, f"{cid} left review before delivery ({it.get('status')})"
+        rev = (it.get("reviewer") or "").strip()
+        if rev and rev != name:
+            return True, f"{cid} reassigned to {rev} before delivery"
+        return False, ""
+    if guard.startswith("rot:"):
+        # The doing-digest asserts "these cards of yours are rotting in doing"
+        # and explicitly says nothing was auto-changed. Once a lane has
+        # reconciled them the digest is a list of decisions already made.
+        # Kept while ANY named card is still held in doing.
+        ids = [c.strip() for c in guard[len("rot:"):].split(",") if c.strip()]
+        if not ids:
+            return False, ""
+        for cid in ids:
+            it = _item_by_id(cid)
+            if not it or it.get("deleted") or it.get("archived"):
+                continue
+            if _status_canon(it.get("status")) == "doing":
+                return False, ""
+        return True, f"all {len(ids)} cards left doing before delivery"
     if guard.startswith("sched:"):
         # Drop a failure nudge if the schedule has since run clean — the same
         # delivery-time revalidation the dep:/watch: guards use.
@@ -13287,7 +13337,8 @@ def _verification_sweep():
                     f"[amux verification sweep] {len(rows)} of your done cards await the "
                     f"done→verified gap:\n{lst}\nFor each: move to verified WITH prod "
                     f"evidence via its gates, or append one line on the card saying why it "
-                    f"honestly stays done. Never force a gate you cannot satisfy.")
+                    f"honestly stays done. Never force a gate you cannot satisfy.",
+                    guard="unverified:" + ",".join(r["id"] for r in rows))
                 ok = True
             except Exception:
                 ok = False
@@ -13499,7 +13550,8 @@ def _auto_assign_reviewer(bid: str, item: dict, notify: bool = True) -> str | No
                                 f"{(item.get('title') or '')[:100]}. Read it "
                                 f"(#issue={bid}), then either ack review→done honestly "
                                 f"via its gates, or comment on the card what blocks. "
-                                f"Never ack what you cannot verify.{_iu}")
+                                f"Never ack what you cannot verify.{_iu}",
+                                guard=f"review:{bid}")
         return rev
     except Exception as e:
         slog(f"[review-loop] assign failed for {bid}: {e}")
@@ -13818,7 +13870,8 @@ def _board_doing_digest():
                 "either evidence it forward (PATCH the desc with the commit/PR, then status=done) "
                 "or demote it (status=todo). Nothing was auto-changed. "
                 f"Full list: GET /api/board/reconcile?session={sess}")
-            _steer_enqueue(sess, "\n".join(lines))
+            _steer_enqueue(sess, "\n".join(lines),
+                           guard="rot:" + ",".join(str(i.get("id")) for i in items[:10] if i.get("id")))
             slog(f"[board-rot] {sess}: digest queued ({len(items)} rotting of {held} doing)")
     except Exception as e:
         slog(f"[board-rot] digest error: {e}")
