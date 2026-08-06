@@ -16986,15 +16986,34 @@ _PATHLIKE_RE = re.compile(r"[\w./~-]*[\w-]+\.[A-Za-z0-9]{1,8}")
 _SHELL_WRITE_SLACK = float(os.environ.get("AMUX_SHELL_WRITE_SLACK", "180"))
 
 
-def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
+def _session_recent_edit_paths(name: str, since_secs: float,
+                               firsthand_only: bool = False) -> dict:
     """{abs realpath: epoch ts} of files this session edited (Edit/Write/
     MultiEdit/NotebookEdit tool_use) within the window, parsed from its own
     JSONL transcript. First-hand evidence — no reliance on git state, which is
-    exactly what's ambiguous in a shared checkout. Cached 30s per session."""
+    exactly what's ambiguous in a shared checkout. Cached 30s per session.
+
+    Two provenances, and callers must choose (AMUX-2456):
+
+      FIRST-HAND — an Edit/Write/MultiEdit tool_use block names the file. The
+      transcript says this session wrote it. Unambiguous.
+
+      INFERRED — a Bash command names a path whose mtime moved within
+      _SHELL_WRITE_SLACK of the command. This catches `sed -i` and heredocs,
+      but mtime is a SHARED resource on a shared checkout: the file changing
+      while your command ran does not mean YOU changed it. amux ran 5,185 Bash
+      commands naming amux-server.py in one session, nearly all reads; any one
+      landing within 180s of a peer's write claims that write as theirs.
+
+    `firsthand_only=True` drops the inferred half. Pick by SAFETY DIRECTION,
+    not by taste: for the staged-guard, over-claiming is safe (a warning about
+    a file you did not write costs a glance) so it wants the inference. For
+    anything that ASSERTS authorship to its reader, over-claiming IS the defect
+    — it states a falsehood about a named session — so it must not."""
     from datetime import datetime
     now = time.time()
     cached = _edit_paths_cache.get(name)
-    if cached and now - cached[0] < 30 and cached[1] == since_secs:
+    if cached and now - cached[0] < 30 and cached[1] == (since_secs, firsthand_only):
         return cached[2]
     out: dict[str, float] = {}
     # Base for resolving RELATIVE paths named in shell commands. Without it the
@@ -17024,6 +17043,11 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
                         if not (isinstance(blk, dict) and blk.get("type") == "tool_use"):
                             continue
                         if blk.get("name") == "Bash":
+                            # AMUX-2456: the whole Bash branch is INFERENCE, and its
+                            # discriminator (mtime) cannot tell two sessions apart on a
+                            # shared checkout. Callers that ASSERT authorship opt out.
+                            if firsthand_only:
+                                continue
                             # SHELL WRITES COUNT TOO (AMUX-2343). Only Edit/Write
                             # tool_use was read, so a session that edits via
                             # `python3 - <<PY`, sed -i, tee or a generator script
@@ -17076,7 +17100,7 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
                     continue
     except Exception:
         pass
-    _edit_paths_cache[name] = (now, since_secs, out)
+    _edit_paths_cache[name] = (now, (since_secs, firsthand_only), out)
     return out
 
 
@@ -70454,8 +70478,43 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                             # their commit ⇒ nothing was outstanding, definitively.
                             # Edit after ⇒ the real alarm, which today reads identically
                             # to the routine case.
+                            # AMUX-2456 round 2, found by the notice's FIRST CONSUMER:
+                            # the alarm branch asserted "you edited it at 15:52 and have
+                            # not committed since 14:58" to amux, about a write that was
+                            # MINE. _session_recent_edit_paths infers a shell write from
+                            # mtime landing within 180s of a Bash command naming the
+                            # path — and on a shared checkout mtime cannot tell two
+                            # sessions apart. amux had run 5,185 commands naming
+                            # amux-server.py, nearly all reads; one inside my write
+                            # window claimed my write as theirs.
+                            #
+                            # This was WORSE than the vague notice it replaced. The old
+                            # text asked the reader to check and was therefore harmless
+                            # when wrong; this one asserts, and it failed on the ALARM
+                            # branch specifically — the branch kept precisely so it
+                            # would be trusted. A loud wrong probe beats a silent one
+                            # for damage, every time.
+                            #
+                            # So the alarm rests ONLY on first-hand Edit/Write tool_use
+                            # evidence. An mtime-inferred edit still lets the notice
+                            # FIRE (a sed -i writer really did edit it) but can never
+                            # produce the assertion — it falls to the suppressed side,
+                            # because "I cannot tell whose write that was" must read as
+                            # silence, not as an accusation.
+                            #
+                            # Note the symmetry with the bug found one round earlier:
+                            # --grep substring matching was a false NEGATIVE, this is a
+                            # false POSITIVE, and both are "the signal cannot
+                            # distinguish two sessions" — the root under this whole day.
+                            _firsthand = _session_recent_edit_paths(
+                                _other, _staged_guard_window(), firsthand_only=True)
                             _outstanding, _basis = [], []
                             for _p in sorted(_touch):
+                                if _p not in _firsthand:
+                                    _basis.append(f"{os.path.relpath(_p, _wd)}: "
+                                                  f"inferred from mtime only — authorship "
+                                                  f"not established, not asserting")
+                                    continue
                                 _pr = os.path.relpath(_p, _wd)
                                 _edit = int(_touch.get(_p) or 0)
                                 # EXACT trailer match, not `--grep`. `--grep` is a
