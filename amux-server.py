@@ -25449,7 +25449,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none;
     overscroll-behavior-x: contain; touch-action: pan-x; }
   .peek-tabs::-webkit-scrollbar { display: none; }
-  .peek-tab { padding: 5px 12px; font-size: 0.8rem; background: none; border: none;
+  /* min-height 44px: these are the peek's PRIMARY navigation and measured 29px
+     tall — 66% of the css-mobile 44px floor (AC-225 finding 1, corrected on
+     review from its reported 15px, which was the label span inside the button).
+     Padding grows the TAP TARGET; the visual line is still drawn by the
+     bottom border, so the bar reads the same, just taller. */
+  .peek-tab { padding: 5px 12px; min-height: 44px; font-size: 0.8rem; background: none; border: none;
     border-bottom: 2px solid transparent; color: var(--dim); cursor: pointer;
     margin-bottom: -1px; -webkit-tap-highlight-color: transparent; flex-shrink: 0; white-space: nowrap; }
   .peek-tab.active { color: var(--text); border-bottom-color: var(--accent); }
@@ -36833,7 +36838,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.487';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.488';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58199,7 +58204,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.487';
+const CACHE = 'amux-v0.9.488';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
