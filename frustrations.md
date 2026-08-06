@@ -437,7 +437,7 @@ COST: Two full rounds of misdiagnosis pointed at the wrong subsystem. The host h
   4.1s and the box was idle at 0 running containers. I reset the instance and rewrote
   the boot fix twice before noticing the contradiction between a stable GET and a
   failing DELETE against the same service. The route had never existed at any point.
-FIX: `1a04ab0` — unmatched `/api/gateway/admin/*` now returns 404 naming the method,
+FIX: `b96510b` — unmatched `/api/gateway/admin/*` now returns 404 naming the method,
   the path, all 11 real admin routes, and a hint pointing at the correct teardown
   route. Control-plane paths are never proxied to an org container.
 NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for something
