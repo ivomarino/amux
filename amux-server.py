@@ -34714,33 +34714,122 @@ function _scopeRowToggle(key) {
 // scoped fetch, so this is a third CALLER of one implementation rather than a
 // third implementation — the distinction that stopped three message renderers
 // from becoming four (AMUX-2334, AMUX-2366).
-let _grpMsgOpen = false;
+let _grpView = 'config';   // config | messages | board | cost — one at a time.
+                           // Was a boolean when messages was the only alternate
+                           // view; three views cannot be a boolean, and naming
+                           // the view is what lets a re-render restore it.
 
-async function _grpMessagesToggle(g) {
+// The view switcher for group/global scope. Every view is the SAME UX over a
+// different data source (Ethan: "same UX obviously it's calling upon different
+// data") \u2014 so they share one entry point, one header and one error path, and a
+// new scope-level view is a case here rather than another toggle.
+function _grpViewHead(label, view, g) {
+  const tab = (k, t) => '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 9px;flex:0 0 auto;'
+    + (k === view ? 'border-color:var(--accent);color:var(--accent);' : '')
+    + '" onclick="event.stopPropagation();_grpViewOpen(\'' + escJs(g) + '\',\'' + k + '\')">' + t + '</button>';
+  return '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:7px;flex-wrap:wrap;">'
+    + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(label) + ' \u00b7 ' + esc(view) + '</span>'
+    + '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
+    + tab('config', '\u2699') + tab('messages', '\u2709') + tab('board', '\u25a4') + tab('cost', '$')
+    + '</span></div>';
+}
+
+async function _grpBoardHTML(qs, label) {
+  // slim=1 drops desc/log: this view shows ids, statuses and owners, and the
+  // full board is 4.7MB of which desc is 75%. archived=0 is stated in the
+  // caption rather than left implicit \u2014 a filtered count that presents itself
+  // as a total is what made a tag-scoped board read as a truncated one.
+  const r = await fetch(API + '/api/board?slim=1&archived=0' + qs, { headers: _authHeaders() });
+  if (!r.ok) throw new Error('board ' + r.status);
+  const d = await r.json();
+  if (!d.length) return '<div style="color:var(--dim);font-size:0.8rem;">No open cards at this scope.</div>';
+  const by = {};
+  d.forEach(c => { const s = (c.status || '?').toLowerCase(); by[s] = (by[s] || 0) + 1; });
+  const order = ['doing', 'todo', 'blocked', 'review', 'done', 'verified', 'discarded'];
+  const keys = order.filter(k => by[k]).concat(Object.keys(by).filter(k => order.indexOf(k) < 0).sort());
+  const chips = keys.map(k => '<span class="scope-chip" style="font-size:0.68rem;">' + esc(k) + ' <b>' + by[k] + '</b></span>').join('');
+  const live = d.filter(c => ['doing', 'todo', 'blocked', 'review'].indexOf((c.status || '').toLowerCase()) >= 0);
+  const show = (live.length ? live : d).slice(0, 50);
+  const rows = show.map(c =>
+    '<div style="display:flex;gap:6px;align-items:baseline;padding:3px 0;border-bottom:1px solid var(--border);">'
+    + '<span style="font-size:0.62rem;color:var(--dim);flex:0 0 auto;min-width:62px;">' + esc(c.id || '') + '</span>'
+    + '<span style="font-size:0.62rem;flex:0 0 auto;opacity:0.75;">' + esc((c.status || '').slice(0, 4)) + '</span>'
+    + '<span style="font-size:0.74rem;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(c.title || '') + '</span>'
+    + '<span style="font-size:0.6rem;color:var(--dim);flex:0 0 auto;">' + esc(c.session || '\u2014') + '</span>'
+    + '</div>').join('');
+  return '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;">' + chips + '</div>'
+    + '<div style="max-height:46vh;overflow-y:auto;">' + rows + '</div>'
+    + '<div style="font-size:0.62rem;color:var(--dim);margin-top:5px;">'
+    + d.length + ' open (unarchived) card' + (d.length === 1 ? '' : 's')
+    + (show.length < (live.length || d.length) ? ' \u00b7 showing first ' + show.length : '')
+    + '</div>';
+}
+
+async function _grpCostHTML(qs) {
+  const r = await fetch(API + '/api/observability?days=7' + qs, { headers: _authHeaders() });
+  if (!r.ok) throw new Error('cost ' + r.status);
+  const d = await r.json();
+  const big = (v, l) => '<div style="flex:1 1 80px;min-width:80px;"><div style="font-size:1.05rem;font-weight:600;color:var(--text);">' + v + '</div>'
+    + '<div style="font-size:0.62rem;color:var(--dim);">' + l + '</div></div>';
+  const per = (d.by_session || []).slice(0, 25);
+  const max = Math.max(1, ...per.map(x => x.cost || 0));
+  const rows = per.map(x =>
+    '<div style="display:flex;gap:6px;align-items:center;padding:3px 0;">'
+    + '<span style="font-size:0.7rem;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(x.session || '\u2014') + '</span>'
+    + '<span style="flex:0 0 70px;height:5px;background:var(--border);border-radius:3px;overflow:hidden;">'
+    + '<span style="display:block;height:100%;width:' + Math.round(100 * (x.cost || 0) / max) + '%;background:var(--accent);"></span></span>'
+    + '<span style="font-size:0.68rem;flex:0 0 auto;min-width:54px;text-align:right;">' + _fmtUsd(x.cost || 0) + '</span>'
+    + '</div>').join('');
+  return '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">'
+    + big(_fmtUsd(d.total_cost || 0), 'est. cost \u00b7 ' + (d.days || 7) + 'd')
+    + big((d.total_turns || 0).toLocaleString(), 'turns')
+    + big((d.cache_hit_pct || 0) + '%', 'cache hit')
+    + '</div>'
+    + (rows ? '<div style="max-height:40vh;overflow-y:auto;">' + rows + '</div>'
+            : '<div style="color:var(--dim);font-size:0.8rem;">No spend recorded at this scope.</div>')
+    + (per.length ? '<div style="font-size:0.62rem;color:var(--dim);margin-top:5px;">'
+        + (d.by_session || []).length + ' worker' + ((d.by_session || []).length === 1 ? '' : 's')
+        + ' with spend' + (per.length < (d.by_session || []).length ? ' \u00b7 showing top ' + per.length : '') + '</div>' : '');
+}
+
+async function _grpViewOpen(g, view) {
   const isGlobal = (g === _GLOBAL_SCOPE);
   const scope = isGlobal ? { level: 'global' } : { level: 'group', name: g };
   const label = isGlobal ? 'Global' : g;
-  _grpMsgOpen = !_grpMsgOpen;
+  // Global scope is the ABSENCE of a filter, not group=global \u2014 passing the
+  // sentinel as a group name would resolve to an empty group and render zero
+  // under the fleet's own label.
+  const qs = isGlobal ? '' : '&group=' + encodeURIComponent(g);
+  _grpView = (_grpView === view) ? 'config' : view;
   const host = document.getElementById('grp-scope-body-' + g);
   if (!host) return;
-  if (!_grpMsgOpen) { _scopeLoad(scope, host.id); return; }
-  host.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Loading group messages\u2026</div>';
+  if (_grpView === 'config') { _scopeLoad(scope, host.id); return; }
+  host.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Loading ' + esc(view) + '\u2026</div>';
   try {
-    const rows = await _peekMsgFetch(scope);
-    const list = rows.slice().reverse().slice(0, 60);
-    const ctx = _msgCtxHistory();
+    let body;
+    if (view === 'messages') {
+      const rows = await _peekMsgFetch(scope);
+      const list = rows.slice().reverse().slice(0, 60);
+      const ctx = _msgCtxHistory();
+      body = list.length
+        ? '<div style="display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;">'
+            + list.map(e => _cmdHistItemHTML(e, ctx)).join('') + '</div>'
+        : '<div style="color:var(--dim);font-size:0.8rem;">No messages at this scope yet.</div>';
+    } else if (view === 'board') {
+      body = await _grpBoardHTML(qs, label);
+    } else {
+      body = await _grpCostHTML(qs);
+    }
+    // Re-resolve the destination: two awaits have passed and render() may have
+    // rebuilt the panel, so the node captured above can be detached.
     const dst = document.getElementById('grp-scope-body-' + g);
     if (!dst) return;
-    dst.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
-      + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(label) + ' \u00b7 messages</span>'
-      + '<button class="btn" style="font-size:0.7rem;min-height:32px;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(g) + '\')">Back to config</button></div>'
-      + (list.length ? '<div style="display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;">'
-          + list.map(e => _cmdHistItemHTML(e, ctx)).join('') + '</div>'
-          : '<div style="color:var(--dim);font-size:0.8rem;">No messages at this scope yet.</div>');
+    dst.innerHTML = _grpViewHead(label, view, g) + body;
     _grpScopeHtml = dst.innerHTML;
   } catch (e) {
     const dst = document.getElementById('grp-scope-body-' + g);
-    if (dst) dst.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Could not load group messages: ' + esc(e.message) + '</div>';
+    if (dst) dst.innerHTML = _grpViewHead(label, view, g)
+      + '<div style="color:var(--dim);font-size:0.8rem;">Could not load ' + esc(view) + ': ' + esc(e.message) + '</div>';
   }
 }
 
@@ -34845,7 +34934,13 @@ async function _scopeLoad(scope, targetId) {
       + (_selCap ? 'Tap the tile again to close.' : 'Tap a config to see its precedence order.')
       + '</span>'
       + (lvl === 'group' || lvl === 'global'
-          ? '<button class="btn" style="font-size:0.7rem;min-height:32px;flex:0 0 auto;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(lvl === 'global' ? _GLOBAL_SCOPE : w) + '\')">\u2709 Messages</button>'
+          ? (() => {
+              const _g = escJs(lvl === 'global' ? _GLOBAL_SCOPE : w);
+              const _b = (k, t) => '<button class="btn" style="font-size:0.7rem;min-height:32px;padding:4px 9px;flex:0 0 auto;"'
+                + ' onclick="event.stopPropagation();_grpViewOpen(\'' + _g + '\',\'' + k + '\')">' + t + '</button>';
+              return '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
+                + _b('messages', '\u2709') + _b('board', '\u25a4') + _b('cost', '$') + '</span>';
+            })()
           : '')
       + '</div>';
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
@@ -35981,7 +36076,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.465';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.466';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -40765,7 +40860,7 @@ function _selectGlobalScope() {
   const closing = (_grpOpen === _GLOBAL_SCOPE);
   _grpScopeHtml = '';
   _grpOpen = closing ? null : _GLOBAL_SCOPE;
-  _grpMsgOpen = false;
+  _grpView = 'config';
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
@@ -40779,6 +40874,11 @@ function _selectGroup(g) {
   if (_grpOpen !== g) _grpScopeHtml = '';    // never show the previous group's data
   _grpOpen = closing ? null : g;
   if (!_grpOpen) _grpScopeHtml = '';
+  // Reset the view with the data. _scopeLoad below renders config, so leaving
+  // _grpView on 'board' would make the next Board tap TOGGLE IT OFF — a dead
+  // button whose cause is invisible, because the panel it would have opened is
+  // already what you are looking at.
+  _grpView = 'config';
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _grpOpen);
@@ -57564,7 +57664,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.465';
+const CACHE = 'amux-v0.9.466';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
