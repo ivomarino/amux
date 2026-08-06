@@ -29016,7 +29016,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style.display!=='none'){document.getElementById('js-fallback-retry').style.display='';}},8000);
 </script>
 <div id="no-apikey-banner" style="display:none;background:#7c2d12;color:#fed7aa;padding:8px 16px;text-align:center;font-size:0.82rem;z-index:200;position:relative;">
-  No Anthropic API key set — Claude sessions won't work. <a href="#" onclick="event.preventDefault();document.getElementById('no-apikey-banner').style.display='none';toggleSettings()" style="color:#fde68a;font-weight:600;text-decoration:underline;">Add key in Settings</a>
+  No Anthropic API key set — Claude workers won't work. <a href="#" onclick="event.preventDefault();document.getElementById('no-apikey-banner').style.display='none';toggleSettings()" style="color:#fde68a;font-weight:600;text-decoration:underline;">Add key in Settings</a>
 </div>
 <!-- API key setup modal — shown on cloud when no user key is configured (dismissible) -->
 <div id="apikey-setup-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:9999;align-items:center;justify-content:center;">
@@ -29097,7 +29097,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="header-add-wrap">
       <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()">+</button>
       <div class="header-add-menu" id="add-menu">
-        <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openCreate()"><span class="mi">&#x2795;</span> New session</div>
+        <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openCreate()"><span class="mi">&#x2795;</span> New worker</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnect()"><span class="mi">&#x1F517;</span> Connect tmux</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnectIterm2()"><span class="mi">&#x1F5A5;</span> Connect iTerm2 pane</div>
         <div class="card-menu-sep"></div>
@@ -29134,7 +29134,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div class="settings-section-label">Offline</div>
           <div id="offline-cache-info" style="font-size:0.78rem;color:var(--dim);margin-bottom:6px;line-height:1.5;"></div>
           <button onclick="_offlinePrefetch(true)" style="width:100%;padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:0.8rem;font-weight:600;cursor:pointer;">
-            &#x2B07; Save all sessions for offline
+            &#x2B07; Save all workers for offline
           </button>
           <div id="offline-sync-status" style="display:none;font-size:0.74rem;color:var(--accent);margin-top:5px;"></div>
           <div id="offline-cache-settings"></div>
@@ -29171,7 +29171,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
               <span class="theme-track"><span class="theme-thumb"></span></span>
             </label>
           </div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Pick &quot;Resume from summary&quot; automatically when the old-session dialog appears</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Pick &quot;Resume from summary&quot; automatically when the old-worker dialog appears</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-file every command as a task</span>
             <label class="theme-toggle">
@@ -29184,7 +29184,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-sep"></div>
         <div class="settings-section">
           <div class="settings-section-label">Alerts</div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-bottom:8px;line-height:1.4;">Routine notifications use in-app amux Alerts. <b>Urgent alerts</b> are reserved for things that need your attention immediately — sessions are told to use them sparingly.</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-bottom:8px;line-height:1.4;">Routine notifications use in-app amux Alerts. <b>Urgent alerts</b> are reserved for things that need your attention immediately — workers are told to use them sparingly.</div>
           <div style="font-weight:600;font-size:0.8rem;margin-bottom:6px;">&#x1F6A8; Urgent alerts</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;">
             <span style="font-size:0.85rem;">In-app push</span>
@@ -29202,7 +29202,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-sep"></div>
         <div class="settings-section">
           <div class="settings-section-label">Default Model</div>
-          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Applied to new sessions without an explicit model</div>
+          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Applied to new workers without an explicit model</div>
           <select id="settings-default-model" onchange="saveDefaultModel(this.value)"
             style="width:100%;font-size:0.85rem;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--fg);">
             <optgroup label="Claude">
@@ -29266,7 +29266,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-sep"></div>
         <div class="settings-section" id="settings-apikeys-section">
           <div class="settings-section-label">API Keys</div>
-          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Anthropic API key for Claude sessions</div>
+          <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Anthropic API key for Claude workers</div>
           <div style="display:flex;gap:6px;align-items:center;">
             <input id="settings-anthropic-key" type="password" autocomplete="off"
               class="search-input" placeholder="sk-ant-..."
@@ -29281,7 +29281,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div class="settings-section-label">Commit guard</div>
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.8rem;">
             <input type="checkbox" id="settings-commitguard-toggle" style="width:auto;accent-color:var(--accent);" onchange="saveCommitGuard(this.checked)">
-            Nudge sessions to commit when they go idle with uncommitted work
+            Nudge workers to commit when they go idle with uncommitted work
           </label>
           <div id="settings-commitguard-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
         </div>
@@ -29290,7 +29290,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <div class="settings-section-label">Board awareness</div>
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.8rem;">
             <input type="checkbox" id="settings-taskguard-toggle" style="width:auto;accent-color:var(--accent);" onchange="saveTaskGuard(this.checked)">
-            Nudge sessions to log tasks on the board, and brief each session on all sessions' tasks at startup
+            Nudge workers to log tasks on the board, and brief each worker on all workers' tasks at startup
           </label>
           <div id="settings-taskguard-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
         </div>
@@ -29562,7 +29562,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </button>
         <button class="fe-tb-oitem fe-tb-oitem-session" id="files-session-oitem" onclick="setFilesSessionDir();_filesOverflowClose()" style="display:none;">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1 12 6.5 6.5 12 1 6.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
-          <span id="files-session-oitem-label">Set session directory</span>
+          <span id="files-session-oitem-label">Set worker directory</span>
         </button>
       </div>
     </div>
@@ -29777,8 +29777,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="map-sidebar-section">
       <div class="map-section-hdr">
-        <span>Tags</span>
-        <button class="btn" style="padding:1px 7px;font-size:0.72rem;" onclick="_mapAddTag()">+ Tag</button>
+        <span>Groups</span>
+        <button class="btn" style="padding:1px 7px;font-size:0.72rem;" onclick="_mapAddTag()">+ Group</button>
       </div>
       <div class="map-tag-chips" id="map-tag-list"></div>
     </div>
@@ -29823,7 +29823,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input id="map-pin-lng" class="map-modal-input" placeholder="Longitude" type="number" step="any">
     </div>
     <div class="map-modal-hint" id="map-pin-coords-hint"></div>
-    <div class="map-modal-label">Tags</div>
+    <div class="map-modal-label">Groups</div>
     <div class="map-modal-tags-row" id="map-pin-tags-row"></div>
     <div class="map-modal-actions">
       <button class="btn" onclick="_mapSavePin()">Save</button>
@@ -29835,7 +29835,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Map: Add/Edit Tag Modal -->
 <div class="map-modal" id="map-tag-modal" onclick="if(event.target===this)_mapCloseTagModal()">
   <div class="map-modal-box">
-    <div class="map-modal-title" id="map-tag-modal-title">New Tag</div>
+    <div class="map-modal-title" id="map-tag-modal-title">New Group</div>
     <input id="map-tag-name" class="map-modal-input" placeholder="Group name *" autocomplete="off">
     <div class="map-tag-color-row">
       <label>Color:</label>
@@ -30096,7 +30096,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="msgs-selbar" style="display:none;"></div>
     </div>
     <select id="msgs-session-filter" onchange="_msgsCounts=null;_messagesLoad(true,this.value)" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
-      <option value="">All sessions</option>
+      <option value="">All workers</option>
     </select>
     <span id="msgs-count" style="font-size:0.75rem;color:var(--dim);white-space:nowrap;"></span>
   </div>
@@ -30482,7 +30482,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <div style="display:flex;gap:10px;align-items:flex-end;">
         <div id="sched-session-group" style="flex:1;">
-          <label class="field-label">Session</label>
+          <label class="field-label">Worker</label>
           <select id="sched-session" class="board-detail-session-select" style="width:100%;margin-bottom:0;"></select>
         </div>
         <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.72rem;color:var(--dim);white-space:nowrap;padding-bottom:7px;" title="Run a shell command on the host instead of sending to a Claude worker">
@@ -30531,7 +30531,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <input id="sched-done-pattern" type="text" placeholder='e.g. "all complete", "under 50.?ms", "nothing to do"' autocomplete="off">
         </div>
         <select id="sched-done-action" style="display:none;"><option value="disable"></option><option value="notify"></option></select>
-        <div class="sched-mode-help"><b>Loop</b> — sends the command to the session over and over on a fixed interval. Add a stop pattern to auto-disable when the work is done ("keep optimizing until under 50ms").</div>
+        <div class="sched-mode-help"><b>Loop</b> — sends the command to the worker over and over on a fixed interval. Add a stop pattern to auto-disable when the work is done ("keep optimizing until under 50ms").</div>
       </div>
       <!-- ROUTINE -->
       <div id="sched-panel-routine" class="sched-panel" style="display:none;">
@@ -30549,11 +30549,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <!-- TRIGGER -->
       <div id="sched-panel-trigger" class="sched-panel" style="display:none;">
-        <label class="field-label">Wake the session when&hellip;</label>
+        <label class="field-label">Wake the worker when&hellip;</label>
         <div style="display:flex;flex-direction:column;gap:6px;margin-top:3px;">
           <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:0.82rem;min-height:32px;">
             <input type="checkbox" id="sched-trigger-idle" style="width:auto;accent-color:var(--accent);">
-            &#x1F4A4; a session goes idle <span style="color:var(--dim);font-size:0.7rem;">(a worker finished a turn)</span>
+            &#x1F4A4; a worker goes idle <span style="color:var(--dim);font-size:0.7rem;">(a worker finished a turn)</span>
           </label>
           <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:0.82rem;min-height:32px;">
             <input type="checkbox" id="sched-trigger-board" style="width:auto;accent-color:var(--accent);">
@@ -30561,7 +30561,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           </label>
         </div>
         <div class="field-group" style="margin-top:8px;">
-          <label class="field-label">Only these sessions <span class="field-optional">(comma-separated; blank = any)</span></label>
+          <label class="field-label">Only these workers <span class="field-optional">(comma-separated; blank = any)</span></label>
           <input id="sched-trigger-sessions" type="text" placeholder="e.g. backend, mvs-infra, ts-gke" autocomplete="off" style="width:100%;box-sizing:border-box;">
         </div>
         <div style="display:flex;gap:12px;">
@@ -30574,7 +30574,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="sched-trigger-expr" type="text" placeholder='e.g. "every 1h"' autocomplete="off" style="width:100%;box-sizing:border-box;">
           </div>
         </div>
-        <div class="sched-mode-help"><b>Trigger</b> — closed-loop orchestration. The session wakes in response to events instead of (or in addition to) a clock. Cooldown caps how often event-fired runs happen.</div>
+        <div class="sched-mode-help"><b>Trigger</b> — closed-loop orchestration. The worker wakes in response to events instead of (or in addition to) a clock. Cooldown caps how often event-fired runs happen.</div>
       </div>
       <!-- ONCE -->
       <div id="sched-panel-once" class="sched-panel" style="display:none;">
@@ -30606,7 +30606,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <textarea id="be-desc" placeholder="Add details or context..."></textarea>
     </div>
     <div class="field-group">
-      <label class="field-label">Tags <span class="field-optional">(optional)</span></label>
+      <label class="field-label">Groups <span class="field-optional">(optional)</span></label>
       <div class="be-tag-wrap" id="be-tag-wrap" onclick="document.getElementById('be-tag-input').focus()">
         <input id="be-tag-input" class="be-tag-input" type="text" placeholder="Add group…"
           autocomplete="off" autocorrect="off" autocapitalize="none"
@@ -30616,7 +30616,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="be-tag-suggestions" class="be-tag-suggestions"></div>
     </div>
     <div class="field-group" id="be-session-row">
-      <label class="field-label">Session <span class="field-optional">(optional)</span></label>
+      <label class="field-label">Worker <span class="field-optional">(optional)</span></label>
       <select id="be-session-add"></select>
     </div>
     <div class="field-group">
@@ -30655,9 +30655,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div id="bd-status-banner" class="bd-status-banner" style="display:none;"></div>
     <div class="board-detail-status-row" id="bd-status-row"></div>
     <div class="board-detail-row" id="bd-session-row">
-      <span style="font-size:0.78rem;color:var(--dim);">Session:</span>
+      <span style="font-size:0.78rem;color:var(--dim);">Worker:</span>
       <select id="bd-session" class="board-detail-session-select"></select>
-        <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; session</button>
+        <button id="bd-goto-session" class="btn" style="display:none;flex:0 0 auto;min-height:44px;font-size:0.78rem;" title="Open this worker's live progress, searched to this card">&#x2192; worker</button>
 
     </div>
     <div class="board-detail-row">
@@ -30666,7 +30666,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input type="time" id="bd-due-time" class="board-detail-session-select" style="width:110px;cursor:pointer;" title="Time (optional — leave blank for all-day)">
     </div>
     <div class="board-detail-row" style="align-items:flex-start;">
-      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Tags:</span>
+      <span style="font-size:0.78rem;color:var(--dim);padding-top:7px;">Groups:</span>
       <div style="flex:1;">
         <div class="be-tag-wrap" id="bd-tag-wrap" onclick="document.getElementById('bd-tag-input').focus()">
           <input id="bd-tag-input" class="be-tag-input" type="text" placeholder="Add group…"
@@ -30702,7 +30702,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Create session modal -->
 <div id="create-overlay" class="edit-overlay" onclick="if(event.target===this)closeCreate()">
   <div class="edit-box">
-    <h3>New session</h3>
+    <h3>New worker</h3>
     <div class="field-group">
       <label class="field-label">Name</label>
       <input id="create-name" type="text" placeholder="my-project" autocomplete="off" autocorrect="off"
@@ -30754,7 +30754,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </label>
       <div id="create-branch-wrap" style="margin-top:8px;display:none;">
         <div style="display:flex;gap:6px;align-items:center;">
-          <input id="create-branch" type="text" placeholder="session/my-project" autocomplete="off" autocorrect="off" style="flex:1;" oninput="_onBranchInput(this.value);_filterBranches()" onfocus="_loadExistingBranches()">
+          <input id="create-branch" type="text" placeholder="worker/my-project" autocomplete="off" autocorrect="off" style="flex:1;" oninput="_onBranchInput(this.value);_filterBranches()" onfocus="_loadExistingBranches()">
           <button class="btn" id="create-branch-suggest-btn" onclick="_suggestBranch()" title="Ask Claude to suggest branch names" style="flex-shrink:0;font-size:0.9rem;">✨</button>
         </div>
         <div id="create-branch-existing" style="display:none;flex-wrap:wrap;gap:5px;margin-top:8px;max-height:120px;overflow-y:auto;"></div>
@@ -30764,10 +30764,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="field-group" id="create-worktree-field" style="display:none;">
       <label class="field-label" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
         <input type="checkbox" id="create-worktree-enabled" onchange="_toggleWorktree(this.checked)" style="width:auto;margin:0;">
-        Use worktree <span class="field-optional">(isolated copy of repo &mdash; no file conflicts between sessions)</span>
+        Use worktree <span class="field-optional">(isolated copy of repo &mdash; no file conflicts between workers)</span>
       </label>
       <div id="create-worktree-info" style="display:none;margin-top:6px;font-size:0.78rem;color:var(--dim);background:rgba(99,102,241,0.06);border-radius:6px;padding:8px 10px;line-height:1.5;">
-        Creates a git worktree with its own working directory and branch. The session works on an isolated copy &mdash; changes are merged back when done.
+        Creates a git worktree with its own working directory and branch. The worker works on an isolated copy &mdash; changes are merged back when done.
       </div>
     </div>
     <div class="edit-actions">
@@ -30797,7 +30797,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="color:var(--dim);font-size:0.85rem;text-align:center;padding:20px;">Loading iTerm2 panes…</div>
     </div>
     <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
-      <label style="font-size:0.82rem;color:var(--dim);">Session name in amux</label>
+      <label style="font-size:0.82rem;color:var(--dim);">Worker name in amux</label>
       <input id="iterm2-session-name" class="send-input" style="min-height:34px;padding:6px 10px;font-size:0.88rem;"
         placeholder="e.g. my-terminal" autocomplete="off" autocorrect="off">
     </div>
@@ -30988,7 +30988,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div style="flex-shrink:0;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px;background:rgba(255,255,255,0.02);">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
         <span style="font-size:0.8rem;font-weight:600;">Standing instructions</span>
-        <span style="font-size:0.68rem;color:var(--dim);flex:1;">Re-sent automatically whenever this session (re)starts — survives compaction.</span>
+        <span style="font-size:0.68rem;color:var(--dim);flex:1;">Re-sent automatically whenever this worker (re)starts — survives compaction.</span>
       </div>
       <textarea id="peek-instructions" rows="3" placeholder="e.g. Act autonomously — don't ask the user for permission or direction. Execute best practices for your mandate; pick the lowest-risk option. Record progress as evidence on your board items. Escalate only to the orchestrator if blocked outside your scope." style="width:100%;font-size:0.78rem;resize:vertical;box-sizing:border-box;"></textarea>
       <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;align-items:center;">
@@ -31025,7 +31025,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button id="piv-list" class="bv-btn" onclick="setPeekIssuesView('list')" title="List view">&#x2630;</button>
         <button id="piv-kanban" class="bv-btn" onclick="setPeekIssuesView('kanban')" title="Board view">&#x25A4;</button>
       </div>
-      <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This session</button>
+      <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
       <span id="peek-issues-count" style="flex:1;font-size:0.82rem;color:var(--dim);align-self:center;"></span>
       <button class="btn primary" style="font-size:0.8rem;padding:5px 12px;" onclick="openBoardAdd('backlog')">+ New issue</button>
     </div>
@@ -31088,7 +31088,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <option value="30">30 days</option>
         <option value="90">90 days</option>
       </select>
-      <span style="font-size:0.72rem;color:var(--dim);align-self:center;">this session's token cost, by task</span>
+      <span style="font-size:0.72rem;color:var(--dim);align-self:center;">this worker's token cost, by task</span>
     </div>
     <div id="peek-cost-body" style="flex:1;overflow-y:auto;padding:12px;"></div>
   </div>
@@ -31096,7 +31096,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="peek-memory-panel" class="peek-memory-editor">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
       <div class="board-detail-tabs" style="border-bottom:none;margin:0;">
-        <button class="board-detail-tab active" id="pm-tab-edit" onclick="peekMemoryTab('edit')">Session</button>
+        <button class="board-detail-tab active" id="pm-tab-edit" onclick="peekMemoryTab('edit')">Worker</button>
         <button class="board-detail-tab" id="pm-tab-preview" onclick="peekMemoryTab('preview')">Preview</button>
         <button class="board-detail-tab" id="pm-tab-global" onclick="peekMemoryTab('global')" title="Global memory shared by all workers">Global</button>
       </div>
@@ -31123,7 +31123,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <span id="peek-git-branch" style="font-family:monospace;font-size:0.88rem;font-weight:600;"></span>
         <span id="peek-git-worktree-badge" style="display:none;font-size:0.7rem;background:rgba(99,102,241,0.15);color:#818cf8;border-radius:4px;padding:2px 7px;">worktree</span>
         <span style="flex:1;"></span>
-        <button class="btn" id="peek-git-filter-btn" onclick="toggleGitFilter()" style="font-size:0.72rem;padding:3px 9px;display:none;" title="Toggle between worker files and all changes">Session</button>
+        <button class="btn" id="peek-git-filter-btn" onclick="toggleGitFilter()" style="font-size:0.72rem;padding:3px 9px;display:none;" title="Toggle between worker files and all changes">Worker</button>
         <button class="btn" id="peek-git-push-btn" onclick="peekGitPush()" style="font-size:0.75rem;padding:3px 9px;" title="Push branch">Push</button>
         <button class="btn" id="peek-git-pr-btn" onclick="peekGitOpenPR()" style="font-size:0.75rem;padding:3px 9px;" title="Open pull request">PR ↗</button>
       </div>
@@ -31143,7 +31143,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           </div>
         </div>
       </div>
-      <div id="peek-git-empty" style="display:none;color:var(--dim);font-size:0.85rem;padding:20px 16px;">No git repository found for this session.</div>
+      <div id="peek-git-empty" style="display:none;color:var(--dim);font-size:0.85rem;padding:20px 16px;">No git repository found for this worker.</div>
     </div>
   </div>
   <!-- Commits panel -->
@@ -31230,7 +31230,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <option value="xhigh">xhigh</option>
         <option value="max">max</option>
       </select>
-      <div style="font-size:0.72rem;color:var(--dim);margin-top:5px;line-height:1.4;">Higher effort = more thinking, slower &amp; pricier. Changing this restarts the session.</div>
+      <div style="font-size:0.72rem;color:var(--dim);margin-top:5px;line-height:1.4;">Higher effort = more thinking, slower &amp; pricier. Changing this restarts the worker.</div>
     </div>
     <div class="edit-actions">
       <button class="btn" onclick="closeEdit()">Cancel</button>
@@ -31370,7 +31370,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         style="flex:1;min-width:0;box-sizing:border-box;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;outline:none;">
       <select id="cmd-history-session-filter" onchange="_cmdHistRows=null;_cmdHistCounts=null;_renderCmdHistoryList();_cmdHistFetch()" title="Filter by worker"
         style="flex-shrink:0;max-width:200px;box-sizing:border-box;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;outline:none;cursor:pointer;">
-        <option value="">All sessions</option>
+        <option value="">All workers</option>
       </select>
     </div>
     <div id="cmd-history-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:10px;align-items:center;scrollbar-width:none;"></div>
@@ -31390,9 +31390,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="filter-section-title">Search</div>
         <label class="filter-toggle-row">
           <input type="checkbox" id="filter-logsearch" onchange="setLogSearchMode(this.checked)">
-          <span>Search inside session logs</span>
+          <span>Search inside worker logs</span>
         </label>
-        <div class="filter-hint">When on, the search box on the sessions page matches text inside each session's output, not just its name.</div>
+        <div class="filter-hint">When on, the search box on the workers page matches text inside each worker's output, not just its name.</div>
       </div>
       <div class="filter-section">
         <div class="filter-section-title">Status</div>
@@ -31428,8 +31428,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div style="font-size:0.72rem;color:var(--dim);margin-bottom:10px;">Tap a saved message to load it into the input, ready to send.</div>
     <div class="sm-scope-tabs" style="display:flex;gap:6px;margin-bottom:10px;">
-      <button class="sm-scope-tab active" id="sm-scope-session" onclick="_smSetScope('session')">This session</button>
-      <button class="sm-scope-tab" id="sm-scope-all" onclick="_smSetScope('all')">All sessions</button>
+      <button class="sm-scope-tab active" id="sm-scope-session" onclick="_smSetScope('session')">This worker</button>
+      <button class="sm-scope-tab" id="sm-scope-all" onclick="_smSetScope('all')">All workers</button>
     </div>
     <div id="sm-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>
   </div>
@@ -65493,9 +65493,9 @@ class CCHandler(BaseHTTPRequestHandler):
                     "samples": []})
             for r in db.execute(
                     "SELECT session, text, card_id FROM cmd_history WHERE ts>=? "
-                    "AND (type IS NULL OR type NOT IN ('session','schedule','system')) ORDER BY ts",
+                    "AND (type IS NULL OR type NOT IN ('worker','schedule','system')) ORDER BY ts",
                     (since_ms,)).fetchall():
-                sl = _slot(r["session"]); sl["messages"] += 1
+                sl = _slot(r["worker"]); sl["messages"] += 1
                 if len(sl["samples"]) < 5 and r["text"]:
                     sl["samples"].append(re.sub(r"^\[.*?\]\s*", "", r["text"]).strip()[:140])
             for r in db.execute(
