@@ -36833,7 +36833,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.486';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.487';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43374,7 +43374,11 @@ async function _filesFtsRun() {
     + '<span style="font-size:0.64rem;color:var(--dim)">' + esc(d.engine || '?') + ' · ' + (d.elapsed_ms || 0) + 'ms · '
     + esc(d.root || root) + (d.truncated ? ' · <span style="color:#d29922">truncated at ' + d.limit + '</span>' : '') + '</span>'
     + '<button class="fe-tb-btn" style="margin-left:auto;font-size:0.68rem;min-height:32px;" '
-    + 'onclick="_filesSearchFilter(\'\')">Back to folder</button></div>';
+    // Clear the input BEFORE re-rendering: the listing renderer name-filters on
+    // whatever is in the box, so leaving the FTS query there made "Back to
+    // folder" render an empty folder — the content query silently re-applied as
+    // a name query. Caught by clicking it, not by reading it.
+    + 'onclick="document.getElementById(\'files-search\').value=\'\';_filesSearchFilter(\'\')">Back to folder</button></div>';
   if (!d.results.length) {
     body.innerHTML = head + '<div style="padding:8px 16px;color:#d29922;font-size:0.74rem;">' + esc(d.note || 'No matches.') + '</div>';
     return;
@@ -58195,7 +58199,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.486';
+const CACHE = 'amux-v0.9.487';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
