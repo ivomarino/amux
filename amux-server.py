@@ -12441,6 +12441,19 @@ def _pickup_next_board_task(session_name: str):
         rows = db.execute(
             "SELECT id, title, desc, log FROM issues i "
             "WHERE session=? AND status='todo' AND owner_type='agent' AND deleted IS NULL "
+            # A card marked needs:you is BLOCKED ON A HUMAN. `amux board needsyou`
+            # is the sanctioned way to say that (142 tag rows), and this loop never
+            # looked at it — so the mark and the mechanism disagreed and a lane could
+            # be handed a card whose owner had not made the decision yet (AC-223).
+            # Hit three times in one session by two different lanes, including cards
+            # I had just parked myself.
+            # Excluding the TAG rather than converting it to a status on purpose: the
+            # status route would reclassify ~142 cards in one migration and surface
+            # them all in Needs-you at once. This exempts exactly 2 currently
+            # dispatchable cards — measured before shipping, per "ask what the first
+            # run after the fix emits".
+            "AND NOT EXISTS (SELECT 1 FROM issue_tags t "
+            "                WHERE t.issue_id = i.id AND t.tag = 'needs:you') "
             # Archived cards stay SEARCHABLE but are never auto-grabbed
             # (Ethan 2026-08-02) — this filter was missing here alone.
             "AND COALESCE(archived,0)=0 "
