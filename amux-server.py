@@ -14614,6 +14614,86 @@ def _sched_audit(schedule_id, field, old, new, source, by_who=""):
              + (f" by {by_who}" if by_who else " (UNATTRIBUTED)"))
     except Exception as e:
         slog(f"[sched-audit] failed for {schedule_id}: {e}")
+    if field == "enabled":
+        try:
+            _sched_burst_check(by_who, source)
+        except Exception as e:
+            # Never let the alarm break the write it is watching, but never
+            # swallow it silently either — a detector that fails quietly is the
+            # thing it was built to prevent.
+            slog(f"[sched-burst] check failed for {schedule_id}: {e}")
+
+
+# One actor flipping many schedules' enabled flag in a minute is the shape of the
+# 2026-08-05 incident: 78 disabled in 47s, fully audited, noticed a DAY later,
+# 69 still off. Attribution was never the gap — DETECTION was (AMUX-2415).
+_SCHED_BURST_N = int(os.environ.get("AMUX_SCHED_BURST_N", "5") or 5)
+_SCHED_BURST_WINDOW_S = int(os.environ.get("AMUX_SCHED_BURST_WINDOW_S", "60") or 60)
+# These flip exactly ONE schedule as normal operation. Counting them would make
+# the alarm fire on healthy behaviour, and an alarm that cries wolf gets muted —
+# which is how you end up back at "nobody noticed for a day".
+_SCHED_BURST_EXEMPT = ("watch-autodisable", "watch-done-command", "run-once")
+
+
+def _sched_burst_check(actor: str, source: str):
+    """Warn the OWNERS when one actor mass-changes schedules.
+
+    Addressed to a named consumer, not written to a log and hoped for. AMUX-2416
+    was exactly the failure of the other approach: the audit was complete,
+    correct, retained — and unreachable, so the incident got filed as
+    'unrecoverable'. An alarm nobody is handed is the same defect one layer up.
+
+    So the message goes to the session whose schedules were turned off. They are
+    the ones who lost their dailies, and they are the only party who can say
+    whether that was intended. mvs-infra and ts-gke worked it out unaided; the
+    other thirteen did not, and are still dark.
+    """
+    if source in _SCHED_BURST_EXEMPT:
+        return
+    db = get_db()
+    now = int(time.time())
+    since = now - _SCHED_BURST_WINDOW_S
+    q = ("SELECT a.schedule_id, a.new_value, s.session FROM schedule_audit a "
+         "LEFT JOIN schedules s ON s.id = a.schedule_id "
+         "WHERE a.field='enabled' AND a.ts >= ? AND a.by_who = ? "
+         "AND a.source NOT IN (?,?,?)")
+    rows = db.execute(q, (since, actor or "", *_SCHED_BURST_EXEMPT)).fetchall()
+    if len(rows) < _SCHED_BURST_N:
+        return
+    # Durable dedupe: one notice per actor per window, surviving the execv
+    # restarts this server does constantly. An in-memory flag would re-fire the
+    # whole burst after any save of amux-server.py (ethos D1: in-memory state is
+    # fiction).
+    seen = db.execute(
+        "SELECT COUNT(*) FROM interaction_log WHERE kind='schedule' AND action='mass_change' "
+        "AND actor=? AND ts >= ?", (actor or "", (now - _SCHED_BURST_WINDOW_S) * 1000)).fetchone()[0]
+    if seen:
+        return
+    off = [r for r in rows if str(r["new_value"]) == "0"]
+    by_owner: dict = {}
+    for r in rows:
+        by_owner.setdefault(r["session"] or "(unowned)", []).append(r["schedule_id"])
+    _ilog("schedule", "mass_change", actor=actor or "(unattributed)",
+          target=f"{len(rows)} schedules",
+          detail={"window_s": _SCHED_BURST_WINDOW_S, "total": len(rows),
+                  "disabled": len(off), "owners": {k: len(v) for k, v in by_owner.items()},
+                  "source": source})
+    slog(f"[sched-burst] {actor or 'UNATTRIBUTED'} changed enabled on {len(rows)} schedules "
+         f"in {_SCHED_BURST_WINDOW_S}s ({len(off)} disabled) across {len(by_owner)} owners")
+    for owner, ids in by_owner.items():
+        if not owner or owner == "(unowned)" or owner == actor:
+            continue   # the actor already knows; unowned has nobody to tell
+        n_off = len([i for i in ids if any(str(r["new_value"]) == "0"
+                                          and r["schedule_id"] == i for r in rows)])
+        _steer_enqueue(owner,
+                       f"[amux] {len(ids)} of your schedules just changed enabled-state "
+                       f"({n_off} DISABLED) by '{actor or 'an unattributed caller'}' within "
+                       f"{_SCHED_BURST_WINDOW_S}s: {', '.join(ids[:6])}"
+                       + (f" +{len(ids)-6} more" if len(ids) > 6 else "")
+                       + ". If that was not intended, re-enable with "
+                       f"PATCH $AMUX_URL/api/schedules/<id> {{\"enabled\":1}} — and see "
+                       f"GET /api/schedules/audit?id=<id> for the full trail.",
+                       guard=f"sched-burst:{actor}:{now // _SCHED_BURST_WINDOW_S}")
 
 
 def _sched_mutation_by(headers, client_address, body) -> str:
@@ -36804,7 +36884,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.483';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.484';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58088,7 +58168,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.483';
+const CACHE = 'amux-v0.9.484';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
