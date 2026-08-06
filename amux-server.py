@@ -65440,6 +65440,36 @@ class CCHandler(BaseHTTPRequestHandler):
                     except Exception as _e:
                         slog(f"[board-patch] post-commit side effect failed for {bid} "
                              f"(write already committed): {_e}")
+                    # SAY WHICH FIELDS WERE DROPPED (AC-263). This handler applies an
+                    # allowlist and silently ignores everything else, then returns the
+                    # full card with HTTP 200 — so a PATCH of an unsupported field is
+                    # byte-indistinguishable from one that worked. `archived` is the
+                    # live example: it is NOT in the write allowlist but IS in
+                    # _AUDIT_FIELDS, so the audit layer believes it is settable while
+                    # the writer never touches it. Five scratch cards were "archived"
+                    # on 2026-08-06, all five silently stayed open, and one was then
+                    # auto-picked up as real work.
+                    #
+                    # Reporting beats guessing which field the caller meant: adding
+                    # `archived` to the allowlist would fix this one spelling and leave
+                    # the class open. The response now names anything it did not write,
+                    # so the next mismatch announces itself instead of being discovered
+                    # by a card coming back to life.
+                    try:
+                        _applied = {"title", "desc", "status", "session", "shepherd", "type",
+                                    "due", "due_time", "owner_type", "pinned", "pos",
+                                    "source_ref", "last_verified_at", "gate", "creator",
+                                    "reviewer", "depends_on", "desc_append", "rev",
+                                    "gate_ack", "gate_checked", "force", "override_doing"}
+                        _ignored = sorted(k for k in body.keys() if k not in _applied)
+                        if _ignored and isinstance(updated_item, dict):
+                            updated_item = dict(updated_item)
+                            updated_item["ignored_fields"] = _ignored
+                            updated_item["ignored_note"] = (
+                                "these keys are not writable via PATCH and were NOT applied; "
+                                "the rest of this response reflects the card as stored")
+                    except Exception:
+                        pass
                     return self._json(updated_item)
 
                 if method == "DELETE":
