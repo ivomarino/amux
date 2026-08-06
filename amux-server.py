@@ -26268,6 +26268,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      visible, not behind the Gate button. Kept visually quiet so it reads as
      the column's contract rather than competing with the cards. */
   /* Group chips on a worker card, and the panel they expand (AMUX-2362). */
+  /* Composer on an expanded worker card (AMUX-2368). */
+  .card-send { display:flex; gap:6px; align-items:flex-end; margin:6px 0 2px; }
+  .card-send-input { flex:1; min-width:0; resize:none; border-radius:8px;
+    border:1px solid var(--border); background:var(--bg); color:var(--text);
+    font-size:0.82rem; padding:7px 9px; font-family:inherit; }
+  .card-send-input:focus { outline:none; border-color:var(--accent); }
+  .card-send-btn { flex-shrink:0; min-width:44px; min-height:36px; border-radius:8px;
+    border:1px solid var(--border); background:var(--card); color:var(--accent);
+    cursor:pointer; font-size:0.95rem; -webkit-tap-highlight-color:transparent; }
+  .card-send-btn:hover, .card-send-btn:active { border-color:var(--accent); }
+  @media (max-width: 600px) {
+    .card-send-input { font-size:0.9rem; padding:9px 10px; }
+    .card-send-btn { min-height:44px; }
+  }
   .grp-chip { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
     font-size:0.66rem; font-weight:600; cursor:pointer; vertical-align:middle;
     background:rgba(88,166,255,0.14); color:var(--accent); border:1px solid transparent;
@@ -32571,6 +32585,11 @@ function render() {
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${(s.sched_on || s.sched_off) ? `<span class="sched-count-chip" title="${s.sched_on} enabled / ${s.sched_off} disabled schedule(s)" onclick="event.stopPropagation();openPeek('${esc(s.name)}');setTimeout(()=>setPeekTab('schedules'),400)" style="cursor:pointer;font-size:0.66rem;border:1px solid var(--border);border-radius:8px;padding:0 6px;font-family:var(--font-mono);"><span style="color:var(--green);font-weight:700;">${s.sched_on}</span><span style="color:var(--dim);">/</span><span style="color:${s.sched_off ? '#d29922' : 'var(--dim)'};">${s.sched_off}</span></span>` : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
+      ${isExp ? `<div class="card-send" onclick="event.stopPropagation();">
+        <textarea class="card-send-input" id="card-send-${escJs(s.name)}" rows="1" placeholder="Message ${esc(s.name)}\u2026"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();_cardSend('${escJs(s.name)}');}"></textarea>
+        <button class="card-send-btn" onclick="_cardSend('${escJs(s.name)}')" title="Send (queues while offline)">${online ? '&#x27A4;' : '&#x23F3;'}</button>
+      </div>` : ''}
       ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
       ${!isExp && (schedOn + schedOff) ? `<div class="card-sched-count" onclick="event.stopPropagation();switchView('scheduler')" title="${schedOn} enabled, ${schedOff} disabled">&#x23F2; ${[schedOn ? `<span class="sched-on">${schedOn} on</span>` : '', schedOff ? `<span class="sched-off">${schedOff} off</span>` : ''].filter(Boolean).join(' &middot; ')}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
@@ -34301,6 +34320,29 @@ function hidePeekLoading() {
   if (ind) ind.style.display = 'none';
 }
 
+// Send from the worker list without opening the peek. Delegates to doSend(),
+// which already handles queueing, msg_id dedupe and the offline path — this adds
+// an entry point, not a second send.
+async function _cardSend(name) {
+  const el = document.getElementById('card-send-' + name);
+  if (!el) return;
+  const text = el.value.trim();
+  if (!text) { el.focus(); return; }
+  el.value = '';
+  el.disabled = true;
+  try {
+    await doSend(name, text);
+    // Say what happened. An action whose success changes nothing on screen must
+    // say so — the scheduler Run-now bug (AMUX-2363) was exactly this, and
+    // "queued" vs "sent" is the distinction the user actually needs offline.
+    if (typeof showToast === 'function') {
+      showToast(online ? ('Sent to ' + name) : ('Offline \u2014 queued for ' + name));
+    }
+  } finally {
+    el.disabled = false;
+  }
+}
+
 async function doSend(name, text) {
   showSendingIndicator();
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
@@ -34561,6 +34603,16 @@ function _grpScopeRehydrate() {
 
 function toggleGroupScope(g) { _selectGroup(g); }
 
+let _scopeRowOpen = {};   // capability rows are CONTRACTED by default
+
+function _scopeRowToggle(key) {
+  _scopeRowOpen[key] = !_scopeRowOpen[key];
+  const parts = key.split(':');
+  const lvl = parts[0], name = parts[1];
+  const tgt = (lvl === 'group') ? ('grp-scope-body-' + name) : 'peek-scope-body';
+  _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name }, tgt);
+}
+
 async function _scopeLoad(scope, targetId) {
   // Explicit target. The first cut had the group panel temporarily RENAME its
   // own node to 'peek-scope-body' so this function could find it — two elements
@@ -34627,14 +34679,22 @@ async function _scopeLoad(scope, targetId) {
       if (here) { src = lvl; srcC = 'var(--accent)'; }
       else if (grpHit.length) { src = 'group:' + grpHit[0]; srcC = '#d29922'; }
       else if (gset) { src = 'global'; srcC = 'var(--dim)'; }
-      h += '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:7px;background:var(--card);">'
+      // Accordion, default CONTRACTED (Ethan). The summary line — capability,
+      // where it comes from, and its value — is what you scan; the precedence
+      // chain and merge semantics are what you consult. Collapsing the second
+      // keeps the panel readable at a glance without hiding the answer.
+      const _ck = lvl + ':' + w + ':' + c.key;
+      const _open = !!_scopeRowOpen[_ck];
+      h += '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:7px;background:var(--card);cursor:pointer;" onclick="_scopeRowToggle(\'' + escJs(_ck) + '\')">'
         + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">'
-        + '<span style="color:var(--text);font-weight:600;font-size:0.84rem;">' + esc(c.label) + '</span>'
+        + '<span style="color:var(--text);font-weight:600;font-size:0.84rem;">'
+        + '<span style="display:inline-block;width:9px;color:var(--dim);transform:rotate(' + (_open ? '90' : '0') + 'deg);transition:transform 0.12s;">&#9656;</span> '
+        + esc(c.label) + '</span>'
         + '<span style="font-size:0.7rem;color:' + srcC + ';">from ' + esc(src) + '</span></div>'
         + '<div style="font-size:0.78rem;margin-top:3px;">' + esc(sum(c)) + '</div>'
         // The layers that did NOT win are the answer to "why does this worker
         // differ from that one" — showing only the winner cannot express it.
-        + '<div style="font-size:0.68rem;color:var(--dim);margin-top:4px;">'
+        + (!_open ? '' : '<div style="font-size:0.68rem;color:var(--dim);margin-top:4px;">'
         + (c.order || []).map(l => {
             const on = (l === lvl && here)
                     || (l === 'group' && (lvl === 'worker' ? grpHit.length : false))
@@ -34642,8 +34702,9 @@ async function _scopeLoad(scope, targetId) {
             return '<span style="opacity:' + (on ? '1' : '0.38') + ';">' + esc(l) + '</span>';
           }).join(' <span style="opacity:0.3;">&rsaquo;</span> ')
         + ' <span style="opacity:0.5;">\u00b7 ' + esc(c.merge) + '</span>'
-        + (c.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at worker level</span>')
-        + '</div></div>';
+        + (c.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
+        + '</div>')
+        + '</div>';
     });
     h += '<div style="font-size:0.68rem;color:var(--dim);margin-top:8px;">'
       + 'Each capability shows its OWN precedence order \u2014 they genuinely differ. '
@@ -35781,7 +35842,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.456';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.458';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57341,7 +57402,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.456';
+const CACHE = 'amux-v0.9.458';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
