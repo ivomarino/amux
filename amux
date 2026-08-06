@@ -1025,11 +1025,18 @@ cmd_start_all() {
 # the easy path; a rule saying "remember the header" is not a fix.
 _board_transition() {
   local id="$1" status="$2"; shift 2
-  local ack="" newtype="" override="" rev="" outcome=""
+  local ack="" newtype="" override="" rev="" outcome="" trigger=""
   local checked=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --outcome) outcome="${2:-}"; [[ -n "$outcome" ]] || die "--outcome needs text"; shift 2 ;;
+      # --trigger records the EXTERNAL condition a card is parked on, into
+      # source_ref/last_verified_at — the fields the board already has and
+      # already renders (is:sourcestale). Without a verb the only way to set
+      # them was a hand-rolled PATCH, which is the same unaudited back door
+      # AMUX-2325 was about, and it is the reason a parked card could sleep
+      # forever: nothing machine-readable said what it was waiting for.
+      --trigger) trigger="${2:-}"; [[ -n "$trigger" ]] || die "--trigger needs text"; shift 2 ;;
       --ack) ack=1; shift ;;
       --checked)
         shift
@@ -1040,7 +1047,7 @@ _board_transition() {
       --override-doing) override=1; shift ;;
       --rev) rev="${2:-}"; shift 2 ;;
       *) die "amux board: unknown flag '$1'
-Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]" ;;
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]" ;;
     esac
   done
   # Record the outcome as its OWN write, BEFORE attempting the transition.
@@ -1057,13 +1064,20 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--o
       "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
   fi
   local body
-  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" python3 -c '
-import json, os, sys
+  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" python3 -c '
+import json, os, sys, time
 b = {"status": os.environ["S"]}
 if os.environ.get("A"): b["gate_ack"] = True
 if os.environ.get("T"): b["type"] = os.environ["T"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
+# Stamp last_verified_at alongside source_ref: a trigger with no verification
+# time is indistinguishable from one checked a month ago, and the staleness
+# view keys on exactly that field. Setting one without the other would make
+# every parked card read as stale the instant it was parked.
+if os.environ.get("G"):
+    b["source_ref"] = os.environ["G"]
+    b["last_verified_at"] = int(time.time())
 crit = sys.argv[1:]
 if crit: b["gate_checked"] = crit
 print(json.dumps(b))' ${checked[@]+"${checked[@]}"})
@@ -1167,7 +1181,7 @@ cmd_board() {
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]"
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]"
       shift
       local result
       result=$(_board_transition "$id" "$status" "$@")
@@ -1176,7 +1190,7 @@ cmd_board() {
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
-      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing]"
+      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]"
       shift 2
       local result
       result=$(_board_transition "$id" "$new_status" "$@")
@@ -1526,6 +1540,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    so a refused transition cannot discard it
     --type T                       retype in the same write
     --override-doing               hold a second card in doing deliberately
+    --trigger "external condition"  park on an EXTERNAL blocker: records it as the
+                                   card's source_ref and stamps last_verified_at, so a
+                                   stale trigger is detectable (is:sourcestale) instead
+                                   of the card sleeping forever
   e.g.  amux board review AC-12 --checked "Findings written up" "Ready for eyes"
 
   amux board import gh:owner/repo#N [--workspace W] [--project P]

@@ -12113,7 +12113,11 @@ def _advance_open_card(session_name: str) -> bool:
             f"  3b. If it is blocked on something EXTERNAL that no one here controls (a "
             f"provider outage, a deploy that cannot run, a third-party queue): record the "
             f"condition and the resume trigger on the card, then `amux board backlog "
-            f"{row['id']}`. That is the state that stops BOTH guards — backlog is not "
+            f"{row['id']} --trigger \"<the external condition>\"`. The --trigger records it "
+            f"as the card's source_ref and stamps last_verified_at, so a trigger nobody "
+            f"re-checks becomes detectable instead of the card sleeping forever — parking "
+            f"without it buys silence with no expiry. That is the state that stops BOTH "
+            f"guards — backlog is not "
             f"selected by this nudge and counts as parked by the untracked-work guard, so "
             f"you will not be pinged again while it waits. Do NOT leave it in 'doing' (this "
             f"nudge re-fires) or move it to 'todo' (the other guard fires instead). If it is "
@@ -12376,6 +12380,82 @@ def _pickup_note(session_name: str, reason: str, detail: str = "") -> None:
 
 _PICKUP_SWEEP_IDLE_MIN = float(os.environ.get("AMUX_PICKUP_SWEEP_IDLE_MIN", "10"))
 _pickup_sweep_last: dict = {}
+
+
+_STALE_TRIGGER_H = float(os.environ.get("AMUX_STALE_TRIGGER_HOURS", "24"))
+
+
+def _stale_trigger_sweep():
+    """Nag when a card parked on an EXTERNAL condition stops being re-checked.
+
+    AMUX-2450, follow-up to AMUX-2448. Parking provider-blocked work in
+    `backlog` with a recorded trigger correctly silences both guards — but the
+    silence was UNBOUNDED. If the watcher dies, the monitor is never re-armed
+    after a restart, or the condition resolves unobserved, the card sleeps
+    forever and nothing notices. The guard-worthy event is the TRIGGER GOING
+    STALE, not the wait itself.
+
+    The detection already existed and acted on nobody: `is:sourcestale` has been
+    in the client since AMUX-2204, and `sourcestale` appears exactly twice in
+    this file — a board query filter and a detail badge. Both are views. A view
+    nobody opens is the same failure as no tag (rule 4), which is why this is a
+    sweep and not a third rendering.
+
+    PREDICATE COPIED FROM THE VIEW, not re-derived. `is:sourcestale` is
+    `_bqIs(item,'open') && source_ref && (!last_verified_at || age > 24h)`, and
+    `open` is `!closed && !archived` — archived counts as cleared, which is
+    Ethan's explicit call. A sweep that disagreed with the badge in either
+    direction would be worse than none, because the badge is what a human reads
+    first.
+
+    Volume is bounded by adoption, deliberately: 3 open cards carry a source_ref
+    today and 0 are stale, so this fires zero times until lanes start using
+    `amux board backlog <id> --trigger "..."`. That is the honest ordering — the
+    verb that populates the field shipped in the same change, because a sweep
+    over a field nothing writes is the decoration this repo keeps rediscovering.
+    """
+    try:
+        db = get_db()
+        cut = time.time() - _STALE_TRIGGER_H * 3600
+        rows = db.execute(
+            "SELECT id, session, title, source_ref, last_verified_at, status FROM issues "
+            "WHERE deleted IS NULL AND COALESCE(archived,0)=0 "
+            "AND status NOT IN ('done','verified','discarded') "
+            "AND owner_type='agent' "
+            "AND source_ref IS NOT NULL AND TRIM(source_ref) <> '' "
+            "AND (last_verified_at IS NULL OR last_verified_at < ?) "
+            "ORDER BY COALESCE(last_verified_at, 0) ASC LIMIT 20", (cut,)).fetchall()
+        for r in rows:
+            name = r["session"]
+            if not name or not is_running(name):
+                continue
+            # One nag per card per staleness window, not per sweep tick. The
+            # per-card budget is what stopped the advance loop spending nine
+            # turns pushing one card into the bin (ethos #5).
+            idem = f"staletrigger:{r['id']}:{int(time.time() // (_STALE_TRIGGER_H * 3600))}"
+            if db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1", (idem,)).fetchone():
+                continue
+            _age = ("never re-checked since it was parked" if not r["last_verified_at"]
+                    else "last re-checked %dh ago" % int((time.time() - r["last_verified_at"]) / 3600))
+            ok, _err = send_text(name,
+                f"[amux] {r['id']} is parked on an external condition that nobody has "
+                f"confirmed lately: \"{(r['source_ref'] or '')[:120]}\" — {_age}.\n\n"
+                f"Not asking you to advance it. Asking whether the WAIT is still real:\n"
+                f"  - If the condition still holds, re-check it and run "
+                f"`amux board {r['status']} {r['id']} --trigger \"<condition>\"` to stamp it "
+                f"verified now. That is the whole ask.\n"
+                f"  - If it RESOLVED while nobody was looking, pick the card back up — that is "
+                f"the case this exists to catch.\n"
+                f"  - If the trigger can never fire (the watcher is gone, the deploy was "
+                f"cancelled), say so and close or discard it rather than leaving it asleep.",
+                defer_if_busy=True)
+            if ok:
+                _emit_event(name, "trigger.stale",
+                            {"issue": r["id"], "source_ref": (r["source_ref"] or "")[:200]},
+                            idem=idem, source="stale-trigger")
+                slog(f"[stale-trigger] {name}: {r['id']} — {_age}")
+    except Exception as e:
+        slog(f"[stale-trigger] sweep failed: {e}")
 
 
 def _pickup_level_sweep():
@@ -72012,6 +72092,7 @@ def main():
     # that just became idle. Cheap (one COUNT per lane) and every guard inside
     # _pickup_next_board_task still applies.
     schedule_job(_pickup_level_sweep,          interval=300,               name="pickup_sweep",       initial_delay=45)
+    schedule_job(_stale_trigger_sweep,         interval=1800,              name="stale_trigger",     initial_delay=300)
     # The owner's channel (Ethan, 2026-08-03). Runs often; SENDS only when
     # something is newly blocked on him, so the cadence is a latency bound, not
     # a message rate.
