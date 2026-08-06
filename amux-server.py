@@ -25745,6 +25745,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .file-overlay-body.file-code code.hljs { display: block; background: transparent; padding: 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
     line-height: 1.5; tab-size: 2; white-space: pre; }
+  /* github-dark ships NO .hljs-punctuation rule, and hljs 11.9 emits exactly three
+     classes for JSON: hljs-attr, hljs-string, hljs-punctuation. So every brace,
+     bracket, colon and comma fell back to the base colour while keys and values
+     were coloured — which is why a JSON file read as washed-out structure with
+     bright text floating in it (Ethan's screenshot, 2026-08-06). Verified by
+     running the shipped 11.9.0 build over real JSON and diffing the emitted
+     classes against the theme's selectors.
+     Dimmed deliberately rather than brightened: punctuation is scaffolding, so it
+     should recede while staying legible. */
+  .file-overlay-body.file-code .hljs-punctuation { color: #8b949e; }
+  body.light .file-overlay-body.file-code .hljs-punctuation { color: #6e7781; }
   .file-overlay-body.file-image { display:flex;align-items:center;justify-content:center;background:var(--bg);white-space:normal;position:relative; }
   /* Zoomable image preview (pinch / trackpad / double-tap). */
   .img-zoom-wrap { position:absolute;inset:0;overflow:hidden;touch-action:none;display:flex;align-items:center;justify-content:center; }
@@ -38474,7 +38485,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.497';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.498';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43829,7 +43840,12 @@ const _HLJS_EXT = {
   xml:'xml', html:'xml', svg:'xml', vue:'xml', css:'css', scss:'scss', sass:'scss', less:'less',
   sql:'sql', graphql:'graphql', gql:'graphql', md:'markdown', markdown:'markdown',
   dockerfile:'dockerfile', makefile:'makefile', mk:'makefile', diff:'diff', patch:'diff',
-  lua:'lua', pl:'perl', r:'r', dart:'dart', proto:'protobuf', tf:'hcl', hcl:'hcl',
+  lua:'lua', pl:'perl', r:'r', dart:'dart', proto:'protobuf',
+  // hljs 11.9.0 ships NO `hcl` grammar — not bundled and 404 on the CDN's
+  // languages/ path (verified). Mapping to it promised a language the library
+  // cannot provide. `ini` is not Terraform, but it colours the key = value
+  // spine and string literals correctly, which beats highlightAuto guessing.
+  tf:'ini', hcl:'ini',
   gradle:'gradle', groovy:'groovy', ps1:'powershell', bat:'dos',
 };
 const _HL_MAX = 600 * 1024;   // above this, skip highlight/format (perf)
@@ -43857,6 +43873,34 @@ function _fileFormatJson(content, ext) {
 // pretty-printed first. Degrades gracefully: too-large files or a missing hljs
 // (e.g. offline, CDN unreachable) fall back to plain escaped text — JSON is
 // still formatted either way.
+// Load a highlight.js grammar the bundled build does not ship (Ethan, 2026-08-06).
+// cdnjs's highlight.min.js is the COMMON build: 36 languages. _HLJS_EXT maps 38,
+// so scala, dockerfile, dart, protobuf, hcl, gradle, groovy, powershell and dos —
+// 10 extensions including Dockerfile and .tf, both common in this fleet — silently
+// fell through to highlightAuto, which guesses and is wrong often enough to look
+// broken. Measured, not assumed: hljs.listLanguages() vs the map.
+//
+// Loaded ON DEMAND rather than shipping the full ~190-language build, because
+// this is a mobile-first PWA and the full bundle is several hundred KB for
+// languages a given worker will never open. One ~2KB file, once, per language
+// actually viewed. Failure resolves rather than rejects: a missing grammar
+// degrades to highlightAuto exactly as before, never to a broken preview.
+const _hljsLangLoads = {};
+function _hljsEnsureLang(lang) {
+  if (!lang || !window.hljs) return Promise.resolve(false);
+  if (hljs.getLanguage(lang)) return Promise.resolve(true);
+  if (_hljsLangLoads[lang]) return _hljsLangLoads[lang];
+  _hljsLangLoads[lang] = new Promise(res => {
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/'
+           + lang + '.min.js';
+    sc.onload = () => res(!!hljs.getLanguage(lang));
+    sc.onerror = () => res(false);
+    document.head.appendChild(sc);
+  });
+  return _hljsLangLoads[lang];
+}
+
 function _fileHighlightHTML(data) {
   let content = data.content || '';
   const { name, ext } = _fileExtName(data);
@@ -44026,6 +44070,19 @@ function _renderFileBody(data, mode) {
     body.className = 'file-overlay-body file-code';
     body.innerHTML = _fileHighlightHTML(data);
     _bindReadPosDiv(body, data.path);
+    // If this file's grammar is not in the common bundle, fetch it and re-render
+    // once. Render-then-upgrade rather than await-then-render so the file is on
+    // screen immediately and a slow or blocked CDN can never leave it blank.
+    const _lz = _HLJS_EXT[_fileExtName(data).ext] || _HLJS_EXT[_fileExtName(data).name] || '';
+    if (_lz && window.hljs && !hljs.getLanguage(_lz)) {
+      _hljsEnsureLang(_lz).then(ok => {
+        if (!ok) return;
+        const b2 = document.getElementById('file-body');
+        if (!b2 || !b2.classList.contains('file-code')) return;   // user moved on
+        b2.innerHTML = _fileHighlightHTML(data);
+        _bindReadPosDiv(b2, data.path);
+      });
+    }
   }
 }
 
@@ -59935,7 +59992,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.497';
+const CACHE = 'amux-v0.9.498';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
