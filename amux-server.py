@@ -12134,7 +12134,10 @@ def _pickup_next_board_task(session_name: str):
                         f"prompts or journals — not dispatchable as-is:\n{_lst}\n"
                         f"Decompose each into real cards (one honest unit of work per card, correct "
                         f"type), carry the content over, then discard the shell. Auto-pickup will "
-                        f"work the real cards at your next idle.")
+                        f"work the real cards at your next idle.\n"
+                        f"PATCH THESE IDS SPECIFICALLY. Do not sweep whatever is open and do not "
+                        f"write one outcome onto several cards: each carries its own, or the "
+                        f"ledger records work against the wrong unit (tubescience, 2026-08-05).")
                     slog(f"[auto-pickup] {session_name}: dispatched decompose nudge for "
                          f"{len(_shells)} shell card(s)")
             return
@@ -12669,11 +12672,20 @@ def _capture_decompose_fastpath(session_name: str):
     try:
         db = get_db()
         now = int(time.time())
-        shells = db.execute(
-            "SELECT COUNT(*) FROM issues WHERE session=? AND status='todo' "
+        # Select the IDS, not just a count (tubescience, AMUX-2381). A notice
+        # that says "3 of your prompts are undecomposed" without naming them
+        # tells the worker to go FIND them, and the cheapest way to find them is
+        # to sweep whatever is open — which is precisely how one desc string got
+        # stamped onto TUBES-1410, 1413 and 1414, each carrying another card's
+        # outcome. Naming the ids turns "close the open ones" into "close these
+        # ones", and the misattribution stops being the path of least effort.
+        _rows = db.execute(
+            "SELECT id, title FROM issues WHERE session=? AND status='todo' "
             "AND deleted IS NULL AND COALESCE(archived,0)=0 "
-            "AND COALESCE(log,'') LIKE '%capture: session prompt%'",
-            (session_name,)).fetchone()[0]
+            "AND COALESCE(log,'') LIKE '%capture: session prompt%' "
+            "ORDER BY created ASC LIMIT 12",
+            (session_name,)).fetchall()
+        shells = len(_rows)
         if shells < 2:
             return
         recent = db.execute(
@@ -12683,11 +12695,16 @@ def _capture_decompose_fastpath(session_name: str):
             return
         _emit_event(session_name, "pickup.decompose_nudge",
                     {"shells": shells, "path": "capture-fastpath"}, source="capture")
+        _lst = "\n".join(f"  {r['id']} — {(r['title'] or '')[:66]}" for r in _rows)
         _steer_enqueue(session_name,
             f"[amux] {shells} of your prompts are captured on the board but not yet "
-            f"decomposed into real cards. At your next natural pause: split each into "
-            f"one card per unit of work (or discard finished ones with a pointer) — "
-            f"you have the context to decompose them; the board does not.")
+            f"decomposed into real cards:\n{_lst}\n"
+            f"At your next natural pause: split each into one card per unit of work "
+            f"(or discard finished ones with a pointer) — you have the context to "
+            f"decompose them; the board does not.\n"
+            f"PATCH THESE IDS SPECIFICALLY. Do not sweep whatever is open and do not "
+            f"write one outcome onto several cards: each carries its own, or the "
+            f"ledger records work against the wrong unit and a reviewer believes it.")
     except Exception as e:
         slog(f"[capture-fastpath] {session_name}: {e}")
 
