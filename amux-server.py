@@ -34736,15 +34736,23 @@ function _renderTabCustomizerMenu() {
 // Same mechanism as the main tab bar: hide/show + reorder, persisted to
 // localStorage, applied UNIFORMLY to every session's peek. Terminal is pinned
 // (always visible, always first) — everything else is customizable.
+// The customizer's universe. A tab MISSING here has a button but cannot be
+// hidden, shown or reordered — _applyPeekTabVisibility only iterates this list,
+// so scope and memory rendered permanently, in fixed positions, while every
+// other tab was configurable. Order here is the DOM order, so a fresh browser's
+// default matches what it already shows. `terminal` is deliberately absent: it
+// is pinned first by _applyPeekTabVisibility and is not reorderable.
 const PEEK_TABS = [
   { id: 'steering',   label: 'Steering' },
   { id: 'schedules',  label: 'Schedules' },
+  { id: 'scope',      label: 'Scope' },
   { id: 'messages',   label: 'Messages' },
   { id: 'dictation',  label: 'Dictation' },
   { id: 'issues',     label: 'Board' },
   { id: 'cost',       label: 'Cost' },
   { id: 'transcript', label: 'Transcript' },
   { id: 'commits',    label: 'Commits' },
+  { id: 'memory',     label: 'Memory' },
   { id: 'git',        label: 'Worktree' },
 ];
 let peekHiddenTabs = (function() {
@@ -37732,7 +37740,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.495';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.496';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -59193,7 +59201,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.495';
+const CACHE = 'amux-v0.9.496';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
