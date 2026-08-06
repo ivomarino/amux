@@ -508,3 +508,38 @@ NOTE: this is the sibling of AC-222, where the same verb printed a status arrow 
   that changes no status. Two entries now on `needsyou` specifically, both about the command
   reporting something other than what it did — which is the argument for auditing its
   output contract rather than patching the next symptom.
+
+## The decompose nudge told me to patch three cards I had already closed
+AREA: notices
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-252
+SYMPTOM: "[amux] 3 of your prompts are captured on the board but not yet decomposed into
+  real cards: AC-243, AC-244, AC-246 ... PATCH THESE IDS SPECIFICALLY." All three were
+  already `done` with their own outcomes, and AC-244's two children (AC-247, AC-248) had
+  been created and closed. Timestamps settle it: emitted 14:53:07 when all three genuinely
+  WERE todo; closed 15:03:17, 15:03:32, 15:19:41; delivered ~26min after the last close.
+  True when written, false when read. The predicate was never wrong — both the server
+  fastpath and the client badge filter status='todo' correctly.
+COST: Low in minutes, high in what it nearly caused. The instruction is imperative and
+  specific — PATCH THESE IDS — so complying literally means writing a fresh outcome onto
+  three cards that already carry their own. That is exactly the misattribution the
+  message's own last line warns about ("each carries its own, or the ledger records work
+  against the wrong unit and a reviewer believes it"). A worker trusting the nudge over
+  the board corrupts the ledger the nudge exists to protect. I checked the cards first and
+  found them closed, but nothing in the message suggests checking.
+FIX: `c32cf8a` — the nudge now passes guard="decompose:<ids>" and `_steer_guard_stale`
+  rechecks the NAMED ids at delivery, dropping the message only when none is still a live
+  todo (a partial decomposition still gets chased). The guard framework already existed for
+  this and has since AMUX-1737; this caller simply never opted in.
+NOTE: the general shape is a nudge asserting a fact with a shorter shelf life than the
+  queue's delivery latency. Delivering at the turn boundary is the RIGHT grain (the
+  no-global-pub-sub decision in ethos.md), which means the fix is never faster delivery but
+  revalidation at the moment of speaking. Worth auditing every other _steer_enqueue caller
+  that states a fact rather than asks a question — that is what AC-252 is for. Also worth
+  recording: my first verification reported the control as stale, and the CONTROL was wrong,
+  not the code — I selected it with status='todo' and no `deleted IS NULL`, so I picked a
+  deleted card. The same missing-predicate mistake in the probe that the guard fixes in the
+  product, one layer down, which is the nesting ethos rule 1 describes.
