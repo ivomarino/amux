@@ -14704,7 +14704,14 @@ def _sched_mutation_by(headers, client_address, body) -> str:
     (AMUX-1768 provenance principle). Falls back to the cloud user-email
     header, then the client IP — attribution can never be truly anonymous."""
     try:
-        hdr = (headers.get("X-Amux-Session", "") or "").strip()[:64]
+        # Through _hdr_worker, NOT a direct X-Amux-Session read (AMUX-2352).
+        # e3d7465 made the CLI send X-Amux-Worker as canonical; this function
+        # kept reading only the old spelling, so every schedule mutation from a
+        # migrated client fell through to the email/IP fallback — weakly
+        # attributed writes on exactly the table whose missing attribution was
+        # the AMUX-2414 incident. amux-homepage caught it in review while the
+        # defect was already live.
+        hdr = _hdr_worker(headers)[:64]
         claimed = str(body.get("by") or body.get("source_session") or "").strip()[:64]
         if hdr and claimed and hdr != claimed:
             return f"{hdr} (claimed {claimed})"
@@ -36884,7 +36891,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.484';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.485';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58168,7 +58175,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.484';
+const CACHE = 'amux-v0.9.485';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63620,16 +63627,45 @@ class CCHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/api/schedules/audit":
                 db = get_db()
                 sid = (qs.get("id", [""])[0] or "").strip()
+                fld = (qs.get("field", [""])[0] or "").strip()
                 lim = min(int(qs.get("limit", ["100"])[0] or 100), 500)
+                # REJECT unknown params instead of ignoring them (AC-228).
+                # ?field= used to be dropped on the floor, so a caller scoping to
+                # `enabled` got all 459 rows back and no tell — a filter that
+                # silently matches everything is worse than one that matches
+                # nothing, because it returns a confident wrong answer. That is
+                # the same failure this endpoint exists to prevent.
+                _known = {"id", "field", "limit", "full"}
+                _bad = sorted(set(qs) - _known)
+                if _bad:
+                    return self._json({"error": f"unknown query param(s): {', '.join(_bad)}",
+                                       "accepted": sorted(_known)}, 400)
+                _w, _p = [], []
                 if sid:
-                    rows = db.execute(
-                        "SELECT a.*, s.title FROM schedule_audit a LEFT JOIN schedules s ON s.id=a.schedule_id "
-                        "WHERE a.schedule_id=? ORDER BY a.ts DESC LIMIT ?", (sid, lim)).fetchall()
-                else:
-                    rows = db.execute(
-                        "SELECT a.*, s.title FROM schedule_audit a LEFT JOIN schedules s ON s.id=a.schedule_id "
-                        "ORDER BY a.ts DESC LIMIT ?", (lim,)).fetchall()
-                self._json([dict(r) for r in rows])
+                    _w.append("a.schedule_id=?"); _p.append(sid)
+                if fld:
+                    _w.append("a.field=?"); _p.append(fld)
+                rows = db.execute(
+                    "SELECT a.*, s.title FROM schedule_audit a LEFT JOIN schedules s ON s.id=a.schedule_id "
+                    + ("WHERE " + " AND ".join(_w) + " " if _w else "")
+                    + "ORDER BY a.ts DESC LIMIT ?", (*_p, lim)).fetchall()
+                out = [dict(r) for r in rows]
+                # TRIM the value diffs in the LIST view. `command` diffs carry the
+                # full old AND new text — 86% of the payload's value bytes, while
+                # `enabled` (the field attribution questions actually ask about)
+                # is 0% — so answering "who disabled these" cost 570KB to read the
+                # 1% that held the answer. amux is mobile-first and this is a PWA
+                # opened on cellular. Scoped reads (?id= or ?full=1) still get
+                # everything, because that is where you go to read a diff.
+                if not sid and (qs.get("full", ["0"])[0] or "0").lower() not in ("1", "true", "yes"):
+                    for o in out:
+                        for k in ("old_value", "new_value"):
+                            v = o.get(k)
+                            if isinstance(v, str) and len(v) > 200:
+                                o[k] = v[:200] + "…"
+                                o["truncated"] = True
+                self._json(out, headers={
+                    "X-Amux-Audit-Full": "add ?full=1 (or ?id=SCHED-N) for untruncated values"})
                 return
 
             # POST /api/schedules
@@ -64780,7 +64816,7 @@ class CCHandler(BaseHTTPRequestHandler):
                                 "body_preview": (body.get("body", ""))[:240],
                                 "in_reply_to": body.get("reply_to_message_id") or None,
                                 "id": result.get("id"), "thread_id": result.get("thread_id"),
-                                "session": self.headers.get("X-Amux-Session")})
+                                "session": _hdr_worker(self.headers) or None})
                 return self._json(result)
 
             return self._json({"error": "not found"}, 404)
@@ -65434,7 +65470,7 @@ return output
                                 "to": to, "cc": cc or None, "subject": subject,
                                 "body_chars": len(message), "body_preview": message[:240],
                                 "id": res.get("id"), "thread_id": res.get("thread_id"),
-                                "session": self.headers.get("X-Amux-Session")})
+                                "session": _hdr_worker(self.headers) or None})
                     return self._json({"ok": True, "to": to, "subject": subject,
                                        "from": from_acct, "cc": cc or None, "via": "gmail",
                                        "id": res.get("id"), "thread_id": res.get("thread_id"),
@@ -65496,7 +65532,7 @@ end tell
                     _email_log({"endpoint": "send", "via": "mailapp", "from": from_acct or "(default)",
                                 "to": to, "cc": cc or None, "subject": subject,
                                 "body_chars": len(message), "body_preview": message[:240],
-                                "session": self.headers.get("X-Amux-Session")})
+                                "session": _hdr_worker(self.headers) or None})
                     return self._json({"ok": True, "to": to, "subject": subject,
                                        "from": from_acct or "(default)", "cc": cc or None,
                                        "body_length": int(actual_len) if actual_len.isdigit() else actual_len})
@@ -65557,7 +65593,7 @@ end tell
                                 "in_reply_to": message_id, "reply_all": bool(reply_all),
                                 "body_chars": len(reply_body), "body_preview": reply_body[:240],
                                 "id": res.get("id"), "thread_id": res.get("thread_id"),
-                                "session": self.headers.get("X-Amux-Session")})
+                                "session": _hdr_worker(self.headers) or None})
                     return self._json({"ok": True, "message_id": message_id,
                                        "reply_all": bool(reply_all), "from": gmail_from,
                                        "via": "gmail", "id": res.get("id"),
@@ -65666,7 +65702,7 @@ end tell
                     _email_log({"endpoint": "reply", "via": "mailapp", "from": from_acct or "(default)",
                                 "in_reply_to": message_id, "reply_all": reply_all,
                                 "body_chars": len(reply_body), "body_preview": reply_body[:240],
-                                "session": self.headers.get("X-Amux-Session")})
+                                "session": _hdr_worker(self.headers) or None})
                     return self._json({"ok": True, "message_id": message_id, "reply_all": reply_all,
                                        "from": from_acct or "(default)",
                                        "body_length": int(actual_len) if actual_len.isdigit() else actual_len})
