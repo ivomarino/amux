@@ -61536,23 +61536,17 @@ class CCHandler(BaseHTTPRequestHandler):
                 if not _it:
                     return self._json({"error": "no such item", "item": bid}, 404)
                 _g = _effective_gate(_it, st)
-                # Which layer answered — same order the resolver applies.
+                # Ask the LAYERED resolver which layer answered, rather than
+                # re-deriving the chain here. This block had its own inline
+                # card>type>session>global walk, so when gates gained the GROUP
+                # tier (213282a) it kept reporting a group gate as "global" —
+                # correct criteria, wrong attribution. Exactly the defect this
+                # endpoint was built to fix (AMUX-2330), reintroduced one layer
+                # up by the same cause: two implementations of one rule.
                 _src = "none"
                 if _g:
-                    _card_g = _it.get("gate")
-                    if isinstance(_card_g, str):
-                        try:
-                            _card_g = json.loads(_card_g)
-                        except Exception:
-                            _card_g = None
-                    if isinstance(_card_g, list) and [x for x in _card_g if str(x).strip()]:
-                        _src = "card"
-                    elif _item_type_gate(_it, st):
-                        _src = "type"
-                    elif (_load_session_gates().get(_it.get("session") or "", {}) or {}).get(st):
-                        _src = "session"
-                    else:
-                        _src = "global"
+                    _applied = next((l for l in _gate_layers(_it, st) if l.get("applied")), None)
+                    _src = (_applied or {}).get("scope") or "global"
                 return self._json({"item": bid, "status": st, "gate": _g,
                                    "source": _src,
                                    "item_type": (_it.get("type") or _DEFAULT_ITEM_TYPE)})
