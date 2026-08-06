@@ -34691,6 +34691,37 @@ function _scopeRowToggle(key) {
   _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name }, tgt);
 }
 
+// Group message history in the group panel. Uses the shared row renderer and the
+// scoped fetch, so this is a third CALLER of one implementation rather than a
+// third implementation — the distinction that stopped three message renderers
+// from becoming four (AMUX-2334, AMUX-2366).
+let _grpMsgOpen = false;
+
+async function _grpMessagesToggle(g) {
+  _grpMsgOpen = !_grpMsgOpen;
+  const host = document.getElementById('grp-scope-body-' + g);
+  if (!host) return;
+  if (!_grpMsgOpen) { _scopeLoad({ level: 'group', name: g }, host.id); return; }
+  host.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Loading group messages\u2026</div>';
+  try {
+    const rows = await _peekMsgFetch({ level: 'group', name: g });
+    const list = rows.slice().reverse().slice(0, 60);
+    const ctx = _msgCtxHistory();
+    const dst = document.getElementById('grp-scope-body-' + g);
+    if (!dst) return;
+    dst.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+      + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(g) + ' \u00b7 messages</span>'
+      + '<button class="btn" style="font-size:0.7rem;min-height:32px;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(g) + '\')">Back to config</button></div>'
+      + (list.length ? '<div style="display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;">'
+          + list.map(e => _cmdHistItemHTML(e, ctx)).join('') + '</div>'
+          : '<div style="color:var(--dim);font-size:0.8rem;">No messages for this group yet.</div>');
+    _grpScopeHtml = dst.innerHTML;
+  } catch (e) {
+    const dst = document.getElementById('grp-scope-body-' + g);
+    if (dst) dst.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Could not load group messages: ' + esc(e.message) + '</div>';
+  }
+}
+
 async function _scopeLoad(scope, targetId) {
   // Explicit target. The first cut had the group panel temporarily RENAME its
   // own node to 'peek-scope-body' so this function could find it — two elements
@@ -34787,8 +34818,11 @@ async function _scopeLoad(scope, targetId) {
         + (_l.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
         + '</div></div>';
     }
-    h += '<div style="font-size:0.66rem;color:var(--dim);margin-top:6px;">'
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">'
+      + '<span style="font-size:0.66rem;color:var(--dim);">'
       + (_selCap ? 'Tap the tile again to close.' : 'Tap a config to see its precedence order.')
+      + '</span>'
+      + (lvl === 'group' ? '<button class="btn" style="font-size:0.7rem;min-height:32px;flex:0 0 auto;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(w) + '\')">\u2709 Messages</button>' : '')
       + '</div>';
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
     dst.innerHTML = h;
@@ -35923,7 +35957,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.462';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.463';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57488,7 +57522,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.462';
+const CACHE = 'amux-v0.9.463';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
