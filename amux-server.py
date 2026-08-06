@@ -15139,9 +15139,14 @@ def _attribute_ledger_tasks() -> None:
         pass
 
 
-def observability_rollup(days: int = 7, session: str = "") -> dict:
+def observability_rollup(days: int = 7, session: str = "", group: str = "") -> dict:
     """Roll the ledger up into cost/token breakdowns by session, task, model, and
-    day. `session` scopes to one session (for the peek tab). Reads only the ledger."""
+    day. `session` scopes to one worker (for the peek tab), `group` sums over every
+    member of a group, and neither is the fleet total. Reads only the ledger.
+
+    Group membership is resolved with the SAME list_sessions()/tags predicate as
+    /api/board?group= and /api/history?group=, so a group's cost covers exactly the
+    workers its board and message history do (AMUX-2385)."""
     _index_token_ledger()  # make sure recent turns are captured
     since = int(time.time()) - days * 86400
     db = get_db()
@@ -15150,6 +15155,18 @@ def observability_rollup(days: int = 7, session: str = "") -> dict:
     if session:
         where += " AND session = ?"
         args.append(session)
+    elif group:
+        _members = [x["name"] for x in list_sessions()
+                    if group in (x.get("tags") or [])]
+        if _members:
+            where += " AND session IN (%s)" % ",".join("?" * len(_members))
+            args.extend(_members)
+        else:
+            # An empty group must total ZERO, not the fleet. Falling through with
+            # no predicate would report every worker's spend under a group name —
+            # and unlike a wrong card count, a wrong dollar figure is one nobody
+            # re-derives before believing it.
+            where += " AND 1=0"
 
     def rows(sql, extra=()):
         return [dict(r) for r in db.execute(sql, tuple(args) + tuple(extra)).fetchall()]
@@ -60550,17 +60567,20 @@ class CCHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/metrics":
             return self._json(get_system_metrics())
 
-        # GET /api/observability?days=7&session=X — cost/token rollup by task,
-        # session, model, and day (dollar cost from the pricing table). The whole
-        # thing is derived from JSONL + board — no model calls.
+        # GET /api/observability?days=7[&session=X|&group=G] — cost/token rollup
+        # by task, session, model, and day (dollar cost from the pricing table).
+        # No filter = fleet total (global scope); session = one worker; group =
+        # every member of the group. The whole thing is derived from JSONL +
+        # board — no model calls.
         if method == "GET" and path == "/api/observability":
             try:
                 days = max(1, min(365, int(qs.get("days", ["7"])[0])))
             except Exception:
                 days = 7
             sess = (qs.get("session", [""])[0] or "").strip()
+            grp = (qs.get("group", [""])[0] or "").strip()
             try:
-                return self._json(observability_rollup(days=days, session=sess))
+                return self._json(observability_rollup(days=days, session=sess, group=grp))
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
 
