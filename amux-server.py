@@ -22534,10 +22534,39 @@ def _verify_submitted(name: str, target: str, text: str, esc_at: float = 0.0,
 
     cleared_once = False
     stuck_looks = 0
+    no_ui_looks = 0
     for _ in range(5):
         time.sleep(0.3)
         raw = tmux_capture(name, 25) or ""
-        pend = _pending_input(_STRIP_ANSI.sub("", raw))
+        _clean = _STRIP_ANSI.sub("", raw)
+        pend = _pending_input(_clean)
+        # NO INPUT BOX AT ALL IS "NOT READY", NOT "SUBMITTED" (AC-271).
+        # A SUCCESSFUL submit leaves the composer rendered and empty — the ❯ line
+        # is still there. So the absence of any ❯/› means Claude Code has not
+        # drawn its UI yet, which on a cold session is the normal state for
+        # several seconds. Both of the "clear looks" below then happen 0.3s apart
+        # inside that window, the verifier reports success, and the text renders
+        # into the box AFTERWARDS and sits there unsubmitted. The docstring
+        # anticipates boot buffering but sizes the guard for a repaint (0.6s),
+        # not for an app start.
+        #
+        # Measured 2026-08-06: containers sit stopped (AC-231), a request wakes
+        # one, and a schedule fired in that window delivered its prompt into a
+        # composer that did not exist yet. send_text returned "sent",
+        # _run_schedule recorded status=ok, and the worker never ran — all 9
+        # workers across 3 customer envs reproduced it. The same trigger on a
+        # WARM session runs in 20s, which is what isolated readiness as the
+        # variable rather than the prompt text or Claude's manual mode.
+        if pend is None and not any(l.strip()[:1] in ("❯", "›") for l in _clean.splitlines()):
+            no_ui_looks += 1
+            if no_ui_looks <= 12:      # ~4s more; a cold Claude Code needs it
+                time.sleep(0.3)
+                continue
+            # UI never appeared — do NOT claim this submitted. Reporting failure
+            # keeps the message queued and makes _run_schedule record an error,
+            # which is the honest outcome: an ok that means "typed into nothing"
+            # is what let 9 dead triggers read as successful runs.
+            return False
         if pend is None or tail_sq not in pend:
             # Looks submitted — but right after a Claude restart the typed text
             # can render into the box AFTER our first look (keystrokes buffered
