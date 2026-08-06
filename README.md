@@ -38,7 +38,7 @@ amux serve   # → https://localhost:8822
 
 **Requirements:** Python 3.10+, tmux 3.2+, and at least one of: Claude Code, Codex CLI, or Gemini CLI.
 
-> **Alternative terminal backend:** sessions can run on [herdr](https://github.com/herdrdev/herdr) instead of tmux — set `AMUX_BACKEND=herdr` in `~/.amux/server.env` (new sessions) or `CC_BACKEND=herdr` in a session env (per-session). amux drives a headless herdr session and starts each lane as a recognized herdr agent (`provider=claude` in this release).
+> **Alternative terminal backend:** sessions can run on [herdr](https://github.com/herdrdev/herdr) instead of tmux — set `AMUX_BACKEND=herdr` in `~/.amux/server.env` (new sessions) or `CC_BACKEND=herdr` in a session env (per-session). amux drives a headless herdr session and starts each lane as a recognized herdr agent (`provider=claude` in this release). **The herdr path is not covered by CI** — its tests mock `subprocess`, so a green build proves the backend-selection logic, not the herdr integration; that has a manual end-to-end pass behind it. tmux remains the default and is unaffected.
 
 > **License:** [MIT + Commons Clause](LICENSE) — free to use, modify, and self-host. Commercial resale requires a separate license.
 

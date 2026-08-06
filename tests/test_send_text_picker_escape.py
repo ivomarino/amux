@@ -79,6 +79,10 @@ ns = {
     "_auto_waking": set(),
     "CC_SESSIONS": None,
     "start_session": lambda name: (True, "ok"),
+    # #80 gave send_text a backend branch. These cases are about the TMUX path
+    # (picker escape, send-keys ordering), so pin the backend — without this the
+    # extracted function raises NameError and the whole module fails collection.
+    "_session_backend": lambda name: "tmux",
 }
 
 tree = ast.parse(open(SERVER, encoding="utf-8").read())

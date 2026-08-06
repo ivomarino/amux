@@ -408,6 +408,19 @@ increasingly make better, with a lossy operation.
 behavior; 0 disables the proactive path while keeping resume-dialog handling).
 **Exit:** models manage their own context; amux only surfaces the number.
 
+## D6 — Two terminal backends to keep in step
+tmux and herdr (#79/#80, 2026-08-06) both host sessions, so every future change
+to session lifecycle must be made twice, and the herdr half cannot be verified
+by anyone without herdr installed — its tests mock `subprocess` and CI proves
+only the backend-SELECTION logic. Accepted anyway: the seam is one resolver
+(`_session_backend`), the change is additive with tmux paths untouched, and
+structured agent lifecycle state is what D1 names as its own exit.
+**Status: accepted with a named cost.** The README says plainly that CI does not
+cover the herdr path, so a green build is never mistaken for an integration test.
+**Exit:** when the AgentRuntime seam (#47/#48) lands, backends resolve through
+it rather than through per-call-site branches — one dispatch point instead of
+two families of code paths.
+
 The pattern under all five: amux WATCHED the model and acted on inference. The
 durable inverse — the model reporting its own state through a real interface —
 is D1's report endpoint; prefer extending it over adding any new scraper.
