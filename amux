@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# amux — phone-friendly Claude Code session manager built on tmux
+# amux — phone-friendly Claude Code worker manager built on tmux
 # Usage: amux [command] [args...]
 
 set -euo pipefail
@@ -155,7 +155,7 @@ herdr_agent_of() {
 }
 
 need_herdr() {
-  command -v herdr &>/dev/null || die "herdr is required for herdr-backend sessions. Install herdr or set AMUX_BACKEND=tmux"
+  command -v herdr &>/dev/null || die "herdr is required for herdr-backend workers. Install herdr or set AMUX_BACKEND=tmux"
 }
 
 _start_via_api() {
@@ -165,7 +165,7 @@ _start_via_api() {
   resp=$(curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/sessions/$name/start" 2>/dev/null) || resp=""
   if [[ -z "$resp" ]]; then
-    die "amux server unreachable — herdr sessions start through the server (amux serve). NOTHING was started."
+    die "amux server unreachable — herdr workers start through the server (amux serve). NOTHING was started."
   fi
   local rc=0
   RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
@@ -576,7 +576,7 @@ cmd_attach() {
   name=$(resolve_session "${1:-}")
   if [[ "$(session_backend "$name")" == "herdr" ]]; then
     need_herdr
-    is_running "$name" || die "session '$name' is not running. Start with: amux start $name"
+    is_running "$name" || die "worker '$name' is not running. Start with: amux start $name"
     local agent
     agent=$(herdr_agent_of "$name")
     if [[ -n "$agent" ]]; then
@@ -598,7 +598,7 @@ cmd_peek() {
 
   if [[ "$(session_backend "$name")" == "herdr" ]]; then
     need_herdr
-    is_running "$name" || die "session '$name' is not running"
+    is_running "$name" || die "worker '$name' is not running"
     local agent
     agent=$(herdr_agent_of "$name")
     echo "${BOLD}── $name ──${RESET}"
@@ -753,7 +753,7 @@ PYEOF
     [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
   fi
   if [[ "$(session_backend "$name")" == "herdr" ]]; then
-    echo "${RED}FAILED${RESET} to send to $name: amux server unreachable, and herdr sessions can only be driven through the server. NOTHING was delivered." >&2
+    echo "${RED}FAILED${RESET} to send to $name: amux server unreachable, and herdr workers can only be driven through the server. NOTHING was delivered." >&2
     return 1
   fi
   # ── Raw-tmux last resort (AMUX-1987) ────────────────────────────────────
@@ -902,7 +902,7 @@ cmd_ls() {
   done
 
   if ! $has_any; then
-    echo "${DIM}No sessions registered. Run: amux register <name>${RESET}"
+    echo "${DIM}No workers registered. Run: amux register <name>${RESET}"
   fi
 }
 
@@ -1584,20 +1584,20 @@ EOF
 
 cmd_help() {
   cat <<EOF
-${BOLD}amux${RESET} — phone-friendly Claude Code session manager ${DIM}v${CC_VERSION}${RESET}
+${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
 
-${BOLD}Session management:${RESET}
+${BOLD}Worker management:${RESET}
   amux register <name> [flags]   Register a worker with Claude Code flags
-  amux start <name> [--detach]   Start a registered session in tmux (-d = don't attach)
+  amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
   amux stop <name>               Stop a running worker
-  amux rm <name>                 Remove a session (stops if running)
-  amux start-all                 Start all registered sessions
-  amux stop-all                  Stop all running sessions
+  amux rm <name>                 Remove a worker (stops if running)
+  amux start-all                 Start all registered workers
+  amux stop-all                  Stop all running workers
 
 ${BOLD}Interaction:${RESET}
-  amux attach <name>             Attach to a running session (detach: Ctrl-b d)
+  amux attach <name>             Attach to a running worker (detach: Ctrl-b d)
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
   amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
                                  ${DIM}amux send api --stdin <<'EOF'${RESET}
@@ -1610,8 +1610,8 @@ ${BOLD}Interaction:${RESET}
   amux send <name> --keys 'C-c'  Send raw key sequence (e.g., Ctrl-C)
 
 ${BOLD}Info:${RESET}
-  amux ls                        List all sessions with status and previews
-  amux info <name>               Show session config details
+  amux ls                        List all workers with status and previews
+  amux info <name>               Show worker config details
   amux defaults [show|edit|reset] Manage global default flags
 
 ${BOLD}Dashboard:${RESET}
@@ -1655,9 +1655,9 @@ ${BOLD}Claude Code flags (on register/exec):${RESET}
   --chrome / --no-chrome       Browser automation toggle
   ... and all other claude CLI flags pass through
 
-${BOLD}Session names support fuzzy matching:${RESET}
+${BOLD}Worker names support fuzzy matching:${RESET}
   amux peek api                  Matches 'api', 'api-server', etc.
-  amux 3                         Attach to session #3 from amux ls
+  amux 3                         Attach to worker #3 from amux ls
 
 ${BOLD}Examples:${RESET}
   amux register api --model opus --yolo --dir ~/Dev/myapp
