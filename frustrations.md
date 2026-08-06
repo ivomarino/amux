@@ -66,7 +66,7 @@ FIX: d18ec81 — `_board_outcome` takes a label for non-transition writes; the t
 ## The `needs:you` tag does not exempt a card from auto-pickup
 AREA: board
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-223
@@ -78,8 +78,12 @@ SYMPTOM: A card tagged `needs:you` — the sanctioned way to say "blocked on a h
 COST: A worker can be handed a card whose owner never made the decision. Hit twice in
   one session, by two different lanes. Also cost me two cards silently sitting in `todo`
   while I believed they were parked.
-FIX: Either pickup excludes the tag, or `needsyou` sets status too. The second
-  reclassifies ~100 cards in one migration — ask what the first run after the fix emits.
+FIX: b4ea1d0 — the pickup query now excludes cards carrying the tag. Chose that over
+  converting the tag to a status: the status route reclassifies ~142 cards in one
+  migration and surfaces them all in Needs-you at once, while the exclusion exempts
+  exactly 2 currently-dispatchable cards. Measured before shipping, not after. The
+  tag/status split itself is still open — this closed the dispatch hole, not the
+  representation question.
 
 ## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
 AREA: attribution
