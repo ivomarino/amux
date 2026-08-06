@@ -7670,6 +7670,45 @@ def _steer_guard_stale(name: str, guard: str):
         if not live:
             return True, f"all {len(ids)} shells decomposed before delivery"
         return False, ""
+    if guard.startswith("ctx:"):
+        # "Your average context is Nk tokens PER TURN". Perishable: the queue
+        # delivers at the next turn boundary, and the remedy this nudge itself
+        # recommends (/compact, or a reset) may already have been taken. A lane
+        # that just compacted being told its context is oversized is the
+        # loud-wrong-probe shape — it arrives, reads as authoritative, and
+        # contradicts what the lane can see.
+        #
+        # The test is NOT "re-run the emitter's query". That metric is a 2h
+        # TRAILING average, so it still contains the expensive turns from before
+        # the compact and would keep the nudge alive for an hour after the lane
+        # fixed it — the guard would then be measuring history rather than the
+        # thing it needs to know. What matters is whether the lane has ALREADY
+        # ACTED, so measure only turns taken SINCE the nudge was queued.
+        #
+        # Silence is not improvement: with too few new turns there is no
+        # evidence either way, and the fact as stated still stands, so keep it.
+        try:
+            _p = guard[len("ctx:"):].split(":")
+            _thresh, _since = int(_p[0]), int(_p[1])
+        except Exception:
+            return False, ""
+        try:
+            _r = get_db().execute(
+                "SELECT SUM(cache_read)/MAX(COUNT(*),1) cpt, COUNT(*) n "
+                "FROM token_ledger WHERE session=? AND ts > ?", (name, _since)).fetchone()
+        except Exception:
+            return False, ""
+        if not _r or not _r["n"] or _r["n"] < 3:
+            return False, ""
+        _cpt = int(_r["cpt"] or 0)
+        if _cpt < _thresh:
+            # Say what was measured, not why. The guard sees the metric fall; it
+            # cannot see whether that was a /compact, a reset, or the work simply
+            # getting smaller — and a reason line that asserts a cause it did not
+            # observe is the kind of confident-wrong instrument ethos rule 4 is about.
+            return True, (f"context now {_cpt // 1000}k/turn over {_r['n']} turns since "
+                          f"queueing, under the {_thresh // 1000}k threshold")
+        return False, ""
     if guard.startswith("unverified:"):
         # "N of your done cards await the done->verified gap: <ids>". Same shape
         # as decompose: it NAMES ids and tells the lane to act on each. If they
@@ -13277,7 +13316,11 @@ def _context_size_monitor():
                 f"YOUR call, not amux's: /compact if the tail matters, a reset "
                 f"if it doesn't, or carry on if the context is genuinely earning "
                 f"its size. Threshold {int(thresh/1000)}k; this nudge repeats at "
-                f"most every 6h while you stay above it.")
+                f"most every 6h while you stay above it.",
+                # Revalidate at delivery against turns taken SINCE this moment:
+                # if the lane already compacted or reset, drop it rather than
+                # telling them to fix what they just fixed.
+                guard=f"ctx:{thresh}:{now}")
             slog(f"[ctx-monitor] {name}: {int(r['cpt']/1000)}k/turn over {r['n']} turns — nudged")
     except Exception as e:
         slog(f"[ctx-monitor] failed: {e}")
