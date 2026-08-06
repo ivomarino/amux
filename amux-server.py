@@ -12004,6 +12004,46 @@ def _advance_open_card(session_name: str) -> bool:
             if not is_running(_rev):
                 slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
                 return False
+            # HAS THE REVIEWER ALREADY RESPONDED? (AC-234.) Blocking a card IS a
+            # completed review action, but the card stays in `review`, so the sweep
+            # re-selected it every cycle and re-nudged a reviewer whose analysis was
+            # already sitting on the card. Three nudges for one card in one night,
+            # which trains reviewers to ignore review nudges — the one class that
+            # should never be ignored.
+            #
+            # "Reviewed, ball is with the author" = the reviewer's last DELIBERATE
+            # write to this card is newer than anyone else's. Self-correcting: the
+            # moment the author actually responds, the reviewer is eligible again.
+            #
+            # DELIBERATE excludes commit_attached, which is the automatic
+            # commit-attach hook (AMUX-2015) firing on every commit into whatever
+            # card the author holds. On AMUX-2368 that produced ~75 author writes
+            # after the review, none of them a response — a naive "who wrote last"
+            # test reads those as the author replying and nudges anyway. Measured on
+            # the real card before writing this.
+            #
+            # NOTE: interaction_log.ts is MILLISECONDS. Both sides of this comparison
+            # come from that table so the units cancel; do NOT compare either against
+            # time.time() without scaling — that is the ~1000x filter the ethos
+            # records, and it fails by matching everything rather than nothing.
+            _DELIB = "('patch','status_update','gate_force')"
+            try:
+                _db = get_db()
+                _r_rev = _db.execute(
+                    "SELECT ts FROM interaction_log WHERE kind='board' AND target=? "
+                    "AND actor=? AND action IN " + _DELIB + " ORDER BY ts DESC LIMIT 1",
+                    (row["id"], _rev)).fetchone()
+                _r_oth = _db.execute(
+                    "SELECT ts FROM interaction_log WHERE kind='board' AND target=? "
+                    "AND actor<>? AND action IN " + _DELIB + " ORDER BY ts DESC LIMIT 1",
+                    (row["id"], _rev)).fetchone()
+                if _r_rev and (_r_rev[0] or 0) > ((_r_oth[0] if _r_oth else 0) or 0):
+                    slog(f"[advance] {row['id']}: reviewer {_rev} already responded "
+                         f"(their write is the most recent deliberate one) — ball is with "
+                         f"the author, staying quiet")
+                    return False
+            except Exception:
+                pass  # fail-open: a broken check must not silence real review requests
             # Charge the SAME per-card budget the holder edge uses (AC-220,
             # reported by amux-cloud after being nudged three times for one
             # card). This edge returned before ever reaching the cap below, so
