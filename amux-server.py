@@ -12388,7 +12388,29 @@ def _pickup_level_sweep():
     holds no doing card and has pickable work, run the SAME path the edge runs.
     Every guard still applies because it is the same function — opt-out, WIP
     cap, agent-only, freshness, re-claim cooldown, irreversible-op refusal.
-    This changes WHEN pickup is attempted, never WHAT may be picked up."""
+    This changes WHEN pickup is attempted, never WHAT may be picked up.
+
+    BOTH HALVES OF THE EDGE, not one (AMUX-2442, validating amux-frustrations'
+    AF-2). The edge at the idle transition runs advance-then-pickup:
+    `if not _advance_open_card(s): _pickup_next_board_task(s)`. This sweep was
+    built to be that edge's level-triggered backstop but carried only the
+    pickup half, so the two stalls the edge distinguishes got opposite
+    treatment: a lane holding NO card was retried every 5 minutes forever,
+    while a lane HOLDING a doing/review card — the one that cannot be helped by
+    pickup, because WIP-1 forbids giving it a second card — got exactly one
+    shot at a transition that, per the paragraph above, may never come again.
+    Measured 2026-08-06: 7 lanes held an agent-owned doing/review card
+    untouched >6h, oldest 2.1 days.
+
+    That asymmetry is invisible from the sweep's own logs, which is why it
+    survived: its slog line reads "no idle EDGE would ever fire for this lane"
+    and is only ever printed for the half that was covered.
+
+    Cost is bounded by the callee, not by this sweep: _advance_open_card
+    enforces the per-SESSION cooldown (15 min) and the per-CARD nudge budget
+    (AMUX_ADVANCE_CARD_BUDGET, default 3), so a stuck card draws at most three
+    nudges in its lifetime whether they arrive by edge or by sweep. Same
+    guarantee as the pickup half: this changes WHEN, never WHAT."""
     try:
         db = get_db()
         now = time.time()
@@ -12405,6 +12427,19 @@ def _pickup_level_sweep():
                 if not (_rep and _rep.get("state") == "idle"
                         and (now - _rep.get("ts", 0)) > _PICKUP_SWEEP_IDLE_MIN * 60):
                     continue                      # only lanes whose own harness says idle, and settled
+                # ADVANCE BEFORE PICKUP — the same order, and the same two calls,
+                # the idle EDGE uses. A lane holding a doing/review card cannot be
+                # helped by pickup (WIP-1 forbids a second card), so a successful
+                # nudge ends this lane's sweep turn exactly as it ends the edge's.
+                # Every guard is the callee's: opt-out, per-session cooldown,
+                # per-card budget, journal-card veto, dependency redirect,
+                # needs:you quiet path. This adds no new policy, only a second
+                # chance at the one the edge already implements.
+                if _advance_open_card(name):
+                    _pickup_sweep_last[name] = now
+                    slog(f"[pickup-sweep] {name}: idle holding an open card — nudged to advance it "
+                         f"(no idle EDGE would ever fire for this lane)")
+                    continue
                 n = db.execute(
                     "SELECT COUNT(*) FROM issues WHERE session=? AND status='todo' "
                     "AND owner_type='agent' AND deleted IS NULL AND COALESCE(archived,0)=0 "
@@ -17227,6 +17262,41 @@ def _set_task_guard_session(name: str, enabled: bool | None):
     _write_env(env_file, cfg)
 
 
+def _session_is_blocked_not_idle(name: str) -> bool:
+    """True if this lane has NO actionable card but DOES have parked/blocked ones.
+
+    The task guard fires on "idle AND nothing in doing" and infers untracked work.
+    For a lane whose queue is entirely blocked that inference is false: it has no
+    `todo` to start and no `doing` to finish because everything it owns is waiting
+    on a human or a reviewer. Nudging it to "create an issue for your session and
+    set its status" then asks for a card describing work that is already recorded —
+    the honest answer is not in the answer space, which is how a well-meaning prompt
+    manufactures a false ledger entry.
+
+    Hit repeatedly on 2026-08-06: amux-cloud sat at 9 needsyou + 4 review + 0 todo
+    with every card blocked behind one owner decision, and was told ~8 times to
+    record what it did. Each nudge was answered by re-verifying that the work was
+    already on the board.
+
+    Deliberately narrow: it requires BOTH no actionable work AND at least one parked
+    card. A lane with nothing at all is genuinely idle and still gets nudged, which
+    is the case the guard exists for.
+    """
+    try:
+        db = get_db()
+        actionable = db.execute(
+            "SELECT 1 FROM issues WHERE session=? AND status IN ('todo','doing') "
+            "AND deleted IS NULL AND COALESCE(archived,0)=0 LIMIT 1", (name,)).fetchone()
+        if actionable:
+            return False
+        parked = db.execute(
+            "SELECT 1 FROM issues WHERE session=? AND status IN ('needsyou','review','blocked') "
+            "AND deleted IS NULL AND COALESCE(archived,0)=0 LIMIT 1", (name,)).fetchone()
+        return bool(parked)
+    except Exception:
+        return False  # fail-open: never suppress the guard on a broken check
+
+
 def _session_has_doing_issue(name: str) -> bool:
     """True if this session has a board issue currently in 'doing'."""
     try:
@@ -17306,6 +17376,14 @@ def _task_guard(name: str) -> bool:
         # hiding work, and telling it otherwise pushes it to invent a card.
         if _session_recently_closed_issue(name):
             _task_guard_nudged[name] = True
+            return False
+        # A lane whose entire queue is BLOCKED is not delinquent (AC-240): no todo
+        # to start, no doing to finish, because everything it owns waits on a human
+        # or a reviewer. Deliberately does NOT set _task_guard_nudged — that flag is
+        # sticky, and a lane that is blocked TODAY should be nudged normally once it
+        # is unblocked and genuinely has untracked work. Suppress while the condition
+        # holds, re-evaluate when it stops holding.
+        if _session_is_blocked_not_idle(name):
             return False
         _task_guard_nudged[name] = True
         _task_guard_last[name] = time.time()
