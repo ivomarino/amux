@@ -38485,7 +38485,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.498';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.499';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49201,8 +49201,22 @@ async function fetchBoard() {
       // 100 cards mid-read. Merge the fresh page over the full set by id, and
       // let the next _boardEnsureFull (60s) true it up.
       if (_boardFullTs && boardItems.length > data.length) {
-        const fresh = new Map(data.map(i => [i.id, i]));
-        boardItems = boardItems.map(i => fresh.get(i.id) || i);
+        // UNION, not update-only (Ethan: "board search doesn't work", searching
+        // ac-264 for a card that plainly existed). The guard correctly refuses to
+        // let the small default page SHRINK the full set, but it was implemented
+        // as boardItems.map(...) — which rewrites cards already present and can
+        // never ADD one. So every card created after the last full load was
+        // invisible to search until _boardEnsureFull's 60s window happened to
+        // expire, and typing again inside that window kept re-searching the stale
+        // set. AC-264 was ~20 minutes old and simply not in the array being
+        // filtered; every filter below it was working perfectly on a corpus that
+        // did not contain the card.
+        //
+        // Merging by id in insertion order keeps both properties the guard wanted:
+        // nothing shrinks, existing cards take the fresh copy, and new ids append.
+        const byId = new Map(boardItems.map(i => [i.id, i]));
+        for (const i of data) byId.set(i.id, i);
+        boardItems = [...byId.values()];
       } else {
         boardItems = _mergeArchived(data);
       }
@@ -59992,7 +60006,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.498';
+const CACHE = 'amux-v0.9.499';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
