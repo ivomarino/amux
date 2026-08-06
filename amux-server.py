@@ -2338,9 +2338,22 @@ asyncio.run(main())
 """
 
 _bu_drivers: dict = {}          # session -> {proc, profile, udir}
+# AC-233 round 2: sessions that have EVER had a driver in this process.
+# _bu_drivers alone cannot answer "did this session have a driver?", because
+# every DEATH path removes the entry — the io-exception handler calls
+# _bu_driver_stop(), and a `closed` response pops it. So the dead-driver check
+# `session in _bu_drivers` is False exactly in the common death mode, and the
+# silent cli fallback it was written to prevent happens anyway. Observed on
+# amux-cloud 2026-08-06: a driver was started, an eval later returned
+# backend="cli", and nothing said the driver had died.
+# Cleared ONLY on an explicit stop (the /api/browser/stop endpoint), never on
+# death or replacement — the whole point is to outlive the registry entry.
+_bu_driver_ever: set = set()
 _bu_driver_lock = threading.Lock()
 
-def _bu_driver_stop(session: str):
+def _bu_driver_stop(session: str, explicit: bool = False):
+    if explicit:
+        _bu_driver_ever.discard(session)
     d = _bu_drivers.pop(session, None)
     if not d:
         return
@@ -2388,6 +2401,7 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
                 return {"error": f"driver failed to start: {e} :: {_err}".strip()}
             d = {"proc": proc, "profile": profile, "udir": str(udir)}
             _bu_drivers[session] = d
+            _bu_driver_ever.add(session)   # AC-233: survives every death path
             slog(f"[browser] v3 driver up session={session} profile={profile!r} store={udir}")
         req = dict(params or {})
         req.update(id="r", verb=verb)
@@ -2447,7 +2461,10 @@ def _bu_eval(session: str, js: str, timeout_s: int = 20) -> dict:
     # about the page, which is worse than an error. Only fall through to cli when
     # no driver was ever started for this session.
     with _bu_driver_lock:
-        _had_driver = session in _bu_drivers
+        # Either still registered (process died quietly) or ever registered
+        # (registry entry already cleaned up by a death path) — both mean a
+        # driver existed for this session and is now gone.
+        _had_driver = session in _bu_drivers or session in _bu_driver_ever
     if _had_driver:
         slog(f"[browser] driver for '{session}' died — refusing silent cli fallback (AC-233)")
         return {"error": f"browser driver for '{session}' has died — restart with "
@@ -2556,6 +2573,33 @@ def _bu_open(url: str, session: str = "amux", explicit_profile: str = "",
         res = dict(res)
         res["profile"] = profile
         res["auto_profile"] = auto
+        # NO DRIVER WAS REGISTERED, AND THAT IS THE FACT THAT BREAKS CALLERS
+        # (AC-233 round 2). Reaching here means the v3 driver branch was skipped
+        # or failed: the driver returns early above. The response already said
+        # profile_verified/profile_fallback — but those describe whether WRITES
+        # PERSIST, which is not what goes wrong next. What goes wrong next is
+        # AMUX-2272: /api/browser/action verbs run through the browser-use CLI,
+        # a DIFFERENT browser process from the one /state and /screenshot
+        # describe. So eval returns results from about:blank while the
+        # screenshot shows a real page, and every symptom points at the wrong
+        # layer.
+        #
+        # This is not theoretical. amux-cloud spent a day on it 2026-08-06:
+        # started a browser with a profile name that did not exist, got
+        # {"success": true, "mode": "real"}, and then read a blank screenshot, a
+        # null eval and backend="cli" as three separate browser bugs. The start
+        # response was successful and true, and silent about the one thing that
+        # mattered. It also defeats the AC-233 dead-driver check upstream of it:
+        # no driver is ever registered, so there is no death to detect.
+        if not res.get("error"):
+            res["driver"] = False
+            res["driver_note"] = (
+                "NO v3 driver for this session — /api/browser/action verbs "
+                "(eval/click/type) will execute via the browser-use CLI, which is a "
+                "DIFFERENT browser process from the one /state and /screenshot report "
+                "on (AMUX-2272). Multi-step UI checks will NOT work. Start with an "
+                "existing amux-managed profile (GET /api/browser/profiles) to get a "
+                "driver; a profile name that does not exist silently lands here.")
         # `profile` above is what we ASKED for. Say what we actually GOT: a
         # caller that trusts the request echo has no way to learn its writes are
         # landing in a temp dir, which is precisely how this stayed misdiagnosed.
@@ -69466,7 +69510,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     return self._json({"ok": True, "backend": "live", "closed": tid})
                 if session in _bu_drivers:
                     _prof = _bu_drivers[session].get("profile", "")
-                    _bu_driver_stop(session)
+                    _bu_driver_stop(session, explicit=True)   # AC-233: user asked; forget it
                     return self._json({"ok": True, "backend": "driver",
                                        "closed": True, "profile": _prof,
                                        "note": "store writes persisted (no copy)"})
