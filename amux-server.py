@@ -19267,9 +19267,35 @@ def _write_claude_memory(name: str, work_dir: str):
             (claude_mem_dir / _MEM_TOPIC_FILE).write_text(global_content.strip() + "\n")
         # Materialise the archive next to MEMORY.md so the index's pointer to it
         # resolves — an archive the session cannot open is the same as deleting it.
+        # MERGE, NEVER CLOBBER — the source is per-SESSION, the destination is
+        # per-PROJECT (GV-644, gtm-videos). `_arch` is ~/.amux/memory/<name>.archive.md,
+        # one per lane; `claude_mem_dir` is keyed by cwd, so every lane sharing a
+        # working directory writes the same memory-archive.md. A write_text here
+        # made that last-writer-wins: the lane that synced most recently replaced
+        # the shared archive with only ITS OWN retired entries.
+        #
+        # Measured on ~/Dev/mixpeek, which 18 lanes share: `backend` had 135 of 135
+        # entries present in the shared archive; the other eight lanes had exactly
+        # ONE each — the common "Archived memories" pointer line. 126 entries that
+        # nine lanes had correctly archived were absent from the only archive the
+        # index points at.
+        #
+        # This is why the symptom read as "rotation deletes without archiving".
+        # The fold was innocent and did exactly what its docstring promises; the
+        # loss happened one step later, in the copy. Worth noting for the next
+        # person: the archived entries were never actually gone — they are still in
+        # each lane's own .archive.md — but they were unreachable from the index,
+        # and unreachable is what a reader experiences as deleted.
         _arch = CC_MEMORY / f"{name}.archive.md"
         if _arch.exists():
-            (claude_mem_dir / _MEM_ARCHIVE_FILE).write_text(_arch.read_text(errors="replace"))
+            _dest = claude_mem_dir / _MEM_ARCHIVE_FILE
+            _prev = _dest.read_text(errors="replace").splitlines() if _dest.exists() else []
+            _have = {l.strip() for l in _prev if l.strip()}
+            _add = [l for l in _arch.read_text(errors="replace").splitlines()
+                    if l.strip() and l.strip() not in _have]
+            if _add or not _dest.exists():
+                _dest.write_text(("\n".join(_prev).rstrip() + "\n" +
+                                  "\n".join(_add)).strip() + "\n")
         # Same rule for the tag layer: the index points at `<tag>.md`, so that
         # file has to exist BESIDE MEMORY.md or the pointer is a dead link — and
         # a pointer to a file the session cannot open is worse than no pointer,
