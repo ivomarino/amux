@@ -29802,6 +29802,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
+    <button class="peek-tab" id="peek-tab-search" onclick="setPeekTab('search')" title="Full-text search across every file in this worker's directory"><span class="tab-ico">&#128269;</span><span class="tab-lbl">Search</span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
     <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
   </div>
@@ -29984,6 +29985,22 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 
   <div id="peek-scope-panel" class="peek-tasks-panel" style="padding:10px;gap:0;overflow-y:auto;">
     <div id="peek-scope-body" style="font-size:0.82rem;color:var(--dim);">Loading&hellip;</div>
+  </div>
+  <div id="peek-search-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
+    <div class="peek-tasks-add" style="gap:6px;padding:8px 10px;flex-wrap:wrap;">
+      <input type="search" id="peek-search-input" placeholder="Search every file in this worker&hellip;"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();_fileSearchRun();}"
+        style="flex:1 1 160px;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
+      <button class="btn primary" style="flex:0 0 auto;min-height:32px;" onclick="_fileSearchRun()">Search</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim);flex:0 0 auto;">
+        <input type="checkbox" id="peek-search-regex" style="margin:0;">regex</label>
+      <label style="display:flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--dim);flex:0 0 auto;"
+        title="Also search .gitignore'd and hidden files">
+        <input type="checkbox" id="peek-search-ignored" style="margin:0;">ignored</label>
+    </div>
+    <div id="peek-search-body" style="flex:1;overflow-y:auto;padding:0 10px 10px;font-size:0.8rem;color:var(--dim);">
+      Search the whole working directory of this worker. Enter to run.
+    </div>
   </div>
   <div id="peek-messages-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
@@ -33627,6 +33644,7 @@ const PEEK_TABS = [
   { id: 'transcript', label: 'Transcript' },
   { id: 'commits',    label: 'Commits' },
   { id: 'git',        label: 'Worktree' },
+  { id: 'search',     label: 'Search' },
 ];
 let peekHiddenTabs = (function() {
   try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
@@ -35158,6 +35176,14 @@ function setPeekTab(tab) {
   const scopePanel = document.getElementById('peek-scope-panel');
   if (tab === 'scope') { scopePanel.classList.add('active'); _scopeLoad(); }
   else { scopePanel.classList.remove('active'); }
+  document.getElementById('peek-tab-search').classList.toggle('active', tab === 'search');
+  const searchPanel = document.getElementById('peek-search-panel');
+  if (tab === 'search') {
+    searchPanel.classList.add('active');
+    // Do NOT auto-run: an empty query would render the "no matches" note as if
+    // a search had happened. Focus and wait for a real one.
+    setTimeout(() => { const i = document.getElementById('peek-search-input'); if (i) i.focus(); }, 40);
+  } else { searchPanel.classList.remove('active'); }
   document.getElementById('peek-tab-memory').classList.toggle('active', tab === 'memory');
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
@@ -36190,6 +36216,83 @@ function _peekMemorySharedBanner(data) {
     + 'expected rather than a mix-up.';
 }
 
+// ── File search (peek Search tab) ──
+// Renders what the server SAYS about the search, not just its hits: engine,
+// elapsed, and every filter that could explain a zero. An empty result is the
+// one answer a reader cannot debug from the rows on screen.
+let _fileSearchSeq = 0;
+
+async function _fileSearchRun() {
+  const inp = document.getElementById('peek-search-input');
+  const body = document.getElementById('peek-search-body');
+  if (!inp || !body || !peekSession) return;
+  const q = inp.value.trim();
+  if (!q) { body.textContent = 'Type something to search for.'; return; }
+  const seq = ++_fileSearchSeq;
+  const sess = peekSession;
+  body.innerHTML = '<span style="color:var(--dim);">Searching ' + esc(sess) + '…</span>';
+  const p = new URLSearchParams({ q: q });
+  if (document.getElementById('peek-search-regex').checked) p.set('literal', '0');
+  if (document.getElementById('peek-search-ignored').checked) p.set('ignored', '1');
+  let d;
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(sess) + '/search?' + p.toString(),
+                          { headers: _authHeaders() });
+    d = await r.json();
+  } catch (e) {
+    if (seq === _fileSearchSeq) body.innerHTML = '<span style="color:#f85149;">Search failed: ' + esc(e.message) + '</span>';
+    return;
+  }
+  // Late response from a previous query must not overwrite a newer one.
+  if (seq !== _fileSearchSeq || peekSession !== sess) return;
+  if (d.error) {
+    body.innerHTML = '<span style="color:#f85149;">' + esc(d.error) + '</span>';
+    return;
+  }
+  const head = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;margin:6px 0 8px;">'
+    + '<b style="color:var(--text);font-size:0.8rem;">' + d.matches + ' match' + (d.matches === 1 ? '' : 'es')
+    + ' in ' + d.files + ' file' + (d.files === 1 ? '' : 's') + '</b>'
+    + '<span style="font-size:0.64rem;color:var(--dim);">' + esc(d.engine || '?') + ' · ' + (d.elapsed_ms || 0) + 'ms'
+    + (d.truncated ? ' · <span style="color:#d29922;">truncated at ' + d.limit + '</span>' : '')
+    + (d.searched_ignored ? ' · incl. ignored+hidden' : '')
+    + '</span></div>';
+  if (!d.results.length) {
+    body.innerHTML = head + '<div style="color:#d29922;font-size:0.74rem;line-height:1.4;">' + esc(d.note || 'No matches.') + '</div>';
+    return;
+  }
+  // Group by file so 50 hits in one file do not read as 50 files.
+  const byFile = {};
+  d.results.forEach(r => { (byFile[r.path] = byFile[r.path] || []).push(r); });
+  body.innerHTML = head + Object.keys(byFile).map(fp => {
+    const rows = byFile[fp].map(r =>
+      '<div style="display:flex;gap:8px;align-items:baseline;padding:1px 0;">'
+      + '<span style="flex:0 0 46px;text-align:right;font-size:0.62rem;color:var(--dim);">' + r.line + '</span>'
+      + '<code style="flex:1 1 auto;font-size:0.68rem;white-space:pre-wrap;word-break:break-word;color:var(--text);">'
+      + _fileSearchHi(r.text, r.spans) + '</code></div>').join('');
+    return '<div style="margin-bottom:10px;">'
+      + '<div style="font-size:0.7rem;color:var(--accent);margin-bottom:2px;word-break:break-all;">' + esc(fp)
+      + ' <span style="color:var(--dim);">(' + byFile[fp].length + ')</span></div>' + rows + '</div>';
+  }).join('');
+}
+
+// Highlight using the server's byte spans. Built from the ORIGINAL string and
+// escaped per segment — escaping first would shift every offset past the first
+// &amp; and silently mis-highlight the rest of the line.
+function _fileSearchHi(text, spans) {
+  if (!spans || !spans.length) return esc(text);
+  const b = new TextEncoder().encode(text);
+  const dec = new TextDecoder();
+  let out = '', pos = 0;
+  spans.slice().sort((x, y) => x[0] - y[0]).forEach(([s, e]) => {
+    if (s == null || e == null || s < pos) return;
+    out += esc(dec.decode(b.slice(pos, s)))
+        + '<mark style="background:rgba(210,153,34,0.35);color:inherit;border-radius:2px;">'
+        + esc(dec.decode(b.slice(s, e))) + '</mark>';
+    pos = e;
+  });
+  return out + esc(dec.decode(b.slice(pos)));
+}
+
 async function loadPeekMemory() {
   const inp = document.getElementById('peek-memory-input');
   const save = document.getElementById('peek-memory-save');
@@ -36283,7 +36386,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.469';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.470';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57916,7 +58019,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.469';
+const CACHE = 'amux-v0.9.470';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
