@@ -32968,8 +32968,12 @@ let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render kee
 // right"). The X called _selectGroup, which also DESELECTED the group — so the
 // only way to hide the panel was to lose the filter you were using. Collapsing
 // keeps the group selected and is remembered across renders and reloads.
+// HIDDEN BY DEFAULT (Ethan: "it keeps expanding the group section when I click
+// the tab. make it hidden by default."). Only an explicit stored '0' expands it,
+// so a fresh browser starts collapsed instead of unfolding under the pills every
+// time the Workers tab is opened.
 let _grpCollapsed = (function() {
-  try { return localStorage.getItem('amux_grp_collapsed') === '1'; } catch (e) { return false; }
+  try { return localStorage.getItem('amux_grp_collapsed') !== '0'; } catch (e) { return true; }
 })();
 function _grpSetCollapsed(v) {
   _grpCollapsed = !!v;
@@ -36765,7 +36769,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.480';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.481';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41588,7 +41592,6 @@ function _selectGlobalScope() {
   _grpScopeHtml = '';
   _grpOpen = closing ? null : _GLOBAL_SCOPE;
   _grpView = 'config';
-  if (_grpOpen) _grpSetCollapsed(false);   // same as a group pill: opening shows it
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
@@ -41607,14 +41610,12 @@ function _selectGroup(g) {
   // button whose cause is invisible, because the panel it would have opened is
   // already what you are looking at.
   _grpView = 'config';
-  // OPENING a group is a deliberate "show me this", so it must EXPAND. The
-  // collapse flag persists in localStorage, so once anyone collapsed the panel
-  // ONCE, every later group click produced a 54px bar with the content hidden
-  // behind a second click they had no reason to expect — the feature reads as
-  // broken, which is exactly how Ethan reported it. Collapse now means "hide
-  // this while I stay on the group", not a sticky global default that defeats
-  // the next click.
-  if (_grpOpen) _grpSetCollapsed(false);
+  // Deliberately does NOT force-expand. That was my over-correction to "I cant
+  // use the group scope stuff": the real cause was AMUX-2406, where a collapsed
+  // panel rendered as an empty box with NO visible handle. With the header fixed
+  // the collapsed state is usable — it says "<group> · scope  ▸ Expand" — so
+  // auto-expanding only made the section unfold under the pills on every tab
+  // click. The stored preference is respected instead.
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _grpOpen);
@@ -58052,7 +58053,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.480';
+const CACHE = 'amux-v0.9.481';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
