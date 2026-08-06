@@ -573,3 +573,35 @@ FIX: Not "check whether the recipient has uncommitted changes" — that is unans
 NOTE: third entry on this one notice, after AC-230 (named the reporting session, not the
   author) and AC-241 (the pre-commit sibling's hypothetical). Three fixes on one message is
   the file's own threshold for designing rather than patching.
+
+## `amux board --outcome` had no stdin path, so an outcome quoting a command was shell-eaten
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-255
+SYMPTOM: `amux board review AMUX-2456 --outcome "... resolved it with \`--grep=Amux-Session:
+  <session>\`, which is a SUBSTRING search ..."`. The shell evaluated the backticks before
+  amux saw them. What landed on the card was "resolved the last commit with , which is a
+  SUBSTRING search" — the command gone, the sentence dangling. bash printed its own syntax
+  error on a separate line while `AMUX-2456 → review` printed success, so the transition
+  read as clean.
+COST: A review handoff went out to a peer naming a bug class, with the exact command that
+  CAUSED the bug deleted from the explanation — the one detail the reviewer needs. Caught
+  only because I re-read the card afterwards; nothing in the output said the text had been
+  altered. Cheap to repair here, but the same shape silently truncates any outcome that
+  quotes a command, which is most of the good ones.
+FIX: `72c2470` — `--outcome-stdin` and `--outcome-file`, mirroring what `send` has had since
+  AMUX-1888 and what `board add` already had. Verified on a scratch card: backticks,
+  `$(date)` and `$HOME` all land verbatim.
+NOTE: the rule against inline double-quoted text is already written down in CLAUDE.md, for
+  `amux send`, with an incident behind it. I violated it on a DIFFERENT verb, and the reason
+  is worth recording because it is not carelessness: the sanctioned escape existed for the
+  two commands whose whole payload is prose, and not for the one field that most often
+  quotes shell — a session recording what it ran and what sha came out. When the safe path
+  is missing exactly where the dangerous input is most likely, "remember the rule" is not
+  the fix; the missing flag is. Same shape as AMUX-2325, where the gate's only honest exit
+  was unwalkable from the audited path. Also the same habit-transfer failure ethos rule 7
+  names: I had used --stdin correctly for `amux send` twice in this session and did not
+  carry it to the adjacent verb.
