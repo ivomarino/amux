@@ -16029,6 +16029,62 @@ def _session_recent_edit_paths(name: str, since_secs: float) -> dict:
 
 
 _desc_stamp: dict = {}   # (worker, desc-hash) -> (card id, ts) — bulk-close detector
+_DESC_REUSE_WINDOW = float(os.environ.get("AMUX_DESC_REUSE_WINDOW", "300"))
+_DESC_REUSE_MINLEN = int(os.environ.get("AMUX_DESC_REUSE_MINLEN", "80"))
+
+
+def _desc_reuse_check(actor: str, bid: str, desc: str):
+    """Same worker writing the same desc onto a DIFFERENT card inside the window.
+
+    Returns the hit dict, or None. Extracted from the PATCH handler so the
+    standing self-test below exercises this exact function — testing a copy would
+    prove only that the copy works.
+    """
+    d = (desc or "").strip()
+    if not d or len(d) < _DESC_REUSE_MINLEN:
+        return None
+    k = (actor, hashlib.sha1(d.encode()).hexdigest()[:12])
+    seen = _desc_stamp.get(k)
+    _desc_stamp[k] = (bid, time.time())
+    if seen and seen[0] != bid and (time.time() - seen[1]) < _DESC_REUSE_WINDOW:
+        return {"also_on": seen[0], "secs_apart": int(time.time() - seen[1])}
+    return None
+
+
+def _desc_reuse_selftest():
+    """STANDING known-positive (tubescience, 2026-08-05). This detector already
+    rotted invisibly twice while being written — placed before the variable it
+    used, then a bare `hashlib` that resolved only as `_hashlib` — and both times
+    it failed into its own `except`, so it looked healthy while doing nothing.
+    A detector that can rot invisibly once can rot invisibly again after the next
+    refactor, and nothing else in the system would notice.
+
+    So: a case that MUST fire, and a case that MUST NOT, run on a schedule.
+    Silence becomes an alarm instead of a comfort. Uses a synthetic actor so it
+    can never collide with a real worker's stamps.
+    """
+    try:
+        who = "__selftest__"
+        text = "x" * (_DESC_REUSE_MINLEN + 20)
+        for k in [k for k in _desc_stamp if k[0] == who]:
+            _desc_stamp.pop(k, None)
+        first = _desc_reuse_check(who, "SELFTEST-1", text)      # must NOT fire
+        second = _desc_reuse_check(who, "SELFTEST-2", text)     # MUST fire
+        third = _desc_reuse_check(who, "SELFTEST-3", "y" * (_DESC_REUSE_MINLEN + 20))  # must NOT
+        for k in [k for k in _desc_stamp if k[0] == who]:
+            _desc_stamp.pop(k, None)
+        ok = (first is None) and bool(second) and (third is None)
+        if not ok:
+            slog("[selftest] DESC-REUSE DETECTOR IS NOT WORKING — "
+                 f"first={first!r} second={second!r} third={third!r}. "
+                 "Bulk-close misattribution is going unnoticed.")
+            _ilog("selftest", "detector_broken", actor="amux", target="desc_reuse",
+                  ok=False, detail={"first": first, "second": second, "third": third})
+        return ok
+    except Exception as e:
+        slog(f"[selftest] desc-reuse self-test itself failed: {e!r}")
+        return False
+
 
 _repo_root_memo: dict = {}
 
@@ -62555,37 +62611,20 @@ class CCHandler(BaseHTTPRequestHandler):
                             _actor = (_hdr_worker(self.headers)
                                       or self.headers.get("X-Amux-User-Email", "")
                                       or "unattributed")
-                            # BULK-CLOSE MISATTRIBUTION GUARD (reported by
-                            # tubescience, 2026-08-05). An end-of-turn sweep that
-                            # PATCHes every open card with ONE desc string makes
-                            # the ledger lie: TUBES-1410 carried 1409's outcome,
-                            # 1413/1414 carried 1412's. A reviewer then attributes
-                            # work to the wrong unit, and the board cannot tell a
-                            # specific outcome from a stamped one.
-                            #
-                            # That exact signature — same worker, same desc text,
-                            # different cards, seconds apart — has no legitimate
-                            # use: two cards with genuinely identical outcomes are
-                            # two cards that should have been one. Warn loudly
-                            # rather than reject: the write is not WRONG, it is
-                            # unlikely to be intended, and refusing it outright
-                            # would block a lane mid-sweep with no way to say
-                            # "yes, really".
+                            # Detection lives in _desc_reuse_check so a standing
+                            # self-test can exercise THIS code path rather than a
+                            # copy of it (tubescience: a fail-open detector wrapped
+                            # in its own except cannot fail, so its silence reads as
+                            # health — plant a known-positive that must always fire).
                             try:
-                                _d_new = (body.get("desc") or "").strip()
-                                if _d_new and len(_d_new) > 80:
-                                    _k = (_actor, hashlib.sha1(_d_new.encode()).hexdigest()[:12])
-                                    _seen = _desc_stamp.get(_k)
-                                    if _seen and _seen[0] != bid and (time.time() - _seen[1]) < 300:
-                                        slog(f"[board] DESC REUSE: '{_actor}' wrote the same "
-                                             f"desc onto {_seen[0]} and now {bid} within "
-                                             f"{int(time.time() - _seen[1])}s — is one of them "
-                                             f"carrying the other's outcome? (tubescience, "
-                                             f"bulk-close misattribution)")
-                                        _ilog("board", "desc_reuse", actor=_actor, target=bid,
-                                              ok=True, detail={"also_on": _seen[0],
-                                                               "secs_apart": int(time.time() - _seen[1])})
-                                    _desc_stamp[_k] = (bid, time.time())
+                                _hit = _desc_reuse_check(_actor, bid, body.get("desc") or "")
+                                if _hit:
+                                    slog(f"[board] DESC REUSE: '{_actor}' wrote the same desc onto "
+                                         f"{_hit['also_on']} and now {bid} within "
+                                         f"{_hit['secs_apart']}s — is one carrying the other's "
+                                         f"outcome? (tubescience, bulk-close misattribution)")
+                                    _ilog("board", "desc_reuse", actor=_actor, target=bid,
+                                          ok=True, detail=_hit)
                             except Exception as _dre:
                                 slog(f"[board] desc-reuse check failed for {bid}: {_dre!r}")
                             if _chg:
@@ -69517,6 +69556,7 @@ def main():
     schedule_job(_index_token_ledger,    interval=60,                   name="token_ledger",  initial_delay=12)
     schedule_job(_ilog_prune,            interval=3600,                 name="ilog_prune",    initial_delay=300)
     schedule_job(_depr_report,           interval=3600,                 name="depr_report",   initial_delay=600)
+    schedule_job(_desc_reuse_selftest,   interval=3600,                 name="desc_selftest", initial_delay=120)
     # initial_delay is deliberately SHORT. This file live-reloads on save and is a
     # shared checkout — observed restarting every ~2 minutes while several sessions
     # were editing it. Every restart resets initial_delay, so a long one on a busy
