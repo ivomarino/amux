@@ -36144,7 +36144,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.468';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.469';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -36317,7 +36317,14 @@ function openPeek(name, opts) {
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   const _tb = document.getElementById('peek-transcript-body');
   if (_tb) { _tb.innerHTML = ''; _tb._lastHTML = null; }
-  clearPeekFiles();  // clear any stale attachments from previous peek
+  // Attachments follow the worker, like the draft. Reopening the SAME worker
+  // keeps whatever is in the bar; switching workers stashes the old one's files
+  // and restores the new one's, so nothing is silently lost and nothing leaks
+  // across workers (which is what the old blanket clear was protecting against).
+  if (peekSession !== name) {
+    if (peekSession) _peekFilesStash(peekSession);
+    _peekFilesRestore(name);
+  }
   peekSession = name;
   _lastPeekedSession = name;   // remembered for the Messages view's default filter
   _peekScrollLocked = false;
@@ -36532,12 +36539,14 @@ function closePeek() {
     const inp = document.getElementById('peek-cmd-input');
     const val = inp ? inp.value : '';
     _draftSave(peekSession, val);
+    _peekFilesStash(peekSession);   // the other half of the same draft
   }
   peekSession = null;
   peekSearchQuery = '';
   lastPeekHTML = '';
   hidePeekLoading();   // don't leak the "Loading latest…" cue into the next open
-  clearPeekFiles();
+  // Attachments were stashed above, beside the draft — do NOT clear them here.
+  // This line used to be clearPeekFiles(), which is what dropped them on close.
   // Close split pane if open
   const splitWrap = document.getElementById('peek-split-wrap');
   if (splitWrap) splitWrap.classList.remove('split-active');
@@ -37956,6 +37965,30 @@ function removePeekFile(idx) {
 function clearPeekFiles() {
   peekFiles.forEach(f => { if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
   peekFiles = [];
+  // Drop the stash too, or a send would clear the bar and the next open would
+  // resurrect the files that were just sent.
+  try { if (peekSession) delete _peekFilesBySession[peekSession]; } catch (e) {}
+  renderPeekFiles();
+}
+
+// Attachments are per WORKER, exactly like the text draft — they are two halves
+// of the same composer. closePeek() called _draftSave(peekSession, val) and then
+// clearPeekFiles() six lines later, so closing a peek PERSISTED what you typed
+// and DESTROYED what you attached; reopening restored the text next to an empty
+// attachment bar, with nothing saying the file had been dropped.
+let _peekFilesBySession = {};   // worker name -> [{name, path, url, isImage, previewUrl}]
+
+function _peekFilesStash(session) {
+  if (session) {
+    if (peekFiles.length) _peekFilesBySession[session] = peekFiles;
+    else delete _peekFilesBySession[session];
+  }
+  peekFiles = [];               // hand off, do NOT revoke: the previews are still live
+  renderPeekFiles();
+}
+
+function _peekFilesRestore(session) {
+  peekFiles = (session && _peekFilesBySession[session]) || [];
   renderPeekFiles();
 }
 
@@ -57744,7 +57777,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.468';
+const CACHE = 'amux-v0.9.469';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
