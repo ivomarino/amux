@@ -72,3 +72,25 @@ spots, both now fixed:
   is syntax + refs + secrets + pytest on one runner with no Docker build. The
   slow workflows (image build 169s, iOS 300s) are correctly out of the
   contribution path.
+
+## Addendum — 2026-08-06, from the herdr merge
+
+**A third failure class exists that the run-stats above hide: GitHub-side
+transients.** `checks` went red on the merge commit with `Failed to resolve
+action download info. Error: Service Unavailable` — the runner could not fetch
+`actions/checkout` at all, so the job died in **Set up job** before any of our
+code ran. Green on a plain re-run, no change.
+
+That matters for reading the table: a red `checks` is not automatically a real
+failure, and "our commits are failing" can include runs where GitHub could not
+start the job. Distinguish by the failing STEP — a failure in `Set up job` is
+infrastructure, a failure in a named step is ours. Worth a retry-once policy on
+the setup steps if this recurs; not worth building until it does.
+
+**Also corrected, both documented wrongly in CLAUDE.md and found by doing a real
+restart:** `~/.local/bin/amux-server.py` is a **symlink** to the repo checkout,
+so the documented `cp amux-server.py ~/.local/bin/` is a no-op (`cp` refuses,
+"are identical"), and the launchd label is **`com.amux.server`**, not
+`com.amux.serve` — the documented `launchctl kickstart` fails with
+"Could not find service". Both would leave someone believing they had restarted
+a server they had not.

@@ -91,8 +91,11 @@ somebody can pick up.
   and you will see it running out of `~/.local/bin`. To see a change on
   `https://localhost:8822`, install it, then confirm it actually took:
   ```bash
-  cp amux-server.py ~/.local/bin/amux-server.py
-  launchctl kickstart -k gui/$(id -u)/com.amux.serve   # label is com.amux.serve
+  # NOTE: ~/.local/bin/amux-server.py is a SYMLINK to this checkout, so there is
+  # nothing to copy — `cp` refuses with "are identical". The label is
+  # com.amux.serVER; `com.amux.serve` fails with "Could not find service", which
+  # looks like a restart you did not get. Both verified 2026-08-06.
+  launchctl kickstart -k gui/$(id -u)/com.amux.server
   curl -sk https://localhost:8822/ | grep -c '<a line unique to your change>'
   ```
   Verify with a string your edit INTRODUCED, not one that already existed — grepping a
@@ -112,12 +115,27 @@ main deploys EVERY unpushed commit touching that file, including other sessions'
 reviewed at that moment.** Always run first:
 
 ```bash
+git fetch origin                                # refresh — the recipe is wrong without this
 git rev-list --count origin/main..main          # how many commits am I about to ship?
 git log --oneline origin/main..main             # whose are they?
 ```
 
-If commits you did not write are listed, ask their author before pushing. "My change is small" is
-not the question; the question is what rides along with it.
+A commit already upstream under a **different SHA** (cherry-pick, rebase, replay) sits in
+`origin/main..main` permanently. Before asking a peer about a seemingly foreign commit,
+check whether it shares a patch-id with something already on origin:
+
+```bash
+# Compare patch-ids: if upstream has the same patch, the local commit is a duplicate, not foreign
+git log --format="%H" origin/main..main | git patch-id --stable | while read pid sha; do
+  if git log --format="%H" origin/main | git patch-id --stable | grep -q "^$pid "; then
+    echo "DUPLICATE (already upstream): $sha"
+  fi
+done
+```
+
+If commits you did not write are listed **and are not upstream duplicates**, ask their author
+before pushing. "My change is small" is not the question; the question is what rides along
+with it.
 
 **The mirror case is just as real: "my commits are not pushed" does NOT mean they are inert.** On a
 shared checkout they are staged to ship under someone else's push, at a time you do not choose. A
