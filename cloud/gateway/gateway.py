@@ -3224,6 +3224,46 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[admin] cleanup DB for {target_uid} failed: {e}", flush=True)
             return self._json({"ok": True, "container_stopped": stopped})
 
+        # ── Unmatched /api/gateway/admin/* → 404, never the container proxy ───
+        # AC-235: a DELETE to /api/gateway/admin/orgs/<id> (a route that does not
+        # exist — org teardown is DELETE /api/gateway/orgs/<id>, no "admin") fell
+        # through to the proxy below, which woke a container and answered
+        # `{"error":"starting"} 503`. A 503 is health-shaped, so five identical
+        # failures read as "the host is sick" and sent two rounds of diagnosis at
+        # a box that was idle and answering GETs in 4s. The gateway knew the route
+        # did not exist and said "service unavailable" instead.
+        #
+        # Anything under /api/gateway/admin/ is a control-plane call, never
+        # something an org container should serve. Answer for it here and name the
+        # routes, so a wrong verb or a wrong path is self-correcting rather than
+        # indistinguishable from an outage.
+        if path.startswith("/api/gateway/admin/"):
+            if not is_admin:
+                return self._json({"error": "forbidden"}, 403)
+            return self._json({
+                "error": "no such admin route",
+                "method": self.command,
+                "path": path,
+                # Keep this list complete — an INCOMPLETE list is its own bug: the
+                # first draft named 5 of the 11 routes, which would send a caller
+                # hunting for a route that exists. Verify against the handlers above
+                # when adding one.
+                "routes": [
+                    "POST   /api/gateway/admin/promo",
+                    "GET    /api/gateway/admin/promos",
+                    "GET    /api/gateway/admin/containers",
+                    "GET    /api/gateway/admin/users",
+                    "POST   /api/gateway/admin/query",
+                    "POST   /api/gateway/admin/provision",
+                    "GET    /api/gateway/admin/orgs",
+                    "PATCH  /api/gateway/admin/orgs/<org_id>",
+                    "POST   /api/gateway/admin/orgs/<org_id>/refresh-auth",
+                    "POST   /api/gateway/admin/orgs/<org_id>/refresh-spend",
+                    "DELETE /api/gateway/admin/cleanup/<user_id>",
+                ],
+                "hint": "to delete an org use DELETE /api/gateway/orgs/<org_id> (owner only, no 'admin' segment)",
+            }, 404)
+
         # ── Determine target container via active org ─────────────────────────
         active_org = _active_org_id()
         org_data = db.execute(

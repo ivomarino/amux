@@ -417,3 +417,35 @@ NOTE: the general shape is worth naming because it recurs — a probe that canno
   family as the empty grep that reads as a measurement, and as `git status` after a commit,
   which cannot distinguish "nothing of theirs was there" from "I swept all of it". In each
   case the failing check produces a green, plausible result and nothing prompts a recheck.
+
+## An unimplemented gateway admin route answers 503, not 404, and wakes a container doing it
+AREA: cloud
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux-cloud-demos
+CARD: AC-235
+SYMPTOM: `DELETE /api/gateway/admin/orgs/<id>` does not exist — org teardown is
+  `DELETE /api/gateway/orgs/<id>`, with no `admin` segment. But the gateway has no
+  catch-all for `/api/gateway/admin/*`, so the request fell past every admin handler
+  into the container proxy, which called `_ensure_container_starting` and answered
+  `{"error":"starting"} 503`. Five DELETEs, five identical 503s.
+COST: Two full rounds of misdiagnosis pointed at the wrong subsystem. The host had
+  genuinely been sick for hours (container thundering herd, AC-231), so a 503 was
+  exactly the shape of the failure I was already fighting, and I read it as "the herd
+  is still saturating the box" — while GET on the same admin API was returning 200 in
+  4.1s and the box was idle at 0 running containers. I reset the instance and rewrote
+  the boot fix twice before noticing the contradiction between a stable GET and a
+  failing DELETE against the same service. The route had never existed at any point.
+FIX: `1a04ab0` — unmatched `/api/gateway/admin/*` now returns 404 naming the method,
+  the path, all 11 real admin routes, and a hint pointing at the correct teardown
+  route. Control-plane paths are never proxied to an org container.
+NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for something
+  that isn't there" and is self-correcting in one round; a 503 says "this service is
+  unwell", which is unfalsifiable from the client and, when the service HAS been unwell,
+  corroborates the wrong theory instead of contradicting it. An error that mimics the
+  outage you are already investigating is worse than a silent failure — it does not just
+  fail to inform, it actively confirms. Same family as the ethos's loud-wrong probe: the
+  answer arrives, looks plausible, and nothing prompts a recheck. When adding a route
+  namespace, add its catch-all in the same commit; the fallthrough target is whatever
+  happens to sit below, and here that was a side-effecting container start.
