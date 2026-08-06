@@ -10490,7 +10490,8 @@ if err=='gate not acknowledged':
     print('')
     print('If a criterion cannot be true because the card is mistyped (item_type='+str(d.get('item_type') or '?')+'),')
     print('correct the TYPE rather than acking something untrue:')
-    print('  amux board '+tgt+' '+iid+' --type <chore|task|doc|research|ops|decision|investigation>')
+    _vt=d.get('valid_types') or []
+    print('  amux board '+tgt+' '+iid+' --type <'+('|'.join(_vt) if _vt else 'see GET /api/board/contract')+'>')
     sys.exit(2)
 if 'holding' in err.lower() or 'wip' in err.lower():
     print(iid+': BLOCKED — '+str(d.get('message') or err))
@@ -19357,6 +19358,78 @@ def _memory_layers(name: str) -> list:
         _add(f"tag:{t}", "memory", CC_MEMORY / "tags" / f"{t}.md")
     _add(f"session:{name}", "memory", CC_MEMORY / f"{name}.md")
     return out
+
+
+_MEM_INHERIT_FILES = [f.strip() for f in
+                      os.environ.get("AMUX_MEMORY_INHERIT_FILES", "CLAUDE.md").split(",")
+                      if f.strip()]
+
+
+def _inherited_instruction_files(work_dir: str, names=None) -> list:
+    """The CLAUDE.md chain a worker inherits, nearest-last (Ethan, 2026-08-06).
+
+    Claude Code composes instructions from every CLAUDE.md between the user
+    level and the working directory, so a lane in
+    ~/Dev/mixpeek/customers/tubescience is operating under FOUR files it never
+    sees listed anywhere: ~/.claude/CLAUDE.md, ~/Dev/CLAUDE.md,
+    ~/Dev/mixpeek/CLAUDE.md, and its own. Until now amux's Memory tab showed
+    only the layers amux itself composes, so the majority of what actually
+    constrains a lane was invisible in the one place built to answer "what is
+    this worker operating under". That is the same gap as the composed GEMINI.md
+    that told a lane to bypass gates and could not be seen from anywhere.
+
+    DISPLAY ONLY, and that distinction is load-bearing. These are NOT folded
+    into the composed memory: Claude Code already loads them itself, so
+    composing them would duplicate every byte into the context window and count
+    twice against the read ceiling the folding machinery exists to protect.
+    They are reported so a human can SEE the inheritance, not so amux can
+    re-deliver it. Hence `kind: "inherited"`, which every composer filters out
+    by kind rather than by accident.
+
+    Walks up to $HOME and stops — above that is /Users and /, which are not
+    project scope and would report a stray file as an inherited instruction.
+    Filename list is config, not code: AMUX_MEMORY_INHERIT_FILES, default
+    CLAUDE.md, comma-separated so a fleet using AGENTS.md or GEMINI.md can say
+    so without a patch.
+    """
+    out = []
+    names = names or _MEM_INHERIT_FILES
+    try:
+        home = Path.home().resolve()
+        # User level first — least specific, matching _memory_layers' ordering.
+        for n in names:
+            _add_inherited(out, "user", CLAUDE_HOME / n)
+        if not work_dir:
+            return out
+        wd = Path(work_dir).expanduser().resolve()
+        chain = []
+        cur = wd
+        while True:
+            chain.append(cur)
+            if cur == home or cur.parent == cur or home not in cur.parents:
+                break
+            cur = cur.parent
+        for d in reversed(chain):            # least specific first
+            for n in names:
+                try:
+                    _rel = d.relative_to(home)
+                    _label = f"~/{_rel}" if str(_rel) != "." else "~"
+                except ValueError:
+                    _label = str(d)
+                _add_inherited(out, _label, d / n)
+    except Exception:
+        pass
+    return out
+
+
+def _add_inherited(out: list, scope: str, path) -> None:
+    try:
+        txt = path.read_text(errors="replace").strip() if path.is_file() else ""
+    except Exception:
+        txt = ""
+    out.append({"layer": scope, "kind": "inherited", "path": str(path),
+                "exists": bool(txt), "bytes": len(txt), "text": txt,
+                "name": path.name})
 
 
 def _compose_rules_block(layers: list) -> str:
@@ -64964,8 +65037,25 @@ class CCHandler(BaseHTTPRequestHandler):
                                     "cli": ("amux board " + str(new_status) + " " + str(bid)
                                             + " --checked "
                                             + " ".join(json.dumps(str(g)) for g in eff_gate)),
-                                    "cli_wrong_type": ("amux board type " + str(bid)
-                                                       + " <chore|task|doc|research|ops|decision|investigation>"),
+                                    # AC-249: DERIVE the suggestion from the same tuple
+                                    # the validator uses. The hardcoded list said
+                                    # <chore|task|doc|research|ops|decision|investigation>
+                                    # — `decision` and `task` are NOT valid types and the
+                                    # server rejects both, while escalation/blocker/
+                                    # tripwire/watch ARE valid and were never suggested.
+                                    # Wrong in both directions from one string that had
+                                    # drifted. Retyping is the sanctioned escape from a
+                                    # gate that does not fit (rule 3, "fix the type, not
+                                    # the truth"), so a wrong hint lands exactly where the
+                                    # honest path has to stay walkable. The card's CURRENT
+                                    # type is excluded — suggesting what it already is is
+                                    # never the fix.
+                                    "cli_wrong_type": ("amux board type " + str(bid) + " <"
+                                                       + "|".join(t for t in _ITEM_TYPES
+                                                                  if t != (gate_item.get("type")
+                                                                           or _DEFAULT_ITEM_TYPE))
+                                                       + ">"),
+                                    "valid_types": list(_ITEM_TYPES),
                                 }, 409)
                         if eff_gate:
                             _chk = body.get("gate_checked")
@@ -69388,6 +69478,27 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                 "not as the session's full reach.",
                     },
                 })
+            if action == "memory-inherited":
+                # The CLAUDE.md chain this worker operates under but amux does not
+                # compose (Ethan, 2026-08-06). Display only — Claude Code loads
+                # these itself, so returning `text` is for a human reading the tab,
+                # never for re-delivery into the context window.
+                _wd = _session_work_dir(name) or ""
+                _names = [f.strip() for f in (qs.get("file", [""])[0] or "").split(",") if f.strip()]
+                _inh = _inherited_instruction_files(_wd, _names or None)
+                return self._json({
+                    "worker": name,
+                    "dir": _wd,
+                    "filenames": _names or _MEM_INHERIT_FILES,
+                    "configured_by": "AMUX_MEMORY_INHERIT_FILES (server.env), or ?file= on this call",
+                    "note": "Loaded by Claude Code itself, not composed by amux — shown so the "
+                            "inheritance is visible, not duplicated into memory.",
+                    "found": [l for l in _inh if l["exists"]],
+                    "missing": [{k: v for k, v in l.items() if k != "text"}
+                                for l in _inh if not l["exists"]],
+                    "total_bytes": sum(l["bytes"] for l in _inh if l["exists"]),
+                })
+
             if action == "memory-explain":
                 # "Which rules is this session actually operating under, and from
                 # which layer?" — answerable without reading the composed file

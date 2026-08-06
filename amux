@@ -1156,7 +1156,19 @@ if "gate" in e:
             "\nIf a criterion does not apply because the card is mistyped "
             "(item_type=" + str(d.get("item_type") or "?") + "), correct the TYPE "
             "rather than acking something untrue:\n"
-            "  amux board type " + iid + " <chore|task|doc|research|ops|decision|investigation>\n")
+            # AC-249: derive from valid_types as published by the server. The
+            # hardcoded list named decision and task, neither of which the
+            # validator accepts, and omitted escalation/blocker/tripwire/watch,
+            # which it does accept -- wrong in BOTH directions from a string
+            # that had drifted from _ITEM_TYPES. No hardcoded fallback: a stale
+            # list that looks authoritative is the whole defect.
+            # NOTE: this block is inside python3 -c QUOTED-WITH-SINGLE-QUOTES,
+            # so an apostrophe here closes the bash string and breaks the CLI
+            # for every session. Keep this comment apostrophe-free.
+            "  " + (d.get("cli_wrong_type")
+                    or ("amux board type " + iid + " <"
+                        + ("|".join(d.get("valid_types") or [])
+                           or "see GET /api/board/contract") + ">")) + "\n")
     sys.exit(3)
 if "holding" in e or "doing" in e or "wip" in e:
     if tgt:
