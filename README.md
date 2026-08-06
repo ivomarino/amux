@@ -415,6 +415,22 @@ curl -sk -X POST -H 'Content-Type: application/json' -d '{
 Config lives in `~/.procwarden/config.json` (created on first run). Entirely
 optional — amux never invokes it unless you schedule it.
 
+### Who changed a schedule
+
+The `schedules` rows carry no actor column, so `updated` alone cannot tell you who
+enabled, disabled or edited one. Every mutation is attributed separately:
+
+```bash
+curl -sk "$AMUX_URL/api/schedules/audit?limit=100"          # fleet-wide, newest first
+curl -sk "$AMUX_URL/api/schedules/audit?id=SCHED-42"        # one schedule's history
+```
+
+Each row is `{schedule_id, ts, field, old_value, new_value, source, by_who}` — `by_who`
+from the caller's `X-Amux-Session`, `source` distinguishing an `api-patch` from the
+scheduler's own `watch-autodisable` / `run-once`. `GET /api/schedules` also returns an
+`X-Amux-Audit` header pointing here, because the table is where people look first and it
+is not the table that holds the answer.
+
 ---
 
 ## Tunnel

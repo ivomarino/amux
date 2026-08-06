@@ -36804,7 +36804,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.482';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.483';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58088,7 +58088,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.482';
+const CACHE = 'amux-v0.9.483';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63499,7 +63499,29 @@ class CCHandler(BaseHTTPRequestHandler):
                         o["fleet_share"] = round(100 * _fd.get(o.get("id"), 0) / _tot, 1)
                 except Exception:
                     pass
-                self._json(out)
+                # POINT AT THE AUDIT FROM THE PAYLOAD PEOPLE ACTUALLY READ
+                # (AMUX-2416). GET /api/schedules/audit has existed since
+                # AMUX-1735 and answers "who changed this" in one call — it
+                # returned all 78 rows of the 2026-08-05 mass-disable, actor and
+                # all. Nobody found it: it is in no doc, no CLI verb, and the
+                # schedules table itself has no attribution column. So an
+                # investigator read `updated`, saw no actor, and filed the
+                # incident as unrecoverable (AMUX-2414). The audit was written,
+                # retained, correct, and unreachable — ethos #4's second layer,
+                # "a tag in a store the reader never opens is the same failure as
+                # no tag". A header cannot break a JSON consumer, and it lands in
+                # front of the one person who is already looking at this data.
+                _n_aud = 0
+                try:
+                    _n_aud = db.execute("SELECT COUNT(*) FROM schedule_audit").fetchone()[0]
+                except Exception:
+                    pass
+                self._json(out, headers={
+                    "X-Amux-Audit": "/api/schedules/audit?id=<SCHED-N>&limit=100",
+                    "X-Amux-Audit-Note": (
+                        f"schedules rows carry NO actor column; every enable/disable/edit is "
+                        f"attributed in schedule_audit ({_n_aud} rows) with by_who + source"),
+                })
                 return
 
             # GET /api/schedules/runs — recent runs across all schedules
