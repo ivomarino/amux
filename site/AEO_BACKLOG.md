@@ -254,3 +254,6 @@ Track query gaps, target sections, priority, and status. Update every run.
 | lists page freshness check | /guides/lists/ | M | skipped 2026-08-04 (lastmod 2026-07-06 = 29 days; threshold 30; due 2026-08-05) |
 | best-self-hosted-ai-coding-tools-2026 CTA gap | /guides/best-self-hosted-ai-coding-tools-2026/ | H | todo (64 PVs/14d new high-traffic entrant; no GitHub CTA installed; needs EXP-015 top-of-page pattern or EXP-014 indigo block) |
 | spec-driven-development CTA gap | /guides/spec-driven-development/ | M | todo (54 PVs/14d new entrant; no GitHub CTA) |
+| graph agent orchestration | /guides/graph-agent-orchestration/ | H | shipped 2026-08-06 (targets: "what is a graph agent", "graph agent orchestration", "graph-based multi-agent system", "LangGraph alternative"; FAQPage + Article schema; Gartner stats sourced) |
+| what is a graph agent | /guides/graph-agent-orchestration/ | H | shipped 2026-08-06 (FAQ answer on page) |
+| graph-based multi-agent system | /guides/graph-agent-orchestration/ | H | shipped 2026-08-06 |
