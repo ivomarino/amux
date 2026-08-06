@@ -29402,7 +29402,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div id="msgs-controls" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-shrink:0;flex-wrap:wrap;">
     <div class="search-wrap" style="flex:1;min-width:180px;">
-      <input class="search-input" id="msgs-search" type="text" placeholder="Search messages..." autocomplete="off" oninput="_messagesRender()">
+      <input class="search-input" id="msgs-search" type="text" placeholder="Search messages… (Enter searches ALL history)" autocomplete="off" oninput="if(!this.value&&_msgsDeepQ){_msgsDeepQ='';_messagesLoad(true);}else{_messagesRender()}" onkeydown="if(event.key==='Enter'){event.preventDefault();_msgsDeepQ=this.value.trim();_messagesLoad(true);}">
       <div id="msgs-selbar" style="display:none;"></div>
     </div>
     <select id="msgs-session-filter" onchange="_msgsCounts=null;_messagesLoad(true,this.value)" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
@@ -36913,7 +36913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.490';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.491';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47577,7 +47577,16 @@ async function fetchBoard() {
     const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
       lastBoardJSON = j;
-      boardItems = _mergeArchived(data);
+      // While a full-corpus text search is live, the default page must not
+      // REPLACE the full set — that would silently shrink the search back to
+      // 100 cards mid-read. Merge the fresh page over the full set by id, and
+      // let the next _boardEnsureFull (60s) true it up.
+      if (_boardFullTs && boardItems.length > data.length) {
+        const fresh = new Map(data.map(i => [i.id, i]));
+        boardItems = boardItems.map(i => fresh.get(i.id) || i);
+      } else {
+        boardItems = _mergeArchived(data);
+      }
       _cacheBoardJSON(j);
       renderBoard();
     }
@@ -48627,7 +48636,29 @@ function _renderBoardBySession(visible, container) {
 }
 
 let _boardRenderPending = false;
+// The board matcher already searches EVERY field, desc and log included — but
+// it scans boardItems, which the SSE cache fills with done_limit=100. So a text
+// search silently searched a PAGE while presenting itself as searching the
+// board: a hit on an older done card was unfindable and read as "no such card"
+// (AMUX-2291/2292's complaint, AMUX-2425). When a text term is present, fetch
+// the FULL board once (cached 60s) and let the same matcher scan all of it —
+// FTS by widening the corpus, not by forking the query language.
+let _boardFullTs = 0, _boardFullLoading = false;
+function _boardEnsureFull() {
+  const q = (boardSearchQuery || '').trim();
+  const hasText = q && _bqParse(q).text.length > 0;
+  if (!hasText || _boardFullLoading || Date.now() - _boardFullTs < 60000) return;
+  _boardFullLoading = true;
+  fetch(API + '/api/board?done_limit=0', { headers: _authHeaders() })
+    .then(r => r.json())
+    .then(d => {
+      if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); }
+    })
+    .catch(() => {})
+    .finally(() => { _boardFullLoading = false; });
+}
 function renderBoard() {
+  _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
   renderBoardFilters();
@@ -55196,6 +55227,7 @@ window.addEventListener('resize', () => {
 
 // ── Messages tab (global send history across all sessions) ──────────────────
 let _msgsData = [];
+let _msgsDeepQ = '';   // non-empty = server-side full-history search is active
 let _msgsOffset = 0;
 const _MSGS_PAGE = 200;
 let _msgsDone = false;
@@ -55211,6 +55243,10 @@ async function _messagesLoad(reset, presetSession) {
     let _u = API + '/api/history?limit=' + _MSGS_PAGE + '&offset=' + _msgsOffset;
     if (_msgsKind !== 'all') _u += '&kind=' + encodeURIComponent(_msgsKind);
     if (_sf) _u += '&session=' + encodeURIComponent(_sf);
+    // Deep search (Enter in the box): the SERVER scans all history, so hits
+    // older than the loaded page exist. Typing still filters the loaded page
+    // instantly — two speeds, one box (AMUX-2426).
+    if (_msgsDeepQ) _u += '&q=' + encodeURIComponent(_msgsDeepQ);
     const r = await fetch(_u);
     const rows = await r.json();
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
@@ -58281,7 +58317,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.490';
+const CACHE = 'amux-v0.9.491';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60978,6 +61014,16 @@ class CCHandler(BaseHTTPRequestHandler):
                         # fleet's history under a group name — a wrong answer that
                         # looks like a working feature.
                         where.append("1=0")
+                # ?q= — full-text over message TEXT, server-side (AMUX-2426:
+                # "board, files, and messages should all support fts"). In SQL,
+                # not applied to fetched rows: the client's box only filtered
+                # the 200 rows already loaded, so a hit older than the current
+                # page was unfindable and read as "no such message" — the same
+                # page-vs-corpus gap the kind filter above already documents.
+                _hq = (qs.get("q", [""])[0] or "").strip()
+                if _hq:
+                    where.append("text LIKE ? ESCAPE '\\'")
+                    params.append("%" + _hq.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%")
                 if want:
                     ors = []
                     for k in want:
