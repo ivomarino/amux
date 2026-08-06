@@ -36421,7 +36421,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.471';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.472';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58054,7 +58054,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.471';
+const CACHE = 'amux-v0.9.472';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -63372,10 +63372,29 @@ class CCHandler(BaseHTTPRequestHandler):
                         # backlog stops the claim, so it must stop the routing.
                         _entered_queue = (updated_item.get("status") == "todo"
                                           and _prior_status != "todo")
+                        # ...and never notify the session that JUST MADE THIS
+                        # CHANGE (AMUX-2396). Returning your own card to the
+                        # queue fired "New board task assigned: <id> ... Run
+                        # `amux board claim <id>`" straight back at you, seconds
+                        # later — handing back the exact card you had just
+                        # declined. Reproduced on AMUX-2393 while writing this.
+                        #
+                        # It reads as a cooldown bug and is not: the auto-pickup
+                        # notice that TELLS you to do this says the card "would
+                        # re-queue for pickup after a 24h cooldown", and that
+                        # cooldown is real — but it lives in the CLAIM query
+                        # (AMUX-1857, task.claimed events) and guards only that
+                        # path. This notifier shares none of its predicates, so
+                        # the promise the notice makes is one the notifier never
+                        # agreed to. Same shape as the doing->backlog case fixed
+                        # right above for AMUX-2205; todo was left behind.
+                        _self_move = bool((_actor or "").strip()) and \
+                            (_actor or "").strip() == (new_session or "").strip()
                         if (new_session
                                 and updated_item.get("owner_type") == "agent"
                                 and updated_item.get("status") == "todo"
                                 and (updated_item.get("type") or "") not in ("tripwire", "watch")
+                                and not _self_move
                                 and (_assigned_now or _entered_queue)):
                             _notify_session_of_task(new_session, bid, updated_item.get("title", ""))
                     except Exception as _e:
