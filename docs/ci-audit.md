@@ -87,6 +87,56 @@ start the job. Distinguish by the failing STEP — a failure in `Set up job` is
 infrastructure, a failure in a named step is ours. Worth a retry-once policy on
 the setup steps if this recurs; not worth building until it does.
 
+## Addendum 2 — 2026-08-06, a THIRD failure class (amux-cloud)
+
+**`Deploy amux.io` is not the sick host, and this document left its 3 failures
+unexplained — which is the same hazard as misattributing them.** It is
+`pages.yml`: GitHub Pages, `configure-pages` + `upload-pages-artifact`, and
+verified here to contain **zero** SSH or host references. It is not among the
+14 workflows that reference the cloud host at all.
+
+Its failures are **concurrency cancellations**:
+
+```yaml
+concurrency:
+  group: pages
+  cancel-in-progress: true
+```
+
+With pushes minutes apart, in-flight runs get cancelled by the next one. When
+the cancel lands *during* the deployment step, the run reports **`failure`**
+while the job conclusion is `cancelled` — confirmed on `dd7a163`: run
+conclusion `failure`, job `deploy` conclusion `cancelled`, no failing named
+step.
+
+    15:31  5e88e012  cancelled   \  same minute — the later push won
+    15:31  40e65713  success     /
+    15:13  837bded8  failure
+    15:05  26ccb2bb  cancelled
+
+**Honest breakdown of the 11 recent failures: ~7 sick host, 3 pages
+concurrency, 1 `Set up job` transient. Zero code failures.** That is a better
+story than "18 of 27 were the host" — but only while the three classes stay
+distinguishable. An unexplained failure class in an audit is how a genuine
+Pages break gets waved through next week.
+
+### Constraint on the reachability probe, if it is built
+
+Yes to gating the cloud family, with one requirement that is load-bearing:
+**it must not read as success.** A skipped job renders neutral/grey, and grey
+reads as fine. If the probe is ever wrong, the deploy silently does not happen
+and nothing says so — trading a loud false failure for a quiet false success,
+which is strictly worse and is the rule-7 shape.
+
+So: probe, and on unreachable emit an explicit annotation (`SKIPPED: host
+unreachable at <host>:22 — not a deploy failure, see AC-231`) and still mark
+the run as needing attention rather than green. The verified-gate text already
+says this in words ("if e2e infra is unavailable, note why — that is not a
+failure"); the workflow should say it in the run.
+
+Note it fixes ~7 of 11 and **does not touch pages**. Anyone expecting it to
+clear all the red will conclude the gate is broken.
+
 **Also corrected, both documented wrongly in CLAUDE.md and found by doing a real
 restart:** `~/.local/bin/amux-server.py` is a **symlink** to the repo checkout,
 so the documented `cp amux-server.py ~/.local/bin/` is a no-op (`cp` refuses,
