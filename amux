@@ -1030,6 +1030,19 @@ _board_transition() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --outcome) outcome="${2:-}"; [[ -n "$outcome" ]] || die "--outcome needs text"; shift 2 ;;
+      # --outcome-stdin / --outcome-file: the same escape `send` has had since
+      # AMUX-1888, for the same reason. An inline double-quoted --outcome is
+      # evaluated by YOUR SHELL before amux sees it, so backticks and $(...)
+      # inside it are EXECUTED, not recorded. Outcomes are the field most likely
+      # to contain a command: on 2026-08-06 an outcome quoting a git invocation
+      # in backticks reached the card as "resolved the last commit with , which
+      # is a SUBSTRING search" — the command silently eaten, the sentence left
+      # dangling, and the shell erroring separately so the board write still
+      # looked like it succeeded. send and `board add` both had --stdin; the
+      # one field that routinely quotes shell did not.
+      --outcome-stdin) outcome="$(cat)"; [[ -n "$outcome" ]] || die "--outcome-stdin got empty input"; shift ;;
+      --outcome-file) [[ -r "${2:-}" ]] || die "--outcome-file needs a readable path"
+                      outcome="$(cat "$2")"; shift 2 ;;
       # --trigger records the EXTERNAL condition a card is parked on, into
       # source_ref/last_verified_at — the fields the board already has and
       # already renders (is:sourcestale). Without a verb the only way to set
@@ -1551,6 +1564,15 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
     --ack                          acknowledge the whole gate at once
     --outcome "what happened"      record the outcome FIRST, as its own write,
                                    so a refused transition cannot discard it
+    --outcome-stdin                read the outcome from stdin ${GREEN}(preferred)${RESET}
+    --outcome-file <path>          read the outcome from a file
+                                   Inline text is evaluated by YOUR shell, so
+                                   \`backticks\` and \$(...) in an outcome are
+                                   EXECUTED, not recorded. Use stdin whenever the
+                                   text quotes a command:
+                                     amux board done ID --checked "..." --outcome-stdin <<'EOF'
+                                     ... \`git log --grep=x\` stays literal ...
+                                     EOF
     --type T                       retype in the same write
     --override-doing               hold a second card in doing deliberately
     --trigger "external condition"  park on an EXTERNAL blocker: records it as the
