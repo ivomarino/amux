@@ -347,3 +347,44 @@ FIX: card AMUX-2444, landed with this entry — `amux-staged-guard` is now track
   `installed=1`. The remaining gap is AMUX-2443: on a single-file project amux-server.py is
   always "shared", which the guard only NOTEs, so the sweep that started all this is still
   possible — that one is open on purpose.
+
+## A generated hook file said nothing about being generated, so it got committed and froze
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2444
+SUPERSEDES: the entry above of the same card id, whose SYMPTOM and FIX were built on a
+  wrong premise. That entry says `amux-staged-guard` "existed ONLY in .git/hooks/ — which
+  git does not track" and treats that as an oversight to be corrected by tracking it. It is
+  not an oversight. Only the third defect in that entry — the stale installed pre-commit
+  with the AC-239 patterns inactive — was real, and that part stands.
+SYMPTOM: `.git/hooks/amux-staged-guard` is written per work_dir by
+  `_install_amux_precommit_guard()` from `_AMUX_GUARD_BODY` in amux-server.py, and the
+  server injects its own shim into whatever pre-commit exists. The file carries no banner
+  saying any of that. Reading it gives you a plain, sensible, untracked script and no
+  evidence at all that it is output.
+COST: I concluded it had gone untracked by mistake, committed a copy into
+  scripts/git-hooks/, and pointed install-hooks.sh at it. That made the installer a SECOND
+  PRODUCER of a generated file, frozen at the moment I copied it — so running it overwrote
+  the live guard and reverted amux-cloud's AC-241 improvement, which had shipped about an
+  hour earlier. It would have reverted every future one too. It also caused the guard to run
+  twice (server shim + my call), and I misread that double-print as a peer hand-editing the
+  installed copy and told them so — a wrong accusation on top of a wrong fix.
+  The tell I did not have: the sibling installer for the OTHER generated guard already warns
+  "edit amux-server.py, not the installed copy" — but it warns at INSTALL time, into the
+  server log, which is not where someone reading the file is looking. Rule 4's second layer:
+  the evidence existed and was not where the reader was.
+FIX: 8443cd9 — `_AMUX_GUARD_BODY` now opens with "GENERATED FILE — DO NOT EDIT, AND DO NOT
+  COMMIT IT TO A REPO", naming the source symbol, the writer function, that local edits are
+  silently replaced, and why it is untracked on purpose. Revert of the bad fix in fe86e63;
+  install-hooks.sh now installs only the pre-commit it owns and REPORTS whether the server's
+  guard is present rather than producing one. Verified on a real restart: server re-injected
+  its shim, invocations back to 1, installed guard carries AC-241's text, AC-239 patterns
+  still active.
+NOTE: this is the 5th AREA-clustered entry today on shared-checkout provenance (4 under
+  attribution, this one under instruments because the defect is the missing banner). All are
+  downstream of the same fact — N sessions share one working tree and git has no concept of
+  which session owns a hunk. Every fix so far, mine included, is a better WARNING about a
+  condition git cannot represent. "All fixed" should not be read as solved.
