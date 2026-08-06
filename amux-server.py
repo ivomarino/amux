@@ -32971,11 +32971,14 @@ let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render kee
 let _grpCollapsed = (function() {
   try { return localStorage.getItem('amux_grp_collapsed') === '1'; } catch (e) { return false; }
 })();
-function _grpAccToggle() {
-  _grpCollapsed = !_grpCollapsed;
+function _grpSetCollapsed(v) {
+  _grpCollapsed = !!v;
   try { localStorage.setItem('amux_grp_collapsed', _grpCollapsed ? '1' : '0'); } catch (e) {}
   const strip = document.getElementById('grp-scope-strip');
   if (strip) strip._want = '';   // force the guarded re-render to repaint
+}
+function _grpAccToggle() {
+  _grpSetCollapsed(!_grpCollapsed);
   render();
 }
 
@@ -36762,7 +36765,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.479';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.480';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -41585,6 +41588,7 @@ function _selectGlobalScope() {
   _grpScopeHtml = '';
   _grpOpen = closing ? null : _GLOBAL_SCOPE;
   _grpView = 'config';
+  if (_grpOpen) _grpSetCollapsed(false);   // same as a group pill: opening shows it
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
@@ -41603,6 +41607,14 @@ function _selectGroup(g) {
   // button whose cause is invisible, because the panel it would have opened is
   // already what you are looking at.
   _grpView = 'config';
+  // OPENING a group is a deliberate "show me this", so it must EXPAND. The
+  // collapse flag persists in localStorage, so once anyone collapsed the panel
+  // ONCE, every later group click produced a 54px bar with the content hidden
+  // behind a second click they had no reason to expect — the feature reads as
+  // broken, which is exactly how Ethan reported it. Collapse now means "hide
+  // this while I stay on the group", not a sticky global default that defeats
+  // the next click.
+  if (_grpOpen) _grpSetCollapsed(false);
   render();
   if (_grpOpen) {
     const el = document.getElementById('grp-scope-body-' + _grpOpen);
@@ -58040,7 +58052,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.479';
+const CACHE = 'amux-v0.9.480';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
