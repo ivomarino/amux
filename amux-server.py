@@ -26789,7 +26789,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Accordion toggle. Sits in flow at the top-right rather than overlapping the
      content the way the old absolute X did — it overlapped the member list, which
      is why the close control landed on top of the worker names. */
-  .grp-scope-acc { float:right; background:none; border:1px solid var(--border);
+  .grp-scope-head { display:flex; align-items:center; justify-content:space-between;
+    gap:10px; }
+  .grp-scope-title { color:var(--text); font-weight:600; font-size:0.82rem;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .grp-scope-sub { color:var(--dim); font-weight:400; }
+  /* NOT float. A float is not contained by a parent whose only other child is
+     display:none, so collapsing dropped the button out of the panel and left an
+     empty bordered box (Ethan's screenshot). Flex keeps the handle in the box at
+     both states. */
+  .grp-scope-acc { flex:0 0 auto; background:none; border:1px solid var(--border);
     border-radius:6px; color:var(--dim); font-size:0.66rem; line-height:1;
     padding:6px 9px; min-height:32px; cursor:pointer; margin-left:8px;
     -webkit-tap-highlight-color:transparent; }
@@ -33011,8 +33020,17 @@ function render() {
   if (stripEl) {
     if (_grpOpen) {
       const gid = escJs(_grpOpen);
+      // A header that is ALWAYS rendered, collapsed or not. The first cut put
+      // only a floated button here and hid the body — so collapsing produced an
+      // EMPTY bordered box with the Expand button escaping below it, because a
+      // float has nothing to contain it once its sibling is display:none. An
+      // accordion has to keep its own handle visible; that is the whole control.
+      const glabel = (_grpOpen === _GLOBAL_SCOPE) ? 'Global' : _grpOpen;
       const want = `<div class="grp-scope-panel" id="grp-scope-${gid}" onclick="event.stopPropagation();">`
-        + `<button class="grp-scope-acc" title="${_grpCollapsed ? 'Expand' : 'Collapse'}" onclick="event.stopPropagation();_grpAccToggle()">${_grpCollapsed ? '▸' : '▾'} ${_grpCollapsed ? 'Expand' : 'Collapse'}</button>`
+        + `<div class="grp-scope-head">`
+        +   `<span class="grp-scope-title">${esc(glabel)}<span class="grp-scope-sub"> · scope</span></span>`
+        +   `<button class="grp-scope-acc" title="${_grpCollapsed ? 'Expand' : 'Collapse'}" onclick="event.stopPropagation();_grpAccToggle()">${_grpCollapsed ? '▸ Expand' : '▾ Collapse'}</button>`
+        + `</div>`
         + `<div class="grp-scope-body" id="grp-scope-body-${gid}"${_grpCollapsed ? ' style="display:none;"' : ''}>${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
       // Only touch the DOM when the markup actually changes: an unconditional
       // innerHTML write on every render would wipe a scroll position and
@@ -33182,7 +33200,7 @@ function render() {
             oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
             onkeydown="cardSlashAcKeydown('${s.name}',event)"
             onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
-          <button class="btn primary" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">Send</button>
+          <div class="send-split"><button class="btn primary send-split-main" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">Send</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
         </div>` : ''}
       </div>
     </div>`;
@@ -35054,6 +35072,24 @@ async function sendFromInput(name) {
     channelOpen(name, routed.target, routed.message);
     return;
   }
+  // Honour the SAME send/queue mode the peek composer uses — the card now has
+  // the same split control, and a button labelled Queue that sends anyway would
+  // be the AMUX-2140 shape: a control you can read correctly and still be lied
+  // to by. Direct-send when the worker is at a selector, matching sendPeekCmd:
+  // a waiting session needs the keystroke to land now, not at a turn boundary.
+  const _atSel = (sessions.find(s => s.name === name) || {}).status === 'waiting';
+  if (_sendMode === 'queue' && !_atSel) {
+    cmdHistoryAdd(text, { type: 'steering' });
+    inp.value = '';
+    _draftClear(name);
+    inp.style.height = 'auto';
+    await steerSession(name, _expandAtMentions(text));
+    inp.style.borderColor = '#a371f7';
+    setTimeout(() => { inp.style.borderColor = ''; }, 600);
+    if (typeof showToast === 'function') showToast('Queued for ' + name + "'s next turn");
+    _cardQueuedBadge(name);
+    return;
+  }
   cmdHistoryAdd(text);
   inp.value = '';
   _draftClear(name);          // it left the composer — a restored copy would be a ghost
@@ -36719,7 +36755,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.476';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.477';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -38698,10 +38734,15 @@ function _toggleSendMode(e) {
   _updateSendSplit();
 }
 function _updateSendSplit() {
-  const split = document.querySelector('.send-split');
-  if (!split) return;
-  split.classList.toggle('mode-queue', _sendMode === 'queue');
-  split.querySelector('.send-split-main').textContent = _sendMode === 'queue' ? 'Queue' : 'Send';
+  // querySelectorAll, not querySelector. Send/Queue is ONE mode shared by every
+  // composer, and the worker list now has a split per card — with the singular
+  // lookup only the first one on the page ever relabelled, so the peek could say
+  // Queue while every card still said Send for the same mode.
+  document.querySelectorAll('.send-split').forEach(split => {
+    split.classList.toggle('mode-queue', _sendMode === 'queue');
+    const main = split.querySelector('.send-split-main');
+    if (main) main.textContent = _sendMode === 'queue' ? 'Queue' : 'Send';
+  });
 }
 setTimeout(_updateSendSplit, 0);
 
@@ -57992,7 +58033,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.476';
+const CACHE = 'amux-v0.9.477';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
