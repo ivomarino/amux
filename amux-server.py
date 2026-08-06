@@ -70425,23 +70425,99 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                             if not _touch:
                                 continue
                             _rel = sorted(os.path.relpath(p, _wd) for p in _touch)[:5]
+                            # ANSWER THE HYPOTHETICAL INSTEAD OF ASKING IT (AMUX-2456).
+                            # This notice used to say "If you had UNCOMMITTED changes
+                            # there, they are in that commit now" and send the reader to
+                            # go check. It never checked. It fires on FILE overlap, and
+                            # in a single-file repo that is EVERY peer commit — amux
+                            # measured six notices in one afternoon, six verification
+                            # round-trips, zero true positives from the notice itself.
+                            # The one real sweep that day was found by reading git state
+                            # directly; the notice arrived afterwards. Base rate ~100%,
+                            # informative rate ~0.
+                            #
+                            # The cost is not the round-trips. A notice that is almost
+                            # always a false alarm trains the reader to skim it, and the
+                            # one time it is real is the time it gets skimmed.
+                            #
+                            # What is NOT answerable, so do not try: "does the recipient
+                            # have uncommitted changes in that file". Git has no
+                            # per-session ownership of a hunk on a shared checkout, and
+                            # clean-after is equally consistent with having been swept —
+                            # the wrong test AC-241 documents.
+                            #
+                            # What IS answerable, from two facts amux already holds: the
+                            # recipient's recorded EDIT time (this notice fires because
+                            # of it) versus the timestamp of THEIR OWN last commit
+                            # touching the path, found via the Amux-Session trailer that
+                            # prepare-commit-msg stamps on every commit. Edit before
+                            # their commit ⇒ nothing was outstanding, definitively.
+                            # Edit after ⇒ the real alarm, which today reads identically
+                            # to the routine case.
+                            _outstanding, _basis = [], []
+                            for _p in sorted(_touch):
+                                _pr = os.path.relpath(_p, _wd)
+                                _edit = int(_touch.get(_p) or 0)
+                                # EXACT trailer match, not `--grep`. `--grep` is a
+                                # substring search, so a session whose name is a PREFIX
+                                # of another's matches the other's commits: with
+                                # `--grep=Amux-Session: amux`, lane 'amux' picked up
+                                # amux-cloud's commit and would have been told its work
+                                # was already committed. That direction is a FALSE
+                                # NEGATIVE — the alarm suppressed for the one lane that
+                                # needed it — which is worse than the noise being fixed
+                                # here. Caught only because the check was run against two
+                                # real session names instead of one.
+                                _cts = 0
+                                try:
+                                    _o = subprocess.run(
+                                        ["git", "-C", _cdir, "log", "-60",
+                                         "--format=%ct%x09%(trailers:key=Amux-Session,valueonly)%x00",
+                                         "--", _pr],
+                                        capture_output=True, text=True, timeout=8).stdout
+                                    for _rec in _o.split("\0"):
+                                        if not _rec.strip():
+                                            continue
+                                        _tss, _, _sn = _rec.strip().partition("\t")
+                                        if _sn.strip() == _other and _tss.strip().isdigit():
+                                            _cts = int(_tss.strip())
+                                            break
+                                except Exception:
+                                    _cts = 0
+                                if _cts and _edit and _edit <= _cts:
+                                    _basis.append(f"{_pr}: your edit "
+                                                  f"{time.strftime('%H:%M', time.localtime(_edit))}"
+                                                  f" ≤ your commit "
+                                                  f"{time.strftime('%H:%M', time.localtime(_cts))}")
+                                else:
+                                    _outstanding.append(
+                                        f"{_pr}: you edited it at "
+                                        f"{time.strftime('%H:%M', time.localtime(_edit)) if _edit else 'an unrecorded time'}"
+                                        + (f" and have not committed it since "
+                                           f"{time.strftime('%H:%M', time.localtime(_cts))}"
+                                           if _cts else " and have no commit of your own touching it"))
+                            # Log BOTH cases — the audit trail is why the base rate is
+                            # measurable at all — but only SPEAK when it discriminates.
+                            # Suppressing the routine case is the fix: it makes the
+                            # notice's arrival itself the signal.
+                            _ilog("git", "sweep_notice", actor=(_author or name), target=_other,
+                                  ok=True, detail={"sha": sha, "paths": _rel,
+                                                   "reporter": name, "author": _author or None,
+                                                   "outstanding": len(_outstanding),
+                                                   "suppressed": not _outstanding})
+                            if not _outstanding:
+                                continue
                             _steer_enqueue(_other,
                                 f"[amux] Commit {sha} by session '{_by}' touched files you "
                                 f"also edited recently: {', '.join(_rel)}.\n"
                                 f"\"{subj}\"\n"
-                                f"If you had UNCOMMITTED changes there, they are in that commit "
-                                f"now — not lost, but shipped under another session's message, "
-                                f"and your next `git commit` will say \"nothing to commit, working "
-                                f"tree clean\". Check `git log -1 --stat {sha}` and confirm your "
-                                f"change is in HEAD before reporting it. Do not report a sha you "
-                                f"did not create.",
+                                + "\n".join(f"  {b}" for b in _outstanding) + "\n"
+                                f"So your edits there may be IN that commit — not lost, but "
+                                f"shipped under another session's message, and your next "
+                                f"`git commit` may say \"nothing to commit, working tree "
+                                f"clean\". Run `git show --stat {sha}` and confirm before "
+                                f"reporting it. Do not report a sha you did not create.",
                                 guard=f"swept:{sha}:{_other}")
-                            # actor = the commit's AUTHOR; reporter kept alongside it so a
-                            # later reader can tell the two apart (they differ on a shared
-                            # checkout, which is what AC-230 was).
-                            _ilog("git", "sweep_notice", actor=(_author or name), target=_other,
-                                  ok=True, detail={"sha": sha, "paths": _rel,
-                                                   "reporter": name, "author": _author or None})
                 except Exception as _se:
                     slog(f"[commit-report] sweep check failed for {sha}: {_se}")
                 row = get_db().execute(
