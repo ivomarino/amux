@@ -543,3 +543,33 @@ NOTE: the general shape is a nudge asserting a fact with a shorter shelf life th
   not the code — I selected it with status='todo' and no `deleted IS NULL`, so I picked a
   deleted card. The same missing-predicate mistake in the probe that the guard fixes in the
   product, one layer down, which is the nesting ethos rule 1 describes.
+
+## The co-edit notice asks the reader to resolve a condition it is better placed to check
+AREA: notices
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2456
+SYMPTOM: "Commit <sha> by session X touched files you also edited recently... If you had
+  UNCOMMITTED changes there, they are in that commit now" — then tells the reader to go
+  check. It never checks. Same hypothetical AC-241 removed from the PRE-commit guard, which
+  now prints the staged line count so the committer can compare against what they wrote.
+COST: Six notices to me in one afternoon (24a294b, 9450b38, 90ac2e2, b96510b, c32cf8a,
+  7504abf), six verification round-trips, zero true positives FROM THE NOTICE. The one real
+  sweep today — 36 lines of mine inside 24a294b — I found independently by reading git
+  state; the notice arrived after. It fires on FILE overlap, and in a single-file repo that
+  is every peer commit, so the base rate is ~100% and the informative rate is ~0.
+  The round-trips are not the real cost. A notice that is almost always a false alarm trains
+  the reader to skim it, and the one time it is real is the time it gets skimmed.
+FIX: Not "check whether the recipient has uncommitted changes" — that is unanswerable, since
+  git has no per-session ownership of a hunk on a shared checkout, and clean-after is exactly
+  the wrong test AC-241 documents. What IS available: the notice fires because amux already
+  tracks that the recipient edited the file recently. Compare that recorded edit time against
+  the recipient's own last commit touching the path — edit before commit means nothing was
+  outstanding and the notice can say so; edit after commit is the real alarm and currently
+  reads identically to the routine case. Filed as AMUX-2456 and routed to amux-cloud, who own
+  the two prior fixes in this family (AC-230, AC-241).
+NOTE: third entry on this one notice, after AC-230 (named the reporting session, not the
+  author) and AC-241 (the pre-commit sibling's hypothetical). Three fixes on one message is
+  the file's own threshold for designing rather than patching.
