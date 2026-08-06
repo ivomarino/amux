@@ -1025,7 +1025,12 @@ types: code task chore doc research ops investigation decision escalation blocke
       result=$(T="$new_type" python3 -c 'import json,os;print(json.dumps({"type":os.environ["T"]}))' \
         | curl -sk -X PATCH -H 'Content-Type: application/json' \
             -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
-      echo "$result" | _board_outcome
+      # Label it as the TYPE write it is. Argument-less, _board_outcome renders
+      # the card's CURRENT status, so retyping a card printed "AMUX-2394 → doing"
+      # — a status-transition arrow for a write that touches no status. Same
+      # defect 1b667aa fixed for needsyou and status-update; this was the third
+      # site, and the card that fixed the other two said there were two.
+      echo "$result" | _board_outcome "$id" "" "type set to $new_type"
       return $?
       ;;
     add|create)
