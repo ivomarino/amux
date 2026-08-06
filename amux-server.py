@@ -33310,6 +33310,13 @@ function render() {
       if (name) renderChips(el, name, false);
     });
   });
+  // Re-apply the send/queue mode to the splits this render just created. The
+  // cards are rebuilt from a template that hardcodes "Send", so without this a
+  // list re-render silently reset every card to Send while _sendMode was still
+  // 'queue' — the button lied about what pressing it would do, and every render
+  // (SSE tick, card toggle, filter change) re-broke it. Caught by measuring the
+  // rendered label against the mode after a toggle, not by reading the code.
+  try { _updateSendSplit(); } catch(e) {}
   try { _grpScopeRehydrate(); } catch(e) {}
 }
 
@@ -36755,7 +36762,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.477';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.478';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58033,7 +58040,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.477';
+const CACHE = 'amux-v0.9.478';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
