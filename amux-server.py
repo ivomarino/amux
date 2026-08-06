@@ -14455,7 +14455,7 @@ def _run_schedule(sched, source: str = "cron"):
                 db.commit()
             except Exception as _se:
                 slog(f"[sched] failed to log archived-skip: {_se}")
-            return
+            return "skipped", f"target '{session}' is archived — not delivered, not woken"
     slog(f"[sched] running '{sched['title']}' [{kind}] ({source}) → {session or '(shell)'}")
     status, note = "ok", None
     # Capture output before sending so we can detect new output later (tmux mode only)
@@ -14575,6 +14575,11 @@ def _run_schedule(sched, source: str = "cron"):
             daemon=True,
             name=f"sched-watch-{sched['id']}"
         ).start()
+    # Hand the OUTCOME back (AMUX-2363). Run-now previously reported only that
+    # the endpoint was reached, so a run that succeeded and did nothing visible
+    # — `exit 0 [noop] quiet` — was indistinguishable from a dead button. The
+    # caller cannot show what happened if the function never says.
+    return status, note
 
 
 def _watch_schedule_response(sched, pre_output: str):
@@ -35720,7 +35725,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.453';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.454';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -46105,13 +46110,43 @@ function _peekRefreshSchedIfActive() {
 }
 
 async function runScheduleNow(id) {
-  const r = await apiCall(API + '/api/schedules/' + id + '/run', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
-  });
-  if (r) {
-    await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
-    renderScheduler();
-    _peekRefreshSchedIfActive();
+  // Ethan pressed Run three times in 63 seconds on SCHED-99 and reported
+  // "nothing happens". All three RAN and all three succeeded — `exit 0 [noop]
+  // quiet: CACHED 0.54s`. The button did its job and said nothing, so a
+  // successful no-op was indistinguishable from a dead control, and the only
+  // rational response to silence is to press again.
+  //
+  // Its sibling skipSchedule() has toasted success AND failure all along; this
+  // one refetched and re-rendered silently. Every user-initiated action has to
+  // render its outcome — including, especially, the outcome "ran fine and
+  // changed nothing", which is the one a refetch cannot show.
+  const btn = document.activeElement;
+  if (btn && btn.tagName === 'BUTTON') { btn.disabled = true; }
+  try {
+    const r = await apiCall(API + '/api/schedules/' + id + '/run', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
+    });
+    if (r) {
+      const d = (typeof r.json === 'function') ? await r.json().catch(() => ({})) : (r || {});
+      await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
+      renderScheduler();
+      _peekRefreshSchedIfActive();
+      if (typeof showToast === 'function') {
+        const st = d.status || 'ok';
+        const note = (d.note || '').split('\n')[0].slice(0, 90);
+        showToast(st === 'ok' ? ('Ran' + (note ? ' \u00b7 ' + note : ' \u00b7 no output'))
+                              : (st === 'skipped' ? ('Skipped \u00b7 ' + note)
+                                                  : ('Failed \u00b7 ' + (note || st))));
+      }
+    } else if (typeof showToast === 'function') {
+      // apiCall returns null for BOTH "queued while offline" and "refused".
+      // Calling a queued run a failure would be its own wrong-message bug —
+      // the user would press again, which is the behaviour being fixed.
+      showToast(online ? 'Run failed — the server did not accept it'
+                       : 'Offline — run queued, will fire when reconnected');
+    }
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
   }
 }
 async function skipSchedule(id) {
@@ -57235,7 +57270,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.453';
+const CACHE = 'amux-v0.9.454';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -62719,13 +62754,15 @@ class CCHandler(BaseHTTPRequestHandler):
                 # Attribute the tap. `{}` for body on purpose: this endpoint takes no
                 # payload, and a claimed 'by' from a body we never parse would be a
                 # fabricated attribution. Header (verified) → cloud email → IP.
-                _run_schedule(sched, source="manual:" + _sched_mutation_by(
+                _res = _run_schedule(sched, source="manual:" + _sched_mutation_by(
                     self.headers, self.client_address, {}))
+                _st, _note = _res if isinstance(_res, tuple) else ("ok", None)
                 _run_ts = int(_time.time())
                 db.execute("UPDATE schedules SET last_run=?, updated=? WHERE id=?",
                            (_run_ts, _run_ts, sid_for_run))   # last_run = UTC unix (AMUX-1736)
                 db.commit()
-                self._json({"ok": True, "ran": sched["title"]})
+                self._json({"ok": True, "ran": sched["title"],
+                            "status": _st, "note": (_note or "")[:300]})
                 return
 
             # POST /api/schedules/<id>/skip — skip the next occurrence (recurring only)
