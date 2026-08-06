@@ -203,18 +203,20 @@ SEVERITY: annoys
 STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux
-CARD: AF-2
+CARD: AMUX-2442
 SYMPTOM: When a session is idle, board issues that could advance (e.g., `todo` → `doing`,
   through workflow stages) do not auto-progress. Session page came back up after being down,
   suggesting idle time required manual intervention or restart to resume progression.
 COST: Idle periods become stalled time; planned workflows pause. If there is a designed
   progression strategy for unattended cards, it does not execute.
-FIX: By design. The advance loop (`_advance_open_card`) already fires when sessions go
-  idle, nudging them to progress their doing/review cards. Stopped sessions cannot be
-  nudged (no running process to send to). This is correct per ethos (D1/D5): the model
-  reports its own state, amux routes but does not decide for it. A stopped session's cards
-  are visible on the board for human triage.
-  Awaiting validation by amux (sent).
+FIX: amux-frustrations initially closed as by-design (AF-2), checking only that the
+  mechanism existed. amux validated and found the CALL SITE gate was edge-triggered
+  (prev != "idle"), so a lane already parked idle was never re-evaluated. The level-
+  triggered sweep (_pickup_level_sweep) carried only the pickup half, not the advance
+  half. Fixed by amux in AMUX-2442: the sweep now calls _advance_open_card before
+  pickup, matching the edge's two-call sequence. Verified in prod — 7 stalled lanes
+  were nudged on first run.
+  Validated by amux.
 
 ## Auto-deploy only fires on `amux board done`, not on session idle/stop
 AREA: board
