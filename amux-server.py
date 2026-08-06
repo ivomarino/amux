@@ -34700,23 +34700,26 @@ function _scopeRowToggle(key) {
 let _grpMsgOpen = false;
 
 async function _grpMessagesToggle(g) {
+  const isGlobal = (g === _GLOBAL_SCOPE);
+  const scope = isGlobal ? { level: 'global' } : { level: 'group', name: g };
+  const label = isGlobal ? 'Global' : g;
   _grpMsgOpen = !_grpMsgOpen;
   const host = document.getElementById('grp-scope-body-' + g);
   if (!host) return;
-  if (!_grpMsgOpen) { _scopeLoad({ level: 'group', name: g }, host.id); return; }
+  if (!_grpMsgOpen) { _scopeLoad(scope, host.id); return; }
   host.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Loading group messages\u2026</div>';
   try {
-    const rows = await _peekMsgFetch({ level: 'group', name: g });
+    const rows = await _peekMsgFetch(scope);
     const list = rows.slice().reverse().slice(0, 60);
     const ctx = _msgCtxHistory();
     const dst = document.getElementById('grp-scope-body-' + g);
     if (!dst) return;
     dst.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
-      + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(g) + ' \u00b7 messages</span>'
+      + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(label) + ' \u00b7 messages</span>'
       + '<button class="btn" style="font-size:0.7rem;min-height:32px;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(g) + '\')">Back to config</button></div>'
       + (list.length ? '<div style="display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;">'
           + list.map(e => _cmdHistItemHTML(e, ctx)).join('') + '</div>'
-          : '<div style="color:var(--dim);font-size:0.8rem;">No messages for this group yet.</div>');
+          : '<div style="color:var(--dim);font-size:0.8rem;">No messages at this scope yet.</div>');
     _grpScopeHtml = dst.innerHTML;
   } catch (e) {
     const dst = document.getElementById('grp-scope-body-' + g);
@@ -34824,7 +34827,9 @@ async function _scopeLoad(scope, targetId) {
       + '<span style="font-size:0.66rem;color:var(--dim);">'
       + (_selCap ? 'Tap the tile again to close.' : 'Tap a config to see its precedence order.')
       + '</span>'
-      + (lvl === 'group' ? '<button class="btn" style="font-size:0.7rem;min-height:32px;flex:0 0 auto;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(w) + '\')">\u2709 Messages</button>' : '')
+      + (lvl === 'group' || lvl === 'global'
+          ? '<button class="btn" style="font-size:0.7rem;min-height:32px;flex:0 0 auto;" onclick="event.stopPropagation();_grpMessagesToggle(\'' + escJs(lvl === 'global' ? _GLOBAL_SCOPE : w) + '\')">\u2709 Messages</button>'
+          : '')
       + '</div>';
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
     dst.innerHTML = h;
@@ -35959,7 +35964,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.464';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.465';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57542,7 +57547,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.464';
+const CACHE = 'amux-v0.9.465';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
