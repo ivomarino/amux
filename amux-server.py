@@ -35502,9 +35502,21 @@ async function _scopeLoad(scope, targetId) {
       const grpHit = Gr.map((m, j) => (m[c.key] && m[c.key].set_here) ? groups[j] : null).filter(Boolean);
       // Which layer actually supplies it, following this capability's own order.
       let src = 'unset', srcC = 'var(--dim)';
+      // `win` is the capability object from the layer that actually SUPPLIES the
+      // value, which is not always this level's. Summarising `c` unconditionally
+      // showed an em-dash for every group- or global-sourced row (AMUX-2413):
+      // the tile named the source and then reported no value for exactly the
+      // rows whose value is not local — the only rows where "why does this
+      // worker differ" is an interesting question. The reads are already in hand
+      // to compute `src`; this uses them.
+      let win = c;
       if (here) { src = lvl; srcC = 'var(--accent)'; }
-      else if (grpHit.length) { src = 'group:' + grpHit[0]; srcC = '#d29922'; }
-      else if (gset) { src = 'global'; srcC = 'var(--dim)'; }
+      else if (grpHit.length) {
+        src = 'group:' + grpHit[0]; srcC = '#d29922';
+        win = (Gr[groups.indexOf(grpHit[0])] || {})[c.key] || c;
+      } else if (gset) { src = 'global'; srcC = 'var(--dim)'; win = G[c.key] || c; }
+      c._win = win;   // the detail panel must agree with the tile
+      c._src = src;
       // HORIZONTAL tiles, mobile-first (Ethan: "this should be horizontal below
       // the group pills and mobile optimized, each one should give me the
       // ability to click into it"). A vertical stack of five full-width cards
@@ -35515,7 +35527,7 @@ async function _scopeLoad(scope, targetId) {
       h += '<button class="scope-tile' + (_open ? ' sel' : '') + '" onclick="event.stopPropagation();_scopeRowToggle(\'' + escJs(_ck) + '\')">'
         + '<span class="scope-tile-label">' + esc(c.label) + '</span>'
         + '<span class="scope-tile-src" style="color:' + srcC + ';">' + esc(src) + '</span>'
-        + '<span class="scope-tile-val">' + esc(sum(c)) + '</span>'
+        + '<span class="scope-tile-val">' + esc(sum(win)) + '</span>'
         + '</button>';
     });
     h += '</div></div></div>';   // .scope-tiles, .grp-scope-tiles, .grp-scope-row
@@ -35526,7 +35538,10 @@ async function _scopeLoad(scope, targetId) {
       const _l = _selCap;
       h += '<div class="scope-detail">'
         + '<div style="color:var(--text);font-weight:600;font-size:0.8rem;margin-bottom:3px;">' + esc(_l.label) + '</div>'
-        + '<div style="font-size:0.75rem;margin-bottom:4px;">' + esc(sum(_l)) + '</div>'
+        + '<div style="font-size:0.75rem;margin-bottom:4px;">' + esc(sum(_l._win || _l))
+        + (_l._src && _l._src !== 'unset' && _l._src !== lvl
+             ? ' <span style="color:var(--dim);font-size:0.68rem;">(from ' + esc(_l._src) + ')</span>'
+             : '') + '</div>'
         + '<div style="font-size:0.7rem;color:var(--dim);">'
         + (_l.order || []).map(x => '<span style="opacity:' + (x === (_selCap._src || '') ? '1' : '0.45') + ';">' + esc(x) + '</span>').join(' <span style="opacity:0.3;">&rsaquo;</span> ')
         + ' <span style="opacity:0.6;">\u00b7 ' + esc(_l.merge) + '</span>'
@@ -36789,7 +36804,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.481';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.482';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -58073,7 +58088,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.481';
+const CACHE = 'amux-v0.9.482';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
