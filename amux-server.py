@@ -31654,6 +31654,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="board-detail-tab active" id="pm-tab-edit" onclick="peekMemoryTab('edit')">Worker</button>
         <button class="board-detail-tab" id="pm-tab-preview" onclick="peekMemoryTab('preview')">Preview</button>
         <button class="board-detail-tab" id="pm-tab-global" onclick="peekMemoryTab('global')" title="Global memory shared by all workers">Global</button>
+        <button class="board-detail-tab" id="pm-tab-inherited" onclick="peekMemoryTab('inherited')" title="CLAUDE.md files this worker inherits from its directory chain — loaded by Claude Code, not composed by amux">Inherited</button>
       </div>
       <div style="display:flex;gap:6px;">
         <button class="btn" id="peek-memory-pull" onclick="pullPeekMemory()" title="Pull latest from Claude's memory file">↻</button>
@@ -31666,6 +31667,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <textarea id="peek-memory-input" class="peek-memory-textarea"
       placeholder="No memory yet. Add notes, context, or conventions that Claude should always remember for this worker..."></textarea>
     <div id="peek-memory-preview" class="board-detail-preview md-content" style="display:none;flex:1;overflow-y:auto;min-height:0;"></div>
+    <div id="peek-memory-inherited" style="display:none;flex:1;overflow-y:auto;min-height:0;font-size:0.8rem;"></div>
     <textarea id="peek-global-input" class="peek-memory-textarea" style="display:none;"
       placeholder="Global memory — applied to ALL workers. Add conventions, tools, or preferences shared across all your workers..."></textarea>
   </div>
@@ -38244,14 +38246,83 @@ let _peekNotesRawContent = '';
 
 
 
+async function _peekLoadInherited() {
+  const box = document.getElementById('peek-memory-inherited');
+  if (!box) return;
+  box.innerHTML = '<div style="color:var(--dim);padding:12px 4px;">Loading…</div>';
+  try {
+    const r = await fetch(API + '/api/sessions/' + peekSession + '/memory-inherited');
+    const d = await r.json();
+    const found = d.found || [], missing = d.missing || [];
+    if (!found.length) {
+      box.innerHTML = '<div style="color:var(--dim);padding:12px 4px;">No ' +
+        esc((d.filenames || ['CLAUDE.md']).join(', ')) + ' found between ~ and <code>' +
+        esc(d.dir || '?') + '</code>.</div>';
+      return;
+    }
+    // Nearest-last, matching how the files actually compose: the deepest
+    // directory is the most specific and is read last.
+    const kb = n => (n >= 1024 ? (n/1024).toFixed(1) + ' KB' : n + ' B');
+    let h = '<div style="color:var(--dim);padding:6px 4px 10px;line-height:1.45;">' +
+      esc(String(found.length)) + ' file(s), ' + kb(d.total_bytes || 0) +
+      ' — loaded by Claude Code itself, <strong>not</strong> composed by amux, so this is what ' +
+      'constrains the worker on top of its amux memory. Least specific first.</div>';
+    found.forEach((f, i) => {
+      const id = 'inh-' + i;
+      h += '<div style="border:1px solid var(--border);border-radius:6px;margin-bottom:8px;overflow:hidden;">' +
+        '<div onclick="_peekToggleInherited(\'' + id + '\')" style="cursor:pointer;padding:8px 10px;' +
+        'display:flex;gap:8px;align-items:center;background:var(--panel);">' +
+        '<span id="' + id + '-chev" style="color:var(--dim);">▶</span>' +
+        '<span style="color:var(--accent);font-weight:600;">' + esc(f.layer) + '</span>' +
+        '<span style="color:var(--dim);">' + esc(f.name || 'CLAUDE.md') + '</span>' +
+        '<span style="margin-left:auto;color:var(--dim);">' + kb(f.bytes) + '</span></div>' +
+        '<div id="' + id + '" style="display:none;padding:10px;border-top:1px solid var(--border);">' +
+        '<div style="color:var(--dim);font-size:0.7rem;margin-bottom:8px;word-break:break-all;">' +
+        esc(f.path) + '</div>' +
+        '<div class="md-content">' + renderMarkdown(f.text || '') + '</div></div></div>';
+    });
+    if (missing.length) {
+      h += '<div style="color:var(--dim);padding:8px 4px;font-size:0.72rem;line-height:1.5;">' +
+        'Not present (would be inherited if created): ' +
+        missing.map(m => '<code>' + esc(m.path) + '</code>').join(', ') + '</div>';
+    }
+    box.innerHTML = h;
+  } catch (e) {
+    box.innerHTML = '<div style="color:var(--red,#f88);padding:12px 4px;">Failed to load inherited files.</div>';
+  }
+}
+function _peekToggleInherited(id) {
+  const el = document.getElementById(id), ch = document.getElementById(id + '-chev');
+  if (!el) return;
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : '';
+  if (ch) ch.textContent = open ? '\u25B6' : '\u25BC';
+}
 function peekMemoryTab(tab) {
   document.getElementById('pm-tab-edit').classList.toggle('active', tab === 'edit');
   document.getElementById('pm-tab-preview').classList.toggle('active', tab === 'preview');
   document.getElementById('pm-tab-global').classList.toggle('active', tab === 'global');
+  const _ti = document.getElementById('pm-tab-inherited');
+  if (_ti) _ti.classList.toggle('active', tab === 'inherited');
   const inp = document.getElementById('peek-memory-input');
   const preview = document.getElementById('peek-memory-preview');
   const globalInp = document.getElementById('peek-global-input');
   const saveBtn = document.getElementById('peek-memory-save');
+  const inh = document.getElementById('peek-memory-inherited');
+  if (inh) inh.style.display = 'none';
+  if (tab === 'inherited') {
+    // READ-ONLY on purpose: these files belong to the repos, not to amux, and
+    // Claude Code loads them itself. Save is hidden rather than disabled so the
+    // tab cannot imply an edit path that would write to someone's repo.
+    inp.style.display = 'none';
+    preview.style.display = 'none';
+    globalInp.style.display = 'none';
+    saveBtn.style.display = 'none';
+    inh.style.display = '';
+    _peekLoadInherited();
+    return;
+  }
+  saveBtn.style.display = '';
   if (tab === 'global') {
     inp.style.display = 'none';
     preview.style.display = 'none';
@@ -38403,7 +38474,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.496';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.497';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -59864,7 +59935,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.496';
+const CACHE = 'amux-v0.9.497';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
