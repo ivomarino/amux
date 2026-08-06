@@ -29204,6 +29204,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <option value="30">30 days</option>
       <option value="90">90 days</option>
     </select>
+    <!-- Group filter, VISIBLE (AMUX-2437: arriving from a group panel must show
+         which group you are looking at, not silently pre-filter). Options are
+         filled from live tags by _costFillGroups. -->
+    <select id="cost-group" onchange="_costLoad()" class="lib-facet">
+      <option value="">All workers</option>
+    </select>
     <span id="cost-updated" style="font-size:0.7rem;color:var(--dim);"></span>
   </div>
   <div id="cost-body"><div style="color:var(--dim);padding:24px;">Loading…</div></div>
@@ -35439,6 +35445,47 @@ let _grpView = 'config';   // config | messages | board | cost — one at a time
 // different data source (Ethan: "same UX obviously it's calling upon different
 // data") \u2014 so they share one entry point, one header and one error path, and a
 // new scope-level view is a case here rather than another toggle.
+// Navigate to the REAL page for this group, filter visible (AMUX-2437, Ethan:
+// "when I click messages board cost it should go to those pages actually with
+// the filter for those groups visible"). The panel's inline Board/Cost/Messages
+// views were a second implementation of three pages that already exist —
+// smaller, without their controls, and drifting from them. These send you to
+// the page with its own filter control SET, so what you see is the page you
+// know, scoped, and you can widen it from there.
+function _grpGoto(g, where) {
+  const isGlobal = (g === _GLOBAL_SCOPE);
+  const label = isGlobal ? '' : g;
+  if (where === 'messages') {
+    switchView('messages');
+    // Group -> its members, via the session filter the page already has. The
+    // select is single-session, so for a group we set the deep-search box to a
+    // group: token instead and let the server scope it.
+    setTimeout(() => {
+      const sel = document.getElementById('msgs-session-filter');
+      if (sel) sel.value = '';
+      _msgsGroup = label || '';
+      _msgsRenderGroupChip();
+      _messagesLoad(true);
+    }, 60);
+    return;
+  }
+  if (where === 'board') {
+    switchView('board');
+    setTimeout(() => {
+      boardSearchQuery = label ? 'group:' + label : '';
+      const inp = document.getElementById('board-search');
+      if (inp) inp.value = boardSearchQuery;
+      _boardActiveView = '';
+      _bfSyncHash(); renderBoard();
+    }, 60);
+    return;
+  }
+  if (where === 'cost') {
+    switchView('cost');
+    setTimeout(() => { _costFillGroups(label || ''); _costLoad(); }, 60);
+  }
+}
+
 function _grpViewHead(label, view, g) {
   const tab = (k, t) => '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 9px;flex:0 0 auto;'
     + (k === view ? 'border-color:var(--accent);color:var(--accent);' : '')
@@ -35759,8 +35806,9 @@ async function _scopeLoad(scope, targetId) {
       + (lvl === 'group' || lvl === 'global'
           ? (() => {
               const _g = escJs(lvl === 'global' ? _GLOBAL_SCOPE : w);
+              // Go to the real page, not the panel's miniature of it.
               const _b = (k, t) => '<button class="btn" style="font-size:0.7rem;min-height:32px;padding:4px 9px;flex:0 0 auto;"'
-                + ' onclick="event.stopPropagation();_grpViewOpen(\'' + _g + '\',\'' + k + '\')">' + t + '</button>';
+                + ' onclick="event.stopPropagation();_grpGoto(\'' + _g + '\',\'' + k + '\')">' + t + ' \u2197</button>';
               return '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
                 + _b('messages', 'Messages') + _b('board', 'Board') + _b('cost', 'Cost') + '</span>';
             })()
@@ -36940,7 +36988,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.493';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.494';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -47770,7 +47818,7 @@ function _beTagKeydown(e, prefix) {
 // The `is:` facets are the point of this: they are DERIVED from live session
 // state, not stored on the card. A card cannot tell you its session went dark
 // 30 days ago — the join can. Nothing here writes; a view is a question.
-const _BQ_KEYS = ['status','session','owner','type','tag','id','is','updated','created','shepherd','creator'];
+const _BQ_KEYS = ['status','session','owner','type','tag','id','is','updated','created','shepherd','creator','group'];
 
 function _bqParse(q) {
   const terms = [], text = [];
@@ -47972,8 +48020,21 @@ function _bqMatch(item, ast, ix) {
       case 'creator':  hit = vals.includes((item.creator || '').toLowerCase()); break;
       case 'owner':    hit = vals.includes(item.owner_type === 'agent' ? 'agent' : 'human'); break;
       case 'type':     hit = vals.includes((item.type || 'code').toLowerCase()); break;
-      case 'tag':
-      case 'group':    hit = (item.tags || []).some(t => vals.includes(t.toLowerCase())); break;
+      case 'tag':      hit = (item.tags || []).some(t => vals.includes(t.toLowerCase())); break;
+      // `group:` means the card's OWNER is in that group — what "group" means
+      // everywhere else in amux (worker tags, /api/board?group=, the scope
+      // panel). It used to alias `tag:`, i.e. the CARD's own tags, a different
+      // set entirely: a card tagged needs:you owned by a worker in `amux`
+      // belongs to group amux and carries no `amux` tag. The alias never fired
+      // because `group` was not a parsed key, so making it one exposed the
+      // disagreement (AMUX-2437). Resolved against live sessions so membership
+      // means one thing on every surface.
+      case 'group':    hit = (function () {
+                         const owner = (item.session || '').toLowerCase();
+                         if (!owner) return false;
+                         const s = (sessions || []).find(x => (x.name || '').toLowerCase() === owner);
+                         return !!s && (s.tags || []).some(t => vals.includes(t.toLowerCase()));
+                       })(); break;
       case 'id':       hit = vals.includes((item.id || '').toLowerCase()); break;
       case 'is':       hit = vals.some(v => _bqIs(item, v, ix)); break;
       case 'updated':  hit = _bqAgeMatch(vals, item.updated); break;
@@ -54217,10 +54278,21 @@ function _trendsFocusTheme(k) {
   _focusIdx = 0; document.addEventListener('keydown', _focusKey, true); _focusRender();
 }
 
+function _costFillGroups(sel) {
+  const el = document.getElementById('cost-group');
+  if (!el) return;
+  const tags = [...new Set((sessions || []).filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
+  const cur = sel !== undefined ? sel : el.value;
+  el.innerHTML = '<option value="">All workers</option>'
+    + tags.map(t => '<option value="' + escJs(t) + '"' + (t === cur ? ' selected' : '') + '>' + esc(t) + '</option>').join('');
+  el.value = cur || '';
+}
 function _costLoad() {
   const days = document.getElementById('cost-days')?.value || '7';
+  const grp = document.getElementById('cost-group')?.value || '';
   const body = document.getElementById('cost-body');
-  fetch(API + '/api/observability?days=' + encodeURIComponent(days))
+  fetch(API + '/api/observability?days=' + encodeURIComponent(days)
+        + (grp ? '&group=' + encodeURIComponent(grp) : ''))
     .then(r => r.json())
     .then(d => {
       if (d.error) { body.innerHTML = '<div style="color:var(--red);padding:20px;">' + esc(d.error) + '</div>'; return; }
@@ -55267,6 +55339,24 @@ window.addEventListener('resize', () => {
 // ── Messages tab (global send history across all sessions) ──────────────────
 let _msgsData = [];
 let _msgsDeepQ = '';   // non-empty = server-side full-history search is active
+let _msgsGroup = '';   // non-empty = scoped to a group (arrived from its scope panel)
+function _msgsRenderGroupChip() {
+  let el = document.getElementById('msgs-group-chip');
+  if (!el) {
+    const host = document.getElementById('msgs-session-filter');
+    if (!host || !host.parentElement) return;
+    el = document.createElement('span');
+    el.id = 'msgs-group-chip';
+    host.parentElement.insertBefore(el, host.nextSibling);
+  }
+  // The filter must be VISIBLE and removable — a silent pre-filter is how a
+  // scoped page gets read as the whole corpus (the tag-scoped board incident).
+  el.innerHTML = _msgsGroup
+    ? '<span class="msg-tag" style="background:rgba(88,166,255,0.14);color:var(--accent);cursor:pointer;"'
+      + ' title="Clear group filter" onclick="_msgsGroup=\'\';_msgsRenderGroupChip();_messagesLoad(true);">group: '
+      + esc(_msgsGroup) + ' \u2715</span>'
+    : '';
+}
 let _msgsOffset = 0;
 const _MSGS_PAGE = 200;
 let _msgsDone = false;
@@ -55286,6 +55376,7 @@ async function _messagesLoad(reset, presetSession) {
     // older than the loaded page exist. Typing still filters the loaded page
     // instantly — two speeds, one box (AMUX-2426).
     if (_msgsDeepQ) _u += '&q=' + encodeURIComponent(_msgsDeepQ);
+    if (_msgsGroup) _u += '&group=' + encodeURIComponent(_msgsGroup);
     const r = await fetch(_u);
     const rows = await r.json();
     fetch(API + '/api/history?counts=1' + (_sf ? '&session=' + encodeURIComponent(_sf) : ''))
@@ -58358,7 +58449,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.493';
+const CACHE = 'amux-v0.9.494';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
