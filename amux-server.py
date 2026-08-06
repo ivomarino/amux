@@ -19895,6 +19895,21 @@ sys.exit(main())
 
 _AMUX_GUARD_MARKER = "# amux-staged-guard"
 _AMUX_GUARD_BODY = '''#!/usr/bin/env python3
+# ============================================================================
+# GENERATED FILE — DO NOT EDIT, AND DO NOT COMMIT IT TO A REPO.
+# Source: _AMUX_GUARD_BODY in amux-server.py. Written per work_dir by
+# _install_amux_precommit_guard(); any local edit is silently replaced on the
+# next install. It is untracked on purpose — it must be regenerated per
+# checkout and must follow core.hooksPath.
+#
+# This banner exists because its absence cost a real revert (2026-08-06): a
+# session read this file, reasonably concluded it had gone untracked by
+# mistake, committed a copy into scripts/git-hooks/, and pointed
+# install-hooks.sh at it. That made the installer a SECOND PRODUCER of a
+# generated file, frozen at the moment of copying, so running it overwrote the
+# live guard and reverted AC-241's improvement. Nothing on the file said where
+# it came from, so nothing contradicted the wrong conclusion.
+# ============================================================================
 # amux-staged-guard — blocks a commit whose staged set contains files that a
 # DIFFERENT amux session edited in this shared checkout (staged-state sweep,
 # AMUX-1730: two sessions share one git index, so `git add -A` in one sweeps
