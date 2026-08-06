@@ -61006,6 +61006,84 @@ class CCHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/events":
             return self._sse_events()
 
+        # GET /api/sessions/contract — the worker payload's field list, PUBLISHED
+        # (AMUX-2447). Must sit ABOVE the /api/sessions/<name> routes or it reads
+        # as a worker literally named "contract".
+        #
+        # WHY THIS EXISTS: gtm-videos needed each worker's cwd, read the payload
+        # for `cwd`, got None, and concluded the API does not expose it. It does —
+        # the key is `dir`. A missing key and a present-but-empty one return the
+        # same None, so a wrong field name is indistinguishable from absent data,
+        # and they wrote a confirmable hypothesis up as untestable. There was
+        # nowhere to look the name up: the board publishes /api/board/contract,
+        # workers published nothing.
+        #
+        # NOT fixed by adding a `cwd` alias. That duplicates ~40 bytes per worker
+        # across 100+ workers on a payload the dashboard polls, on a mobile-first
+        # PWA, and it only closes the case for `cwd` rather than for whichever
+        # synonym the next caller reaches for.
+        #
+        # DERIVED FROM A REAL PAYLOAD, never hand-listed. A hand-maintained field
+        # list is a doc that drifts from the code, which is the failure this repo
+        # spent 2026-08-06 on. Names come from list_sessions() itself, so a field
+        # added or removed shows up here immediately; only the prose can lag, and
+        # `undocumented` / `documented_but_absent` make that lag VISIBLE instead
+        # of silent. Those two arrays are the part that can fail — a contract
+        # that cannot report its own staleness is the thing being fixed.
+        if method == "GET" and path == "/api/sessions/contract":
+            _desc = {
+                "name": "worker name — the id used by every other endpoint and by `amux send`",
+                "dir": "the worker's working directory (cwd). NOT `cwd` — this is the key callers miss.",
+                "status": "active | waiting | idle | '' (not running). Derived from the harness report when fresh, else the pane scrape.",
+                "running": "whether a terminal process exists for this worker",
+                "tags": "group membership. The board query key is `group:`; this payload field is still `tags`.",
+                "backend": "tmux | herdr — which terminal backend hosts this worker",
+                "provider": "claude | codex | gemini",
+                "active_model": "model currently in use",
+                "self_report": "state the harness reported about itself (D1 exit); outranks the scrape when fresh",
+                "worktree": "isolated git worktree path, if this worker has one",
+                "worktree_repo": "repo the worktree was cut from",
+                "tokens": "token usage counters for this worker",
+                "preview": "last lines of the pane — a scrape, not authoritative state",
+                "waiting_since": "unix ts the worker entered `waiting`",
+                "last_activity": "unix ts of the last observed activity",
+                "last_human_ts": "unix ts of the last HUMAN prompt, as opposed to an amux-generated one",
+                "credit_limited": "hit a credit/usage limit and is parked",
+                "rate_limited_until": "unix ts a rate limit expires",
+                "api_error": "last transient API error text, if the worker died on one",
+                "archived": "hidden from the default worker list",
+                "pinned": "pinned to the top of the worker list",
+                "steering": "queued steering messages awaiting the next turn boundary",
+                "task_board_id": "board card this worker is currently working",
+            }
+            # SCOPE THE SAMPLE. Field names do not vary by caller, but the
+            # denominator does: reporting 106 to a caller who may only see its
+            # own tag's workers leaks fleet size past tag isolation. The ethos
+            # calls this out as the shape that is easy to ship and hard to
+            # notice — so mirror GET /api/sessions rather than inventing a
+            # second visibility rule that can drift from it.
+            try:
+                _rows = _sse_cache["sessions"]["data"] or list_sessions()
+            except Exception:
+                _rows = []
+            _sc, _sct, _scn = _caller_scope(self.headers)
+            if _sc:
+                _rows = [r for r in _rows
+                         if r.get("name") == _scn
+                         or (_sct and {t.lower() for t in (r.get("tags") or [])} & _sct)]
+            _keys = sorted({k for r in _rows for k in r.keys()})
+            return self._json({
+                "endpoint": "GET /api/sessions",
+                "note": "Field names are derived from a live payload, not hand-listed, so this cannot drift from what the API actually returns. Descriptions are hand-written and CAN lag — see `undocumented`.",
+                "cwd_is_called_dir": "The working directory is `dir`. There is no `cwd` key; .get('cwd') returns None exactly as it would for a worker with no directory.",
+                "fields": {k: _desc.get(k, "") for k in _keys},
+                "undocumented": [k for k in _keys if k not in _desc],
+                "documented_but_absent": sorted(k for k in _desc if k not in _keys),
+                "sampled_workers": len(_rows),
+                "see_also": {"board": "GET /api/board/contract",
+                             "one_worker": "GET /api/sessions/<name>"},
+            })
+
         # GET /api/sessions
         if method == "GET" and path == "/api/sessions":
             _scoped, _ctags, _cname = _caller_scope(self.headers)
