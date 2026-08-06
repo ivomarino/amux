@@ -13523,8 +13523,21 @@ def _scope_read(level: str, name: str) -> dict:
                      if level == "global" else
                      CC_MEMORY / "tags" / f"{name}{suf}" if level == "group" else
                      CC_MEMORY / f"{name}{suf}")
-                row["value"] = {"path": str(f), "bytes": f.stat().st_size if f.exists() else 0}
-                row["set_here"] = f.exists() and f.stat().st_size > 0
+                _sz = f.stat().st_size if f.exists() else 0
+                row["value"] = {"path": str(f), "bytes": _sz}
+                row["set_here"] = f.exists() and _sz > 0
+                # Ship the TEXT, not just its size — an editor prefilled from a
+                # size renders empty, and saving an empty box would silently
+                # replace the file. `truncated` exists so a capped read can
+                # never be written back: that would turn a display limit into
+                # data loss, which is the same class as a filter that silently
+                # excludes.
+                if _sz:
+                    row["value"]["text"] = f.read_text(errors="replace")[:_SCOPE_TEXT_CAP]
+                    row["value"]["truncated"] = _sz > _SCOPE_TEXT_CAP
+                else:
+                    row["value"]["text"] = ""
+                    row["value"]["truncated"] = False
             elif cap["key"] == "env":
                 f = (CC_AMUX_ENV if level == "global" else
                      CC_HOME / "env" / f"{name}.env" if level == "group" else
@@ -13555,6 +13568,9 @@ def _scope_read(level: str, name: str) -> dict:
             row["error"] = str(e)[:120]
         out["capabilities"].append(row)
     return out
+
+
+_SCOPE_TEXT_CAP = int(os.environ.get("AMUX_SCOPE_TEXT_CAP", "200000") or 200000)
 
 
 def _scope_write_allowed(level: str, name: str, actor: str) -> tuple:
@@ -35217,6 +35233,80 @@ async function _grpViewOpen(g, view) {
   }
 }
 
+// The WRITE surface for one capability at one level (AMUX-2359). Renders a
+// control ONLY where the server says a value can actually be set; everywhere
+// else it renders the REASON. A field whose write the resolver would outrank is
+// worse than no field — it is an instruction you can follow exactly that does
+// nothing (AMUX-2140), and the read half already publishes `supported`, so
+// there is no excuse for the client to guess.
+function _scopeEditorHTML(lvl, name, cap) {
+  const id = 'scope-ed-' + lvl + '-' + (name || 'global') + '-' + cap.key;
+  if (!cap.supported) {
+    return '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">'
+      + 'Not settable here. It is decided at: ' + esc((cap.order || []).filter(x => x !== lvl).join(' > '))
+      + '</div>';
+  }
+  const v = cap.value || {};
+  // Text-backed capabilities get a textarea; keyed/structured ones are edited
+  // where they live (env file, gate editor) rather than half-edited here.
+  if (cap.kind === 'text') {
+    // A capped read must never be writable: saving it back would replace the
+    // file with its own first N bytes, turning a DISPLAY limit into data loss.
+    if (v.truncated) {
+      return '<div style="margin-top:6px;font-size:0.68rem;color:#d29922;">'
+        + 'Too large to edit here (' + (v.bytes || 0) + ' bytes, shown truncated), so editing is '
+        + 'disabled — saving a truncated copy would delete the rest. Edit '
+        + '<code>' + esc(v.path || '') + '</code> directly.</div>';
+    }
+    return '<div style="margin-top:7px;">'
+      + '<textarea id="' + id + '" placeholder="Nothing set at this level. Type to set it."'
+      + ' style="width:100%;min-height:74px;background:var(--bg);border:1px solid var(--border);'
+      + 'border-radius:6px;padding:6px 8px;font-size:0.72rem;color:var(--text);font-family:inherit;'
+      + 'resize:vertical;" oninput="event.stopPropagation();">' + esc(v.text || '') + '</textarea>'
+      + '<div style="display:flex;gap:6px;align-items:center;margin-top:5px;">'
+      + '<button class="btn primary" style="font-size:0.68rem;min-height:32px;padding:4px 10px;"'
+      + ' onclick="event.stopPropagation();_scopeSave(\'' + escJs(lvl) + '\',\'' + escJs(name || '') + '\',\''
+      + escJs(cap.key) + '\',\'' + escJs(id) + '\')">Save</button>'
+      + '<span id="' + id + '-msg" style="font-size:0.64rem;color:var(--dim);">'
+      + (v.bytes ? v.bytes + ' bytes at this level' : 'unset at this level') + '</span>'
+      + '</div></div>';
+  }
+  return '<div style="margin-top:6px;font-size:0.66rem;color:var(--dim);">'
+    + 'Edited where it lives (' + esc(cap.kind) + '). Writable via '
+    + '<code>PUT /api/scope</code> with capability <code>' + esc(cap.key) + '</code>.'
+    + '</div>';
+}
+
+async function _scopeSave(lvl, name, key, elId) {
+  const ta = document.getElementById(elId);
+  const msg = document.getElementById(elId + '-msg');
+  if (!ta) return;
+  if (msg) { msg.textContent = 'Saving…'; msg.style.color = 'var(--dim)'; }
+  try {
+    const r = await fetch(API + '/api/scope', {
+      method: 'PUT',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify({ level: lvl, name: name, capability: key, value: { text: ta.value } }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      // Show the server's REASON verbatim. A 403 here is a real policy answer
+      // ("a session may not write the group layer"), not a glitch, and
+      // paraphrasing it into "save failed" would hide the one useful sentence.
+      if (msg) { msg.textContent = d.error || ('save failed (' + r.status + ')'); msg.style.color = '#f85149'; }
+      return;
+    }
+    if (msg) { msg.textContent = 'Saved · ' + (d.value && d.value.bytes != null ? d.value.bytes + ' bytes' : 'ok'); msg.style.color = 'var(--green)'; }
+    // Re-read so the tile's supplying-layer badge reflects the write, which is
+    // the card's acceptance criterion — not just "the POST returned 200".
+    const host = document.getElementById('grp-scope-body-' + (lvl === 'global' ? _GLOBAL_SCOPE : name));
+    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
+               host ? host.id : undefined);
+  } catch (e) {
+    if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
+  }
+}
+
 async function _scopeLoad(scope, targetId) {
   // Explicit target. The first cut had the group panel temporarily RENAME its
   // own node to 'peek-scope-body' so this function could find it — two elements
@@ -35316,7 +35406,9 @@ async function _scopeLoad(scope, targetId) {
         + (_l.order || []).map(x => '<span style="opacity:' + (x === (_selCap._src || '') ? '1' : '0.45') + ';">' + esc(x) + '</span>').join(' <span style="opacity:0.3;">&rsaquo;</span> ')
         + ' <span style="opacity:0.6;">\u00b7 ' + esc(_l.merge) + '</span>'
         + (_l.supported ? '' : ' <span style="color:#d29922;">\u00b7 not settable at this level</span>')
-        + '</div></div>';
+        + '</div>'
+        + _scopeEditorHTML(lvl, w, _l)
+        + '</div>';
     }
     h += '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">'
       + '<span style="font-size:0.66rem;color:var(--dim);">'
@@ -36572,7 +36664,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.474';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.475';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -57845,7 +57937,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.474';
+const CACHE = 'amux-v0.9.475';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
