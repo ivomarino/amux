@@ -38241,6 +38241,16 @@ function renderPeekIssues() {
 }
 
 function _renderPeekIssuesKanban(items, list) {
+  // Belt and braces for the same failure: if there are no columns to render
+  // into, fall back to the list rather than painting an empty box over real
+  // data. A blank panel next to a count of 30 is the worst possible output —
+  // it looks like a broken board rather than a missing status list.
+  if (!Array.isArray(boardStatuses) || !boardStatuses.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 4px;">'
+      + 'Board columns unavailable — showing a flat list.</div>'
+      + items.map(item => _issueRowHTML(item, {})).join('');
+    return;
+  }
   // Group this session's issues by status, mirroring the regular board columns.
   const cols = {};
   boardStatuses.forEach(s => { cols[s.id] = []; });
@@ -38712,7 +38722,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.502';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.503';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -49413,7 +49423,14 @@ async function fetchBoard() {
     const statusesChanged = sj !== lastStatusesJSON;
     if (statusesChanged) {
       lastStatusesJSON = sj;
-      boardStatuses = statusData;
+      // Only accept a NON-EMPTY array (Ethan, 2026-08-06 — peek Board showing
+      // "30 issues" over a blank panel). boardStatuses ships with 7 sensible
+      // defaults, and this line overwrote them with whatever came back. An
+      // empty array, an error object or a 5xx body therefore wiped every column
+      // definition, and the kanban renderer — which builds its columns by
+      // iterating boardStatuses — emitted an empty container while the count,
+      // computed from `items`, still said 30. Data present, columns gone.
+      if (Array.isArray(statusData) && statusData.length) boardStatuses = statusData;
     }
     if (r.status === 304) {
       if (statusesChanged) renderBoard();
@@ -60235,7 +60252,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.502';
+const CACHE = 'amux-v0.9.503';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
