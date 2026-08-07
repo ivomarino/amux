@@ -316,6 +316,36 @@ EXACTLY produced a success signal and no claim (AMUX-2140). When the instruction
 the failure are the same action, no amount of care catches it; only using the result
 does. Anything a notification or doc tells an agent to run must itself be exercised.
 
+**A rule you have written down is not a rule you run, and the moment of highest
+risk is when the result matches what you expected** (amux + cold-outbound,
+2026-08-07). Two sessions, one morning, the same shape twice each. cold-outbound
+reported that a PATCH "silently ignores" a field — the response carried
+`ignored_fields` plus an explanatory note the whole time; they read the 200 and the
+bumped `rev` and never opened the body, against a rule they had written for
+themselves in almost those words ("confirm at the FIELD, never at the status code").
+Hours later I did the identical thing to three cloud customer cards, reporting them
+un-archived when the same body said otherwise. Then I twice cited a commit sha
+written into prose BEFORE the commit existed, while actively writing about
+unverified citations.
+
+The predictive half is not "read the body". It is that a CONFIRMING result is where
+the check gets skipped: nothing about an expected answer feels like the moment to
+verify, so the habit fires on surprises and sleeps on agreement — which is exactly
+backwards, because a wrong expected answer is the one nobody else will catch either.
+The counterpart is that writing the rule down buys nothing, since the rule was
+written and then not run by its own author within hours, twice.
+
+Corollary, and the more generalisable half: **when you kill a misleading signal, ask
+which signal people will reach for next, and whether it can carry the weight.**
+Making no-op PATCHes return 400 fixed the trap and immediately created a new one —
+callers would switch to "did `rev` move?", and `rev` did not move for tag writes.
+cold-outbound caught that before it cost anything, which is the first time this week
+that substitution was spotted in advance rather than after. Tracing WHY rev was
+ambiguous then found the real defect: `expect_rev` is checked against `rev`, so tag
+writes sat outside optimistic-concurrency control entirely and two clients could
+clobber each other silently. The reporting bug was the visible edge of a correctness
+bug.
+
 Make the answer space match the shape of the claim (fleet-converged,
 2026-08-02, four instances in one day — orch's MO-3000 the clearest): a prompt
 offering exactly `done` or `todo` about a STANDING-ROLE card forces a false
