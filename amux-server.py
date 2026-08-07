@@ -14678,6 +14678,35 @@ def _scope_write(level: str, name: str, key: str, value, actor: str) -> dict:
             "actor": actor or "human", "why_allowed": why}
 
 
+# The gate precedence, MOST-SPECIFIC-FIRST, as ONE fact. It used to be prose,
+# restated in three places, and the three disagreed: `_effective_gate`'s docstring
+# and `/api/board/contract` both listed FOUR layers (card > type > worker > global)
+# long after the group tier shipped, while the code resolved FIVE. That is not a
+# stale comment — the contract is the surface an agent READS to learn how gates
+# work, so it actively concealed the only layer that was applying.
+#
+# It cost a real wrong answer (2026-08-06): a done->verified sweep of 10 cards
+# quoted the global column default as each card's gate and concluded all 10 were
+# blocked on prod access. Eight were actually under a `group:amux` PEER-REVIEW
+# gate that never mentions prod, and two were under their type gate. Every line
+# written on those cards was wrong, and the contract is why — nothing the reader
+# could see said a group tier existed.
+#
+# So: render the docs from this, never re-type the order. `tests/test_gate_contract.py`
+# asserts the scopes `_gate_layers` actually emits are exactly these keys, so a new
+# tier cannot be added without the contract following it.
+_GATE_PRECEDENCE = (
+    ("card",   "card-level `gate` override (issues.gate)"),
+    ("type",   "TYPE-derived gate (from `type`) — an escalation has no code, so it "
+               "can never be gated on a merge"),
+    ("worker", "per-WORKER override (session_gates[<worker>])"),
+    ("group",  "per-GROUP override (session_gates['group:<name>']) — applies to every "
+               "worker in the group; THIS is the tier that is invisible if you read "
+               "only the per-status defaults below"),
+    ("global", "global per-status default (statuses.gate)"),
+)
+
+
 def _gate_layers(item, target_status: str) -> list:
     """EVERY scope layer's contribution to this transition, not just the winner.
 
@@ -14742,11 +14771,11 @@ def _gate_layers(item, target_status: str) -> list:
 def _effective_gate(item, target_status: str) -> list:
     """Resolve the effective gate checklist for moving `item` into `target_status`.
 
-    Resolution order, most specific first (AMUX-2330):
-      1. card-level override  (issues.gate, if non-empty)
-      2. type-derived gate    (_TYPE_GATES[item.type][status], if non-empty)
-      3. per-session override (session_gates[session][status], if non-empty)
-      4. global status default (statuses.gate[status])
+    Resolution order is `_GATE_PRECEDENCE`, most specific first — read it there,
+    do NOT restate it here. This docstring used to carry its own four-item copy
+    that omitted the group tier for a day after that tier shipped, and the
+    contract carried the same wrong copy; see the note on _GATE_PRECEDENCE for
+    what the disagreement cost.
 
     The client's _gateResolve calls GET /api/board/gate, which calls this
     function, so there is one rule and one owner. The client-side _effectiveGate
@@ -62646,15 +62675,28 @@ class CCHandler(BaseHTTPRequestHandler):
                     "status": f"One of {list(statuses)}.",
                 },
                 "gates": {
-                    "how_they_resolve": [
-                        "1. card-level `gate` override (issues.gate)",
-                        "2. TYPE-derived gate (from `type`) — an escalation has no code, so it can never be gated on a merge",
-                        "3. per-session override",
-                        "4. global per-status default",
-                    ],
+                    # AUTHORITATIVE first, because everything below it is a DEFAULT
+                    # and a reader who stops early will quote the wrong gate — which
+                    # is exactly what happened on 2026-08-06 (see _GATE_PRECEDENCE).
+                    "AUTHORITATIVE": "GET /api/board/gate?item=<id>&status=<status> — "
+                                     "THE gate for a specific card. The tables below are "
+                                     "defaults by layer; they do NOT tell you which layer "
+                                     "wins for your card. Never quote `by_status_default` "
+                                     "as a card's gate — ask this endpoint.",
+                    "how_they_resolve": [f"{i+1}. {_d}" for i, (_k, _d)
+                                         in enumerate(_GATE_PRECEDENCE)],
                     "by_status_default": statuses,
                     "by_type": {"code": "(no override — the per-status defaults above apply)",
                                 **{t: _TYPE_GATES[t] for t in _TYPE_GATES}},
+                    # The ACTIVE per-group/per-worker overrides, not just the fact that
+                    # the tiers exist. Listing the tiers without their contents is how a
+                    # reader concludes "no group gate applies to me": absence of evidence
+                    # rendered as evidence of absence.
+                    "active_overrides": {
+                        _k: {_st: _crit for _st, _crit in (_v or {}).items() if _crit}
+                        for _k, _v in sorted((_load_session_gates() or {}).items())
+                        if any((_v or {}).values())
+                    } or "(none set — every card resolves via type or the status default)",
                 },
                 "how_to_satisfy_a_gate": {
                     "gate_ack": "true  — acknowledge the whole checklist",
@@ -64820,6 +64862,27 @@ class CCHandler(BaseHTTPRequestHandler):
             # implementations of one rule exist, they diverge, and each looks
             # correct on its own. Returns `source` so a wrong answer is
             # attributable to a layer instead of inferred from behaviour.
+            # /api/board/gates (PLURAL) is the natural guess for "show me the gate
+            # rules", and it used to fall through to /api/board/<id> and answer
+            # "item not found" — a reader asking about gates told their CARD does
+            # not exist. Another session already burned a guess on it (the comment
+            # at the contract handler records both this and /api/board/contract as
+            # 404s it had to work around). A wrong-subject error is worse than a
+            # 404: it sends you debugging the id.
+            if path == "/api/board/gates":
+                return self._json({
+                    "see": "/api/board/contract (key: gates) — the full tables",
+                    "AUTHORITATIVE": "GET /api/board/gate?item=<id>&status=<status> — "
+                                     "the gate for ONE card, with which layer won",
+                    "how_they_resolve": [f"{i+1}. {_d}" for i, (_k, _d)
+                                         in enumerate(_GATE_PRECEDENCE)],
+                    "active_overrides": {
+                        _k: {_st: _crit for _st, _crit in (_v or {}).items() if _crit}
+                        for _k, _v in sorted((_load_session_gates() or {}).items())
+                        if any((_v or {}).values())
+                    },
+                })
+
             if path == "/api/board/gate":
                 bid = (qs.get("item", [""])[0] or "").strip()
                 st = (qs.get("status", [""])[0] or "").strip()
