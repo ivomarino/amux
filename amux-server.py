@@ -61520,6 +61520,95 @@ self.addEventListener('fetch', e => {
 // anyway, so page-side-only is also the one behavior that works everywhere.
 """.strip()
 
+# ── Skin registry (AMUX-2516) ───────────────────────────────────────────────
+# A skin is a TEMPLATE, not code: an index.html that talks to the APIs amux already
+# serves. Built-ins ship in this file; user skins live in ~/.amux/skins/<name>/
+# index.html, so "upload a template and the UX wraps around it" is a file copy with
+# no server change and no restart.
+#
+# Deliberately NOT a code-plugin system. A skin that could run server-side code would
+# be a new extension surface to secure, version and sandbox — and nothing about a
+# persona view needs it, because every skin so far reads only board/groups/sessions/
+# observability. Keeping skins to templates means a better model writes a better skin
+# without amux changing at all, which is the compounding test.
+_SKIN_BUILTINS: dict = {}          # populated after the constants below are defined
+
+
+def _skin_dir():
+    d = CC_HOME / "skins"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _list_skins() -> list:
+    """Every selectable skin: built-ins plus ~/.amux/skins/<name>/index.html."""
+    out = [{"name": k, "source": "builtin"} for k in sorted(_SKIN_BUILTINS)]
+    try:
+        for p in sorted(_skin_dir().iterdir()):
+            idx = p / "index.html"
+            if p.is_dir() and idx.is_file():
+                meta = {}
+                try:
+                    mf = p / "skin.json"
+                    if mf.is_file():
+                        meta = json.loads(mf.read_text(errors="replace")) or {}
+                except Exception:
+                    meta = {}
+                out.append({"name": p.name, "source": "user",
+                            "path": str(idx), "bytes": idx.stat().st_size,
+                            "label": meta.get("label") or p.name,
+                            "description": meta.get("description") or ""})
+    except Exception:
+        pass
+    return out
+
+
+def _load_skin(name: str):
+    """HTML for `name`, or None if there is no such skin.
+
+    A user skin SHADOWS a built-in of the same name, so a persona can be iterated on
+    without editing amux — which is the point of the registry. Name is matched against
+    real directory entries rather than joined into a path, so `../` cannot escape.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    try:
+        for p in _skin_dir().iterdir():
+            if p.is_dir() and p.name == name:
+                idx = p / "index.html"
+                if idx.is_file():
+                    return idx.read_text(errors="replace")
+    except Exception:
+        pass
+    return _SKIN_BUILTINS.get(name)
+
+
+def _default_skin_for(headers) -> str:
+    """Which skin this caller gets when none is named in the URL.
+
+    Scope order mirrors gates — worker, then group, then global — because a persona is
+    per-lane config and Ethan's rule for that hierarchy is already established: the
+    local worker takes precedence. Falls back to AMUX_DEFAULT_SKIN.
+    """
+    try:
+        who = _hdr_worker(headers) or ""
+        if who:
+            v = (_scope_read("worker", who) or {}).get("skin")
+            if v:
+                return str(v)
+            for g in _session_tags_of(who):
+                v = (_scope_read("group", g) or {}).get("skin")
+                if v:
+                    return str(v)
+    except Exception:
+        pass
+    return os.environ.get("AMUX_DEFAULT_SKIN", "")
+
+
 FLOOR_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -62096,6 +62185,12 @@ def _fleet_graph() -> dict:
     # Obsidian graph keeps the old behaviour, where node.color is a per-note
     # default that folder colouring is meant to override.
     return {"nodes": nodes, "edges": [], "color_authority": True}
+
+
+# Register the bundled skins now that their constants exist. Built-ins are just
+# entries in the same registry a user skin lands in, so there is no privileged path —
+# dropping ~/.amux/skins/floor/index.html shadows this one with no code change.
+_SKIN_BUILTINS["floor"] = FLOOR_HTML
 
 
 class CCHandler(BaseHTTPRequestHandler):
@@ -62953,8 +63048,35 @@ class CCHandler(BaseHTTPRequestHandler):
             import json as _json
             _user_email = self.headers.get("X-Amux-User-Email", "")
             _user_id = self.headers.get("X-Amux-User-Id", "")
-            _skin = qs.get("skin", [os.environ.get("AMUX_DEFAULT_SKIN", "")])[0]
-            if _skin == "floor":
+            # SKIN REGISTRY (AMUX-2516). Ethan: "a plug-in system for skins, so if you
+            # wanted to create a new skin you could upload a scan or a template and the
+            # UX is wrapped around it — the ability to customise the amux UX for
+            # different personas."
+            #
+            # NOT A NEW PRIMITIVE, and the existing floor skin is what proves it: 17KB
+            # of pure presentation calling six APIs that already exist (board, groups,
+            # sessions, observability). A skin adds no backend. It is a VIEW over the
+            # primitives, which is exactly Ethan's own framing that a persona is "a
+            # configured environment: these tabs, these board gates, this group, these
+            # workers" rather than a subsystem to build.
+            #
+            # So the composition is: FILESYSTEM holds the template, ENVIRONMENT selects
+            # it, GROUPS scope it. The only thing that was not pluggable was the
+            # hardcoded `if _skin == "floor"` — every new persona needed a server edit,
+            # which is the ceiling this removes.
+            _skin = qs.get("skin", [_default_skin_for(self.headers)])[0]
+            _skin_html = _load_skin(_skin) if _skin else None
+            if _skin_html is not None:
+                page = _skin_html.replace(
+                    "</head>",
+                    f'<script>window._AMUX_AUTH_TOKEN={_json.dumps(AUTH_TOKEN)};'
+                    f'window._AMUX_UI_TOKEN={_json.dumps(_UI_TOKEN)};'
+                    f'window._AMUX_SKIN={_json.dumps(_skin)};'
+                    f'window._AMUX_USER_EMAIL={_json.dumps(_user_email)};</script></head>',
+                    1,
+                )
+                return self._html(page)
+            if False:
                 page = FLOOR_HTML.replace(
                     "</head>",
                     f'<script>window._AMUX_AUTH_TOKEN={_json.dumps(AUTH_TOKEN)};'
@@ -64471,6 +64593,22 @@ class CCHandler(BaseHTTPRequestHandler):
             })
 
         # GET /api/prefs — read all prefs (or ?key=X for one)
+        # GET /api/skins — what personas are installed and where they came from.
+        # A registry nobody can enumerate is one nobody uses; this is what makes
+        # "upload a template" discoverable rather than folklore.
+        if method == "GET" and path == "/api/skins":
+            _sk = _list_skins()
+            return self._json({
+                "skins": _sk,
+                "default": _default_skin_for(self.headers) or "(full dashboard)",
+                "install": f"drop index.html into {_skin_dir()}/<name>/ — no restart, "
+                           f"no code change; an optional skin.json may set label/description",
+                "select": "?skin=<name> on /, or set it per worker/group via the scope "
+                          "API, or AMUX_DEFAULT_SKIN globally",
+                "note": "a user skin SHADOWS a built-in of the same name, so a persona "
+                        "can be iterated on without editing amux",
+            })
+
         if method == "GET" and path == "/api/prefs":
             key = qs.get("key", [""])[0]
             db = get_db()
