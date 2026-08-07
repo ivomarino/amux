@@ -11554,11 +11554,24 @@ def _autotask_title(text: str) -> str:
                   r"please\s+|kindly\s+|pls\s+|"
                   r"(?:also|so|and|oh|ok|okay|hey|yeah|yea|um)[,\s]+)+",
                   "", head, flags=re.I).strip(" -–—:,")
+    # STRIP PASTED NOISE (Ethan, 2026-08-06: "improve the names of board issue
+    # titles"). A prompt often carries a console dump, stack frame or URL after
+    # the actual ask, and the first clause then swallows it — one live card read
+    # "Tags is still being used vs groups (index):25258 Uncaught ReferenceError:…".
+    # Cut at the first marker of pasted output so the title stays the ASK.
+    head = re.split(r"\s(?:Uncaught |TypeError|ReferenceError|Traceback|at [A-Za-z_$][\w$]*\s*\()"
+                    r"|\s\(index\):\d+|\shttps?://|\s\S+\.(?:py|js|ts|json):\d+",
+                    head, maxsplit=1)[0].strip(" -–—:,")
     head = head.rstrip(".!?,; ").strip()
+    # A title ending in a dangling conjunction reads as truncated even when it
+    # is not: "…and ensure", "…also chapters". Drop it.
+    head = re.sub(r"\s+(?:and|or|but|also|so|then|with|for|to|of|in|on|plus|vs)$", "", head, flags=re.I).strip()
     if head and head[0].islower():
         head = head[0].upper() + head[1:]
-    if len(head) > 80:
-        head = head[:77].rsplit(" ", 1)[0] + "…"
+    # 80 was long enough that 247 of 379 live titles ran past 60 and ended in an
+    # ellipsis mid-thought. Shorter, and always cut on a word boundary.
+    if len(head) > 64:
+        head = head[:63].rsplit(" ", 1)[0].rstrip(" -–—:,") + "…"
     return head or (t[:60] or "Task")
 
 
@@ -65740,6 +65753,25 @@ class CCHandler(BaseHTTPRequestHandler):
                                         _extra = f" [gate: {', '.join(str(x) for x in _gc[:4])}]"
                                     _role = "human" if _audit_prior.get("owner_type") != "agent" or _actor == "Ethan" else "session"
                                     _append_board_log(bid, f"status: {_frm} \u2192 {_to} (by {_actor}/{_role}){_extra}")
+                            # TITLE CHANGES WERE INVISIBLE (Ethan, 2026-08-06).
+                            # Measured across 4341 cards: 2615 status transitions
+                            # logged, 911 carrying the attested gate criteria, 109
+                            # forced bypasses recorded — and ZERO title edits. A
+                            # card could be renamed to mean something else with no
+                            # trace, which matters more than most fields because the
+                            # title is what every list, notice and digest shows:
+                            # change it and you change what everyone believes the
+                            # card IS. The code already treats retitling as
+                            # dangerous — auto-retitling on every inbound message
+                            # clobbered manually-managed cards (MO-2952/2963) — and
+                            # still left no record when it happened.
+                            if "title" in body:
+                                _old_t = str(_audit_prior.get("title") or "").strip()
+                                _new_t = str(body.get("title") or "").strip()
+                                if _new_t and _new_t != _old_t:
+                                    _ta = _hdr_worker(self.headers) or "unattributed"
+                                    _append_board_log(bid, "title (by %s): %r \u2192 %r"
+                                                      % (_ta, _old_t[:70], _new_t[:70]))
                         except Exception as _ae:
                             slog(f"[board] patch audit failed for {bid}: {_ae}")
                     except Exception:
