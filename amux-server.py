@@ -12031,6 +12031,47 @@ def _needsyou_renag(session_name: str, issue_id: str, title: str,
         return False
 
 
+# ── The advance ladder and the reviewer pairing, defined ONCE ───────────────
+# backend's rule of thumb, earned across three bugs in one night (AMUX-2478):
+# wherever you just wrote "copied from X, keep in sync", the copy should have been
+# a call. Every "keep these in sync" comment is a defect report about the code's
+# shape, filed in advance. All three of tonight's causes were one half of a pair
+# being widened while the other was left behind:
+#
+#   - the nudge's selection gained `done` but its target-status ternary did not,
+#     so a done card was quoted the gate it had already satisfied;
+#   - the reviewer sign-off requirement was widened to any close (AMUX-2217) but
+#     the routing that tells a reviewer they owe an ack still tested
+#     status == "review", so a done card with an unacked reviewer nudged the one
+#     party who could not act while the reviewer was never told;
+#   - and AMUX-2477, where the published gate contract disagreed with the resolver.
+#
+# So the routing set is DERIVED from the enforcement set rather than restated
+# next to it. Widening `_REVIEWER_SIGNOFF_TARGETS` now moves the router with it,
+# and `tests/test_advance_nudge_retype.py` enumerates the domain and asserts every
+# member has a consumer branch, so the pairing has a standing check rather than a
+# comment asking to be remembered.
+_ADVANCE_NEXT = {"doing": "review", "review": "done", "done": "verified"}
+
+# Target statuses whose transition requires the named reviewer's sign-off. This is
+# the ENFORCEMENT set; the PATCH handler tests membership directly.
+_REVIEWER_SIGNOFF_TARGETS = ("done", "verified")
+
+
+def _advance_target(status: str) -> str:
+    """The status a card in `status` moves to next, or "" if it is terminal."""
+    return _ADVANCE_NEXT.get((status or "").strip().lower(), "")
+
+
+def _reviewer_acts_next(status: str) -> bool:
+    """True when a card SITTING in `status` needs its named reviewer to act next.
+
+    Derived, not restated: a card whose next transition lands in the enforcement
+    set is one the author cannot complete alone.
+    """
+    return _advance_target(status) in _REVIEWER_SIGNOFF_TARGETS
+
+
 def _advance_open_card(session_name: str) -> bool:
     """A session that goes idle holding an in-flight card gets pushed to finish it.
 
@@ -12294,8 +12335,7 @@ def _advance_open_card(session_name: str) -> bool:
         # describes it was not, so the two disagreed about one fact. Predicate is
         # copied from the enforcement above rather than re-derived; if that set
         # changes again, change both.
-        _rev_gated = ("review", "done")     # must match the sign-off check's new_status set
-        if row["status"] in _rev_gated and _rev and _rev != session_name:
+        if _reviewer_acts_next(row["status"]) and _rev and _rev != session_name:
             if not is_running(_rev):
                 slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
                 return False
@@ -12359,7 +12399,7 @@ def _advance_open_card(session_name: str) -> bool:
             # Name the ACTUAL transition. A card at `done` told to "ack review->done"
             # is being pointed at a move it already made, which is the same
             # already-answered-question defect as the gate_next ternary.
-            _rev_next = "verified" if row["status"] == "done" else "done"
+            _rev_next = _advance_target(row["status"])
             ok, err = send_text(_rev,
                 f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in "
                 f"'{row['status']}' and names YOU as reviewer. Review it: if the work "
@@ -12391,14 +12431,11 @@ def _advance_open_card(session_name: str) -> bool:
         # f88fbc3 and this ternary was not updated with it, so the one class of card
         # the nudge was extended to reach got the one gate it had already passed.
         _st = row["status"]
-        if _st == "done":
-            if _term != "verified":
-                # `done` IS terminal for this lane, so there is nothing to advance
-                # to and the nudge can only re-fire forever with no honest exit.
-                return False
-            gate_next = "verified"
-        else:
-            gate_next = "review" if _st == "doing" else "done"
+        if _st == "done" and _term != "verified":
+            # `done` IS terminal for this lane, so there is nothing to advance to
+            # and the nudge can only re-fire forever with no honest exit.
+            return False
+        gate_next = _advance_target(_st) or "done"
         gate = _effective_gate(item, gate_next) or []
         gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
         # RE-TYPE: the honest exit this menu never offered (AMUX-2478, found by
@@ -65728,7 +65765,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         # a different transition is a gate that cannot fail.
                         # Now: a reviewer, once set, is required for ANY close.
                         _rev = (gate_item.get("reviewer") or "").strip()
-                        if (_rev and new_status in ("done", "verified")
+                        if (_rev and new_status in _REVIEWER_SIGNOFF_TARGETS
                                 and not body.get("force")):
                             _acker = _hdr_worker(self.headers)
                             if _acker != _rev:

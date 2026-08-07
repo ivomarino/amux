@@ -37,15 +37,31 @@ import pytest
 
 def _load(home):
     """Fresh module bound to an isolated AMUX_HOME. Re-imported per test because the
-    home path is resolved at import time."""
+    home path is resolved at import time.
+
+    AMUX_HOME is RESTORED after the import. It only has to be set while the module
+    body runs — CC_HOME is bound there and the module keeps it — but leaving it set
+    leaks a tmp path into every module imported later in the session. That is not
+    hypothetical: it broke tests/test_gate_contract.py, which imports the server
+    fresh and got a home directory pytest had already deleted. A test that fails
+    only depending on which file ran before it is worse than no test, and this one
+    pointed at an innocent module.
+    """
+    prev = os.environ.get("AMUX_HOME")
     os.environ["AMUX_HOME"] = str(home)
-    sys.modules.pop("amux_server_nudge", None)
-    spec = importlib.util.spec_from_file_location(
-        "amux_server_nudge", Path(__file__).parent.parent / "amux-server.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["amux_server_nudge"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        sys.modules.pop("amux_server_nudge", None)
+        spec = importlib.util.spec_from_file_location(
+            "amux_server_nudge", Path(__file__).parent.parent / "amux-server.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["amux_server_nudge"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if prev is None:
+            os.environ.pop("AMUX_HOME", None)
+        else:
+            os.environ["AMUX_HOME"] = prev
 
 
 @pytest.fixture
@@ -208,3 +224,58 @@ def test_review_card_routing_still_says_review_to_done(rig):
 
     assert sent and sent[-1][0] == "peer"
     assert "ack review->done" in sent[-1][1]
+
+
+@pytest.fixture(scope="module")
+def srv_mod(tmp_path_factory):
+    """Module only — these assert on predicates, not on DB state."""
+    return _load(tmp_path_factory.mktemp("pairing"))
+
+
+# ───────────── tier 3: the pairing tripwire (backend, AMUX-2478) ─────────────
+#
+# All three of tonight's causes were one half of a pair widened while the other
+# was left behind. Tiers 1 and 2 (extract the predicate; generate one side from
+# the other) are applied in the code. This is tier 3: enumerate the enforcement
+# predicate's DOMAIN and assert every member has a consumer behaviour, so the
+# pairing has a standing known-positive instead of a comment asking to be
+# remembered. It fails when someone widens one half.
+
+def test_every_signoff_target_has_a_router_branch(srv_mod):
+    """For each target status requiring reviewer sign-off, some card status must
+    route to the reviewer. A target nobody can be routed for is an author stuck
+    at a 409 while the reviewer is never told — cause 3 exactly."""
+    routed = {srv_mod._advance_target(s)
+              for s in srv_mod._ADVANCE_NEXT
+              if srv_mod._reviewer_acts_next(s)}
+    missing = set(srv_mod._REVIEWER_SIGNOFF_TARGETS) - routed
+    assert not missing, (
+        f"sign-off is enforced for {sorted(missing)} but no card status routes to the "
+        f"reviewer for it — widen _ADVANCE_NEXT or the router, or narrow enforcement")
+    print(f"checked {len(srv_mod._REVIEWER_SIGNOFF_TARGETS)} sign-off targets, "
+          f"{len(routed)} routed")
+
+
+def test_advance_ladder_has_no_dead_rungs(srv_mod):
+    """Every status the nudge SELECTS must have a next target, or the card is quoted
+    a gate it already satisfied (cause 2). The selection set is the domain here."""
+    selected = ("doing", "review", "done")
+    dead = [s for s in selected if not srv_mod._advance_target(s)]
+    assert not dead, f"nudge selects {dead} but the ladder gives them no target"
+    for s in selected:
+        assert srv_mod._advance_target(s) != s, f"{s} advances to itself"
+    print(f"checked {len(selected)} selected statuses, all advance forward")
+
+
+def test_reviewer_acts_next_is_derived_not_hardcoded(srv_mod):
+    """The whole point of tier 1: narrowing enforcement must narrow routing with it,
+    with no second edit. If this fails, someone re-hardcoded the routing set."""
+    orig = srv_mod._REVIEWER_SIGNOFF_TARGETS
+    try:
+        srv_mod._REVIEWER_SIGNOFF_TARGETS = ("verified",)   # narrow enforcement only
+        assert srv_mod._reviewer_acts_next("done") is True, "done->verified still gated"
+        assert srv_mod._reviewer_acts_next("review") is False, (
+            "review->done no longer requires sign-off, but the router still claims it "
+            "does — the routing set is not derived from the enforcement set")
+    finally:
+        srv_mod._REVIEWER_SIGNOFF_TARGETS = orig
