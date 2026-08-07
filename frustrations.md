@@ -725,7 +725,7 @@ SYMPTOM: `amux board type AMUX-2479 decision` -> `{"error": "unknown type 'decis
 COST: small in minutes, but it is the worst shape of help: confidently wrong, and it points you at
   your CARD rather than at the tool. The server's error is good (it returns `valid_types`), so the
   recovery was fast — without that it would have read as the card being in a bad state.
-FIX: `2c1d1a2` — the server publishes `fields.valid_types` machine-readably (the existing prose
+FIX: `32b9d14` — the server publishes `fields.valid_types` machine-readably (the existing prose
   `"One of [...]"` was not parseable), and the CLI renders its usage line from that with a fallback
   when the server is unreachable. Verified live: usage now prints `tripwire`, and greps clean for
   `task`/`decision`.
