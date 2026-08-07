@@ -20524,16 +20524,54 @@ def _write_claude_memory(name: str, work_dir: str):
         # person: the archived entries were never actually gone — they are still in
         # each lane's own .archive.md — but they were unreachable from the index,
         # and unreachable is what a reader experiences as deleted.
+        # PROPAGATE ONCE, NOT FOREVER (GCA-78, general-canvas-apps).
+        #
+        # The merge above fixed last-writer-wins clobbering, and traded it for a
+        # quieter loss: it is ADDITIVE-ONLY, so it re-seeds anything deleted from
+        # the shared file. general-canvas-apps removed two entries from the shared
+        # memory-archive.md at ~09:0x, verified the removal with a re-measure
+        # (118 -> 116 violations), and found one of them BACK three hours later.
+        # Reproduced verbatim with this code before changing it: delete a line from
+        # the destination, run one lane's sync, and the line returns — because the
+        # deleting session edited the SHARED file while the lane's own
+        # `<name>.archive.md` still listed it, so the merge saw it "missing".
+        #
+        # Not a race, so compare-and-swap would not have fixed it: no concurrent
+        # write is needed, and the stale mtime they measured is a symptom of the
+        # last ADD, not of a clobber. The bug is that the per-lane archive was
+        # treated as a standing source of truth to re-apply on every sync, when it
+        # is really a stream of entries to hand over once.
+        #
+        # So: a sidecar records what this lane has already propagated. A line is
+        # appended only if it is absent from the destination AND has never been
+        # handed over before. A downstream deletion therefore STICKS, while a
+        # genuinely new retirement still flows. Silent-and-delayed was the worst
+        # property of this bug — the edit succeeded, was verified, and regressed
+        # hours later — and that is exactly what a propagate-once rule removes.
         _arch = CC_MEMORY / f"{name}.archive.md"
         if _arch.exists():
             _dest = claude_mem_dir / _MEM_ARCHIVE_FILE
+            _sent_f = CC_MEMORY / f"{name}.archive.sent"
             _prev = _dest.read_text(errors="replace").splitlines() if _dest.exists() else []
             _have = {l.strip() for l in _prev if l.strip()}
-            _add = [l for l in _arch.read_text(errors="replace").splitlines()
-                    if l.strip() and l.strip() not in _have]
+            try:
+                _sent = {l.strip() for l in _sent_f.read_text(errors="replace").splitlines()
+                         if l.strip()} if _sent_f.exists() else set()
+            except Exception:
+                _sent = set()
+            _src = [l for l in _arch.read_text(errors="replace").splitlines() if l.strip()]
+            _add = [l for l in _src if l.strip() not in _have and l.strip() not in _sent]
             if _add or not _dest.exists():
                 _dest.write_text(("\n".join(_prev).rstrip() + "\n" +
                                   "\n".join(_add)).strip() + "\n")
+            # Record everything this lane has now handed over, whether it was
+            # appended this pass or was already present. Written AFTER the
+            # destination so a crash between the two re-propagates (safe) rather
+            # than silently dropping an entry that never landed (lossy).
+            try:
+                _sent_f.write_text("\n".join(sorted(_sent | {l.strip() for l in _src})) + "\n")
+            except Exception:
+                pass
         # Same rule for the tag layer: the index points at `<tag>.md`, so that
         # file has to exist BESIDE MEMORY.md or the pointer is a dead link — and
         # a pointer to a file the session cannot open is worse than no pointer,
