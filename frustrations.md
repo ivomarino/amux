@@ -809,3 +809,34 @@ NOTE: same family as the night's other entries, one layer out. Every one of thos
   two intents. The lesson generalises the same way: if two things that must never be confused
   look identical at the point of use, something will eventually confuse them, and being careful
   is not a mechanism.
+
+## Assignment notices arrive for cards that were deleted a second after being created
+AREA: notices
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: amux-cloud
+CARD: AC-284
+SYMPTOM: "New board task assigned: AC-284 — [scratch] foreign-owned archive guard probe —
+  delete me. Run `amux board claim AC-284` to take it." The card had already been deleted.
+  `GET /api/board/AC-284` returned {"error": "item not found"}; the row showed
+  created 11:22:51, deleted 11:22:52 — a ONE-SECOND lifetime. AC-285 repeated it within
+  the hour. Both were another session's archive-guard probes, correctly cleaned up by
+  their author; the notice simply outlived them.
+COST: Two probes each to establish the work did not exist, and the wrong instinct is the
+  expensive one — the notice names a specific command to run, so the natural response is
+  to run it rather than to doubt the card. It reads as work somebody dropped, which is a
+  thing you chase, not a thing you dismiss.
+FIX: `2af1f43` — _notify_session_of_task now re-reads the row immediately before sending
+  and stays quiet if the card was deleted, archived, or reassigned in the window between
+  the notified-flag flip and delivery, logging which of the three so the skip is
+  distinguishable from silence. Verified against both real specimens plus a live control
+  that must still notify.
+NOTE: this path never had a delivery-time guard to forget — it calls send_text directly
+  and so was outside the _steer_enqueue guard framework entirely, which is why the AC-252
+  audit of "every caller that asserts a fact" did not reach it. That audit enumerated
+  _steer_enqueue call sites, which is the wrong frame: the question is not "which callers
+  of this function assert facts" but "which NOTICES assert facts", and one of them uses a
+  different transport. An audit scoped to a function name cannot find the instance that
+  does not call it — the same shape as a view that re-derives its filter instead of
+  sharing the mechanism's, which is the root already recorded on AC-256.
