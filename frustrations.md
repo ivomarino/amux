@@ -679,3 +679,32 @@ NOTE: the reusable shape is not "docs go stale". It is that naming a TIER withou
   distinguish two states — this is the fourth in AREA gates/instruments this week, which
   is the argument that the "publish a rule, hand-type it elsewhere" pattern needs to go,
   not just this instance of it.
+
+## `amux board` could not set `reviewer`, the field that gates review -> done
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux
+CARD: BACKE-3183
+SYMPTOM: `amux board review BACKE-3183 --reviewer backend` -> `error: amux board: unknown
+  flag '--reviewer'`. The usage line lists `--checked --ack --type --override-doing
+  --trigger` and there is no reviewer verb or flag anywhere in the CLI (`grep -n reviewer
+  amux` returned one hit, in an unrelated comment). The server accepts `reviewer` on PATCH
+  and has all along, so nothing looks broken from the API side.
+COST: minutes here, but the shape is the cost. review->done is BLOCKED on a named
+  reviewer's sign-off — I hit that refusal on AMUX-2311 earlier tonight ("review sign-off
+  required from the reviewer"). So the only way to route a card for review was a raw
+  `curl -X PATCH`, which carries no X-Amux-Session. The review gate exists precisely to
+  make cross-session sign-off ATTRIBUTABLE, and the missing verb was manufacturing the
+  unattributed writes it depends on.
+FIX: `c2d57ed` — `amux board reviewer <ISSUE-ID> <session>` (pass `none` to clear), same
+  shape as the `type` verb. Verified by reading the field back rather than trusting the
+  success line: `reviewer = 'backend'`.
+NOTE: this is the SECOND instance of AMUX-2325's exact defect, and the `type` verb's own
+  comment — four lines above where I added this one — documents the first. One instance
+  is a missed verb; two says the rule should be inverted: every gate-relevant FIELD needs
+  an attributed setter by default, and the audit should be "which fields can a gate block
+  on, and does each have an `amux board` verb?" rather than waiting for a session to trip
+  over the next one. `depends_on` and `owner_type` are both gate-relevant and both
+  currently unsettable from the CLI — same trap, unsprung.
