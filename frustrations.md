@@ -928,3 +928,56 @@ NOTE: three surfaces documented it — the search placeholder (`-worker:none`), 
   exactly is what produces the failure), with the added twist that the comment claiming
   the fix was in is what makes a code reader stop looking. A `case` arm is not what
   makes a key real; the key list is.
+
+## The nudge told 108 cards' worth of lanes to take an exit that did not exist
+AREA: gates
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: mixpeek-studio (reported), amux (fixed)
+CARD: AMUX-2499
+SYMPTOM: the archived-but-unfinished notice offers three exits, one being "un-archive it
+  if it IS live work that was cleared by mistake". At the time it fired there was no way
+  to un-archive: PATCH ignored `archived`, `amux board` had no verb, POST
+  /api/board/<id>/unarchive 404s. mixpeek-studio confirmed across several attempts.
+COST: a lane holding 108 archived-but-live cards had only two reachable exits, both of
+  which mis-stamp the outcome (discard destroys real backlog; verified/done asserts
+  work that is not done). They correctly refused to bulk-discard and announced they
+  would stop answering the nudge — so the loop produced silence from the lane holding
+  the second-largest population it exists to clear.
+FIX: 2c4aae0 made `archived` writable and added `amux board unarchive`, FOURTEEN MINUTES
+  after the notice first fired — so the report was accurate for the build tested and
+  stale by the time it was written. d758a9e makes the notice NAME the command for each
+  of its three exits, verified end-to-end on a throwaway card.
+NOTE: the generalisable part is the fourteen minutes. The reporter was not wrong and was
+  not out of date through any fault of theirs — a capability landing between a
+  notification being composed and being acted on is invisible from the receiving side.
+  What removes the class is not "un-archive now exists", it is that the message names
+  the command: a named verb either runs or errors, whereas "un-archive it" requires the
+  reader to go looking, and concluding "it does not exist" after looking is a REASONABLE
+  inference that happened to be true. Related: AMUX-2140 (the sanctioned instruction
+  itself was the theatre) and ethos rule 6.
+
+## The mechanism that surfaces unreachable cards was itself only reachable when idle
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2499
+SYMPTOM: the archived-but-unfinished notice sat in `_advance_open_card`'s `if not row:`
+  tail — reached only when a lane has nothing advanceable. 25 notifications ever, all
+  inside one 9-minute window, all to small lanes, while 54 lanes held limbo cards.
+COST: of the top twelve holders, only the two with zero advanceable candidates could
+  reach it. Ten lanes holding 1235 cards — 86% of the population — were structurally
+  unreachable by the mechanism built to surface them. Ethan asked why the pile was not
+  being worked; the answer was that most of the fleet had never been told.
+FIX: d758a9e hoists the check ahead of the candidate selection and deduplicates once per
+  lane per day (the key had been the COUNT, which re-nagged lanes for making progress
+  and went permanently silent whenever a count recurred).
+NOTE: SECOND instance of this exact shape in the SAME function — AC-194 hoisted the
+  stale-ask re-nag out of the same tail after 48 cycles and 0 fires. That makes it a
+  pattern rather than a slip: "check it when the loop has nothing else to do" reads as
+  politeness and is in fact a filter that selects against the population you most need
+  to reach, because the lanes with the most backlog are the ones never idle. Worth
+  auditing any other work hung off an idle branch.
