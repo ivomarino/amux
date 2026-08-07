@@ -29097,6 +29097,57 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .board-filter-chip.active { background: rgba(88,166,255,0.15); color: var(--accent); border-color: rgba(88,166,255,0.3); }
   .board-filter-chip.active-session { background: rgba(139,148,158,0.15); color: var(--text); border-color: var(--dim); }
   /* Board toolbar + view toggle */
+  /* AT-A-GLANCE PROGRESS (AMUX-2506) + COLUMN PURPOSE (AMUX-2507).
+     Mobile-first per .claude/rules/css-mobile.md: this is a horizontally
+     scrollable rail, NOT a grid, so at 375px it stays one readable line instead
+     of wrapping into a wall. Touch targets are not interactive here (read-only
+     figures) so the 44px rule does not bind, but the rail keeps 44px height so it
+     matches the toolbar it sits under. */
+  .board-stats {
+    display: flex; gap: 8px; align-items: stretch;
+    margin: 0 0 10px; padding: 2px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .board-stats::-webkit-scrollbar { display: none; }
+  .bstat {
+    flex: 0 0 auto; min-width: 74px; padding: 7px 11px;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); text-align: left;
+  }
+  .bstat-v { font-size: 1.05rem; font-weight: 650; line-height: 1.15; color: var(--fg); }
+  .bstat-l {
+    font-size: 0.66rem; color: var(--dim); margin-top: 2px;
+    text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
+  }
+  .bstat.c-doing .bstat-v   { color: var(--yellow); }
+  .bstat.c-review .bstat-v  { color: var(--accent); }
+  .bstat.c-done .bstat-v    { color: var(--green, #3fb950); }
+  .bstat.c-blocked .bstat-v { color: var(--red, #f85149); }
+  /* NOT flex-greedy. `flex:1 1 auto` stretched this across the full board width
+     and dwarfed the counts beside it — the opposite of an at-a-glance rail. */
+  .bstat-prog { min-width: 146px; max-width: 210px; flex: 0 0 auto; }
+  .bstat-prog .bstat-bar {
+    height: 4px; border-radius: 2px; background: var(--border);
+    overflow: hidden; margin-bottom: 5px;
+  }
+  .bstat-prog .bstat-bar > span {
+    display: block; height: 100%; border-radius: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--green, #3fb950));
+    transition: width 0.3s ease;
+  }
+  .board-col-purpose {
+    font-size: 0.68rem; color: var(--dim); padding: 0 2px 6px;
+    line-height: 1.3; letter-spacing: 0.01em;
+  }
+  @media (max-width: 600px) {
+    .board-stats { gap: 6px; margin-bottom: 8px; }
+    .bstat { min-width: 64px; padding: 6px 9px; }
+    .bstat-v { font-size: 0.95rem; }
+    .bstat-l { font-size: 0.6rem; }
+    .bstat-prog { min-width: 116px; }
+    .board-col-purpose { font-size: 0.64rem; }
+  }
   .board-toolbar { display: flex; gap: 8px; align-items: center; }
   .board-owner-toggle { display: flex; gap: 2px; background: rgba(255,255,255,0.04); border-radius: 6px; padding: 2px; flex-shrink: 0; }
   .board-view-toggle { display: flex; gap: 2px; background: rgba(255,255,255,0.04); border-radius: 6px; padding: 2px; flex-shrink: 0; }
@@ -30820,6 +30871,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div class="board-views" id="board-views"></div>
   <div class="board-filters" id="board-filters"></div>
+  <div id="board-stats-mount"></div>
   <div class="board-columns" id="board-columns"></div>
 </div>
 <!-- Calendar view -->
@@ -39405,7 +39457,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.506';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.508';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -51232,6 +51284,62 @@ function _boardEnsureFull() {
     .catch(() => {})
     .finally(() => { _boardFullLoading = false; });
 }
+// Column purpose lines (AMUX-2507). Deliberately phrased as the ENTRY condition,
+// because that is what a reader needs when deciding whether a card belongs here.
+const _COL_PURPOSE = {
+  backlog:   'Parked — waiting on something external',
+  todo:      'Queued, nobody on it yet',
+  doing:     'Being worked right now',
+  review:    'Awaiting another set of eyes',
+  done:      'Meets the gate to close',
+  verified:  'Confirmed to still hold',
+  discarded: 'Closed without completing — reason on the card',
+};
+
+// AT-A-GLANCE PROGRESS (AMUX-2506). The board could not answer the one question
+// the fleet is organised around — how close is this to all-verified? — without a
+// human counting columns.
+//
+// Computed from the rows already rendered, so it always agrees with what is on
+// screen: if a filter hides cards, the strip describes the filtered set rather
+// than a different population. A header that disagrees with its own board is the
+// AMUX-2477 shape, and this is exactly where it would happen.
+//
+// NOT included, on purpose: throughput/day and ETA-to-100%. Both are computable
+// from transition history, but an ETA is a PREDICTION rendered with the same
+// authority as a measurement, and the ethos records that an instrument which
+// always produces a plausible-looking answer gets believed. It needs a visible
+// confidence basis, not a number in a box.
+function _boardStatsHTML(rows) {
+  const n = rows.length;
+  if (!n) return '';
+  let ver = 0, active = 0, review = 0, blocked = 0, done = 0;
+  rows.forEach(i => {
+    const st = _statusCanon(i.status || 'todo');
+    if (st === 'verified') ver++;
+    else if (st === 'done') done++;
+    else if (st === 'review') review++;
+    else if (st === 'doing') active++;
+    if (st === 'blocked' || (i.tags || i.groups || []).some(t => /^needs:you/i.test(t))) blocked++;
+  });
+  const closable = n - blocked;
+  const pct = closable > 0 ? Math.round((ver / closable) * 100) : 0;
+  const cell = (label, val, cls) =>
+    '<div class="bstat' + (cls ? ' ' + cls : '') + '"><div class="bstat-v">' + val
+    + '</div><div class="bstat-l">' + label + '</div></div>';
+  return '<div class="board-stats" role="group" aria-label="Board progress">'
+    + '<div class="bstat bstat-prog">'
+    +   '<div class="bstat-bar"><span style="width:' + pct + '%"></span></div>'
+    +   '<div class="bstat-v">' + pct + '%</div>'
+    +   '<div class="bstat-l">' + ver + '/' + closable + ' verified</div>'
+    + '</div>'
+    + cell('in progress', active, 'c-doing')
+    + cell('in review', review, 'c-review')
+    + cell('at done', done, 'c-done')
+    + (blocked ? cell('blocked', blocked, 'c-blocked') : '')
+    + '</div>';
+}
+
 function renderBoard() {
   _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
@@ -51284,9 +51392,16 @@ function renderBoard() {
         + '<span style="color:var(--dim);font-weight:400;">' + g.length + '</span></div>';
       html += g.map(i => _issueRowHTML(i, { showOwner: true })).join('');
     });
+    const _sEl2 = document.getElementById('board-stats-mount');
+    if (_sEl2) _sEl2.innerHTML = _boardStatsHTML(visible);
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
+  // Mount the progress strip above the columns, over the SAME `visible` set the
+  // columns are about to render (AMUX-2506). Fed from `visible` and not from
+  // boardItems so it can never describe a different population than the board.
+  const _sEl = document.getElementById('board-stats-mount');
+  if (_sEl) _sEl.innerHTML = _boardStatsHTML(visible);
   container.classList.remove('board-list-mode');
   if (boardViewMode === 'worker') {
     container.classList.remove('board-columns');
@@ -51338,6 +51453,20 @@ function renderBoard() {
       html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete column">&#x2715;</button>';
     }
     html += '</span></div>';
+    // WHAT THE COLUMN MEANS, not just what it is called (AMUX-2507). The gate
+    // criteria below say what a card must SATISFY; this says what the column IS
+    // FOR. Five separate defects this week came from people not knowing that
+    // `done` means "meets the gate to close" while `verified` means "confirmed
+    // to still hold" — the distinction the whole ledger rests on and the one
+    // thing the board never said out loud.
+    //
+    // Derived from the status id rather than stored per-board, so a custom
+    // column (matching / exceptions / summary in the cloud envs) renders
+    // without an empty slot instead of demanding someone fill one in.
+    const _colPurpose = _COL_PURPOSE[st] || '';
+    if (_colPurpose) {
+      html += '<div class="board-col-purpose">' + esc(_colPurpose) + '</div>';
+    }
     // ENTRY CRITERIA, visible on the board (AMUX-2313). Ethan: "the gate
     // configurations not hidden but easily accessible, and it should be obvious
     // that gates are criteria for passing to the next column." The criteria used
@@ -60948,7 +61077,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.506';
+const CACHE = 'amux-v0.9.508';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
