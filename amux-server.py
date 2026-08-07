@@ -11960,6 +11960,77 @@ _advance_last: dict = {}
 _ADVANCE_COOLDOWN = 15 * 60     # never push the same lane twice inside this window
 
 
+def _needsyou_renag(session_name: str, issue_id: str, title: str,
+                    asked_age: float, archived=0) -> bool:
+    """ONE stale-ask re-nag, deduped. Both callers use this (AMUX-2476).
+
+    There were two copies of this nudge. The one in the pre-selection block
+    checked session_events for a prior fire and suppressed within the window;
+    the one on the needs:you EDGE checked only whether the ask was YOUNGER than
+    the window and, if not, sent every single sweep — no event, no dedupe. So a
+    3-day-old ask was re-nagged every ~15 minutes forever. creative-dna measured
+    4 firings in ~40 minutes on CD-51 and only ONE recorded event, which is the
+    signature: one copy writes the durable record, the other does not, and the
+    guard cannot see fires it never recorded. The codebase already names this
+    class — two implementations of one rule diverge and each looks correct alone
+    (AMUX-2315/2325/2330).
+
+    COMPLIANCE RESETS THE WINDOW, which is the other half of the report. The
+    message asks the lane to "re-state it on the card so it resurfaces fresh".
+    Keying purely on tag age made that instruction unsatisfiable: creative-dna
+    re-verified the premise, rewrote the desc with fresh numbers, re-touched the
+    tag and updated the title with a re-confirmation date — and the next firing
+    quoted the refreshed title back at them as stale. A guard whose prescribed
+    remedy cannot clear it teaches sessions to ignore it (ethos #3). So a card
+    edited SINCE the last re-nag counts as re-confirmed and starts a fresh
+    window.
+    """
+    try:
+        db = get_db()
+        _win = _NEEDSYOU_RENAG_DAYS * 86400
+        _last = db.execute(
+            "SELECT MAX(ts) AS t FROM session_events WHERE type='needsyou.renag' AND data LIKE ?",
+            ('%"' + issue_id + '"%',)).fetchone()
+        _last_ts = float(_last["t"]) if (_last and _last["t"]) else 0.0
+        if _last_ts and (time.time() - _last_ts) < _win:
+            return False                      # already asked inside this window
+        if _last_ts:
+            _row = db.execute("SELECT updated FROM issues WHERE id=?", (issue_id,)).fetchone()
+            _upd = float(_row["updated"] or 0) if _row else 0.0
+            if _upd > _last_ts:
+                # Re-stated since we last asked: that IS the remedy the message
+                # prescribes. Record it so the next window is measured from the
+                # re-confirmation, and say nothing this round.
+                _emit_event(session_name, "needsyou.renag",
+                            {"issue": issue_id, "reconfirmed": True}, source="advance")
+                slog(f"[advance] {session_name}: {issue_id} re-stated since the last ask "
+                     f"— counting that as re-confirmation, not re-nagging")
+                return False
+        _days = int(asked_age / 86400)
+        _emit_event(session_name, "needsyou.renag", {"issue": issue_id, "days": _days},
+                    source="advance")
+        ok, _err = send_text(session_name,
+            f"[amux] {issue_id} has been waiting on a human answer for at least "
+            f"{_days} days: {(title or '')[:90]}\n\n"
+            + ("This card is ARCHIVED, which does NOT clear the ask — needs:you stays "
+               "visible to the human by design.\n\n" if archived else "")
+            + f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
+            f"right: is the question you recorded still the question? If it is, re-state it "
+            f"on the card and that counts as re-confirming it — you will not be asked again "
+            f"for {_NEEDSYOU_RENAG_DAYS} days. If it has been overtaken by events, clear the "
+            f"needs:you tag and move the card to whatever is now true.",
+            defer_if_busy=True)
+        if ok:
+            _advance_last[session_name] = time.time()
+            _cmd_hist_record(session_name, f"[amux] stale-ask check: {issue_id}", "system", "advance")
+            slog(f"[advance] {session_name}: {issue_id} needs:you for {_days}d "
+                 f"(archived={archived}) — asked whether the ask still holds")
+        return bool(ok)
+    except Exception as _e:
+        slog(f"[advance] {session_name}: stale-ask re-nag failed for {issue_id}: {_e}")
+        return False
+
+
 def _advance_open_card(session_name: str) -> bool:
     """A session that goes idle holding an in-flight card gets pushed to finish it.
 
@@ -12031,30 +12102,13 @@ def _advance_open_card(session_name: str) -> bool:
             "GROUP BY i.id HAVING asked_at IS NOT NULL AND asked_at < ? "
             "ORDER BY asked_at ASC LIMIT 1", (session_name, _renag_cut)).fetchone()
         if _stale:
-            _seen = db.execute(
-                "SELECT MAX(ts) AS t FROM session_events WHERE type='needsyou.renag' AND data LIKE ?",
-                ('%"' + _stale["id"] + '"%',)).fetchone()
-            if not (_seen and _seen["t"] and (time.time() - float(_seen["t"])) < _NEEDSYOU_RENAG_DAYS * 86400):
-                _days = int((time.time() - float(_stale["asked_at"])) / 86400)
-                _emit_event(session_name, "needsyou.renag", {"issue": _stale["id"], "days": _days},
-                            source="advance")
-                ok, err = send_text(session_name,
-                    f"[amux] {_stale['id']} has been waiting on a human answer for at least "
-                    f"{_days} days: {(_stale['title'] or '')[:90]}\n\n"
-                    + ("This card is ARCHIVED, which does NOT clear the ask — needs:you stays "
-                       "visible to the human by design.\n\n" if _stale["archived"] else "")
-                    + f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
-                    f"right: is the question you recorded still the question? If it is, re-state it "
-                    f"on the card so it resurfaces fresh. If it has been overtaken by events, clear "
-                    f"the needs:you tag and move the card to whatever is now true.",
-                    defer_if_busy=True)
-                if ok:
-                    _advance_last[session_name] = time.time()
-                    _cmd_hist_record(session_name, f"[amux] stale-ask check: {_stale['id']}",
-                                     "system", "advance")
-                    slog(f"[advance] {session_name}: {_stale['id']} needs:you for {_days}d "
-                         f"(archived={_stale['archived']}) — asked whether the ask still holds")
-                    return True
+            # Single resolver (AMUX-2476) — dedupe, re-confirmation and the
+            # message all live in _needsyou_renag so the two call sites cannot
+            # drift apart again.
+            if _needsyou_renag(session_name, _stale["id"], _stale["title"] or "",
+                               time.time() - float(_stale["asked_at"]),
+                               _stale["archived"]):
+                return True
         # INCLUDE 'done' (Ethan, 2026-08-06: "ensure it doesnt stop until all issues
         # are furthest to the right and have done every gate fully (verified)").
         # This selected doing/review only, so a card that reached `done` was never
@@ -12216,27 +12270,8 @@ def _advance_open_card(session_name: str) -> bool:
                 slog(f"[advance] {session_name}: {row['id']} is needs:you "
                      f"({int(_asked_age/3600)}h) — the human owes the answer, not the lane")
                 return False
-            ok, err = send_text(session_name,
-                # "at least" is load-bearing, not hedging. Tags applied before
-                # issue_tags.added_at existed are backfilled from issues.created —
-                # a true LOWER BOUND (a tag cannot predate its card), but not the
-                # real application time. Asserting an exact age for those rows
-                # would state something the system does not know; "at least" is
-                # true for a backfilled row and for a precisely-stamped one alike,
-                # so one phrasing stays honest in both cases.
-                f"[amux] {row['id']} has been waiting on a human answer for at least "
-                f"{int(_asked_age/86400)} days: {(row['title'] or '')[:90]}\n\n"
-                f"Not asking you to advance it — you cannot. Asking whether the ASK is still "
-                f"right: is the question you recorded still the question? If it is, re-state it "
-                f"on the card so it resurfaces fresh. If it has been overtaken by events, clear "
-                f"the needs:you tag and move the card to whatever is now true.",
-                defer_if_busy=True)
-            if ok:
-                _advance_last[session_name] = time.time()
-                _cmd_hist_record(session_name, f"[amux] stale-ask check: {row['id']}", "system", "advance")
-                slog(f"[advance] {session_name}: {row['id']} needs:you for "
-                     f"{int(_asked_age/86400)}d — asked whether the ask still holds")
-            return bool(ok)
+            return _needsyou_renag(session_name, row["id"], row["title"] or "",
+                                   _asked_age, item.get("archived") or 0)
         # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
         # work now — pushing the author asks for a self-ack the transition refuses.
         _rev = (item.get("reviewer") or "").strip()
