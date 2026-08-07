@@ -135,3 +135,41 @@ def test_MIGRATION_empty_seeding_would_have_re_added_it():
     assert out == [A, B], (
         "empty seeding no longer re-adds — if this fails the migration hazard is gone "
         "and this test is what to delete, not the seeding")
+
+
+def test_the_ERROR_PATH_fails_toward_already_propagated():
+    """general-canvas-apps, reviewing AMUX-2511: the `except` branch used to set
+    `_sent = set()`, which re-adds every deliberate deletion — the reported bug
+    restored by the error path of its own fix.
+
+    The asymmetry decides the direction. Assuming propagated wrongly = a new entry
+    does not flow, which is LOUD (a memory missing from an index that points at it,
+    the 5877f38 symptom). Assuming unpropagated wrongly = resurrection, which is
+    SILENT and delayed. Fail toward the loud one.
+    """
+    lane, dest = [A, B], [A]                 # B deliberately deleted downstream
+    on_error_bad = set()                     # the old behaviour
+    on_error_good = {l.strip() for l in lane}
+    assert merge(dest, lane, on_error_bad)[0] == [A, B], (
+        "empty-on-error no longer resurrects — if this fails, delete this test, not the fix")
+    assert merge(dest, lane, on_error_good)[0] == [A], (
+        "the error path must not re-add a deliberate deletion")
+
+
+def test_source_error_branch_does_not_reset_to_empty():
+    """Reads the shipped code, because the behavioural test above exercises a mirror.
+    A future edit could reintroduce `_sent = set()` while every test here stays green."""
+    from pathlib import Path
+    src = (Path(__file__).parent.parent / "amux-server.py").read_text()
+    i = src.find("archive.sent")
+    assert i > 0
+    # WHOLE FILE, comments stripped. Two earlier versions of this guard were wrong in
+    # opposite directions and BOTH passed a broken fix, which is worse than not having
+    # it: the first matched its own explanatory comment and failed on correct code; the
+    # second used a +3000 byte window that no longer reached the assignment once the
+    # comments above it grew. Offsets are the wrong anchor. `_sent = set()` should
+    # appear nowhere in executable code, so assert exactly that.
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    assert "_sent = set()" not in code, (
+        "the archive sync's error path resets the propagated-set to empty, which "
+        "re-adds every deliberate deletion (AMUX-2511 review)")

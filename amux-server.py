@@ -20585,7 +20585,23 @@ def _write_claude_memory(name: str, work_dir: str):
                     _sent = {l.strip() for l in _src}
                     _sent_f.write_text("\n".join(sorted(_sent)) + "\n")
             except Exception:
-                _sent = set()
+                # FAIL TOWARD "ALREADY PROPAGATED" (general-canvas-apps, reviewing
+                # AMUX-2511). This branch used to be `_sent = set()`, which is the
+                # exact thing the comment above argues is wrong: an empty set makes
+                # every line absent from the destination look new, so every
+                # deliberate deletion is re-added — the reported bug restored by the
+                # error path of its own fix. Reachable two ways: an unreadable
+                # sidecar, or a write_text failure in the migration branch, which
+                # discarded the correct seed computed one line earlier.
+                #
+                # The asymmetry decides it, and it is the same one that governs the
+                # whole card. Wrongly assuming propagated means a genuinely new
+                # entry does not flow — LOUD, and it surfaces as a memory missing
+                # from an index that points at it, which is the symptom 5877f38 was
+                # filed for. Wrongly assuming unpropagated means resurrection —
+                # SILENT and delayed, discovered hours later with the exception long
+                # gone and nothing left to attribute it to.
+                _sent = {l.strip() for l in _src}
             _add = [l for l in _src if l.strip() not in _have and l.strip() not in _sent]
             if _add or not _dest.exists():
                 _dest.write_text(("\n".join(_prev).rstrip() + "\n" +
