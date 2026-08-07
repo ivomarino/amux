@@ -71528,6 +71528,44 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 if "tags" in body:
                     cfg["CC_TAGS"] = body["tags"].strip()
                     _write_env(env_file, cfg)
+                    # INVALIDATE THE SESSIONS CACHE so the change is visible on the
+                    # next read (Ethan, 2026-08-06: "these tags arent relevant when
+                    # i click them nothing is shown").
+                    #
+                    # The write lands in the env file immediately, but the group
+                    # PILLS, the worker list, the group: board filter and
+                    # /api/groups are all served from _sse_cache["sessions"], which
+                    # refreshes on a TTL. Measured: a newly assigned group took ~6s
+                    # to appear. That window is exactly when someone acts — you
+                    # assign a group and immediately click its pill — so the pill
+                    # either is not there yet or filters a worker set that does not
+                    # know about it, and the feature reads as broken at the precise
+                    # moment you are testing it.
+                    #
+                    # Expiring the timestamp rather than recomputing here: the next
+                    # reader rebuilds through the existing path, so there is one
+                    # refresh mechanism rather than a second one that could disagree
+                    # with it.
+                    # REPOPULATE, do not merely expire. Expiring `time` alone does
+                    # nothing for the very next read: the reader serves the stale
+                    # payload whenever `data` is not None and refreshes in the
+                    # background, so the change still took a TTL to appear — I tried
+                    # that first and measured no improvement. Clearing `data` instead
+                    # would leave a None window that the concurrent-reader branch
+                    # ("another thread is refreshing, return stale") would hand back
+                    # as an empty body.
+                    #
+                    # So rebuild here, synchronously, and store it. Costs one
+                    # list_sessions() on an explicit user action, and the cache is
+                    # never observed empty.
+                    try:
+                        _sc = _sse_cache["sessions"]
+                        _fresh = list_sessions()
+                        _sc["data"] = _fresh
+                        _sc["json"] = json.dumps(_fresh, sort_keys=True)
+                        _sc["time"] = time.time()
+                    except Exception:
+                        pass
                     return self._json({"ok": True, "message": "tags updated"})
 
                 # Set MCP browser config (chrome or empty to disable)
