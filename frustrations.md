@@ -908,7 +908,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux
-CARD: AMUX-2524
+CARD: AMUX-2530
 SYMPTOM: `worker:amux` in the board search returns an empty board. Not an error, not a
   hint — the same result as a worker with no cards. `_bqParse` only emits a term when
   the key is in `_BQ_KEYS`, and `worker` was not in it, so the token fell through to

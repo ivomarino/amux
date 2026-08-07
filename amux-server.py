@@ -18727,7 +18727,7 @@ def list_sessions() -> list:
             _doing_ids[row["session"]] = row["id"]
     except Exception:
         _doing_tasks, _doing_updated, _doing_ids = {}, {}, {}
-    # Per-session board counts BY STATUS for the worker card (AMUX-2527). Served
+    # Per-session board counts BY STATUS for the worker card (AMUX-2529). Served
     # from the sessions payload rather than derived client-side on purpose: the
     # client's board array is only fetched when the board view is open, so a
     # client-derived count reads 0 on a fresh load of the Workers tab — the same
@@ -26604,7 +26604,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-weight: 600; text-transform: uppercase; white-space: nowrap; flex-shrink: 0;
   }
   .badge.yolo { background: rgba(210,153,34,0.2); color: var(--yellow); }
-  /* Worker card metrics row: board counts by status + schedules (AMUX-2527).
+  /* Worker card metrics row: board counts by status + schedules (AMUX-2529).
      Replaced .card-sched-count, which rendered the same schedule numbers a
      second time one line below the chip that already showed them. */
   .card-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 3px 0 2px; }
@@ -36236,7 +36236,7 @@ function _taskIdChip(s) {
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
 }
-// ── Worker card: one metrics row (AMUX-2527) ────────────────────────────────
+// ── Worker card: one metrics row (AMUX-2529) ────────────────────────────────
 // Board counts by status + the schedule count, on a single wrapping line. Each
 // count taps through to the board filtered to exactly the cards it counted, so
 // the number and the list you land on cannot disagree.
@@ -50990,7 +50990,7 @@ function _beTagKeydown(e, prefix) {
 // you to use a key the parser did not know: the case arm in _bqMatch was dead
 // code, and its own comment claimed the fix was in. The key list is what makes a
 // key real; adding an arm without adding it here ships a filter that silently
-// returns an empty board (AMUX-2527).
+// returns an empty board (AMUX-2530).
 const _BQ_KEYS = ['status','session','worker','owner','type','tag','id','is','updated','created','shepherd','creator','group'];
 
 function _bqParse(q) {
