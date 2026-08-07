@@ -1572,8 +1572,37 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
     progress)
       # amux board progress <ID> "message" — append progress note + post GH comment if gh-linked
       local id="${1:-}"; shift 2>/dev/null || true
-      local msg="$*"
-      [[ -n "$id" && -n "$msg" ]] || die "Usage: amux board progress <ISSUE-ID> <message>"
+      # ACCEPT --stdin/--file, and NEVER take a bare flag as the message (AMUX-2515).
+      #
+      # `amux board needsyou` already refuses a leading --flag and its error text
+      # recommends THIS verb for long text. But progress had no guard, so
+      # `amux board progress <id> --stdin <<EOF` appended the literal string
+      # "--stdin", discarded the entire heredoc, and printed "progress noted".
+      # A success line for a write that kept none of the body — and the silent verb
+      # is the one the loud verb sends you to.
+      #
+      # Supporting --stdin outright is the better fix than only guarding: the fleet
+      # convention in CLAUDE.md is to pass card text via stdin precisely because an
+      # inline "$msg" is evaluated by the SHELL first, so backticks and $(...) inside
+      # it are EXECUTED (AMUX-1888: a garbled message, a leaked credential, and a
+      # stray rebase on a shared checkout). I hit exactly that on this card an hour
+      # ago — two backticked identifiers were run as commands and silently dropped.
+      local msg
+      if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then
+        msg=$(cat)
+      elif [[ "${1:-}" == "--file" ]]; then
+        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board progress <ISSUE-ID> --file <path>"
+        msg=$(cat "$2")
+      else
+        msg="$*"
+        case "$msg" in
+          --*) die "amux board progress: '${msg%% *}' looks like a flag, not a message.
+Supported:  amux board progress $id --stdin <<'EOF'   (heredoc; backticks stay literal)
+            amux board progress $id --file <path>
+            amux board progress $id \"plain text\"" ;;
+        esac
+      fi
+      [[ -n "$id" && -n "$msg" ]] || die "Usage: amux board progress <ISSUE-ID> <message>|--stdin|--file <path>"
       # Append progress note to board task description (desc_append preserves prior content;
       # a plain {"desc":...} REPLACES and silently destroys the card body — see MC-1219)
       # X-Amux-Session (AMUX-2269). This was the ONE mutating board verb in this

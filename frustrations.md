@@ -871,3 +871,33 @@ NOTE: general-canvas-apps' framing is the durable half and is why this is filed 
   stuck, indefinitely, with no signal that the other is what they are waiting on.
   Same family as the night's other entries: the mechanism is right and the INSTRUMENT cannot
   express the state it has put you in.
+
+## `amux board progress --stdin` stored the literal flag and printed "progress noted"
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2515
+SYMPTOM: `amux board progress AMUX-2508 --stdin <<'EOF' ... EOF` appended the literal
+  string `--stdin` to the card, discarded the entire heredoc, and printed
+  `AMUX-2508 — progress noted`. Verified by reading the card back: its desc ended
+  `...294 tests pass.\n--stdin`.
+COST: a correction I was posting — about a DIFFERENT silent-loss bug on the same card —
+  was itself silently lost. I only noticed because I re-read the card to confirm the
+  correction had landed. Anyone who trusts the success line loses the whole note.
+FIX: `progress` now accepts `--stdin` and `--file <path>` like `add` does, and refuses a
+  bare leading `--flag` with a message naming all three forms. Verified both directions:
+  a heredoc containing backticks and `$(date)` stores them literally, and `--bogus-flag`
+  is refused rather than stored.
+NOTE: the sharp part is the ASYMMETRY between sibling verbs. `amux board needsyou`
+  already guards this exact mistake — it refuses a leading flag and its error text says
+  "For long text use: amux board progress <ID> \"$(cat file)\"". So the verb that
+  refuses loudly RECOMMENDS the verb that accepted silently. One guard, written once,
+  never propagated to the sibling it points at.
+  Compounding it: the reason to use `--stdin` at all is AMUX-1888 — an inline
+  double-quoted argument is shell-evaluated first, so backticks and $(...) inside it
+  are EXECUTED. I hit that on the same card an hour earlier: two backticked identifiers
+  in a progress note were run as commands and dropped, leaving sentences with words
+  missing. So the safe form was unsupported on the verb where the unsafe form is most
+  tempting, and both failures were silent.
