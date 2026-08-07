@@ -1266,6 +1266,27 @@ types: code task chore doc research ops investigation decision escalation blocke
       echo "$result" | _board_outcome "$id" "" "type set to $new_type"
       return $?
       ;;
+    reviewer)
+      # review->done is gated on a NAMED reviewer's sign-off, and until now nothing
+      # in the CLI could set that name — `amux board review <id> --reviewer X` died
+      # on "unknown flag". So the only way to route a card for review was a raw
+      # PATCH, which carries no X-Amux-Session. The review gate exists precisely to
+      # make cross-session sign-off attributable, and the missing verb was
+      # manufacturing the unattributed writes it depends on. Same defect as the
+      # `type` verb above (AMUX-2325); this is the second instance, which is the
+      # argument that every gate-relevant FIELD needs an attributed setter, not
+      # just the ones someone tripped over.
+      local id="${1:-}"; local who="${2:-}"
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session>   (pass 'none' to clear)
+Sets the session whose sign-off is required for review -> done."
+      [[ "$who" == "none" ]] && who=""
+      local result
+      result=$(R="$who" python3 -c 'import json,os;print(json.dumps({"reviewer":os.environ["R"]}))' \
+        | curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "reviewer set to ${who:-none}"
+      return $?
+      ;;
     add|create)
       # Title via --stdin/--file keeps it out of a shell-evaluated string
       # (AMUX-1888); the JSON body is built with json.dumps, not string
