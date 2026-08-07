@@ -537,8 +537,21 @@ cmd_start() {
   # completed its task and its card came back as AMUX-2471 with no owner.
   # Every attribution header in this CLI reads ${AMUX_WORKER:-${AMUX_SESSION:-}},
   # so both are set here rather than relying on one.
+  #
+  # AMUX_URL too (board accountability experiment, run 3). The lane had
+  # AMUX_SESSION and AMUX_WORKER but NOT the API base, so a fresh Sonnet worker
+  # reported "$AMUX_URL wasn't set in this shell" and hand-rolled curl against
+  # the default address instead of using `amux board`. Its create happened to
+  # carry X-Amux-Session; its later doing->done PATCH did not, and landed as
+  # `unattributed`.
+  #
+  # That is AMUX-2325's shape arriving through a new door: the sanctioned path
+  # was not unwalkable, it was merely un-configured, and an un-configured
+  # sanctioned path produces exactly the same unattributed writes as a broken
+  # one. Exporting the base is what makes `amux board` work without the worker
+  # having to discover the address.
   tmux new-session -d -s "$tname" -n "$name" -c "$dir" \
-    -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" \
+    -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
     "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
   # Lock the window name so Claude can't overwrite it with escape sequences
   tmux set-option -t "=$tname" allow-rename off 2>/dev/null
