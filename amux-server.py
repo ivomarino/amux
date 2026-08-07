@@ -12072,6 +12072,63 @@ def _reviewer_acts_next(status: str) -> bool:
     return _advance_target(status) in _REVIEWER_SIGNOFF_TARGETS
 
 
+def _norm_actor(name: str) -> str:
+    """Session name reduced to a comparable form.
+
+    `cmd_history.origin` is NOT a clean session id. Real values observed in one
+    night: 'mixpeek-frustrations', 'mixpeek frustrations', and
+    'mixpeek frustrations [manual:ip:100.66.26.84]'. An equality test silently
+    misses two of those three, and a miss here re-nudges a reviewer who already
+    answered — the failure this check exists to prevent.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
+
+
+def _reviewer_msg_engagement(card_id: str, reviewer: str) -> int:
+    """Newest ms-timestamp of a MESSAGE from `reviewer` that names `card_id`, else 0.
+
+    AMUX-2479. Reviewer acks routinely arrive as inter-session messages rather than
+    board writes — backend had five cards whose acks lived entirely in transcripts.
+    The router's "already responded" check read `interaction_log` (board writes)
+    only, so those acks were invisible and every one of those cards stayed eligible
+    for a re-nudge aimed at a reviewer who had already done the work.
+
+    ENGAGEMENT, NOT APPROVAL (backend's constraint). Any message naming the card
+    counts, whatever it says. Their MF-500 round-1 reply was a BLOCK; a check that
+    parsed sentiment would have scored it "not an ack" and re-nudged an actively
+    engaged reviewer. Engagement is decidable from an id-reference plus a timestamp.
+    Approval is not decidable from prose, and a check that cannot decide its own
+    predicate will decide it wrongly.
+
+    UNITS: cmd_history.ts is MILLISECONDS, and so is interaction_log.ts — measured,
+    not assumed, because the ethos file records two sessions in one evening treating
+    a ms column as seconds and building a filter ~1000x too small that matched
+    everything. The two cancel when compared to each other, which is the only
+    comparison the caller makes. Never compare either to time.time() unscaled.
+
+    Fails to 0 (= "no engagement found"), which lets the nudge proceed. That is the
+    safe direction: a missed silence costs one nudge, a wrong silence loses a review.
+    """
+    try:
+        want = _norm_actor(reviewer)
+        if not want or not card_id:
+            return 0
+        # Word-boundary guard so MF-500 does not match MF-5001. The LIKE is only a
+        # cheap prefilter; the regex is what decides.
+        pat = re.compile(r"\b" + re.escape(card_id) + r"\b")
+        rows = get_db().execute(
+            "SELECT origin, text, ts FROM cmd_history WHERE text LIKE ? "
+            "ORDER BY ts DESC LIMIT 500", (f"%{card_id}%",)).fetchall()
+        for r in rows:
+            if not _norm_actor(r["origin"] or "").startswith(want):
+                continue
+            if pat.search(r["text"] or ""):
+                return int(r["ts"] or 0)
+        return 0
+    except Exception:
+        return 0
+
+
 def _advance_open_card(session_name: str) -> bool:
     """A session that goes idle holding an in-flight card gets pushed to finish it.
 
@@ -12372,10 +12429,35 @@ def _advance_open_card(session_name: str) -> bool:
                     "SELECT ts FROM interaction_log WHERE kind='board' AND target=? "
                     "AND actor<>? AND action IN " + _DELIB + " ORDER BY ts DESC LIMIT 1",
                     (row["id"], _rev)).fetchone()
-                if _r_rev and (_r_rev[0] or 0) > ((_r_oth[0] if _r_oth else 0) or 0):
+                # A reviewer who answered by MESSAGE counts as responded (AMUX-2479,
+                # backend). This check read board writes only, so an ack delivered
+                # out-of-band was invisible to it — ethos rule 4 exactly: a tag in a
+                # store the reader never opens is the same failure as no tag. backend
+                # had five cards whose reviewer acks lived entirely in transcripts, so
+                # every one of them was eligible to be re-nudged at a reviewer who had
+                # already done the work.
+                #
+                # ENGAGEMENT, NOT APPROVAL — backend's constraint, and it is the whole
+                # design. Their MF-500 round-1 reply was a BLOCK ("not acked, three
+                # must move back"). A check that parsed sentiment would score that as
+                # not-an-ack and re-nudge a reviewer who was actively engaged. The
+                # early-return's job is don't-renudge-the-engaged, not
+                # adjudicate-the-outcome: engagement is decidable from an id-reference
+                # plus a timestamp, approval is not decidable from prose. So ANY
+                # message from the reviewer naming the card counts, whatever it says.
+                #
+                # ONLY THE REVIEWER SIDE IS WIDENED, deliberately. Widening the "other"
+                # side to messages too would make the reviewer eligible MORE often,
+                # i.e. more nudges — and fleet nudge volume is the human's call
+                # (AMUX-2479 is needs:you for exactly that). This half only ever
+                # SILENCES, so it needs no volume decision.
+                _rev_msg = _reviewer_msg_engagement(row["id"], _rev)
+                _rev_ts = max((_r_rev[0] if _r_rev else 0) or 0, _rev_msg)
+                if _rev_ts > ((_r_oth[0] if _r_oth else 0) or 0):
+                    _how = "message" if _rev_msg > ((_r_rev[0] if _r_rev else 0) or 0) else "board write"
                     slog(f"[advance] {row['id']}: reviewer {_rev} already responded "
-                         f"(their write is the most recent deliberate one) — ball is with "
-                         f"the author, staying quiet")
+                         f"(their {_how} is the most recent deliberate action) — ball is "
+                         f"with the author, staying quiet")
                     return False
             except Exception:
                 pass  # fail-open: a broken check must not silence real review requests

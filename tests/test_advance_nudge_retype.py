@@ -279,3 +279,81 @@ def test_reviewer_acts_next_is_derived_not_hardcoded(srv_mod):
             "does — the routing set is not derived from the enforcement set")
     finally:
         srv_mod._REVIEWER_SIGNOFF_TARGETS = orig
+
+
+# ───── reviewer engagement by MESSAGE, not just board write (AMUX-2479) ──────
+
+def _msg(mod, origin, text, ts_ms):
+    mod.get_db().execute(
+        "INSERT INTO cmd_history (text,type,session,ts,origin) VALUES (?,'session','someone',?,?)",
+        (text, ts_ms, origin))
+    mod.get_db().commit()
+
+
+def test_message_from_reviewer_counts_as_engagement(rig):
+    mod, _ = rig
+    _msg(mod, "radio-canada", "looked at BACKE-3182, ship it", 1_700_000_000_000)
+    assert mod._reviewer_msg_engagement("BACKE-3182", "radio-canada") == 1_700_000_000_000
+
+
+def test_a_BLOCK_counts_too_engagement_not_approval(rig):
+    """backend's constraint. Their MF-500 round-1 was a refusal; a sentiment check
+    would call it not-an-ack and re-nudge an actively engaged reviewer."""
+    mod, _ = rig
+    _msg(mod, "peer", "MF-500 NOT acked — three of these must move back", 1_700_000_000_000)
+    assert mod._reviewer_msg_engagement("MF-500", "peer") == 1_700_000_000_000
+
+
+def test_origin_spelling_variants_still_match(rig):
+    """Real origins seen in one night: hyphenated, space-separated, and suffixed with
+    '[manual:ip:...]'. Equality would miss two of the three."""
+    mod, _ = rig
+    _msg(mod, "mixpeek frustrations [manual:ip:100.66.26.84]", "MF-501 done", 1_700_000_000_001)
+    assert mod._reviewer_msg_engagement("MF-501", "mixpeek-frustrations") == 1_700_000_000_001
+
+
+def test_a_DIFFERENT_session_does_not_count(rig):
+    """The counter-case: prefix matching must not let a similarly-named lane silence
+    a nudge. 'amux-frustrations' is not 'mixpeek-frustrations'."""
+    mod, _ = rig
+    _msg(mod, "amux-frustrations", "MF-502 looks fine to me", 1_700_000_000_002)
+    assert mod._reviewer_msg_engagement("MF-502", "mixpeek-frustrations") == 0
+
+
+def test_word_boundary_MF_500_does_not_match_MF_5001(rig):
+    mod, _ = rig
+    _msg(mod, "peer", "MF-5001 is unrelated", 1_700_000_000_003)
+    assert mod._reviewer_msg_engagement("MF-500", "peer") == 0
+
+
+def test_router_stays_QUIET_when_reviewer_engaged_by_message(rig):
+    """End to end: the whole point. Reviewer answered out-of-band, so no re-nudge."""
+    mod, sent = rig
+    _card(mod, "P-9", "done", "code", desc="x")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-9'")
+    db.commit()
+    _msg(mod, "peer", "P-9 reviewed, holding on one point", int(time.time() * 1000))
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert not sent, f"re-nudged a reviewer who had already answered by message: {sent}"
+
+
+def test_router_STILL_FIRES_when_reviewer_has_not_engaged(rig):
+    """The paired positive. Without it, the test above is satisfied by a check that
+    silences everything."""
+    mod, sent = rig
+    _card(mod, "P-10", "done", "code", desc="x")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-10'")
+    db.commit()
+    _msg(mod, "peer", "talking about some OTHER card entirely", int(time.time() * 1000))
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent and sent[-1][0] == "peer", (
+        "reviewer was never asked despite no engagement — the silence check is "
+        "matching everything, which is worse than not having it")
