@@ -528,7 +528,18 @@ cmd_start() {
     echo "  ${DIM}$cmd${RESET}"
     return
   fi
-  tmux new-session -d -s "$tname" -n "$name" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
+  # -e AMUX_SESSION/AMUX_WORKER: without these the worker cannot attribute
+  # ANYTHING it writes (board-exp-1, 2026-08-06). The server's own start path
+  # passes them; this one never did, so a CLI-started worker running
+  # `amux board add` produced a card with session=None, creator='' and the
+  # fallback AMUX prefix — landing on another lane's board, owned by nobody, and
+  # therefore never driven by advance or pickup. Measured: a fresh worker
+  # completed its task and its card came back as AMUX-2471 with no owner.
+  # Every attribution header in this CLI reads ${AMUX_WORKER:-${AMUX_SESSION:-}},
+  # so both are set here rather than relying on one.
+  tmux new-session -d -s "$tname" -n "$name" -c "$dir" \
+    -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" \
+    "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
   # Lock the window name so Claude can't overwrite it with escape sequences
   tmux set-option -t "=$tname" allow-rename off 2>/dev/null
   tmux set-window-option -t "=$tname" automatic-rename off 2>/dev/null

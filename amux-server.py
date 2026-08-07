@@ -12066,6 +12066,48 @@ def _advance_open_card(session_name: str) -> bool:
             slog(f"[advance] {session_name}: not nudging on {row['id']} — {why}")
             _append_board_log(row["id"], f"Advance-nudge SKIPPED — {why}; split it into real cards "
                                          f"or discard it. A session cannot honestly finish this.")
+            # TELL THE LANE, do not just log it (board-exp-1, 2026-08-06).
+            #
+            # Measured end to end with a fresh Sonnet worker: a human task was
+            # captured as one shell card, the worker DID the work and committed it,
+            # then went idle with the card still in `doing` — forever. This branch
+            # is why. It correctly refuses to nudge "advance it" at a capture shell
+            # (nothing about a chat prompt is done or not-done), and then says so
+            # only to slog and the card's own log, neither of which the lane reads.
+            #
+            # The other half of the intended flow does not cover it either:
+            # _capture_decompose_fastpath needs 2+ shells in `todo`, and auto-pickup
+            # had already moved this one to `doing`. So with exactly one captured
+            # task, NOTHING ever asks for a decomposition and the card is inert
+            # while the work is finished in the repo. That is the board failing at
+            # the one thing it exists for.
+            #
+            # Refusing to nudge is right; going silent is not. Ask for the split —
+            # once per card per window, same budget discipline as every other nudge.
+            try:
+                _idem = f"decompose:{row['id']}"
+                if not db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                                  (_idem,)).fetchone():
+                    ok, _e = send_text(session_name,
+                        f"[amux] {row['id']} is a captured prompt, not a unit of work — "
+                        f"{why}. It cannot move through the gates as it stands, so it is "
+                        f"holding your WIP slot and nothing is driving it.\n\n"
+                        f"Split it: create one card per unit of work that can honestly be "
+                        f"finished (`amux board add \"...\"` for each), then discard "
+                        f"{row['id']} with a pointer to them, or retype it if it is really "
+                        f"one unit. Then drive each new card through its gates to done.\n\n"
+                        f"If the work is ALREADY finished, that is exactly the case to split "
+                        f"and close honestly rather than leave open — the board is the record "
+                        f"that it happened.",
+                        defer_if_busy=True)
+                    if ok:
+                        _emit_event(session_name, "capture.decompose_ask",
+                                    {"issue": row["id"], "reason": why},
+                                    idem=_idem, source="advance")
+                        _advance_last[session_name] = time.time()
+                        slog(f"[advance] {session_name}: asked for a decomposition of {row['id']}")
+            except Exception as _de:
+                slog(f"[advance] {session_name}: decompose ask failed: {_de}")
             return False
         nxt = db.execute(
             "SELECT COUNT(*) AS n FROM issues WHERE session=? AND deleted IS NULL "
@@ -12674,9 +12716,35 @@ def _pickup_level_sweep():
                 if not is_running(name):
                     continue
                 _rep = _session_reported.get(name)
-                if not (_rep and _rep.get("state") == "idle"
-                        and (now - _rep.get("ts", 0)) > _PICKUP_SWEEP_IDLE_MIN * 60):
-                    continue                      # only lanes whose own harness says idle, and settled
+                if _rep:
+                    if not (_rep.get("state") == "idle"
+                            and (now - _rep.get("ts", 0)) > _PICKUP_SWEEP_IDLE_MIN * 60):
+                        continue                  # harness says not-idle, or not settled yet
+                else:
+                    # FALL BACK TO THE SCRAPE for lanes that have never reported
+                    # (board-exp-1, 2026-08-06). Requiring a report made this sweep
+                    # invisible to exactly the lanes that need it most: a brand-new
+                    # worker, or one whose hooks are broken, has self_report=null
+                    # forever, so `not _rep` skipped it on every pass. Measured on a
+                    # fresh Sonnet worker — it finished its task, went idle holding a
+                    # card, and was never swept, because the report it was being
+                    # judged on had never existed.
+                    #
+                    # This is the same exemption-makes-it-invisible shape the ethos
+                    # records for `watch` cards: the condition that was supposed to
+                    # make the sweep CHEAP silently made it UNREACHABLE. The scan
+                    # already falls back to scraping for hookless lanes precisely
+                    # because "for them the scraper is the only voice"; this sweep
+                    # did not, and the two disagreed about who exists.
+                    # No settle-window here on purpose: there is no trustworthy
+                    # "idle since" for a lane that never reports, and inventing one
+                    # from a variable that does not exist is how a guard silently
+                    # evaluates false forever. Scraped-idle is the whole signal, and
+                    # the volume is already bounded downstream — _advance_open_card
+                    # enforces the 15-minute per-lane cooldown and the per-card nudge
+                    # budget, and this sweep stamps _pickup_sweep_last per lane.
+                    if _session_prev_status.get(name) != "idle":
+                        continue
                 # ADVANCE BEFORE PICKUP — the same order, and the same two calls,
                 # the idle EDGE uses. A lane holding a doing/review card cannot be
                 # helped by pickup (WIP-1 forbids a second card), so a successful
