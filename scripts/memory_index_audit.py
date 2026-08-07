@@ -140,6 +140,14 @@ def audit(d, claims=None):
         print(f"     DANGLING  {f}  (this index points at a file it cannot open)")
     for f in both:
         print(f"     IN BOTH   {f}  (simultaneously live and retired)")
+        # Where to fix it, because the obvious edit undoes itself. The shared project archive is
+        # built by a purely ADDITIVE merge (amux 5877f38: _add = lines in the LANE's
+        # ~/.amux/memory/<lane>.archive.md not already present). There is no delete semantics, so a
+        # line removed from the shared file is re-supplied on the owning lane's next sync.
+        # Diagnosed by general-canvas-apps after their own first diagnosis (a concurrent writer with
+        # a stale copy) turned out to be wrong; verified here by reading the diff.
+        print("                 fix in the LANE's ~/.amux/memory/<lane>.archive.md — editing the shared")
+        print("                 archive undoes itself on that lane's next sync (additive merge, no delete)")
     for f in orphaned:
         print(f"     ORPHANED  {f}  (no index anywhere references it)")
     if remote:
