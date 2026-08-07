@@ -9565,6 +9565,15 @@ CREATE TABLE IF NOT EXISTS task_windows (
     left_doing    INTEGER                          -- NULL = still open (currently doing)
 );
 CREATE INDEX IF NOT EXISTS idx_task_windows_session ON task_windows(session, entered_doing);
+
+CREATE TABLE IF NOT EXISTS group_config (
+    name       TEXT PRIMARY KEY,
+    department TEXT NOT NULL DEFAULT '',
+    goal       TEXT NOT NULL DEFAULT '',
+    kpis       TEXT NOT NULL DEFAULT '[]',
+    human_cost INTEGER NOT NULL DEFAULT 0,
+    updated    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -60903,7 +60912,313 @@ self.addEventListener('fetch', e => {
 // anyway, so page-side-only is also the one behavior that works everywhere.
 """.strip()
 
+FLOOR_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>amux — Your floor</title>
+<style>
+:root {
+  --bg: #f5f0e8; --card: #fff; --accent: #8b6914; --accent-light: #c4a94d;
+  --text: #2d2a26; --muted: #6b6560; --success: #4a7c4a; --warn: #c4682b;
+  --danger: #b54040; --border: #e0dbd3; --radius: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Georgia, 'Times New Roman', serif; background: var(--bg); color: var(--text); padding: 24px; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 2rem; font-weight: 400; margin-bottom: 4px; }
+.subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 24px; font-family: -apple-system, system-ui, sans-serif; }
+.skin-toggle { position: fixed; top: 12px; right: 16px; font-family: -apple-system, system-ui, sans-serif;
+  font-size: 0.8rem; color: var(--muted); text-decoration: none; background: var(--card); padding: 6px 12px;
+  border-radius: 20px; border: 1px solid var(--border); z-index: 100; }
+.skin-toggle:hover { color: var(--text); border-color: var(--accent); }
+.dept { margin-bottom: 36px; }
+.dept-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.dept-name { font-size: 1.3rem; font-weight: 400; }
+.dept-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+.dept-goal { font-family: -apple-system, system-ui, sans-serif; font-size: 0.85rem; color: var(--muted); }
+.dept-goal b { color: var(--text); }
+.pace-good { color: var(--success); font-weight: 600; }
+.pace-bad { color: var(--danger); font-weight: 600; }
+.workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.wcard { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; cursor: pointer; transition: box-shadow 0.15s; }
+.wcard:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+.wcard-top { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.avatar { width: 42px; height: 42px; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 1.1rem; font-family: -apple-system, system-ui, sans-serif; flex-shrink: 0; }
+.wcard-name { font-size: 1.05rem; font-weight: 600; font-family: -apple-system, system-ui, sans-serif; }
+.wcard-title { font-size: 0.8rem; color: var(--muted); font-style: italic; }
+.badge { display: inline-block; font-family: -apple-system, system-ui, sans-serif; font-size: 0.75rem; padding: 3px 10px; border-radius: 6px; font-weight: 600; margin-bottom: 10px; }
+.badge-working { background: #e8f0e8; color: var(--success); }
+.badge-idle { background: #f0ece4; color: var(--muted); }
+.badge-needsyou { background: #fce8e0; color: var(--warn); }
+.badge-error { background: #fce0e0; color: var(--danger); }
+.wcard-activity { font-size: 0.88rem; color: var(--muted); margin-bottom: 12px; font-family: -apple-system, system-ui, sans-serif; line-height: 1.4; }
+.wcard-cost { font-family: -apple-system, system-ui, sans-serif; font-size: 0.85rem; color: var(--muted); }
+.wcard-cost b { color: var(--accent); font-size: 1rem; }
+.recruit-card { background: var(--card); border: 2px dashed var(--border); border-radius: var(--radius); padding: 20px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: var(--muted); font-family: -apple-system, system-ui, sans-serif; font-size: 0.9rem; min-height: 180px; cursor: pointer; transition: border-color 0.15s; }
+.recruit-card:hover { border-color: var(--accent); color: var(--text); }
+.recruit-card .plus { font-size: 1.5rem; }
 
+/* detail overlay */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); z-index: 200; display: none; align-items: flex-start; justify-content: center; padding: 40px 20px; overflow-y: auto; }
+.overlay.open { display: flex; }
+.detail { background: var(--bg); border-radius: var(--radius); max-width: 900px; width: 100%; padding: 32px; position: relative; }
+.detail-back { font-family: -apple-system, system-ui, sans-serif; font-size: 0.85rem; color: var(--muted); cursor: pointer; margin-bottom: 16px; display: inline-block; }
+.detail-back:hover { color: var(--text); }
+.detail-header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+.detail-avatar { width: 64px; height: 64px; border-radius: 14px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 1.5rem; font-family: -apple-system, system-ui, sans-serif; }
+.detail-name { font-size: 1.5rem; font-weight: 600; font-family: -apple-system, system-ui, sans-serif; }
+.detail-subtitle { font-size: 0.9rem; color: var(--muted); font-style: italic; }
+.detail-cost { text-align: right; flex: 1; font-family: -apple-system, system-ui, sans-serif; }
+.detail-cost b { font-size: 1.4rem; color: var(--accent); display: block; }
+.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+.detail-section { background: var(--card); border-radius: var(--radius); padding: 20px; border: 1px solid var(--border); }
+.detail-section h3 { font-family: -apple-system, system-ui, sans-serif; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 14px; font-weight: 600; }
+.kpi-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #f0ece4; font-family: -apple-system, system-ui, sans-serif; font-size: 0.9rem; }
+.kpi-row:last-child { border-bottom: none; }
+.kpi-bar { height: 4px; background: #e8e4dc; border-radius: 2px; margin-top: 4px; flex: 1; margin-left: 16px; margin-right: 16px; }
+.kpi-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+.kpi-val { font-weight: 700; min-width: 60px; text-align: right; }
+.kpi-good .kpi-fill { background: var(--accent); }
+.kpi-warn .kpi-fill { background: var(--warn); }
+.activity-row { display: flex; gap: 16px; padding: 10px 0; border-bottom: 1px solid #f0ece4; font-family: -apple-system, system-ui, sans-serif; font-size: 0.88rem; }
+.activity-row:last-child { border-bottom: none; }
+.activity-when { color: var(--muted); min-width: 90px; font-size: 0.82rem; }
+.detail-actions { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
+.btn { font-family: -apple-system, system-ui, sans-serif; padding: 10px 20px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 0.88rem; cursor: pointer; font-weight: 500; }
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary:hover { background: #7a5c10; }
+.btn-danger { color: var(--danger); border-color: var(--danger); background: none; }
+.empty-state { text-align: center; padding: 60px 20px; color: var(--muted); font-family: -apple-system, system-ui, sans-serif; }
+.empty-state h2 { font-family: Georgia, serif; font-weight: 400; font-size: 1.5rem; color: var(--text); margin-bottom: 8px; }
+@media (max-width: 600px) {
+  body { padding: 16px; }
+  .detail-grid { grid-template-columns: 1fr; }
+  .workers { grid-template-columns: 1fr; }
+  .detail-header { flex-wrap: wrap; }
+}
+</style>
+</head>
+<body>
+<a class="skin-toggle" href="/">Switch to full dashboard</a>
+<h1>Your floor</h1>
+<p class="subtitle" id="subtitle"></p>
+<div id="floor"></div>
+<div class="overlay" id="overlay" onclick="if(event.target===this)closeDetail()">
+  <div class="detail" id="detail"></div>
+</div>
+<script>
+const API = location.origin;
+const H = () => {
+  const h = {'Accept':'application/json'};
+  if (window._AMUX_UI_TOKEN) h['X-Amux-UI-Token'] = window._AMUX_UI_TOKEN;
+  if (window._AMUX_AUTH_TOKEN) h['Authorization'] = 'Bearer ' + window._AMUX_AUTH_TOKEN;
+  return h;
+};
+const _f = (u) => fetch(API + u, {headers: H()}).then(r => r.json());
+const COLORS = ['#6b3a2a','#3a5a3a','#3a4a6b','#6b4a3a','#4a3a6b','#2a5a5a','#5a3a4a','#3a6b5a'];
+const colorFor = (name) => COLORS[Math.abs([...name].reduce((a,c)=>a+c.charCodeAt(0),0)) % COLORS.length];
+const initial = (name) => (name||'?')[0].toUpperCase();
+const statusBadge = (s) => {
+  if (!s || !s.running) return {cls:'badge-idle', label:'Offline'};
+  const st = (s.status||'').toLowerCase();
+  if (st === 'active') return {cls:'badge-working', label:'Working'};
+  if (st === 'waiting') return {cls:'badge-working', label:'Working'};
+  if (st === 'idle') return {cls:'badge-idle', label:'Idle'};
+  return {cls:'badge-idle', label: st||'Unknown'};
+};
+
+let _sessions = [], _groups = [], _costs = {};
+
+async function load() {
+  const [sessions, groups, obs] = await Promise.all([
+    _f('/api/sessions'), _f('/api/groups'), _f('/api/observability?days=7')
+  ]);
+  _sessions = sessions;
+  _groups = groups.groups || [];
+  _costs = {};
+  for (const s of (obs.by_session||[])) _costs[s.session] = s.cost;
+  render();
+}
+
+function render() {
+  const el = document.getElementById('floor');
+  const now = new Date();
+  document.getElementById('subtitle').textContent =
+    _sessions.length + ' workers across ' + _groups.length + ' departments. ' +
+    now.toLocaleDateString('en-US', {weekday:'long', month:'long', day:'numeric'});
+
+  if (!_groups.length) {
+    el.innerHTML = '<div class="empty-state"><h2>No departments yet</h2>' +
+      '<p>Group your workers with tags to see them here.<br>' +
+      'PATCH /api/sessions/&lt;name&gt;/config {"tags": "sales"}</p></div>';
+    return;
+  }
+
+  let html = '';
+  const grouped = {};
+  for (const s of _sessions) {
+    for (const t of (s.tags||[])) {
+      (grouped[t] = grouped[t]||[]).push(s);
+    }
+  }
+
+  for (const g of _groups) {
+    const members = grouped[g.name] || [];
+    const dot = members.some(m => m.status === 'active') ? 'var(--success)' : 'var(--muted)';
+    html += '<div class="dept">';
+    html += '<div class="dept-header">';
+    html += '<div><span class="dept-dot" style="background:'+dot+'"></span>';
+    html += '<span class="dept-name">' + esc(g.department || g.name) + '</span>';
+    html += ' <span style="color:var(--muted);font-size:0.85rem;font-family:sans-serif">' + members.length + ' workers</span></div>';
+    if (g.goal) {
+      html += '<div class="dept-goal">Goal: <b>' + esc(g.goal) + '</b></div>';
+    }
+    html += '</div>';
+    html += '<div class="workers">';
+    for (const w of members) {
+      const b = statusBadge(w);
+      const cost = _costs[w.name] || 0;
+      const color = colorFor(w.name);
+      const preview = (w.preview||'').split('\n').filter(l=>l.trim()).slice(-2).join(' ').substring(0, 120);
+      html += '<div class="wcard" onclick="showDetail(\'' + esc(w.name) + '\')">';
+      html += '<div class="wcard-top">';
+      html += '<div class="avatar" style="background:'+color+'">' + initial(w.name) + '</div>';
+      html += '<div><div class="wcard-name">' + esc(w.name) + '</div>';
+      html += '<div class="wcard-title">' + esc(w.active_model || w.provider || '') + '</div></div></div>';
+      html += '<span class="badge '+b.cls+'">' + b.label + '</span>';
+      html += '<div class="wcard-activity">' + (preview ? esc(preview) : '<em>No recent activity</em>') + '</div>';
+      html += '<div class="wcard-cost"><b>$' + cost.toFixed(2) + '</b> this week</div>';
+      html += '</div>';
+    }
+    html += '<div class="recruit-card" onclick="alert(\'Configure via: PATCH /api/sessions + /api/groups/\'+\'' + esc(g.name) + '\'+\'/config\')"><span class="plus">+</span>Add a worker</div>';
+    html += '</div></div>';
+  }
+
+  const ungrouped = _sessions.filter(s => !(s.tags||[]).length);
+  if (ungrouped.length) {
+    html += '<div class="dept"><div class="dept-header"><div>';
+    html += '<span class="dept-dot" style="background:var(--muted)"></span>';
+    html += '<span class="dept-name">Ungrouped</span>';
+    html += ' <span style="color:var(--muted);font-size:0.85rem;font-family:sans-serif">' + ungrouped.length + ' workers</span>';
+    html += '</div></div><div class="workers">';
+    for (const w of ungrouped.slice(0, 12)) {
+      const b = statusBadge(w);
+      const cost = _costs[w.name] || 0;
+      const color = colorFor(w.name);
+      html += '<div class="wcard" onclick="showDetail(\'' + esc(w.name) + '\')">';
+      html += '<div class="wcard-top"><div class="avatar" style="background:'+color+'">' + initial(w.name) + '</div>';
+      html += '<div><div class="wcard-name">' + esc(w.name) + '</div></div></div>';
+      html += '<span class="badge '+b.cls+'">' + b.label + '</span>';
+      html += '<div class="wcard-cost"><b>$' + cost.toFixed(2) + '</b> this week</div></div>';
+    }
+    if (ungrouped.length > 12) {
+      html += '<div class="recruit-card">+' + (ungrouped.length - 12) + ' more</div>';
+    }
+    html += '</div></div>';
+  }
+  el.innerHTML = html;
+}
+
+async function showDetail(name) {
+  const w = _sessions.find(s => s.name === name);
+  if (!w) return;
+  const color = colorFor(name);
+  const b = statusBadge(w);
+  const cost = _costs[name] || 0;
+
+  let obs = {};
+  try { obs = await _f('/api/observability?days=7&session=' + encodeURIComponent(name)); } catch(e) {}
+
+  const el = document.getElementById('detail');
+  let html = '<div class="detail-back" onclick="closeDetail()">&larr; Back to the floor</div>';
+  html += '<div class="detail-header">';
+  html += '<div class="detail-avatar" style="background:'+color+'">' + initial(name) + '</div>';
+  html += '<div><div class="detail-name">' + esc(name) + '</div>';
+  html += '<div class="detail-subtitle">' + esc(w.active_model || w.provider || '') + ' &middot; ' + esc((w.tags||[]).join(', ')) + '</div>';
+  html += '<span class="badge '+b.cls+'" style="margin-top:6px">' + b.label + '</span></div>';
+  html += '<div class="detail-cost"><b>$' + cost.toFixed(2) + '</b>this week</div></div>';
+
+  html += '<div class="detail-grid">';
+
+  // cost breakdown
+  html += '<div class="detail-section"><h3>Cost this week</h3>';
+  const byModel = obs.by_model || [];
+  if (byModel.length) {
+    for (const m of byModel) {
+      html += '<div class="kpi-row"><span>' + esc(m.model||'unknown') + '</span>';
+      html += '<span class="kpi-val">$' + (m.cost||0).toFixed(2) + '</span></div>';
+    }
+    html += '<div class="kpi-row" style="font-weight:700;border-top:2px solid var(--border);padding-top:10px"><span>Total</span>';
+    html += '<span class="kpi-val">$' + (obs.total_cost||0).toFixed(2) + '</span></div>';
+  } else {
+    html += '<div style="color:var(--muted);font-family:sans-serif;font-size:0.88rem">No usage this week</div>';
+  }
+  html += '</div>';
+
+  // activity by day
+  html += '<div class="detail-section"><h3>Activity by day</h3>';
+  const byDay = obs.by_day || [];
+  if (byDay.length) {
+    for (const d of byDay.slice(-7)) {
+      html += '<div class="activity-row"><span class="activity-when">' + esc(d.day) + '</span>';
+      html += '<span>' + (d.tokens||0).toLocaleString() + ' tokens &middot; $' + (d.cost||0).toFixed(2) + '</span></div>';
+    }
+  } else {
+    html += '<div style="color:var(--muted);font-family:sans-serif;font-size:0.88rem">No activity</div>';
+  }
+  html += '</div>';
+  html += '</div>';
+
+  // tasks
+  html += '<div class="detail-section" style="margin-bottom:20px"><h3>Current tasks</h3>';
+  try {
+    const board = await _f('/api/board?session=' + encodeURIComponent(name));
+    const active = (Array.isArray(board) ? board : []).filter(c => ['doing','todo','review'].includes(c.status)).slice(0, 8);
+    if (active.length) {
+      for (const c of active) {
+        html += '<div class="activity-row"><span class="activity-when badge badge-' +
+          (c.status==='doing'?'working':c.status==='review'?'needsyou':'idle') + '" style="min-width:auto">' +
+          esc(c.status) + '</span><span>' + esc((c.title||'').substring(0,100)) + '</span></div>';
+      }
+    } else {
+      html += '<div style="color:var(--muted);font-family:sans-serif;font-size:0.88rem">No active tasks</div>';
+    }
+  } catch(e) {
+    html += '<div style="color:var(--muted);font-family:sans-serif;font-size:0.88rem">Could not load tasks</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="detail-actions">';
+  html += '<button class="btn btn-primary" onclick="sendTask(\'' + esc(name) + '\')">Give a task</button>';
+  html += '<button class="btn" onclick="window.open(\'/?#worker-\'+\'' + esc(name) + '\')">Full dashboard</button>';
+  html += '</div>';
+
+  el.innerHTML = html;
+  document.getElementById('overlay').classList.add('open');
+}
+
+function closeDetail() { document.getElementById('overlay').classList.remove('open'); }
+
+function sendTask(name) {
+  const msg = prompt('What should ' + name + ' work on?');
+  if (!msg) return;
+  fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
+    method: 'POST', headers: {...H(), 'Content-Type':'application/json'},
+    body: JSON.stringify({text: msg})
+  }).then(() => alert('Task sent to ' + name)).catch(e => alert('Error: ' + e.message));
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
+""".strip()
 
 
 # ═══════════════════════════════════════════
@@ -61734,7 +62049,8 @@ class CCHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/workers"):
             path = "/api/sessions" + path[len("/api/workers"):]
         elif path.startswith("/api/groups"):
-            path = "/api/tags" + path[len("/api/groups"):]
+            if not path.endswith("/config"):
+                path = "/api/tags" + path[len("/api/groups"):]
         else:
             # Count OLD-name traffic so retirement is driven by MEASURED zero
             # usage rather than a guess about who has migrated. Sampled: this
@@ -62029,16 +62345,21 @@ class CCHandler(BaseHTTPRequestHandler):
             import json as _json
             _user_email = self.headers.get("X-Amux-User-Email", "")
             _user_id = self.headers.get("X-Amux-User-Id", "")
+            _skin = qs.get("skin", [os.environ.get("AMUX_DEFAULT_SKIN", "")])[0]
+            if _skin == "floor":
+                page = FLOOR_HTML.replace(
+                    "</head>",
+                    f'<script>window._AMUX_AUTH_TOKEN={_json.dumps(AUTH_TOKEN)};'
+                    f'window._AMUX_UI_TOKEN={_json.dumps(_UI_TOKEN)};'
+                    f'window._AMUX_USER_EMAIL={_json.dumps(_user_email)};</script></head>',
+                    1,
+                )
+                return self._html(page)
             page = DASHBOARD_HTML.replace(
                 "</head>",
                 f'<script>window._AMUX_S3_ICAL_URL={_json.dumps(_S3_CAL_URL)};'
                 f'window._AMUX_AUTH_TOKEN={_json.dumps(AUTH_TOKEN)};'
                 f'window._AMUX_HOME={_json.dumps(str(Path.home()))};'
-                # NOTE: GOOGLE_API_KEY is deliberately NOT injected here. It used
-                # to ship the real key into every served page (readable by anyone
-                # who could load the dashboard — LAN/Tailscale/share links). Anything
-                # needing Gemini goes through a server-side endpoint instead
-                # (see /api/dictate), so the key never leaves this process.
                 f'window._AMUX_POSTHOG_KEY={_json.dumps(os.environ.get("POSTHOG_KEY",""))};'
                 f'window._AMUX_POSTHOG_HOST={_json.dumps(os.environ.get("POSTHOG_HOST","https://us.i.posthog.com"))};'
                 f'window._AMUX_USER_EMAIL={_json.dumps(_user_email)};'
@@ -62449,13 +62770,64 @@ class CCHandler(BaseHTTPRequestHandler):
                     t = (t or "").strip()
                     if t:
                         _counts[t] = _counts.get(t, 0) + 1
+            _cfgs = {}
+            try:
+                for _cr in get_db().execute("SELECT * FROM group_config"):
+                    _cfgs[_cr["name"]] = {
+                        "department": _cr["department"], "goal": _cr["goal"],
+                        "kpis": json.loads(_cr["kpis"] or "[]"),
+                        "human_cost": _cr["human_cost"],
+                    }
+            except Exception:
+                pass
             return self._json({
-                "groups": [{"name": g, "workers": n}
-                           for g, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+                "groups": [{
+                    "name": g, "workers": n,
+                    **(_cfgs.get(g, {})),
+                } for g, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0]))],
                 "total": len(_counts),
                 "derived_from": "CC_TAGS across workers — not a stored list, so it cannot drift",
                 "set_on_a_worker": "PATCH /api/sessions/<name>/config {\"tags\": \"a, b\"}",
+                "configure_group": "PATCH /api/groups/<name>/config {\"goal\": \"...\", \"department\": \"sales\", \"kpis\": [...], \"human_cost\": 300000}",
             })
+
+        # GET/PATCH /api/groups/<name>/config — per-group metadata (goal, KPIs,
+        # department, human-equivalent cost). Enriches the floor skin and the
+        # GET /api/groups list. The group itself is derived from worker tags and
+        # cannot drift; this is the metadata layer on top.
+        _gcm = re.match(r"/api/groups/([^/]+)/config$", path)
+        if _gcm:
+            _gname = urllib.parse.unquote(_gcm.group(1))
+            if method == "GET":
+                _row = get_db().execute(
+                    "SELECT * FROM group_config WHERE name=?", (_gname,)).fetchone()
+                if not _row:
+                    return self._json({"name": _gname, "department": "", "goal": "",
+                                       "kpis": [], "human_cost": 0})
+                return self._json({
+                    "name": _row["name"], "department": _row["department"],
+                    "goal": _row["goal"], "kpis": json.loads(_row["kpis"] or "[]"),
+                    "human_cost": _row["human_cost"],
+                })
+            if method == "PATCH":
+                body = self._read_body()
+                db = get_db()
+                db.execute(
+                    "INSERT INTO group_config (name, department, goal, kpis, human_cost, updated) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                    "department=COALESCE(excluded.department, department), "
+                    "goal=COALESCE(excluded.goal, goal), "
+                    "kpis=COALESCE(excluded.kpis, kpis), "
+                    "human_cost=COALESCE(excluded.human_cost, human_cost), "
+                    "updated=excluded.updated",
+                    (_gname, body.get("department", ""),
+                     body.get("goal", ""),
+                     json.dumps(body.get("kpis", [])),
+                     body.get("human_cost", 0),
+                     int(time.time())))
+                db.commit()
+                return self._json({"ok": True, "name": _gname})
+            return self._json({"error": "method not allowed"}, 405)
 
         # GET /api/sessions/contract — the worker payload's field list, PUBLISHED
         # (AMUX-2447). Must sit ABOVE the /api/sessions/<name> routes or it reads
