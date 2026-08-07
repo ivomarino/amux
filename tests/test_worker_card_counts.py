@@ -348,3 +348,77 @@ def test_a_status_with_no_column_still_gets_a_unique_letter():
     for e in _EXTRAS:
         assert got[e] not in known, "%s took an existing status's letter %r" % (e, got[e])
         known.add(got[e])
+
+
+# ───────────────── board columns must not mislabel strays (AMUX-2526) ────────
+
+def test_column_mode_does_not_file_unknown_statuses_under_todo():
+    """51 live cards displayed as To Do while carrying a different status.
+
+    The bucketer's else-branch was `cols['todo'].push(item)`, so 26 needsyou, 17
+    blocked, 6 archived, 1 armed and 1 resolved all rendered under To Do. The alias
+    comment in this same file says a card reading "resolved" displayed as "To Do" is
+    a lie — and the fallback told it, at scale, twelve lines below the comment.
+    """
+    body = _js_block("renderBoard")
+    assert "strayCols" in body, (
+        "the column bucketer no longer collects unknown statuses — check whether the "
+        "todo fallback is back")
+    assert not re.search(r"else\s*\{\s*cols\['todo'\]", body), (
+        "unknown statuses are filed under To Do again: every card in a status with no "
+        "column will display as To Do (AMUX-2526)")
+
+
+def test_both_board_view_modes_share_the_stray_predicate():
+    """The real defect was DISAGREEMENT, not just mislabelling. List mode already
+    appended unknown statuses as their own group with the real name, so one card read
+    "blocked" in list mode and "To Do" in column mode. Two views of one board
+    disagreeing about one card is worse than either being wrong alone, because
+    whichever you opened first is the one you believe.
+    """
+    body = _js_block("renderBoard")
+    # list mode: appends keys not in its own order array
+    assert re.search(r"order\.concat\(Object\.keys\(groups\)\.filter", body), (
+        "list mode no longer appends unknown statuses as their own group")
+    # column mode: appends strays after the configured columns
+    assert re.search(r"boardStatuses\.concat\(strayCols", body), (
+        "column mode no longer appends stray statuses, so it disagrees with list mode")
+
+
+def test_stray_columns_do_not_offer_controls_that_cannot_work():
+    """A stray column has no stored gate and was never configured, so editStatusGate
+    would write a gate for a status absent from the list and deleteBoardStatus would
+    delete a column that does not exist. A control that cannot do what it says is the
+    `amux board claim` shape — the instruction succeeds and nothing happens."""
+    body = _js_block("renderBoard")
+    assert "stObj.stray" in body, "stray columns are no longer distinguished at render"
+    assert re.search(r"if\s*\(!stObj\.stray\)\s*\{", body), (
+        "the gate/delete controls are offered on stray columns again")
+
+
+def test_stray_columns_are_labelled_as_unconfigured():
+    """Ethos rule 8: what the board's statuses ARE is Ethan's decision. Surfacing the
+    cards without silently promoting the status to a real column is the whole design
+    — so the column has to SAY it is unconfigured, or it just looks like a status
+    somebody added."""
+    body = _js_block("renderBoard")
+    # The flag must be emitted UNDER the stray guard, not merely present in the
+    # file. The first version of this test asserted `"col-stray-flag" in body`
+    # and passed against a seeded copy where the guard had been stubbed to
+    # `if (false)` — the string was still there, unreachable. A test that green-
+    # lights dead code is exactly the theatre this file keeps finding elsewhere,
+    # and it took seeding the defect to notice, not reading the test.
+    assert re.search(r"if\s*\(stObj\.stray\)\s*\{[^}]*col-stray-flag", body, re.S), (
+        "the unconfigured marker is not emitted under the stray guard, so an "
+        "unconfigured status is indistinguishable from a configured one")
+
+
+def test_stray_column_counts_are_remembered_across_renders():
+    """The follow-on: _prevCardRects drives the count bump animation. Snapshotting
+    only boardStatuses leaves a stray column's `prev` permanently 0, so its counter
+    re-animates on every render forever — a cosmetic bug that reads as live activity
+    on a column that has not changed."""
+    body = _js_block("renderBoard")
+    assert re.search(r"_renderCols\.forEach\(stObj => \{ _prevCardRects", body), (
+        "_prevCardRects is snapshotted from boardStatuses only, so stray columns bump "
+        "on every render")

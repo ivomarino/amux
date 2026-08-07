@@ -26619,6 +26619,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .cnt-k { font-weight: 700; opacity: 0.7; letter-spacing: 0.02em; flex: 0 0 auto; }
   .cnt-sched { background: rgba(139,148,158,0.1); color: var(--dim);
     border-color: var(--border); gap: 2px; }
+  /* Marks a column the board never configured — cards carry the status but no
+     column was declared for it. Deliberately quiet: it is a prompt to decide,
+     not an error (AMUX-2526). */
+  .col-stray-flag { font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--dim); border: 1px dashed var(--border);
+    border-radius: 6px; padding: 0 5px; margin-left: 5px; cursor: help; }
   .cnt-total { display: inline-flex; align-items: center; cursor: pointer;
     font-size: 0.68rem; font-weight: 700; font-family: var(--font-mono);
     color: var(--text); opacity: 0.75; padding: 1px 5px 1px 0; }
@@ -40084,7 +40090,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.513';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.514';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52050,11 +52056,33 @@ function renderBoard() {
 
   const cols = {};
   boardStatuses.forEach(s => { cols[s.id] = []; });
+  // A status with no column gets ITS OWN column, appended after the configured
+  // ones — it does not get filed under To Do (AMUX-2526).
+  //
+  // The fallback used to be `cols['todo'].push(item)`, and 51 live cards were
+  // sitting in it: 26 needsyou, 17 blocked, 6 with status 'archived', 1 armed,
+  // 1 resolved. Every one of them displayed as To Do. This file's own alias
+  // comment says a card reading "resolved" displayed as "To Do" is a lie, and
+  // then the bucketer twelve lines down told it, at scale.
+  //
+  // Worse, the two view modes DISAGREED: list mode already appends unknown
+  // statuses as their own group with the real name, so the same card read
+  // "blocked" in one view and "To Do" in the other. Column mode now shares list
+  // mode's predicate, which is the fix — not a second opinion about it.
+  //
+  // Deliberately NOT resolved by adding these to boardStatuses: what the board's
+  // statuses are is Ethan's to decide, not something to infer from stray data
+  // (ethos rule 8). A stray column exists only while cards are in it and
+  // vanishes when the last one leaves, so this surfaces the decision instead of
+  // taking it.
+  const strayCols = [];
   visible.forEach(item => {
     const s = _statusCanon(item.status);
-    if (cols[s] !== undefined) cols[s].push(item);
-    else { cols['todo'] = cols['todo'] || []; cols['todo'].push(item); }
+    if (cols[s] !== undefined) { cols[s].push(item); return; }
+    if (!cols[s]) { cols[s] = []; strayCols.push(s); }
+    cols[s].push(item);
   });
+  strayCols.sort();
 
   // FLIP step 1: snapshot current card positions
   const oldRects = {};
@@ -52068,7 +52096,13 @@ function renderBoard() {
 
   const builtIn = new Set(['backlog','todo','doing','review','done','verified','discarded']);
   let html = '';
-  boardStatuses.forEach(stObj => {
+  // Configured columns, then any stray status that has cards. Synthesised
+  // stObjs carry `stray:true` so the header can say what they are rather than
+  // passing for a real column — an unexplained extra column is its own puzzle.
+  const _renderCols = boardStatuses.concat(strayCols.map(id => ({
+    id: id, label: id, stray: true,
+  })));
+  _renderCols.forEach(stObj => {
     const st = stObj.id;
     const stCol = cols[st] || [];
     const sty = statusStyle(st);
@@ -52079,13 +52113,25 @@ function renderBoard() {
     html += '<span style="display:flex;align-items:center;gap:5px;">';
     html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
     html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
+    if (stObj.stray) {
+      html += '<span class="col-stray-flag" title="Cards carry the status &quot;' + esc(st)
+        + '&quot; but the board has no column for it. They used to display as To Do. '
+        + 'Add it as a real status, or move these cards to one — the column disappears '
+        + 'when the last card leaves.">unconfigured</span>';
+    }
     html += '</span>';
     html += '<span style="display:flex;align-items:center;gap:6px;">';
     html += '<span class="col-count" data-col="' + st + '">' + stCol.length + '</span>';
     const _hasGate = Array.isArray(stObj.gate) && stObj.gate.length;
-    html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
-    if (!isBuiltIn) {
-      html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete column">&#x2715;</button>';
+    // A stray column has no stored gate and no delete: editStatusGate would
+    // write a gate for a status that is not in the list, and deleteBoardStatus
+    // would try to remove a column that was never configured. Offering either
+    // would be a control that cannot do what it says.
+    if (!stObj.stray) {
+      html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
+      if (!isBuiltIn) {
+        html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete column">&#x2715;</button>';
+      }
     }
     html += '</span></div>';
     // WHAT THE COLUMN MEANS, not just what it is called (AMUX-2507). The gate
@@ -52292,7 +52338,10 @@ function renderBoard() {
       el.addEventListener('animationend', () => el.classList.remove('bump'), { once: true });
     }
   });
-  boardStatuses.forEach(stObj => { _prevCardRects[stObj.id] = (cols[stObj.id] || []).length; });
+  // _renderCols, not boardStatuses: a stray column's count must be remembered
+  // too, or its counter re-fires the bump animation on every single render
+  // because `prev` is permanently 0.
+  _renderCols.forEach(stObj => { _prevCardRects[stObj.id] = (cols[stObj.id] || []).length; });
 }
 
 // Event delegation for board tag + session clicks (cards + detail)
@@ -61753,7 +61802,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.513';
+const CACHE = 'amux-v0.9.514';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
