@@ -15589,6 +15589,23 @@ def _cron_next_run(parts: list, base) -> str | None:
             return value in [int(x) for x in spec.split(',')]
         return value == int(spec)
 
+    # A 5-WORD STRING IS NOT NECESSARILY CRON. This fell straight into the cron
+    # parser on word count alone, so three 5-word expressions exploded on
+    # `int('at')`: `weekly on Monday at 10:00` and `monthly on 1 at 9am` — BOTH
+    # documented in CLAUDE.md as supported — plus any garbage of the same length
+    # ("whenever i feel like it").
+    #
+    # The consequence was not a bad next-run, it was an exception on the RE-ARM
+    # path: a schedule created with a documented weekly/monthly form fires and then
+    # throws when computing its next occurrence. Found by writing the CI coverage
+    # Ethan asked for and parametrising over the forms the docs promise, which is
+    # the only reason it surfaced — every one of these was reachable from the API.
+    #
+    # Guard on SHAPE, not on length: every cron field is digits, *, /, -, or commas.
+    # Anything else is not cron and must return None so the caller reports "could not
+    # compute the next occurrence" instead of raising.
+    if not all(re.fullmatch(r"[0-9*/,\-]+", _p or "") for _p in parts):
+        return None
     min_s, hour_s, dom_s, mon_s, dow_s = parts
     t = base.replace(second=0, microsecond=0)
     from datetime import timedelta as _td
@@ -15764,7 +15781,18 @@ def _skip_next_run(sched):
         mo = 1 if base.month == 12 else base.month + 1
         day = min(base.day, _cal.monthrange(y, mo)[1])
         return base.replace(year=y, month=mo, day=day).strftime("%Y-%m-%dT%H:%M")
-    return (base + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+    # UNRECOGNISED EXPRESSIONS RETURN None, they do not become daily. The bare
+    # `+1 day` fallback meant "whenever i feel like it" and "every 3 potatoes" were
+    # accepted and silently re-armed as DAILY schedules — a typo that fires forever
+    # at a cadence nobody chose, with no error at any layer.
+    #
+    # This is the filter-that-matches-everything shape: a default that swallows every
+    # unparsed input is indistinguishable from a parser that understands them, and it
+    # returns a confident wrong answer rather than nothing. `daily` still reaches the
+    # +1 day path above by name; only genuinely unrecognised strings fall to here.
+    if rec == 'daily' or low.startswith('daily') or low.startswith('every day'):
+        return (base + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+    return None
 
 
 def _next_run_dt(sched):
