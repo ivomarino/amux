@@ -470,10 +470,13 @@ COST: Retyping a card is the sanctioned escape from a gate that does not fit —
   text already committed — and the obvious retry would have appended the whole outcome a
   second time. I checked the card before re-running and avoided it, but the safe move is not
   discoverable from the error.
-FIX: Fixed by AMUX-2479 (32b9d14). The gate hint `cli_wrong_type` at line 66100 now generates
-  from `_ITEM_TYPES`, excluding the card's current type. The CLI `amux board type` usage line
-  also renders from the server's `fields.valid_types` rather than a drifted copy. Both paths
-  derive from the authoritative list; hand-maintained copies eliminated.
+FIX: Closed in two passes on two surfaces. b1c3e93 (amux-cloud, AC-249): derived
+  `cli_wrong_type` from `_ITEM_TYPES`, published `valid_types` on the 409, excluded the
+  card's own type, and pointed both CLIs at the server line. 32b9d14 (amux, AMUX-2479):
+  added `valid_types` to the fields payload and made the CLI usage line render from the
+  server too. The gate hint path (what an agent hits when blocked) was b1c3e93; the usage
+  line path was 32b9d14. Both now derive from the authoritative list.
+  Validated by amux-cloud.
 NOTE: this is the ethos rule-7 shape where the SANCTIONED INSTRUCTION is the theatre — same
   family as `amux board claim` (AMUX-2140), which did not exist, fell through to help text and
   exited 0. That one was worse because it reported success; this one fails loudly, which is
