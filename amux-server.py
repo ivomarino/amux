@@ -18727,6 +18727,25 @@ def list_sessions() -> list:
             _doing_ids[row["session"]] = row["id"]
     except Exception:
         _doing_tasks, _doing_updated, _doing_ids = {}, {}, {}
+    # Per-session board counts BY STATUS for the worker card (AMUX-2527). Served
+    # from the sessions payload rather than derived client-side on purpose: the
+    # client's board array is only fetched when the board view is open, so a
+    # client-derived count reads 0 on a fresh load of the Workers tab — the same
+    # divergence that put two disagreeing schedule counts on one card.
+    #
+    # `archived=0` matches the board's own default view, so the chips sum to the
+    # card count a tap-through actually lands on. A row that showed archived work
+    # would be a view disagreeing with the mechanism it describes (ethos rule 1).
+    _issue_counts: dict = {}
+    try:
+        for r in get_db().execute(
+                "SELECT session, status, COUNT(*) n FROM issues "
+                "WHERE deleted IS NULL AND COALESCE(archived,0)=0 "
+                "AND session IS NOT NULL AND session != '' "
+                "GROUP BY session, status").fetchall():
+            _issue_counts.setdefault(r["session"], {})[r["status"] or "todo"] = int(r["n"] or 0)
+    except Exception:
+        _issue_counts = {}
     for f in env_files:
         name = f.stem
         cfg = parse_env_file(f)
@@ -18945,6 +18964,8 @@ def list_sessions() -> list:
             "task_board_id": (_doing_ids.get(name, "") if _tsrc == "board" else ""),
             "sched_on": _sched_counts.get(name, (0, 0))[0],
             "sched_off": _sched_counts.get(name, (0, 0))[1],
+            # {status: count} for this worker's non-archived board cards.
+            "issue_counts": _issue_counts.get(name, {}),
             "task_updated": _bu,
             "task_board_age": int(time.time() - _bu) if (_bt and _bu and not _board_fresh) else 0,
             "tokens": tokens,
@@ -26583,9 +26604,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-weight: 600; text-transform: uppercase; white-space: nowrap; flex-shrink: 0;
   }
   .badge.yolo { background: rgba(210,153,34,0.2); color: var(--yellow); }
-  .card-sched-count { font-size: 0.72rem; color: var(--dim); padding: 1px 0 2px; cursor: pointer; opacity: 0.9; }
-  .card-sched-count .sched-on { color: var(--green); font-weight: 600; }
-  .card-sched-count .sched-off { color: #f0a020; font-weight: 600; }
+  /* Worker card metrics row: board counts by status + schedules (AMUX-2527).
+     Replaced .card-sched-count, which rendered the same schedule numbers a
+     second time one line below the chip that already showed them. */
+  .card-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 3px 0 2px; }
+  .cnt-chip { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+    font-size: 0.68rem; font-weight: 600; font-family: var(--font-mono);
+    line-height: 1.5; padding: 1px 7px; border: 1px solid transparent; border-radius: 9px; }
+  .cnt-chip:hover, .cnt-chip:active { filter: brightness(1.25); }
+  /* The status letter. Replaced a coloured dot, which was pure redundancy with
+     the chip's own background and carried no information colour did not already
+     carry — while colour itself does not separate todo from discarded, or
+     backlog from review from blocked. Same width, actually discriminates. */
+  .cnt-k { font-weight: 700; opacity: 0.7; letter-spacing: 0.02em; flex: 0 0 auto; }
+  .cnt-sched { background: rgba(139,148,158,0.1); color: var(--dim);
+    border-color: var(--border); gap: 2px; }
+  .cnt-total { display: inline-flex; align-items: center; cursor: pointer;
+    font-size: 0.68rem; font-weight: 700; font-family: var(--font-mono);
+    color: var(--text); opacity: 0.75; padding: 1px 5px 1px 0; }
+  .cnt-total:hover { opacity: 1; }
+  /* Mobile hit area: expanded to ~32px, NOT the 44px the css-mobile rule asks
+     for, and that is a deliberate deviation rather than an oversight. 44px-tall
+     pills would push the task label and preview below the fold on a 375px card,
+     which is the real estate Ethan asked to reclaim in the same breath. Vertical
+     expansion only — going wider would overlap the neighbouring chip and turn a
+     small target into a wrong one. Every destination here is also reachable from
+     the Board tab, so a missed tap costs a tap, not the route. */
+  @media (max-width: 600px) {
+    .card-counts { gap: 6px; padding: 5px 0 3px; }
+    .cnt-chip, .cnt-total { position: relative; font-size: 0.72rem; }
+    .cnt-chip { padding: 2px 9px; }
+    .cnt-chip::after, .cnt-total::after { content: ''; position: absolute;
+      left: 0; right: 0; top: -6px; bottom: -6px; }
+  }
   .sched-toggle-label { display:flex;align-items:center;cursor:pointer;flex-shrink:0;margin-top:1px;min-width:44px;min-height:44px;justify-content:center; }
   .sched-actions { display:flex;gap:6px;margin-top:8px;flex-wrap:wrap; }
   .sched-action-btn { font-size:0.72rem;padding:4px 12px; }
@@ -29382,10 +29433,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     min-width:44px; min-height:44px; -webkit-tap-highlight-color:transparent; }
   .grp-scope-close:hover, .grp-scope-close:active { color:var(--text); }
   .grp-scope-body { font-size:0.8rem; color:var(--dim); }
-  /* Mobile: 44px touch target without making the chip huge inline — pad the hit
-     area rather than the visual box (css-mobile rule). */
+  /* Mobile sizing. The comment here used to claim it padded the HIT AREA to 44px
+     "rather than the visual box" — it only ever set padding:4px 9px, i.e. ~26px.
+     A comment asserting a property the rule does not implement is worse than no
+     comment: it is what a reviewer greps for when checking the css-mobile rule,
+     and it answers yes. The hit area is now actually expanded, below. */
   @media (max-width: 600px) {
-    .grp-chip { font-size:0.72rem; padding:4px 9px; margin-left:5px; }
+    .grp-chip { font-size:0.72rem; padding:4px 9px; margin-left:5px; position:relative; }
+    /* Real hit-area expansion, vertical only. Expanding horizontally too would
+       overlap the adjacent chip (they sit 5px apart) and trade a small target
+       for a wrong one. */
+    .grp-chip::after { content:''; position:absolute; left:0; right:0; top:-9px; bottom:-9px; }
     .grp-scope-panel { padding:12px; }
   }
   .col-gate-crit { margin: 6px 0 8px; padding: 7px 9px; border-radius: 8px;
@@ -35905,9 +35963,12 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    const _schedMine = schedules.filter(sc => sc.session === s.name);
-    const schedOn = _schedMine.filter(sc => sc.enabled).length;
-    const schedOff = _schedMine.length - schedOn;
+    // Schedule counts come from the SESSIONS payload (s.sched_on/s.sched_off),
+    // not from the client `schedules` array. The card used to render both, and
+    // they are not the same fact: `schedules` is refetched only on the scheduler
+    // view, so it goes stale while the payload refreshes every poll. Two chips
+    // showing one number is a duplicate; two chips showing DIFFERENT numbers is
+    // the failure that made removing one non-optional (AMUX-2527).
     const taskStale = _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
@@ -35960,11 +36021,10 @@ function render() {
       ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.dir)}">${esc(s.dir)}</span></div>` : ''}
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
-      ${(s.sched_on || s.sched_off) ? `<span class="sched-count-chip" title="${s.sched_on} enabled / ${s.sched_off} disabled schedule(s)" onclick="event.stopPropagation();openPeek('${esc(s.name)}');setTimeout(()=>setPeekTab('schedules'),400)" style="cursor:pointer;font-size:0.66rem;border:1px solid var(--border);border-radius:8px;padding:0 6px;font-family:var(--font-mono);"><span style="color:var(--green);font-weight:700;">${s.sched_on}</span><span style="color:var(--dim);">/</span><span style="color:${s.sched_off ? '#d29922' : 'var(--dim)'};">${s.sched_off}</span></span>` : ''}
+      ${_cardCountsRow(s)}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
       ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
-      ${!isExp && (schedOn + schedOff) ? `<div class="card-sched-count" onclick="event.stopPropagation();switchView('scheduler')" title="${schedOn} enabled, ${schedOff} disabled">&#x23F2; ${[schedOn ? `<span class="sched-on">${schedOn} on</span>` : '', schedOff ? `<span class="sched-off">${schedOff} off</span>` : ''].filter(Boolean).join(' &middot; ')}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
         const hits = _logMatches[s.name];
@@ -35973,13 +36033,12 @@ function render() {
           `<div class="card-log-hit" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}',hitIdx:${hi}})"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
         ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
       })() : ''}
-      ${(isYolo || model || s.tags.length || provider) ? `<div class="badges">
+      ${(isYolo || model || provider) ? `<div class="badges">
         ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
         ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
         ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
         ${model ? `<span class="badge model" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
         ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
-        ${s.tags.map(t => `<span class="tag" data-tag="${esc(t)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(t)}')">${esc(t)}</span>`).join('')}
       </div>` : ''}
       ${!s.running ? `<div style="padding:6px 0 2px;" onclick="event.stopPropagation()">
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
@@ -36176,6 +36235,138 @@ function _taskIdChip(s) {
   return ' <span class="task-id-chip" onclick="event.stopPropagation();_openIssue(\'' + escJs(id) + '\')" '
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
+}
+// ── Worker card: one metrics row (AMUX-2527) ────────────────────────────────
+// Board counts by status + the schedule count, on a single wrapping line. Each
+// count taps through to the board filtered to exactly the cards it counted, so
+// the number and the list you land on cannot disagree.
+//
+// Colours come from statusStyle(), the SAME function the board columns and the
+// status dots use — not a second palette keyed by status name. A second colour
+// source is how `review` ends up amber here and purple two tabs over, and it
+// would silently stop covering custom statuses, which statusStyle() handles by
+// falling through to the custom palette.
+function _cardStatusCounts(s) {
+  const counts = (s && s.issue_counts) || {};
+  // Ordered by boardStatuses so the row reads left-to-right in the same
+  // direction work flows on the board. Statuses the payload reports but the
+  // board does not list (a status deleted while cards still carry it) are
+  // appended rather than dropped — a count row that hides cards is worse than
+  // one with an unfamiliar label on it.
+  const known = (typeof boardStatuses !== 'undefined' ? boardStatuses : []).map(x => x.id);
+  const extra = Object.keys(counts).filter(k => !known.includes(k)).sort();
+  return known.concat(extra)
+    .map(id => ({ id: id, n: counts[id] || 0 }))
+    .filter(x => x.n > 0);
+}
+// Colour alone does not discriminate these, and that is not a fixable palette
+// choice — it is what statusStyle() legitimately returns. Measured on the live
+// board: todo and discarded are BOTH grey, and backlog, review and blocked are
+// all blue (review and blocked fall through to the custom palette, whose first
+// entry is the same accent blue backlog uses). Five of nine statuses collide in
+// pairs or triples.
+//
+// That is fine in the board columns, where every colour sits under a written
+// label. In an unlabelled row it makes the largest number on the card — usually
+// discarded — indistinguishable from the queue. So each chip carries a letter.
+//
+// DERIVED from boardStatuses, not a hardcoded map: a custom status must get an
+// abbreviation too, and a second hand-maintained table keyed by status id is the
+// drift this file already paid for once. First letter, extended until unique in
+// board order, so Done stays D and Discarded becomes Di rather than one of them
+// silently shadowing the other.
+// Multi-word labels take one initial per word (To Do -> TD, In Progress -> IP,
+// In Review -> IR); single words take the first letter, lengthened only when
+// something already claimed it (Done -> D, Discarded -> Di).
+//
+// The two rules exist because either alone collides on the REAL status set. Last
+// word only: "To Do" -> Do -> D, which steals D from Done and reads as Done —
+// the single worst confusion available here, and the first version shipped it
+// until the uniqueness test caught it. First letter only: "In Progress" and "In
+// Review" both become I. Word-initials for multi-word labels sidesteps both, and
+// TD/IP/IR are how people already write those statuses.
+function _abbrOf(label, taken) {
+  const words = String(label || '').trim().split(/\s+/).filter(Boolean);
+  let a;
+  if (words.length > 1) {
+    a = words.map(w => w[0].toUpperCase()).join('');
+  } else {
+    const base = (words[0] || 'x').replace(/[^a-z]/gi, '') || 'x';
+    a = base[0].toUpperCase();
+    for (let i = 1; taken[a] && i < base.length; i++) a = base[0].toUpperCase() + base[i].toLowerCase();
+  }
+  while (taken[a]) a += '′';     // pathological: two identical labels
+  taken[a] = 1;
+  return a;
+}
+function _statusAbbrs() {
+  const list = (typeof boardStatuses !== 'undefined' ? boardStatuses : []);
+  const out = {}, taken = {};
+  // Board order, so which status keeps the plain letter is decided by the same
+  // order the row renders in rather than by object-key iteration.
+  list.forEach(x => { out[x.id] = _abbrOf(x.label || x.id, taken); });
+  return { map: out, taken: taken };
+}
+function _statusAbbr(id, st) {
+  if (st.map[id]) return st.map[id];
+  // A status the board does not list — `blocked` and `needsyou` held 43 live
+  // cards when this shipped. Resolved lazily against the same taken-set, so an
+  // extra can never shadow a real column's letter.
+  st.map[id] = _abbrOf(String(id), st.taken);
+  return st.map[id];
+}
+function _cardCountsRow(s) {
+  const cs = _cardStatusCounts(s);
+  const sched = (s.sched_on || 0) + (s.sched_off || 0);
+  if (!cs.length && !sched) return '';
+  const label = {};
+  (typeof boardStatuses !== 'undefined' ? boardStatuses : []).forEach(x => { label[x.id] = x.label; });
+  const abbr = _statusAbbrs();
+  const total = cs.reduce((a, x) => a + x.n, 0);
+  const chips = cs.map(x => {
+    const st = statusStyle(x.id);
+    const nm = label[x.id] || x.id;
+    return '<span class="cnt-chip" style="background:' + st.bg + ';color:' + st.color
+      + ';border-color:' + st.border + ';" title="' + x.n + ' ' + esc(nm)
+      + ' issue' + (x.n === 1 ? '' : 's') + ' — open the board filtered to these" '
+      + 'onclick="event.stopPropagation();openBoardFor(\'' + escJs(s.name) + '\',\'' + escJs(x.id) + '\')">'
+      + '<span class="cnt-k">' + esc(_statusAbbr(x.id, abbr)) + '</span>' + x.n + '</span>';
+  }).join('');
+  const schedChip = sched
+    ? '<span class="cnt-chip cnt-sched" title="' + (s.sched_on || 0) + ' enabled / '
+      + (s.sched_off || 0) + ' disabled schedule' + (sched === 1 ? '' : 's')
+      + '" onclick="event.stopPropagation();openPeek(\'' + escJs(s.name) + '\');'
+      + 'setTimeout(()=>setPeekTab(\'schedules\'),400)">&#x23F2;'
+      + '<span style="color:var(--green);font-weight:700;">' + (s.sched_on || 0) + '</span>'
+      + '<span style="opacity:0.5;">/</span>'
+      + '<span style="color:' + ((s.sched_off || 0) ? '#d29922' : 'inherit') + ';">'
+      + (s.sched_off || 0) + '</span></span>'
+    : '';
+  // The total is a tap target too, because "how much work does this worker
+  // have" is the question the row is usually answering, and reaching it via
+  // whichever status chip happens to be largest is a worse route.
+  const totalChip = total
+    ? '<span class="cnt-total" title="' + total + ' non-archived issue' + (total === 1 ? '' : 's')
+      + ' — open this worker\'s board" onclick="event.stopPropagation();openBoardFor(\''
+      + escJs(s.name) + '\',\'\')">' + total + '</span>'
+    : '';
+  return '<div class="card-counts">' + totalChip + chips + schedChip + '</div>';
+}
+// Board, filtered to this worker (and optionally one status). Compiles to the
+// query language rather than setting some separate filter state — same rule the
+// filter bar follows, so the search box shows what you are looking at and the
+// view is shareable via the #bq= hash.
+function openBoardFor(worker, status) {
+  const q = 'worker:' + worker + (status ? ' status:' + status : '');
+  switchView('board');
+  setTimeout(() => {
+    boardSearchQuery = q;
+    const inp = document.getElementById('board-search');
+    if (inp) inp.value = q;
+    _boardActiveView = '';
+    _bfSyncHash();
+    renderBoard();
+  }, 60);
 }
 async function _askCardStatus(id, sess) {
   // Ask the owning session to report status onto the board (AMUX-2174). The
@@ -39893,7 +40084,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.512';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.513';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50792,7 +50983,15 @@ function _beTagKeydown(e, prefix) {
 // The `is:` facets are the point of this: they are DERIVED from live session
 // state, not stored on the card. A card cannot tell you its session went dark
 // 30 days ago — the join can. Nothing here writes; a view is a question.
-const _BQ_KEYS = ['status','session','owner','type','tag','id','is','updated','created','shepherd','creator','group'];
+// `worker` was handled in _bqMatch and documented in the search placeholder and
+// the filter menu ("-worker:none", `grp('Worker', ...)` emits `worker:<name>`),
+// but was never listed HERE — so _bqParse rejected it, the token fell through to
+// free text, and `worker:amux` matched nothing on any card. Three surfaces told
+// you to use a key the parser did not know: the case arm in _bqMatch was dead
+// code, and its own comment claimed the fix was in. The key list is what makes a
+// key real; adding an arm without adding it here ships a filter that silently
+// returns an empty board (AMUX-2527).
+const _BQ_KEYS = ['status','session','worker','owner','type','tag','id','is','updated','created','shepherd','creator','group'];
 
 function _bqParse(q) {
   const terms = [], text = [];
@@ -61554,7 +61753,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.512';
+const CACHE = 'amux-v0.9.513';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
