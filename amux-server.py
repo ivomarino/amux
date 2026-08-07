@@ -11757,6 +11757,60 @@ def _stamp_msg_card(session_name: str, prompt_text: str, card_id: str):
         time.sleep(0.5)
 
 
+# Secret patterns for anything CAPTURED from chat into durable storage (AMUX-2502).
+#
+# Ethan pasted a god-mode password into chat; auto-capture wrote it verbatim into a
+# board card TITLE and DESC, where it sat in a database the fleet syncs and the API
+# serves. The repo has had a pre-commit secret scanner for months — it protects the
+# PUBLIC repo, and nothing protected the SYNCED database. general-canvas-apps'
+# sharpening is the right frame: the asymmetry is not repo-vs-database, it is
+# public-vs-synced, and a secret in the DB reaches every session immediately, which is
+# a FASTER blast radius than a git commit even though it feels safer.
+#
+# Patterns are the CI scanner's, deliberately — a second hand-maintained list is the
+# drift shape this repo has hit six times this week. Kept as one tuple so the next
+# addition lands in both places by being in one place.
+_CAPTURE_SECRET_RES = [
+    re.compile(r"sk-ant-api[0-9a-zA-Z_-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"ghp_[A-Za-z0-9]{36}"),
+    re.compile(r"sk_(?:test|live)_[A-Za-z0-9]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token)\b\s*[:=]\s*\S{8,}"),
+    # The shape that actually bit: an email followed by a credential, which is how a
+    # human pastes a login. "hello@amux.io (godmode) // qrP3LW7QPiUn4Hk" matched none
+    # of the vendor patterns above, because it is not a vendor key — it is a password.
+    re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+\s*(?:\([^)]*\))?\s*(?://|:|\|)\s*\S{8,}"),
+]
+
+
+def _redact_secrets(text: str) -> tuple:
+    """Redact anything that looks like a credential. Returns (clean, hits).
+
+    Runs on the way IN, not as a sweep afterwards. A sweep is what I had to do by hand
+    this morning across `issues` and `cmd_history`, and it cannot reach a value that
+    already synced to another machine or was read by another session.
+
+    Fails OPEN on error — a capture that loses the prompt entirely is worse than one
+    that stores it, and the scanner must never be the reason a task is lost.
+    """
+    try:
+        # Non-strings pass through UNCHANGED rather than becoming "". `text or ""`
+        # would blank a None field instead of leaving it alone, which is a lossy
+        # failure dressed as a safe one — the opposite of fail-open.
+        if not isinstance(text, str):
+            return text, 0
+        hits = 0
+        out = text
+        for rx in _CAPTURE_SECRET_RES:
+            out, n = rx.subn("[REDACTED-CREDENTIAL]", out)
+            hits += n
+        return out, hits
+    except Exception:
+        return text, 0
+
+
 def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
     """Create or update a board issue for a session task. If the session already has an
     active (non-done/discarded) issue, update its title instead of creating a duplicate.
@@ -11811,6 +11865,14 @@ def _auto_create_board_issue(session_name: str, title: str, prompt_text: str):
                      f"({_dup['id']} already open with identical title)")
                 _stamp_msg_card(session_name, prompt_text, _dup["id"])
                 return
+            # REDACT BEFORE THE ROW EXISTS (AMUX-2502). Both title and body: the
+            # incident put the credential in BOTH, and a scan that covers only the
+            # body leaves it in the one field every list view renders.
+            title, _t_hits = _redact_secrets(title)
+            prompt_text, _p_hits = _redact_secrets(prompt_text)
+            if _t_hits or _p_hits:
+                slog(f"[capture] {session_name}: redacted {_t_hits + _p_hits} suspected "
+                     f"credential(s) from a captured prompt before writing the card")
             prefix = _prefix_from_session(session_name)
             item_id = _next_issue_id(prefix)
             # notified=1 at birth: the session already RECEIVED this prompt as
