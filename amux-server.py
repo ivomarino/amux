@@ -12329,21 +12329,33 @@ def _advance_open_card(session_name: str) -> bool:
             # are human-owned). The fix for invisibility is VISIBILITY: say it once per
             # lane per window, name the ids, and let the lane decide.
             try:
+                # COUNT SEPARATELY FROM THE SAMPLE (mvs-infra, 2026-08-07). The
+                # message below shows a handful of ids and then says "+N more"; if N
+                # is derived from a CAPPED row set it silently understates the real
+                # population. Theirs read "8, +12 more" — which any reader takes as
+                # 20 total — against an actual 182. That is the same defect as the
+                # board list truncating without declaring it, committed in the
+                # message that reports the truncation problem.
+                _limbo_total = db.execute(
+                    "SELECT COUNT(*) FROM issues WHERE session=? AND deleted IS NULL "
+                    "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded')",
+                    (session_name,)).fetchone()[0]
                 _limbo = db.execute(
                     "SELECT id, title, status FROM issues WHERE session=? AND deleted IS NULL "
                     "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded') "
                     "ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
             except Exception:
                 _limbo = []
+                _limbo_total = 0
             if _limbo:
-                _idem = f"limbo:{session_name}:{len(_limbo)}"
+                _idem = f"limbo:{session_name}:{_limbo_total}"
                 if not db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
                                   (_idem,)).fetchone():
                     _ids = ", ".join(f"{r['id']} ({r['status']})" for r in _limbo[:8])
                     ok, _e = send_text(session_name,
-                        f"[amux] {len(_limbo)} of your cards are ARCHIVED but not finished, "
+                        f"[amux] {_limbo_total} of your cards are ARCHIVED but not finished, "
                         f"which means no loop can reach them: {_ids}"
-                        + (f", +{len(_limbo)-8} more" if len(_limbo) > 8 else "") + ".\n\n"
+                        + (f", +{_limbo_total-8} more" if _limbo_total > 8 else "") + ".\n\n"
                         f"`archived` means cleared and their status says unfinished, so they "
                         f"are invisible to auto-pickup, to the advance nudge, to rot detection "
                         f"AND to the default board view — they will sit there forever without "
@@ -12356,10 +12368,10 @@ def _advance_open_card(session_name: str) -> bool:
                         defer_if_busy=True)
                     if ok:
                         _emit_event(session_name, "advance.limbo",
-                                    {"n": len(_limbo), "ids": [r["id"] for r in _limbo[:20]]},
+                                    {"n": _limbo_total, "sampled": len(_limbo), "ids": [r["id"] for r in _limbo[:20]]},
                                     idem=_idem, source="advance-limbo")
                         _advance_last[session_name] = time.time()
-                        slog(f"[advance] {session_name}: {len(_limbo)} archived-but-unfinished "
+                        slog(f"[advance] {session_name}: {_limbo_total} archived-but-unfinished "
                              f"card(s) surfaced — {_ids}")
                         return True
             return False

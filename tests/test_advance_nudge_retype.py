@@ -530,3 +530,32 @@ def test_reviewer_NOT_responded_still_goes_to_the_reviewer(rig):
     sent.clear()
     mod._advance_open_card("probe")
     assert sent and sent[-1][0] == "peer", f"should still route to the reviewer: {sent}"
+
+
+def test_limbo_message_reports_the_TRUE_total_not_the_sampled_cap(rig):
+    """mvs-infra, 2026-08-07: the guard said "8, +12 more" — which any reader takes as
+    20 total — against an actual population of 182. `+N more` was derived from a row
+    set capped at LIMIT 20, so the absence-of-more claim inherited the cap silently.
+
+    Same defect as the board list truncating without declaring it, committed inside the
+    message that reports truncation problems. The count must come from a COUNT(*), not
+    from len(sample).
+    """
+    mod, sent = rig
+    db = mod.get_db()
+    now = int(time.time())
+    for i in range(30):                      # more than the LIMIT 20 sample
+        db.execute("INSERT INTO issues (id,title,status,session,type,created,updated,"
+                   "notified,owner_type,archived) VALUES (?,?,?,?,?,?,?,1,'agent',1)",
+                   (f"LT-{i}", f"t{i}", "todo", "probe", "code", now, now))
+    db.commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent, "no limbo notice sent"
+    msg = sent[-1][1]
+    assert "30 of your cards are ARCHIVED" in msg, (
+        f"reported a capped count instead of the real population: {msg[:120]}")
+    assert "+22 more" in msg, f"the +N more figure is still derived from the sample: {msg[:200]}"
+    assert "+12 more" not in msg, "still reporting LIMIT 20 minus 8"
