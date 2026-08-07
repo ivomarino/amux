@@ -34695,7 +34695,23 @@ function render() {
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_initialLoad) {
-      el.innerHTML = '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
+      // A SPINNER THAT NEVER RESOLVES IS A LIE (amux-cloud, AC-275, 2026-08-06).
+      // _initialLoad clears on ANY successful /api/sessions fetch, empty list
+      // included — so a spinner still showing means the fetch never COMPLETED,
+      // not that the workspace is empty. In god mode that was indistinguishable
+      // from an empty personal workspace and cost two rounds of debugging the
+      // wrong thing.
+      //
+      // Fifth instance today of one shape: a view that cannot tell "nothing to
+      // show" from "I was never given what I need to show it" — board search on
+      // a stale corpus, the co-edit notice, the peek Board, the kanban over 30
+      // real issues, and now this. Say which it is.
+      el.innerHTML = consecutiveFailures > 0
+        ? '<div class="empty">Can\u2019t reach the server \u2014 ' + consecutiveFailures +
+          ' failed attempt' + (consecutiveFailures === 1 ? '' : 's') + '.<br>' +
+          '<span style="color:var(--dim);font-size:0.85rem;">This is a connection problem, not an ' +
+          'empty workspace. Workers may exist and be unreachable.</span></div>'
+        : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…</div>';
     } else {
       el.innerHTML = '<div class="empty">No workers yet.<br>Tap <strong>+</strong> to create one.' +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
@@ -38722,7 +38738,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.504';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.505';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -60252,7 +60268,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.504';
+const CACHE = 'amux-v0.9.505';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -60904,7 +60920,7 @@ class CCHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_raw(self, json_str, status=200, etag=""):
+    def _json_raw(self, json_str, status=200, etag="", headers=None):
         try: _req_tl.resp_body = _capture_payload(json_str, "application/json")
         except Exception: pass
         body = json_str.encode() if isinstance(json_str, str) else json_str
@@ -60919,6 +60935,8 @@ class CCHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json")
+        for _hk, _hv in (headers or {}).items():
+            self.send_header(_hk, _hv)
         if etag:
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", "no-cache")
@@ -64462,8 +64480,27 @@ class CCHandler(BaseHTTPRequestHandler):
                     # path: a write nulls the cached data, so this reloads.
                     _bd = _sse_cache["board"]["data"] or _load_board(done_limit=done_limit or 100)
                     return self._json(_board_project(_bd, _slim, _f_sess, _f_stat, _f_arch))
-                if done_limit == 0:
-                    return self._json(_load_board(done_limit=0))
+                # HONOUR ANY EXPLICIT done_limit, not just 0 (gtm-videos, 2026-08-06).
+                # Only ==0 bypassed the cache; every other value fell through to a
+                # cache BUILT WITH 100, so `?done_limit=5000` accepted the
+                # parameter, ignored it, and returned 100 with nothing saying so.
+                #
+                # That is how AMUX-2446 was "missing": individually addressable,
+                # absent from every list, because it is `done` and outside the
+                # newest 100 of 1862. gtm-videos ruled out truncation by trying
+                # ?limit=5000 and ?all=1 — neither of which touches this knob — so
+                # a well-formed probe cleared the very cause. The cost is not
+                # display: they had derived ABSENCE claims from list reads ("no
+                # open card is a re-cut of this asset"), and absence from a
+                # silently-truncated list establishes nothing.
+                if done_limit == 0 or done_limit != 100:
+                    _fresh = _load_board(done_limit=done_limit)
+                    # Say what was withheld, in a header so the array shape that
+                    # every consumer parses is unchanged. A list that can omit must
+                    # announce it; otherwise every negative derived from it inherits
+                    # the omission silently.
+                    return self._json(_board_project(_fresh, _slim, _f_sess, _f_stat, _f_arch),
+                                      headers={"X-Amux-Done-Limit": str(done_limit)})
                 # Default done_limit=100 → use the shared SSE board cache
                 bc = _sse_cache["board"]
                 now = time.time()
@@ -64500,7 +64537,8 @@ class CCHandler(BaseHTTPRequestHandler):
                                             _sse_cache_lock.release()
                                     threading.Thread(target=_bg_board, daemon=True).start()
                                     released_to_bg = True
-                                    return self._json_raw(bc["json"], etag=_cache_etag(bc))
+                                    return self._json_raw(bc["json"], etag=_cache_etag(bc),
+                                                          headers={"X-Amux-Done-Limit": "100"})
                                 for _ in range(4):
                                     _g0 = bc.get("gen", 0)
                                     data = _load_board()
@@ -64533,7 +64571,8 @@ class CCHandler(BaseHTTPRequestHandler):
                             for _ in range(200):
                                 time.sleep(0.1)
                                 if bc["json"] and bc["data"] is not None:
-                                    return self._json_raw(bc["json"], etag=_cache_etag(bc))
+                                    return self._json_raw(bc["json"], etag=_cache_etag(bc),
+                                                          headers={"X-Amux-Done-Limit": "100"})
                             return self._json(_load_board())
                         if bc["json"]:
                             return self._json_raw(bc["json"], etag=_cache_etag(bc))
