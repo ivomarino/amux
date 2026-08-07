@@ -901,3 +901,30 @@ NOTE: the sharp part is the ASYMMETRY between sibling verbs. `amux board needsyo
   in a progress note were run as commands and dropped, leaving sentences with words
   missing. So the safe form was unsupported on the verb where the unsafe form is most
   tempting, and both failures were silent.
+
+## The board filter every surface tells you to use matched nothing
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2524
+SYMPTOM: `worker:amux` in the board search returns an empty board. Not an error, not a
+  hint — the same result as a worker with no cards. `_bqParse` only emits a term when
+  the key is in `_BQ_KEYS`, and `worker` was not in it, so the token fell through to
+  free text and searched every card for the literal string "worker:amux".
+COST: caught only because I was wiring a tap-through and tested the query I generated.
+  Nobody would have found it by reading the code: `_bqMatch` has a `case 'worker':` arm
+  whose own comment explains the both-sides aliasing and says renaming the placeholder
+  without teaching the parser "would have documented a filter that silently matches
+  nothing". That is exactly what shipped. The arm was unreachable the whole time.
+FIX: added `worker` to `_BQ_KEYS` (475b653), plus a drift guard asserting every key
+  `_bqMatch` has a case arm for is a key `_bqParse` accepts — so the next unreachable
+  arm fails a test instead of returning an empty board.
+NOTE: three surfaces documented it — the search placeholder (`-worker:none`), the filter
+  menu (which EMITS `worker:<name>` when you click a worker), and the code comment. The
+  filter menu is the sharp one: clicking a UI control produced a query that silently
+  matched nothing. This is the AMUX-2140 shape (following the sanctioned instruction
+  exactly is what produces the failure), with the added twist that the comment claiming
+  the fix was in is what makes a code reader stop looking. A `case` arm is not what
+  makes a key real; the key list is.
