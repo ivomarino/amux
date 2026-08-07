@@ -326,8 +326,16 @@ def test_word_boundary_MF_500_does_not_match_MF_5001(rig):
     assert mod._reviewer_msg_engagement("MF-500", "peer") == 0
 
 
-def test_router_stays_QUIET_when_reviewer_engaged_by_message(rig):
-    """End to end: the whole point. Reviewer answered out-of-band, so no re-nudge."""
+def test_reviewer_engaged_by_message_is_not_re_nudged(rig):
+    """The REVIEWER must not be re-nudged once they have answered out-of-band.
+
+    ASSERTION UPDATED, not weakened (AMUX-2498). This used to assert `not sent` —
+    nobody nudged at all — which encoded the old behaviour rather than the intent.
+    The intent is "do not re-nudge the reviewer", and that still holds exactly. What
+    changed is that the card is now handed to the AUTHOR instead of the loop going
+    silent, because "the ball is with the author" was a conclusion the code reached
+    and then discarded, stranding 70 cards across 12 lanes.
+    """
     mod, sent = rig
     _card(mod, "P-9", "done", "code", desc="x")
     db = mod.get_db()
@@ -338,7 +346,10 @@ def test_router_stays_QUIET_when_reviewer_engaged_by_message(rig):
     mod._advance_last.pop("probe", None)
     sent.clear()
     mod._advance_open_card("probe")
-    assert not sent, f"re-nudged a reviewer who had already answered by message: {sent}"
+    assert sent, "nobody was nudged — the card is stranded"
+    assert sent[-1][0] != "peer", (
+        f"re-nudged the reviewer who had already answered by message: {sent[-1][0]}")
+    assert sent[-1][0] == "probe", "the author owes the next move, so it goes to them"
 
 
 def test_router_STILL_FIRES_when_reviewer_has_not_engaged(rig):
@@ -484,3 +495,38 @@ def test_all_budgets_spent_still_goes_quiet(rig):
     sent.clear()
     mod._advance_open_card("probe")
     assert not sent, "kept nudging a lane whose every candidate had spent its budget"
+
+
+def test_reviewer_responded_hands_the_card_to_the_AUTHOR(rig):
+    """AMUX-2498. The loop logged 'ball is with the author, staying quiet' and then
+    nudged NOBODY — it reached the right conclusion and discarded it. Measured at 70
+    cards across 12 lanes, most at `done` awaiting the author's move to verified."""
+    mod, sent = rig
+    _card(mod, "R-1", "done", "code", desc="x")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET reviewer='peer' WHERE id='R-1'")
+    db.commit()
+    # reviewer's response is the most recent deliberate action on the card
+    _msg(mod, "peer", "R-1 looks good from my side", int(time.time() * 1000))
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+
+    assert sent, "reviewer had responded and NOBODY was nudged — the stall this fixes"
+    target, msg = sent[-1]
+    assert target == "probe", f"went to {target!r}, but the ball is with the author"
+    assert "already responded" in msg and "YOUR move" in msg, msg
+
+
+def test_reviewer_NOT_responded_still_goes_to_the_reviewer(rig):
+    """Counter-case: don't hand it to the author while the reviewer genuinely owes it."""
+    mod, sent = rig
+    _card(mod, "R-2", "done", "code", desc="x")
+    mod.get_db().execute("UPDATE issues SET reviewer='peer' WHERE id='R-2'")
+    mod.get_db().commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent and sent[-1][0] == "peer", f"should still route to the reviewer: {sent}"

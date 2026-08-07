@@ -12510,6 +12510,7 @@ def _advance_open_card(session_name: str) -> bool:
                                    _asked_age, item.get("archived") or 0)
         # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
         # work now — pushing the author asks for a self-ack the transition refuses.
+        _ball_with_author = ""
         _rev = (item.get("reviewer") or "").strip()
         # `done` belongs here too (AMUX-2478 third cause, predicted from
         # mixpeek-frustrations' MF-495 canary and confirmed in code before claiming
@@ -12593,10 +12594,25 @@ def _advance_open_card(session_name: str) -> bool:
                 _rev_ts = max((_r_rev[0] if _r_rev else 0) or 0, _rev_msg)
                 if _rev_ts > ((_r_oth[0] if _r_oth else 0) or 0):
                     _how = "message" if _rev_msg > ((_r_rev[0] if _r_rev else 0) or 0) else "board write"
+                    # BALL IS WITH THE AUTHOR — SO TELL THE AUTHOR (AMUX-2498).
+                    # This said exactly that in a slog line and then returned False,
+                    # nudging nobody. The reviewer must not be re-nudged (correct, AC-234)
+                    # but the conclusion "the author owes the next move" was thrown away
+                    # instead of acted on, so the card sat with both parties silent — the
+                    # author never learning they were unblocked.
+                    #
+                    # MEASURED: 70 cards across 12 lanes in exactly this state, most of
+                    # them at `done` awaiting the author's move to verified. That is a
+                    # large share of the 558 done cards Ethan asked why we were not
+                    # driving. Falling through hands the card to the normal author nudge
+                    # below with the reviewer's response named, which is the whole point
+                    # of knowing whose turn it is.
                     slog(f"[advance] {row['id']}: reviewer {_rev} already responded "
-                         f"(their {_how} is the most recent deliberate action) — ball is "
-                         f"with the author, staying quiet")
-                    return False
+                         f"(their {_how} is the most recent deliberate action) — handing "
+                         f"it to the author {session_name}")
+                    _ball_with_author = f"{_rev} has already responded (their {_how} is the most recent action on this card), so it is YOUR move — read their response on the card and either satisfy it or say why you disagree"
+                else:
+                    _ball_with_author = ""
             except Exception:
                 pass  # fail-open: a broken check must not silence real review requests
             # Charge the SAME per-card budget the holder edge uses (AC-220,
@@ -12620,26 +12636,30 @@ def _advance_open_card(session_name: str) -> bool:
             # is being pointed at a move it already made, which is the same
             # already-answered-question defect as the gate_next ternary.
             _rev_next = _advance_target(row["status"])
-            ok, err = send_text(_rev,
-                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in "
-                f"'{row['status']}' and names YOU as reviewer. Review it: if the work "
-                f"holds, ack {row['status']}->{_rev_next} yourself (your X-Amux-Session is "
-                f"the required sign-off); if not, say what fails on the card. "
-                f"The author cannot close it.",
-                defer_if_busy=True)
-            if ok:
-                _emit_event(_rev, "advance.nudged", {"issue": row["id"], "n": _rn + 1},
-                            source="advance-review")
-                # Stamp the REVIEWER's cooldown, not the holder's. This wrote
-                # _advance_last[session_name] — the card's OWNER — while the
-                # message went to _rev, so the reviewer's own cooldown was never
-                # touched and the wrong lane was silenced. Two cards in review
-                # naming one reviewer could nudge it twice in a row untouched.
-                _advance_last[_rev] = time.time()
-                _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
-                slog(f"[advance] routed review of {row['id']} to reviewer {_rev} "
-                     f"(nudge {_rn + 1}/{_nb})")
-            return bool(ok)
+            # Only route to the reviewer when it is actually THEIR move. When the ball
+            # is with the author we fall through to the author nudge below, carrying
+            # `_ball_with_author` so the message names the reviewer's response.
+            if not _ball_with_author:
+                ok, err = send_text(_rev,
+                    f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in "
+                    f"'{row['status']}' and names YOU as reviewer. Review it: if the work "
+                    f"holds, ack {row['status']}->{_rev_next} yourself (your X-Amux-Session is "
+                    f"the required sign-off); if not, say what fails on the card. "
+                    f"The author cannot close it.",
+                    defer_if_busy=True)
+                if ok:
+                    _emit_event(_rev, "advance.nudged", {"issue": row["id"], "n": _rn + 1},
+                                source="advance-review")
+                    # Stamp the REVIEWER's cooldown, not the holder's. This wrote
+                    # _advance_last[session_name] — the card's OWNER — while the
+                    # message went to _rev, so the reviewer's own cooldown was never
+                    # touched and the wrong lane was silenced. Two cards in review
+                    # naming one reviewer could nudge it twice in a row untouched.
+                    _advance_last[_rev] = time.time()
+                    _cmd_hist_record(_rev, f"[amux] review requested: {row['id']}", "system", "advance")
+                    slog(f"[advance] routed review of {row['id']} to reviewer {_rev} "
+                         f"(nudge {_rn + 1}/{_nb})")
+                return bool(ok)
         # AMUX-2312: only name `verified` as the aim for lanes it applies to.
         # Telling a lane that deploys nothing to drive every card to `verified`
         # sets a target whose gate ("Deployed to prod", "Confirmed working in
@@ -12694,7 +12714,8 @@ def _advance_open_card(session_name: str) -> bool:
         msg = (
             f"[amux] You went idle holding {row['id']} in '{row['status']}': "
             f"{(row['title'] or '')[:110]}\n\n"
-            f"Keep driving it. Do exactly one of:\n"
+            + (f"\n{_ball_with_author}.\n" if _ball_with_author else "")
+            + f"Keep driving it. Do exactly one of:\n"
             f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
             f"     Satisfy those honestly and move it, then continue to the next card.\n"
             f"{_retype_txt}"
