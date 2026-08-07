@@ -840,3 +840,34 @@ NOTE: this path never had a delivery-time guard to forget — it calls send_text
   different transport. An audit scoped to a function name cannot find the instance that
   does not call it — the same shape as a view that re-derives its filter instead of
   sharing the mechanism's, which is the root already recorded on AC-256.
+
+## Push guard deadlocks stacked sessions and never says the escape exists
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2512
+SYMPTOM: six unpushed commits interleaved by owner — mine at positions 1, 3, 4, 5, 6 and
+  gtm-videos' at 2. `git push origin main` from EITHER of us ships the other's work, so the
+  push guard correctly blocks both. Both sessions declined to override, which is the
+  behaviour the guard exists to produce, and nothing moved. My GCA-78 fix sat local while
+  the session that REPORTED the bug waited on it and could not tell whether I had stalled
+  or was deadlocked.
+COST: the reporter (general-canvas-apps) had to diagnose my push state from outside, reopen
+  their own "is it fixed" question on the card, and hand me the escape. Their words: "I think
+  you are deadlocked with gtm-videos rather than idle." A guard whose correct operation is
+  indistinguishable from a stalled session costs a peer's time to disambiguate.
+FIX: the escape needs no new mechanism and already works — `git push origin <your-sha>:main`
+  ships exactly your commits when yours are BELOW the foreign one. The guard's refusal should
+  say so, computing the highest same-session sha that is push-safe and printing that command,
+  the same way the board's 409 bodies name the attributed CLI verb instead of only describing
+  the rule (AMUX-2325).
+NOTE: general-canvas-apps' framing is the durable half and is why this is filed rather than
+  grumbled about: whoever is NOT at the tip can always escape via <sha>:main, but the TIP
+  owner is blocked until everyone below has pushed. That is an ORDERING CONSTRAINT the guard
+  creates and never announces — lower owner first, tip owner last. Nothing in the refusal
+  hints that ordering matters, so two sessions can each be individually correct and jointly
+  stuck, indefinitely, with no signal that the other is what they are waiting on.
+  Same family as the night's other entries: the mechanism is right and the INSTRUMENT cannot
+  express the state it has put you in.
