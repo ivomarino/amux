@@ -2349,12 +2349,52 @@ _bu_drivers: dict = {}          # session -> {proc, profile, udir}
 # Cleared ONLY on an explicit stop (the /api/browser/stop endpoint), never on
 # death or replacement — the whole point is to outlive the registry entry.
 _bu_driver_ever: set = set()
+# REGISTRY lock — guards _bu_drivers / _bu_driver_ever / _bu_session_locks only,
+# and is never held across IO. It used to guard the driver CALL as well, which
+# made it a fleet-wide serialiser: _bu_driver_call held it across subprocess
+# spawn, a blocking readline, and a select() whose timeout DEFAULTS TO 45s, so
+# one lane's hung browser call blocked every other lane's browser call for up to
+# 45 seconds (AC-289, found by amux-cloud reviewing AC-170).
+#
+# The function's own docstring said "Serialized per session" the whole time. It
+# was a module-level lock; the claim was never true, which is why nobody looked.
 _bu_driver_lock = threading.Lock()
+# Per-session driver locks. The serialisation is REAL and must stay: a driver is
+# one subprocess behind one stdin/stdout pipe pair, so two concurrent calls to the
+# SAME driver would interleave and corrupt the line protocol. What was wrong was
+# the scope — per session is the invariant, global was the accident.
+_bu_session_locks: dict = {}
+
+
+def _bu_lock_for(session: str) -> threading.Lock:
+    """This session's driver lock, created on first use.
+
+    LOCK ORDER, and the only rule that matters here: session lock FIRST, then the
+    registry lock, never the reverse. This function takes the registry lock and
+    RELEASES it before returning, so a caller can never be holding registry while
+    it blocks on a session lock — which is the deadlock this ordering avoids.
+    """
+    with _bu_driver_lock:
+        lk = _bu_session_locks.get(session)
+        if lk is None:
+            lk = _bu_session_locks[session] = threading.Lock()
+        return lk
 
 def _bu_driver_stop(session: str, explicit: bool = False):
-    if explicit:
-        _bu_driver_ever.discard(session)
-    d = _bu_drivers.pop(session, None)
+    """Tear down a session's driver. TAKES THE REGISTRY LOCK ITSELF — callers must
+    NOT hold it.
+
+    The registry pop is under the lock; the process teardown is not, because it
+    blocks for up to 8 seconds on proc.wait(). Holding a global lock across that
+    is the same defect as AC-289 itself, just an order of magnitude smaller, and I
+    reintroduced it here while fixing the 45s version — the call sites wrapped this
+    in `with _bu_driver_lock:` because that is what the old code did. Splitting the
+    function is what makes the mistake unavailable rather than merely avoided.
+    """
+    with _bu_driver_lock:
+        if explicit:
+            _bu_driver_ever.discard(session)
+        d = _bu_drivers.pop(session, None)
     if not d:
         return
     try:
@@ -2370,11 +2410,37 @@ def _bu_driver_stop(session: str, explicit: bool = False):
 def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None = None,
                     timeout_s: int = 45) -> dict:
     """Run a verb against the profile-true driver, spawning it on demand.
-    Returns {ok, ...} or {error}. Serialized per session."""
-    with _bu_driver_lock:
-        d = _bu_drivers.get(session)
+    Returns {ok, ...} or {error}. Serialized per session — see _bu_lock_for.
+
+    This docstring used to say "Serialized per session" while the lock it took was
+    module-level, i.e. global. The sentence was the reason nobody checked: it
+    described the intended design so accurately that reading it answered the
+    question. Now it is true.
+    """
+    _lk = _bu_lock_for(session)
+    # MEASURE THE CONTENTION (AC-289). amux-cloud filed this as confirmed-by-read
+    # and explicitly declined to claim it explains the flaky browser rig we both
+    # fought on 08-06/07 — "it would explain what we saw" is how a plausible story
+    # gets promoted to a cause. This is the measurement that would settle it, and
+    # it costs one timestamp. If two lanes really were colliding on a 45s lock, the
+    # waits show up here; if they never exceed the threshold, the rig's flakiness
+    # is something else and this line says so just as clearly.
+    _t0 = time.monotonic()
+    _acquired = _lk.acquire(timeout=max(5.0, timeout_s + 15))
+    if not _acquired:
+        _w = time.monotonic() - _t0
+        slog(f"[browser] {session}: gave up after {_w:.1f}s waiting for its OWN driver lock "
+             f"(verb={verb}) — a previous call on this session is wedged")
+        return {"error": f"browser driver for '{session}' is busy with a previous call "
+                         f"that has not returned after {_w:.0f}s"}
+    _wait = time.monotonic() - _t0
+    if _wait > 1.0:
+        slog(f"[browser] {session}: waited {_wait:.1f}s for its driver lock (verb={verb})")
+    try:
+        with _bu_driver_lock:
+            d = _bu_drivers.get(session)
         if d and (d["profile"] != profile or d["proc"].poll() is not None):
-            _bu_driver_stop(session)
+            _bu_driver_stop(session)      # takes the registry lock itself
             d = None
         if not d:
             udir, _pdir = _bu_profile_launch_target(profile)
@@ -2400,8 +2466,9 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
                 except Exception: pass
                 return {"error": f"driver failed to start: {e} :: {_err}".strip()}
             d = {"proc": proc, "profile": profile, "udir": str(udir)}
-            _bu_drivers[session] = d
-            _bu_driver_ever.add(session)   # AC-233: survives every death path
+            with _bu_driver_lock:
+                _bu_drivers[session] = d
+                _bu_driver_ever.add(session)   # AC-233: survives every death path
             slog(f"[browser] v3 driver up session={session} profile={profile!r} store={udir}")
         req = dict(params or {})
         req.update(id="r", verb=verb)
@@ -2415,11 +2482,19 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
             line = d["proc"].stdout.readline()
             res = json.loads(line or "{}")
             if res.get("closed"):
-                _bu_drivers.pop(session, None)
+                with _bu_driver_lock:
+                    _bu_drivers.pop(session, None)
             return res
         except Exception as e:
-            _bu_driver_stop(session)
+            _bu_driver_stop(session)      # takes the registry lock itself
             return {"error": f"driver io: {e}"}
+    finally:
+        # Released on EVERY path, including the six early `return`s above. The old
+        # `with _bu_driver_lock:` gave this for free; converting to an explicit
+        # acquire (needed for the timeout) means the release has to be explicit
+        # too, and a leaked driver lock would wedge that session's browser
+        # permanently — the exact failure this card is about, made per-session.
+        _lk.release()
 
 
 def _bu_active_driver(session: str):
