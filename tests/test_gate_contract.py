@@ -31,6 +31,7 @@ where a bare pass does not.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -41,12 +42,36 @@ SERVER_PATH = REPO_ROOT / "amux-server.py"
 
 
 @pytest.fixture(scope="module")
-def srv():
-    spec = importlib.util.spec_from_file_location("amux_server_gate", SERVER_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["amux_server_gate"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+def srv(tmp_path_factory):
+    """Loaded against an ISOLATED AMUX_HOME with a real schema.
+
+    This used to import the module bare and passed locally for the wrong reason: the
+    developer's live ~/.amux/amux.db happened to exist, so `_load_board_statuses()`
+    found a `statuses` table. In CI there is no such database and both assertions died
+    with `sqlite3.OperationalError: no such table: statuses` — green on every machine
+    that had already run amux, red on every machine that had not.
+
+    That is the ambient-state failure this whole file is about, one layer up: a check
+    that cannot fail locally is not evidence, and I shipped it while writing tests for
+    exactly that shape. AMUX_HOME is restored after import so the tmp path does not
+    leak into modules imported later in the session.
+    """
+    home = tmp_path_factory.mktemp("gatehome")
+    (home / "sessions").mkdir(parents=True, exist_ok=True)
+    prev = os.environ.get("AMUX_HOME")
+    os.environ["AMUX_HOME"] = str(home)
+    try:
+        spec = importlib.util.spec_from_file_location("amux_server_gate", SERVER_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["amux_server_gate"] = mod
+        spec.loader.exec_module(mod)
+        mod._init_db()          # only called under __main__ in the server
+        return mod
+    finally:
+        if prev is None:
+            os.environ.pop("AMUX_HOME", None)
+        else:
+            os.environ["AMUX_HOME"] = prev
 
 
 def test_precedence_is_not_empty(srv):
