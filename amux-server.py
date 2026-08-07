@@ -13636,6 +13636,21 @@ def _verify_routing_sweep():
         slog(f"[verify-route] asked {asked} peer(s) to verify a done card")
 
 
+def _ellipsize(text: str, limit: int) -> str:
+    """Truncate on a WORD boundary and say that it was truncated.
+
+    A hard slice produced "durable queu" in the owner's SMS — mid-word, and with no
+    marker, so a cut line reads as a complete one. Whether a message was truncated is
+    information the reader needs in order to know they are missing something; that is
+    the same rule as the board list declaring its cap.
+    """
+    t = " ".join((text or "").split())          # collapse newlines/runs first
+    if len(t) <= limit:
+        return t
+    cut = t[:limit].rsplit(" ", 1)[0].rstrip(" .,;:—-")
+    return (cut or t[:limit]) + "\u2026"
+
+
 def _needsyou_digest():
     """Push + SMS the owner a BATCHED digest of what is newly waiting on them.
 
@@ -13702,7 +13717,27 @@ def _needsyou_digest():
             _age = f"{int((time.time() - float(r['added_at'])) / 86400)}d "
         except Exception:
             pass
-        lines.append(f"• {_age}{r['id']} ({r['session'] or 'unowned'}): {(r['title'] or '')[:70]}"
+        # THE ASK, NOT THE TITLE, AND NEVER MID-WORD (Ethan, 2026-08-07: "text
+        # alerts appear cutoff, also they need to be summarized with action and
+        # worker id source").
+        #
+        # This sent `title[:70]`, which produced "...go through the same durable
+        # queu" on his phone — a hard slice landing mid-word, with no ellipsis, so
+        # a truncated line is indistinguishable from a line that just ends. And a
+        # card TITLE says what the work IS; it does not say what he has to DO, which
+        # is the only thing an alert to the owner is for.
+        #
+        # `amux board needsyou` records the actual question as a `NEEDS-YOU:` line
+        # in the desc. That IS the action, written by whoever blocked on him, so
+        # prefer it and fall back to the title only when no ask was recorded.
+        _ask = ""
+        for _ln in reversed((r["desc"] or "").splitlines()):
+            _m = re.match(r"\s*NEEDS[- ]YOU:\s*(.+)", _ln, re.I)
+            if _m and _m.group(1).strip():
+                _ask = _m.group(1).strip()
+                break
+        _summary = _ellipsize(_ask or (r["title"] or ""), 150)
+        lines.append(f"• {_age}{r['id']} ({r['session'] or 'unowned'}): {_summary}"
                      + (f"\n    {_ask}" if _ask else ""))
     more = f"\n(+{len(fresh) - 12} more)" if len(fresh) > 12 else ""
     body = "\n".join(lines) + more
