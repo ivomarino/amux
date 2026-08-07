@@ -93,7 +93,15 @@ def test_repeated_syncs_are_idempotent():
 def test_source_still_reads_the_sent_sidecar():
     """Guards the mirror above from drifting from the shipped code: the real block must
     still consult a propagated-set, not just the destination. A rewrite that drops the
-    sidecar reintroduces GCA-78 while every test above stays green."""
+    sidecar reintroduces GCA-78 while every test above stays green.
+
+    DO NOT CONSOLIDATE THIS WITH test_source_error_branch_does_not_reset_to_empty
+    (general-canvas-apps, verifying a187634). The three substrings below are ALL
+    unchanged by the `_sent = set()` error-path regression, so this test stays green
+    while deletions resurrect. That is fine only because the other test covers that
+    case specifically. Merging them would produce one source test that looks like it
+    covers both and silently covers one — the shape this whole file exists to prevent.
+    """
     from pathlib import Path
     src = (Path(__file__).parent.parent / "amux-server.py").read_text()
     assert "archive.sent" in src, (
