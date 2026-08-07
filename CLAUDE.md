@@ -166,7 +166,10 @@ reviewed at that moment.** Always run first:
 ```bash
 git fetch origin                                # refresh — the recipe is wrong without this
 git rev-list --count origin/main..main          # how many commits am I about to ship?
-git log --oneline origin/main..main             # whose are they?
+git log --format="%h [%(trailers:key=Amux-Session,valueonly,separator=)] %s" origin/main..main
+# ↑ "whose are they?" — %an is shared by every session on this machine, so --oneline
+#   cannot discriminate. The Amux-Session trailer, stamped by prepare-commit-msg, is
+#   the real discriminator. [] = untrailered commit, treat as foreign.
 ```
 
 A commit already upstream under a **different SHA** (cherry-pick, rebase, replay) sits in

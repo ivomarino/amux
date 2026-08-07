@@ -392,7 +392,7 @@ NOTE: this is the 5th AREA-clustered entry today on shared-checkout provenance (
 ## A wrong field name on /api/sessions is indistinguishable from the data not existing
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux
 CARD: AMUX-2447
@@ -406,12 +406,10 @@ COST: A confirmable hypothesis was left unconfirmed and written up as untestable
   evidence for hours. I then repeated the same shape from the other side: I asserted the
   overcounting detector was "the pushed tip" that "should not sit long" without reading the
   ref. It was never pushed. Both of us reasoned confidently about state neither had measured.
-FIX: NOT an alias field. Adding `cwd` alongside `dir` duplicates a ~40-byte string per lane
-  on a payload the dashboard polls, across 106 lanes, on a mobile-first PWA — the wrong
-  trade for a naming convenience. The right fix is discoverability: `/api/sessions` has no
-  contract endpoint the way the board does (`GET /api/board/contract`), so there is nowhere
-  to look up field names short of reading amux-server.py or dumping a payload. Publish the
-  field list, and the class closes for every consumer rather than for `cwd` specifically.
+FIX: `GET /api/sessions/contract` now exists (line 62434), derived from a live payload rather
+  than hand-listed. Fields, descriptions, `undocumented`/`documented_but_absent` arrays make
+  staleness visible. Scoped to the caller's tag isolation. No alias — the class is closed for
+  every consumer, not just `cwd`.
 NOTE: the general shape is worth naming because it recurs — a probe that cannot express
   "you asked the wrong question" returns something indistinguishable from an answer. Same
   family as the empty grep that reads as a measurement, and as `git status` after a commit,
@@ -453,7 +451,7 @@ NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for som
 ## The gate's own "wrong type?" hint recommends two types the server rejects
 AREA: board
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-249
@@ -472,10 +470,10 @@ COST: Retyping a card is the sanctioned escape from a gate that does not fit —
   text already committed — and the obvious retry would have appended the whole outcome a
   second time. I checked the card before re-running and avoided it, but the safe move is not
   discoverable from the error.
-FIX: Not fixed. Derive the hint from the same `valid_types` list the validator uses instead of
-  a hardcoded string — the two have already drifted, which is the tell. Suggesting the full
-  valid set would also surface `escalation`/`blocker`/`tripwire`/`watch`, which today an agent
-  only learns by triggering the error.
+FIX: Fixed by AMUX-2479 (32b9d14). The gate hint `cli_wrong_type` at line 66100 now generates
+  from `_ITEM_TYPES`, excluding the card's current type. The CLI `amux board type` usage line
+  also renders from the server's `fields.valid_types` rather than a drifted copy. Both paths
+  derive from the authoritative list; hand-maintained copies eliminated.
 NOTE: this is the ethos rule-7 shape where the SANCTIONED INSTRUCTION is the theatre — same
   family as `amux board claim` (AMUX-2140), which did not exist, fell through to help text and
   exited 0. That one was worse because it reported success; this one fails loudly, which is
@@ -547,7 +545,7 @@ NOTE: the general shape is a nudge asserting a fact with a shorter shelf life th
 ## The co-edit notice asks the reader to resolve a condition it is better placed to check
 AREA: notices
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-06
 SESSION: amux
 CARD: AMUX-2456
@@ -562,14 +560,13 @@ COST: Six notices to me in one afternoon (24a294b, 9450b38, 90ac2e2, b96510b, c3
   is every peer commit, so the base rate is ~100% and the informative rate is ~0.
   The round-trips are not the real cost. A notice that is almost always a false alarm trains
   the reader to skim it, and the one time it is real is the time it gets skimmed.
-FIX: Not "check whether the recipient has uncommitted changes" — that is unanswerable, since
-  git has no per-session ownership of a hunk on a shared checkout, and clean-after is exactly
-  the wrong test AC-241 documents. What IS available: the notice fires because amux already
-  tracks that the recipient edited the file recently. Compare that recorded edit time against
-  the recipient's own last commit touching the path — edit before commit means nothing was
-  outstanding and the notice can say so; edit after commit is the real alarm and currently
-  reads identically to the routine case. Filed as AMUX-2456 and routed to amux-cloud, who own
-  the two prior fixes in this family (AC-230, AC-241).
+FIX: Fixed in commit-report handler (line 71663). The notice now compares the recipient's
+  first-hand Edit/Write tool_use evidence against their own last commit (via Amux-Session
+  trailer). Edit-before-commit = suppressed (nothing outstanding). Edit-after-commit = alarm.
+  Mtime-inferred edits can fire the notice but never produce the assertion (authorship not
+  established). Three rounds of refinement (false positives from mtime, timestamp from wrong
+  map, --grep substring match). The routine case is now silent, making the notice's arrival
+  itself the signal.
 NOTE: third entry on this one notice, after AC-230 (named the reporting session, not the
   author) and AC-241 (the pre-commit sibling's hypothetical). Three fixes on one message is
   the file's own threshold for designing rather than patching.
@@ -741,7 +738,7 @@ NOTE: fourth instance tonight of ONE fact maintained in two places and drifting 
 ## Pre-push "is this commit mine?" checks use %an, which every session shares
 AREA: attribution
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux
 CARD: AMUX-2480
@@ -763,11 +760,12 @@ COST: I reported "all commits unpushed are yours, none foreign" to Ethan repeate
   their instance because a COUNT looked implausible, not because the check complained.
   (They consented when asked, so nothing shipped wrongly; the check is what failed, not
   the outcome.)
-FIX: the pre-push guard should read the `Amux-Session` trailer, not `%an`, and should say
-  plainly when a commit carries NO trailer rather than defaulting it to the current
-  session. CLAUDE.md's own deploy recipe (`git log --oneline origin/main..main` + "whose
-  are they?") should name the trailer, since "whose are they" has no answer in the output
-  that recipe produces.
+FIX: Two changes. (1) The pre-push guard already read the trailer (line 20926) but silently
+  passed untrailered commits — now collects them under "(no Amux-Session trailer)" and blocks
+  on them the same way it blocks on foreign-session commits. (2) CLAUDE.md's deploy recipe
+  changed from `git log --oneline` (which shows only %an — identical for every session) to
+  `git log --format="%h [%(trailers:key=...)] %s"` with a comment explaining why %an is
+  meaningless on a shared checkout and that `[]` = untrailered = treat as foreign.
 NOTE: second entry today whose root is an instrument that returns a plausible answer
   while discriminating nothing (see the action-name trap on AMUX-2479: 6,814 `patch` rows
   vs 137 `status_update`, so keying on the action name would have matched ~everything).

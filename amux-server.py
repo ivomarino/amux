@@ -20935,6 +20935,9 @@ def main():
                 who = bits[2].strip()
                 if who and who != sess:
                     foreign.setdefault(who, []).append((bits[0], bits[1][:62]))
+                elif not who:
+                    foreign.setdefault("(no Amux-Session trailer)", []).append(
+                        (bits[0], bits[1][:62]))
     except Exception:
         return 0  # fail open — the guard must never brick a push
     if not foreign:
