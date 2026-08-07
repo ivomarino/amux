@@ -12042,10 +12042,22 @@ def _advance_open_card(session_name: str) -> bool:
                     slog(f"[advance] {session_name}: {_stale['id']} needs:you for {_days}d "
                          f"(archived={_stale['archived']}) — asked whether the ask still holds")
                     return True
+        # INCLUDE 'done' (Ethan, 2026-08-06: "ensure it doesnt stop until all issues
+        # are furthest to the right and have done every gate fully (verified)").
+        # This selected doing/review only, so a card that reached `done` was never
+        # selected again and NOTHING drove done -> verified. Measured on
+        # board-exp-1: the worker advanced its own card to `done` and stopped
+        # there permanently, which reads as success and is one gate short of it.
+        #
+        # Ordered so doing/review are still preferred over done — unfinished work
+        # outranks unverified work, and a lane with both should be pushed on the
+        # former first.
         row = db.execute(
             "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
-            "AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' "
-            "ORDER BY updated DESC LIMIT 1", (session_name,)).fetchone()
+            "AND COALESCE(archived,0)=0 AND status IN ('doing','review','done') "
+            "AND owner_type='agent' "
+            "ORDER BY CASE status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, "
+            "         updated DESC LIMIT 1", (session_name,)).fetchone()
         if not row:
             return False
         # Same not-a-task guard as auto-pickup. Pushing a session to "advance"
