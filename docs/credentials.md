@@ -32,7 +32,7 @@ grep -oE '^[A-Z0-9_]+=' ~/.amux/server.env | tr -d '=' | sort
 | Key | Purpose |
 |---|---|
 | `AMUX_GODMODE_EMAIL` | `hello@amux.io` — god-mode identity for cloud.amux.io. In the gateway's `ADMIN_EMAILS`, so it sees every workspace. |
-| `AMUX_GODMODE_PASSWORD` | Its Clerk password. Sign-in is password first factor + `email_code` second factor delivered to that mailbox (readable via `/api/email/inbox?account=hello@amux.io`). |
+| `AMUX_GODMODE_PASSWORD` | Its Clerk password. NOTE: password alone does NOT complete a sign-in — the instance requires an `email_code` second factor even though the user has `two_factor_enabled: false`, so this is instance config rather than per-user MFA. Automation should NOT use this path: reading the code needs the hello@amux.io mailbox, which couples login to a revocable Gmail OAuth grant (it was revoked on 2026-08-07 and the failure surfaced as "Clerk did not send the code"). Use `AMUX_GODMODE_USER_ID` + `E2E_CLERK_SECRET_KEY` instead — see AC-282. |
 | `AMUX_QA_EMAIL` | `qa-godmode@amux.io` — the PRE-EXISTING god-mode account. Also in `ADMIN_EMAILS`. Check this before provisioning another one. |
 | `AMUX_QA_PASSWORD` | Its password. |
 | `AMUX_QA_USER_ID` | Its Clerk user id, for admin API calls that take a user id. |
@@ -84,8 +84,9 @@ happened here:
   raw credential. Do NOT rewrite an audit log to hide a secret — **rotate**, which makes
   every persisted copy inert, wherever it landed.
 
-Tracked as AC-160 (unredacted prompt capture). Pending rotation as of 2026-08-06:
-AC-239, AC-214, AC-156, and `AMUX_GODMODE_PASSWORD`.
+Tracked as AC-160 (unredacted prompt capture).
+
+ROTATION: recommended for AC-239, AC-214, AC-156 and `AMUX_GODMODE_PASSWORD`, and DECLINED by the owner — Ethan, 2026-08-06 14:52: "no need to rotate just continue." Recorded so this reads as a weighed decision by the party entitled to make it rather than an outstanding action nobody picked up. The exposures themselves are unchanged and still described on those cards.
 
 ## Verifying nothing is committed
 
