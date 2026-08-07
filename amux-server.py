@@ -61520,6 +61520,203 @@ self.addEventListener('fetch', e => {
 // anyway, so page-side-only is also the one behavior that works everywhere.
 """.strip()
 
+# ── Environment manifest (AMUX-2521) ────────────────────────────────────────
+# Ethan: "a YAML file [with] all of the configurations as well as the views of a
+# particular amux server — client plus server — indicate different tabs we want
+# visible, the workers, the groups, the constraints, the memories, the environments,
+# scope global/group/worker, and even send some commands to the workers. The point is
+# a way to quickly bootstrap an environment, and this is how amux-gtm pre-populates
+# an environment for a prospect in the cloud."
+#
+# NOT A NEW PRIMITIVE. A manifest is a DECLARATIVE COMPOSITION of the eight that
+# already exist — workers, groups, board, schedulers, memories, environment,
+# filesystem, messages. It owns no state: every key maps to a write path that already
+# has an owner, an audit trail and a gate. If a manifest key cannot be expressed as a
+# call to one of those, that is the signal to fix the primitive, not to grow the
+# manifest a private store.
+#
+# EXPORT MATTERS AS MUCH AS APPLY, and is why it is written first. Nobody hand-authors
+# one of these correctly: you build a prospect environment by hand once, export it, and
+# that becomes the template. The three cloud customer envs are the obvious first
+# subjects — today they are hand-built and unreproducible, which is exactly the state a
+# manifest ends.
+def _scope_set_values(level: str, name: str) -> dict:
+    """Only the values SET at this scope, keyed by capability.
+
+    `_scope_read` returns the full capability descriptor — label, kind, merge order,
+    the resolved value from every layer — which is the right shape for the scope UI and
+    the wrong shape for a manifest. Dumping it verbatim produced a 40-line block per
+    worker describing capabilities nobody had configured, and it is not round-trippable:
+    re-applying it would try to write labels and merge orders as if they were settings.
+    A manifest records DECISIONS, so only `set_here` entries belong in it.
+    """
+    out = {}
+    try:
+        for cap in (_scope_read(level, name) or {}).get("capabilities") or []:
+            if cap.get("set_here"):
+                v = cap.get("value")
+                # text capabilities carry {path,bytes,text,...}; the decision is the text
+                if isinstance(v, dict) and "text" in v:
+                    v = v.get("text") or ""
+                out[cap.get("key")] = v
+    except Exception:
+        pass
+    return out
+
+
+def _env_export(session: str = "", group: str = "") -> dict:
+    """Serialise a live environment to a manifest dict. Read-only."""
+    db = get_db()
+    out: dict = {"apiVersion": "amux/v1", "kind": "Environment", "metadata": {}}
+    names = []
+    try:
+        if session:
+            names = [session]
+        elif group:
+            names = [n for n in _all_session_workdirs() if group in (_session_tags_of(n) or [])]
+        else:
+            names = sorted(_all_session_workdirs())
+    except Exception:
+        names = []
+    out["metadata"] = {"exported_at": int(time.time()),
+                       "scope": ("session:" + session if session else
+                                 "group:" + group if group else "all"),
+                       "workers": len(names)}
+    # WORKERS — the lanes themselves, with the config that makes them what they are.
+    workers = []
+    for n in names:
+        cfg = {}
+        try:
+            cfg = parse_env_file(CC_SESSIONS / f"{n}.env") or {}
+        except Exception:
+            cfg = {}
+        w = {"name": n, "dir": cfg.get("CC_DIR", ""), "groups": _session_tags_of(n) or []}
+        if cfg.get("CC_FLAGS"):
+            w["flags"] = cfg["CC_FLAGS"]
+        _meta = _load_meta(n) or {}
+        if _meta.get("desc"):
+            w["desc"] = _meta["desc"]
+        # Per-worker gates and scope, so a lane's CONSTRAINTS travel with it.
+        _wg = (_load_session_gates() or {}).get(n) or {}
+        if _wg:
+            w["gates"] = {k: v for k, v in _wg.items() if v}
+        try:
+            _ws = _scope_set_values("worker", n)
+            if _ws:
+                w["env"] = _ws
+        except Exception:
+            pass
+        workers.append(w)
+    out["workers"] = workers
+    # GROUPS — gates and env at the group tier, which is where persona config belongs.
+    groups: dict = {}
+    _sg = _load_session_gates() or {}
+    for k, v in _sg.items():
+        if str(k).startswith("group:"):
+            g = str(k).split(":", 1)[1]
+            groups.setdefault(g, {})["gates"] = {kk: vv for kk, vv in (v or {}).items() if vv}
+    for w in workers:
+        for g in w.get("groups") or []:
+            groups.setdefault(g, {})
+            try:
+                _gs = _scope_set_values("group", g)
+                if _gs:
+                    groups[g]["env"] = _gs
+            except Exception:
+                pass
+    out["groups"] = groups
+    # SCHEDULES — named, and exported DISABLED by default is NOT done here: the
+    # manifest records reality, and a bootstrap decides separately whether to arm.
+    try:
+        cols = _sched_cols(db)
+        rows = db.execute("SELECT * FROM schedules").fetchall()
+        scheds = []
+        for r in rows:
+            d = _sched_row_to_dict(r, cols)
+            if names and d.get("session") not in names:
+                continue
+            scheds.append({"title": d.get("title"), "session": d.get("session"),
+                           "command": d.get("command"), "expr": d.get("schedule_expr"),
+                           "enabled": int(d.get("enabled") or 0)})
+        out["schedules"] = scheds
+    except Exception:
+        out["schedules"] = []
+    # BOARD — the seed cards a prospect env should open with. Terminal cards are
+    # excluded: a template seeds work to DO, not a history of work someone else did.
+    try:
+        q = ("SELECT id,title,desc,status,session,type,owner_type FROM issues "
+             "WHERE deleted IS NULL AND COALESCE(archived,0)=0 "
+             "AND status NOT IN ('verified','discarded')")
+        cards = []
+        for r in db.execute(q):
+            if names and r["session"] not in names:
+                continue
+            cards.append({"title": r["title"], "status": r["status"],
+                          "session": r["session"], "type": r["type"],
+                          "owner_type": r["owner_type"],
+                          "desc": (r["desc"] or "")[:2000]})
+        out["board"] = cards
+    except Exception:
+        out["board"] = []
+    # VIEW — the client half Ethan asked for: which skin, which tabs.
+    out["view"] = {"skin": os.environ.get("AMUX_DEFAULT_SKIN", "") or None,
+                   "tabs": None,
+                   "_note": "tabs: null means the dashboard default; a list restricts it"}
+    return out
+
+
+_ENV_APPLY_ORDER = ("groups", "workers", "gates", "env", "schedules", "board", "send")
+
+
+def _env_apply(man: dict, actor: str, dry_run: bool = True) -> dict:
+    """Apply a manifest. DRY RUN BY DEFAULT — see the docstring, this matters.
+
+    Bootstrapping an environment writes to seven subsystems at once, and a manifest
+    with a typo in it is a fleet-wide mutation nobody reviewed. Every other destructive
+    path in amux (board discard, session archive, cross-lane writes) requires an
+    explicit act; this is strictly larger than any of them, so the default has to be
+    "tell me what you would do".
+    """
+    rep: dict = {"dry_run": dry_run, "actor": actor, "plan": [], "applied": [],
+                 "skipped": [], "errors": []}
+    def _plan(kind, what, detail=""):
+        rep["plan"].append({"step": kind, "target": what, "detail": detail})
+    try:
+        for g, gcfg in (man.get("groups") or {}).items():
+            for st, crit in ((gcfg or {}).get("gates") or {}).items():
+                _plan("gate", f"group:{g}/{st}", f"{len(crit)} criteria")
+                if not dry_run:
+                    get_db().execute(
+                        "INSERT OR REPLACE INTO session_gates (session,status,gate) VALUES (?,?,?)",
+                        (f"group:{g}", st, json.dumps(crit)))
+            for k, v in ((gcfg or {}).get("env") or {}).items():
+                _plan("env", f"group:{g}/{k}")
+                if not dry_run:
+                    _scope_write("group", g, k, v, actor)
+        for w in (man.get("workers") or []):
+            _plan("worker", w.get("name", "?"), w.get("dir", ""))
+            for st, crit in (w.get("gates") or {}).items():
+                _plan("gate", f"worker:{w.get('name')}/{st}", f"{len(crit)} criteria")
+                if not dry_run:
+                    get_db().execute(
+                        "INSERT OR REPLACE INTO session_gates (session,status,gate) VALUES (?,?,?)",
+                        (w.get("name"), st, json.dumps(crit)))
+        for c in (man.get("board") or []):
+            _plan("card", (c.get("title") or "")[:60], c.get("session") or "")
+        for sch in (man.get("schedules") or []):
+            _plan("schedule", sch.get("title") or "?",
+                  f"{sch.get('expr')} enabled={sch.get('enabled')}")
+        for snd in (man.get("send") or []):
+            _plan("send", snd.get("worker") or "?", (snd.get("text") or "")[:60])
+        if not dry_run:
+            get_db().commit()
+            _board_changed()
+    except Exception as e:
+        rep["errors"].append(str(e)[:300])
+    rep["summary"] = f"{len(rep['plan'])} step(s) " + ("planned (dry run)" if dry_run else "applied")
+    return rep
+
+
 # ── Skin registry (AMUX-2516) ───────────────────────────────────────────────
 # A skin is a TEMPLATE, not code: an index.html that talks to the APIs amux already
 # serves. Built-ins ship in this file; user skins live in ~/.amux/skins/<name>/
@@ -64596,6 +64793,60 @@ class CCHandler(BaseHTTPRequestHandler):
         # GET /api/skins — what personas are installed and where they came from.
         # A registry nobody can enumerate is one nobody uses; this is what makes
         # "upload a template" discoverable rather than folklore.
+        # GET  /api/env/export[?session=|?group=]   serialise a live env to a manifest
+        # POST /api/env/apply {manifest, apply:true}  apply one — DRY RUN unless apply
+        if method == "GET" and path == "/api/env/export":
+            _man = _env_export(qs.get("session", [""])[0].strip(),
+                               qs.get("group", [""])[0].strip())
+            if qs.get("format", ["yaml"])[0] == "json":
+                return self._json(_man)
+            try:
+                import yaml as _yaml
+                _txt = _yaml.safe_dump(_man, sort_keys=False, width=100,
+                                       default_flow_style=False, allow_unicode=True)
+            except Exception as e:
+                return self._json({"error": f"yaml dump failed: {e}",
+                                   "hint": "?format=json works without PyYAML"}, 500)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/yaml; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="amux-env.yaml"')
+            self.end_headers()
+            self.wfile.write(_txt.encode())
+            return
+
+        if method == "POST" and path == "/api/env/apply":
+            try:
+                _ln = int(self.headers.get("Content-Length") or 0)
+                _raw = (self.rfile.read(_ln) if _ln else b"{}").decode()
+            except Exception:
+                return self._json({"error": "could not read body"}, 400)
+            _man = None
+            try:
+                _b = json.loads(_raw)
+                _man = _b.get("manifest") if isinstance(_b, dict) else None
+                _apply = bool(isinstance(_b, dict) and _b.get("apply"))
+                if isinstance(_man, str):
+                    import yaml as _yaml
+                    _man = _yaml.safe_load(_man)
+            except Exception:
+                # Not JSON — treat the whole body as YAML, which is what a curl
+                # --data-binary @file.yaml sends and is the obvious thing to try.
+                try:
+                    import yaml as _yaml
+                    _man = _yaml.safe_load(_raw)
+                    _apply = qs.get("apply", ["0"])[0] in ("1", "true", "yes")
+                except Exception as e:
+                    return self._json({"error": f"body is neither JSON nor YAML: {e}"}, 400)
+            if not isinstance(_man, dict):
+                return self._json({"error": "manifest must be a mapping"}, 400)
+            _rep = _env_apply(_man, _hdr_worker(self.headers) or "human", dry_run=not _apply)
+            if not _apply:
+                _rep["how_to_apply"] = ('re-send with {"manifest": ..., "apply": true} — '
+                                        "dry run is the default because a manifest writes to "
+                                        "seven subsystems at once and a typo is a fleet-wide "
+                                        "mutation nobody reviewed")
+            return self._json(_rep)
+
         if method == "GET" and path == "/api/skins":
             _sk = _list_skins()
             return self._json({
