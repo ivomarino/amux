@@ -12355,21 +12355,67 @@ def _advance_open_card(session_name: str) -> bool:
                 slog(f"[advance] routed review of {row['id']} to reviewer {_rev} "
                      f"(nudge {_rn + 1}/{_nb})")
             return bool(ok)
-        gate_next = "review" if row["status"] == "doing" else "done"
-        gate = _effective_gate(item, gate_next) or []
-        gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
         # AMUX-2312: only name `verified` as the aim for lanes it applies to.
         # Telling a lane that deploys nothing to drive every card to `verified`
         # sets a target whose gate ("Deployed to prod", "Confirmed working in
         # prod") it cannot satisfy truthfully — the ethos-3 shape, and the
         # reason this nudge produced false 'verified' claims.
         _term = "verified" if _status_applies("verified", session_name)[0] else "done"
+        # A card already AT `done` was told to satisfy the gate for `done` — the
+        # status it is already in. `done` was added to this nudge's selection in
+        # f88fbc3 and this ternary was not updated with it, so the one class of card
+        # the nudge was extended to reach got the one gate it had already passed.
+        _st = row["status"]
+        if _st == "done":
+            if _term != "verified":
+                # `done` IS terminal for this lane, so there is nothing to advance
+                # to and the nudge can only re-fire forever with no honest exit.
+                return False
+            gate_next = "verified"
+        else:
+            gate_next = "review" if _st == "doing" else "done"
+        gate = _effective_gate(item, gate_next) or []
+        gate_txt = "\n".join(f"  - {g}" for g in gate) or "  (no gate configured)"
+        # RE-TYPE: the honest exit this menu never offered (AMUX-2478, found by
+        # mixpeek-frustrations). Four finished cards — a doc move, two
+        # negative-result investigations, an archive move — sat terminal-at-done
+        # re-firing this nudge every turn because, typed `code`, they faced gates
+        # (CI green / deployed / confirmed-in-prod) with NOTHING TO BIND TO. They
+        # correctly refused all three exits offered: false verified, fabricated
+        # trigger, false discard. The state they needed already existed at gate
+        # layer 2 — investigation/doc/research/chore carry done="Outcome recorded"
+        # and verified="Outcome confirmed to still hold", both honestly satisfiable
+        # for that work — but nothing in this message ever said so.
+        #
+        # Ethos rule 3: when a gate does not fit, the fix is the TYPE, not the
+        # truth. A menu that lists only dishonest exits is precisely what teaches a
+        # capable model to pick one, and the `code` default makes this the common
+        # case, not an edge (1,143 of 1,215 open cards were typed `code`).
+        _eff_type = (item.get("type") or _DEFAULT_ITEM_TYPE).strip().lower()
+        _retype_txt = ""
+        if _eff_type == "code":
+            _no_ev = not _board_has_evidence(item)
+            _retype_txt = (
+                f"  1b. {'THIS CARD LOOKS MIS-TYPED. ' if _no_ev else ''}If the work on this "
+                f"card is NOT CODE — a doc or file move, an investigation whose result was "
+                f"negative, a research finding, a chore — then the gate above does not fit it, "
+                f"and the reason is the card's TYPE, not the work. It is typed `code`, so it "
+                f"inherits code's gates"
+                + (" — and its description carries no commit, PR or merge reference, which is "
+                   "what a code card would have by now" if _no_ev else "")
+                + f". Retyping is the HONEST exit and it already exists:\n"
+                f"       amux board type {row['id']} <investigation|research|doc|chore|ops>\n"
+                f"     Those types gate on 'Outcome recorded in the item' for done and "
+                f"'Outcome confirmed to still hold' for verified — satisfiable truthfully for "
+                f"work that ships no code. Fix the type, not the truth; never ack a merge or a "
+                f"deploy that did not happen.\n")
         msg = (
             f"[amux] You went idle holding {row['id']} in '{row['status']}': "
             f"{(row['title'] or '')[:110]}\n\n"
             f"Keep driving it. Do exactly one of:\n"
             f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
             f"     Satisfy those honestly and move it, then continue to the next card.\n"
+            f"{_retype_txt}"
             f"  2. If it is genuinely finished, close it out to {_term} with the evidence.\n"
             f"  3. If it is BLOCKED, say what on — and if the blocker is another card, "
             f"go work that dependency instead of waiting.\n"
