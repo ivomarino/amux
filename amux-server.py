@@ -14053,6 +14053,32 @@ def _notify_session_of_task(session_name: str, item_id: str, title: str):
             db.commit()
             if cur.rowcount == 0:
                 return  # someone else already notified
+            # RE-CHECK THE CARD STILL EXISTS BEFORE SPEAKING (AC-284). This runs on
+            # a background thread and send_text can take seconds on a busy pane, so
+            # the row can be deleted or archived between the flag flip above and the
+            # message landing. Observed 2026-08-07: amux created a one-second probe
+            # card (`[scratch] foreign-owned archive guard probe — delete me`),
+            # assigned it to amux-cloud and deleted it 1s later; the assignment
+            # notice still arrived, naming a card that already returned
+            # {"error": "item not found"}. The recipient spent two probes
+            # establishing the work did not exist.
+            #
+            # Same family as the delivery-time guards on _steer_enqueue (AC-252),
+            # except this path never used them: it calls send_text directly, so
+            # nothing revalidated. A notice for a card that is gone is worse than
+            # silence — it is a specific instruction ("claim AC-284") that cannot
+            # be followed and reads as work someone dropped.
+            _still = db.execute(
+                "SELECT session, COALESCE(archived,0) AS archived FROM issues "
+                "WHERE id=? AND deleted IS NULL", (item_id,)).fetchone()
+            if not _still or _still["archived"]:
+                slog(f"[notify] {item_id} vanished before delivery "
+                     f"({'archived' if _still else 'deleted'}) — not notifying {session_name}")
+                return
+            if (_still["session"] or "") != session_name:
+                slog(f"[notify] {item_id} reassigned to "
+                     f"{_still['session'] or 'nobody'} before delivery — not notifying {session_name}")
+                return
             text = (
                 f"New board task assigned: {item_id} — {title[:120]}. "
                 f"Run `amux board claim {item_id}` to take it, or check `amux board` for context."
