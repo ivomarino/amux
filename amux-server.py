@@ -24252,6 +24252,46 @@ def _gmail_service(account: str):
         return None
 
 
+_gmail_health_cache: dict[str, tuple[float, str]] = {}   # account -> (ts, state)
+_GMAIL_HEALTH_TTL = 300
+
+
+def _gmail_account_health(account: str) -> str:
+    """'ok' | 'needs_reauth' | 'not_connected' — the state a CALLER experiences.
+
+    Token-file presence is not connectedness, and conflating them cost a real
+    diagnosis (2026-08-07). `/api/gmail/accounts` listed hello@amux.io as connected
+    because ~/.amux/gmail-tokens/hello@amux.io.json exists, while every read of that
+    mailbox returned "not_connected" — two components disagreeing about one fact, and
+    the error naming the wrong one. The god-mode walkthrough, which polls that mailbox
+    for a Clerk second factor, reported "no verification code arrived": a message that
+    describes CLERK failing to send when the truth was that amux could not read the
+    inbox at all. Three probes were spent in the wrong place.
+
+    The trap underneath, worth naming because it looks like a working check:
+    `_gmail_service()` returns a live object for a REVOKED token. googleapiclient
+    builds lazily, so the credential is not exercised until the first real call —
+    "service built OK" is not evidence the account works. Health therefore requires a
+    round trip, which is why it is cached rather than skipped.
+    """
+    import time as _t
+    hit = _gmail_health_cache.get(account)
+    if hit and (_t.time() - hit[0]) < _GMAIL_HEALTH_TTL:
+        return hit[1]
+    state = "not_connected"
+    try:
+        svc = _gmail_service(account)
+        if svc:
+            # cheapest authenticated call that actually exercises the token
+            svc.users().getProfile(userId="me").execute()
+            state = "ok"
+    except Exception as e:
+        state = "needs_reauth" if "invalid_grant" in str(e) else "not_connected"
+        slog(f"[gmail] health {account}: {state} ({str(e)[:120]})")
+    _gmail_health_cache[account] = (_t.time(), state)
+    return state
+
+
 def _gmail_auth_url(account: str) -> tuple[str, str] | tuple[None, str]:
     """Generate OAuth authorization URL (localhost callback). Returns (url, state) or (None, error)."""
     cfg = _gmail_client_config()
@@ -24349,7 +24389,14 @@ def _gmail_list_messages(account: str, label: str = "INBOX",
     try:
         svc = _gmail_service(account)
         if not svc:
-            return {"error": "not_connected"}
+            # Distinguish "no token at all" from "token present but dead". The
+            # undifferentiated error sent a reader to check whether the account was
+            # connected — it WAS — instead of to re-auth it.
+            _h = _gmail_account_health(account)
+            return {"error": _h if _h != "ok" else "not_connected",
+                    "account": account,
+                    "fix": (f"GET /api/gmail/auth?account={account} — open the url and approve"
+                            if _h == "needs_reauth" else None)}
         kwargs: dict = {"userId": "me", "maxResults": max_results}
         if q:
             kwargs["q"] = q
@@ -67633,7 +67680,21 @@ class CCHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/gmail"):
             # GET /api/gmail/accounts
             if path == "/api/gmail/accounts":
-                return self._json({"accounts": _gmail_connected_accounts()})
+                _accts = _gmail_connected_accounts()
+                # `accounts` keeps its old meaning (a token file exists) for
+                # compatibility, but it is no longer the whole answer — `health`
+                # is what a caller actually experiences, and `needs_reauth` names
+                # the accounts that will fail on first use while looking connected.
+                _health = {a: _gmail_account_health(a) for a in _accts}
+                return self._json({
+                    "accounts": _accts,
+                    "health": _health,
+                    "needs_reauth": [a for a, v in _health.items() if v == "needs_reauth"],
+                    "note": "`accounts` = a token file exists. `health` = the token still "
+                            "works. A revoked token stays in `accounts` and fails every "
+                            "read, so check `health` before concluding a mailbox is usable.",
+                    "reauth": "GET /api/gmail/auth?account=<email>, open the url, approve",
+                })
 
             # GET /api/gmail/auth?account=<email>  → OAuth authorization URL
             if path == "/api/gmail/auth" and method == "GET":
