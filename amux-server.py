@@ -20554,12 +20554,38 @@ def _write_claude_memory(name: str, work_dir: str):
             _sent_f = CC_MEMORY / f"{name}.archive.sent"
             _prev = _dest.read_text(errors="replace").splitlines() if _dest.exists() else []
             _have = {l.strip() for l in _prev if l.strip()}
+            _src = [l for l in _arch.read_text(errors="replace").splitlines() if l.strip()]
             try:
-                _sent = {l.strip() for l in _sent_f.read_text(errors="replace").splitlines()
-                         if l.strip()} if _sent_f.exists() else set()
+                if _sent_f.exists():
+                    _sent = {l.strip() for l in _sent_f.read_text(errors="replace").splitlines()
+                             if l.strip()}
+                else:
+                    # MIGRATION: no sidecar yet means this lane predates the fix, and
+                    # its whole archive must be treated as ALREADY HANDED OVER
+                    # (general-canvas-apps, GCA-78). Their measurement is what settles
+                    # this, and it is an inference from the OLD code's behaviour rather
+                    # than a guess:
+                    #
+                    # the additive merge has been live for weeks and re-applied every
+                    # lane's full archive on every sync, so anything in a lane archive
+                    # would ALREADY be in the shared destination. A line that is in a
+                    # lane archive and NOT in the destination therefore was not
+                    # "never propagated" — it was propagated and then deliberately
+                    # DELETED by someone tidying an in-both violation.
+                    #
+                    # Seeding empty would re-add exactly those deletions once, which is
+                    # the reported bug reproducing through its own fix. Both of GCA's
+                    # entries are in that state right now (backend.archive.md and
+                    # mixpeek-cicd.archive.md), and both are absent from the shared file.
+                    #
+                    # The risk this trades against — a genuinely unpropagated entry
+                    # being suppressed — is the 126-entry loss 5877f38 fixed. It is
+                    # small precisely BECAUSE that fix has been running: additive merge
+                    # leaves nothing unpropagated for a lane that has synced since.
+                    _sent = {l.strip() for l in _src}
+                    _sent_f.write_text("\n".join(sorted(_sent)) + "\n")
             except Exception:
                 _sent = set()
-            _src = [l for l in _arch.read_text(errors="replace").splitlines() if l.strip()]
             _add = [l for l in _src if l.strip() not in _have and l.strip() not in _sent]
             if _add or not _dest.exists():
                 _dest.write_text(("\n".join(_prev).rstrip() + "\n" +

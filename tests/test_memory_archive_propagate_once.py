@@ -96,8 +96,42 @@ def test_source_still_reads_the_sent_sidecar():
     sidecar reintroduces GCA-78 while every test above stays green."""
     from pathlib import Path
     src = (Path(__file__).parent.parent / "amux-server.py").read_text()
-    i = src.find("_MEM_ARCHIVE_FILE\n") if False else src.find("archive.sent")
-    assert i > 0, "the propagate-once sidecar is gone — additive-only merge is back"
-    block = src[max(0, i - 2000): i + 1200]
-    assert "_sent" in block and "not in _sent" in block, (
+    assert "archive.sent" in src, (
+        "the propagate-once sidecar is gone — additive-only merge is back")
+    # Anchor on the append condition itself rather than a byte window around the
+    # sidecar name: the first version of this guard used a fixed +1200 slice and
+    # broke the moment the migration branch moved code around, which is a check
+    # failing for a reason unrelated to what it guards.
+    assert "not in _sent" in src, (
         "the archive copy no longer excludes already-propagated lines")
+    assert "_sent_f.write_text" in src, (
+        "nothing records what was propagated, so the sidecar can never suppress a "
+        "re-add on the next sync")
+
+
+def test_MIGRATION_first_sync_without_a_sidecar_does_not_re_add_deletions():
+    """GCA-78's decisive case, and the one my first fix got wrong.
+
+    A lane that predates the fix has no sidecar. If it seeds EMPTY, every line in its
+    archive that is absent from the destination looks new and gets appended — re-adding
+    exactly the deliberate deletions the fix exists to protect. That is the reported bug
+    reproducing through its own fix.
+
+    Seeding from the lane's current archive is correct, and it is an inference rather
+    than a preference: the additive merge ran for weeks and re-applied each lane's full
+    archive on every sync, so anything in a lane archive was already in the destination.
+    lane-minus-destination is therefore deliberate deletions, not backlog.
+    """
+    # pre-fix state: lane still lists A and B; someone deleted B from the shared file
+    lane, dest = [A, B], [A]
+    seeded = {l.strip() for l in lane}          # migration seeding
+    out, _ = merge(dest, lane, seeded)
+    assert out == [A], f"migration re-added a deliberate deletion: {out}"
+
+
+def test_MIGRATION_empty_seeding_would_have_re_added_it():
+    """Pins WHY seeding matters, so the choice is documented and not silently reversible."""
+    out, _ = merge([A], [A, B], set())
+    assert out == [A, B], (
+        "empty seeding no longer re-adds — if this fails the migration hazard is gone "
+        "and this test is what to delete, not the seeding")
