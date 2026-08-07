@@ -13,11 +13,9 @@ reviewer reading "3 workers, 11 tool calls, 4 demo files" decides whether that
 demonstrates a workflow; this script must not decide it for them, because the
 whole point of the gate is a second pair of eyes.
 
-AUTH CHAIN (all of it needed; none of it optional):
-  1. Clerk password first factor      hello@amux.io + AMUX_GODMODE_PASSWORD
-  2. Clerk email_code SECOND factor   the code is emailed to hello@amux.io, which
-                                      is a mailbox the amux email API can read, so
-                                      this stays fully automatable
+AUTH CHAIN (no mailbox, no OAuth — see sign_in() for why it changed):
+  1. Clerk BACKEND sign-in token      api.clerk.com + E2E_CLERK_SECRET_KEY + AMUX_QA_USER_ID
+  2. ticket -> complete sign-in       no second factor, no inbox poll
   3. Clerk session JWT
   4. POST /api/cloud-auth             exchanges the JWT for an amux_session cookie
   5. amux_org cookie                  switches which workspace the gateway proxies to
@@ -43,6 +41,7 @@ CLERK = "https://clerk.amux.io"
 CLOUD = "https://cloud.amux.io"
 AMUX = os.environ.get("AMUX_URL", "https://localhost:8822")
 Q = "__clerk_api_version=2021-02-05&_clerk_js_version=5.0.0"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 # The real customer environments. Deliberately a literal list rather than "every
 # org": 60 orgs exist and 56 are personal workspaces belonging to individual
@@ -67,23 +66,53 @@ def env(key):
     raise SystemExit(f"{key} not in {path} — see docs/credentials.md")
 
 
-def inbox():
-    """hello@amux.io messages. NOTE: this endpoint returns a top-level LIST.
-
-    Reading it as {"messages": [...]} raises AttributeError, and a broad except
-    then turns every message into zero — which reads as "the code never arrived"
-    and is indistinguishable from a real delivery failure. That cost a full
-    retry cycle on 2026-08-06.
-    """
-    out = subprocess.run(
-        ["curl", "-sk", f"{AMUX}/api/email/inbox?account=hello@amux.io&count=8&days=1"],
-        capture_output=True, text=True).stdout
-    d = json.loads(out)
-    return d if isinstance(d, list) else d.get("messages", [])
-
-
 def sign_in():
-    """Full god-mode sign-in. Returns the amux_session cookie value."""
+    """Full god-mode sign-in. Returns the amux_session cookie value.
+
+    NO MAILBOX, NO OAUTH, NO SECOND FACTOR (AC-282). This used to be: password
+    first factor -> Clerk emails a 6-digit code -> read it from the hello@amux.io
+    inbox via the Gmail API -> submit it. That made SIGNING IN depend on READING AN
+    INBOX, and therefore on a Gmail OAuth grant that can be revoked silently. On
+    2026-08-07 it was: hello@amux.io's token returned invalid_grant, the rig died
+    at "no verification code arrived", and the failure read as Clerk not sending
+    the code. Wrong owner, three probes wasted.
+
+    Now: mint a sign-in token with the Clerk BACKEND api (E2E_CLERK_SECRET_KEY +
+    AMUX_QA_USER_ID, both already in server.env), exchange it for a session via the
+    `ticket` strategy, take the JWT. A backend-minted ticket needs no factors at
+    all, so the whole fragile leg is deleted rather than re-plumbed.
+
+    Measured before being chosen, not after: qa-godmode@amux.io hits the SAME
+    email_code requirement as hello@, so swapping identities does not avoid the
+    coupling (and qa-godmode has no Gmail token at all). Meanwhile the backend api
+    reports that user as two_factor_enabled: FALSE — so the second factor is
+    INSTANCE-level config, not per-user MFA. Plain username/password is reachable
+    by a Clerk config change; this path does not need it either way.
+    """
+    # hello@amux.io is the god-mode identity Ethan named, so mint the ticket for
+    # THAT user rather than the pre-existing qa-godmode account. Both are in
+    # ADMIN_EMAILS and either would work; using the named one keeps the evidence
+    # this rig produces attributable to the account a reviewer expects to see.
+    key, uid = env("E2E_CLERK_SECRET_KEY"), env("AMUX_GODMODE_USER_ID")
+
+    # api.clerk.com is behind Cloudflare and answers 403 "error code: 1010" to a
+    # default urllib user-agent. That is a browser-signature block, NOT an auth
+    # failure — it reads exactly like a bad secret key and cost a probe to tell
+    # apart. Send a normal UA.
+    print("  [1/3] minting a Clerk sign-in token (backend api, no factors)")
+    out = subprocess.run(
+        ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST",
+         "-H", f"Authorization: Bearer {key}", "-H", "Content-Type: application/json",
+         "-A", UA, "https://api.clerk.com/v1/sign_in_tokens",
+         "-d", json.dumps({"user_id": uid, "expires_in_seconds": 300})],
+        capture_output=True, text=True, timeout=60).stdout
+    body, _, code = out.rpartition("\n")
+    if code.strip() != "200":
+        raise SystemExit(f"  sign-in token refused (HTTP {code.strip()}): {body[:200]}\n"
+                         f"  403 with 'error code: 1010' is Cloudflare blocking the "
+                         f"user-agent, not a bad key.")
+    ticket = json.loads(body).get("token", "")
+
     import http.cookiejar
     jar = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(
@@ -94,58 +123,26 @@ def sign_in():
         req = urllib.request.Request(
             f"{CLERK}{path}?{Q}", data=urllib.parse.urlencode(data or {}).encode(),
             headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Origin": "https://accounts.amux.io", "User-Agent": "Mozilla/5.0"})
+                     "Origin": "https://accounts.amux.io", "User-Agent": UA})
         try:
             with op.open(req, timeout=40) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             return json.loads(e.read().decode() or "{}")
 
-    email, pw = env("AMUX_GODMODE_EMAIL"), env("AMUX_GODMODE_PASSWORD")
-    seen = {m.get("message_id") for m in inbox()}
-
-    print(f"  [1/5] password first factor as {email}")
-    d = fapi("/v1/client/sign_ins",
-             {"identifier": email, "strategy": "password", "password": pw})
+    print("  [2/3] exchanging the ticket for a session")
+    d = fapi("/v1/client/sign_ins", {"strategy": "ticket", "ticket": ticket})
     r = d.get("response") or d
-    if d.get("errors"):
-        raise SystemExit("  sign-in refused: " +
-                         "; ".join(e.get("message", "?") for e in d["errors"]))
-    sia = r.get("id")
+    if r.get("status") != "complete":
+        raise SystemExit("  ticket exchange did not complete: " +
+                         json.dumps(d.get("errors") or r.get("status"))[:200])
+    jwt = (fapi(f"/v1/client/sessions/{r['created_session_id']}/tokens", {}) or {}).get("jwt", "")
 
-    print("  [2/5] requesting the email second factor")
-    fapi(f"/v1/client/sign_ins/{sia}/prepare_second_factor", {"strategy": "email_code"})
-
-    print("  [3/5] polling hello@amux.io for a NEW message")
-    code = None
-    for attempt in range(15):
-        time.sleep(5)
-        for m in inbox():
-            if m.get("message_id") in seen:
-                continue
-            hit = re.search(r"\b(\d{6})\b", f"{m.get('subject','')} {m.get('body','')}")
-            if hit:
-                code = hit.group(1)
-                break
-        if code:
-            break
-    if not code:
-        raise SystemExit("  no verification code arrived")
-
-    print("  [4/5] submitting the second factor")
-    d = fapi(f"/v1/client/sign_ins/{sia}/attempt_second_factor",
-             {"strategy": "email_code", "code": code})
-    r = d.get("response") or d
-    sess = r.get("created_session_id")
-    if not sess:
-        raise SystemExit("  second factor rejected: " + json.dumps(d)[:200])
-    jwt = (fapi(f"/v1/client/sessions/{sess}/tokens", {}) or {}).get("jwt", "")
-
-    print("  [5/5] exchanging the JWT for an amux_session cookie")
+    print("  [3/3] exchanging the JWT for an amux_session cookie")
     req = urllib.request.Request(
         f"{CLOUD}/api/cloud-auth", method="POST",
-        data=json.dumps({"token": jwt, "email": email}).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        data=json.dumps({"token": jwt, "email": env("AMUX_GODMODE_EMAIL")}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": UA})
     with op.open(req, timeout=60) as resp:
         for c in resp.headers.get_all("Set-Cookie") or []:
             if c.startswith("amux_session="):
@@ -216,6 +213,33 @@ def walk(cookie, org, label):
         for s in scheds:
             print(f"    [{'ON ' if s.get('enabled') else 'off'}] {(s.get('title') or '')[:42]:44s}"
                   f" -> {s.get('session','?')}")
+
+    # BOARD ISSUES. Ethan named this dimension explicitly — "board issues all have
+    # intuitive named" — and the rig did not report it at all, so the one instrument
+    # a reviewer uses to satisfy that gate criterion could not express it. A gate whose
+    # evidence cannot be produced is the ethos rule-4 shape: the reviewer would have had
+    # to take it on faith or go hunting by hand.
+    #
+    # Prints the TITLES, not a count. "12 issues" cannot be judged for intuitiveness;
+    # the whole question is whether a human reading them understands the workflow. The
+    # capture-shell heuristic is a HINT, not a verdict — a title that starts like a
+    # pasted prompt is the specific failure mode seen on the local board (AMUX-2474),
+    # and flagging it tells the reviewer where to look without deciding for them.
+    st, issues = get(cookie, "/api/board?slim=1&archived=0", org)
+    if isinstance(issues, list):
+        shells = [i for i in issues
+                  if re.match(r"(?i)^(capture|captured|prompt)\b", (i.get("title") or "")
+                              ) or len(i.get("title") or "") > 90]
+        print(f"\n  BOARD: {len(issues)} open issue(s)"
+              + (f"  — {len(shells)} look like undecomposed captures, REVIEW THESE"
+                 if shells else "  — none look like raw captures"))
+        for i in issues[:12]:
+            flag = "!" if i in shells else " "
+            print(f"   {flag}[{(i.get('status') or '?')[:9]:9s}] {(i.get('title') or '')[:74]}")
+        if len(issues) > 12:
+            print(f"     … +{len(issues) - 12} more (printed 12; not a sample — the rest are on the board)")
+    else:
+        print(f"\n  BOARD UNAVAILABLE (HTTP {st}): {str(issues)[:100]}")
 
     for w in workers:
         name = w.get("name")
