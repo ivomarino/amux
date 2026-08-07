@@ -66809,6 +66809,28 @@ class CCHandler(BaseHTTPRequestHandler):
                                     "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?, ?, ?)",
                                     (bid, tag, _prev_at.get(tag) or _now_at),
                                 )
+                        # A tags write MOVES rev (cold-outbound, AMUX-2492). It did not,
+                        # because tags apply outside set_clauses — and that is two bugs,
+                        # not a cosmetic one.
+                        #
+                        # First, `rev` is the optimistic-concurrency token: `expect_rev`
+                        # is checked against it. A change that does not move rev is a
+                        # change two clients can clobber, because a stale caller's
+                        # expect_rev still matches after someone else rewrote the tags.
+                        # Tag writes were outside that protection entirely.
+                        #
+                        # Second, and this is what cold-outbound actually spotted: after
+                        # the no-op fix above, a caller who learns "stop trusting the
+                        # status code, check whether rev moved" walks straight into a
+                        # FRESH trap, because rev-unchanged meant either nothing-applied
+                        # (now a 400) or side-effect-applied-fine (a 200). The obvious
+                        # lesson from this bug pointed at exactly the wrong replacement
+                        # check. Making every applied write move rev is what makes that
+                        # replacement check correct instead of documenting why it is not.
+                        if not _wrote_field:
+                            db.execute(
+                                "UPDATE issues SET rev = COALESCE(rev, 0) + 1, updated = ? "
+                                "WHERE id = ?", (now, bid))
                     db.commit()
                     # ── POST-COMMIT: best-effort side effects only ──────────────
                     # The write has LANDED. Nothing below may turn a committed PATCH
