@@ -21780,9 +21780,25 @@ def main():
     # localhost POST on `git checkout -- <paths>` / `git restore <paths>`, and nothing
     # at all on any other command.
     discard_why = None
-    try:
-        discard_why = _discard_verdict(cmd, scrubbed, run_dir)
-    except Exception as _dv_err:
+    _dv_err = None
+    # RETRY BEFORE REFUSING (AC-287). The amux server re-execs on every save of
+    # amux-server.py, which on this shared checkout happens many times an hour, so
+    # a single 4s timeout is a routine event rather than an outage. Failing closed
+    # on the first miss would refuse legitimate discards during every restart —
+    # caught by a control in review: the guard blocked with a reachable server
+    # purely because the call landed in a reload window. Three tries over ~6s costs
+    # nothing on an operation this rare and removes that whole false-refusal class.
+    for _dv_try in range(3):
+        try:
+            discard_why = _discard_verdict(cmd, scrubbed, run_dir)
+            _dv_err = None
+            break
+        except Exception as _e:
+            _dv_err = _e
+            if _dv_try < 2:
+                import time as _t   # inline, matching this hook's import style
+                _t.sleep(2)
+    if _dv_err is not None:
         # FAIL CLOSED HERE, unlike everywhere else in this guard (AC-287).
         # The standing contract is fail-OPEN: a guard that blocks when the server
         # is down wedges every lane, and for a COMMIT that trade is right — the
@@ -21854,9 +21870,25 @@ def main():
     # tree-wide table below, whose own remedy line tells callers to "scope to YOUR
     # OWN paths" — this is what makes "your own" enforced rather than advisory.
     discard_why = None
-    try:
-        discard_why = _discard_verdict(cmd, scrubbed, run_dir)
-    except Exception as _dv_err:
+    _dv_err = None
+    # RETRY BEFORE REFUSING (AC-287). The amux server re-execs on every save of
+    # amux-server.py, which on this shared checkout happens many times an hour, so
+    # a single 4s timeout is a routine event rather than an outage. Failing closed
+    # on the first miss would refuse legitimate discards during every restart —
+    # caught by a control in review: the guard blocked with a reachable server
+    # purely because the call landed in a reload window. Three tries over ~6s costs
+    # nothing on an operation this rare and removes that whole false-refusal class.
+    for _dv_try in range(3):
+        try:
+            discard_why = _discard_verdict(cmd, scrubbed, run_dir)
+            _dv_err = None
+            break
+        except Exception as _e:
+            _dv_err = _e
+            if _dv_try < 2:
+                import time as _t   # inline, matching this hook's import style
+                _t.sleep(2)
+    if _dv_err is not None:
         # FAIL CLOSED HERE, unlike everywhere else in this guard (AC-287).
         # The standing contract is fail-OPEN: a guard that blocks when the server
         # is down wedges every lane, and for a COMMIT that trade is right — the
