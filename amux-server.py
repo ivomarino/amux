@@ -65800,10 +65800,36 @@ class CCHandler(BaseHTTPRequestHandler):
                                  "X-Amux-Scope-Note": (f"{len(_vis)} of {len(_bd)} cards visible to this "
                                                        f"session; the rest belong to other tags")})
                 if _projecting:
+                    # HONOUR done_limit HERE TOO (mvs-infra, 2026-08-07). This branch
+                    # served the SSE cache — always built with done_limit=100 — for ANY
+                    # projecting request, so `?slim=1&done_limit=0` silently returned the
+                    # capped set with no header saying so. Measured: `?done_limit=0`
+                    # returns 1484 done cards, `?done_limit=0&slim=1` returns 62.
+                    #
+                    # That is the AMUX-2446 defect the comment BELOW this block says was
+                    # fixed — the fix is real and sits underneath an early return that
+                    # bypasses it whenever any filter is present. Third time this shape
+                    # has appeared today: the remedy exists and something upstream never
+                    # reaches it.
+                    #
+                    # It matters most because `?slim=1` is what the board contract tells
+                    # readers to scan with ("Scan with GET /api/board?slim=1"), so the
+                    # documented path is the one that truncates. mvs-infra ran a
+                    # full-list census, got ZERO of their own done cards, and the idle
+                    # guard then surfaced four of them one-by-one over the next minutes
+                    # — each live, each addressable by id. Absence from a silently
+                    # truncated list establishes nothing, and they had already re-paid
+                    # that lesson tonight.
+                    if done_limit != 100:
+                        _bd = _load_board(done_limit=done_limit)
+                        return self._json(
+                            _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch),
+                            headers={"X-Amux-Done-Limit": str(done_limit)})
                     # Same read-through-on-invalidation contract as the scoped
                     # path: a write nulls the cached data, so this reloads.
                     _bd = _sse_cache["board"]["data"] or _load_board(done_limit=done_limit or 100)
-                    return self._json(_board_project(_bd, _slim, _f_sess, _f_stat, _f_arch))
+                    return self._json(_board_project(_bd, _slim, _f_sess, _f_stat, _f_arch),
+                                      headers={"X-Amux-Done-Limit": "100"})
                 # HONOUR ANY EXPLICIT done_limit, not just 0 (gtm-videos, 2026-08-06).
                 # Only ==0 bypassed the cache; every other value fell through to a
                 # cache BUILT WITH 100, so `?done_limit=5000` accepted the
