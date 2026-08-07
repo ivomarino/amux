@@ -29444,6 +29444,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .col-gate-btn::before { content: '\2611\FE0E'; font-size: 0.9rem; }
     .board-col-purpose { font-size: 0.62rem; padding: 0 2px 4px; line-height: 1.25; }
 
+    /* WORKERS TAB DENSITY (Ethan's 12:14 screenshot). The group summary card spent
+       ~600px before the first worker: a THREE-LINE list of member names, three config
+       tiles clipped at the right edge, a hint line, and three action buttons on two
+       rows. The member list is the worst offender because it is pure duplication —
+       those exact workers are the cards immediately below it. */
+    .grp-members { display: none; }              /* the cards below ARE the list */
+    .grp-scope-row { gap: 6px; }
+    .grp-scope-ident { font-size: 0.8rem !important; }
+    .scope-tiles { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+                   scrollbar-width: none; }
+    .scope-tiles::-webkit-scrollbar { display: none; }
+    .scope-tile { flex: 0 0 auto; min-width: 96px; min-height: 44px; padding: 6px 9px; }
+    .scope-tile-label { font-size: 0.68rem; }
+    .scope-tile-val, .scope-tile-src { font-size: 0.64rem; }
+
     /* Toolbar: three separate rows became one scrollable row plus the search box. */
     .board-toolbar { gap: 5px; }
     .board-owner-toggle .bv-btn, .board-view-toggle .bv-btn { padding: 6px 10px; }
@@ -38416,7 +38431,8 @@ async function _scopeLoad(scope, targetId) {
           + '<div class="grp-scope-ident" style="color:var(--text);font-size:0.86rem;">'
           + '<b>' + esc(lvl === 'global' ? 'Global' : w) + '</b>'
           + (lvl === 'worker' ? ' \u00b7 groups: ' + (groups.length ? chips(groups) : '<i>none</i>') : '')
-          + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's') + ': ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') : '')
+          + (lvl === 'group' ? ' \u00b7 ' + members.length + ' worker' + (members.length === 1 ? '' : 's')
+              + '<span class="grp-members">: ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') + '</span>' : '')
           + '</div>'
           + '<div class="grp-scope-tiles"><div class="scope-tiles">';
     // Group/global panel shows ONLY memory, board gates and env (Ethan,
@@ -39780,7 +39796,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.511';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.512';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -61441,7 +61457,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.511';
+const CACHE = 'amux-v0.9.512';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
