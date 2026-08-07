@@ -31861,6 +31861,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <option value="claude-sonnet-4-6[1m]">claude-sonnet-4-6 [1M]</option>
       <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
     </select>
+    <select id="edit-group-picker" class="edit-select" style="display:none;margin-bottom:6px;" onchange="_editAddGroup(this)"></select>
     <div id="edit-effort-wrap" style="display:none;margin-top:12px;">
       <label class="field-label" style="display:block;margin-bottom:5px;font-size:0.78rem;color:var(--dim);">Reasoning effort</label>
       <select id="edit-effort-select">
@@ -35936,6 +35937,21 @@ if (window._AMUX_DEFAULT_MODEL) {
   if (defOpt) defOpt.textContent = 'Default (' + window._AMUX_DEFAULT_MODEL + ')';
 }
 
+// Append a picked group to the comma list without clobbering what is typed,
+// and without adding it twice — the picker is an aid to the field, not a second
+// source of truth for it.
+function _editAddGroup(sel) {
+  const g = sel.value;
+  sel.selectedIndex = 0;
+  if (!g) return;
+  const inp = document.getElementById('edit-input');
+  const cur = (inp.value || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (cur.some(x => x.toLowerCase() === g.toLowerCase())) return;
+  cur.push(g);
+  inp.value = cur.join(', ');
+  inp.focus();
+}
+
 // ── Edit modal ──
 let editState = null;  // {session, field, current}
 function editField(session, field, current, provider) {
@@ -36013,9 +36029,44 @@ function editField(session, field, current, provider) {
     inpWrap.style.display = 'none';
     sel.style.display = 'block';
     sel.value = current || '';
+  } else if (field === 'tags') {
+    // GROUPS GET A DROPDOWN (Ethan, 2026-08-06: "groups isnt working it should be
+    // a dropdown when I create it"). It was a bare text box, so joining an
+    // existing group meant retyping its name from memory and matching the
+    // spelling exactly — one typo silently created a new single-worker group
+    // instead of joining "customers". There was no list to pick from because
+    // GET /api/groups 404'd; that endpoint is added in this same change.
+    //
+    // Dropdown ALONGSIDE the input rather than replacing it, because a worker
+    // belongs to zero or more groups and new groups have to be creatable. The
+    // select is a picker that appends; the field stays the source of truth. A
+    // pure <select> would have made "dropdown" true and "create a group"
+    // impossible.
+    inpWrap.style.display = '';
+    sel.style.display = 'none';
+    inp.value = current || '';
+    inp.placeholder = placeholders[field] || '';
+    const gw = document.getElementById('edit-group-picker');
+    if (gw) {
+      gw.style.display = '';
+      gw.innerHTML = '<option value="">+ Add existing group…</option>';
+      fetch(API + '/api/groups', { headers: _authHeaders() })
+        .then(r => r.json())
+        .then(d => {
+          (d.groups || []).forEach(g => {
+            const o = document.createElement('option');
+            o.value = g.name;
+            o.textContent = g.name + '  (' + g.workers + ')';
+            gw.appendChild(o);
+          });
+        })
+        .catch(() => {});   // picker is an aid; the text field still works
+    }
   } else {
     inpWrap.style.display = '';
     sel.style.display = 'none';
+    const _gw0 = document.getElementById('edit-group-picker');
+    if (_gw0) _gw0.style.display = 'none';
     inp.value = current || '';
     inp.placeholder = placeholders[field] || '';
   }
@@ -38558,7 +38609,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.500';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.501';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -60081,7 +60132,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.500';
+const CACHE = 'amux-v0.9.501';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -61731,6 +61782,51 @@ class CCHandler(BaseHTTPRequestHandler):
         # GET /api/events (SSE stream)
         if method == "GET" and path == "/api/events":
             return self._sse_events()
+
+        # GET /api/groups — the group list, which did not exist (Ethan, 2026-08-06:
+        # "groups isnt working it should be a dropdown when I create it").
+        #
+        # The alias above rewrites /api/groups -> /api/tags, and /api/tags HAS NO
+        # ROUTE. It was added beside /api/workers -> /api/sessions, which is real,
+        # on the assumption that a tags API existed; it never did. So every request
+        # for the group list 404'd, nothing could enumerate groups, and the only
+        # UI possible was a free-text box where you retype "customers" and hope you
+        # spell it the same way as last time. A phantom alias — same shape as the
+        # hcl grammar mapped to a language highlight.js does not ship.
+        #
+        # DERIVED FROM CC_TAGS, never a stored list. Group membership already lives
+        # in each worker's env; a second table would be a second source of truth
+        # that drifts the first time someone edits one and not the other. Counts
+        # come from the same read, so the dropdown cannot show a group that no
+        # worker is in, or miss one that a worker just joined.
+        # Matched as /api/tags, NOT /api/groups: the compat block above rewrites
+        # new-name paths to old-name paths BEFORE routing, so a handler keyed on
+        # "/api/groups" can never fire. My first cut was, and 404'd exactly like
+        # the missing route it was written to add — the alias made the fix
+        # invisible in the same way it made the gap invisible.
+        if method == "GET" and path in ("/api/tags", "/api/groups"):
+            try:
+                _rows = _sse_cache["sessions"]["data"] or list_sessions()
+            except Exception:
+                _rows = []
+            _sc, _sct, _scn = _caller_scope(self.headers)
+            if _sc:
+                _rows = [r for r in _rows
+                         if r.get("name") == _scn
+                         or (_sct and {t.lower() for t in (r.get("tags") or [])} & _sct)]
+            _counts: dict = {}
+            for r in _rows:
+                for t in (r.get("tags") or []):
+                    t = (t or "").strip()
+                    if t:
+                        _counts[t] = _counts.get(t, 0) + 1
+            return self._json({
+                "groups": [{"name": g, "workers": n}
+                           for g, n in sorted(_counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+                "total": len(_counts),
+                "derived_from": "CC_TAGS across workers — not a stored list, so it cannot drift",
+                "set_on_a_worker": "PATCH /api/sessions/<name>/config {\"tags\": \"a, b\"}",
+            })
 
         # GET /api/sessions/contract — the worker payload's field list, PUBLISHED
         # (AMUX-2447). Must sit ABOVE the /api/sessions/<name> routes or it reads
