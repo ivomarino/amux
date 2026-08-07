@@ -708,3 +708,32 @@ NOTE: this is the SECOND instance of AMUX-2325's exact defect, and the `type` ve
   on, and does each have an `amux board` verb?" rather than waiting for a session to trip
   over the next one. `depends_on` and `owner_type` are both gate-relevant and both
   currently unsettable from the CLI — same trap, unsprung.
+
+## `amux board type` advertised two types the server rejects, and omitted one it accepts
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2479
+SYMPTOM: `amux board type AMUX-2479 decision` -> `{"error": "unknown type 'decision'"}`. I picked
+  `decision` from the CLI's OWN usage line, which read `types: code task chore doc research ops
+  investigation decision escalation blocker watch`. The server's `_ITEM_TYPES` is `code escalation
+  blocker investigation ops research chore doc tripwire watch` — so the CLI advertised `task` and
+  `decision` (both rejected) and omitted `tripwire` (accepted). Two hand-maintained copies of one
+  list, drifted.
+COST: small in minutes, but it is the worst shape of help: confidently wrong, and it points you at
+  your CARD rather than at the tool. The server's error is good (it returns `valid_types`), so the
+  recovery was fast — without that it would have read as the card being in a bad state.
+FIX: `2c1d1a2` — the server publishes `fields.valid_types` machine-readably (the existing prose
+  `"One of [...]"` was not parseable), and the CLI renders its usage line from that with a fallback
+  when the server is unreachable. Verified live: usage now prints `tripwire`, and greps clean for
+  `task`/`decision`.
+NOTE: fourth instance tonight of ONE fact maintained in two places and drifting — after the gate
+  contract vs the resolver (AMUX-2477), the nudge's selection vs its target-status ternary, and the
+  reviewer sign-off requirement vs its routing (both AMUX-2478). backend named the remedy hierarchy
+  that covers all four: extract the predicate when both sites share a codebase; GENERATE one side
+  from the other when they are different artifacts (this entry is that tier — a bash CLI and a
+  Python server cannot share a constant, so the list is served); tripwire the pairing when neither
+  works. The generalisable line is theirs: every "keep these in sync" comment is a defect report
+  about the code's shape, filed in advance.

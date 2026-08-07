@@ -1252,8 +1252,22 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # Without this verb the only way to retype was raw curl, which is how the
       # attribution was being lost in the first place (AMUX-2325).
       local id="${1:-}"; local new_type="${2:-}"
-      [[ -n "$id" && -n "$new_type" ]] || die "Usage: amux board type <ISSUE-ID> <type>
-types: code task chore doc research ops investigation decision escalation blocker watch"
+      if [[ -z "$id" || -z "$new_type" ]]; then
+        # Ask the SERVER for the list instead of carrying a copy. The hardcoded one
+        # had drifted: it advertised `task` and `decision` — both rejected — and
+        # omitted `tripwire`. Following this tool's own usage line produced
+        # "unknown type 'decision'", which is the worst kind of help: confidently
+        # wrong, and it sends you looking at your card instead of at the CLI.
+        # (Hit live on AMUX-2479, 2026-08-07.)
+        local _types
+        _types=$(curl -sk --max-time 3 "$AMUX_API/api/board/contract" 2>/dev/null \
+          | python3 -c 'import json,sys
+try: print(" ".join(json.load(sys.stdin)["fields"]["valid_types"]))
+except Exception: pass' 2>/dev/null)
+        [[ -n "$_types" ]] || _types="(server unreachable — see GET /api/board/contract)"
+        die "Usage: amux board type <ISSUE-ID> <type>
+types: $_types"
+      fi
       local result
       result=$(T="$new_type" python3 -c 'import json,os;print(json.dumps({"type":os.environ["T"]}))' \
         | curl -sk -X PATCH -H 'Content-Type: application/json' \

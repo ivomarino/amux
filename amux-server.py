@@ -62935,6 +62935,15 @@ class CCHandler(BaseHTTPRequestHandler):
                     "depends_on": "JSON list of card ids this card is BLOCKED by while they are open; the autonomy loop skips blocked cards and routes nudges to the dependency.",
                     "reviewer": "Session whose X-Amux-Session must ack review->done when set (cross-session verification; force is the logged escape).",
                     "type": f"Item type; DERIVES the gate. One of {list(_ITEM_TYPES)}. Default '{_DEFAULT_ITEM_TYPE}'.",
+                    # MACHINE-READABLE, because the prose above is not. The `amux`
+                    # CLI hardcoded its own copy of this list and drifted: it
+                    # advertised `task` and `decision` (both rejected by the server)
+                    # and omitted `tripwire`. Someone following the CLI's own usage
+                    # line got "unknown type 'decision'" — the tool told them a value
+                    # the server refuses. Tier 2 of backend's hierarchy: render one
+                    # side from the other rather than keep two lists in step.
+                    "valid_types": list(_ITEM_TYPES),
+                    "default_type": _DEFAULT_ITEM_TYPE,
                     "status": f"One of {list(statuses)}.",
                 },
                 "gates": {
