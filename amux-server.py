@@ -17103,6 +17103,25 @@ def _all_session_workdirs() -> dict[str, str]:
     return result
 
 
+def _session_dirt_pathspec(name: str, work_dir: str) -> list:
+    """The pathspec scoping dirt to THIS session's territory: its working dir, minus
+    subdirectories that are *other* sessions' working dirs.
+
+    Extracted so `_session_dirty_files` and `_upstream_dirt_verdicts` cannot drift
+    apart. Two implementations of one scoping rule is the shape that produced
+    AMUX-2477 (a published gate order that disagreed with the enforced one) — a
+    verdict computed over a DIFFERENT file set than the refusal it explains would be
+    the same defect wearing different clothes."""
+    wd = str(Path(work_dir).expanduser().resolve())
+    excludes = []
+    for other, od in _all_session_workdirs().items():
+        if other == name:
+            continue
+        if od != wd and (od + os.sep).startswith(wd + os.sep):
+            excludes.append(":(exclude)" + os.path.relpath(od, wd))
+    return excludes
+
+
 def _session_dirty_files(name: str, work_dir: str) -> list:
     """Uncommitted/untracked files this session owns. Scoped to its working dir,
     and — for a session whose cwd is a monorepo root — excludes subdirectories that
@@ -17110,15 +17129,9 @@ def _session_dirty_files(name: str, work_dir: str) -> list:
     own territory. Returns paths; [] if clean or not a git repo."""
     try:
         wd = str(Path(work_dir).expanduser().resolve())
-        all_dirs = _all_session_workdirs()
-        excludes = []
-        for other, od in all_dirs.items():
-            if other == name:
-                continue
-            if od != wd and (od + os.sep).startswith(wd + os.sep):
-                excludes.append(":(exclude)" + os.path.relpath(od, wd))
         r = subprocess.run(
-            ["git", "-C", wd, "status", "--porcelain", "--", "."] + excludes,
+            ["git", "-C", wd, "status", "--porcelain", "--", "."]
+            + _session_dirt_pathspec(name, wd),
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode != 0:
@@ -17126,6 +17139,148 @@ def _session_dirty_files(name: str, work_dir: str) -> list:
         return [ln[3:].strip() for ln in r.stdout.splitlines() if ln.strip()]
     except Exception:
         return []
+
+
+def _upstream_dirt_verdicts(name: str, work_dir: str, fetch: bool = True) -> dict:
+    """Per-path adjudication of status-dirty files: which are provably ALREADY
+    committed upstream, and which are real dirt.
+
+    Why this exists (BACKE-3183, backend). `git status` compares the working tree to
+    the LOCAL HEAD. Parts of the fleet land work by pushing a commit-tree graft, which
+    moves the remote ref and leaves the local ref where it was — so every landed file
+    reads ` M` against a stale HEAD forever, while being byte-identical to what is on
+    origin. The verify gate then refuses transitions on a checkout that has lost
+    nothing, and the only exit is `force`. backend forced past it 4+ times in one night
+    with written rationale. That is the quiet cost worth naming: routine forcing
+    un-teaches the gate's one honest catch, so when it finally refuses something REAL
+    the reflex is already to bypass it.
+
+    THE DISCRIMINATOR IS NOT "identical to origin". Verified on two constructed
+    specimens rather than argued (2026-08-06):
+
+      specimen 1 — graft: local HEAD stale, a.txt ` M`, blob-identical to origin/main,
+                   `HEAD is ancestor of origin/main` = YES.  Nothing local to lose.
+      specimen 2 — revert: local HEAD one unpushed commit AHEAD, working tree put back
+                   to origin's content. a.txt ` M`, ALSO blob-identical to origin/main,
+                   `HEAD is ancestor of origin/main` = NO.  This is a destructive
+                   uncommitted reversion of committed work.
+
+    Both are status-dirty and both are identical-to-origin, so identity ALONE cannot
+    tell them apart — it would bless specimen 2 and silently green-light discarding a
+    commit. The amux checkout sits at 16 unpushed commits as this is written, i.e. it
+    is permanently in specimen 2's shape. The ancestry test is what separates them, so
+    it gates the whole comparison.
+
+    Deliberately still DIRTY, whatever the content says:
+      - deletions: a removed file has no blob to match, and losing it is exactly the
+        hazard the gate should catch (backend's MG-1434 note).
+      - untracked: not in any commit, upstream or otherwise.
+      - renames: the old path's disappearance is unrepresented by the new path's blob.
+
+    No unbounded network in a request path. The fetch is bounded and best-effort, runs
+    only when there IS dirt to adjudicate, and a failure NEVER silently hardens a
+    refusal — `fetch_error` is reported so a 409 built on a stale ref says so.
+    """
+    wd = str(Path(work_dir).expanduser().resolve())
+    out = {"ref": None, "fetched": False, "fetch_error": None,
+           "head_is_upstream_ancestor": None, "reason": None,
+           "already_upstream": [], "still_dirty": [], "verdicts": {}}
+
+    def _git(args, timeout=10):
+        return subprocess.run(["git", "-C", wd] + args, capture_output=True,
+                              text=True, timeout=timeout)
+
+    try:
+        # 1. Which upstream ref? Prefer the branch's own @{u} — hardcoding origin/main
+        #    would silently adjudicate against the wrong branch on any lane not on main.
+        ref = ""
+        r = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        if r.returncode == 0 and r.stdout.strip():
+            ref = r.stdout.strip()
+        else:
+            for cand in ("origin/main", "origin/master"):
+                if _git(["rev-parse", "--verify", "--quiet", cand]).returncode == 0:
+                    ref = cand
+                    break
+        if not ref:
+            out["reason"] = "no upstream ref — cannot prove anything is upstream"
+            return out
+        out["ref"] = ref
+
+        # 2. Bounded, best-effort refresh. On the graft workflow the LOCAL copy of the
+        #    remote ref is the stale thing, so skipping the fetch would leave the very
+        #    false positive this function exists to remove.
+        if fetch:
+            remote = ref.split("/", 1)[0] if "/" in ref else "origin"
+            try:
+                fr = _git(["fetch", "--quiet", remote], timeout=8)
+                out["fetched"] = fr.returncode == 0
+                if fr.returncode != 0:
+                    out["fetch_error"] = (fr.stderr or "").strip()[:200] or "fetch failed"
+            except subprocess.TimeoutExpired:
+                out["fetch_error"] = "fetch exceeded 8s — verdicts use the local (possibly stale) ref"
+            except Exception as e:
+                out["fetch_error"] = str(e)[:200]
+
+        # 3. THE GUARD. If HEAD is not an ancestor of upstream, local commits exist that
+        #    upstream does not have, so "identical to upstream" means REVERTED, not
+        #    landed. Refuse to adjudicate at all — never weaken the gate here.
+        anc = _git(["merge-base", "--is-ancestor", "HEAD", ref])
+        out["head_is_upstream_ancestor"] = (anc.returncode == 0)
+        if anc.returncode != 0:
+            out["reason"] = (
+                f"HEAD is NOT an ancestor of {ref} — this checkout has local commits "
+                f"that {ref} does not. Content matching {ref} would mean the work was "
+                f"REVERTED, not landed, so every dirty path stays dirty.")
+            return out
+
+        # 4. Per-path verdicts. -z avoids git's quoting of unusual paths, which a
+        #    line-based parse mangles into a path that then fails to hash and reads
+        #    as dirty for the wrong reason.
+        r = _git(["status", "--porcelain", "-z", "--", "."]
+                 + _session_dirt_pathspec(name, wd))
+        if r.returncode != 0:
+            out["reason"] = "git status failed"
+            return out
+        fields = [f for f in r.stdout.split("\0")]
+        i = 0
+        while i < len(fields):
+            ent = fields[i]
+            i += 1
+            if not ent or len(ent) < 4:
+                continue
+            code, path = ent[:2], ent[3:]
+            if code[0] == "R" or code[1] == "R":   # rename: the NEXT field is the old path
+                i += 1
+                out["still_dirty"].append(path)
+                out["verdicts"][path] = "renamed — old path's removal is not covered by the new blob"
+                continue
+            if code == "??":
+                out["still_dirty"].append(path)
+                out["verdicts"][path] = "untracked — not committed anywhere"
+                continue
+            if "D" in code:
+                out["still_dirty"].append(path)
+                out["verdicts"][path] = "DELETED — losing it is the hazard the gate exists to catch"
+                continue
+            try:
+                h = _git(["hash-object", "--", path])
+                u = _git(["rev-parse", f"{ref}:{path}"])
+                if h.returncode == 0 and u.returncode == 0 and \
+                        h.stdout.strip() and h.stdout.strip() == u.stdout.strip():
+                    out["already_upstream"].append(path)
+                    out["verdicts"][path] = f"identical to {ref}:{path} ({h.stdout.strip()[:12]})"
+                else:
+                    out["still_dirty"].append(path)
+                    out["verdicts"][path] = (
+                        f"differs from {ref}:{path}" if u.returncode == 0
+                        else f"not present in {ref} — uncommitted new content")
+            except Exception as e:
+                out["still_dirty"].append(path)
+                out["verdicts"][path] = f"could not compare ({str(e)[:60]}) — treated as dirty"
+    except Exception as e:
+        out["reason"] = f"adjudication failed ({str(e)[:120]}) — all paths stay dirty"
+    return out
 
 
 def _checkout_busy_cotenant(name: str, work_dir: str) -> str:
@@ -65383,12 +65538,30 @@ class CCHandler(BaseHTTPRequestHandler):
                                         dirty = [f for f in dirty if f not in _foreign]
                                 except Exception:
                                     pass
+                            # ALREADY-UPSTREAM dirt (BACKE-3183): `git status` compares
+                            # to the LOCAL HEAD, and lanes that land work by pushing a
+                            # commit-tree graft never move their local ref — so landed,
+                            # byte-identical files read ` M` forever and this gate
+                            # refused checkouts that had lost nothing. Guarded by an
+                            # ancestry test: if HEAD is AHEAD of upstream, matching
+                            # upstream means REVERTED, and _upstream_dirt_verdicts
+                            # refuses to clear anything. See its docstring for the two
+                            # specimens that separate those cases.
+                            _uv = None
+                            if dirty:
+                                try:
+                                    _uv = _upstream_dirt_verdicts(eff_session, wd)
+                                    _up = set(_uv.get("already_upstream") or [])
+                                    if _up:
+                                        dirty = [f for f in dirty if f not in _up]
+                                except Exception:
+                                    _uv = None
                             # Blanket fallback for UNATTRIBUTED dirt: a peer
                             # actively working the same checkout may own it.
                             if dirty and _checkout_busy_cotenant(eff_session, wd):
                                 dirty = []
                             if dirty:
-                                return self._json({
+                                _resp = {
                                     "error": "session has uncommitted changes; commit before "
                                              "verifying, or pass force=true if unrelated to this task",
                                     "ok": False,
@@ -65396,7 +65569,27 @@ class CCHandler(BaseHTTPRequestHandler):
                                     "session": eff_session,
                                     "dirty_count": len(dirty),
                                     "dirty_files": dirty[:20],
-                                }, 409)
+                                }
+                                # Per-path evidence in the REFUSAL itself. A 409 that
+                                # only says "you are dirty" leaves force as the sole
+                                # move and leaves no record of what was weighed; with
+                                # verdicts a force cites which paths and why.
+                                if _uv:
+                                    _resp["why_each_path_is_dirty"] = {
+                                        p: _uv["verdicts"].get(p, "status-dirty")
+                                        for p in dirty[:20]}
+                                    _resp["compared_against"] = _uv.get("ref")
+                                    if _uv.get("already_upstream"):
+                                        _resp["cleared_as_already_upstream"] = \
+                                            _uv["already_upstream"][:20]
+                                    if _uv.get("reason"):
+                                        _resp["not_adjudicated"] = _uv["reason"]
+                                    # A refusal built on a ref we could not refresh must
+                                    # SAY so — otherwise a stale ref manufactures dirt
+                                    # and the message reads like a settled fact.
+                                    if _uv.get("fetch_error"):
+                                        _resp["ref_may_be_stale"] = _uv["fetch_error"]
+                                return self._json(_resp, 409)
                     # ── Gate enforcement on status transitions ──────────────────
                     # Any move to a DIFFERENT status that has a non-empty effective
                     # gate must be acknowledged (gate_ack:true OR gate_checked:[...]).
