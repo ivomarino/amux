@@ -38056,6 +38056,7 @@ let _peekIssuesSortables = [];
 // Deliberately NOT persisted: a search is a transient lens, and a stale query
 // restored on the next peek looks like an empty board.
 let _peekIssuesQuery = '';
+let _peekIssuesFetching = false;   // one in-flight board fetch per peek panel
 
 function setPeekIssuesView(mode) {
   _peekIssuesView = mode;
@@ -38072,6 +38073,22 @@ function togglePeekIssuesAll() {
 function renderPeekIssues() {
   // Don't rebuild mid-drag — a board SSE refresh would destroy the active Sortable.
   if (document.body.classList.contains('board-dragging')) return;
+  // NOT LOADED IS NOT EMPTY (Ethan, 2026-08-06 — screenshot of the amux worker's
+  // Board tab reading "No issues for this worker yet." while that worker owned 29
+  // cards). This panel renders from the global boardItems and never fetched: open
+  // a worker peek straight to Board before fetchBoard() has resolved, or after an
+  // offline start with no cached board, and it asserted that the worker has no
+  // issues. It is the same conflation as the search bug an hour earlier — a view
+  // that cannot tell "found nothing" from "was never given anything to look at",
+  // stated as a fact about the worker.
+  //
+  // Fetch once when the array is empty, and re-render when it lands. Guarded so a
+  // genuinely empty board does not re-fetch on every render.
+  if (!(boardItems || []).length && !_peekIssuesFetching) {
+    _peekIssuesFetching = true;
+    fetchBoard().then(() => renderPeekIssues()).catch(() => {})
+      .finally(() => { _peekIssuesFetching = false; });
+  }
   const list = document.getElementById('peek-issues-list');
   const count = document.getElementById('peek-issues-count');
   const allScope = _peekIssuesAllSessions;
@@ -38123,6 +38140,12 @@ function renderPeekIssues() {
     // empty when a query simply matched nothing sends you looking for a bug.
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 4px;">' +
       (_q ? 'No issues match <b>' + esc(_q) + '</b>' + (scoped.length ? ' (' + scoped.length + ' hidden)' : '')
+          : !(boardItems || []).length
+              // Say which of the two it is. "No issues for this worker yet" is a
+              // claim about the WORKER; with an unloaded board the honest claim is
+              // about the board. Distinguishing them is the whole point — the
+              // wrong one sent Ethan looking at a worker that owned 29 cards.
+              ? 'Loading the board&hellip;'
           : allScope ? 'No issues on the board yet.' : 'No issues for this worker yet.') + '</div>';
     return;
   }
@@ -38609,7 +38632,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.501';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.502';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -60132,7 +60155,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.501';
+const CACHE = 'amux-v0.9.502';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
