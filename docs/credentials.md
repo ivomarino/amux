@@ -36,6 +36,7 @@ grep -oE '^[A-Z0-9_]+=' ~/.amux/server.env | tr -d '=' | sort
 | `AMUX_QA_EMAIL` | `qa-godmode@amux.io` — the PRE-EXISTING god-mode account. Also in `ADMIN_EMAILS`. Check this before provisioning another one. |
 | `AMUX_QA_PASSWORD` | Its password. |
 | `AMUX_QA_USER_ID` | Its Clerk user id, for admin API calls that take a user id. |
+| `AMUX_GODMODE_USER_ID` | hello@amux.io's Clerk user id. Used with `E2E_CLERK_SECRET_KEY` to mint a backend sign-in token, which needs NO second factor — that is how the walkthrough rig logs in without reading a mailbox (AC-282). |
 | `E2E_COOKIE_SECRET` | HMAC secret for minting an `amux_session` cookie directly, bypassing Clerk. The e2e/admin back door — treat as god mode. |
 | `E2E_CLERK_SECRET_KEY` | Clerk **Backend API** key (`sk_live_`). Creates/updates users server-side, which skips the sign-up captcha that blocks the public flow. |
 
