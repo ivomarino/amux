@@ -225,17 +225,27 @@ def walk(cookie, org, label):
     # capture-shell heuristic is a HINT, not a verdict — a title that starts like a
     # pasted prompt is the specific failure mode seen on the local board (AMUX-2474),
     # and flagging it tells the reviewer where to look without deciding for them.
-    st, issues = get(cookie, "/api/board?slim=1&archived=0", org)
+    # NO archived filter. The first version asked for archived=0 and reported
+    # "0 open issues" for Capital Express (jacob@) — which has SEVEN, all archived
+    # and all still in `todo`, including QA scaffolding ("Reply with exactly:
+    # QUOTA-OK"). That is the ethos rule-1 trap in its purest form: a view that
+    # does not share the predicate of the thing it claims to describe, reporting
+    # an empty board as evidence of a clean one. Archived cards are exactly what a
+    # demo reviewer needs to see, because a prospect who opens the board finds
+    # either nothing or leftover test cards.
+    st, issues = get(cookie, "/api/board?slim=1", org)
     if isinstance(issues, list):
         shells = [i for i in issues
                   if re.match(r"(?i)^(capture|captured|prompt)\b", (i.get("title") or "")
                               ) or len(i.get("title") or "") > 90]
-        print(f"\n  BOARD: {len(issues)} open issue(s)"
+        _arch = [i for i in issues if i.get("archived")]
+        print(f"\n  BOARD: {len(issues)} issue(s), {len(_arch)} ARCHIVED"
               + (f"  — {len(shells)} look like undecomposed captures, REVIEW THESE"
                  if shells else "  — none look like raw captures"))
         for i in issues[:12]:
             flag = "!" if i in shells else " "
-            print(f"   {flag}[{(i.get('status') or '?')[:9]:9s}] {(i.get('title') or '')[:74]}")
+            _a = "arch " if i.get("archived") else "     "
+            print(f"   {flag}{_a}[{(i.get('status') or '?')[:9]:9s}] {(i.get('title') or '')[:68]}")
         if len(issues) > 12:
             print(f"     … +{len(issues) - 12} more (printed 12; not a sample — the rest are on the board)")
     else:
