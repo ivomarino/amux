@@ -636,3 +636,46 @@ NOTE: the AC-241 numstat was already on screen when I did this. It printed "114 
   as the ethos rule-4 point that a skip leaving no trace is indistinguishable from a scan
   that found nothing — and this is the third entry today whose root is that a signal could
   not distinguish two sessions or two states (see AC-256).
+
+## /api/board/contract published 4 gate layers while the resolver enforced 5
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-06
+SESSION: amux
+CARD: AMUX-2477
+SYMPTOM: `GET /api/board/contract` → `gates.how_they_resolve` listed four layers
+  (card > type > worker > global). `_effective_gate` resolves five — the `group:` tier
+  shipped days earlier and neither the contract nor `_effective_gate`'s own docstring
+  picked it up. Separately, `GET /api/board/gates` (the plural, and the natural guess
+  for "show me the gate rules") fell through to `/api/board/<id>` and answered
+  `{"error":"item not found"}` — a reader asking about gate RULES told their CARD does
+  not exist. A comment in the contract handler shows another session already burned a
+  guess on that same path.
+COST: a done→verified sweep of ten cards (AMUX-2310..2332) quoted the GLOBAL per-status
+  default as each card's gate and wrote ten wrong lines onto real cards, then wrote a
+  long "evidence for the gate decision" note on AMUX-2466 built entirely on the wrong
+  premise. Eight of the ten were under a `group:amux` PEER-REVIEW gate that never
+  mentions prod, so the sweep's central claim — "blocked because cloud.amux.io returns
+  401 and I cannot exercise prod" — was answering a question nobody asked. The other two
+  were under their type gate, so the opposite claim ("unsatisfiable by construction for
+  research/investigation") was also false. Worse than the wrong lines: the note
+  recommended a per-type gate change to Ethan when the peer-review gate he had asked for
+  was ALREADY LIVE for group amux, which would have put a decision in front of him that
+  had already been made.
+FIX: `ba802de` — `_GATE_PRECEDENCE` is the order once; the contract renders from it and
+  the docstring points at it. Contract leads with AUTHORITATIVE (`GET /api/board/gate?
+  item=&status=`) and publishes `active_overrides` (the group/worker gates actually SET,
+  not just the fact the tiers exist). `/api/board/gates` answers instead of misdirecting.
+  `tests/test_gate_contract.py` pins resolver scopes == published keys and self-tests by
+  seeding the missing group tier.
+NOTE: the reusable shape is not "docs go stale". It is that naming a TIER without its
+  CONTENTS reads as confirmation the tier is empty — the contract said a per-session
+  override layer existed, I checked nothing was set for my worker, and concluded no
+  override applied. That is the ethos rule-1 corollary (a view must share the predicate
+  of the mechanism it describes) in its under-filtering direction: the view was not
+  wrong about what exists, it was silent about what is SET, and silence read as zero.
+  Same family as the three entries above whose root is a signal that could not
+  distinguish two states — this is the fourth in AREA gates/instruments this week, which
+  is the argument that the "publish a rule, hand-type it elsewhere" pattern needs to go,
+  not just this instance of it.
