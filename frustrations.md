@@ -878,7 +878,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux
-CARD: AMUX-2515
+CARD: AMUX-2520
 SYMPTOM: `amux board progress AMUX-2508 --stdin <<'EOF' ... EOF` appended the literal
   string `--stdin` to the card, discarded the entire heredoc, and printed
   `AMUX-2508 — progress noted`. Verified by reading the card back: its desc ended
