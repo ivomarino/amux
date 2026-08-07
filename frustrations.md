@@ -737,3 +737,42 @@ NOTE: fourth instance tonight of ONE fact maintained in two places and drifting 
   Python server cannot share a constant, so the list is served); tripwire the pairing when neither
   works. The generalisable line is theirs: every "keep these in sync" comment is a defect report
   about the code's shape, filed in advance.
+
+## Pre-push "is this commit mine?" checks use %an, which every session shares
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2480
+SYMPTOM: `git log --format='%an' origin/main..main | sort -u` returns exactly `Ethan
+  Steininger` — for every commit, from every session, always. Every lane on this machine
+  commits under one git identity, so any author-based check has ONE possible value and
+  cannot distinguish own work from a peer's. amux-cloud hit the identical thing the same
+  day with `git log --oneline --author="$(git config user.name)"`, which is worse in the
+  same way: an `--author` filter READS as narrowing, and here it is a no-op that returns
+  a confident, targeted-looking wrong answer. The real discriminator is the
+  `Amux-Session` trailer, which amux already stamps on every commit.
+COST: I reported "all commits unpushed are yours, none foreign" to Ethan repeatedly
+  across a long session. It was false: 4 of 26 belonged to amux-cloud, three of them
+  touching `amux-server.py`, which is the path that fires deploy-cloud.yml and
+  cloud-image.yml. Had he said "push" on the strength of that, a peer's unreviewed work
+  would have deployed to cloud.amux.io at a moment they did not choose — the exact
+  incident the Deploy section of CLAUDE.md exists to prevent, walked into by following
+  its instruction to check with an instrument that cannot answer. amux-cloud only caught
+  their instance because a COUNT looked implausible, not because the check complained.
+  (They consented when asked, so nothing shipped wrongly; the check is what failed, not
+  the outcome.)
+FIX: the pre-push guard should read the `Amux-Session` trailer, not `%an`, and should say
+  plainly when a commit carries NO trailer rather than defaulting it to the current
+  session. CLAUDE.md's own deploy recipe (`git log --oneline origin/main..main` + "whose
+  are they?") should name the trailer, since "whose are they" has no answer in the output
+  that recipe produces.
+NOTE: second entry today whose root is an instrument that returns a plausible answer
+  while discriminating nothing (see the action-name trap on AMUX-2479: 6,814 `patch` rows
+  vs 137 `status_update`, so keying on the action name would have matched ~everything).
+  Both are the ethos rule-7 shape — "a filter that silently matches EVERYTHING is the same
+  defect as one that matches nothing, except it returns a confident wrong answer instead
+  of silence" — and both were caught by a number looking wrong, not by the check failing.
+  Two independent sessions, same root, same day: that is the argument this belongs in the
+  guard rather than in anyone's discipline.
