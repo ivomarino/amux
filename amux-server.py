@@ -11966,6 +11966,10 @@ def _pickup_junk_reason(title: str, desc: str) -> str:
     return ""
 
 _advance_last: dict = {}
+# What we last nudged this lane about: session -> (issue_id, status_at_nudge).
+# Makes "did this lane make PROGRESS since we spoke?" decidable, which is what
+# separates a lane that is working from a lane that is stuck (AMUX-2500).
+_advance_last_card: dict = {}
 _ADVANCE_COOLDOWN = 15 * 60     # never push the same lane twice inside this window
 
 
@@ -12173,7 +12177,33 @@ def _advance_open_card(session_name: str) -> bool:
         # hit today. The cooldown, not the idle transition, is what bounds this.
         last = _advance_last.get(session_name, 0)
         if last and (time.time() - last) < _ADVANCE_COOLDOWN:
-            return False
+            # PROGRESS YIELDS THE COOLDOWN (AMUX-2500). Ethan: "all issues should
+            # always continue driving; a worker should NOT go idle until all issues
+            # are either blocked or complete verified."
+            #
+            # The cooldown and the per-card budget exist for a real reason and are
+            # NOT removed: the token audit found 182 advance wakes in 24h, 15 cards
+            # nudged 4+ times, one nudged nine times and then discarded — nine model
+            # turns spent pushing a card into the bin. Repeating yourself at a stuck
+            # card is ethos rule 5.
+            #
+            # But that argument only covers REPETITION. A lane that moved the card we
+            # last named has demonstrably not stalled, and making it wait 15 minutes
+            # to be handed the next one is what leaves 558 `done` cards sitting. So
+            # the cap stays on saying the same thing again and lifts on continuing.
+            _prev = _advance_last_card.get(session_name)
+            _moved = False
+            if _prev:
+                try:
+                    _pr = get_db().execute(
+                        "SELECT status FROM issues WHERE id=?", (_prev[0],)).fetchone()
+                    _moved = bool(_pr) and _pr["status"] != _prev[1]
+                except Exception:
+                    _moved = False
+            if not _moved:
+                return False
+            slog(f"[advance] {session_name}: {_prev[0]} moved {_prev[1]}->"
+                 f"(changed) — progress, so not waiting out the cooldown")
         # PER-CARD NUDGE BUDGET (token audit, 2026-08-04). _ADVANCE_COOLDOWN is
         # per SESSION, so the same card could be re-nudged every 15 minutes
         # forever. Measured over 24h: 182 advance wakes, 114 distinct cards, and
@@ -12238,12 +12268,41 @@ def _advance_open_card(session_name: str) -> bool:
         # Ordered so doing/review are still preferred over done — unfinished work
         # outranks unverified work, and a lane with both should be pushed on the
         # former first.
-        row = db.execute(
+        # CANDIDATES, not LIMIT 1 (AMUX-2498). This took the single highest-priority
+        # card and, if that card's nudge budget was spent, returned False for the whole
+        # lane — so one exhausted card silenced every other card the lane held.
+        #
+        # Measured: 558 visible `done` cards sit behind 25 `review` and 5 `doing`,
+        # because the ORDER BY puts done last and a lane holding ANY doing/review card
+        # never reaches its done tier. backend proved that is a steady state rather than
+        # a transient — a lane that peer-reviews continuously always has a populated
+        # review tier, so the lanes using reviewers most are starved hardest (AMUX-2479).
+        #
+        # Ordering is unchanged: unfinished work still outranks unverified work, which
+        # is right. What changes is that an unnudgeable candidate no longer ends the
+        # search — we fall through to the next one. The per-card budget still bounds
+        # repetition; it just stops bounding the LANE.
+        _cands = db.execute(
             "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND status IN ('doing','review','done') "
             "AND owner_type='agent' "
             "ORDER BY CASE status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, "
-            "         updated DESC LIMIT 1", (session_name,)).fetchone()
+            "         updated DESC LIMIT 40", (session_name,)).fetchall()
+        row = None
+        for _c in _cands:
+            try:
+                _spent = db.execute(
+                    "SELECT COUNT(*) FROM session_events WHERE type='advance.nudged' "
+                    "AND ts > ? AND data LIKE ?",
+                    (time.time() - 86400, '%"' + _c["id"] + '"%')).fetchone()[0]
+            except Exception:
+                _spent = 0
+            if _spent < _nb:
+                row = _c
+                break
+        if row is None and _cands:
+            slog(f"[advance] {session_name}: all {len(_cands)} candidate(s) have spent "
+                 f"their {_nb}-nudge budget — going quiet for this lane")
         if not row:
             # ARCHIVED-BUT-UNFINISHED (AMUX-2486). Nothing to advance here — but before
             # returning, check for cards this loop can NEVER see. `archived=0` is on
@@ -12689,6 +12748,10 @@ def _advance_open_card(session_name: str) -> bool:
             slog(f"[advance] {session_name}: send failed ({err}) — not starting the cooldown")
             return False
         _advance_last[session_name] = time.time()
+        # Remember WHAT we named, so the next cycle can tell a lane that is working
+        # from one that is stuck (AMUX-2500). If this card has moved by then, the
+        # lane gets the next one immediately instead of waiting out the cooldown.
+        _advance_last_card[session_name] = (row["id"], row["status"])
         # Record it in the Messages history like every other system send.
         # send_text alone does NOT record (only the API send path does), so
         # without this the nudge was invisible in the one surface built for

@@ -419,3 +419,68 @@ def test_limbo_never_preempts_real_advanceable_work(rig):
     mod._advance_open_card("probe")
     assert sent and "L-5" in sent[-1][1], "live doing card was not the nudge"
     assert "ARCHIVED but not finished" not in sent[-1][1]
+
+
+# ───── continuous drive: progress yields the cooldown (AMUX-2500/2498) ──────
+
+def test_progress_bypasses_the_cooldown(rig):
+    """Ethan: a worker should not go idle while drivable work remains. The cooldown
+    exists to stop REPETITION at a stuck card, not to stop PROGRESS — a lane that
+    moved the card we named has demonstrably not stalled."""
+    mod, sent = rig
+    _card(mod, "D-1", "doing", "code", desc="x")
+    _card(mod, "D-2", "done", "code", desc="y")
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent and "D-1" in sent[-1][1], "first nudge should name the doing card"
+
+    # cooldown is now armed; a second call with NO movement must stay quiet
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert not sent, "nudged again inside the cooldown without any progress"
+
+    # the lane moves D-1 -> that is progress, so it should be handed the next card
+    mod.get_db().execute("UPDATE issues SET status='review' WHERE id='D-1'")
+    mod.get_db().commit()
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent, "lane made progress and was still made to wait out the cooldown"
+
+
+def test_budget_spent_card_does_not_silence_the_whole_lane(rig):
+    """AMUX-2498. The selection took LIMIT 1, so one exhausted card returned False for
+    the entire lane — which is why 558 `done` cards sat behind 25 `review`."""
+    mod, sent = rig
+    _card(mod, "S-1", "review", "code", desc="blocked thing")
+    _card(mod, "S-2", "done", "code", desc="drivable thing")
+    db = mod.get_db()
+    for _ in range(3):                      # spend S-1's per-card budget
+        db.execute("INSERT INTO session_events (ts,session,type,data,source) "
+                   "VALUES (?,?,?,?,?)",
+                   (time.time(), "probe", "advance.nudged", '{"issue": "S-1"}', "t"))
+    db.commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent, "a budget-spent review card silenced the lane's drivable done card"
+    assert "S-2" in sent[-1][1], f"fell through to the wrong card: {sent[-1][1][:120]}"
+
+
+def test_all_budgets_spent_still_goes_quiet(rig):
+    """The counter-case. Falling through must not become never stopping — a lane whose
+    every candidate is exhausted is exactly the stuck case the budget exists for."""
+    mod, sent = rig
+    _card(mod, "S-3", "done", "code", desc="x")
+    db = mod.get_db()
+    for _ in range(3):
+        db.execute("INSERT INTO session_events (ts,session,type,data,source) "
+                   "VALUES (?,?,?,?,?)",
+                   (time.time(), "probe", "advance.nudged", '{"issue": "S-3"}', "t"))
+    db.commit()
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert not sent, "kept nudging a lane whose every candidate had spent its budget"
