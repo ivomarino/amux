@@ -65515,6 +65515,14 @@ class CCHandler(BaseHTTPRequestHandler):
                     # the transition while the owning session's tree is dirty. The orchestrator
                     # (or anyone) can override with {"force": true} if the dirt is unrelated to
                     # this task — judgment stays with the caller; amux just enforces the default.
+                    # Carried to the SUCCESS response, not just refusals (backend, on
+                    # BACKE-3183). A gate that clears paths silently is
+                    # indistinguishable from a tree that was simply clean, so the
+                    # force-rate telemetry is only interpretable from one direction:
+                    # you can see every refusal but never the saves. Same shape as
+                    # ethos rule 4 — a skip that leaves no trace reads as a scan that
+                    # found nothing.
+                    _verify_cleared = None
                     if (body.get("status") == "verified" and prior and prior["status"] != "verified"
                             and not body.get("force")):
                         eff_session = body.get("session") if "session" in body else prior_session
@@ -65554,6 +65562,19 @@ class CCHandler(BaseHTTPRequestHandler):
                                     _up = set(_uv.get("already_upstream") or [])
                                     if _up:
                                         dirty = [f for f in dirty if f not in _up]
+                                        _verify_cleared = {
+                                            "paths": sorted(_up)[:20],
+                                            "count": len(_up),
+                                            "compared_against": _uv.get("ref"),
+                                            "note": "status-dirty but byte-identical to "
+                                                    "upstream, and HEAD is an ancestor of it "
+                                                    "— nothing local would be lost",
+                                        }
+                                        if _uv.get("fetch_error"):
+                                            _verify_cleared["ref_may_be_stale"] = _uv["fetch_error"]
+                                        slog(f"[verify-gate] {eff_session}: cleared {len(_up)} "
+                                             f"already-upstream path(s) vs {_uv.get('ref')}: "
+                                             f"{', '.join(sorted(_up)[:5])}")
                                 except Exception:
                                     _uv = None
                             # Blanket fallback for UNATTRIBUTED dirt: a peer
@@ -66225,6 +66246,10 @@ class CCHandler(BaseHTTPRequestHandler):
                                 "the rest of this response reflects the card as stored")
                     except Exception:
                         pass
+                    # Show the work on the way THROUGH, not only on refusal.
+                    if _verify_cleared and isinstance(updated_item, dict):
+                        updated_item = dict(updated_item)
+                        updated_item["verify_gate_cleared"] = _verify_cleared
                     return self._json(updated_item)
 
                 if method == "DELETE":
