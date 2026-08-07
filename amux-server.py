@@ -29418,11 +29418,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     line-height: 1.3; letter-spacing: 0.01em;
   }
   @media (max-width: 600px) {
-    .board-stats { gap: 6px; margin-bottom: 8px; }
-    .bstat { min-width: 64px; padding: 6px 9px; }
-    .bstat-v { font-size: 0.95rem; }
-    .bstat-l { font-size: 0.6rem; }
-    .bstat-prog { min-width: 116px; }
+    /* MOBILE BOARD DENSITY (AMUX-2506, from Ethan's 375px screenshot).
+       The board stacked EIGHT bands of chrome above the first card — header, tabs,
+       search, +Filter, owner toggle + view icons, chips, group, stats — and then
+       column headers collided with their own Gate buttons. On a phone the content
+       started below the fold and the columns were clipped mid-word.
+       Everything here buys VERTICAL SPACE back; nothing hides information. */
+    .board-stats { gap: 5px; margin-bottom: 6px; padding: 0; }
+    .bstat { min-width: 0; padding: 5px 8px; border-radius: 7px; }
+    .bstat-v { font-size: 0.9rem; line-height: 1.1; }
+    .bstat-l { font-size: 0.56rem; letter-spacing: 0.02em; }
+    .bstat-prog { min-width: 104px; max-width: 132px; }
+    .bstat-prog .bstat-bar { height: 3px; margin-bottom: 3px; }
+
+    /* Column header: the collision. Label + count + Gate + delete were competing for
+       ~150px, so the Gate button wrapped under the title and overlapped the next
+       column. Let the title take the row and drop the Gate control to an icon — the
+       criteria are still rendered in full underneath, which is where they are read. */
+    .board-col-header { flex-wrap: nowrap; gap: 4px; min-height: 34px; }
+    .board-col-header > span:first-child { min-width: 0; flex: 1 1 auto; }
+    .board-col-header > span:first-child > span { overflow: hidden; text-overflow: ellipsis;
+                                                  white-space: nowrap; font-size: 0.78rem; }
+    .col-gate-btn { font-size: 0; padding: 6px; min-width: 34px; min-height: 34px;
+                    line-height: 1; }
+    .col-gate-btn::before { content: '\2611\FE0E'; font-size: 0.9rem; }
+    .board-col-purpose { font-size: 0.62rem; padding: 0 2px 4px; line-height: 1.25; }
+
+    /* Toolbar: three separate rows became one scrollable row plus the search box. */
+    .board-toolbar { gap: 5px; }
+    .board-owner-toggle .bv-btn, .board-view-toggle .bv-btn { padding: 6px 10px; }
     .board-col-purpose { font-size: 0.64rem; }
   }
   .board-toolbar { display: flex; gap: 8px; align-items: center; }
@@ -39756,7 +39780,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.510';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.511';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -61417,7 +61441,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.510';
+const CACHE = 'amux-v0.9.511';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
