@@ -37477,7 +37477,7 @@ async function doSend(name, text) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
-    if (r.ok) return;
+    if (r.ok) return 'sent';
     if (r.status === 409) {
       const d = await r.json().catch(() => ({}));
       const msg = d.message || 'not running';
@@ -37489,13 +37489,16 @@ async function doSend(name, text) {
           showToast('Starting ' + name + '...');
           // Wait for session to be ready, then retry send
           setTimeout(() => doSend(name, text), 3000);
+          return 'starting';
         }
+        return 'declined';        // user said no — nothing sent, nothing queued
       } else {
         showToast('Send failed: ' + msg);
+        return 'failed';
       }
-      return;
     }
     showToast('Send error: ' + r.status);
+    return 'failed';
   } catch(e) {
     // Offline — queue it (same body, same msg_id → server-side dedup if the
     // original request actually landed before the connection died)
@@ -37503,6 +37506,7 @@ async function doSend(name, text) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: sendBody
     });
+    return 'queued';
   }
 }
 
@@ -37657,17 +37661,35 @@ async function sendFromInput(name) {
   inp.value = '';
   _draftClear(name);          // it left the composer — a restored copy would be a ghost
   inp.style.height = 'auto';
-  const wasOnline = online;
-  await doSend(name, _expandAtMentions(text));
+  // OUTCOME FROM doSend, NOT FROM A FLAG SAMPLED BEFORE THE ATTEMPT (amux-cloud,
+  // reviewing this card). `online` and "what the send actually did" are two different
+  // facts and they diverge in reachable ways: an online fetch that THROWS gets queued
+  // while the toast said "Sent" — false success in exactly the case this card exists to
+  // report; a 500 produced two contradictory toasts with the wrong one last; and a
+  // declined start prompt sent nothing while claiming it had (62 of 105 lanes are not
+  // running, so that path is live).
+  //
+  // Same defect as AMUX-2363 six commits earlier, inverted onto the client: there the
+  // endpoint reported that it was REACHED rather than what it DID. doSend knows the
+  // outcome; it was throwing it away and the caller was guessing.
+  const _outcome = await doSend(name, _expandAtMentions(text));
   // Same queue/send semantics as the peek composer. doSend() has always queued
   // correctly when offline; the worker list just never SAID which happened — a
   // 400ms green border reads identically for "delivered" and "sitting in a local
   // queue until the server comes back". Those are different facts and the second
   // one is the one you need.
-  inp.style.borderColor = wasOnline ? 'var(--green)' : '#d29922';
+  const _colour = { sent: 'var(--green)', queued: '#d29922', starting: '#d29922',
+                    failed: 'var(--red, #f85149)', declined: '' };
+  inp.style.borderColor = _colour[_outcome] !== undefined ? _colour[_outcome] : 'var(--green)';
   setTimeout(() => { inp.style.borderColor = ''; }, 600);
   if (typeof showToast === 'function') {
-    showToast(wasOnline ? ('Sent to ' + name) : ('Offline \u2014 queued for ' + name));
+    // Silent when doSend already spoke — that double-toast was case 2 in the review,
+    // where the WRONG message was the one left on screen.
+    const _msg = { sent: 'Sent to ' + name,
+                   queued: 'Offline \u2014 queued for ' + name,
+                   starting: 'Starting ' + name + ' \u2014 will resend',
+                   declined: 'Not sent \u2014 ' + name + ' is not running' }[_outcome];
+    if (_msg) showToast(_msg);
   }
   _cardQueuedBadge(name);
 }
@@ -39565,7 +39587,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.508';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.509';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -61185,7 +61207,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.508';
+const CACHE = 'amux-v0.9.509';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
