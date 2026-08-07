@@ -12060,6 +12060,18 @@ def _needsyou_renag(session_name: str, issue_id: str, title: str,
 # and `tests/test_advance_nudge_retype.py` enumerates the domain and asserts every
 # member has a consumer branch, so the pairing has a standing check rather than a
 # comment asking to be remembered.
+# Keys a board PATCH actually writes. ONE definition: the handler's no-op check and
+# the response's `ignored_fields` both read it, so a field added to one can never be
+# missing from the other. The hand-maintained copy this replaces omitted `tags` and
+# `groups` — both applied, both reported as ignored — which is the same drift that
+# produced AMUX-2477 and four more the same night.
+_PATCH_WRITABLE = (
+    "title", "desc", "desc_append", "status", "session", "shepherd", "type",
+    "due", "due_time", "owner_type", "pinned", "pos", "source_ref",
+    "last_verified_at", "gate", "creator", "reviewer", "depends_on",
+    "archived", "tags", "groups",
+)
+
 _ADVANCE_NEXT = {"doing": "review", "review": "done", "done": "verified"}
 
 # Target statuses whose transition requires the named reviewer's sign-off. This is
@@ -66723,11 +66735,46 @@ class CCHandler(BaseHTTPRequestHandler):
                     # If session is being changed, reset notified so the new assignee gets pinged
                     if "session" in body and (body.get("session") or None) != prior_session:
                         set_clauses.append("notified = 0")
-                    set_clauses.append("rev = COALESCE(rev, 0) + 1")
-                    set_clauses.append("updated = ?")
-                    params.append(now)
-                    params.append(bid)
-                    if set_clauses:
+                    # AMUX-2492(b), cold-outbound: a no-op that returns 200 AND BUMPS REV
+                    # is worse than a 400, because the rev bump is affirmative evidence
+                    # that something happened. They appended "UN-ARCHIVED" to five cards on
+                    # the strength of it and had to correct all five; a 400 would have cost
+                    # one retry. I made the identical mistake on the cloud cards the same
+                    # day — read the 200, never the body.
+                    #
+                    # `rev` and `updated` were appended UNCONDITIONALLY, so `set_clauses`
+                    # was never empty, the UPDATE always ran, and rev always moved. The
+                    # response did carry `ignored_fields`, so it was never strictly silent
+                    # — but a truthful body under a 200 with a moving rev is not what a
+                    # caller reads, and two sessions proved that in one day.
+                    #
+                    # Deliberately NOT a reject-unknown-keys rule. The dashboard PATCHes
+                    # whole item objects, so 400ing on any unrecognised key would break the
+                    # UI. The precise property is narrower and safe: did this PATCH change
+                    # ANYTHING? Side-effect keys count (`tags`/`groups` are applied below,
+                    # outside set_clauses), so only a PATCH that touched nothing at all
+                    # fails.
+                    _wrote_field = bool(set_clauses)
+                    _wrote_side = any(k in body for k in ("tags", "groups"))
+                    if not _wrote_field and not _wrote_side:
+                        _ign = sorted(k for k in body.keys() if k not in (
+                            "expect_rev", "authorized_by", "gate_ack", "gate_checked",
+                            "force", "override_doing", "rev"))
+                        return self._json({
+                            "error": "no writable field in this PATCH — nothing was changed",
+                            "ok": False,
+                            "ignored_fields": _ign,
+                            "why": ("these keys are not writable via PATCH. This used to "
+                                    "return 200 and bump `rev`, which reads as applied — "
+                                    "the trap that cost five wrong card notes (AMUX-2492)."),
+                            "writable": sorted(_PATCH_WRITABLE),
+                            "contract": "GET /api/board/contract",
+                        }, 400)
+                    if _wrote_field:
+                        set_clauses.append("rev = COALESCE(rev, 0) + 1")
+                        set_clauses.append("updated = ?")
+                        params.append(now)
+                        params.append(bid)
                         db.execute(
                             f"UPDATE issues SET {', '.join(set_clauses)} WHERE id = ?", params
                         )
@@ -67000,11 +67047,9 @@ class CCHandler(BaseHTTPRequestHandler):
                     # so the next mismatch announces itself instead of being discovered
                     # by a card coming back to life.
                     try:
-                        _applied = {"title", "desc", "status", "session", "shepherd", "type",
-                                    "due", "due_time", "owner_type", "pinned", "pos",
-                                    "source_ref", "last_verified_at", "gate", "creator",
-                                    "reviewer", "depends_on", "desc_append", "rev", "archived",
-                                    "gate_ack", "gate_checked", "force", "override_doing"}
+                        _applied = set(_PATCH_WRITABLE) | {
+                            "rev", "gate_ack", "gate_checked", "force", "override_doing",
+                            "authorized_by", "expect_rev"}
                         _ignored = sorted(k for k in body.keys() if k not in _applied)
                         if _ignored and isinstance(updated_item, dict):
                             updated_item = dict(updated_item)
