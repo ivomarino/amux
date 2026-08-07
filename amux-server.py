@@ -32580,6 +32580,12 @@ let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _initialLoad = true;   // true until first data arrives from server
 let _lastDataTime = null;  // timestamp of last successful data
+// AC-275: when NO data has ever arrived, _lastDataTime stays null and every
+// staleness check below is falsy — so a client that never receives its first
+// SSE event is permanently stuck: no reconnect, no polling fallback, spinner
+// forever. Measured on cloud 2026-08-06: 0 fetches in 25s on a dashboard that
+// polls every 5s. Page load is the reference point until real data replaces it.
+const _pageLoadTime = Date.now();
 let _debugLog = [];        // recent connection events (capped at 12)
 let _liveSSE = false;      // true only when SSE is actively receiving messages
 let expanded = new Set();
@@ -38786,7 +38792,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.505';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.506';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -53554,7 +53560,13 @@ const _SSE_STALE_MS = 18000;     // declared zombie if no data this long
 const _SSE_REFRESH_MS = 4000;    // visibility-resume refresh threshold
 
 function _sseLooksStale() {
-  return _lastDataTime && (Date.now() - _lastDataTime > _SSE_STALE_MS);
+  // Fall back to page load when nothing has arrived yet (AC-275). Without this the
+  // watchdog arms only AFTER the first successful datum — which is the one case
+  // that never needs it. A client stuck with zero data could not declare itself
+  // stale, so the reconnect and the polling fallback were both unreachable exactly
+  // when they were the only things that would have helped.
+  const ref = _lastDataTime || _pageLoadTime;
+  return ref && (Date.now() - ref > _SSE_STALE_MS);
 }
 function _forceSseReconnect(reason) {
   _dbgLog('SSE reconnect: ' + reason);
@@ -53601,6 +53613,13 @@ if (window._peekEmbed) {
   // amplification when multiple workspace tiles are open.
   fetchSessions();
 } else {
+  // FETCH FIRST, THEN SUBSCRIBE (AC-275). This branch relied on SSE for the initial
+  // session list, so when SSE connected but delivered nothing the dashboard sat on
+  // "Connecting to server..." with an empty worker list and no request in flight.
+  // Verified by hand on the stuck page: one fetchSessions() cleared the spinner and
+  // rendered the workers immediately — the client was correct, nothing had ever
+  // invoked it. The peek-embed branch above already did exactly this.
+  fetchSessions();
   connectSSE();
   fetchSchedules().then(() => render());
 }
@@ -60316,7 +60335,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.505';
+const CACHE = 'amux-v0.9.506';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
