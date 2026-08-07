@@ -12233,6 +12233,64 @@ def _advance_open_card(session_name: str) -> bool:
             "ORDER BY CASE status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, "
             "         updated DESC LIMIT 1", (session_name,)).fetchone()
         if not row:
+            # ARCHIVED-BUT-UNFINISHED (AMUX-2486). Nothing to advance here — but before
+            # returning, check for cards this loop can NEVER see. `archived=0` is on
+            # every autonomy query (advance, pickup, rot, the nudges), and deliberately
+            # so: the ethos file records that keeping it is what stops cleared work
+            # leaking back into auto-pickup. The cost of that correctness is a state
+            # nobody watches — archived=1 AND status not terminal.
+            #
+            # Such a card is incoherent rather than merely idle: `archived` means
+            # cleared, `todo/doing/review` means unfinished. It is invisible to every
+            # loop AND absent from the default board view, while not being done. It
+            # cannot rot (rot filters archived), cannot be picked up, cannot be
+            # advanced, and cannot be seen. It simply stops existing while remaining
+            # open.
+            #
+            # Measured on the cloud customer envs, 2026-08-07: 17 cards across three
+            # environments, every single non-verified card in all three, including a
+            # whole env whose board renders empty because all 7 of its cards are here.
+            # Ethan asked why they never reached verified; this is the entire answer.
+            #
+            # NOT auto-advanced, on purpose. Force-moving cleared cards is the exact
+            # leak the archived filter exists to prevent, and a card in an incoherent
+            # state is one a human should adjudicate (ethos rule 8 — several of these
+            # are human-owned). The fix for invisibility is VISIBILITY: say it once per
+            # lane per window, name the ids, and let the lane decide.
+            try:
+                _limbo = db.execute(
+                    "SELECT id, title, status FROM issues WHERE session=? AND deleted IS NULL "
+                    "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded') "
+                    "ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
+            except Exception:
+                _limbo = []
+            if _limbo:
+                _idem = f"limbo:{session_name}:{len(_limbo)}"
+                if not db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                                  (_idem,)).fetchone():
+                    _ids = ", ".join(f"{r['id']} ({r['status']})" for r in _limbo[:8])
+                    ok, _e = send_text(session_name,
+                        f"[amux] {len(_limbo)} of your cards are ARCHIVED but not finished, "
+                        f"which means no loop can reach them: {_ids}"
+                        + (f", +{len(_limbo)-8} more" if len(_limbo) > 8 else "") + ".\n\n"
+                        f"`archived` means cleared and their status says unfinished, so they "
+                        f"are invisible to auto-pickup, to the advance nudge, to rot detection "
+                        f"AND to the default board view — they will sit there forever without "
+                        f"this message. Nothing is being force-moved: a card in a contradictory "
+                        f"state is yours to resolve.\n\n"
+                        f"For each, do ONE: finish it honestly and move it to verified/done; or "
+                        f"discard it if it was never real work (`amux board discarded <id>`); or "
+                        f"un-archive it if it IS live work that was cleared by mistake. If a card "
+                        f"is not yours to judge, say so on it and leave it.",
+                        defer_if_busy=True)
+                    if ok:
+                        _emit_event(session_name, "advance.limbo",
+                                    {"n": len(_limbo), "ids": [r["id"] for r in _limbo[:20]]},
+                                    idem=_idem, source="advance-limbo")
+                        _advance_last[session_name] = time.time()
+                        slog(f"[advance] {session_name}: {len(_limbo)} archived-but-unfinished "
+                             f"card(s) surfaced — {_ids}")
+                        return True
             return False
         # Same not-a-task guard as auto-pickup. Pushing a session to "advance"
         # a journal card asks for exactly the false progress the gates exist to

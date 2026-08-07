@@ -357,3 +357,65 @@ def test_router_STILL_FIRES_when_reviewer_has_not_engaged(rig):
     assert sent and sent[-1][0] == "peer", (
         "reviewer was never asked despite no engagement — the silence check is "
         "matching everything, which is worse than not having it")
+
+
+# ────── archived-but-unfinished: the state no loop can see (AMUX-2486) ──────
+
+def test_archived_unfinished_card_is_surfaced(rig):
+    """Every autonomy query carries archived=0, deliberately — it is what stops
+    cleared work leaking back into auto-pickup. The cost is a state nobody watches:
+    archived=1 with a non-terminal status is invisible to advance, pickup, rot AND
+    the default board view, while not being finished.
+
+    Measured on the cloud customer envs 2026-08-07: 17 cards, every non-verified card
+    across three environments, including one env whose board renders empty because
+    all 7 of its cards are in this state.
+    """
+    mod, sent = rig
+    _card(mod, "L-1", "todo", "code", desc="x")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET archived=1 WHERE id='L-1'")
+    db.commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+
+    assert sent, "an archived-but-unfinished card produced no signal at all"
+    msg = sent[-1][1]
+    assert "ARCHIVED but not finished" in msg, msg
+    assert "L-1 (todo)" in msg
+    assert "amux board discarded" in msg, "must name the sanctioned exit, not just the problem"
+
+
+def test_archived_TERMINAL_cards_are_not_surfaced(rig):
+    """The counter-case. Archived + verified/discarded is the NORMAL end state — the
+    overwhelming majority of the board. A detector that fires on those is noise that
+    gets switched off, and would report ~97% of rows as defects."""
+    mod, sent = rig
+    for cid, st in (("L-2", "verified"), ("L-3", "discarded")):
+        _card(mod, cid, st, "code", desc="x")
+        mod.get_db().execute("UPDATE issues SET archived=1 WHERE id=?", (cid,))
+    mod.get_db().commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert not sent, f"fired on normally-archived terminal cards: {sent}"
+
+
+def test_limbo_never_preempts_real_advanceable_work(rig):
+    """Limbo is checked only when there is nothing to advance. A lane holding live work
+    must still be nudged about THAT — surfacing a cleared card instead would trade one
+    invisibility for another."""
+    mod, sent = rig
+    _card(mod, "L-4", "todo", "code", desc="x")
+    mod.get_db().execute("UPDATE issues SET archived=1 WHERE id='L-4'")
+    _card(mod, "L-5", "doing", "code", desc="real live work")
+    mod.get_db().commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent and "L-5" in sent[-1][1], "live doing card was not the nudge"
+    assert "ARCHIVED but not finished" not in sent[-1][1]
