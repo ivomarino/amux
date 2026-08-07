@@ -415,10 +415,26 @@ def test_archived_TERMINAL_cards_are_not_surfaced(rig):
     assert not sent, f"fired on normally-archived terminal cards: {sent}"
 
 
-def test_limbo_never_preempts_real_advanceable_work(rig):
-    """Limbo is checked only when there is nothing to advance. A lane holding live work
-    must still be nudged about THAT — surfacing a cleared card instead would trade one
-    invisibility for another."""
+def test_limbo_does_not_STARVE_real_advanceable_work(rig):
+    """SUPERSEDES test_limbo_never_preempts_real_advanceable_work (AMUX-2499).
+
+    The original asserted limbo is checked ONLY when there is nothing to advance, on
+    the reasoning that surfacing a cleared card instead "would trade one invisibility
+    for another". The reasoning is sound; the conclusion was refuted by measurement.
+
+    Checking limbo only on idle passes meant it ran precisely where limbo cards are
+    rarest. On the live fleet: 25 notifications ever, all to small lanes in one
+    9-minute window, while ten lanes holding 1235 cards — 86% of the population —
+    could never reach the branch at all, because a lane with any advanceable card
+    never gets there. The rule intended to protect advancement was silencing the
+    surfacing entirely.
+
+    What makes preemption safe is the day-keyed dedupe, not the ordering: limbo can
+    speak at most once per lane per day, against an advance loop bounded by a 900s
+    cooldown — roughly one pass in ninety-six. So the invariant worth pinning is not
+    "limbo never goes first", it is "limbo does not STARVE advancement": it takes one
+    pass, and the very next pass is live work again.
+    """
     mod, sent = rig
     _card(mod, "L-4", "todo", "code", desc="x")
     mod.get_db().execute("UPDATE issues SET archived=1 WHERE id='L-4'")
@@ -428,8 +444,22 @@ def test_limbo_never_preempts_real_advanceable_work(rig):
     mod._advance_last.pop("probe", None)
     sent.clear()
     mod._advance_open_card("probe")
-    assert sent and "L-5" in sent[-1][1], "live doing card was not the nudge"
-    assert "ARCHIVED but not finished" not in sent[-1][1]
+    assert sent and "ARCHIVED but not finished" in sent[-1][1], (
+        "a lane holding live work was never told about its unreachable cards — that is "
+        "the idle-only placement back again")
+
+    # THE PROTECTION: the next pass must return to live work, not repeat the notice.
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+    assert sent, "the lane went silent entirely after the limbo notice"
+    assert "L-5" in sent[-1][1], (
+        "the live doing card is still not being nudged — limbo is consuming every "
+        "pass, which IS the starvation the original test guarded against: %s"
+        % sent[-1][1][:160])
+    assert "ARCHIVED but not finished" not in sent[-1][1], (
+        "the limbo notice repeated within the same day — the dedupe is not holding, "
+        "and without it preemption really would starve the lane")
 
 
 # ───── continuous drive: progress yields the cooldown (AMUX-2500/2498) ──────

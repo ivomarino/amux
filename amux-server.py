@@ -12237,6 +12237,122 @@ def _reviewer_msg_engagement(card_id: str, reviewer: str) -> int:
         return 0
 
 
+def _advance_limbo_check(session_name: str, db) -> bool:
+    """Surface archived-but-unfinished cards to their lane. True if it spoke."""
+    # ARCHIVED-BUT-UNFINISHED (AMUX-2486, relocated AMUX-2499). Cards this
+    # loop can NEVER see. `archived=0` is on every autonomy query (advance,
+    # pickup, rot, the nudges), and deliberately so: the ethos file records
+    # that keeping it is what stops cleared work leaking back into
+    # auto-pickup. The cost of that correctness is a state nobody watches —
+    # archived=1 AND status not terminal.
+    #
+    # Such a card is incoherent rather than merely idle: `archived` means
+    # cleared, `todo/doing/review` means unfinished. It is invisible to every
+    # loop AND absent from the default board view, while not being done. It
+    # cannot rot (rot filters archived), cannot be picked up, cannot be
+    # advanced, and cannot be seen. It simply stops existing while remaining
+    # open.
+    #
+    # RUNS AHEAD OF THE MAIN SELECTION, not in the `if not row` tail. That
+    # placement was the whole defect: the tail is reached only when a lane
+    # has NOTHING advanceable, so the check fired exclusively on idle lanes
+    # — while limbo cards accumulate fastest on the busy ones. Measured
+    # 2026-08-07 before this moved: 25 notifications ever, all to small
+    # lanes in one 9-minute window, and of the top twelve holders only the
+    # two with zero advanceable candidates could reach it. Ten lanes holding
+    # 1235 cards were structurally unreachable — 86% of the population, by
+    # the mechanism built to surface it.
+    #
+    # This is the second defect of exactly this shape in this function: the
+    # stale-ask re-nag directly above was hoisted here by AC-194 after 48
+    # cycles and 0 fires, for the same reason. "Put it where the loop has
+    # nothing else to do" reads like politeness and is a filter on the
+    # population you most need to reach.
+    #
+    # NOT auto-advanced, on purpose. Force-moving cleared cards is the exact
+    # leak the archived filter exists to prevent, and a card in an incoherent
+    # state is one a human should adjudicate (ethos rule 8 — 298 of these are
+    # human-owned). The fix for invisibility is VISIBILITY: say it once per
+    # lane per day, name the ids, and let the lane decide.
+    try:
+        # COUNT SEPARATELY FROM THE SAMPLE (mvs-infra, 2026-08-07). The
+        # message below shows a handful of ids and then says "+N more"; if N
+        # is derived from a CAPPED row set it silently understates the real
+        # population. Theirs read "8, +12 more" — which any reader takes as
+        # 20 total — against an actual 182. That is the same defect as the
+        # board list truncating without declaring it, committed in the
+        # message that reports the truncation problem.
+        _limbo_total = db.execute(
+            "SELECT COUNT(*) FROM issues WHERE session=? AND deleted IS NULL "
+            "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded')",
+            (session_name,)).fetchone()[0]
+        _limbo = db.execute(
+            "SELECT id, title, status FROM issues WHERE session=? AND deleted IS NULL "
+            "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded') "
+            "ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
+    except Exception:
+        _limbo = []
+        _limbo_total = 0
+    if _limbo:
+        # DEDUPE ON THE DAY, NOT THE COUNT (AMUX-2499). The key was
+        # `limbo:<lane>:<count>`, which is wrong in both directions at once:
+        #   - count moves by one -> brand-new key -> re-notify. Live evidence:
+        #     amux-homepage was told at 16 and again at 6, two minutes apart.
+        #     A lane actively working the pile down gets nagged for doing so.
+        #   - count RETURNS to a value already seen -> silent forever, because
+        #     that exact key is burnt. cold-outbound fired at 14 and at 10; back
+        #     at 14 it would never speak again, with the condition unresolved.
+        # A standing condition wants a time window. One per lane per day: a lane
+        # that resolves them stops hearing it because the query empties, and a
+        # lane that ignores 450 unreachable cards hears again tomorrow, which is
+        # the correct amount of insistence for work that is otherwise invisible.
+        _idem = f"limbo:{session_name}:{int(time.time() // 86400)}"
+        if not db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
+                          (_idem,)).fetchone():
+            _ids = ", ".join(f"{r['id']} ({r['status']})" for r in _limbo[:8])
+            ok, _e = send_text(session_name,
+                f"[amux] {_limbo_total} of your cards are ARCHIVED but not finished, "
+                f"which means no loop can reach them: {_ids}"
+                + (f", +{_limbo_total-8} more" if _limbo_total > 8 else "") + ".\n\n"
+                f"`archived` means cleared and their status says unfinished, so they "
+                f"are invisible to auto-pickup, to the advance nudge, to rot detection "
+                f"AND to the default board view — they will sit there forever without "
+                f"this message. Nothing is being force-moved: a card in a contradictory "
+                f"state is yours to resolve.\n\n"
+                # NAME THE COMMAND FOR EVERY EXIT (AMUX-2499, reported by
+                # mixpeek-studio). This said "un-archive it" with no verb, and at
+                # the time that was worse than vague: un-archive did not EXIST.
+                # PATCH ignored `archived` and the CLI had no verb until 2c4aae0,
+                # which landed FOURTEEN MINUTES after this notice first fired. A
+                # lane holding 108 cards was told to take an exit that was not
+                # there, tried it across several attempts, correctly concluded the
+                # loop had no honest resolution, and said it would stop answering.
+                # Ethos rule 6 exactly: a constraint whose sanctioned escape is
+                # unwalkable gets walked from somewhere else, or not at all.
+                #
+                # Each branch now names the command that performs it. An exit the
+                # reader has to go and discover is one they may reasonably conclude
+                # does not exist — which here they would have been right about.
+                f"For each, do ONE:\n"
+                f"  - finish it honestly  ->  `amux board done <id>` / `amux board verified <id>`\n"
+                f"  - never real work     ->  `amux board discarded <id>`\n"
+                f"  - cleared by mistake  ->  `amux board unarchive <id>`  "
+                f"(restores it to the loops; does NOT change its status)\n\n"
+                f"Do NOT discard live work just to clear the count — un-archive is the "
+                f"honest lever for anything real. If a card is not yours to judge, say "
+                f"so on it and leave it.",
+                defer_if_busy=True)
+            if ok:
+                _emit_event(session_name, "advance.limbo",
+                            {"n": _limbo_total, "sampled": len(_limbo), "ids": [r["id"] for r in _limbo[:20]]},
+                            idem=_idem, source="advance-limbo")
+                _advance_last[session_name] = time.time()
+                slog(f"[advance] {session_name}: {_limbo_total} archived-but-unfinished "
+                     f"card(s) surfaced — {_ids}")
+                return True
+    return False
+
+
 def _advance_open_card(session_name: str) -> bool:
     """A session that goes idle holding an in-flight card gets pushed to finish it.
 
@@ -12365,6 +12481,13 @@ def _advance_open_card(session_name: str) -> bool:
         # is right. What changes is that an unnudgeable candidate no longer ends the
         # search — we fall through to the next one. The per-card budget still bounds
         # repetition; it just stops bounding the LANE.
+        # ARCHIVED-BUT-UNFINISHED, ahead of the main selection (AMUX-2499) — the
+        # same relocation AC-194 applied to the stale-ask check directly above,
+        # for the same reason and with the same evidence shape. Left in the
+        # `if not row` tail it only ever ran on lanes with nothing to advance,
+        # which is the inverse of where these cards pile up.
+        if _advance_limbo_check(session_name, db):
+            return True
         _cands = db.execute(
             "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND status IN ('doing','review','done') "
@@ -12387,76 +12510,6 @@ def _advance_open_card(session_name: str) -> bool:
             slog(f"[advance] {session_name}: all {len(_cands)} candidate(s) have spent "
                  f"their {_nb}-nudge budget — going quiet for this lane")
         if not row:
-            # ARCHIVED-BUT-UNFINISHED (AMUX-2486). Nothing to advance here — but before
-            # returning, check for cards this loop can NEVER see. `archived=0` is on
-            # every autonomy query (advance, pickup, rot, the nudges), and deliberately
-            # so: the ethos file records that keeping it is what stops cleared work
-            # leaking back into auto-pickup. The cost of that correctness is a state
-            # nobody watches — archived=1 AND status not terminal.
-            #
-            # Such a card is incoherent rather than merely idle: `archived` means
-            # cleared, `todo/doing/review` means unfinished. It is invisible to every
-            # loop AND absent from the default board view, while not being done. It
-            # cannot rot (rot filters archived), cannot be picked up, cannot be
-            # advanced, and cannot be seen. It simply stops existing while remaining
-            # open.
-            #
-            # Measured on the cloud customer envs, 2026-08-07: 17 cards across three
-            # environments, every single non-verified card in all three, including a
-            # whole env whose board renders empty because all 7 of its cards are here.
-            # Ethan asked why they never reached verified; this is the entire answer.
-            #
-            # NOT auto-advanced, on purpose. Force-moving cleared cards is the exact
-            # leak the archived filter exists to prevent, and a card in an incoherent
-            # state is one a human should adjudicate (ethos rule 8 — several of these
-            # are human-owned). The fix for invisibility is VISIBILITY: say it once per
-            # lane per window, name the ids, and let the lane decide.
-            try:
-                # COUNT SEPARATELY FROM THE SAMPLE (mvs-infra, 2026-08-07). The
-                # message below shows a handful of ids and then says "+N more"; if N
-                # is derived from a CAPPED row set it silently understates the real
-                # population. Theirs read "8, +12 more" — which any reader takes as
-                # 20 total — against an actual 182. That is the same defect as the
-                # board list truncating without declaring it, committed in the
-                # message that reports the truncation problem.
-                _limbo_total = db.execute(
-                    "SELECT COUNT(*) FROM issues WHERE session=? AND deleted IS NULL "
-                    "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded')",
-                    (session_name,)).fetchone()[0]
-                _limbo = db.execute(
-                    "SELECT id, title, status FROM issues WHERE session=? AND deleted IS NULL "
-                    "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded') "
-                    "ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
-            except Exception:
-                _limbo = []
-                _limbo_total = 0
-            if _limbo:
-                _idem = f"limbo:{session_name}:{_limbo_total}"
-                if not db.execute("SELECT 1 FROM session_events WHERE idem=? LIMIT 1",
-                                  (_idem,)).fetchone():
-                    _ids = ", ".join(f"{r['id']} ({r['status']})" for r in _limbo[:8])
-                    ok, _e = send_text(session_name,
-                        f"[amux] {_limbo_total} of your cards are ARCHIVED but not finished, "
-                        f"which means no loop can reach them: {_ids}"
-                        + (f", +{_limbo_total-8} more" if _limbo_total > 8 else "") + ".\n\n"
-                        f"`archived` means cleared and their status says unfinished, so they "
-                        f"are invisible to auto-pickup, to the advance nudge, to rot detection "
-                        f"AND to the default board view — they will sit there forever without "
-                        f"this message. Nothing is being force-moved: a card in a contradictory "
-                        f"state is yours to resolve.\n\n"
-                        f"For each, do ONE: finish it honestly and move it to verified/done; or "
-                        f"discard it if it was never real work (`amux board discarded <id>`); or "
-                        f"un-archive it if it IS live work that was cleared by mistake. If a card "
-                        f"is not yours to judge, say so on it and leave it.",
-                        defer_if_busy=True)
-                    if ok:
-                        _emit_event(session_name, "advance.limbo",
-                                    {"n": _limbo_total, "sampled": len(_limbo), "ids": [r["id"] for r in _limbo[:20]]},
-                                    idem=_idem, source="advance-limbo")
-                        _advance_last[session_name] = time.time()
-                        slog(f"[advance] {session_name}: {_limbo_total} archived-but-unfinished "
-                             f"card(s) surfaced — {_ids}")
-                        return True
             return False
         # Same not-a-task guard as auto-pickup. Pushing a session to "advance"
         # a journal card asks for exactly the false progress the gates exist to
