@@ -9109,6 +9109,27 @@ CREATE TABLE IF NOT EXISTS issue_tags (
     PRIMARY KEY (issue_id, tag),
     FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
+-- Context files attached to an issue (AMUX-2508). Ethan named attachments as the
+-- gap when he shared the reference board. This is deliberately a POINTER table and
+-- not a blob store: amux already has FILESYSTEM and BOARD as primitives, so an
+-- attachment is the join between them, not a ninth thing. Files stay on disk where
+-- /api/fs/* already reads them, and the card records where to look.
+--
+-- Storing bytes here would double every artifact into a database the fleet syncs,
+-- and would make the board the owner of content the filesystem already owns — a
+-- second spelling of an existing primitive, which the ethos rejects outright.
+--
+-- `path` is stored as given (absolute, or relative to the owning session's work
+-- dir); resolution happens at read time so a moved checkout does not orphan rows.
+CREATE TABLE IF NOT EXISTS issue_files (
+    issue_id    TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    added_by    TEXT,
+    added_at    INTEGER,
+    note        TEXT,
+    PRIMARY KEY (issue_id, path),
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS issue_counters (
     prefix      TEXT PRIMARY KEY,
     next_n      INTEGER NOT NULL DEFAULT 1
@@ -15096,6 +15117,27 @@ _GATE_PRECEDENCE = (
                "only the per-status defaults below"),
     ("global", "global per-status default (statuses.gate)"),
 )
+
+
+def _resolve_issue_file(p: str, item: dict) -> str:
+    """Resolve an attachment pointer to an absolute path, or "" if it cannot be.
+
+    Relative paths resolve against the OWNING SESSION's working directory, not the
+    server's cwd — the server runs from wherever launchd started it, and a card's
+    context files belong to the lane that attached them. Resolving at read time
+    rather than storing an absolute path means a moved checkout re-resolves instead
+    of orphaning every row.
+    """
+    try:
+        p = (p or "").strip()
+        if not p:
+            return ""
+        if os.path.isabs(p):
+            return os.path.realpath(p)
+        wd = _session_work_dir((item or {}).get("session") or "")
+        return os.path.realpath(os.path.join(wd, p)) if wd else ""
+    except Exception:
+        return ""
 
 
 def _gate_layers(item, target_status: str) -> list:
@@ -66237,6 +66279,92 @@ class CCHandler(BaseHTTPRequestHandler):
             # at the contract handler records both this and /api/board/contract as
             # 404s it had to work around). A wrong-subject error is worse than a
             # 404: it sends you debugging the id.
+            # ── Issue context files (AMUX-2508) ─────────────────────────────
+            # GET  /api/board/<id>/files            list attachments (resolved + live stat)
+            # POST /api/board/<id>/files {path,note} attach a filesystem path
+            # DELETE /api/board/<id>/files?path=..   detach (never deletes the file)
+            _m_files = re.match(r"^/api/board/([A-Za-z0-9_-]+)/files$", path)
+            if _m_files:
+                _fid = _m_files.group(1)
+                _it = _item_by_id(_fid)
+                if not _it:
+                    return self._json({"error": "no such item", "item": _fid}, 404)
+                _db = get_db()
+                if method == "GET":
+                    out = []
+                    for r in _db.execute(
+                            "SELECT path, added_by, added_at, note FROM issue_files "
+                            "WHERE issue_id=? ORDER BY added_at DESC", (_fid,)):
+                        _p = _resolve_issue_file(r["path"], _it)
+                        # STAT AT READ TIME, and report absence rather than hiding it.
+                        # A pointer table can go stale — a file gets moved or deleted
+                        # and the row survives. Silently dropping those rows would make
+                        # the panel look clean while context the card claims to carry
+                        # is gone; that is the unreachable-is-what-a-reader-experiences
+                        # -as-deleted failure from the memory archive, one primitive over.
+                        _st = None
+                        try:
+                            if _p and os.path.isfile(_p):
+                                _st = os.stat(_p)
+                        except Exception:
+                            _st = None
+                        out.append({
+                            "path": r["path"], "resolved": _p,
+                            "added_by": r["added_by"], "added_at": r["added_at"],
+                            "note": r["note"] or "",
+                            "exists": bool(_st),
+                            "bytes": (_st.st_size if _st else None),
+                            "modified": (int(_st.st_mtime) if _st else None),
+                        })
+                    return self._json({"item": _fid, "files": out,
+                                       "missing": len([f for f in out if not f["exists"]]),
+                                       "note": "pointers to files on disk — detaching never "
+                                               "deletes the file"})
+                if method == "POST":
+                    # Parse the body HERE: this route sits in a block reached before
+                    # the handler's shared body parse, so `body` is not yet bound.
+                    # Caught by exercising the endpoint rather than by reading it —
+                    # GET and DELETE worked and POST returned a NameError as a 500.
+                    try:
+                        _ln = int(self.headers.get("Content-Length") or 0)
+                        _raw = self.rfile.read(_ln) if _ln else b"{}"
+                        body = json.loads(_raw.decode() or "{}")
+                    except Exception:
+                        return self._json({"error": "invalid JSON body"}, 400)
+                    _fp = str((body or {}).get("path") or "").strip()
+                    if not _fp:
+                        return self._json({"error": "path required"}, 400)
+                    _res = _resolve_issue_file(_fp, _it)
+                    if not _res or not os.path.isfile(_res):
+                        # REFUSE A POINTER THAT DOES NOT RESOLVE. Accepting it would
+                        # create the stale row this design is trying to avoid, at the
+                        # one moment we can cheaply tell.
+                        return self._json({"error": "path does not resolve to a file",
+                                           "path": _fp, "resolved": _res,
+                                           "why": "attachments are pointers; a pointer that "
+                                                  "cannot be opened is worse than none"}, 400)
+                    _db.execute(
+                        "INSERT OR REPLACE INTO issue_files (issue_id,path,added_by,added_at,note) "
+                        "VALUES (?,?,?,?,?)",
+                        (_fid, _fp, _hdr_worker(self.headers) or "human", int(time.time()),
+                         str((body or {}).get("note") or "")))
+                    _db.commit()
+                    _append_board_log(_fid, f"context attached: {_fp}")
+                    _board_changed()
+                    return self._json({"ok": True, "item": _fid, "path": _fp,
+                                       "resolved": _res})
+                if method == "DELETE":
+                    _fp = (qs.get("path", [""])[0] or "").strip()
+                    if not _fp:
+                        return self._json({"error": "path required"}, 400)
+                    _db.execute("DELETE FROM issue_files WHERE issue_id=? AND path=?",
+                                (_fid, _fp))
+                    _db.commit()
+                    _append_board_log(_fid, f"context detached: {_fp}")
+                    _board_changed()
+                    return self._json({"ok": True, "detached": _fp,
+                                       "note": "the file on disk was NOT deleted"})
+
             if path == "/api/board/gates":
                 return self._json({
                     "see": "/api/board/contract (key: gates) — the full tables",
