@@ -39756,7 +39756,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.509';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.510';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -54173,6 +54173,7 @@ if (_cachedInit) {
 // killed the SSE parse and the board fetch wrapping it — observed live in the
 // console. The cache is an optimisation: a failed write must be silent, drop
 // the stale entry, and never poison the caller.
+let _boardCacheBytes = 0;
 function _cacheBoardJSON(j) {
   // This called ITSELF (43483bd, 2026-07-28). The commit mechanically replaced
   // every `localStorage.setItem('amux_board_cache', ...)` with a call to the
@@ -54185,8 +54186,48 @@ function _cacheBoardJSON(j) {
   // check that confirms a symptom's absence cannot tell "fixed" from "the code
   // no longer runs" (ethos #7). The check that would have caught it is reading
   // back localStorage.getItem('amux_board_cache') after a fetch.
-  try { localStorage.setItem('amux_board_cache', j); }
-  catch (e) { try { localStorage.removeItem('amux_board_cache'); } catch (e2) {} }
+  // SLIM THE CACHE, AND NEVER LET IT EVICT THE SESSION LIST (AMUX-2522).
+  //
+  // RCA, 2026-08-07: Ethan could not view workers offline. The board cache is written
+  // from ?archived=0, which its own comment records as 129KB when this caching was
+  // designed (AMUX-2271). It is 2.74MB today — 21x — because it carries full records
+  // and non-archived card DESCRIPTIONS now total 3.22MB across 1241 cards. Against a
+  // ~5MB localStorage cap shared with `amux_sessions_cache`, the board write blows
+  // quota, the catch removes the key, and the SESSION LIST goes with it. Offline
+  // startup reads amux_sessions_cache, so workers vanish.
+  //
+  // Nothing "broke" — the payload grew past a threshold nobody was watching, and the
+  // failure is silent by construction. This file already documents one instance of
+  // that exact class three comments up (the recursive _cacheBoardJSON whose own
+  // verification passed BECAUSE nothing was ever written).
+  //
+  // Two fixes, and the second is the one that stops a recurrence:
+  //   1. cache a SLIM projection — offline needs id/title/status/session/type to
+  //      render a list, not desc and log, which are 96% of the bytes.
+  //   2. the board cache is now strictly SUBORDINATE to the session list: on quota
+  //      failure it drops itself and leaves amux_sessions_cache alone, because a
+  //      board you cannot read offline is a degraded view and a worker list you
+  //      cannot read offline is a broken app.
+  try {
+    let slim = j;
+    try {
+      slim = JSON.stringify((JSON.parse(j) || []).map(i => ({
+        id: i.id, title: i.title, status: i.status, session: i.session,
+        type: i.type, owner_type: i.owner_type, archived: i.archived,
+        updated: i.updated, tags: i.tags, groups: i.groups,
+        desc_len: (i.desc || '').length,
+      })));
+    } catch (e) { /* unparseable — fall back to storing what we were given */ }
+    localStorage.setItem('amux_board_cache', slim);
+    _boardCacheBytes = slim.length;
+  } catch (e) {
+    try { localStorage.removeItem('amux_board_cache'); } catch (e2) {}
+    _boardCacheBytes = 0;
+    // LOUD, not silent. A cache that evicts itself and says nothing is how this
+    // reached 21x its design budget unnoticed.
+    try { console.warn('[amux] board cache exceeded localStorage quota and was dropped ' +
+                       '— offline board unavailable; worker list preserved'); } catch (e3) {}
+  }
 }
 const _cachedBoard = localStorage.getItem('amux_board_cache');
 if (_cachedBoard) {
@@ -61376,7 +61417,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.509';
+const CACHE = 'amux-v0.9.510';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
