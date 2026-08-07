@@ -84,3 +84,69 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# ── Bare-identifier check (AMUX board regression, 2026-08-06) ────────────────
+# The vocabulary rename (tags -> groups) renamed a DECLARATION and left its use
+# behind: `const groups = item.tags || []` followed by `tags.forEach(...)`,
+# which threw ReferenceError and broke every board render.
+#
+# Nothing caught it. `node --check` proves a block PARSES, not that its names
+# RESOLVE. The refs check above resolves `_`-prefixed FUNCTION calls only. And
+# the rename's own invariant — "every changed line differs only by the
+# vocabulary words" — passes by construction for an identifier rename, because
+# that is exactly what the diff looks like. Three green checks, one live crash.
+#
+# This closes the specific class: a bare vocabulary identifier used as a value
+# with no `const/let/var/function` binding of that name anywhere in the client.
+# Deliberately narrow — a full scope analysis needs a real JS parser, and a
+# check that reports nothing is worth more than one that cannot be trusted.
+_VOCAB_IDENTS = ("tags", "groups", "sessions", "workers")
+
+
+def bare_vocab_uses(js):
+    """Uses of a vocabulary word as a bare identifier (not obj.tags, not a key)."""
+    out = set()
+    for name in _VOCAB_IDENTS:
+        # METHOD CALL ONLY: name.method( — nothing looser.
+        # My first cut matched `name` followed by a dot, which fired on PROSE
+        # inside string literals ("No limited workers.</div>", "Search
+        # workers...") and reported 6 phantom orphans. A checker that cries wolf
+        # is worse than none, so this requires a real call shape: the word, a
+        # dot, an identifier, and an open paren.
+        for m in re.finditer(r"(?<![.\w$'\"])" + name + r"\.[A-Za-z_$][\w$]*\s*\(", js):
+            out.add(name)
+    return out
+
+
+def declared_vocab(js):
+    d = set()
+    for name in _VOCAB_IDENTS:
+        if re.search(r"\b(?:const|let|var|function)\s+" + name + r"\b", js) or \
+           re.search(r"\b" + name + r"\s*=>", js) or \
+           re.search(r"function\s*\([^)]*\b" + name + r"\b", js):
+            d.add(name)
+    return d
+
+
+def check_bare_vocab(js):
+    used, declared = bare_vocab_uses(js), declared_vocab(js)
+    missing = sorted(used - declared)
+    # Self-test both directions: a planted orphan must be caught, and a properly
+    # declared one must not be. A checker that only ever passes is theatre.
+    assert "tags" in bare_vocab_uses("const groups = x.tags || []; tags.forEach(f);"), \
+        "self-test: planted orphan not detected"
+    assert "tags" in declared_vocab("const tags = x.tags || []; tags.forEach(f);"), \
+        "self-test: real declaration not seen"
+    return missing
+
+
+if __name__ == "__main__":
+    _src = open(SRC, encoding="utf-8").read() if "SRC" in dir() else open(
+        "/Users/ethan/Dev/amux/amux-server.py", encoding="utf-8").read()
+    _js = client_js(_src)
+    _missing = check_bare_vocab(strip_comments(_js))
+    if _missing:
+        print("FAIL: vocabulary identifier used but never declared: " + ", ".join(_missing))
+        raise SystemExit(1)
+    print("OK: no orphaned vocabulary identifiers (%d checked)" % len(_VOCAB_IDENTS))
