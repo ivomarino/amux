@@ -1280,6 +1280,32 @@ types: $_types"
       echo "$result" | _board_outcome "$id" "" "type set to $new_type"
       return $?
       ;;
+    archive|unarchive)
+      # AMUX-2492. `archived` had no per-card setter anywhere — only the age-archive
+      # sweep and a per-session bulk update could touch it, so an automated action had
+      # no un-do and 17 cards across three cloud envs were stranded where no loop and
+      # no view could reach them. Same shape as the `type` and `reviewer` verbs above
+      # (AMUX-2325): a field the gates/visibility depend on, reachable only by raw curl
+      # — which drops X-Amux-Session and produces exactly the unattributed writes the
+      # ledger depends on not having.
+      local _av=1; [[ "$subcmd" == "unarchive" ]] && _av=0
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: amux board $sub <ISSUE-ID>
+archive   hides a card from every board view AND every autonomy loop (advance, pickup, rot)
+unarchive brings it back — this is the un-do that did not exist before AMUX-2492"
+      shift
+      local _auth=""
+      [[ "${1:-}" == "--authorized-by" ]] && { _auth="${2:-}"; shift 2; }
+      local result
+      result=$(A="$_av" W="$_auth" python3 -c 'import json,os
+b={"archived": int(os.environ["A"])}
+if os.environ.get("W"): b["authorized_by"]=os.environ["W"]
+print(json.dumps(b))' \
+        | curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "${subcmd}d"
+      return $?
+      ;;
     reviewer)
       # review->done is gated on a NAMED reviewer's sign-off, and until now nothing
       # in the CLI could set that name — `amux board review <id> --reviewer X` died

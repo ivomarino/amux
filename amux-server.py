@@ -66618,6 +66618,69 @@ class CCHandler(BaseHTTPRequestHandler):
                     if "reviewer" in body:
                         set_clauses.append("reviewer = ?")
                         params.append((str(body.get("reviewer") or "").strip() or None))
+                    if "archived" in body:
+                        # AMUX-2492. `archived` was settable ONLY by automated sweeps —
+                        # the 3-day age-archive and the per-session bulk update. There
+                        # was no per-card inverse anywhere: not PATCH (the field was
+                        # absent from the writable set), not a route, not the CLI. So a
+                        # sweep could hide a card and nothing could ever bring it back.
+                        #
+                        # That is an automated action with no un-do, and it is what
+                        # stranded 17 cards across three cloud customer envs — every
+                        # non-verified card in all of them, including one whose whole
+                        # board rendered empty to a viewer. `archived` + a non-terminal
+                        # status is invisible to every autonomy loop AND to the default
+                        # board view (AMUX-2486/2490), so nothing could reach them and
+                        # nobody could see them.
+                        #
+                        # The omission reads as an oversight rather than a policy: the
+                        # cross-lane destruction guard above already computes
+                        # `_is_destructive` from `body.get("archived")` and its own error
+                        # text says "discarding/ARCHIVING <id>". The guard was written
+                        # expecting this field to arrive; it just never could.
+                        #
+                        # Archiving therefore routes through that guard unchanged (it is
+                        # destructive: it hides a card from every view and loop).
+                        # UN-archiving does not, because `bool(0)` is false — restoring
+                        # visibility is not destruction and must not need an authorizer,
+                        # or the un-do is as unreachable as before.
+                        _arc_v = 1 if str(body.get("archived")).strip().lower() \
+                            in ("1", "true", "yes", "on") else 0
+                        # CROSS-LANE GUARD, re-checked here on purpose. The existing
+                        # destruction guard computes `_is_destructive` from
+                        # `body.get("archived")` — but it lives INSIDE
+                        # `if new_status != prior["status"]`, so an archive-only PATCH
+                        # (no status field) never reaches it. That clause was dead code
+                        # for the standalone case, harmless only because `archived` was
+                        # unwritable. Making it writable without this check would have
+                        # opened an UNGUARDED destructive path: any lane could hide any
+                        # other lane's card, unattributed, with no authorizer — the exact
+                        # AMUX-2246 shape the guard exists to stop. Caught by testing the
+                        # guard rather than trusting the comment I had just written
+                        # claiming it "routes through that guard unchanged". It did not.
+                        #
+                        # Asymmetric on purpose: archiving hides a card from every view
+                        # and loop, so cross-lane archiving needs an authorizer.
+                        # UN-archiving restores visibility and is never gated, or the
+                        # un-do stays as unreachable as it was before AMUX-2492.
+                        if _arc_v:
+                            _a_caller = _hdr_worker(self.headers)
+                            _a_owner = (prior["session"] or "").strip() if prior else ""
+                            if (_a_caller and _a_owner and _a_owner != _a_caller
+                                    and not str(body.get("authorized_by") or "").strip()):
+                                return self._json({
+                                    "error": "cross-lane destruction requires authorized_by",
+                                    "why": (f"{_a_caller} is archiving {bid}, which belongs to "
+                                            f"{_a_owner}. Archiving hides it from every board "
+                                            f"view AND every autonomy loop, so it is a "
+                                            f"termination in effect even though the status is "
+                                            f"untouched."),
+                                    "how": ('add {"authorized_by": "<who asked>"}, or use '
+                                            f'`amux board archive {bid} --authorized-by "<who>"`'),
+                                    "card_owner": _a_owner,
+                                }, 400)
+                        set_clauses.append("archived = ?")
+                        params.append(_arc_v)
                     for k in ("title", "desc", "status", "session", "shepherd", "type", "due", "due_time", "owner_type", "pinned", "pos", "source_ref", "last_verified_at"):
                         if k in body:
                             set_clauses.append(f"{k} = ?")
@@ -66914,7 +66977,7 @@ class CCHandler(BaseHTTPRequestHandler):
                         _applied = {"title", "desc", "status", "session", "shepherd", "type",
                                     "due", "due_time", "owner_type", "pinned", "pos",
                                     "source_ref", "last_verified_at", "gate", "creator",
-                                    "reviewer", "depends_on", "desc_append", "rev",
+                                    "reviewer", "depends_on", "desc_append", "rev", "archived",
                                     "gate_ack", "gate_checked", "force", "override_doing"}
                         _ignored = sorted(k for k in body.keys() if k not in _applied)
                         if _ignored and isinstance(updated_item, dict):
