@@ -21207,6 +21207,7 @@ def main():
     if os.environ.get("AMUX_PUSH_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
         return 0
     foreign = {}
+    ordered = []
     try:
         for line in sys.stdin.read().splitlines():
             parts = line.split()
@@ -21242,6 +21243,7 @@ def main():
                 if len(bits) < 3:
                     continue
                 who = bits[2].strip()
+                ordered.append((bits[0], who))   # newest-first, for the escape below
                 if who and who != sess:
                     foreign.setdefault(who, []).append((bits[0], bits[1][:62]))
                 elif not who:
@@ -21261,8 +21263,37 @@ def main():
             w("    %s  %s\\n" % (sha, subj))
         if len(foreign[who]) > 6:
             w("    ... and %d more\\n" % (len(foreign[who]) - 6))
-    w("\\nTheir work is not yours to deploy. Options:\\n"
-      "  - ask that session to push its own commits, or\\n"
+    # NAME THE ESCAPE, and compute it (AMUX-2512). This refusal offered only "ask
+    # that session" or the override, and said nothing about ORDER — so two sessions
+    # with interleaved commits each blocked correctly and both stalled. That happened
+    # twice in one afternoon, roles swapped the second time, and it took a third
+    # session reading the stack from outside to spot it.
+    #
+    # The constraint the guard creates and never announced, stated precisely — my
+    # first version of this comment overstated it and the test caught me:
+    # you can always ship the contiguous run of YOUR commits sitting directly above
+    # the remote, whatever is above THAT. So a tip owner is not fully blocked; they
+    # ship their lower prefix and wait for the foreign commit to clear before the
+    # rest. Only a stack whose FIRST unpushed commit is foreign has no escape at all.
+    # Either way the ordering is: lower owner first. Nothing in the old message
+    # hinted ordering mattered, so "correctly declined to override" looked identical
+    # to "stalled".
+    safe = ""
+    for _sha, _who in reversed(ordered):      # oldest first
+        if _who == sess:
+            safe = _sha
+        else:
+            break
+    w("\\nTheir work is not yours to deploy. Options:\\n")
+    if safe:
+        w("  - PUSH ONLY YOURS (no override needed) — your commits up to %s form a\\n"
+          "    contiguous run above the remote, so this ships exactly them:\\n"
+          "      git push origin %s:main\\n" % (safe, safe))
+    else:
+        w("  - the commit directly above the remote is not yours, so there is no\\n"
+          "    same-session prefix to ship — those sessions must push first, lower\\n"
+          "    owner first. Ask them, then push.\\n")
+    w("  - or ask that session to push its own commits, or\\n"
       "  - if the human explicitly asked you to ship everything:\\n"
       "      AMUX_ALLOW_FOREIGN=1 git push ...\\n\\n")
     return 1
@@ -21751,8 +21782,34 @@ def main():
     discard_why = None
     try:
         discard_why = _discard_verdict(cmd, scrubbed, run_dir)
-    except Exception:
-        discard_why = None  # fail-open: server down, timeout, odd quoting
+    except Exception as _dv_err:
+        # FAIL CLOSED HERE, unlike everywhere else in this guard (AC-287).
+        # The standing contract is fail-OPEN: a guard that blocks when the server
+        # is down wedges every lane, and for a COMMIT that trade is right — the
+        # peer's work survives in the object store either way, so the cost of a
+        # missed warning is a glance.
+        #
+        # A DISCARD is not that. It is UNRECOVERABLE: no object, no reflog entry.
+        # A missed block is permanent data loss belonging to someone who is not
+        # even at the keyboard. Measured 2026-08-07 with the server unreachable:
+        # exit 0, no output, the destroy proceeded — and the only thing printed
+        # was the co-tenant SKIP notice, which talks about COMMITTING a shared
+        # file while the user is DISCARDING one, so it named the wrong operation
+        # for the one case where the stakes are highest.
+        #
+        # This is the same asymmetry that motivated AC-221 — "both of us wrote
+        # this" is a reason to let you commit and a reason to stop you deleting —
+        # applied one level up, to the FAILURE MODE rather than the verdict. One
+        # fail-open policy cannot serve a recoverable and an unrecoverable
+        # consumer. The override below is the sanctioned escape and stays
+        # available, so this is refusable, not a wedge.
+        discard_why = ("cannot verify co-tenancy — the amux server is unreachable "
+                       f"({type(_dv_err).__name__}). REFUSING an unrecoverable "
+                       "discard rather than guessing: unlike a commit, this leaves "
+                       "no object and no reflog entry, so a wrong guess is "
+                       "permanent and the work destroyed may not be yours. Re-run "
+                       "when the server answers, or use `git stash push -- <paths>` "
+                       "which is reversible")
     if discard_why:
         if _consume_override(cmd):
             sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {discard_why}\n")
@@ -21799,8 +21856,34 @@ def main():
     discard_why = None
     try:
         discard_why = _discard_verdict(cmd, scrubbed, run_dir)
-    except Exception:
-        discard_why = None  # fail-open: server down, timeout, odd quoting
+    except Exception as _dv_err:
+        # FAIL CLOSED HERE, unlike everywhere else in this guard (AC-287).
+        # The standing contract is fail-OPEN: a guard that blocks when the server
+        # is down wedges every lane, and for a COMMIT that trade is right — the
+        # peer's work survives in the object store either way, so the cost of a
+        # missed warning is a glance.
+        #
+        # A DISCARD is not that. It is UNRECOVERABLE: no object, no reflog entry.
+        # A missed block is permanent data loss belonging to someone who is not
+        # even at the keyboard. Measured 2026-08-07 with the server unreachable:
+        # exit 0, no output, the destroy proceeded — and the only thing printed
+        # was the co-tenant SKIP notice, which talks about COMMITTING a shared
+        # file while the user is DISCARDING one, so it named the wrong operation
+        # for the one case where the stakes are highest.
+        #
+        # This is the same asymmetry that motivated AC-221 — "both of us wrote
+        # this" is a reason to let you commit and a reason to stop you deleting —
+        # applied one level up, to the FAILURE MODE rather than the verdict. One
+        # fail-open policy cannot serve a recoverable and an unrecoverable
+        # consumer. The override below is the sanctioned escape and stays
+        # available, so this is refusable, not a wedge.
+        discard_why = ("cannot verify co-tenancy — the amux server is unreachable "
+                       f"({type(_dv_err).__name__}). REFUSING an unrecoverable "
+                       "discard rather than guessing: unlike a commit, this leaves "
+                       "no object and no reflog entry, so a wrong guess is "
+                       "permanent and the work destroyed may not be yours. Re-run "
+                       "when the server answers, or use `git stash push -- <paths>` "
+                       "which is reversible")
     if discard_why:
         if _consume_override(cmd):
             sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned): {discard_why}\n")
