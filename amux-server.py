@@ -12275,7 +12275,27 @@ def _advance_open_card(session_name: str) -> bool:
         # Reviewer edge: a card in review with a named reviewer is the REVIEWER's
         # work now — pushing the author asks for a self-ack the transition refuses.
         _rev = (item.get("reviewer") or "").strip()
-        if row["status"] == "review" and _rev and _rev != session_name:
+        # `done` belongs here too (AMUX-2478 third cause, predicted from
+        # mixpeek-frustrations' MF-495 canary and confirmed in code before claiming
+        # it). The sign-off REQUIREMENT was deliberately widened from review-only to
+        # "any close" — `_rev and new_status in ("done","verified")` — because an
+        # author could otherwise skip review by transitioning doing->verified
+        # (AMUX-2217). The ROUTING that tells the reviewer they owe an ack was never
+        # widened with it and still tested `status == "review"`.
+        #
+        # So a card at `done` with an unacked reviewer fell in the gap: the author
+        # got nudged to advance it to verified, every such attempt returned 409
+        # "review sign-off required from the reviewer", and the reviewer was never
+        # told anything. That is a no-coherent-action loop for the one party being
+        # asked to act — the same defect the gate_next ternary produced, arrived at
+        # from the other direction.
+        #
+        # Same root as AMUX-2477: a mechanism was widened and the thing that
+        # describes it was not, so the two disagreed about one fact. Predicate is
+        # copied from the enforcement above rather than re-derived; if that set
+        # changes again, change both.
+        _rev_gated = ("review", "done")     # must match the sign-off check's new_status set
+        if row["status"] in _rev_gated and _rev and _rev != session_name:
             if not is_running(_rev):
                 slog(f"[advance] {row['id']} awaits reviewer {_rev}, which is not running — skipping")
                 return False
@@ -12336,10 +12356,15 @@ def _advance_open_card(session_name: str) -> bool:
                 slog(f"[advance] {row['id']}: reviewer {_rev} has been nudged {_rn} times in 24h "
                      f"— budget spent, going quiet")
                 return False
+            # Name the ACTUAL transition. A card at `done` told to "ack review->done"
+            # is being pointed at a move it already made, which is the same
+            # already-answered-question defect as the gate_next ternary.
+            _rev_next = "verified" if row["status"] == "done" else "done"
             ok, err = send_text(_rev,
-                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in review and names YOU as "
-                f"reviewer. Review it: if the work holds, ack review->done yourself (your "
-                f"X-Amux-Session is the required sign-off); if not, say what fails on the card. "
+                f"[amux] {row['id']} ({(row['title'] or '')[:80]}) sits in "
+                f"'{row['status']}' and names YOU as reviewer. Review it: if the work "
+                f"holds, ack {row['status']}->{_rev_next} yourself (your X-Amux-Session is "
+                f"the required sign-off); if not, say what fails on the card. "
                 f"The author cannot close it.",
                 defer_if_busy=True)
             if ok:

@@ -161,3 +161,50 @@ def test_done_card_not_nudged_when_verified_does_not_apply(rig):
     mod._status_applies = lambda st, sess: (False, "not enabled for this lane")
     _card(mod, "P-6", "done", "code", desc="x")
     assert _nudge(mod, sent) == "", "terminal-at-done card was nudged with nowhere to go"
+
+
+# ─────────────── third cause: done + unacked reviewer (MF-495 canary) ────────
+
+def test_done_card_with_unacked_reviewer_routes_to_the_REVIEWER(rig):
+    """AMUX-2478 third cause, predicted from mixpeek-frustrations' MF-495.
+
+    The sign-off REQUIREMENT covers `new_status in ("done","verified")` — widened
+    from review-only so an author could not skip review via doing->verified
+    (AMUX-2217). The ROUTING that tells the reviewer they owe an ack still tested
+    `status == "review"`. A card at done with an unacked reviewer therefore nudged
+    its AUTHOR to reach verified, every attempt 409'd on "review sign-off required",
+    and the reviewer was never told. No coherent action exists for either party.
+    """
+    mod, sent = rig
+    _card(mod, "P-7", "done", "investigation", desc="negative result recorded")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-7'")
+    db.commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+
+    assert sent, "nothing was sent — the card fell through both edges entirely"
+    target, msg = sent[-1]
+    assert target == "peer", (
+        f"nudge went to {target!r}, not the reviewer — the author cannot close a "
+        f"reviewer-gated card, so this is an unactionable loop")
+    assert "ack done->verified" in msg, msg
+    assert "review->done" not in msg, "told the reviewer to ack a move the card already made"
+
+
+def test_review_card_routing_still_says_review_to_done(rig):
+    """Guard the case that already worked, so widening the predicate cannot break it."""
+    mod, sent = rig
+    _card(mod, "P-8", "review", "code", desc="x")
+    db = mod.get_db()
+    db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-8'")
+    db.commit()
+
+    mod._advance_last.pop("probe", None)
+    sent.clear()
+    mod._advance_open_card("probe")
+
+    assert sent and sent[-1][0] == "peer"
+    assert "ack review->done" in sent[-1][1]
