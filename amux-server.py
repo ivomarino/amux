@@ -40143,7 +40143,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.514';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.515';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -52183,7 +52183,19 @@ function renderBoard() {
     if (!stObj.stray) {
       html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
       if (!isBuiltIn) {
-        html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete column">&#x2715;</button>';
+        // TRASH, NOT ✕ (AMUX-2491). This used the same glyph as every dismiss
+        // control in the app — search-clear, filter chips, tab close, pane close,
+        // modal close: 43 uses of U+2715, most of them meaning "close this, no
+        // consequences". One of them silently meant "delete this column and
+        // rewrite the status of every card in it". A dismiss reflex, or an agent
+        // clicking every ✕ to clear overlays, lands on a destructive confirm.
+        //
+        // The codebase already had the right convention and had not applied it
+        // here: the dictionary UI uses &#128465; with class="danger" for delete.
+        // Making the glyph carry the semantics is what stops the collision — a
+        // confirm dialog is a last line, not a substitute for an affordance that
+        // never should have looked dismissible.
+        html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete the ' + esc(stObj.label) + ' column">&#128465;</button>';
       }
     }
     html += '</span></div>';
@@ -53329,7 +53341,20 @@ function toggleColCollapse(st) {
 async function deleteBoardStatus(id) {
   const stObj = boardStatuses.find(s => s.id === id);
   const label = stObj ? stObj.label : id;
-  if (!await showConfirm('Delete "' + label + '" column? Items will move to To Do.', 'Delete', true)) return;
+  // SAY HOW MANY CARDS THIS REWRITES (AMUX-2491). "Items will move to To Do" is
+  // true and tells you nothing about the size of what you are agreeing to — the
+  // difference between an empty column and 40 cards losing their status is the
+  // whole decision, and it was the one number the dialog withheld. Counted from
+  // the loaded board with the same canon the columns bucket by, so it matches
+  // the count shown on the column header you just clicked.
+  const n = (typeof boardItems !== 'undefined' ? boardItems : [])
+    .filter(i => !i.archived && _statusCanon(i.status) === id).length;
+  const msg = n
+    ? 'Delete the "' + label + '" column?\n\n' + n + ' card' + (n === 1 ? '' : 's')
+      + ' will be moved to To Do and lose the "' + label + '" status. This is recorded '
+      + 'on each card, but there is no undo button — you would restore them by hand.'
+    : 'Delete the "' + label + '" column? It is empty, so no cards are affected.';
+  if (!await showConfirm(msg, 'Delete column', true)) return;
   const r = await apiCall(API + '/api/board/statuses/' + id, { method: 'DELETE' });
   if (r && r.ok) {
     boardStatuses = boardStatuses.filter(s => s.id !== id);
@@ -54221,7 +54246,7 @@ function _wsRenderProfileBar() {
   el.innerHTML = names.map(n => {
     const safe = n.replace(/'/g, "\\'");
     return `<span class="ws-profile-chip" onclick="wsLoadProfile('${safe}')">${esc(n)
-      }<button class="ws-profile-del" onclick="event.stopPropagation();wsDeleteProfile('${safe}')" title="Delete">&#x2715;</button></span>`;
+      }<button class="ws-profile-del" onclick="event.stopPropagation();wsDeleteProfile('${safe}')" title="Delete this browser profile">&#128465;</button></span>`;
   }).join('');
 }
 
@@ -59655,7 +59680,7 @@ function _crmRenderInteractions(interactions) {
       '<div class="crm-ix-meta">' +
         '<span class="crm-ix-date">' + ix.date + '</span>' +
         '<span class="crm-ix-type ' + esc(ix.type) + '">' + esc(ix.type) + '</span>' +
-        '<span class="crm-ix-del" onclick="_crmDeleteIx(\'' + esc(ix.id) + '\')" title="Delete">&#x2715;</span>' +
+        '<span class="crm-ix-del" onclick="_crmDeleteIx(\'' + esc(ix.id) + '\')" title="Delete this interaction">&#128465;</span>' +
       '</div>' +
       (ix.notes ? '<div class="crm-ix-notes">' + esc(ix.notes) + '</div>' : '') +
       (fuText ? '<span class="crm-ix-fu' + (od ? ' overdue' : '') + '">' + fuText + '</span>' : '') +
@@ -61855,7 +61880,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.514';
+const CACHE = 'amux-v0.9.515';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -67419,13 +67444,40 @@ class CCHandler(BaseHTTPRequestHandler):
                 if method == "DELETE":
                     if sid in ("backlog", "todo", "doing", "review", "done", "verified", "discarded"):
                         return self._json({"error": "cannot delete built-in status"}, 400)
+                    # AUDIT THE BULK STATUS REWRITE (AMUX-2491). Deleting a column
+                    # rewrites `status` on every card in it, and this used to leave
+                    # NO trace: no History line, no interaction_log row, and the
+                    # prior status overwritten. So an accidental confirm was both
+                    # unrecoverable and undiagnosable — you could not even find out
+                    # which cards had moved, let alone what they were.
+                    #
+                    # That is what makes the affordance dangerous rather than merely
+                    # untidy, and it is ethos rule 4: when this goes wrong, what
+                    # will someone see? Previously, nothing. The age-sweep already
+                    # does this correctly per card; this is the same treatment.
+                    _moved = db.execute(
+                        "SELECT id, status FROM issues WHERE status = ? AND deleted IS NULL",
+                        (sid,)).fetchall()
+                    # Same resolver every other attributed write uses, so a column
+                    # delete cannot be the one board mutation that lands
+                    # unattributed (AMUX-2352 routes both header spellings here).
+                    _actor = _hdr_worker(self.headers) or "human"
+                    for _r in _moved:
+                        _append_board_log(_r["id"],
+                                          f"status: {sid} -> todo (column '{sid}' deleted by {_actor})")
+                        _ilog("board", "status-column-delete", actor=_actor, target=_r["id"],
+                              detail={"deleted_status": sid, "moved_to": "todo"},
+                              before={"status": _r["status"]}, ok=True)
                     db.execute("DELETE FROM statuses WHERE id = ? AND is_builtin = 0", (sid,))
                     db.execute(
                         "UPDATE issues SET status = 'todo' WHERE status = ? AND deleted IS NULL", (sid,)
                     )
                     db.commit()
                     _board_changed()
-                    return self._json({"ok": True})
+                    slog(f"[board] column '{sid}' deleted by {_actor} — {len(_moved)} card(s) moved to todo")
+                    # `moved` lets the caller say what it just did instead of a bare ok.
+                    return self._json({"ok": True, "moved": len(_moved),
+                                       "ids": [r["id"] for r in _moved[:50]]})
                 if method == "PATCH":
                     body = self._read_body()
                     label = body.get("label", "").strip()
