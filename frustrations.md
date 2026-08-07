@@ -777,3 +777,35 @@ NOTE: second entry today whose root is an instrument that returns a plausible an
   of silence" — and both were caught by a number looking wrong, not by the check failing.
   Two independent sessions, same root, same day: that is the argument this belongs in the
   guard rather than in anyone's discipline.
+
+## Column delete and modal close share the ✕ affordance — a dismiss loop hit a destructive confirm
+AREA: board
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-07
+SESSION: amux
+CARD: AMUX-2491
+SYMPTOM: driving the cloud board in a browser, I dismissed onboarding modals with a blanket
+  `document.querySelectorAll("button")` loop clicking anything whose text was `✕` or `Skip`.
+  It reported `{"dismissed":26}`. One of those 26 was a board COLUMN's delete control, and the
+  next screenshot showed `Delete "Summary" column? Items will move to To Do.` with Delete and
+  Cancel. I cancelled; all 10 Wexus columns and all 9 issues verified intact afterwards via the
+  API, so nothing was lost.
+COST: a near-miss, not a loss — but the loss would have been a customer demo env's custom
+  workflow column (`summary`) plus the silent relocation of its cards to To Do, discovered by
+  nobody until a prospect opened the board. The blast radius was three envs' worth of
+  hand-built demo state and the only thing between it and a live confirm dialog was that I
+  screenshotted before clicking again.
+FIX: two halves, and the first is mine — never write a blanket click-everything-matching loop
+  against a live UI; enumerate and check what each target IS before clicking. The amux half is
+  real too and is why this is logged rather than swallowed: a DESTRUCTIVE control (delete this
+  column, cards get moved) is rendered with the same `✕` glyph as DISMISSIVE controls (close
+  this modal). Nothing in the affordance distinguishes "close this thing" from "destroy this
+  thing and relocate its contents", so any agent — or any human clicking fast — can hit it.
+  Column delete should be behind a distinct affordance (an overflow menu, or a trash glyph),
+  not the same character as every close button on the page.
+NOTE: same family as the night's other entries, one layer out. Every one of those was an
+  instrument that could not distinguish two states; this is a CONTROL that does not distinguish
+  two intents. The lesson generalises the same way: if two things that must never be confused
+  look identical at the point of use, something will eventually confuse them, and being careful
+  is not a mechanism.
