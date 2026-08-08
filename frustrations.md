@@ -1034,3 +1034,27 @@ FIX: Time these GETs with per-request thread CPU alongside slog lock-wait, so lo
   contention (AC-174) and `_load_board` SQL cost over full board history are distinguishable
   instead of both presenting as "the board is slow". Right now the instrument cannot tell them
   apart, which is the actual defect — two live hypotheses and no way to separate them.
+
+## `amux send` fell back to raw tmux and the message never arrived
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-07
+SESSION: amux-cloud
+CARD: AC-174
+SYMPTOM: `amux send amux --stdin` with a ~70-line report hit the server during a transient
+  wedge and fell back to keystroke injection:
+    warning: amux server unreachable — falling back to raw tmux (UNSTAMPED, unaudited)
+    injected into amux via raw tmux — DELIVERY UNVERIFIED, no origin stamp, no audit.
+  I peeked and none of five distinctive strings from the message were in the recipient's
+  history. The message was gone. The server answered /health 200 in 0.19s a minute later.
+COST: One report lost, ~10 min to detect and re-send. Would have been a silent loss if I had
+  not checked — and the loud warning is the only reason I did.
+FIX: Credit where due: the warning is exactly right — it names the degradation, says delivery
+  is unverified, and prints the peek command to confirm. That is what made this cheap, and it
+  should be the model for every degraded path in amux. What is missing is the next step: on
+  server-unreachable, QUEUE the message and retry when /health answers, instead of firing
+  keystrokes at a pane that may have a picker open. A long message is exactly the case where
+  keystroke injection is least likely to survive and most expensive to lose. Failing that,
+  verify-after-inject (grep the recipient's history for a nonce) so the CLI itself reports the
+  loss rather than leaving the sender to discover it.
