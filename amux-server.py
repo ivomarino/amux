@@ -12922,6 +12922,41 @@ def _advance_open_card(session_name: str) -> bool:
             if (_dep.get("session") or "") == session_name:
                 if not is_running(session_name):
                     return False
+                # IS THE BLOCKER ACTIONABLE BY THIS SESSION? (AC-298)
+                #
+                # Owning a card is not the same as being able to advance it. This
+                # branch checked only `dep.session == me` and then said "drive it
+                # through its gates" — but a card in `review` cannot be moved by
+                # its AUTHOR: review->done requires the reviewer's sign-off, and
+                # the gate rejects the author's own ack. A card parked in backlog
+                # on an external trigger is waiting on the world, not on work.
+                #
+                # In both cases the nudge asks for something no honest action of
+                # the recipient's can produce, and it re-fires every advance
+                # cycle. It fired EIGHT times at me for AC-294 in one session:
+                # fixed, committed, in review, reviewer amux-gtm, and the deploy
+                # that would verify it gated on a human decision. The only way to
+                # make it stop was to force a gate I could not satisfy — so a
+                # nudge meant to enforce the gates was manufacturing pressure to
+                # lie to them (ethos rule 3).
+                #
+                # Skips announce themselves, because a silent skip is
+                # indistinguishable from a nudge that was never due (rule 4).
+                _dstat = (_dep.get("status") or "").lower()
+                _drev = (_dep.get("reviewer") or "").strip()
+                _why_stuck = ""
+                if _dstat == "review":
+                    _why_stuck = (f"in review awaiting {_drev}'s sign-off" if _drev
+                                  else "in review awaiting a peer's sign-off")
+                elif _dstat == "backlog" and (_dep.get("source_ref") or "").strip():
+                    _why_stuck = "parked in backlog on an external trigger"
+                elif _dstat in ("done", "verified", "discarded"):
+                    _why_stuck = f"already {_dstat}"
+                if _why_stuck:
+                    slog(f"[advance] {session_name}: {row['id']} blocked by own "
+                         f"{_dep_id}, but that is {_why_stuck} — not actionable by "
+                         f"this session, not nudging (AC-298)")
+                    return False
                 ok, err = send_text(session_name,
                     f"[amux] {row['id']} is blocked by {_dep_id} ({(_dep.get('title') or '')[:80]}), "
                     f"which is YOURS. Work the dependency first: drive {_dep_id} through its gates, "
