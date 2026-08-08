@@ -1535,3 +1535,37 @@ NOTE: this is AMUX-2325 one verb over, and the same argument applies — the gat
   the unattributed ones. The second half is the ethos rule-6 corollary in its purest form:
   the refusal destroyed the evidence needed to satisfy it. Together they are the third
   AREA: cli entry where the sanctioned command cannot express something the gate requires.
+
+## No rig can render amux at phone width, so the mobile half of `verified` is undecidable
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-18
+SYMPTOM: amux is mobile-first by policy and `verified` is meant to include the real UI at
+  phone width. Three rigs, none can do it. (1) The shipped driver: POST /api/browser/start
+  takes url/profile/session/fresh/backend — no viewport parameter — and in-page
+  window.resizeTo(390,844) is ignored (innerWidth stayed 1280, matchMedia('(max-width:600px)')
+  false). (2) Chrome CDP, the one rig with real device emulation: localhost:9222 returns 404,
+  and cdp.mjs has no emulate verb anyway. (3) iOS Simulator, which my own notes call ground
+  truth: HTML renders but the app sits on "Connecting to server…" and /health stays blank
+  through a long settle, so the API never answers inside the sim; adding the root cert per the
+  documented recipe changed nothing, and simctl has no tap primitive to dismiss the first-run
+  tour that covers the page.
+COST: Two verifications in one afternoon. AMUX-2369 is literally titled "mobile optimized" and
+  could not be verified on that axis — left `done` with the check handed back to a human with
+  a phone. AMUX-2367 shipped an unresolvable question: `.send-row button` declares
+  min-height:40px with no override in any of the 48 mobile media blocks, under the 44px rule,
+  but min-height is a floor and I could not measure a rendered button, so it went on the card
+  as a flag rather than a finding.
+FIX: Cheapest and highest-value is a window size (or an `emulate` action) on the driver amux
+  already ships and already launches — it is the default path and it is one launch argument
+  from working. Then CDP (enable 9222 + an emulate verb). The simulator is the
+  highest-fidelity rig and worth repairing, but it has two independent blockers.
+NOTE: this is ethos rule 3 with a tooling shape. The verified gate asks for a check no shipped
+  tool can perform, so it resolves the same way every time: the reviewer writes "could not
+  check at phone width" and the mobile half of `verified` quietly becomes decorative. It will
+  do that on every mobile card until a rig exists — which is exactly the "constraint that
+  cannot be satisfied honestly" pattern, except the dishonest exit here is silent omission
+  rather than a false ack.
