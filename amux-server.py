@@ -6772,6 +6772,25 @@ def _hydrate_rate_limit_state() -> None:
     except Exception as e:
         try: slog(f"[rate-limit] hydrate failed: {e}")
         except Exception: pass
+
+
+def _clear_credit_limit(name: str, why: str) -> None:
+    """Clear a credit/model-cap flag on its REMEDY (AF-14, option 2 of the
+    three on the card). Unlike a rate limit, a credit cap carries no reset
+    clock — it ends when the model changes or the session restarts, both
+    events amux observes directly, so clearing there is correct by
+    construction (no pane inference, which can mistake a scrolled-out banner
+    for resolution). If the cap is in fact still live, the next scan re-arms
+    it within ~60s from the banner Claude re-prints. This clear became
+    REQUIRED when rate-limit state started persisting across server restarts
+    (e21ef3d) — before that, execv amnesia was accidentally providing it."""
+    acts = _session_auto_actions.get(name)
+    if acts and acts.get("rate_limit_credits"):
+        acts.pop("rate_limit_credits", None)
+        acts.pop("rate_limit_model_name", None)
+        slog(f"[rate-limit] session={name} credit-limit flag cleared ({why}); "
+             f"re-detects within a scan if the cap is still live")
+        _persist_rate_limit_state()
 # How long a needs:you card stays quiet before the holder is asked whether the
 # ASK still holds (AMUX-2270). Config, not a constant, because the right value
 # depends on how fast the human actually answers — which is not amux's to guess.
@@ -19970,6 +19989,11 @@ def list_sessions() -> list:
             # NOT auto-resume; surfaced in bulk actions for a one-tap switch.
             "credit_limited": bool(_aa.get("rate_limit_credits")),
             "credit_limit_model": _aa.get("rate_limit_model_name", ""),
+            # When the cap was last SEEN on the pane — a stale detection must be
+            # visible AS stale (AF-14 option 3; the rule-4 move that would have
+            # made both credit-limit audits unnecessary).
+            "credit_limited_since": (int(_aa.get("rate_limit_last_event_ts", 0) or 0)
+                                     if _aa.get("rate_limit_credits") else 0),
             # When the current 'waiting' episode began (0 = not waiting). A
             # session parked at a selector does no work and nothing surfaced
             # that: the AMUX-1882 escalation only fires when messages are
@@ -23718,6 +23742,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
     with _get_session_lock(name):
         if is_running(name):
             return True, "already running"
+        _clear_credit_limit(name, "session (re)start")
         cfg = parse_env_file(f)
         if cfg.get("CC_ARCHIVED") == "1":
             return False, "session is archived; wake it first"
@@ -37269,7 +37294,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
-          ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)">${esc(s.credit_limit_model || 'model')} limit</span>` : ''}
+          ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
           ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
           ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
           ${s.tokens ? `<span class="token-count">${fmtTokens(s.tokens)}</span>` : ''}
@@ -41333,7 +41358,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.524';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.525';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -63198,7 +63223,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.524';
+const CACHE = 'amux-v0.9.525';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -75803,6 +75828,10 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     if current_provider not in _SESSION_PROVIDERS:
                         current_provider = "claude"
                     was_running = is_running(name)
+                    # Switching model IS the remedy for a per-model credit cap
+                    # (AF-14) — clear the flag here rather than waiting for
+                    # pane evidence the swap may never render.
+                    _clear_credit_limit(name, f"model changed to {model_val or 'default'}")
                     if _capture_log_tail_for_reload(name, "model swap"):
                         _mark_pending_log_reload(name, "model swap")
                     _write_env(env_file, cfg)
