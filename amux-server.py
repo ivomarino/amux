@@ -40143,7 +40143,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.517';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.518';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -55192,6 +55192,22 @@ async function _swOfferGoodOrigin() {
   try { info = await (await fetch(API + '/api/offline-origin')).json(); } catch(e) {}
   const here = location.origin;
   const good = info && info.good_origin;
+  // A TRUSTED ORIGIN GETS NO RED BANNER (AC-294). If TLS was terminated by a
+  // proxy with a real certificate, offline mode being unavailable is not
+  // something the reader can act on — there is no origin to switch to and
+  // nothing to install — so a full-width red failure bar is pure alarm. It was
+  // the first thing a prospect saw on every cloud demo workspace.
+  //
+  // NOT silenced, only de-escalated: the console.warn at the call site, the
+  // `amux_sw_error` localStorage entry and `_swFailure` all still record the
+  // real error, so this stays diagnosable by anyone who goes looking. The bar
+  // exists to tell a LOCAL user which origin to re-install from, and that
+  // advice is still delivered in full when it applies.
+  if (info && info.proxied) {
+    console.warn('[amux] offline mode unavailable on this origin (proxied TLS) — '
+                 + 'not a certificate problem, nothing to install:', info.why);
+    return;
+  }
   const bar = document.createElement('div');
   bar.id = 'sw-fail-bar';
   bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9999;'
@@ -61880,7 +61896,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.517';
+const CACHE = 'amux-v0.9.518';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -65112,6 +65128,43 @@ class CCHandler(BaseHTTPRequestHandler):
             except Exception:
                 ts = ""
             good = f"https://{ts}:{_AMUX_SELF_PORT}" if ts else ""
+            # DID THIS REQUEST ARRIVE OVER A TRUSTED ORIGIN? (AC-294)
+            #
+            # Everything below this line used to introspect OUR OWN cert and
+            # report the result as the reason a service worker failed. Behind a
+            # reverse proxy those are different facts: the gateway terminates TLS
+            # with a real certificate, and the container's view of its own
+            # self-signed cert says nothing about how the browser saw the page.
+            #
+            # The cost of conflating them was a full-width red banner on EVERY
+            # cloud workspace — verified in two prospect orgs — telling hosted
+            # users "No Tailscale hostname found... Install Tailscale, or run
+            # `mkcert` and restart amux". That is correct advice for a local OSS
+            # user and unactionable for someone evaluating a hosted product: a
+            # VPN and a cert tool for a machine they do not have and cannot
+            # reach. Found only by looking at the rendered page; the API layer
+            # was green throughout, which is why AC-277-280 specify browser
+            # verification.
+            #
+            # X-Forwarded-Proto is the gateway-injected header the
+            # single-codebase rule prescribes, and is already how four other
+            # handlers in this file derive scheme. No IS_CLOUD branch.
+            if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+                _host = ((self.headers.get("X-Forwarded-Host") or "").strip()
+                         or self.headers.get("Host") or "")
+                return self._json({
+                    "tailscale_hostname": ts,
+                    "good_origin": f"https://{_host}" if _host else "",
+                    "trusted_cert": True,
+                    "proxied": True,
+                    # Say what is true and what the reader can do, which here is
+                    # nothing. A service-worker failure on a proxied origin is
+                    # not a certificate problem, so no cert advice belongs in it.
+                    "why": ("This origin's TLS was terminated by a proxy with a real "
+                            "certificate, so a service-worker failure here is NOT a "
+                            "certificate problem and there is nothing to install. "
+                            "Offline mode is unavailable on this workspace."),
+                })
             return self._json({
                 "tailscale_hostname": ts,
                 "good_origin": good,
