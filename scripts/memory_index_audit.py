@@ -35,6 +35,16 @@ MEMORY.preamble-backup.md and amux.md, the latter opening "CLAUDE-TAG-MEM-MARKER
 amux-tagged lanes". Neither is a memory. Without the exclusion this reports a defect on a clean
 directory, which is how a good check gets switched off by the second person who runs it.
 
+AUDIT THIS READER BY READING IT, ON A SCHEDULE — do not wait for it to annoy someone. Three reader
+bugs have been found here (fragments, one-link-per-line, archive never resolution-checked) and all
+three share a failure mode: each made the tool report CLEAN or report the wrong thing, never raise a
+false alarm. That is not coincidence, it is selection. A reader bug that OVER-reports gets fixed the
+day someone trips over it, so the bugs that survive in any detector are selected for silence. Both
+were found by peers reading the source against their own data (general-canvas-apps and creative-dna,
+2026-08-08); nobody was burned into finding them, and nothing in the output would have led there.
+Corollary for anyone extending this file: the assertions most worth doubting are the ones that have
+never failed.
+
 BEFORE YOU BULK-ACT ON THIS TOOL'S OUTPUT, RE-RUN IT. general-canvas-apps' lesson from using it
 (2026-08-08), and the most transferable thing in its history: mid-way through a 151-file indexing pass
 they appended a file to the archive because it appeared in the orphan list, and it was in that list
