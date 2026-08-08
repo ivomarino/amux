@@ -38196,12 +38196,18 @@ function _embedFitZoom() {
 // terminal, notes, logs, …) — or peek:<session> as a shorthand for a peek tile.
 // Each panel is an isolated iframe, so singleton views never collide.
 // sessions→session-view etc.; mirror switchView's id/name mapping.
+// notes: removed with the subsystem (AMUX-2389's last splinter — the dead key
+// let ?embed=notes pass the allowlist and set a view with no element, inside
+// the very allowlist meant to contain it; found by amux-frustrations with an
+// 18-entries/17-resolve control). groups/proxies/messages/sql/mcp added the
+// same day for the mirror this comment promises — every entry verified
+// against a real id= in this file.
 const _EMBED_VIEW_EL = {
-  sessions:'session-view', board:'board-view', calendar:'calendar-view',
-  scheduler:'scheduler-view', files:'files-view', logs:'logs-view',
-  notes:'notes-view', crm:'crm-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
-  torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view',
-  graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view'
+  sessions:'session-view', board:'board-view', groups:'groups-view', calendar:'calendar-view',
+  scheduler:'scheduler-view', files:'files-view', proxies:'proxies-view', logs:'logs-view',
+  messages:'messages-view', crm:'crm-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
+  torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view', sql:'sql-view',
+  graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view', mcp:'mcp-view'
 };
 let _embedViewApplied = false;
 (function() {
