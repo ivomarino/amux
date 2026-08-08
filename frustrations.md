@@ -1505,3 +1505,30 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
+
+## `amux board review` cannot name the reviewer, so completing a handoff requires leaving the audited path
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-16
+SYMPTOM: `amux board review <ID>` has no --reviewer flag (usage: [--checked] [--ack]
+  [--type] [--override-doing] [--trigger] [--force]). A card moved to `review` with
+  reviewer=None is a card nobody has been asked to look at, and the review gate rests
+  entirely on the reviewer's X-Amux-Session being the required sign-off. So the sanctioned
+  command produces the status but not the state that means anything; the only completion is
+  a raw PATCH for `reviewer`.
+COST: Two writes and a hand-passed X-Amux-Session where one attributed command should do.
+  Compounding: `amux board review AF-15 --checked "..." --reviewer amux --outcome-stdin
+  <<EOF ...` failed on the unknown flag — loudly and correctly — but the --outcome-stdin
+  body was already consumed and was discarded with the rejected invocation, so ~40 lines of
+  review outcome had to be re-authored.
+FIX: Add --reviewer <session> to `amux board review` (arguably to every status verb, so a
+  card can be routed as it is created). Separately, validate argv BEFORE draining stdin, or
+  echo the consumed body back on rejection.
+NOTE: this is AMUX-2325 one verb over, and the same argument applies — the gate system
+  depends on attributed writes, so a gap in the audited path is precisely what manufactures
+  the unattributed ones. The second half is the ethos rule-6 corollary in its purest form:
+  the refusal destroyed the evidence needed to satisfy it. Together they are the third
+  AREA: cli entry where the sanctioned command cannot express something the gate requires.
