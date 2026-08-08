@@ -37160,7 +37160,13 @@ function render() {
           ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
-          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','groups','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
+          ${/* field is 'tags', the INTERNAL name — b009f6e's vocab pass renamed
+               this argument to 'groups' as if it were a display string, and
+               every branch in editField/submitEdit tests 'tags', so the Groups
+               editor opened as a bare text box and Save silently did nothing
+               (AMUX-2559, "I cant add a worker to a group"). The label is the
+               vocab; the field is the contract. */ ''}
+          <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
