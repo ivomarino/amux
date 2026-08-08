@@ -1575,3 +1575,54 @@ NOTE: this is ethos rule 3 with a tooling shape. The verified gate asks for a ch
   do that on every mobile card until a rig exists — which is exactly the "constraint that
   cannot be satisfied honestly" pattern, except the dishonest exit here is silent omission
   rather than a false ack.
+
+---
+
+## tmux -t is a PREFIX match, so an archived short name kept killing the live longer name
+AREA: lifecycle
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux
+CARD: AMUX-2555
+SYMPTOM: social-media died 61s after every start, for days, with no stop event and no
+  log line naming it. The only trace was "[cleanup] reaped 1 orphan tmux session(s)
+  for archived/blocked: social" — a DIFFERENT session's name. An archived env named
+  `social` made every sweep run kill-session -t amux-social; tmux found no exact match
+  and prefix-matched amux-social-media. The kill was invisible from both ends: the log
+  names the archived session, and a tmux death outside stop_session emits no event.
+COST: Ethan restarted the worker repeatedly across at least two days and filed two
+  cards; the lane lost every turn it started; diagnosis took an afternoon because the
+  discriminating line was attributed to another session.
+FIX-NOTE: 7f293eb — tmux_target() returns '=name' (exact, tmux>=2.1) so ~57 call
+  sites inherit it; 14 direct -t sites exactified; live-tmux behavioral test pins the
+  semantics. The same prefix rule applies to send-keys, which is a plausible mechanism
+  for AMUX-1730's cross-session delivery — noted on that card. Residual worth an
+  entry of its own someday: a tmux session dying by ANY external cause still emits no
+  session.stopped event (rule 4 — this incident was reconstructed from absence).
+
+---
+
+## One vocab rename, fourteen silent client casualties across four features
+AREA: client
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux
+CARD: AMUX-2553
+SYMPTOM: b009f6e (sessions->workers, tags->groups "in client strings") also rewrote
+  identifiers and a dispatch field. Casualty census: offline seed (cb40d22), SSE
+  handler (8bf3b7f), #peek= deeplink gate, board-card LIVE emphasis, schedule-modal
+  worker dropdown, five Workspace-grid functions (6ff5a81), and the card menu's
+  editField field arg 'tags'->'groups' so Groups edits silently no-oped (40305cf).
+  Every one failed CALM: typeof guards and (x || []) short-circuits read a dead
+  global as false/empty, and an unmatched dispatch string falls through every branch.
+COST: two days of degraded features nobody attributed (offline view, peek links,
+  grid, group membership), three separate Ethan reports, and five fix commits.
+FIX-NOTE: the durable outputs are the CLASS invariants, each with a can-it-fail arm
+  run against the pre-fix blob: no bare assignment to the dead global, no READ of it
+  (test_client_storage_budget — whose own first cut was theatre, caught by its own
+  arm: a newline-spanning backtick stripper swallowed the specimens), and every
+  editField call-site field must have a dispatcher branch (test_editfield_contract).
+  The pattern for next time: a rename in a 74k-line single file with no type system
+  needs its invariant test written FIRST, from the rename's own diff.
