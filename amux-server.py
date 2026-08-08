@@ -2377,7 +2377,22 @@ def _bu_lock_for(session: str) -> threading.Lock:
     with _bu_driver_lock:
         lk = _bu_session_locks.get(session)
         if lk is None:
-            lk = _bu_session_locks[session] = threading.Lock()
+            # RLock, NOT Lock, and this is load-bearing (AC-290). _bu_driver_call
+            # holds this lock and calls _bu_driver_stop on two paths — a profile
+            # change and an IO error. _bu_driver_stop must ALSO take it, or the
+            # /api/browser/stop endpoint can tear a driver down underneath a call
+            # that is mid-select on the same pipe. With a plain Lock those two
+            # requirements are contradictory: the inner acquire self-deadlocks,
+            # blocks for the full acquire timeout, and returns "busy with a
+            # previous call" — this subsystem's own symptom, manufactured by the
+            # fix for it. amux-cloud called that trap in the AC-290 report before
+            # anyone walked into it.
+            #
+            # Re-entrancy here is structural rather than accidental: teardown is
+            # legitimately reachable from inside a call and from outside it, and
+            # RLock lets _bu_driver_stop state its own requirement instead of
+            # depending on every call site to remember which it is.
+            lk = _bu_session_locks[session] = threading.RLock()
         return lk
 
 def _bu_driver_stop(session: str, explicit: bool = False):
@@ -2391,12 +2406,28 @@ def _bu_driver_stop(session: str, explicit: bool = False):
     in `with _bu_driver_lock:` because that is what the old code did. Splitting the
     function is what makes the mistake unavailable rather than merely avoided.
     """
-    with _bu_driver_lock:
-        if explicit:
-            _bu_driver_ever.discard(session)
-        d = _bu_drivers.pop(session, None)
-    if not d:
-        return
+    # SESSION LOCK FIRST (AC-290). Without it, POST /api/browser/stop could write
+    # `close` into a pipe an in-flight call was mid-select() on — the exact
+    # interleaving the per-session lock exists to prevent, and the one caller that
+    # sat outside the invariant. Pre-existing: the lock-free version predates
+    # AC-289 and the window is unchanged in width; making the invariant explicit is
+    # what let amux-cloud notice the caller outside it.
+    #
+    # Held across proc.wait(timeout=8) ON PURPOSE — that is the whole point, and it
+    # only blocks THIS session, which is the difference between this and AC-289.
+    # The REGISTRY lock still is not, because that one is global.
+    with _bu_lock_for(session):
+        with _bu_driver_lock:
+            if explicit:
+                _bu_driver_ever.discard(session)
+            d = _bu_drivers.pop(session, None)
+        if not d:
+            return
+        _bu_driver_teardown(d)
+
+
+def _bu_driver_teardown(d: dict):
+    """Close a driver process. No locks, no registry — caller owns both."""
     try:
         d["proc"].stdin.write('{"id":"x","verb":"close"}\n')
         d["proc"].stdin.flush()
@@ -72627,8 +72658,15 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     _cdp_call(["close", tid], 10)   # browser-level closeTarget — window.close() can't close our tab
                     _cdp_call(["stop", tid], 8)
                     return self._json({"ok": True, "backend": "live", "closed": tid})
-                if session in _bu_drivers:
-                    _prof = _bu_drivers[session].get("profile", "")
+                # ONE READ, not `in` then `[]` (AC-290, TOCTOU). Between the
+                # membership test and the subscript, any death path — an IO error
+                # in a concurrent call, a `closed` response, another stop — pops
+                # the entry, and the subscript raises KeyError, which surfaces as a
+                # 500 on a request that was about to succeed anyway. `.get()` makes
+                # the window unreachable rather than narrow.
+                _d = _bu_drivers.get(session)
+                if _d is not None:
+                    _prof = _d.get("profile", "")
                     _bu_driver_stop(session, explicit=True)   # AC-233: user asked; forget it
                     return self._json({"ok": True, "backend": "driver",
                                        "closed": True, "profile": _prof,

@@ -80,7 +80,15 @@ def test_per_session_serialisation_is_PRESERVED():
     correctness, so the per-session lock must still exist and still be acquired."""
     assert "_bu_session_locks" in SRC, "the per-session lock registry is gone"
     lf = _fn("_bu_lock_for")
-    assert "threading.Lock()" in lf, "_bu_lock_for no longer creates a real lock"
+    # RLock, and it must STAY an RLock (AC-290): _bu_driver_call holds this lock
+    # and calls _bu_driver_stop, which must also take it so /api/browser/stop
+    # cannot tear a driver down mid-call. With a plain Lock those two requirements
+    # self-deadlock to the acquire timeout and return "busy with a previous call" —
+    # this subsystem's own symptom, produced by the fix for it.
+    assert "threading.RLock()" in lf, (
+        "_bu_lock_for no longer creates an RLock — if it was 'simplified' to Lock, "
+        "_bu_driver_stop's inner acquire self-deadlocks on the two paths where "
+        "_bu_driver_call calls it (profile change, IO error)")
     body = _fn("_bu_driver_call")
     assert re.search(r"_lk\s*=\s*_bu_lock_for\(session\)", body), (
         "the per-session lock is looked up but not bound/acquired")
@@ -160,9 +168,97 @@ def test_two_sessions_do_not_serialise_on_each_other():
                                      "the locks are not independent"
         b.release()
         assert time.monotonic() - t0 < 1.0, "lane-b waited on lane-a's lock"
-        # and the same session genuinely blocks (the invariant that must survive)
-        assert not a.acquire(timeout=0.2), (
-            "a second concurrent call to the SAME session acquired — two calls would "
-            "interleave on one stdin/stdout pipe and corrupt the protocol")
+
+        # THE SAME SESSION MUST BLOCK A DIFFERENT THREAD. Checked from a second
+        # thread on purpose: two concurrent HTTP requests are two threads, which is
+        # the situation this lock exists for. The first version of this assertion
+        # re-acquired from the SAME thread, which a plain Lock refused and an RLock
+        # correctly allows — so it was testing non-reentrancy, an accident of the
+        # old implementation, rather than mutual exclusion, the actual requirement.
+        # It failed the moment RLock landed and it was the test that was wrong.
+        got = []
+        t = threading.Thread(target=lambda: got.append(a.acquire(timeout=0.3)))
+        t.start(); t.join()
+        assert got == [False], (
+            "another THREAD acquired this session's lock while it was held — two "
+            "calls would interleave on one stdin/stdout pipe and corrupt the protocol")
+
+        # ...and the owning thread MAY re-enter, which is what lets _bu_driver_stop
+        # take the lock whether it is called from inside a call or from the endpoint.
+        assert a.acquire(timeout=0.2), (
+            "the session lock is not reentrant, so _bu_driver_stop deadlocks when "
+            "_bu_driver_call invokes it (AC-290)")
+        a.release()
     finally:
         a.release()
+
+
+# ───────────── teardown must not interleave with an in-flight call (AC-290) ──
+
+def test_driver_stop_takes_the_SESSION_lock():
+    """POST /api/browser/stop tore a driver down without the per-session lock, so it
+    could write `close` into a pipe an in-flight call was mid-select() on — the exact
+    interleaving the lock exists to prevent, from the one caller outside the invariant.
+
+    Pre-existing rather than introduced by AC-289: the lock-free version predates it
+    and the window is unchanged in width. Making the invariant explicit is what let it
+    be noticed."""
+    stop = _fn("_bu_driver_stop")
+    assert "_bu_lock_for(session)" in stop, (
+        "_bu_driver_stop no longer takes the session lock — /api/browser/stop can "
+        "again tear down a driver underneath an in-flight call (AC-290)")
+
+
+def test_the_OBVIOUS_fix_would_self_deadlock():
+    """Pins WHY the session lock is an RLock, because the reasoning is invisible from
+    the call sites and 'simplify RLock to Lock' is a tempting cleanup.
+
+    _bu_driver_call holds the session lock and calls _bu_driver_stop on two paths (a
+    profile change and an IO error). _bu_driver_stop must also take it, for the reason
+    above. With a plain Lock those requirements are contradictory: the inner acquire
+    blocks forever against its own thread. Demonstrated rather than asserted.
+    """
+    plain = threading.Lock()
+    plain.acquire()
+    assert not plain.acquire(timeout=0.2), (
+        "threading.Lock became reentrant — if so this whole note is obsolete, delete "
+        "it rather than the RLock")
+    plain.release()
+    r = threading.RLock()
+    r.acquire()
+    assert r.acquire(timeout=0.2), "RLock is not reentrant — the fix does not work"
+    r.release(); r.release()
+
+
+def test_teardown_is_separable_from_the_registry_pop():
+    """The split that keeps AC-289 fixed while adding AC-290: the session lock is held
+    across proc.wait(timeout=8) deliberately (that is the point — it blocks THIS
+    session), but the GLOBAL registry lock must not be, or an 8s fleet-wide stall
+    replaces the 45s one."""
+    assert re.search(r"^def _bu_driver_teardown\(", SRC, re.M), (
+        "the teardown is no longer a separate function, so the registry lock and the "
+        "blocking proc.wait() are at risk of being fused again")
+    td = _fn("_bu_driver_teardown")
+    assert "_bu_driver_lock" not in td, "the global registry lock is held across proc.wait()"
+    assert "_bu_lock_for" not in td, (
+        "teardown acquires the session lock itself as well as its caller — harmless "
+        "with RLock but it means the ownership contract has drifted")
+    stop = _fn("_bu_driver_stop")
+    lock_chunk = re.search(r"with _bu_driver_lock:\n((?: {12}.*\n|\n)*)", stop)
+    assert lock_chunk and "wait(" not in lock_chunk.group(1), (
+        "proc.wait() is back inside the global registry lock — AC-289 at 8s scale")
+
+
+def test_stop_endpoint_has_no_TOCTOU_on_the_registry():
+    """`if session in _bu_drivers:` then `_bu_drivers[session]` — any death path
+    between the two (a concurrent call's IO error, a `closed` response, another stop)
+    pops the entry and the subscript raises KeyError, surfacing as a 500 on a request
+    that was about to succeed."""
+    i = SRC.find('path == "/api/browser/stop"')
+    assert i > 0, "the stop endpoint moved"
+    body = SRC[i:i + 1600]
+    assert not re.search(r"if session in _bu_drivers:\s*\n\s*_prof = _bu_drivers\[session\]", body), (
+        "the stop endpoint reads _bu_drivers twice (membership then subscript); a "
+        "concurrent teardown between them is a KeyError -> 500 (AC-290)")
+    assert "_bu_drivers.get(session)" in body, (
+        "the stop endpoint no longer reads the registry once into a local")
