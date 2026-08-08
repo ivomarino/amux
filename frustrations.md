@@ -1058,3 +1058,59 @@ FIX: Credit where due: the warning is exactly right — it names the degradation
   keystroke injection is least likely to survive and most expensive to lose. Failing that,
   verify-after-inject (grep the recipient's history for a nonce) so the CLI itself reports the
   loss rather than leaving the sender to discover it.
+
+## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-297
+SYMPTOM: Two commits, 20 minutes apart, both `git add amux-server.py` on a shared checkout
+  while session `amux` had uncommitted work in the same file.
+    fc72811 — guard WARNED ("also edited by session 'amux' 30m ago... stages 55 insertions /
+              2 deletions"). I checked line by line. It was genuinely clean, all mine.
+    8adf348 — guard SILENT. It swept ~85 insertions of amux's session-report/heartbeat work
+              (_ACTIVE_HEARTBEAT_S, _persist_session_reports(force=...), the PostToolUse
+              "tool-hook" entry, _scrape_vs_report "active-stale") into my AC-293 fix.
+  So the one time it mattered it said nothing, and the one time it spoke the commit was fine.
+COST: A peer's uncommitted work is now inside my commit and cannot be separated without a
+  history rewrite on a shared checkout — the operation CLAUDE.md records as having destroyed a
+  session's unpushed work. Second occurrence for me; the first was b1c3e93 (~93 lines).
+  Disclosed both times, and both times the fix was the peer's call rather than mine to make.
+FIX: The correlation is the dangerous part, not the miss. I checked BECAUSE it warned and did
+  not check when it did not — so the guard actively trained the behaviour it exists to prevent.
+  A guard that is silent on the true positive is worse than no guard. Find why it fired at 30m
+  and not at ~20m (mtime window? cooldown? a debounce that suppresses a second warning in the
+  same session?) and make it fire on the FACT — peer has uncommitted hunks in a file I am
+  staging whole — not on a time heuristic.
+  Until then the instrument that actually worked was arithmetic: reconcile the numstat against
+  what you believe you wrote, every commit, guard or no guard. 146/14 against a ~60-line change
+  is what caught this. That check needs no guard and cannot go silent.
+
+## In-memory driver registry makes every server save a silent browser-session amnesia
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-296
+SYMPTOM: `_bu_drivers` and `_bu_driver_ever` are module-level and persisted NOWHERE (grepped
+  for db/json/write_text against both names: no hits). amux-server.py re-execs on every save,
+  which on a shared checkout with ~40 lanes editing it happens many times an hour. After a
+  re-exec a session that HAS a live driver is indistinguishable from one that never had one, so
+  `_bu_eval` falls through to the browser-use CLI — a different browser process — instead of
+  returning the `dead-driver` error AC-233 added specifically to forbid that silent fallback.
+  amux-gtm: evals returned backend=driver "until the worker-click eval, which suddenly returned
+  backend:cli", session set explicitly throughout. I saved amux-server.py at least twice during
+  their pass; server uptime was 52s when I checked.
+COST: Two sessions spent a day treating an unreliable browser rig as driver instability or lock
+  contention. It cost amux-gtm the one AC-277 acceptance box neither of us has evidence for
+  (click a worker, see its transcript), and it cost me a wrong hypothesis on AC-289 that amux
+  then spent a measurement disproving.
+FIX: Persist the driver registry the way session reports already are — the ethos file records
+  "in-memory state is fiction, this process re-execs on every save" as a lesson LEARNED for
+  reports, and it was never applied to the registry next door. Persisting `_bu_driver_ever`
+  alone restores the AC-233 guard: the pid may be dead after a restart, but "a driver existed
+  for this session" is exactly the durable fact that turns a silent cli result into an honest
+  error. Related: [[AC-233]], AC-293.
