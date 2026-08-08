@@ -4305,9 +4305,9 @@ def tmux_name(session: str) -> str:
         _tmux_name_migrated.add(session)
         for old in [f"cmux-{session}", f"cc-{session}"]:
             try:
-                r = subprocess.run(["tmux", "has-session", "-t", old], capture_output=True, timeout=3)
+                r = subprocess.run(["tmux", "has-session", "-t", "=" + old], capture_output=True, timeout=3)
                 if r.returncode == 0:
-                    subprocess.run(["tmux", "rename-session", "-t", old, new], capture_output=True, timeout=5)
+                    subprocess.run(["tmux", "rename-session", "-t", "=" + old, new], capture_output=True, timeout=5)
                     break
             except Exception:
                 pass
@@ -4315,8 +4315,19 @@ def tmux_name(session: str) -> str:
 
 
 def tmux_target(session: str) -> str:
-    """Return the tmux target for -t flags."""
-    return tmux_name(session)
+    """Return the tmux target for -t flags — EXACT match, never a prefix.
+
+    tmux resolves a bare -t name by exact-then-unique-PREFIX. With sessions
+    named amux-social (archived) and amux-social-media (live), any operation
+    aimed at the dead one lands on the live one: on 2026-08-08 the
+    archived-session reaper ran `kill-session -t amux-social`, tmux prefix-
+    matched amux-social-media, and Ethan's freshly-started worker died 61s
+    after starting — every start, every sweep, no log naming the victim
+    ("keeps stopping", AMUX-2544/2555). The leading '=' forces exact match
+    (tmux >= 2.1). Same class as cross-session send-keys: a steer aimed at a
+    prefix name would TYPE INTO the longer-named session.
+    """
+    return "=" + tmux_name(session)
 
 
 _tmux_sessions_cache: tuple[float, set[str]] = (0.0, set())
@@ -4370,7 +4381,7 @@ def is_running(session: str) -> bool:
             return False
         try:
             r_pp = subprocess.run(
-                ["tmux", "list-panes", "-t", tmux_sess, "-F", "#{pane_pid}"],
+                ["tmux", "list-panes", "-t", "=" + tmux_sess, "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5)
             if r_pp.returncode == 0 and r_pp.stdout.strip():
                 shell_pid = r_pp.stdout.strip().split("\n")[0]
@@ -9041,7 +9052,7 @@ def _snapshot_all_sessions_inner():
                         try:
                             tmux_sess = tmux_name(name)
                             r_pp = subprocess.run(
-                                ["tmux", "list-panes", "-t", tmux_sess, "-F", "#{pane_pid}"],
+                                ["tmux", "list-panes", "-t", "=" + tmux_sess, "-F", "#{pane_pid}"],
                                 capture_output=True, text=True, timeout=5)
                             if r_pp.returncode == 0 and r_pp.stdout.strip():
                                 shell_pid = r_pp.stdout.strip().split("\n")[0]
@@ -9112,7 +9123,7 @@ def _snapshot_all_sessions_inner():
                     actions["last_stale_check"] = now
                     try:
                         tmux_sess = tmux_name(name)
-                        r = subprocess.run(["tmux", "list-panes", "-t", tmux_sess, "-F", "#{pane_pid}"],
+                        r = subprocess.run(["tmux", "list-panes", "-t", "=" + tmux_sess, "-F", "#{pane_pid}"],
                                            capture_output=True, text=True, timeout=5)
                         if r.returncode == 0 and r.stdout.strip():
                             shell_pid = r.stdout.strip().split("\n")[0]
@@ -21077,7 +21088,7 @@ def _attach_log_streaming():
             pass
         try:
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", tmux_name(name), "-o",
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name), "-o",
                  _log_pipe_command(lp)],
                 capture_output=True, timeout=5,
             )
@@ -22186,7 +22197,7 @@ def _capture_log_tail_for_reload(name: str, reason: str) -> bool:
     if is_running(name):
         try:
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", tmux_name(name)],
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name)],
                 capture_output=True, timeout=5,
             )
         except Exception:
@@ -22262,7 +22273,7 @@ def _stop_session_for_restart(name: str, provider: str) -> tuple[bool, str]:
         return stop_session(name)
     try:
         subprocess.run(
-            ["tmux", "pipe-pane", "-t", tmux_name(name)],
+            ["tmux", "pipe-pane", "-t", "=" + tmux_name(name)],
             capture_output=True, timeout=5,
         )
     except Exception:
@@ -24144,19 +24155,19 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                     check=True, capture_output=True, timeout=10,
                 )
                 # Set remain-on-exit so pane survives if bash crashes
-                subprocess.run(["tmux", "set-option", "-t", tmux_sess, "remain-on-exit", "on"],
+                subprocess.run(["tmux", "set-option", "-t", "=" + tmux_sess, "remain-on-exit", "on"],
                                capture_output=True, timeout=5)
                 # Lock the window name immediately
                 subprocess.run(
-                    ["tmux", "set-option", "-t", tmux_sess, "allow-rename", "off"],
+                    ["tmux", "set-option", "-t", "=" + tmux_sess, "allow-rename", "off"],
                     capture_output=True, timeout=5,
                 )
                 subprocess.run(
-                    ["tmux", "set-window-option", "-t", tmux_sess, "automatic-rename", "off"],
+                    ["tmux", "set-window-option", "-t", "=" + tmux_sess, "automatic-rename", "off"],
                     capture_output=True, timeout=5,
                 )
                 subprocess.run(
-                    ["tmux", "rename-window", "-t", tmux_sess, name],
+                    ["tmux", "rename-window", "-t", "=" + tmux_sess, name],
                     capture_output=True, timeout=5,
                 )
                 # Source profile and cd to work_dir
@@ -24283,7 +24294,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
             except Exception:
                 pass
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", tmux_name(name), "-o",
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name), "-o",
                  _log_pipe_command(lp)],
                 capture_output=True, timeout=5,
             )
@@ -24469,7 +24480,7 @@ def stop_session(name: str) -> tuple[bool, str]:
     
         # Detach pipe-pane before sending shell-visible commands
         try:
-            subprocess.run(["tmux", "pipe-pane", "-t", tmux_sess],
+            subprocess.run(["tmux", "pipe-pane", "-t", "=" + tmux_sess],
                            capture_output=True, timeout=5)
         except Exception:
             pass
@@ -24520,7 +24531,7 @@ def _kill_tmux_session(name: str) -> None:
     """Best-effort removal of the tmux session backing an archived amux session."""
     try:
         subprocess.run(
-            ["tmux", "kill-session", "-t", tmux_name(name)],
+            ["tmux", "kill-session", "-t", "=" + tmux_name(name)],
             capture_output=True,
             timeout=5,
         )
@@ -76157,7 +76168,7 @@ def _tmux_session_exists(name: str) -> bool:
     session that's been reduced to an idle shell — which still holds memory."""
     try:
         r = subprocess.run(
-            ["tmux", "has-session", "-t", tmux_name(name)],
+            ["tmux", "has-session", "-t", "=" + tmux_name(name)],
             capture_output=True, timeout=5,
         )
         return r.returncode == 0
