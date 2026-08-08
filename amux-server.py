@@ -4935,7 +4935,14 @@ def _herdr_create_and_start(name: str, kind: str, args: list, work_dir: str,
     if not d2:
         # Don't leave a half-started pane behind.
         _herdr_json(["pane", "close", pane_id], timeout=10)
-        return False, f"herdr agent start failed ({_err_code})"
+        # Carry the WHOLE failure surface: "(no-json)" alone sent the first
+        # e2e debugging stdout-parsing while the actual answer sat in
+        # stderr/returncode, unlogged — the same instrument gap this retry
+        # loop was added to fix, one layer down.
+        _stderr_tail = ((r2.stderr or "").strip()[-200:] if r2 else "spawn failed")
+        _rc = (r2.returncode if r2 else "none")
+        return False, (f"herdr agent start failed ({_err_code}; rc={_rc}; "
+                       f"stderr={_stderr_tail!r})")
     try:
         env_file = CC_SESSIONS / f"{name}.env"
         cfg = parse_env_file(env_file)
