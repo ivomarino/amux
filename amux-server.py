@@ -12363,8 +12363,25 @@ def _pickup_junk_reason(title: str, desc: str) -> str:
     _folds = len(re.findall(r"New task:", desc))
     if "capture: session prompt" in desc and _folds < 2:
         return "captured chat prompt, not a unit of work"
-    if re.search(r"^\s*\[?(probe|temp|test)\b|\bprobe-stale\b|\bcanary\b|"
-                 r"\btripwire\b|\barmed watch\b", title or "", re.I):
+    # ANCHORED — the artifact word must be the SUBJECT of the title, not merely
+    # mentioned in it (GCA-85). The original anchored probe|temp|test to the
+    # start and left canary/tripwire/armed-watch floating, so any card ABOUT a
+    # canary was classified AS one: three of general-canvas-apps' investigation
+    # cards fired on 'canary' mid-title, and mixpeek-frustrations' MF-523 — a
+    # real merged fix in review — fired on 'tripwire' mid-title while its two
+    # near-identical siblings (no artifact word) sailed through, which is what
+    # made the trigger findable. Verified against all six specimens before and
+    # after: the three mid-title mentions stop firing, "[probe] x" / "Canary:
+    # x" style subjects still do.
+    #
+    # The asymmetry mattered more than a false positive because the prescribed
+    # exit is DECOMPOSE AND DISCARD THE SHELL, and the structure veto that
+    # would have protected these cards runs one check LATER — the title rule
+    # returned first, so the protection built for exactly this case could
+    # never fire. Dormancy still beats structure (a structured tripwire is
+    # still not dispatchable); it just has to actually BE one.
+    if re.search(r"^\s*\[?(probe|temp|test|probe-stale|canary|tripwire|armed watch)\b",
+                 title or "", re.I):
         return "looks like a test artifact or armed tripwire"
     _caps_heads = len(re.findall(r"^[A-Z][A-Z0-9 /'-]{3,40}:", desc or "", re.M))
     if (_caps_heads >= 2
