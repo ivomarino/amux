@@ -1162,3 +1162,30 @@ FIX: `amux board <status> <id> --force "<why>"`, requiring the reason, so the au
   a first-class exit rather than a curl. Bonus: the gate could name the dirty paths' OWNER, since
   it already computes why each path is dirty; "dirty because amux is mid-edit" answers the
   question the message raises.
+
+## The idle nudge told me to commit a peer's in-flight work, calling it "your working directory"
+AREA: notices
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-300
+SYMPTOM: "You went idle with 1 uncommitted change(s) under your working directory
+  (/Users/ethan/Dev/amux): amux-server.py — Commit completed work now... Don't leave the working
+  tree dirty." The change was session `amux`'s, mid-iteration on hook matchers. Nothing of mine
+  was uncommitted (four commits covered it all; I grepped the diff for my own identifiers to be
+  sure). Followed literally, the instruction is "commit your peer's unfinished code".
+COST: Nothing this time, because I checked. But this is the exact mechanism behind both of my
+  sweeps tonight — b1c3e93 (~93 lines) and 8adf348 (~85 lines), both amux's, both disclosed. And
+  the nudge's own remedy for incomplete work is a WIP commit: I checked the tree twice twenty
+  minutes apart and amux's matcher changed "*" -> ".*" with insertions 18 -> 24, and their comment
+  says the "*" version was INERT. So the snapshot I would have committed was known-broken.
+FIX: The nudge already runs `git status`. Run `git diff` too and attribute before instructing:
+  "amux-server.py is dirty, but the changes look like session `amux`'s. Nothing of yours is
+  uncommitted — leave it alone." The data is already in hand; only the conclusion is wrong.
+  Cheapest partial: suppress when the recipient has nothing uncommitted in a file they touched
+  this session, and never suggest a WIP commit for a file they have not written to.
+  SAME ROOT AS AC-297, which is the real argument: two independent instruments guard this seam,
+  and tonight one pushed toward the accident (this nudge) while the other failed to stop it (the
+  staged-guard, silent on the true positive). Either alone is a bug; both failing toward the same
+  accident on the same night says the shared-checkout seam has no working guard.
