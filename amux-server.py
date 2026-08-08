@@ -12874,11 +12874,23 @@ def _advance_open_card(session_name: str) -> bool:
         # which is the inverse of where these cards pile up.
         if _advance_limbo_check(session_name, db):
             return True
+        # NO `done` TIER (Ethan, 2026-08-08: "we shouldnt be sending commands to
+        # idle workers that genuinely have no more work"). `done` was added here
+        # on his 08-06 ask so something drove done -> verified; since then the
+        # DAILY VERIFICATION SWEEP took that job and does it better — one batched
+        # message listing every done card, once a day — while this loop kept
+        # re-waking lanes per card, per cooldown. The token audit measured the
+        # result: 294 advance nudges/day against 25 human prompts, 46% of them
+        # repeats, each wake replaying a 400-600k context. A lane whose only
+        # remaining cards are `done` has nothing IN FLIGHT: it is exactly the
+        # "genuinely no more work" case, and it now stays silent between sweeps.
+        # doing/review remain — those are live work, and pushing them is the
+        # loop's whole point.
         _cands = db.execute(
             "SELECT id, title, status, type FROM issues WHERE session=? AND deleted IS NULL "
-            "AND COALESCE(archived,0)=0 AND status IN ('doing','review','done') "
+            "AND COALESCE(archived,0)=0 AND status IN ('doing','review') "
             "AND owner_type='agent' "
-            "ORDER BY CASE status WHEN 'doing' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, "
+            "ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, "
             "         updated DESC LIMIT 40", (session_name,)).fetchall()
         row = None
         for _c in _cands:

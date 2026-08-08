@@ -34,6 +34,14 @@ from pathlib import Path
 
 import pytest
 
+# POLICY CHANGE, 2026-08-08 (Ethan: "we shouldnt be sending commands to idle
+# workers that genuinely have no more work"): the advance loop no longer selects
+# `done` cards — the once-daily verification sweep owns done->verified in one
+# batched message. Tests below that exercised nudge CONTENT and ROUTING against
+# done fixtures now use `review`, where the same machinery (retype hints,
+# reviewer edges, per-card budget fall-through) still runs; the one test whose
+# SUBJECT was the done tier itself is superseded in place with its reasoning.
+
 
 def _load(home):
     """Fresh module bound to an isolated AMUX_HOME. Re-imported per test because the
@@ -109,7 +117,7 @@ def _nudge(mod, sent, session="probe"):
 
 def test_code_card_with_no_evidence_is_told_it_looks_mistyped(rig):
     mod, sent = rig
-    _card(mod, "P-1", "done", "code", desc="moved a markdown file into docs/")
+    _card(mod, "P-1", "review", "code", desc="moved a markdown file into docs/")
     msg = _nudge(mod, sent)
 
     assert msg, "no nudge was sent — the rest of this test proves nothing"
@@ -124,7 +132,7 @@ def test_code_card_WITH_commit_evidence_still_offers_retype_but_softer(rig):
     honest exit must still be on the menu, because evidence in the desc does not
     prove the card's WORK was code."""
     mod, sent = rig
-    _card(mod, "P-2", "done", "code", desc="landed in commit deadbeef1234, PR #4412")
+    _card(mod, "P-2", "review", "code", desc="landed in commit deadbeef1234, PR #4412")
     msg = _nudge(mod, sent)
 
     assert "amux board type P-2" in msg, msg
@@ -135,7 +143,7 @@ def test_noncode_card_is_not_told_to_retype(rig):
     """The counter-case. A check that fires on every card cannot discriminate, and an
     investigation already HAS an honest gate — telling it to retype would be noise."""
     mod, sent = rig
-    _card(mod, "P-3", "done", "investigation", desc="result was negative")
+    _card(mod, "P-3", "review", "investigation", desc="result was negative")
     msg = _nudge(mod, sent)
 
     assert msg, "no nudge sent — cannot conclude anything from an absent string"
@@ -147,15 +155,32 @@ def test_noncode_card_is_not_told_to_retype(rig):
 
 # ──────────────────── the gate_next defect this fix uncovered ────────────────
 
-def test_done_card_is_gated_on_verified_not_on_done(rig):
-    """A card at `done` was quoted the gate for `done` — the status it already holds."""
+def test_done_cards_are_never_nudged_by_the_advance_loop(rig):
+    """SUPERSEDES test_done_card_is_gated_on_verified_not_on_done AND
+    test_done_card_not_nudged_when_verified_does_not_apply (policy change,
+    2026-08-08 — Ethan: "we shouldnt be sending commands to idle workers that
+    genuinely have no more work").
+
+    The done tier was added to this loop on his 08-06 ask so something drove
+    done->verified; the once-daily verification sweep then took that job and does
+    it batched. The loop kept re-waking lanes per card per cooldown anyway — the
+    token audit measured 294 nudges/day vs 25 human prompts, 46% repeats. A lane
+    whose only remaining cards are `done` has nothing in flight: that IS the
+    "genuinely no more work" case, and it must stay silent between sweeps.
+
+    The two superseded tests' subjects are both closed by construction now: the
+    gate_next ternary cannot misquote a gate for a card the loop never selects,
+    and terminal-at-done cannot re-fire forever if it never fires. Their history
+    stays in this docstring so neither defect is re-discovered as new."""
     mod, sent = rig
     _card(mod, "P-4", "done", "code", desc="x")
-    msg = _nudge(mod, sent)
-
-    assert "The gate for 'verified' is:" in msg, msg
-    assert "The gate for 'done' is:" not in msg, (
-        "a card already at done was told to satisfy done's gate — f88fbc3's ternary bug")
+    assert _nudge(mod, sent) == "", (
+        "a lane whose only card is done was woken by the advance loop — the done "
+        "tier is back and the directive is broken")
+    # And with several done cards — still silence; volume does not change the policy.
+    _card(mod, "P-4b", "done", "code", desc="y")
+    _card(mod, "P-4c", "done", "investigation", desc="z")
+    assert _nudge(mod, sent) == ""
 
 
 def test_doing_and_review_targets_are_unchanged(rig):
@@ -170,13 +195,9 @@ def test_doing_and_review_targets_are_unchanged(rig):
     assert "The gate for 'done' is:" in _nudge(mod, sent), "review -> done regressed"
 
 
-def test_done_card_not_nudged_when_verified_does_not_apply(rig):
-    """If `verified` is not a status this lane can reach, `done` IS terminal — nudging
-    can only re-fire forever with no honest exit, which is the reported symptom."""
-    mod, sent = rig
-    mod._status_applies = lambda st, sess: (False, "not enabled for this lane")
-    _card(mod, "P-6", "done", "code", desc="x")
-    assert _nudge(mod, sent) == "", "terminal-at-done card was nudged with nowhere to go"
+# (test_done_card_not_nudged_when_verified_does_not_apply removed — its subject,
+# the terminal-at-done re-fire, is closed by construction now that the loop never
+# selects done cards; see test_done_cards_are_never_nudged_by_the_advance_loop.)
 
 
 # ─────────────── third cause: done + unacked reviewer (MF-495 canary) ────────
@@ -192,7 +213,7 @@ def test_done_card_with_unacked_reviewer_routes_to_the_REVIEWER(rig):
     and the reviewer was never told. No coherent action exists for either party.
     """
     mod, sent = rig
-    _card(mod, "P-7", "done", "investigation", desc="negative result recorded")
+    _card(mod, "P-7", "review", "investigation", desc="negative result recorded")
     db = mod.get_db()
     db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-7'")
     db.commit()
@@ -206,8 +227,10 @@ def test_done_card_with_unacked_reviewer_routes_to_the_REVIEWER(rig):
     assert target == "peer", (
         f"nudge went to {target!r}, not the reviewer — the author cannot close a "
         f"reviewer-gated card, so this is an unactionable loop")
-    assert "ack done->verified" in msg, msg
-    assert "review->done" not in msg, "told the reviewer to ack a move the card already made"
+    assert "ack review->done" in msg, msg   # transition text matches the card's real edge
+    # (done-era assertion removed: it forbade "review->done" because the fixture
+    # was AT done then — for a review-status card that ack is exactly right, and
+    # the wrong-transition class is covered by asserting the correct edge above.)
 
 
 def test_review_card_routing_still_says_review_to_done(rig):
@@ -337,7 +360,7 @@ def test_reviewer_engaged_by_message_is_not_re_nudged(rig):
     and then discarded, stranding 70 cards across 12 lanes.
     """
     mod, sent = rig
-    _card(mod, "P-9", "done", "code", desc="x")
+    _card(mod, "P-9", "review", "code", desc="x")
     db = mod.get_db()
     db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-9'")
     db.commit()
@@ -356,7 +379,7 @@ def test_router_STILL_FIRES_when_reviewer_has_not_engaged(rig):
     """The paired positive. Without it, the test above is satisfied by a check that
     silences everything."""
     mod, sent = rig
-    _card(mod, "P-10", "done", "code", desc="x")
+    _card(mod, "P-10", "review", "code", desc="x")
     db = mod.get_db()
     db.execute("UPDATE issues SET reviewer='peer' WHERE id='P-10'")
     db.commit()
@@ -495,7 +518,7 @@ def test_budget_spent_card_does_not_silence_the_whole_lane(rig):
     the entire lane — which is why 558 `done` cards sat behind 25 `review`."""
     mod, sent = rig
     _card(mod, "S-1", "review", "code", desc="blocked thing")
-    _card(mod, "S-2", "done", "code", desc="drivable thing")
+    _card(mod, "S-2", "review", "code", desc="drivable thing")
     db = mod.get_db()
     for _ in range(3):                      # spend S-1's per-card budget
         db.execute("INSERT INTO session_events (ts,session,type,data,source) "
@@ -514,7 +537,7 @@ def test_all_budgets_spent_still_goes_quiet(rig):
     """The counter-case. Falling through must not become never stopping — a lane whose
     every candidate is exhausted is exactly the stuck case the budget exists for."""
     mod, sent = rig
-    _card(mod, "S-3", "done", "code", desc="x")
+    _card(mod, "S-3", "review", "code", desc="x")
     db = mod.get_db()
     for _ in range(3):
         db.execute("INSERT INTO session_events (ts,session,type,data,source) "
@@ -532,7 +555,7 @@ def test_reviewer_responded_hands_the_card_to_the_AUTHOR(rig):
     nudged NOBODY — it reached the right conclusion and discarded it. Measured at 70
     cards across 12 lanes, most at `done` awaiting the author's move to verified."""
     mod, sent = rig
-    _card(mod, "R-1", "done", "code", desc="x")
+    _card(mod, "R-1", "review", "code", desc="x")
     db = mod.get_db()
     db.execute("UPDATE issues SET reviewer='peer' WHERE id='R-1'")
     db.commit()
@@ -552,7 +575,7 @@ def test_reviewer_responded_hands_the_card_to_the_AUTHOR(rig):
 def test_reviewer_NOT_responded_still_goes_to_the_reviewer(rig):
     """Counter-case: don't hand it to the author while the reviewer genuinely owes it."""
     mod, sent = rig
-    _card(mod, "R-2", "done", "code", desc="x")
+    _card(mod, "R-2", "review", "code", desc="x")
     mod.get_db().execute("UPDATE issues SET reviewer='peer' WHERE id='R-2'")
     mod.get_db().commit()
 
