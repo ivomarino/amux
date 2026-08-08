@@ -1424,3 +1424,48 @@ FIX: Any timing or availability measurement against the local server needs the r
   this is to stat the file and read the restart log, which nobody does before believing a number.
 NOTE: the shared checkout is the amplifier (see AMUX-2443, open) — my working tree was clean and
   I had made no edit, so nothing in MY session hinted that the binary under test had changed.
+
+## SUPERSEDES the restart-framed-its-subject entry above: BOTH causes were real, and the instrument already existed
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-11
+SUPERSEDES: "A peer's save restarts the server mid-measurement, and the timings blame your
+  subject" (same session, same day). That entry is wrong in its diagnosis and wrong in its
+  FIX. Leaving it in place per this file's convention; read this one instead.
+SYMPTOM: I reported `GET /api/board?slim=1` timing out at 60s while the unfiltered 6.6MB
+  fetch returned in 16.9s, found that a peer had written amux-server.py at 12:39:48 and
+  the server had restarted at 12:40:24, and concluded the numbers were "entirely
+  fabricated". Then I re-measured, got slim 0.10s / full 0.11s, and declared the
+  hypothesis dead. Timeline says otherwise: my FIRST measurement predates the write, so no
+  restart was involved — it was measuring a live defect (AMUX-2562, filtered board GETs
+  running an uncapped full-table scan per request, which is precisely why the PROJECTING
+  path hung while the unfiltered one returned). d4dfbc7 landed the fix at 12:40:49. My
+  "control" ran after that. I compared before-fix to after-fix and labelled it
+  before-restart to after-restart.
+COST: A wrong conclusion published in two places (this file and AF-11) and a real defect
+  dismissed as measurement noise by the only other session that had independently
+  observed it. amux filed AMUX-2562 from their own diagnosis an hour later; had I read my
+  own data correctly they would have had a second data point at 12:36 instead of none.
+FIX: Nothing to build — GET /health ALREADY returns `build` (a content hash of the running
+  amux-server.py), plus `pid` and `uptime_s`. Any of the three would have caught this;
+  `build` catches it exactly, because the invalidating fact was that the served CODE
+  changed, not merely that the process bounced. Fixed by routing callers to it: CLAUDE.md
+  now carries the bracket recipe (read `build` before and after, a move means the
+  measurement is INVALID, not that the subject is slow), next to the existing "verify with
+  a string your edit INTRODUCED" rule. AF-11 closed as already-implemented and retyped
+  code -> doc; adding the field it already has would have been a second spelling of an
+  existing primitive, shipped in the belief it fixed something.
+NOTE: two lessons, and the second is the transferable one. (1) A confound that explains
+  PART of a mess will be accepted as explaining ALL of it — the restart was real and did
+  explain my second run's HTTP 000s, which is exactly what made it convincing enough to
+  stop the search. Ask what the confound does NOT explain: the first run had no restart in
+  it and I never checked. (2) The ethos rule about confirming results fired precisely as
+  written — I was most careless at the moment the answer matched what I expected, and the
+  re-measurement that "proved" me right was run against different code than the
+  measurement it was meant to control. A control that does not hold the build constant is
+  not a control. This is the same shape as `_build_id`'s own docstring, which was written
+  for two other sessions hitting it on two other fixes in one hour; I hit it a third time
+  with the instrument already sitting one curl away.

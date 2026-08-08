@@ -174,6 +174,24 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   common idiom returns a happy non-zero count against the old build and tells you
   nothing (this cost a wrong "it's live" call on AMUX-4).
 - Always verify Python syntax after edits: `python3 -c "import ast; ast.parse(open('amux-server.py').read())"`
+- **Bracket any timing/availability measurement with `/health`'s `build`.** The server
+  re-execs whenever ANYONE saves `amux-server.py` — and on this shared checkout that is
+  routinely not you, with your own tree clean and nothing in your session hinting the
+  binary changed underneath you. A restart's symptoms (timeouts, HTTP 000, wild
+  latencies) are indistinguishable from the thing you are measuring being slow, so the
+  wrong conclusion arrives already corroborated by repeat runs. Read `build` before and
+  after and assert it did not move:
+  ```bash
+  B0=$(curl -sk $AMUX_URL/health | python3 -c 'import json,sys;print(json.load(sys.stdin)["build"])')
+  # ... take the measurement ...
+  B1=$(curl -sk $AMUX_URL/health | python3 -c 'import json,sys;print(json.load(sys.stdin)["build"])')
+  [ "$B0" = "$B1" ] || echo "INVALID: build moved $B0 -> $B1 — you measured two different servers"
+  ```
+  `build` is a content hash of the running file, so it discriminates a code change, not
+  merely a bounce (`pid`/`uptime_s` catch the bounce). On 2026-08-08 this cost a session
+  a published wrong conclusion: a filtered-board hang (AMUX-2562) was measured, blamed on
+  a restart, and "disproved" by a re-measurement that had silently run against the FIXED
+  build. The instrument was already there and nobody was routed to it.
 - **Client JS changes need `APP_VER` and the sw.js `CACHE` bumped together**, or a
   browser holding the cached script never receives the fix.
 - Always verify Python syntax after edits: `python3 -c "import ast; ast.parse(open('amux-server.py').read())"`
