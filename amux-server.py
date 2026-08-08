@@ -32733,7 +32733,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <span id="msgs-count" style="font-size:0.75rem;color:var(--dim);white-space:nowrap;"></span>
   </div>
   <div id="msgs-kind-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:10px;flex-shrink:0;align-items:center;">
-    <button class="btn" onclick="_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
+    <button class="btn" onclick="_msgsAllSessions=null;_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
   <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
   <div id="trends-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
@@ -40748,7 +40748,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.518';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.520';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -59390,6 +59390,7 @@ window.addEventListener('resize', () => {
 
 // ── Messages tab (global send history across all sessions) ──────────────────
 let _msgsData = [];
+let _msgsAllSessions = null;   // store-derived dropdown options (AMUX-2548); null = not fetched
 let _msgsDeepQ = '';   // non-empty = server-side full-history search is active
 let _msgsGroup = '';   // non-empty = scoped to a group (arrived from its scope panel)
 function _msgsRenderGroupChip() {
@@ -59437,17 +59438,30 @@ async function _messagesLoad(reset, presetSession) {
     _msgsData = _msgsData.concat(rows.map(_msgNorm));
     _msgsOffset += rows.length;
     _msgsDone = rows.length < _MSGS_PAGE;
-    // Session filter options (from loaded data)
+    // Session filter options — FROM THE STORE, not the loaded page (AMUX-2548).
+    // Deriving names from _msgsData meant the dropdown listed only workers with
+    // a message in the newest 200 rows — ~7 hours of a 46-lane fleet — so 90 of
+    // 115 workers with history were absent from it entirely. A message to any
+    // of them was unfindable from the global view while that worker's peek
+    // showed it fine: the same store, two windows, and the view's own control
+    // silently limited to the window. The dropdown is the SCOPE control; it
+    // must enumerate the store's scopes, which only the server can see.
     const sel = document.getElementById('msgs-session-filter');
     if (sel) {
-      // Opening from a session (presetSession) scopes the filter to that session;
-      // plain refresh/paginate calls (no presetSession) keep the current choice.
       const cur = (presetSession != null && presetSession !== '') ? presetSession : sel.value;
-      const names = [...new Set(_msgsData.map(m => m.session).filter(Boolean))].sort();
+      let names = _msgsAllSessions;
+      if (!names) {
+        try {
+          const sr = await fetch(API + '/api/history?sessions=1');
+          if (sr.ok) names = _msgsAllSessions = (await sr.json()).map(x => x.session);
+        } catch (e) {}
+      }
+      // Fallback keeps the old (window-derived) behaviour if the fetch failed,
+      // which can only ever show a subset — never nothing.
+      if (!names) names = [...new Set(_msgsData.map(m => m.session).filter(Boolean))].sort();
       sel.innerHTML = '<option value="">All workers</option>' +
         names.map(n => '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>').join('');
-      // A preset session with no messages in the loaded page has no <option>;
-      // the select then falls back to "All sessions" on its own.
+      if (cur && !names.includes(cur)) sel.value = '';
     }
     _messagesRender();
   } catch (e) {
@@ -59478,7 +59492,15 @@ function _msgLocate(session, encText) {
 // the history modal — one definition so the three surfaces cannot drift.
 // Defaults to human for the same reason: on a busy fleet, inter-session and
 // scheduler traffic outnumber what you typed by roughly 3:1 and bury it.
-let _msgsKind = 'human';        // all | human | session | schedule
+// 'all', matching the session peek's default (AMUX-2548). This was 'human',
+// which made the two views disagree BY DEFAULT: a message sent by a session,
+// a schedule or the harness existed in the store, showed in the worker's peek
+// Messages tab, and was silently absent from the global tab — including from
+// its Enter deep-search, which inherits the kind filter. Ethan: "make sure the
+// message tab contents for global amux is the same tab contents as session
+// message, for example I cant locate a message that was sent." The kind chips
+// still narrow; they just no longer narrow SILENTLY as the starting state.
+let _msgsKind = 'all';          // all | human | session | schedule
 let _msgsCounts = null;         // true per-kind totals from the server
 function _msgsSetKind(k) {
   _msgsKind = k;
@@ -59490,7 +59512,7 @@ function _msgsRenderChips() {
   const c = _msgsCounts || { all: _msgsData.length, human: 0, session: 0, schedule: 0 };
   if (!_msgsCounts) _msgsData.forEach(m => { c[_msgKind(m)] = (c[_msgKind(m)] || 0) + 1; });
   const chips = [['all', 'All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
-  const refresh = '<button class="btn" onclick="_messagesLoad(true)" title="Refresh" '
+  const refresh = '<button class="btn" onclick="_msgsAllSessions=null;_messagesLoad(true)" title="Refresh" '
     + 'style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">\u21BB</button>';
   bar.innerHTML = refresh + chips.map(([k, lbl]) => {
     const on = _msgsKind === k;
@@ -59633,7 +59655,16 @@ function _messagesRender() {
   if (!rows.length) {
     const kl = (_MSG_KIND[_msgsKind] || {}).label;
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">'
-      + (q ? 'No matches.'
+      + (q ? (_msgsDeepQ === q
+               ? 'No matches anywhere in history.'
+               // The instant filter searches ONLY the loaded page. A bare "No
+               // matches." here is how a message that provably exists reads as
+               // absent (AMUX-2548) — the reader cannot tell a page-local miss
+               // from a store-wide one, and that difference is the whole
+               // answer. Name the denominator and offer the real search.
+               : 'No matches in the ' + _msgsData.length + ' loaded messages. '
+                 + '<a href="#" onclick="event.preventDefault();_msgsDeepQ=document.getElementById(\'msgs-search\').value.trim();_messagesLoad(true);" '
+                 + 'style="color:var(--accent);">Search all history</a> (or press Enter).')
            : kl ? 'No ' + kl.toLowerCase() + ' messages' + (sessF ? ' for ' + esc(sessF) : '') + '.'
                 : (sessF ? 'No messages for ' + esc(sessF) + '.' : 'No messages yet.')) + '</div>';
     return;
@@ -62501,7 +62532,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.518';
+const CACHE = 'amux-v0.9.520';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -66123,6 +66154,20 @@ class CCHandler(BaseHTTPRequestHandler):
                 # limit. The UI fetches a kind-filtered WINDOW for the list but
                 # must label its chips with true totals; counting the window
                 # would make every unselected chip read 0.
+                # ?sessions=1 → every session that has ANY history, with counts.
+                # The global tab's session dropdown used to be derived from the
+                # LOADED PAGE — the newest 200 rows, spanning ~7 hours of a
+                # 46-lane fleet — so 90 of 115 workers with history were simply
+                # absent from it, and a message to any of them was unfindable
+                # from the global view while the peek of that worker showed it
+                # fine (AMUX-2548, Ethan: "I can't locate a message that was
+                # sent"). The dropdown must be derived from the STORE, and only
+                # the server can see the store.
+                if qs.get("sessions"):
+                    rows = db.execute(
+                        "SELECT session, COUNT(*) c FROM cmd_history "
+                        "WHERE session != '' GROUP BY session ORDER BY session").fetchall()
+                    return self._json([{"session": r["session"], "count": r["c"]} for r in rows])
                 if qs.get("counts"):
                     if session:
                         rows = db.execute("SELECT type, COUNT(*) c FROM cmd_history WHERE session=? GROUP BY type",
