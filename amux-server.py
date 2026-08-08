@@ -3703,6 +3703,12 @@ _sse_cache = {
 }
 _sse_cache_lock = threading.Lock()  # prevents thundering herd on cache refresh
 _SSE_CACHE_TTL = 2  # seconds
+# How often the verification sweep may take a PASS (AF-13). Not the per-lane
+# cadence — each lane still waits 20h — this only bounds how often a maintenance
+# tick calls list_sessions(). It is also the cost of a crashed pass: un-stamped
+# lanes retry after this, instead of losing a full 20h cycle to a global stamp
+# that was committed before the work.
+_VERIFY_PASS_THROTTLE_S = 900   # 15 min
 
 
 def _cache_etag(c: dict) -> str:
@@ -14761,6 +14767,12 @@ def _verification_sweep():
     # the very handler meant to record what happened. First cut bound it in
     # _verify_routing_sweep — a different function entirely (AMUX-2349).
     _swept_scope: dict = {}   # scope rule -> workers it excluded
+    # Same reason as _swept_scope directly above, and the same mistake I nearly
+    # repeated: these are read by the except handler, so an exception raised before
+    # the loop (get_db, the prefs read, list_sessions) would make the audit line
+    # itself raise NameError — inside the handler written to record what went wrong.
+    _due = 0          # lanes whose own cooldown had elapsed this pass
+    _completed = 0    # lanes this pass actually finished processing
     try:
         db = get_db()
         now = int(time.time())
@@ -14770,14 +14782,48 @@ def _verification_sweep():
             last = int(json.loads(row[0])) if row else 0
         except Exception:
             last = 0
-        if now - last < 20 * 3600:
+        # PER-LANE COOLDOWN, STAMPED AFTER THE WORK (AF-13). This used to be ONE
+        # global key committed BEFORE the loop, so any exception between the stamp
+        # and the end of the loop — list_sessions() or _status_applies(), neither of
+        # which sits inside the per-lane try — burned the whole 20h for every lane
+        # after the failure point, silently, behind one slog line. Lanes are iterated
+        # in list_sessions() order, so WHICH ones got dropped was arbitrary.
+        #
+        # That was survivable while the advance loop also nudged `done` cards. It is
+        # not now: AMUX-2565 removed that tier on Ethan's directive, so this sweep is
+        # the ONLY clock on done->verified and a half-finished pass has no backstop.
+        #
+        # The global key is kept, demoted to a cheap pass throttle so a maintenance
+        # tick does not call list_sessions() every time. A crash now costs 15 minutes
+        # for the un-swept lanes instead of 20 hours.
+        if now - last < _VERIFY_PASS_THROTTLE_S:
             return
         db.execute("INSERT INTO prefs (key, value) VALUES ('verify_sweep_last', ?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now),))
         db.commit()
+        # MIGRATION: seed each lane from the last GLOBAL sweep. Without this the first
+        # pass after this change finds no per-lane keys, treats every lane as never
+        # swept, and messages the whole fleet at once — the "fixing a filter is a
+        # migration event" shape from ethos. Inheriting the global time makes the
+        # cutover a no-op: nobody is re-swept earlier than they would have been.
+        _lane_last: dict = {}
+        try:
+            for _k, _v in db.execute(
+                    "SELECT key, value FROM prefs WHERE key LIKE 'verify_sweep_last:%'").fetchall():
+                try:
+                    _lane_last[_k.split(":", 1)[1]] = int(json.loads(_v))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         live = [s["name"] for s in list_sessions() if s.get("running") and not s.get("archived")]
         sent = 0
         for name in live:
+            # Per-lane gate. `last` (the previous global sweep) is the seed for a lane
+            # that has no key yet, so the cutover does not re-sweep anyone.
+            if now - _lane_last.get(name, last) < 20 * 3600:
+                continue
+            _due += 1
             # AMUX-2312: `verified` is explicit — do not sweep lanes it does not
             # apply to. Asking a lane with no prod surface to close a done->verified
             # "gap" manufactures a gap that does not exist for it, and the only
@@ -14793,7 +14839,18 @@ def _verification_sweep():
                 "AND NOT EXISTS (SELECT 1 FROM session_events e WHERE "
                 "  e.type='verify.requested' AND e.ts > ? AND e.data LIKE '%\"' || i.id || '\"%') "
                 "ORDER BY updated ASC LIMIT 10", (name, now - 7 * 86400)).fetchall()
+
+            def _stamp_lane(_n=name):
+                # AFTER the lane's work, never before — that ordering IS the fix.
+                # A lane that never reaches here is simply retried next pass.
+                db.execute("INSERT INTO prefs (key, value) VALUES (?, ?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           ("verify_sweep_last:" + _n, json.dumps(now)))
+                db.commit()
+
             if not rows:
+                _stamp_lane()          # nothing to ask: the lane IS done for this cycle
+                _completed += 1
                 continue
             lst = "\n".join(f"  {r['id']} — {(r['title'] or '')[:70]}" for r in rows)
             try:
@@ -14811,9 +14868,20 @@ def _verification_sweep():
                 for r in rows:
                     _emit_event(name, "verify.requested", {"issue": r["id"]},
                                 source="verification-sweep")
-        slog(f"[verify-sweep] batched {sent} session(s)")
+                _stamp_lane()          # delivered — this lane is done for its cycle
+                _completed += 1
+            # NOT stamped when the enqueue failed: the lane still owes this message,
+            # so it is retried next pass instead of waiting out a cooldown it never
+            # got the benefit of.
+        # ATTEMPTED vs COMPLETED, not just successes (AF-13). "batched N session(s)"
+        # alone cannot distinguish a pass that found 3 lanes with work from a pass
+        # that died after 3 of 40 — the two print the same line, which is how a
+        # half-finished sweep stayed invisible.
+        slog(f"[verify-sweep] due={_due} completed={_completed} messaged={sent} "
+             f"live={len(live)}")
     except Exception as e:
-        slog(f"[verify-sweep] failed: {e}")
+        slog(f"[verify-sweep] FAILED after due={_due} completed={_completed}: {e} "
+             f"— un-stamped lanes retry next pass")
 
 
     if _swept_scope:
