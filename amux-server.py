@@ -40647,6 +40647,7 @@ let _peekIssuesSortables = [];
 // restored on the next peek looks like an empty board.
 let _peekIssuesQuery = '';
 let _peekIssuesFetching = false;   // one in-flight board fetch per peek panel
+let _peekIssuesFetchFailed = false; // last self-fetch failed — say so, don't claim "Loading"
 
 function setPeekIssuesView(mode) {
   _peekIssuesView = mode;
@@ -40676,8 +40677,14 @@ function renderPeekIssues() {
   // genuinely empty board does not re-fetch on every render.
   if (!(boardItems || []).length && !_peekIssuesFetching) {
     _peekIssuesFetching = true;
-    fetchBoard().then(() => renderPeekIssues()).catch(() => {})
-      .finally(() => { _peekIssuesFetching = false; });
+    // The failure must reach the panel. A swallowed catch left "Loading the
+    // board…" up FOREVER when the fetch hung or died (Ethan hit it three ways
+    // on 2026-08-08: the AMUX-2562 server hang, airplane mode, and a fresh
+    // peek pre-data). The finally re-render paints either the data or the
+    // honest failure line; renderBoard's tail hook retries on the next arrival.
+    fetchBoard().then(() => { _peekIssuesFetchFailed = false; })
+      .catch(() => { _peekIssuesFetchFailed = true; })
+      .finally(() => { _peekIssuesFetching = false; renderPeekIssues(); });
   }
   const list = document.getElementById('peek-issues-list');
   const count = document.getElementById('peek-issues-count');
@@ -40731,11 +40738,14 @@ function renderPeekIssues() {
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:12px 4px;">' +
       (_q ? 'No issues match <b>' + esc(_q) + '</b>' + (scoped.length ? ' (' + scoped.length + ' hidden)' : '')
           : !(boardItems || []).length
-              // Say which of the two it is. "No issues for this worker yet" is a
+              // Say which of the three it is. "No issues for this worker yet" is a
               // claim about the WORKER; with an unloaded board the honest claim is
-              // about the board. Distinguishing them is the whole point — the
-              // wrong one sent Ethan looking at a worker that owned 29 cards.
-              ? 'Loading the board&hellip;'
+              // about the board, and with a FAILED load the honest claim is about
+              // the connection — "Loading…" that never resolves is a lie with a
+              // spinner (Ethan, 3 screenshots on 2026-08-08).
+              ? (_peekIssuesFetchFailed
+                  ? 'Couldn&#39;t load the board &mdash; offline or server unreachable. Retries on the next update.'
+                  : 'Loading the board&hellip;')
           : allScope ? 'No issues on the board yet.' : 'No issues for this worker yet.') + '</div>';
     return;
   }
@@ -52934,8 +52944,11 @@ function _renderBoardCard(item) {
   const pinned = item.pinned ? 1 : 0;
   // LIVE emphasis: this card is what its owning session is working on right now
   // (item in doing + that session's terminal is actively generating).
+  // `sessions`, not the pre-rename `workers` (b009f6e's FOURTH casualty —
+  // the typeof guard made the dead global read as false instead of throwing,
+  // so the LIVE emphasis just silently never lit).
   const _liveNow = item.status === 'doing' && item.session &&
-    (typeof workers !== 'undefined') && (workers || []).some(s => s.name === item.session && s.status === 'active');
+    (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
   let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.worker) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
@@ -53504,6 +53517,17 @@ function renderBoard() {
   // too, or its counter re-fires the bump animation on every single render
   // because `prev` is permanently 0.
   _renderCols.forEach(stObj => { _prevCardRects[stObj.id] = (cols[stObj.id] || []).length; });
+  // An open peek Board tab reads the same boardItems this render just consumed,
+  // but nothing re-rendered IT when data arrived through the normal path
+  // (fetchBoard/SSE both end here) — so a peek opened before the board loaded
+  // sat on "Loading the board…" until some interaction poked it (AMUX-2561;
+  // renderPeekIssues' own self-fetch only covers the empty-array case, and a
+  // hung or failed fetch left even that stuck). Every data arrival now
+  // refreshes the visible peek panel; drag-in-progress is guarded inside.
+  if (typeof _peekTab !== 'undefined' && _peekTab === 'issues' && peekSession
+      && document.getElementById('peek-issues-list')) {
+    try { renderPeekIssues(); } catch (e) {}
+  }
 }
 
 // Event delegation for board tag + session clicks (cards + detail)
@@ -53617,7 +53641,7 @@ function openSchedModal(editId) {
   const overlay = document.getElementById('sched-overlay');
   // Populate session list
   const sel = document.getElementById('sched-session');
-  sel.innerHTML = (workers || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  sel.innerHTML = (sessions || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   // Reset all fields to defaults
   const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
   const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = v; };
@@ -55108,7 +55132,7 @@ function _renderGridChips() {
   // then needs-input, then by most recent activity.
   const open = _gridPanes || {};
   const rank = s => (open[s.name] ? 0 : s.status === 'active' ? 1 : s.status === 'waiting' ? 2 : 3);
-  const list = (workers || [])
+  const list = (sessions || [])
     .filter(s => s.running || open[s.name])
     .sort((a, b) => rank(a) - rank(b)
                  || (b.last_activity || 0) - (a.last_activity || 0)
@@ -55125,7 +55149,7 @@ function _renderGridChips() {
 }
 
 function wsExpandActive() {
-  (workers || []).filter(s => s.running && s.status !== 'idle').forEach(s => addGridPane(s.name));
+  (sessions || []).filter(s => s.running && s.status !== 'idle').forEach(s => addGridPane(s.name));
 }
 function toggleGridPane(name) {
   if (_gridPanes[name]) removeGridPane(name);
@@ -55194,7 +55218,7 @@ function _updateGridPane(name) {
   const frame = document.getElementById(sid + '-frame');
   if (!dot && !frame) { removeGridPane(name); return; }  // pane was removed
   if (dot) {
-    const s = (workers || []).find(s => s.name === name);
+    const s = (sessions || []).find(s => s.name === name);
     dot.className = 'gp-dot' + (!s || !s.running ? '' : s.status === 'active' ? ' working' : s.status === 'waiting' ? ' waiting' : ' idle');
   }
 }
@@ -55220,7 +55244,7 @@ function _gridRestoreLayout() {
       // attempted at all.
       if (item.id.startsWith('ws-term:')) {
         wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
-      } else if ((workers || []).find(s => s.name === item.id)) {
+      } else if ((sessions || []).find(s => s.name === item.id)) {
         addGridPane(item.id, item.x, item.y, item.w, item.h);
       }
     });
@@ -55317,7 +55341,7 @@ function wsLoadProfile(name) {
     if (!item.id) return;
     if (item.id.startsWith('ws-term:')) {
       wsAddTermPane(item.x, item.y, item.w, item.h, item.id);
-    } else if ((workers || []).find(s => s.name === item.id)) {
+    } else if ((sessions || []).find(s => s.name === item.id)) {
       addGridPane(item.id, item.x, item.y, item.w, item.h);
     }
   });
@@ -55369,10 +55393,10 @@ function wsApplyPreset(preset) {
   if (!names.length) {
     if (preset === 'auto') {
       // Auto: prefer running/active sessions, fall back to all
-      const running = (workers || []).filter(s => s.running || s.status === 'active' || s.status === 'waiting');
-      names = running.length ? running.map(s => s.name) : (workers || []).map(s => s.name);
+      const running = (sessions || []).filter(s => s.running || s.status === 'active' || s.status === 'waiting');
+      names = running.length ? running.map(s => s.name) : (sessions || []).map(s => s.name);
     } else {
-      names = (workers || []).map(s => s.name);
+      names = (sessions || []).map(s => s.name);
     }
   }
   if (!names.length) return;
@@ -57923,7 +57947,11 @@ async function _handleDeeplink(hash) {
       if (m) tab = decodeURIComponent(m[1]);
     }
     const tryOpen = (attempt) => {
-      if (typeof workers !== 'undefined' && sessions.some(s => s.name === target)) {
+      // `sessions` (b009f6e's THIRD casualty): `typeof workers` was undefined
+      // forever, so tryOpen polled out its 20 attempts and every #peek= link
+      // silently no-oped — masked until the peekState-restore stand-down
+      // removed the fallback that happened to open A peek (the wrong one).
+      if (typeof sessions !== 'undefined' && sessions.some(s => s.name === target)) {
         openPeek(target);
         // Let openPeek finish its own async setup before switching tabs.
         if (tab) setTimeout(() => { try { setPeekTab(tab); } catch(e) {} }, 350);
@@ -58033,6 +58061,11 @@ function _restoreScreen() {
   }
   // 2. Restore an open session peek. Prefer sessionStorage (same tab session);
   //    fall back to localStorage when we came back after an eviction.
+  //    A #peek= deeplink names its own target — restoring the LAST peek over
+  //    it made the rig land on whichever session was peeked before (verified
+  //    2026-08-08: #peek=amux opened amux-frustrations), and a shared link
+  //    would misdirect the same way.
+  if (location.hash && location.hash.startsWith('#peek=')) return;
   let _ps = null;
   try { _ps = JSON.parse(sessionStorage.getItem('peekState') || 'null'); } catch(e) {}
   if (!_ps || !_ps.session) {

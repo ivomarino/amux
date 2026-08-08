@@ -172,3 +172,57 @@ def test_no_client_assignment_to_the_dead_workers_global():
     assert not bad, (
         "bare assignment(s) to the dead `workers` global in client code — the "
         "b009f6e rename bug is back: %s" % bad)
+
+
+def test_no_client_read_of_the_dead_workers_global():
+    """The assignment invariant above missed b009f6e's THIRD and FOURTH
+    casualties, both READS: `typeof workers !== 'undefined'` gating the #peek=
+    deeplink (polled out 20 attempts and no-oped every peek link) and the
+    board-card LIVE emphasis (`(workers || []).some(...)` — never lit). A
+    typeof guard is the worst shape: it exists to tolerate absence, so the
+    dead global reads as calm false forever instead of throwing.
+
+    Legal uses of the word in client code are strings/comments and declared
+    locals. A `typeof workers` or a bare `workers` followed by `.`, `(`, `||`
+    or `)` in an expression is the rename bug. Anchored on the same script-
+    block extraction as the assignment test.
+
+    First cut of THIS test was itself theatre and its own can-it-fail probe
+    caught it: the string-stripper's backtick pattern spanned newlines, so it
+    matched from one template literal to the next and swallowed the very code
+    holding both specimens — HEAD (pre-fix) scanned clean. Line-based now, and
+    the pre-fix specimen check below is part of the test.
+    """
+    import re
+    import subprocess
+
+    def _violations(src):
+        blocks = [b for b in re.findall(r"<script>(.*?)</script>", src, re.S)
+                  if not re.search(r"^\s*def \w+\(", b, re.M)]
+        bad = []
+        for b in blocks:
+            for ln, line in enumerate(b.split("\n"), 1):
+                code = line.split("//")[0]   # prose lives in comments; drop it
+                for m in re.finditer(r"\btypeof\s+workers\b|\bworkers\s*(?:\.\w|\|\||\.some)", code):
+                    pre = code[:m.start()]
+                    if re.search(r"(?:let|const|var|function\s*\w*\s*\(|,)\s*$", pre):
+                        continue  # declared local / param
+                    bad.append("line %d: %s" % (ln, m.group(0)[:40]))
+        return bad
+
+    bad = _violations(CLIENT)
+    assert not bad, (
+        "read(s) of the dead `workers` global in client code — a typeof guard "
+        "or short-circuit makes these silent, not safe: %s" % bad)
+
+    # Can this check fail? Run it on the last blob that CONTAINED the
+    # specimens; if git can't produce one (shallow clone), skip the arm.
+    try:
+        pre = subprocess.run(["git", "show", "3211a6e:amux-server.py"],
+                             capture_output=True, text=True, timeout=15)
+    except Exception:
+        pre = None
+    if pre and pre.returncode == 0 and pre.stdout:
+        assert _violations(pre.stdout), (
+            "the detector no longer fires on the commit that motivated it — "
+            "either the pattern regressed or the specimen assumption broke")
