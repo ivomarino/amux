@@ -6607,9 +6607,129 @@ _RATE_LIMIT_CREDIT_RECHECK_S = 120
 _RATE_LIMIT_DRIFT_TOLERANCE = 30  # seconds; reset times closer than this are "in sync"
 _RATE_LIMIT_DRIFT_LOG_COOLDOWN = 600  # don't repeat the drift warning more than every 10 min
 _rate_limit_last_responded: dict = {}
+# Re-pressing option 1 into a session that is already parked types "1" into
+# whatever the session is doing NOW — the menu was consumed long ago and only
+# its text lingers. mixpeek-autopilot took five presses in one afternoon
+# (2026-08-08), two of them 61s apart, because the only guard was the armed
+# flag and that flag lives in memory a restart wipes. One press per hour is
+# the ceiling; the flag-arming below it still runs so badges stay accurate.
+_RATE_LIMIT_PRESS_COOLDOWN_S = 3600
 # Swallowed-exception ledger for the fleet scan loop (AMUX-2111 post-mortem):
 # per-session dedupe so a recurring throw logs every ~10 min, not every scan.
 _rate_limit_scan_err: dict = {}
+
+
+def _correct_stale_banner_reset(name: str, parsed_reset: int | None,
+                                now: float, actions: dict | None) -> int | None:
+    """Undo the roll-to-tomorrow on a reset parsed from a STALE banner.
+
+    A limit banner stays on an idle pane after its own reset time passes, and
+    "resets 4:50pm" re-parsed at 4:50:03pm resolves to TOMORROW. On 2026-08-08
+    that overwrote mixpeek-autopilot's due flag three seconds after it became
+    due — auto-resume keys on reset_at <= now, so the lane was silently parked
+    an extra 24h by the very scan meant to free it.
+
+    The roll has a signature: parsed lands 20-24h out (the rolled-back
+    time-of-day passed within the last ~4h). When that shape appears, two
+    discriminators amux already holds decide staleness:
+      1. Our own memory — a flag (or expiry tombstone) armed for exactly that
+         time-of-day TODAY means this is the same banner, one day rolled.
+      2. With no memory (this process re-execs on every save of this file, so
+         flags are wiped several times a day): the last deliberate send. A lane
+         that received no input since before the rolled-back time cannot have
+         hit a NEW limit after it — the banner predates the reset it names.
+    Returns the rolled-back timestamp (already in the past, so the auto-resume
+    tick fires on its next pass and the resumed turn scrolls the banner away),
+    or the parse unchanged when the shape or the evidence says it is genuine.
+    Known cost, bounded by the auto-resume budget: a lane that worked >4h with
+    no input and then hit a REAL cap resumes wrongly once per tick until the
+    budget caps it. Weekly banners parse via month-day/absolute formats and
+    never take this path (their tod_prev sits in the future)."""
+    if not parsed_reset or parsed_reset - now <= 20 * 3600:
+        return parsed_reset
+    tod_prev = parsed_reset - 86400
+    if tod_prev > now:
+        return parsed_reset
+    reason = ""
+    for k in ("rate_limit_reset_at", "rate_limit_expired_at"):
+        v = (actions or {}).get(k)
+        if v and abs(float(v) - tod_prev) < 180:
+            reason = f"own {k} for the same time-of-day today"
+            break
+    if not reason:
+        try:
+            ls = _load_meta(name).get("last_send", 0) or 0
+        except Exception:
+            ls = 0
+        if ls and ls < tod_prev - 60:
+            reason = f"no input since {int(tod_prev - ls)}s before the rolled-back reset"
+    if reason:
+        slog(f"[rate-limit] session={name} banner reset rolled to tomorrow by a "
+             f"stale re-parse — corrected {parsed_reset} -> {int(tod_prev)} "
+             f"({reason}); auto-resume will fire instead of waiting 24h")
+        return int(tod_prev)
+    return parsed_reset
+
+
+_RATE_LIMIT_PERSIST_KEYS = (
+    "rate_limit_reset_at", "rate_limit_reset_at_fallback", "rate_limit_weekly",
+    "rate_limit_banner", "rate_limit_credits", "rate_limit_model_name",
+    "rate_limit_expired_at", "rate_limit_menu_pressed_ts",
+    "rate_limit_last_event_ts", "rate_limit_budget_day",
+    "rate_limit_resumes_today", "rate_limit_api_quota", "api_quota_prev")
+_rate_limit_persist_last = 0.0
+
+
+def _persist_rate_limit_state(force: bool = False) -> None:
+    """Rate-limit flags must survive the execv restarts this file triggers on
+    every save (same lesson as _persist_session_reports — in-memory state is
+    fiction here). An amnesiac restart mid-park re-pressed menus, re-parsed
+    stale banners with no memory, and reset the per-day resume budget."""
+    global _rate_limit_persist_last
+    now = time.time()
+    if not force and (now - _rate_limit_persist_last) < 10:
+        return
+    try:
+        snap = {}
+        for sess, acts in list(_session_auto_actions.items()):
+            keep = {k: acts[k] for k in _RATE_LIMIT_PERSIST_KEYS if k in acts}
+            if keep:
+                snap[sess] = keep
+        db = get_db()
+        db.execute("INSERT INTO prefs (key, value) VALUES ('rate_limit_state', ?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (json.dumps(snap),))
+        db.commit()
+        _rate_limit_persist_last = now
+    except Exception as e:
+        try: slog(f"[rate-limit] persist failed: {e}")
+        except Exception: pass
+
+
+def _hydrate_rate_limit_state() -> None:
+    """Restore rate-limit flags at boot; drop entries whose reset passed more
+    than a day ago (nothing licenses acting on those, and hydrating them would
+    resurrect exactly the stale badges AMUX-2566 removed)."""
+    try:
+        row = get_db().execute("SELECT value FROM prefs WHERE key='rate_limit_state'").fetchone()
+        if not row:
+            return
+        now = time.time()
+        n = 0
+        for sess, keep in (json.loads(row["value"]) or {}).items():
+            if not isinstance(keep, dict):
+                continue
+            ra = keep.get("rate_limit_reset_at") or keep.get("rate_limit_expired_at") \
+                or keep.get("rate_limit_last_event_ts") or 0
+            if ra and now - float(ra) > 86400:
+                continue
+            _session_auto_actions.setdefault(sess, {}).update(keep)
+            n += 1
+        if n:
+            slog(f"[rate-limit] hydrated limit state for {n} session(s) across restart")
+    except Exception as e:
+        try: slog(f"[rate-limit] hydrate failed: {e}")
+        except Exception: pass
 # How long a needs:you card stays quiet before the holder is asked whether the
 # ASK still holds (AMUX-2270). Config, not a constant, because the right value
 # depends on how fast the human actually answers — which is not amux's to guess.
@@ -6831,12 +6951,19 @@ def _rate_limit_auto_respond():
             # 10-minute grace covers auto-resume racing the clock.
             _ra_exp = existing.get("rate_limit_reset_at") if existing else None
             if _ra_exp and time.time() > float(_ra_exp) + 600:
+                # Tombstone, not a clean pop: the banner that armed this flag is
+                # usually STILL on the idle pane, and the next scan re-parses it
+                # with its time-of-day now in the past — rolling it to tomorrow.
+                # The tombstone is the memory _correct_stale_banner_reset uses
+                # to recognise that re-parse as the same banner, one day rolled.
+                existing["rate_limit_expired_at"] = float(_ra_exp)
                 for _k in ("rate_limit_reset_at", "rate_limit_reset_at_fallback",
                            "rate_limit_weekly", "rate_limit_banner",
                            "rate_limit_credits", "rate_limit_model_name"):
                     existing.pop(_k, None)
                 slog(f"[rate-limit] session={name} reset time passed — flag expired "
                      f"(no activity needed; the clock is the authority)")
+                _persist_rate_limit_state()
                 continue
             _tail12 = "\n".join(clean.splitlines()[-12:])
             _activity_evident = bool(
@@ -6852,7 +6979,17 @@ def _rate_limit_auto_respond():
                 # turn actually runs.
                 or re.search(r"tokens\)\s*$", _tail12, re.M)
                 or any(_LIMIT_ACTIVITY_RE.match(l.strip()) for l in _tail12.splitlines()))
-            if _activity_evident:
+            # A live limit banner/menu in the tail VETOES the activity clear.
+            # Claude Code's "waiting for limit to reset" state renders a
+            # spinner, so the clear fired on a parked pane, popped the flag,
+            # and the next scan re-matched the same menu and pressed 1 again —
+            # the flag flapped and mixpeek-autopilot ate five presses in one
+            # afternoon (2026-08-08). Activity next to a live banner means the
+            # banner wins; the flag clears when the banner leaves the tail.
+            _limit_ui_live = bool(
+                _SESSION_LIMIT_RE.search(_tail12) or _WEEKLY_LIMIT_RE.search(_tail12)
+                or any(p.search(_tail12) for p, _ in _RATE_LIMIT_PROMPTS))
+            if _activity_evident and not _limit_ui_live:
                 if existing and (existing.get("rate_limit_reset_at")
                                  or existing.get("rate_limit_weekly")
                                  or existing.get("rate_limit_banner")
@@ -6864,6 +7001,7 @@ def _rate_limit_auto_respond():
                     existing.pop("rate_limit_credits", None)
                     existing.pop("rate_limit_model_name", None)
                     slog(f"[rate-limit] session={name} active — cleared stale rate-limit flag")
+                    _persist_rate_limit_state()
                 continue
             # The interactive /rate-limit-options menu is always rendered LIVE at
             # the bottom of the screen, so match it against the tail only — never
@@ -6884,12 +7022,28 @@ def _rate_limit_auto_respond():
                 _rl_action = (_rl_row[0] or "wait").strip().lower() if _rl_row else "wait"
             except Exception:
                 _rl_action = "wait"
+            # Parse the reset BEFORE deciding to press. A menu whose reset
+            # already passed is a leftover render, not a live question —
+            # answering it types "1" into whatever the session is doing now.
+            # The stale-roll correction runs here too, so a lingering banner
+            # re-parsed after its own reset arms the PAST time (auto-resume
+            # fires next tick) instead of parking the lane until tomorrow.
+            parsed_reset = _parse_rate_limit_reset(clean, now=now)
+            parsed_reset = _correct_stale_banner_reset(name, parsed_reset, now, existing)
+            _pressed_ts = (existing or {}).get("rate_limit_menu_pressed_ts", 0)
+            _press_ok = (now - float(_pressed_ts or 0) > _RATE_LIMIT_PRESS_COOLDOWN_S
+                         and not (parsed_reset and parsed_reset <= now))
             matched_idx = -1
             for i, (pattern, response) in enumerate(_RATE_LIMIT_PROMPTS):
                 if pattern.search(tail):
-                    if _rl_action != "off":
+                    if _rl_action != "off" and _press_ok:
                         send_text(name, response)
                         _rate_limit_last_responded[name] = now
+                        _session_auto_actions.setdefault(name, {})["rate_limit_menu_pressed_ts"] = now
+                    elif _rl_action != "off":
+                        slog(f"[rate-limit] session={name} menu matched but press "
+                             f"suppressed ({'reset already passed' if parsed_reset and parsed_reset <= now else 'pressed within the hour'}) "
+                             f"— flag still armed for badges/auto-resume")
                     matched_idx = i
                     break
             # Weekly/usage-cap banner has no menu to answer — detect it on its own
@@ -7101,7 +7255,8 @@ def _rate_limit_auto_respond():
                 continue
             actions.pop("rate_limit_credits", None)
             actions.pop("rate_limit_model_name", None)
-            parsed_reset = _parse_rate_limit_reset(clean, now=now)
+            # parsed_reset was computed (and stale-roll-corrected) above the
+            # press decision — re-parsing here would discard the correction.
             actions["rate_limit_last_event_ts"] = int(now)
             if parsed_reset:
                 reset_at = parsed_reset
@@ -7135,6 +7290,7 @@ def _rate_limit_auto_respond():
                 "reset_at": reset_at,
                 "fallback": not parsed_reset,
             }, distinct_id=name)
+            _persist_rate_limit_state(force=True)
         except Exception:
             # A poisoned iteration must not kill the fleet scan — but a SILENT
             # pass here made a real cloud negative indistinguishable from "the
@@ -7252,6 +7408,8 @@ def _rate_limit_auto_resume():
             slog(f"[rate-limit] session={name} resume error: {e}")
 
     total = resumed + skipped + budget_exhausted
+    if total:
+        _persist_rate_limit_state(force=True)
     if total > 1:
         slog(f"[rate-limit] fleet resume: {resumed} sessions steered, "
              f"{skipped} skipped (user intervened), "
@@ -76694,6 +76852,7 @@ def main():
     # Initialize SQLite and migrate flat-file data on first run
     _init_db()
     _hydrate_session_reports()
+    _hydrate_rate_limit_state()
     # Restore had-a-driver markers and reap drivers orphaned by the last
     # re-exec — their pipes died with the old process image (AC-296).
     _bu_hydrate_ever()
