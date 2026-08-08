@@ -6841,7 +6841,16 @@ def _rate_limit_auto_respond():
             _tail12 = "\n".join(clean.splitlines()[-12:])
             _activity_evident = bool(
                 _detect_claude_status(raw) == "active"
-                or re.search(r"esc to interrupt|tokens\)\s*$", _tail12, re.M)
+                # NOT "esc to interrupt": the NORMAL IDLE status bar contains it
+                # ("⏵⏵ bypass permissions on … · esc to interrupt · ← N agents"),
+                # a fact this file already records at the steering settle check
+                # (regression 2026-07-20) — so using it HERE as activity evidence
+                # cleared GENUINE limit flags off idle panes: the badge flapped
+                # in both directions and neither state could be trusted
+                # (AMUX-2566, Ethan's second screenshot). The spinner suffix and
+                # turn markers below are the signals that only exist while a
+                # turn actually runs.
+                or re.search(r"tokens\)\s*$", _tail12, re.M)
                 or any(_LIMIT_ACTIVITY_RE.match(l.strip()) for l in _tail12.splitlines()))
             if _activity_evident:
                 if existing and (existing.get("rate_limit_reset_at")
@@ -36817,9 +36826,15 @@ function render() {
         </div>
         </div>
         ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || !online) ? `<div class="card-header-meta">
-          ${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
+${/* A lane at a limit banner is not WORKING, and a working lane is not
+              limited — showing both asserts a contradiction (Ethan's screenshot:
+              three lanes wearing WORKING + RATE-LIMITED at once, because a turn
+              that hits the banner never fires Stop and the active latch keeps
+              claiming work). The payload now only reports FUTURE limits, so when
+              rate_limited_until is set it is the true state and it supersedes
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
-          ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}
+          ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)">${esc(s.credit_limit_model || 'model')} limit</span>` : ''}
           ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
@@ -40831,7 +40846,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.522';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.523';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -62638,7 +62653,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.522';
+const CACHE = 'amux-v0.9.523';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
