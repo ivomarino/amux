@@ -1075,6 +1075,7 @@ cmd_start_all() {
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
+  local reviewer="" want_stdin=""
   local checked=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1089,7 +1090,13 @@ _board_transition() {
       # dangling, and the shell erroring separately so the board write still
       # looked like it succeeded. send and `board add` both had --stdin; the
       # one field that routinely quotes shell did not.
-      --outcome-stdin) outcome="$(cat)"; [[ -n "$outcome" ]] || die "--outcome-stdin got empty input"; shift ;;
+      # DEFERRED, not read here (AF-16). Reading stdin mid-parse meant a LATER
+      # unknown flag died with the heredoc already consumed, so the refusal
+      # destroyed the very outcome text needed to satisfy the retry — ethos
+      # rule 6, and it cost ~40 lines of re-authored review on AF-15. The read
+      # now happens after argv validates, so a bad invocation leaves stdin
+      # untouched and the same heredoc can simply be piped again.
+      --outcome-stdin) want_stdin=1; shift ;;
       --outcome-file) [[ -r "${2:-}" ]] || die "--outcome-file needs a readable path"
                       outcome="$(cat "$2")"; shift 2 ;;
       # --trigger records the EXTERNAL condition a card is parked on, into
@@ -1107,12 +1114,27 @@ _board_transition() {
         while [[ $# -gt 0 && "$1" != --* ]]; do checked+=("$1"); shift; done ;;
       --type) newtype="${2:-}"; [[ -n "$newtype" ]] || die "--type needs a value"; shift 2 ;;
       --override-doing) override=1; shift ;;
+      # --reviewer NAMES the peer a card is handed to (AF-16). `amux board
+      # review <ID>` could set the STATUS but not the reviewer, and the review
+      # gate rests entirely on the reviewer's own X-Amux-Session being the
+      # required sign-off ("the author cannot close it") — so a card could
+      # reach `review` with reviewer=None, which is a card nobody has been
+      # asked to look at. Completing the handoff meant a hand-rolled PATCH,
+      # i.e. the unattributed back door AMUX-2325 is about, reached from the
+      # audited path for want of one flag.
+      --reviewer) reviewer="${2:-}"; [[ -n "$reviewer" ]] || die "--reviewer needs a session name"; shift 2 ;;
       --rev) rev="${2:-}"; shift 2 ;;
       --force) force_reason="${2:-}"; [[ -n "$force_reason" ]] || die "--force requires a reason (why you are bypassing the gate)"; shift 2 ;;
       *) die "amux board: unknown flag '$1'
-Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" ;;
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" ;;
     esac
   done
+  # Now that argv is known-good, drain stdin. See --outcome-stdin above: doing
+  # this inside the loop meant an unknown flag AFTER it swallowed the heredoc
+  # and then died, and the retry had nothing left to pipe.
+  if [[ -n "$want_stdin" ]]; then
+    outcome="$(cat)"; [[ -n "$outcome" ]] || die "--outcome-stdin got empty input"
+  fi
   # Record the outcome as its OWN write, BEFORE attempting the transition.
   # A PATCH is atomic, so `{"desc":...,"status":"done"}` that trips the gate
   # discards the outcome text TOO — and the retry then has nothing to satisfy
@@ -1127,11 +1149,12 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--o
       "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
   fi
   local body
-  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" python3 -c '
+  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" python3 -c '
 import json, os, sys, time
 b = {"status": os.environ["S"]}
 if os.environ.get("A"): b["gate_ack"] = True
 if os.environ.get("T"): b["type"] = os.environ["T"]
+if os.environ.get("V"): b["reviewer"] = os.environ["V"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
 if os.environ.get("F"): b["force"] = True; b["desc_append"] = "[FORCED] " + os.environ["F"]
@@ -1270,7 +1293,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       shift
       local result
       result=$(_board_transition "$id" "$status" "$@")
@@ -1279,7 +1302,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
-      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
+      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       shift 2
       local result
       result=$(_board_transition "$id" "$new_status" "$@")
@@ -1727,6 +1750,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                      ... \`git log --grep=x\` stays literal ...
                                      EOF
     --type T                       retype in the same write
+    --reviewer W                   name the peer this card is handed to. `review`
+                                     sets the STATUS; the review gate rests on the
+                                     REVIEWER's sign-off, so a card in review with
+                                     no reviewer is one nobody was asked to look at
     --override-doing               hold a second card in doing deliberately
     --trigger "external condition"  park on an EXTERNAL blocker: records it as the
                                    card's source_ref and stamps last_verified_at, so a
