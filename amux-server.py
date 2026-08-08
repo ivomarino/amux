@@ -76072,9 +76072,6 @@ def main():
     for _host in bind_hosts:
         for _attempt in range(10):
             try:
-    # Restore had-a-driver markers and reap drivers orphaned by the last
-    # re-exec — their pipes died with the old process image (AC-296).
-    _bu_hydrate_ever()
                 servers.append(ResilientHTTPSServer((_host, port), CCHandler))
                 break
             except OSError as e:
@@ -76092,6 +76089,9 @@ def main():
         try:
             cert, key, ts_hostname, fb_ctx = _ensure_tls(lan_ip)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Restore had-a-driver markers and reap drivers orphaned by the last
+    # re-exec — their pipes died with the old process image (AC-296).
+    _bu_hydrate_ever()
             ctx.load_cert_chain(cert, key)
             # SNI callback: use Tailscale cert for hostname, fallback for IPs
             if ts_hostname and fb_ctx:
