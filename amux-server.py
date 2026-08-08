@@ -4902,15 +4902,40 @@ def _herdr_create_and_start(name: str, kind: str, args: list, work_dir: str,
         pane_id = (((d or {}).get("result") or {}).get("root_pane") or {}).get("pane_id", "")
         if not pane_id:
             return False, "herdr workspace create failed"
+        # A fresh pane's login shell can cd AWAY from the workspace --cwd (a
+        # profile that ends in `cd ~/Dev` did, first e2e 2026-08-08) — pin the
+        # dir the same way the tmux path does: profile first, cd second.
+        _herdr(["pane", "run", pane_id, f"cd {shlex.quote(work_dir)}"], timeout=5)
     start_args = ["agent", "start", agent_name, "--kind", kind,
                   "--pane", pane_id, "--timeout", "60000"]
     if args:
         start_args += ["--"] + args
-    d2 = _herdr_json(start_args, timeout=90)
-    if not d2 or not ((d2.get("result") or {}).get("agent")):
+    # RETRY agent_pane_busy: workspace create returns before the pane's shell
+    # can host an agent, and the very first e2e start died on exactly that
+    # race ("agent target pane is not an available shell"; a by-hand retry
+    # ~10s later succeeded, and the pane's agent_status field reads "unknown"
+    # throughout, so TIME is the only usable signal). Raw _herdr + own parse,
+    # because _herdr_json flattens error payloads to None — the site could
+    # not even SEE which error it was retrying (rule 4).
+    d2, _err_code = None, ""
+    for _attempt in range(10):
+        r2 = _herdr(start_args, timeout=90)
+        try:
+            _payload = json.loads(r2.stdout) if r2 and r2.stdout else None
+        except Exception:
+            _payload = None
+        if _payload and ((_payload.get("result") or {}).get("agent")):
+            d2 = _payload
+            break
+        _err = (_payload or {}).get("error")
+        _err_code = (_err.get("code", "") if isinstance(_err, dict) else "") or "no-json"
+        if _err_code != "agent_pane_busy":
+            break
+        time.sleep(2)
+    if not d2:
         # Don't leave a half-started pane behind.
         _herdr_json(["pane", "close", pane_id], timeout=10)
-        return False, "herdr agent start failed"
+        return False, f"herdr agent start failed ({_err_code})"
     try:
         env_file = CC_SESSIONS / f"{name}.env"
         cfg = parse_env_file(env_file)
@@ -16895,7 +16920,25 @@ def _board_full_cached() -> list:
     with _sse_cache_lock:
         if _bf["data"] is not None and time.time() - _bf["time"] < _SSE_CACHE_TTL * 5:
             return _bf["data"]
-        data = _load_board(done_limit=0)
+        # GENERATION GUARD (AF-12), the same one `board` has had since AMUX-2560 and
+        # this cache was shipped without. _board_changed() nulls _bf["data"] WITHOUT
+        # taking this lock, so a write landing while _load_board() is in flight was
+        # silently undone: the rebuild committed its pre-write result and stamped it
+        # fresh, and filtered GETs then served a board missing a committed card for
+        # up to TTL*5. Reproduced before fixing — 5 trials with the write timed into
+        # an in-flight rebuild, 1 came back stale (desc_len 2227 expected, 2222 served).
+        #
+        # REBUILD-UNTIL-STABLE, not discard-if-moved, and the distinction is load-
+        # bearing: the sibling's comment records that discarding on every bump caused
+        # the 2026-08-02 outage — under a write burst the cache never became fresh, so
+        # every client full-built its own board (2 cores pinned, 90s reads). A build
+        # STARTED after the latest bump is correct to commit. Bounded at 4 so a
+        # sustained burst commits a near-fresh board instead of starving.
+        for _ in range(4):
+            _g0 = _bf.get("gen", 0)
+            data = _load_board(done_limit=0)
+            if _bf.get("gen", 0) == _g0:
+                break
         _bf["data"] = data
         _bf["time"] = time.time()
         return data
@@ -16917,6 +16960,11 @@ def _board_changed():
     cheap for pollers; only an explicit write forces the slow path."""
     _bf = _sse_cache["board_full"]
     _bf["data"] = None
+    # Bump board_full's generation too (AF-12). Nulling `data` alone is not enough:
+    # this runs WITHOUT _sse_cache_lock, so a rebuild already inside the lock will
+    # happily write its pre-write result back afterwards and stamp it fresh, undoing
+    # this invalidation. The generation is what lets that rebuild notice.
+    _bf["gen"] = _bf.get("gen", 0) + 1
     _bc = _sse_cache["board"]
     _bc["time"] = 0
     _bc["data"] = None
