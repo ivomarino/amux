@@ -1539,10 +1539,16 @@ NOTE: this is AMUX-2325 one verb over, and the same argument applies — the gat
 ## No rig can render amux at phone width, so the mobile half of `verified` is undecidable
 AREA: browser
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-frustrations
 CARD: AF-18
+FIX-NOTE: e29069b — the driver's viewport was a LITERAL (1280x900); it is now a
+  parameter (argv, AMUX_BU_VIEWPORT, and a `viewport` action taking width+height or
+  device=iphone|ipad|...). innerWidth 1280->390, mq(max-width:600px) false->true.
+  Also explains why window.resizeTo() looked broken: Playwright owns the viewport, so
+  the call was inert rather than blocked. Unblocked AMUX-2369 (now verified) and
+  resolved AMUX-2367's 40-vs-44px flag (renders 67px, clean).
 SYMPTOM: amux is mobile-first by policy and `verified` is meant to include the real UI at
   phone width. Three rigs, none can do it. (1) The shipped driver: POST /api/browser/start
   takes url/profile/session/fresh/backend — no viewport parameter — and in-page
