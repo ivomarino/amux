@@ -4894,18 +4894,59 @@ def _herdr_create_and_start(name: str, kind: str, args: list, work_dir: str,
                    timeout=5)
             time.sleep(0.2)
     if not pane_id:
+        # NO --env pairs on the command line (AMUX-2571): argv is readable by
+        # every local process via ps, and these pairs carry live provider keys.
+        # herdr 0.8.0 offers no env-file flag, so env goes in via a 0600 file
+        # SOURCED into the pane shell — the same trust boundary the tmux path
+        # uses (env flows through the shell, never through argv). The file's
+        # last line deletes it, which doubles as the handshake: the file
+        # vanishing proves the pane shell actually ran it, the one signal a
+        # booting pane can give (its agent_status never leaves "unknown").
         ws_args = ["workspace", "create", "--cwd", work_dir,
                    "--label", f"amux-{name}", "--no-focus"]
-        for pair in env_pairs:
-            ws_args += ["--env", pair]
         d = _herdr_json(ws_args, timeout=15)
         pane_id = (((d or {}).get("result") or {}).get("root_pane") or {}).get("pane_id", "")
         if not pane_id:
             return False, "herdr workspace create failed"
-        # A fresh pane's login shell can cd AWAY from the workspace --cwd (a
-        # profile that ends in `cd ~/Dev` did, first e2e 2026-08-08) — pin the
-        # dir the same way the tmux path does: profile first, cd second.
-        _herdr(["pane", "run", pane_id, f"cd {shlex.quote(work_dir)}"], timeout=5)
+        _envf = None
+        try:
+            _tmpd = CC_HOME / "tmp"
+            _tmpd.mkdir(parents=True, exist_ok=True)
+            _envf = _tmpd / f"herdr-env-{name}-{os.urandom(6).hex()}.sh"
+            _lines = []
+            for _pair in env_pairs:
+                _ek, _, _ev = _pair.partition("=")
+                _lines.append(f"export {_ek}={shlex.quote(_ev)}")
+            _lines.append(f"rm -f -- {shlex.quote(str(_envf))}")
+            _fd = os.open(str(_envf), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(_fd, "w") as _fh:
+                _fh.write("\n".join(_lines) + "\n")
+        except Exception as _e:
+            slog(f"[herdr] {name}: env file write failed ({_e}) — starting without forwarded env")
+            _envf = None
+        # A fresh pane's login shell can also cd AWAY from the workspace --cwd
+        # (a profile ending in `cd ~/Dev` did, first e2e 2026-08-08) — pin the
+        # dir and source the env in ONE pane run: profile first, ours second.
+        _cmd = f"cd {shlex.quote(work_dir)}"
+        if _envf is not None:
+            _cmd += f" && . {shlex.quote(str(_envf))}"
+        _herdr(["pane", "run", pane_id, _cmd], timeout=5)
+        if _envf is not None:
+            # Wait for the handshake; a dropped keystroke into a booting shell
+            # is silent, and an agent started without creds fails later in a
+            # way that does not name this step. Retry the pane run until the
+            # file is consumed, then give up loudly (start proceeds — OAuth
+            # lanes need no env at all).
+            for _attempt in range(10):
+                time.sleep(1.0)
+                if not _envf.exists():
+                    break
+                _herdr(["pane", "run", pane_id, _cmd], timeout=5)
+            else:
+                slog(f"[herdr] {name}: env file never consumed by the pane shell — "
+                     f"agent starts without forwarded env; removing {_envf.name}")
+                try: _envf.unlink()
+                except Exception: pass
     start_args = ["agent", "start", agent_name, "--kind", kind,
                   "--pane", pane_id, "--timeout", "60000"]
     if args:
