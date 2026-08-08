@@ -2051,6 +2051,56 @@ def _bu_session_profile(session: str) -> str:
         pass
     return ""
 
+def _bu_session_resolve(explicit, headers) -> str:
+    """Whose browser a /api/browser/* call operates on.
+
+    ORDER (AC-293): explicit `session` in the body or query, then the
+    X-Amux-Session header, then "amux".
+
+    THE BUG THIS EXISTS FOR. All eight browser endpoints did
+    `body.get("session", "amux")` and NO browser endpoint read X-Amux-Session
+    anywhere. Neither half was harmless on its own, and together they were worse:
+
+      - The header every other subsystem uses for attribution — the one CLAUDE.md
+        makes mandatory, the one `amux send` and the board rely on — was passed by
+        well-behaved callers and dropped on the floor here.
+      - The fallback is not a neutral sentinel. "amux" is a REAL, LIVE LANE. So
+        every caller that omitted `session` silently operated inside that lane's
+        browser: its driver, its page, its cookie jar.
+
+    Two lanes doing that are not two sessions contending for a lock. They are ONE
+    session as far as this API is concerned, and whoever navigates last wins. That
+    is what produced the browser-rig unreliability three sessions fought on
+    2026-08-06/07 — context drifting to about:blank between calls, evals returning
+    a page nobody had loaded, drivers apparently dying mid-sequence. I filed lock
+    contention as the suspected cause on AC-289; amux measured it and found none,
+    which was the correct result, because the lock was never the mechanism.
+
+    Reproduced by walking into it: POST /api/browser/start with
+    X-Amux-Session: amux-cloud registered a driver and returned
+    backend="driver"; POST /api/browser/action with session="amux-cloud" then
+    returned backend="cli", because no driver existed under that name. Start and
+    action disagreed about who the caller was, and the eval silently fell through
+    to the browser-use CLI — a different browser process (AMUX-2272) — returning a
+    page that was never loaded, as a success. amux-gtm independently hit the same
+    thing the same night from a first attempt that omitted `session`.
+
+    Why the header is the DEFAULT and not an override: a lane driving its own
+    browser is the overwhelming common case and should need no ceremony, while a
+    lane driving ANOTHER lane's browser is a real thing to want (a reviewer
+    watching a peer's page) and should have to say so out loud. Changing only the
+    fallback string would fix the collision and leave attribution broken — and
+    they are the same line of code, so fixing one without the other is a choice.
+
+    "amux" is kept as the final fallback so the dashboard, which sends no header
+    and passes its own `session` explicitly, is byte-for-byte unaffected.
+    """
+    s = explicit.strip() if isinstance(explicit, str) else ""
+    if s:
+        return s
+    return (headers.get("X-Amux-Session") or "").strip() or "amux"
+
+
 def _chrome_user_data_dirs_in_use() -> list:
     """Every --user-data-dir a live Chrome is actually running with.
 
@@ -3725,8 +3775,23 @@ _session_reported: dict = {}   # name -> {"state": ..., "detail": ..., "ts": epo
 _scrape_vs_report: dict = {}   # name -> last scrape/hook disagreement (ethos #4)
 
 
-def _persist_session_reports() -> None:
+_report_persist_last: float = 0.0
+_REPORT_PERSIST_EVERY_S = 10
+
+
+def _persist_session_reports(force: bool = False) -> None:
     """Mirror the self-report table into prefs so it survives a restart.
+
+    THROTTLED (AMUX-2538). This wrote the whole dict to SQLite on every report,
+    which was fine while reports were two edges per turn. The PostToolUse
+    heartbeat makes reports fire on every tool call across the fleet, so an
+    unthrottled write here would put a full-table serialise on the hot path —
+    paying a durability cost per tool call to protect against a restart that
+    happens a few times a day.
+    Throttling is safe precisely because of what this protects: a report lost to
+    a restart within the last 10s is a report whose lane is about to take a turn
+    and re-report anyway. `force` exists for the edges, where the state CHANGE is
+    the thing worth durably keeping.
 
     This process re-execs itself on every save of this file, so anything held
     only in memory is fiction across a restart. That was tolerable while
@@ -3735,12 +3800,17 @@ def _persist_session_reports() -> None:
     restart would drop every lane back to full-rate pane capture until each
     one happened to take a turn, which is exactly the load the demotion
     exists to remove."""
+    global _report_persist_last
+    now = time.time()
+    if not force and (now - _report_persist_last) < _REPORT_PERSIST_EVERY_S:
+        return
     try:
         db = get_db()
         db.execute("INSERT INTO prefs (key, value) VALUES ('session_reports', ?) "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                    (json.dumps(_session_reported),))
         db.commit()
+        _report_persist_last = now
     except Exception as e:
         try: slog(f"[report] persist failed: {e}")
         except Exception: pass
@@ -6424,6 +6494,19 @@ _scan_demoted_last: dict = {}   # session -> last FULL scan while self-reporting
 # silently becomes the ceiling: raise _HOOKS_LIVE_S as hooks get more reliable,
 # lower _SCAN_DEMOTE_S if a class of state change turns out to need faster eyes.
 _HOOKS_LIVE_S = int(os.environ.get("AMUX_HOOKS_LIVE_S", "1800"))
+# How long an `active` report may keep OVERRIDING the pane scrape without being
+# re-asserted by a heartbeat (AMUX-2538). Separate from _HOOKS_LIVE_S, which
+# governs scan demotion and is legitimately generous — the two answer different
+# questions and sharing one number is what made a 30-minute-old edge authoritative
+# about what a lane is doing RIGHT NOW.
+#
+# 120s: PostToolUse fires on every tool call, so a working turn re-asserts far more
+# often than this; the window only has to cover a long stretch of pure thinking
+# between tools. Exceeding it is NOT an error and does not make the status wrong —
+# it just stops the stale edge from OUTRANKING the scrape, and the scrape is what
+# already serves the 68 lanes with no hooks at all. Failing back to a live signal
+# is the safe direction.
+_ACTIVE_HEARTBEAT_S = int(os.environ.get("AMUX_ACTIVE_HEARTBEAT_S", "120"))
 _SCAN_DEMOTE_S = int(os.environ.get("AMUX_SCAN_DEMOTE_S", "60"))
 # An `idle` report is self-renewing: the only way a lane leaves idle is a
 # prompt, and every prompt fires UserPromptSubmit -> report. So an idle report
@@ -19012,6 +19095,21 @@ def list_sessions() -> list:
                 # discarded and a misfiring regex won the tie. We HAVE the event; we were
                 # throwing it away and then guessing. active/waiting still decay on the
                 # short window, because those really do go stale on their own.
+                # An `active` report only outranks the scrape while a HEARTBEAT is
+                # still re-asserting it (AMUX-2538). Without this, one edge won for
+                # 1800s and a lane whose Stop never fired read WORKING for half an
+                # hour — and a long turn was byte-identical to a wedged one. When
+                # the heartbeat lapses we do not assert idle; we simply stop
+                # overriding, and the pane scrape decides. `idle` and `waiting` are
+                # unaffected: idle is self-renewing (the only exit is a prompt,
+                # which fires UserPromptSubmit).
+                _now = time.time()
+                if _rep and _rep.get("state") == "active" \
+                        and (_now - _rep.get("ts", 0)) > _ACTIVE_HEARTBEAT_S:
+                    _scrape_vs_report[name] = {"scrape": status, "report": "active-stale",
+                                               "age_s": int(_now - _rep.get("ts", 0)),
+                                               "ts": _now}
+                    _rep = None
                 if _rep and _rep.get("state") in ("active", "idle", "waiting") \
                         and _hooks_live(_rep, time.time()):
                     if status != _rep["state"] and _rep["state"] == "idle":
@@ -22629,8 +22727,25 @@ def _install_state_report_hooks() -> None:
                     "\"${AMUX_URL:-https://localhost:8822}" + _STATE_HOOK_MARKER + "\" "
                     ">/dev/null 2>&1; exit 0")
         changed = False
+        # PostToolUse is a HEARTBEAT, and it is what turns `active` from a latch
+        # into a state (AMUX-2538). Stop/UserPromptSubmit are two EDGES: one sets
+        # active, one clears it, and nothing re-asserts it in between — so the
+        # absence of a signal carries no information, and a Stop that never fires
+        # (crash, /clear, restart, kill, context-limit abort) pins the card
+        # WORKING for the full 1800s window.
+        #
+        # Measured on the live fleet before this: a genuinely long turn and a
+        # wedged lane are BYTE-IDENTICAL — both read "prompt-hook active, N
+        # seconds old". backend sat at 2660s of `active` and was really working;
+        # a dead lane looks exactly the same. Ethos rule 4: the instrument could
+        # not express the discriminator.
+        #
+        # PostToolUse already fired on every tool call and was already configured
+        # in settings.json — it simply reported nothing. Ethos rule 1: the
+        # capability existed and reached no one.
         for event, state, source in (("Stop", "idle", "stop-hook"),
-                                     ("UserPromptSubmit", "active", "prompt-hook")):
+                                     ("UserPromptSubmit", "active", "prompt-hook"),
+                                     ("PostToolUse", "active", "tool-hook")):
             arr = hooks.setdefault(event, [])
             if any(_STATE_HOOK_MARKER in json.dumps(e) for e in arr):
                 continue
@@ -72377,7 +72492,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             if method == "POST" and path == "/api/browser/start":
                 body = self._read_body()
                 url = body.get("url", "about:blank")
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 profile = (body.get("profile") or "").strip()
                 fresh = bool(body.get("fresh"))
                 if (body.get("backend") or "").strip().lower() == "live":
@@ -72408,7 +72523,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 url = body.get("url", "")
                 if not url:
                     return self._json({"error": "url required"}, 400)
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 profile = (body.get("profile") or "").strip()
                 if session in _live_targets:
                     r = _cdp_call(["nav", _live_targets[session], url], 30)
@@ -72418,8 +72533,9 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
 
             # GET /api/browser/screenshot?session=amux&url=...
             if method == "GET" and path == "/api/browser/screenshot":
-                session = (qs.get("session", ["amux"])[0] if isinstance(qs.get("session"), list)
-                           else qs.get("session", "amux"))
+                _q = qs.get("session")
+                session = _bu_session_resolve(
+                    (_q[0] if isinstance(_q, list) and _q else _q), self.headers)  # AC-293
                 url_param = (qs.get("url", [""])[0] if isinstance(qs.get("url"), list)
                              else qs.get("url", ""))
                 if session in _live_targets:
@@ -72456,8 +72572,9 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # to browser-use's raw state, we surface a parsed `elements` list
             # ([{index,tag,label}]) + `viewport` for ref-based clicking.
             if method == "GET" and path == "/api/browser/state":
-                session = (qs.get("session", ["amux"])[0] if isinstance(qs.get("session"), list)
-                           else qs.get("session", "amux"))
+                _q = qs.get("session")
+                session = _bu_session_resolve(
+                    (_q[0] if isinstance(_q, list) and _q else _q), self.headers)  # AC-293
                 if session in _live_targets:
                     r = _cdp_call(["snap", _live_targets[session]], 30)
                     if not r.get("ok"):
@@ -72513,14 +72630,14 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # POST /api/browser/inspect/clear?session=amux — reset capture buffers
             if method == "POST" and path == "/api/browser/inspect/clear":
                 body = self._read_body()
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 return self._json(_bu_inspect(session=session, clear=True, limit=1))
 
             # POST /api/browser/action  {"action":"click|type|key|scroll|eval","session":"...","..."}
             if method == "POST" and path == "/api/browser/action":
                 body = self._read_body()
                 action = body.get("action", "")
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 if session in _live_targets:
                     tid = _live_targets[session]
                     if action == "click":
@@ -72632,7 +72749,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # POST /api/browser/stop  {"session":"..."}
             if method == "POST" and path == "/api/browser/stop":
                 body = self._read_body()
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 tid = _live_targets.pop(session, None)
                 if tid:
                     _cdp_call(["close", tid], 10)   # browser-level closeTarget — window.close() can't close our tab
@@ -72702,7 +72819,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
             # profile next time. `name` defaults to the session's active profile.
             if method == "POST" and path == "/api/browser/save-profile":
                 body = self._read_body()
-                session = body.get("session", "amux")
+                session = _bu_session_resolve(body.get("session"), self.headers)   # AC-293
                 name = (body.get("name") or "").strip() or _bu_session_profile(session) or "default"
                 label = (body.get("label") or "").strip()
                 host = (body.get("host") or "").strip().lower()
@@ -74113,11 +74230,26 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 st = _ALIAS.get(st, st)
                 if st not in ("active", "idle", "waiting", "error"):
                     return self._json({"error": f"state must be one of active|idle|waiting|error (got {st!r})"}, 400)
+                _src = str(body.get("source") or "hook")[:40]
+                # A HEARTBEAT MUST NOT RESURRECT A FINISHED TURN (AMUX-2538).
+                # PostToolUse fires per tool call, and a subagent's tool calls can
+                # land AFTER the parent's Stop. Letting a tool-hook write `active`
+                # over a stop-hook `idle` would flip a finished lane back to
+                # WORKING — manufacturing the exact defect this change exists to
+                # remove, from its own fix. So the heartbeat only REFRESHES an
+                # already-active turn; it never starts one. Only UserPromptSubmit
+                # starts a turn, which is what actually knows one began.
+                _prev = _session_reported.get(name) or {}
+                if _src == "tool-hook" and _prev.get("state") != "active":
+                    return self._json({"ok": True, "state": _prev.get("state") or "unknown",
+                                       "note": "heartbeat ignored — no active turn to refresh"})
                 _session_reported[name] = {"state": st,
                                            "detail": str(body.get("detail") or "")[:200],
-                                           "source": str(body.get("source") or "hook")[:40],
+                                           "source": _src,
                                            "ts": time.time()}
-                _persist_session_reports()
+                # Force the durable write on real state CHANGES (the edges) and
+                # let the throttle absorb the heartbeats.
+                _persist_session_reports(force=(_prev.get("state") != st))
                 return self._json({"ok": True, "state": st})
             if action == "apply-template":
                 body = self._read_body()
