@@ -1626,3 +1626,26 @@ FIX-NOTE: the durable outputs are the CLASS invariants, each with a can-it-fail 
   editField call-site field must have a dispatcher branch (test_editfield_contract).
   The pattern for next time: a rename in a 74k-line single file with no type system
   needs its invariant test written FIRST, from the rename's own diff.
+
+---
+
+## `git commit` on the shared checkout consumes PEERS' staged files silently
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux
+CARD: AMUX-2554
+SYMPTOM: I staged amux-server.py and committed; the commit also carried
+  tests/test_board_full_cache_generation.py — amux-frustrations' AF-12 test, sitting
+  in the SHARED index. The staged-guard warned about the co-edited server file but
+  says nothing about OTHER paths already staged by peers, and `git commit` takes the
+  whole index. The amend repair is (correctly) blocked by the shared-checkout guard,
+  so the misattribution is permanent in history.
+COST: a peer's test shipped under my sha and message; two sessions spent time on
+  notice/acknowledgement; the same sweep with a SECRETS or WIP file staged would be
+  worse than misattribution.
+FIX-NOTE: candidate fixes, someone's to pick up: (a) staged-guard lists ALL staged
+  paths not touched by the committing session's diff, loudly; (b) fleet convention:
+  `git commit -- <own paths>` instead of bare commit (commit takes pathspecs and
+  bypasses the index sweep); (c) both. (b) is zero-code and I am adopting it now.
