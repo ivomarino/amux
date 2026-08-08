@@ -18936,8 +18936,10 @@ def _commit_guard(name: str) -> bool:
         # path is; a file another session touched inside the window is theirs, and
         # nudging THIS session about it asks it to sweep a peer's WIP (the exact
         # incident class the staged-guard exists to block).
+        _shared_note = ""
         try:
-            _fg = _staged_guard_check(name, wd, files).get("foreign") or []
+            _chk = _staged_guard_check(name, wd, files)
+            _fg = _chk.get("foreign") or []
             _theirs = {f.get("path") for f in _fg}
             _own = [f for f in files if f not in _theirs]
             if not _own:
@@ -18946,6 +18948,83 @@ def _commit_guard(name: str) -> bool:
                      f"{'/'.join(_owners)}'s recent edits — not nudging")
                 return False
             files = _own
+            # READ `shared` TOO, NOT JUST `foreign` (AC-300). This filter used to
+            # consume only `foreign`, and on THIS repo that made it inert on the
+            # only file that matters.
+            #
+            # _staged_guard_check classifies a path both sessions edited as
+            # `shared`, not `foreign` — deliberately, because the committer has a
+            # legitimate claim to their own hunks and blocking would deadlock a
+            # genuinely shared file. But amux is a SINGLE-FILE project, so
+            # "both sessions edited amux-server.py" is satisfied essentially
+            # always, and that function's own comment says so. So `foreign` is
+            # empty for the one path with all the collisions, `_own` keeps it,
+            # and the nudge told this session to commit a peer's in-flight work.
+            #
+            # 2026-08-08: it did exactly that to me — "commit completed work now,
+            # amux-server.py" while the only dirt was amux's mid-iteration hook
+            # matchers. Their value changed "*" -> ".*" between two checks
+            # twenty minutes apart, and their own comment records the "*" version
+            # as inert, so the WIP checkpoint this nudge recommends would have
+            # committed a known-broken snapshot under my name.
+            #
+            # ONE FUNCTION, TWO CONSUMERS, OPPOSITE FAILURES — which is why this
+            # is not two bugs: the same `ap in mine` exemption made the staged
+            # guard SILENT on a commit that swept ~85 lines of a peer's work
+            # (AC-297) and made this nudge LOUD about work that was not mine.
+            # Fixing only one leaves the other, because the disagreement is
+            # between the two consumers' predicates, not in the classifier.
+            #
+            # Do NOT suppress the nudge on `shared`: on a single-file repo that
+            # would silence it permanently, which is the opposite over-correction.
+            # Say the file is contested and name who else is in it — the
+            # recipient can then check per-hunk instead of `git add <file>`.
+            _sh = [f for f in (_chk.get("shared") or []) if f.get("path") in set(files)]
+            if _sh:
+                _who = "/".join(sorted({f.get("owner") or "?" for f in _sh}))
+                _paths = ", ".join(f.get("path") for f in _sh[:4])
+                _shared_note = (
+                    f"\n\nCO-EDITED — {_paths} {'was' if len(_sh) == 1 else 'were'} also "
+                    f"edited by {_who} recently, so some hunks in "
+                    f"{'it' if len(_sh) == 1 else 'them'} are probably NOT yours. "
+                    f"`git add <file>` takes the whole file. Read `git diff` first and "
+                    f"stage only your hunks (`git diff -U0 <file> > /tmp/mine.patch`, trim, "
+                    f"`git apply --cached --unidiff-zero /tmp/mine.patch`). If none of it is "
+                    f"yours, leave it — say so and do not commit.")
+                slog(f"[commit-guard] {name}: co-edited with {_who} on {_paths} — "
+                     f"nudging WITH the contested-file warning")
+            # FOREIGN FILES — a peer edited it and this session did NOT (AC-300).
+            # The block above handles `shared` (both touched it) and this branch
+            # was missing entirely, so a file that is 100% someone else's work
+            # was named in "commit your uncommitted changes" with no warning at
+            # all. Followed literally, the instruction is "commit your peer's
+            # unfinished code", and that is the mechanism behind two real sweeps
+            # on 2026-08-07 (b1c3e93 ~93 lines, 8adf348 ~85 lines, both by
+            # amux-cloud, both disclosed, both of MY in-flight work).
+            #
+            # amux-cloud then hit it a third time, recognised it, and declined —
+            # which is the only reason this is a card and not a fourth incident.
+            # A guard that depends on the recipient being suspicious of it is not
+            # a guard.
+            _fg = [f for f in (_chk.get("foreign") or []) if f.get("path") in set(files)]
+            if _fg and len(_fg) == len(files):
+                # NOTHING here is theirs. Do not nudge at all — there is no
+                # honest action for this session to take, and the only available
+                # one is destructive.
+                _fw = "/".join(sorted({f.get("owner") or "?" for f in _fg}))
+                slog(f"[commit-guard] {name}: all {len(files)} dirty file(s) belong to "
+                     f"{_fw} — suppressing the nudge entirely (AC-300)")
+                return False
+            if _fg:
+                _fw = "/".join(sorted({f.get("owner") or "?" for f in _fg}))
+                _fp = ", ".join(f.get("path") for f in _fg[:4])
+                _shared_note += (
+                    f"\n\nNOT YOURS — {_fp} {'was' if len(_fg) == 1 else 'were'} edited by "
+                    f"{_fw} and NOT by you. Do not commit {'it' if len(_fg) == 1 else 'them'}: "
+                    f"`git add -A` or `git commit -a` would sweep a peer's in-flight work into "
+                    f"your commit under your name. Stage only the files you touched.")
+                slog(f"[commit-guard] {name}: {len(_fg)} foreign file(s) owned by {_fw} — "
+                     f"nudging WITH the do-not-commit warning")
         except Exception:
             pass   # attribution unavailable → keep the old (over-nudging) behavior
         if _commit_guard_nudged.get(name):
@@ -18957,7 +19036,8 @@ def _commit_guard(name: str) -> bool:
                f"{sample}\n\n"
                "Commit completed work now with a clear, descriptive message (group related changes). "
                "If something is intentionally incomplete, commit a WIP checkpoint and say so. "
-               "Don't leave the working tree dirty.")
+               "Don't leave the working tree dirty."
+               + _shared_note)
         # Token-efficiency (audit 2026-07-13: 87 commit nudges/day vs 75 human
         # sends — each nudge was its own full-context turn into a cold-cache
         # idle session, the single largest automated token stream):
