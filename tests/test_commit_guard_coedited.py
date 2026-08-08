@@ -62,10 +62,11 @@ def guard():
     sent = {}
     m._steer_enqueue = lambda name, text, **kw: sent.__setitem__(name, text)
 
-    def run(chk):
+    def run(chk, files=("amux-server.py",)):
         sent.clear()
         m._commit_guard_nudged.pop("lane", None)
         m._commit_guard_daily.clear()
+        m._session_dirty_files = lambda n, w, _f=list(files): list(_f)
         m._staged_guard_check = lambda s, w, f: chk
         m._commit_guard("lane")
         return sent.get("lane", "")
@@ -109,6 +110,39 @@ def test_solo_dirty_tree_gets_NO_false_warning(guard):
     t = guard({"ok": True, "foreign": [], "shared": [], "cotenants": []})
     assert t, "a genuinely solo dirty tree should still be nudged"
     assert "CO-EDITED" not in t
+
+
+def test_partly_foreign_gets_the_DO_NOT_COMMIT_warning(guard):
+    """amux's `NOT YOURS` block, promoted from a source-shape assertion to a behavioural one.
+
+    Distinct from the co-edited case and not covered by it: `foreign` means the recipient did
+    NOT touch that path at all, so the instruction is "do not commit this", not "stage your
+    hunks". With a second file that IS theirs, the nudge must still fire — suppressing would
+    strand the recipient's own real work.
+    """
+    m_files = ["peer_only.py", "mine.py"]
+    t = guard({"ok": True,
+               "foreign": [{"path": "peer_only.py", "owner": "amux", "age_secs": 90}],
+               "shared": [], "cotenants": ["amux"]},
+              files=m_files)
+    assert t, "a partly-foreign tree must still nudge — the recipient has real work in mine.py"
+    assert "NOT YOURS" in t, "no do-not-commit warning for a file the recipient never touched"
+    note = t.split("NOT YOURS")[1]
+    assert "peer_only.py" in note and "amux" in note, "the warning names neither the file nor the owner"
+    assert "in-flight" in t or "Do not commit" in t
+
+
+def test_both_warnings_can_appear_together(guard):
+    """One file purely a peer's, another co-edited. Both notes must survive — they are
+    different instructions (do not commit vs stage only your hunks), and the second one
+    appends to the first, so a naive assignment instead of += would silently drop one."""
+    t = guard({"ok": True,
+               "foreign": [{"path": "peer_only.py", "owner": "amux", "age_secs": 90}],
+               "shared": [{"path": "shared.py", "owner": "amux", "age_secs": 120}],
+               "cotenants": ["amux"]},
+              files=["peer_only.py", "shared.py", "mine.py"])
+    assert "NOT YOURS" in t and "CO-EDITED" in t, (
+        "one of the two warnings was overwritten rather than appended")
 
 
 def test_shared_entries_for_files_already_dropped_are_ignored(guard):

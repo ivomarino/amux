@@ -19036,6 +19036,16 @@ def _commit_guard(name: str) -> bool:
                 slog(f"[commit-guard] {name}: all {len(files)} dirty file(s) are "
                      f"{'/'.join(_owners)}'s recent edits — not nudging")
                 return False
+            # KEEP THE PRE-FILTER LIST. Both warning blocks below intersect their
+            # category against the dirty files, and after `files = _own` the
+            # foreign paths are GONE from it — so intersecting the foreign
+            # warning against `files` makes it dead code that can never fire.
+            # Caught by a behavioural test, not by reading: the block looked
+            # correct and every source-shape assertion about it passed.
+            # Same defect as AC-291 (an archived filter applied to a list already
+            # truncated by done_limit) — a filter whose denominator was narrowed
+            # upstream returns a confident empty.
+            _all_dirty = list(files)
             files = _own
             # READ `shared` TOO, NOT JUST `foreign` (AC-300). This filter used to
             # consume only `foreign`, and on THIS repo that made it inert on the
@@ -19095,15 +19105,20 @@ def _commit_guard(name: str) -> bool:
             # which is the only reason this is a card and not a fourth incident.
             # A guard that depends on the recipient being suspicious of it is not
             # a guard.
-            _fg = [f for f in (_chk.get("foreign") or []) if f.get("path") in set(files)]
-            if _fg and len(_fg) == len(files):
-                # NOTHING here is theirs. Do not nudge at all — there is no
-                # honest action for this session to take, and the only available
-                # one is destructive.
-                _fw = "/".join(sorted({f.get("owner") or "?" for f in _fg}))
-                slog(f"[commit-guard] {name}: all {len(files)} dirty file(s) belong to "
-                     f"{_fw} — suppressing the nudge entirely (AC-300)")
-                return False
+            _fg = [f for f in (_chk.get("foreign") or []) if f.get("path") in set(_all_dirty)]
+            # NO SUPPRESSION BRANCH HERE. There was one — `if _fg and len(_fg) ==
+            # len(files): return False` — and it was doubly wrong once `_fg` was
+            # corrected to intersect the PRE-filter list:
+            #   1. It compared a pre-filter count against a post-filter one, so
+            #      one foreign file plus one of mine gave 1 == 1 and suppressed a
+            #      nudge for a session that had real uncommitted work. It even
+            #      logged "all 1 dirty file(s) belong to amux" while two were
+            #      dirty and one was mine.
+            #   2. Corrected to compare against `_all_dirty`, it becomes exactly
+            #      `not _own`, which the branch above already handles and returns
+            #      on. So the honest fix is deletion, not repair.
+            # Caught behaviourally; every source-shape assertion about this block
+            # passed while it was silently eating legitimate nudges.
             if _fg:
                 _fw = "/".join(sorted({f.get("owner") or "?" for f in _fg}))
                 _fp = ", ".join(f.get("path") for f in _fg[:4])
