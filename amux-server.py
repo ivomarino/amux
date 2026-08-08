@@ -44282,8 +44282,15 @@ function cmdHistoryAdd(text, opts) {
   try {
     localStorage.setItem('amux_cmd_history', JSON.stringify(_cmdHistory));
   } catch (e) {
+    // EVICTION ORDER (AMUX-2553): the sessions cache is the LAST thing to
+    // sacrifice, not the first. It is the offline PWA's core value — on a plane
+    // it IS the workers view — while the board and schedules caches are big,
+    // rebuildable conveniences. The old order dropped amux_sessions_cache first
+    // ("biggest transient cache"), so one over-quota history write on a phone
+    // silently destroyed the next flight's offline fleet view.
     try {
-      localStorage.removeItem('amux_sessions_cache');  // biggest transient cache
+      try { localStorage.removeItem('amux_board_cache'); } catch (e0) {}
+      try { localStorage.removeItem('amux_schedules_cache'); } catch (e0) {}
       _cmdHistory = _cmdHistory.slice(-50);
       localStorage.setItem('amux_cmd_history', JSON.stringify(_cmdHistory));
     } catch (e2) {
@@ -55233,7 +55240,14 @@ async function sendGridCmd(name) {
 // Load cached sessions immediately so offline startup renders content
 const _cachedInit = localStorage.getItem('amux_sessions_cache');
 if (_cachedInit) {
-  try { workers = JSON.parse(_cachedInit); } catch(e) {}
+  // `sessions`, NOT `workers` (AMUX-2553). The vocab rename (b009f6e,
+  // sessions -> workers in client STRINGS) caught this one assignment too, so
+  // for two days the cached list loaded into an undeclared implicit global that
+  // nothing reads while every renderer kept reading `sessions` — offline
+  // startup then showed "Can't reach the server" instead of the cached fleet.
+  // A rename that changes prose must never change an identifier: the variable
+  // is the API, the copy is the vocabulary.
+  try { sessions = JSON.parse(_cachedInit); } catch(e) {}
 }
 // Load cached board from localStorage (fast, synchronous)
 // The board payload is multi-MB (3.16MB measured) and localStorage caps around
