@@ -1509,10 +1509,13 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
 ## `amux board review` cannot name the reviewer, so completing a handoff requires leaving the audited path
 AREA: cli
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-frustrations
 CARD: AF-16
+FIX-NOTE: 868d893 — --reviewer added to every status verb; --outcome-stdin
+  deferred until argv validates, which also stopped the wrong error being
+  reported (it said "got empty input" instead of naming the unknown flag).
 SYMPTOM: `amux board review <ID>` has no --reviewer flag (usage: [--checked] [--ack]
   [--type] [--override-doing] [--trigger] [--force]). A card moved to `review` with
   reviewer=None is a card nobody has been asked to look at, and the review gate rests
