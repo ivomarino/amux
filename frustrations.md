@@ -1189,3 +1189,37 @@ FIX: The nudge already runs `git status`. Run `git diff` too and attribute befor
   and tonight one pushed toward the accident (this nudge) while the other failed to stop it (the
   staged-guard, silent on the true positive). Either alone is a bug; both failing toward the same
   accident on the same night says the shared-checkout seam has no working guard.
+
+## SUPERSEDES my "two independent instruments" claim — it was ONE function, two consumers
+AREA: attribution
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-300
+SYMPTOM: The two entries above (AC-297 staged-guard silent on the true positive; AC-300 idle
+  nudge instructing me to commit a peer's work) both claimed these were independent instruments
+  failing toward the same accident, and I argued that pairing was "a stronger argument than
+  either alone". That diagnosis was WRONG, and reading the code rather than the symptoms is what
+  showed it. Both are one function: _staged_guard_check classifies a path BOTH sessions edited as
+  `shared`, not `foreign`. amux is a single-file project, so "both edited amux-server.py" is
+  satisfied essentially always — the function's own comment says so. Consequences by consumer:
+    - the commit-guard's foreign-dirt filter read ONLY `foreign` -> empty -> nudged me about a
+      peer's work (loud, wrong direction)
+    - the staged-guard's warning path needs a fresh `hit` inside its window -> went silent on the
+      commit that actually swept ~85 lines (quiet, wrong direction)
+  One exemption, two consumers, opposite-sign failures.
+COST: The wrong diagnosis was already committed twice (5735973, 18f1a59) and would have sent the
+  next person to fix two guards separately, leaving whichever they did not touch. It also made a
+  structural argument ("this seam has no working guard") out of what is really a single
+  classifier whose two readers disagree about its predicate.
+FIX: fixed for the nudge in 8e387fb — it now reads `shared` as well as `foreign`, and rather than
+  suppressing (which on a single-file repo would silence it forever) it says the file is
+  contested, names the co-editor, gives the per-hunk staging recipe, and says explicitly to leave
+  it if none of it is yours. AC-297's half is still open and belongs to the same root: the
+  staged-guard must report `shared` reliably, not only when a `hit` lands inside its window.
+  THE GENERALISABLE PART, which is why this entry exists rather than a silent edit to the others:
+  ethos already says "a view must share the predicate of the mechanism it claims to describe".
+  This is that rule applied to two VIEWS of one mechanism — and the tell was not in either
+  symptom, it was that both symptoms named the same file. When two instruments disagree about the
+  same fact, look for the single function they both call before concluding you have two bugs.
