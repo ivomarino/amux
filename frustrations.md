@@ -1361,3 +1361,66 @@ FIX: amux's entry proposes gates bind on FORWARD transitions, not parking. EXTEN
   redundancy exit. Related: AC-299 (no --force in the CLI, so taking this exit at all requires a
   hand-rolled curl — two gate defects compounding: one forces the bypass, the other makes the
   bypass unwalkable from the audited path).
+
+## A cross-cutting finding recorded on someone else's card dies when that card closes
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-10
+SYMPTOM: Reviewing AC-275 on 2026-08-06 I found a defect OUTSIDE that card's scope — the
+  vocab rename left `workers = msg.payload` in the SSE handler assigning an undeclared
+  global while render() kept reading `sessions`. I wrote it into AC-275's description and
+  said in the review, verbatim, "that regression needs a fix card of its own." No card was
+  filed. AC-275 went to `verified`. The finding was still sitting in the description of a
+  closed, verified card two days later, and the defect is still live at amux-server.py:55609
+  as of 0.9.520.
+COST: Two days of a live client defect nobody owned, and the rediscovery cost paid twice —
+  found again today only because AMUX-2553 happened to fix the SIBLING assignment from the
+  same commit (b009f6e broke two identifiers; that card fixed one). Without that coincidence
+  it would still be invisible. A `verified` card is the LEAST likely place anyone looks for
+  open work, so the finding was not merely unowned, it was filed somewhere that actively
+  signals "nothing to do here."
+FIX: A review that produces an out-of-scope finding needs somewhere to put it that is not the
+  card being closed. Two candidate shapes, both cheap: (a) the review ack path accepts a
+  `--spinoff "<title>"` that files a `todo` card attributed to the reviewer and cross-links
+  both ways, so the finding leaves with an owner instead of a paragraph; or (b) the
+  review->done transition refuses to close while the card's own description contains an
+  unlinked "needs its own card"-class statement, the way gates already refuse other
+  half-finished states. (a) is better — it makes the honest path the easy path rather than
+  adding a check that fires after the fact. Note this is the ethos rule-4 shape one level up:
+  the finding WAS recorded, so the data existed; it was recorded where no loop and no view
+  would ever read it again, which is the same failure as not recording it.
+NOTE: related to the `watch`-type blindness in ethos.md (a card surfaced by nothing is a note,
+  not a monitor) — same root, different container: here the invisible thing is a paragraph
+  inside a terminal-status card rather than a card outside every query.
+
+## A peer's save restarts the server mid-measurement, and the timings blame your subject
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-11
+SYMPTOM: Benchmarking `GET /api/board?slim=1` against the unprojected fetch, I measured slim
+  timing out at 60s while the FULL 6.6MB payload returned in 16.9s — a projection added to make
+  the fetch cheap looking 4x SLOWER than no projection at all. Second run: full 78s, slim
+  HTTP 000 at 22s, then both 000 instantly. Every number was an artifact. A peer session wrote
+  amux-server.py in this shared checkout at 12:39:48, the server auto-restarted at 12:40:24, and
+  my requests spanned the restart. Re-measured on a confirmed-healthy server: slim 828KB/0.10s,
+  full 6.6MB/0.11s. The projection is fine.
+COST: ~6 minutes and a near-miss on filing a fabricated performance defect against `slim=`
+  (AMUX-2223's own feature) with three runs of "evidence" behind it. The failure mode is the
+  dangerous direction: the restart produces symptoms — timeouts, truncated reads, connection
+  failures — that are indistinguishable from the subject being slow, so the wrong conclusion
+  arrives fully corroborated. I only caught it by checking the server's mtime, which I had no
+  particular reason to do.
+FIX: Any timing or availability measurement against the local server needs the restart to be
+  VISIBLE in the result, not inferred afterward. Cheapest version: `/health` already responds —
+  have it report the process start time, so a caller can bracket a measurement (start_ts before,
+  start_ts after) and know the server it finished on is the one it began on. That turns a silent
+  confound into a checkable precondition, and it costs one field. Today the only way to learn
+  this is to stat the file and read the restart log, which nobody does before believing a number.
+NOTE: the shared checkout is the amplifier (see AMUX-2443, open) — my working tree was clean and
+  I had made no edit, so nothing in MY session hinted that the binary under test had changed.
