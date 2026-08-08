@@ -4268,6 +4268,40 @@ def tmux_target(session: str) -> str:
     return tmux_name(session)
 
 
+_tmux_sessions_cache: tuple[float, set[str]] = (0.0, set())
+_tmux_sessions_cache_lock = threading.Lock()
+_TMUX_SESSIONS_CACHE_TTL = 3  # seconds
+
+def _tmux_sessions_set() -> set[str]:
+    """Return the set of running tmux session names, cached for 3s.
+
+    Every caller that needs to know whether a tmux session exists was
+    independently shelling out to `tmux list-sessions`. With 60+ call
+    sites across loops that tick every 2-15s, this was the single largest
+    source of subprocess overhead (~18ms * N calls per tick). One shared
+    cache with a 3s TTL collapses all of them to at most 1 call per 3s.
+    """
+    now = time.time()
+    cached = _tmux_sessions_cache
+    if now - cached[0] < _TMUX_SESSIONS_CACHE_TTL:
+        return cached[1]
+    with _tmux_sessions_cache_lock:
+        # Re-check after acquiring lock (another thread may have refreshed)
+        if time.time() - _tmux_sessions_cache[0] < _TMUX_SESSIONS_CACHE_TTL:
+            return _tmux_sessions_cache[1]
+        try:
+            r = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            result = set(r.stdout.splitlines()) if r.returncode == 0 else set()
+        except Exception:
+            result = set()
+        global _tmux_sessions_cache
+        _tmux_sessions_cache = (time.time(), result)
+        return result
+
+
 def is_running(session: str) -> bool:
     """Check if Claude is running in this session's tmux pane."""
     iterm2_id = _session_iterm2_id(session)
@@ -4276,22 +4310,14 @@ def is_running(session: str) -> bool:
     if _session_backend(session) == "herdr":
         return _herdr_agent_get(session) is not None
     try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5,
-        )
         tmux_sess = tmux_name(session)
-        if tmux_sess not in r.stdout.splitlines():
+        if tmux_sess not in _tmux_sessions_set():
             return False
-        # Tmux exists -- check if Claude is actually running (not at shell prompt)
         output = tmux_capture(session, 10)
         if not output:
-            return True  # empty output but tmux exists -- assume running (startup)
+            return True
         if _at_shell_prompt(output):
             return False
-        # Terminal-based check can false-positive when Claude's status bar text
-        # leaks into scrollback after a SIGKILL. Cross-check by verifying the
-        # shell actually has a child process (Claude).
         try:
             r_pp = subprocess.run(
                 ["tmux", "list-panes", "-t", tmux_sess, "-F", "#{pane_pid}"],
@@ -6017,17 +6043,9 @@ _yolo_last_responded: dict = {}
 def _yolo_auto_respond():
     """Check yolo sessions for known blocking prompts and auto-answer them."""
     now = time.time()
-    # Fetch running tmux sessions once to avoid spawning a subprocess per session
-    running_sessions = set()
-    try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            running_sessions = set(r.stdout.splitlines())
-    except Exception:
-        return  # tmux not available, nothing to do
+    running_sessions = _tmux_sessions_set()
+    if not running_sessions:
+        return
     for f in CC_SESSIONS.glob("*.env"):
         name = f.stem
         try:
@@ -8556,16 +8574,8 @@ def _steering_fast_tick():
 
 
 def _snapshot_all_sessions_inner():
-    # Fetch running tmux sessions once to avoid spawning a subprocess per session
-    running_sessions = set()
-    try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            running_sessions = set(r.stdout.splitlines())
-    except Exception:
+    running_sessions = _tmux_sessions_set()
+    if not running_sessions:
         return
     _HIBERNATE_IDLE_SECS = int(os.environ.get("AMUX_HIBERNATE_IDLE_SECS", "1800") or "1800")  # 0 disables
     _HIBERNATE_STARTUP_GRACE = 600  # 10 min grace after server restart
@@ -38418,8 +38428,11 @@ async function doStart(name) {
   if (!r) return;
   const data = await r.json();
   if (!data.ok) { await showAlert('Failed to start: ' + (data.message || data.error || 'unknown error')); return; }
-  // Poll until session shows as running (up to 5s)
-  for (let i = 0; i < 10; i++) {
+  // Poll until the session shows as running. Start is async now (202
+  // "starting", choreography in the background, AMUX-2557) and a real launch
+  // takes ~5s — 10s of polling covers it; the old 5s window could expire just
+  // before the flip and leave the button looking dead again.
+  for (let i = 0; i < 20; i++) {
     await new Promise(r => setTimeout(r, 500));
     await fetchSessions();
     if (sessions.find(s => s.name === name && s.running)) break;
@@ -40748,7 +40761,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.520';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.521';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -62546,7 +62559,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.520';
+const CACHE = 'amux-v0.9.521';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -74451,13 +74464,47 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                 return self._json({"ok": True, "message": "deploy instructions sent to session"})
             if action == "start":
                 body = self._read_body() if method == "POST" else {}
-                ok, msg = start_session(name)
-                meta = _load_meta(name)
-                # If a prompt was provided, wait for Claude to be ready then send it
+                # RESPOND BEFORE THE CHOREOGRAPHY, not after (AMUX-2557). This
+                # blocked the HTTP response on the whole launch dance — measured
+                # 5.2s of which 4.4s was time.sleep (readiness polls, key-send
+                # spacing), and ~14s under load. From a phone that is a Start
+                # button that does nothing: Ethan hit it repeatedly on
+                # social-media and reported it broken, and on a flaky connection
+                # the request can time out entirely after the work succeeded.
+                # The stop action directly below has done it right all along —
+                # background pool, instant 202 — start now mirrors it.
+                #
+                # Fast validations stay inline so a misconfigured worker still
+                # fails loudly at the button instead of in a log.
+                _cfg0 = parse_env_file(env_file)
+                _wd0 = _cfg0.get("CC_DIR", "").strip()
+                if _wd0 and not os.path.isdir(os.path.expanduser(_wd0)):
+                    return self._json({"ok": False, "message": f"work dir missing: {_wd0}"}, 500)
                 initial_prompt = body.get("prompt", "").strip() if body else ""
-                if ok and initial_prompt:
-                    threading.Thread(target=_send_after_ready, args=(name, initial_prompt), daemon=True).start()
-                return self._json({"ok": ok, "message": msg, "resumed": bool(meta.get("cc_session_name") or meta.get("cc_conversation_id"))}, 200 if ok else 500)
+                def _bg_start(sname=name, prompt=initial_prompt):
+                    try:
+                        ok2, msg2 = start_session(sname)
+                        if ok2:
+                            _emit_event(sname, "session.started", source="api-start")
+                            if prompt:
+                                _send_after_ready(sname, prompt)
+                        else:
+                            # A background failure must still be SEEN (rule 4):
+                            # event + log, and the status loop shows not-running.
+                            _emit_event(sname, "session.start_failed",
+                                        {"message": (msg2 or "")[:200]}, source="api-start")
+                            slog(f"[start] {sname}: background start failed: {msg2}")
+                    except Exception as e:
+                        try:
+                            _emit_event(sname, "session.start_failed",
+                                        {"message": str(e)[:200]}, source="api-start")
+                            slog(f"[start] {sname}: background start error: {e}")
+                        except Exception:
+                            pass
+                _stop_pool.submit(_bg_start)
+                meta = _load_meta(name)
+                return self._json({"ok": True, "message": "starting",
+                                   "resumed": bool(meta.get("cc_session_name") or meta.get("cc_conversation_id"))}, 202)
             if action == "stop":
                 def _bg_stop(sname=name):
                     try:
