@@ -981,3 +981,56 @@ NOTE: SECOND instance of this exact shape in the SAME function — AC-194 hoiste
   politeness and is in fact a filter that selects against the population you most need
   to reach, because the lanes with the most backlog are the ones never idle. Worth
   auditing any other work hung off an idle branch.
+
+## `?archived=1` returned a confident list that structurally could not contain archived cards
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-07
+SESSION: amux-cloud
+CARD: AC-291
+SYMPTOM: amux sent "13 of your cards are ARCHIVED but not finished". I checked with
+  `GET /api/board?archived=1`, filtered to my session, and got **0** — so the notice looked
+  like a false alarm. It was not: all 13 were exactly as described, confirmed by per-id GETs.
+  `_load_board(done_limit=100)` caps terminal-status (done/verified/discarded) rows to the 100
+  most recent, and `_board_project()` applies the `?archived=` filter to that already-truncated
+  list (amux-server.py:13157). Archived cards are overwhelmingly OLD, so the filter is almost
+  always applied to the population least likely to be inside the window.
+    ?archived=1               -> 551 rows, AC-156/AC-174/AC-119 ABSENT
+    ?archived=1&done_limit=0  ->  56 rows for my session, all 13 present
+  Nothing in the 200 says it was truncated: no flag, no total, no note.
+COST: I nearly reported amux's correct notice as a false alarm. That would have left 13 cards
+  in a contradictory state with a "checked, nothing there" note on top — worse than never
+  checking, because the next session trusts it. Caught only because I asked what a positive
+  would look like and re-probed per-id instead of believing the zero. ~20 min.
+FIX: Say when done_limit truncates (`truncated: true` or a dropped count) — that kills the
+  class, not just this instance. Better, do not apply the recency cap when `?archived=` is
+  explicitly passed: an archived query is a history query by nature, so a recency default
+  contradicts the request. And make amux's sweep and the human-facing view share ONE predicate;
+  here two mechanisms describing the same set disagreed and the trusted one was wrong.
+  Ethos precedent: three archived armed watches invisible to both the view meant to expose them
+  and the sweep meant to fire them, because both ran on a payload filtered to archived=0. Same
+  structure, different hidden predicate.
+
+## A board GET hung for 2 minutes, and the smaller response was the slower one
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+CARD: AC-174
+DATE: 2026-08-07
+SESSION: amux-cloud
+SYMPTOM: Three consecutive board GETs against the running local server:
+    ?archived=1                                   -> 200, 1.8MB, 21.6s
+    ?archived=1                                   -> HUNG, killed at 120s
+    ?done_limit=0&slim=1&session=amux-cloud        -> 200,  28KB, 32.7s
+  Same handler, same process: one call fine, the identical next call wedged. The 28KB slim
+  response was SLOWER than the 1.8MB one, which is backwards if serialisation cost explained it.
+COST: No wrong conclusion shipped, but it nearly cost one in the other direction — AC-174's exit
+  condition is "recurrence-or-not on the ~3h clock", days had passed, and I was about to read
+  elapsed time as the all-clear. "No recurrence in N days" is not evidence when nobody was
+  running the query that would show it. I only saw this because I happened to hit the endpoint
+  hard today for an unrelated reason.
+FIX: Time these GETs with per-request thread CPU alongside slog lock-wait, so log-lock
+  contention (AC-174) and `_load_board` SQL cost over full board history are distinguishable
+  instead of both presenting as "the board is slow". Right now the instrument cannot tell them
+  apart, which is the actual defect — two live hypotheses and no way to separate them.
