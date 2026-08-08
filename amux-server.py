@@ -18668,30 +18668,37 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
             cur = theirs.get(p)
             if not cur or ts > cur[1]:
                 theirs[p] = (other, ts)
+    # Check which staged paths have UNSTAGED changes RIGHT NOW (AC-297).
+    # The time-window heuristic missed the true positive (warned at 30m, silent
+    # at 20m) because it keys on WHEN a peer edited, not WHETHER they have
+    # outstanding changes. The working tree is the ground truth.
+    _dirty_paths: set = set()
+    try:
+        _ds = subprocess.run(
+            ["git", "-C", wd, "diff", "--name-only", "-z"],
+            capture_output=True, text=True, timeout=5)
+        if _ds.returncode == 0:
+            _dirty_paths = {os.path.realpath(os.path.join(wd, p))
+                            for p in _ds.stdout.split("\0") if p.strip()}
+    except Exception:
+        pass
     foreign, shared = [], []
     for rel in rel_paths[:2000]:
         if not isinstance(rel, str) or not rel.strip():
             continue
         ap = os.path.realpath(os.path.join(wd, rel))
         hit = theirs.get(ap)
+        _is_dirty = ap in _dirty_paths
         if ap in mine:
-            # NOT foreign — both sessions edited it, so the committer has a
-            # legitimate claim and blocking here would deadlock a genuinely
-            # shared file. But silence is wrong too (AMUX-2332): amux is a
-            # SINGLE-FILE project, so on amux-server.py — the only file that
-            # matters — this exemption is satisfied essentially always, and the
-            # guard was inert by construction on exactly the highest-risk path.
-            # A peer's commit swept this session's uncommitted work at
-            # 22:58 on 2026-08-04 with the guard running and returning 200.
-            # File-level ownership cannot express per-hunk ownership, so report
-            # the overlap and let the human judge. Warn, never block.
-            if hit:
-                shared.append({"path": rel, "owner": hit[0],
-                               "age_secs": int(max(0, now - hit[1]))})
+            if hit or _is_dirty:
+                shared.append({"path": rel, "owner": hit[0] if hit else "(unknown)",
+                               "age_secs": int(max(0, now - hit[1])) if hit else 0,
+                               "has_unstaged_changes": _is_dirty})
             continue
         if hit:
             foreign.append({"path": rel, "owner": hit[0],
-                            "age_secs": int(max(0, now - hit[1]))})
+                            "age_secs": int(max(0, now - hit[1])),
+                            "has_unstaged_changes": _is_dirty})
     return {"ok": True, "foreign": foreign, "shared": shared,
             "cotenants": cotenants, "window_secs": int(window)}
 
@@ -22173,13 +22180,6 @@ def main():
     # hunks too, and their `git commit` then reports "nothing to commit".
     for f in (d.get("shared") or []):
         mins = int((f.get("age_secs") or 0) / 60)
-        # Report the STAGED SIZE, not a hypothetical (AC-241). The old text said
-        # "IF they have uncommitted changes" — a condition the committer cannot
-        # resolve at that moment, so the natural check is the wrong one: checking
-        # `git status` AFTER committing shows a clean tree, which is equally
-        # consistent with having swept everything. That is how amux-cloud shipped
-        # 36 lines of another session's work in 24a294b with this very warning on
-        # screen. The number it needed was already computable here.
         _n = ""
         try:
             _ns = subprocess.run(
@@ -22190,6 +22190,10 @@ def main():
                      "MORE than you wrote, their work is in it." % (_ns[0], _ns[1])
         except Exception:
             _n = ""
+        # AC-297: upgrade from NOTE to WARNING when the file has unstaged changes
+        # right now. That is the FACT — someone has uncommitted work in a file
+        # you are about to commit whole.
+        _level = "WARNING" if f.get("has_unstaged_changes") else "NOTE"
         # RECIPE CORRECTED (AC-303). This printed `git diff -U0` + `git apply
         # --cached`, and that pairing produced FOUR unbuildable commits on
         # 2026-08-08 (amux-cloud 3bf1470/01b5d02, amux 9188a9f/10916ac) — all the
@@ -22210,7 +22214,7 @@ def main():
         # only in the pre-commit hook: the hook was fixed the same night to read
         # `git show ":$FILE"` instead of the worktree, but a reader whose hook is
         # older gets no protection at all from a hint that omits it.
-        w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago.%s\\n"
+        w("amux staged-guard: %s — %s was also edited by session '%s' %dm ago.%s\\n"
           "  Reconcile the count above against what you believe you wrote — that is the "
           "check that caught this class twice.\\n"
           "  Keep only your hunks:  git diff %s > /tmp/mine.patch  (trim to yours)  &&  "
@@ -22219,7 +22223,7 @@ def main():
           "stale offsets (four unbuildable commits, 2026-08-08).\\n"
           "  Then verify the STAGED blob, not the worktree:  git show \\":%s\\" | "
           "python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'\\n"
-          % (f.get("path"), f.get("owner"), mins, _n, f.get("path"), f.get("path")))
+          % (_level, f.get("path"), f.get("owner"), mins, _n, f.get("path"), f.get("path")))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
@@ -63738,6 +63742,13 @@ class CCHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json")
+        _bt0 = getattr(_req_tl, "board_t0", None)
+        if _bt0:
+            _bms = (time.monotonic() - _bt0) * 1000
+            self.send_header("Server-Timing", f"total;dur={_bms:.0f}")
+            if _bms > 500:
+                slog(f"[board] slow GET {_bms:.0f}ms size={len(body)}")
+            _req_tl.board_t0 = None
         for _hk, _hv in (headers or {}).items():
             self.send_header(_hk, _hv)
         if gz:
@@ -63756,12 +63767,24 @@ class CCHandler(BaseHTTPRequestHandler):
             self._cors()
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", "no-cache")
+            _bt0 = getattr(_req_tl, "board_t0", None)
+            if _bt0:
+                _bms = (time.monotonic() - _bt0) * 1000
+                self.send_header("Server-Timing", f"total;dur={_bms:.0f}")
+                _req_tl.board_t0 = None
             self.end_headers()
             return
         body, gz = self._gzip_out(body)
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json")
+        _bt0 = getattr(_req_tl, "board_t0", None)
+        if _bt0:
+            _bms = (time.monotonic() - _bt0) * 1000
+            self.send_header("Server-Timing", f"total;dur={_bms:.0f}")
+            if _bms > 500:
+                slog(f"[board] slow GET {_bms:.0f}ms size={len(body)}")
+            _req_tl.board_t0 = None
         for _hk, _hv in (headers or {}).items():
             self.send_header(_hk, _hv)
         if etag:
@@ -67454,6 +67477,7 @@ class CCHandler(BaseHTTPRequestHandler):
             # GET /api/board — list non-deleted issues
             # ?done_limit=N  limits returned done/discarded items (default 100, 0=all)
             if method == "GET" and path == "/api/board":
+                _req_tl.board_t0 = time.monotonic()
                 done_limit = int(qs.get("done_limit", ["100"])[0])
                 _scoped, _ctags, _cname = _caller_scope(self.headers)
                 # AMUX-2223: slim projection + server-side filters. Absent
@@ -68560,15 +68584,18 @@ class CCHandler(BaseHTTPRequestHandler):
                                         _resp["ref_may_be_stale"] = _uv["fetch_error"]
                                 return self._json(_resp, 409)
                     # ── Gate enforcement on status transitions ──────────────────
-                    # Any move to a DIFFERENT status that has a non-empty effective
-                    # gate must be acknowledged (gate_ack:true OR gate_checked:[...]).
-                    # This is the server-side mirror of the client's confirm dialog,
-                    # so CLI/API callers (agents) can't silently skip the gate. For
-                    # 'verified' this STACKS on the clean-tree check above — both must
-                    # pass. `force:true` bypasses the gate (same escape hatch as the
-                    # clean-tree gate; judgment stays with the caller).
+                    # Gates bind on FORWARD transitions that assert progress or
+                    # completion: review, done, verified. They do NOT bind on
+                    # retreats or parking moves: todo, backlog, discarded, doing.
+                    # A discard does not claim the work is done — it claims the
+                    # CARD is redundant. A backlog move parks not-ready work.
+                    # Gating those forces a false ack or an unaudited bypass,
+                    # which is worse than no gate (AMUX-2539, AC-304).
+                    _GATE_EXEMPT_TARGETS = {"todo", "backlog", "discarded", "doing"}
                     new_status = body.get("status")
-                    if new_status is not None and prior and new_status != prior["status"]:
+                    if (new_status is not None and prior
+                            and new_status != prior["status"]
+                            and new_status not in _GATE_EXEMPT_TARGETS):
                         # Resolve the gate against the item as it WILL be after this
                         # PATCH (session and/or card gate may change in the same call).
                         gate_item = _item_by_id(bid) or {}

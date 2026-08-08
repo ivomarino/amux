@@ -776,8 +776,33 @@ PYEOF
     [[ $rc -eq 0 ]] && return 0
     [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
   fi
+  # Retry: the server re-execs on amux-server.py saves; a 1-2s wait often
+  # recovers. Three tries over ~4s before falling back to raw tmux.
+  local _retry
+  for _retry in 1 2; do
+    sleep 2
+    resp=$(curl -sk -m 5 -X POST -H 'Content-Type: application/json' \
+      -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+      -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
+    if [[ -n "$resp" ]]; then
+      rc=0
+      RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+except Exception:
+    sys.exit(1)
+tgt = os.environ["TGT"]
+if d.get("error") or d.get("ok") is False:
+    sys.exit(2)
+print(f"sent to {tgt} (origin-stamped, retry {os.environ.get('_R','')}): {d.get('message', 'ok')}")
+PYEOF
+      [[ $rc -eq 0 ]] && return 0
+      [[ $rc -eq 2 ]] && return 1
+    fi
+  done
   if [[ "$(session_backend "$name")" == "herdr" ]]; then
-    echo "${RED}FAILED${RESET} to send to $name: amux server unreachable, and herdr workers can only be driven through the server. NOTHING was delivered." >&2
+    echo "${RED}FAILED${RESET} to send to $name: amux server unreachable after retries, and herdr workers can only be driven through the server. NOTHING was delivered." >&2
     return 1
   fi
   # ── Raw-tmux last resort (AMUX-1987) ────────────────────────────────────
@@ -1049,7 +1074,7 @@ cmd_start_all() {
 # the easy path; a rule saying "remember the header" is not a fix.
 _board_transition() {
   local id="$1" status="$2"; shift 2
-  local ack="" newtype="" override="" rev="" outcome="" trigger=""
+  local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
   local checked=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1083,8 +1108,9 @@ _board_transition() {
       --type) newtype="${2:-}"; [[ -n "$newtype" ]] || die "--type needs a value"; shift 2 ;;
       --override-doing) override=1; shift ;;
       --rev) rev="${2:-}"; shift 2 ;;
+      --force) force_reason="${2:-}"; [[ -n "$force_reason" ]] || die "--force requires a reason (why you are bypassing the gate)"; shift 2 ;;
       *) die "amux board: unknown flag '$1'
-Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]" ;;
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" ;;
     esac
   done
   # Record the outcome as its OWN write, BEFORE attempting the transition.
@@ -1101,13 +1127,14 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--o
       "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
   fi
   local body
-  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" python3 -c '
+  body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" python3 -c '
 import json, os, sys, time
 b = {"status": os.environ["S"]}
 if os.environ.get("A"): b["gate_ack"] = True
 if os.environ.get("T"): b["type"] = os.environ["T"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
+if os.environ.get("F"): b["force"] = True; b["desc_append"] = "[FORCED] " + os.environ["F"]
 # Stamp last_verified_at alongside source_ref: a trigger with no verification
 # time is indistinguishable from one checked a month ago, and the staleness
 # view keys on exactly that field. Setting one without the other would make
@@ -1243,7 +1270,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]"
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       shift
       local result
       result=$(_board_transition "$id" "$status" "$@")
@@ -1252,7 +1279,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
-      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"external condition\"]"
+      [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       shift 2
       local result
       result=$(_board_transition "$id" "$new_status" "$@")
