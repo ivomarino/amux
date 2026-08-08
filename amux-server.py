@@ -2335,10 +2335,22 @@ _BU_DRIVER_SRC = r"""
 import asyncio, base64, json, sys
 async def main():
     udir, headless = sys.argv[1], sys.argv[2] == "1"
+    # VIEWPORT IS A PARAMETER, NOT A CONSTANT (AF-18). It was hardcoded 1280x900,
+    # which is why window.resizeTo() did nothing (Playwright pins the viewport) and
+    # why NO rig could render amux at phone width — on a product whose own policy is
+    # "mobile wins". A hardcoded number that decides what the model may SEE is the
+    # ethos-D4 shape: it silently becomes the ceiling. argv[3] is WxH.
+    _vw, _vh = 1280, 900
+    if len(sys.argv) > 3 and "x" in sys.argv[3]:
+        try:
+            _a, _b = sys.argv[3].lower().split("x", 1)
+            _vw, _vh = max(120, int(_a)), max(120, int(_b))
+        except Exception:
+            pass
     from playwright.async_api import async_playwright
     pw = await async_playwright().start()
     ctx = await pw.chromium.launch_persistent_context(
-        udir, headless=headless, ignore_https_errors=True, viewport={"width": 1280, "height": 900})
+        udir, headless=headless, ignore_https_errors=True, viewport={"width": _vw, "height": _vh})
     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
     print(json.dumps({"ready": True, "user_data_dir": udir}), flush=True)
     loop = asyncio.get_event_loop()
@@ -2368,6 +2380,15 @@ async def main():
                 await page.keyboard.type(str(req.get("text", "")), delay=20)
             elif verb == "keys":
                 await page.keyboard.press(str(req.get("key", "Enter")))
+            elif verb == "viewport":
+                # Resize a LIVE driver. Needed because the driver is spawned lazily
+                # on first use, so a caller that decides it wants phone width after
+                # the browser is already up would otherwise have to tear it down.
+                _w = max(120, int(req.get("width") or 390))
+                _h = max(120, int(req.get("height") or 844))
+                await page.set_viewport_size({"width": _w, "height": _h})
+                out.update(width=_w, height=_h,
+                           inner=await page.evaluate("[innerWidth, innerHeight]"))
             elif verb == "eval":
                 out.update(value=await page.evaluate(str(req.get("js", ""))))
             elif verb == "cookies":
@@ -2650,8 +2671,12 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
             # 'driver failed to start: <empty>', undiagnosable). stderr is now
             # captured into the error, and the interpreter is configurable.
             _py = os.environ.get("AMUX_BU_DRIVER_PYTHON") or sys.executable
+            # Default viewport is CONFIG, not a constant (AF-18): AMUX_BU_VIEWPORT
+            # in ~/.amux/server.env, e.g. "390x844" to make phone width the default
+            # for a session that only ever checks mobile.
+            _vp = (os.environ.get("AMUX_BU_VIEWPORT") or "1280x900").strip()
             proc = subprocess.Popen(
-                [_py, "-c", _BU_DRIVER_SRC, str(udir), "1"],
+                [_py, "-c", _BU_DRIVER_SRC, str(udir), "1", _vp],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True)
             # BOUND THE SPAWN HANDSHAKE (AC-292 root enabler). This was a bare
@@ -73678,6 +73703,28 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                     if isinstance(_res.get("result"), str):
                         _res["result"] = _obs_cap(_res["result"], _OBS_EVAL_CAP)
                     return self._json(_res, 400 if _res.get("error") else 200)
+                elif action == "viewport":
+                    # AF-18: amux is mobile-first by policy, and until this existed no
+                    # rig could render it at phone width — the driver pinned 1280x900
+                    # and window.resizeTo() is inert under Playwright. Two verifications
+                    # (AMUX-2367, AMUX-2369) were left unresolvable on the mobile axis.
+                    # Accepts an explicit w/h or a named device for the common cases.
+                    _dev = {"iphone": (390, 844), "iphone-se": (375, 667),
+                            "ipad": (820, 1180), "desktop": (1280, 900)}
+                    _d = str(body.get("device") or "").strip().lower()
+                    _w = body.get("width"); _h = body.get("height")
+                    if _d and _d in _dev:
+                        _w, _h = _dev[_d]
+                    if _w is None or _h is None:
+                        return self._json({"error": "viewport needs width+height, or device "
+                                                    "(one of %s)" % ", ".join(sorted(_dev))}, 400)
+                    _dd = _bu_active_driver(session)
+                    if not _dd:
+                        return self._json({"error": "viewport needs the driver backend "
+                                                    "(POST /api/browser/start with a profile)"}, 400)
+                    _r = _bu_driver_call(session, _dd["profile"], "viewport",
+                                         {"width": int(_w), "height": int(_h)}, timeout_s=20)
+                    return self._json(_r, 400 if _r.get("error") else 200)
                 elif action == "wait":
                     selector = body.get("selector", "")
                     text = body.get("text", "")
@@ -73839,7 +73886,8 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                            "POST /api/browser/action", "POST /api/browser/stop",
                            "POST /api/browser/save-profile", "POST /api/browser/agent"],
                 "actions": ["click (selector|index|x,y)", "type", "input", "key",
-                            "scroll", "eval", "wait", "extract", "back"],
+                            "scroll", "eval", "wait", "extract", "back",
+                            "viewport (width+height, or device=iphone|iphone-se|ipad|desktop)"],
                 "eval_contract": "script must be a bare EXPRESSION; a `return` statement yields null",
             }, 404)
 
