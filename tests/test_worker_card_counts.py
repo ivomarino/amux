@@ -1,11 +1,20 @@
-"""The worker card's counts row, and the drift that let a filter key be dead code.
+"""What SURVIVED the worker-card counts row, plus the board defects it exposed.
 
-Ethan, 2026-08-07: "card view on list page has some duplicate stuff like scheduler
-count and group id twice also it should have a count color coded for each count of
-issues per status on the board".
+Ethan asked for a colour-coded per-status count on each worker card, then — after
+seeing it on a phone — asked for the whole row to be removed. It is gone (the chips,
+the total, the schedule chip, the server-side issue_counts payload and its query).
+The eleven tests that covered it went with it: a test whose subject is deleted is
+not a regression guard, it is a tripwire on a ghost.
 
-Three things are pinned here, each because fixing his report surfaced a defect that
-nothing could have caught:
+One of those eleven had already gone false-green before it was removed, which is the
+reason this note exists rather than a silent deletion. `test_card_renders_the_
+schedule_count_from_ONE_source` asserted `"sched_on" in _renderSessionCard`, and
+after the row was deleted it kept passing — on a leftover COMMENT that still
+mentioned s.sched_on. The renderer had no schedule count at all. A source-reading
+test cannot tell code from prose unless it is written to, and this one was not.
+
+What remains here is everything the removal did NOT invalidate, all of it found
+while building the row rather than being about the row:
 
   worker: was never a key    `_bqMatch` has a `case 'worker'` arm with a comment
                              explaining the aliasing, the search placeholder says
@@ -15,15 +24,13 @@ nothing could have caught:
                              NOTHING. Three surfaces documenting a filter that returns
                              an empty board, and an arm that could never execute.
 
-  two schedule counts        The card rendered s.sched_on/s.sched_off (server payload,
-                             refreshed every poll) AND a count derived from the client
-                             `schedules` array (refetched only on the scheduler view).
-                             Not merely redundant: they drift, and then one card shows
-                             two different answers to one question.
+  group rendered twice       s.tags appeared as a grp-chip beside the worker name AND
+                             as a .tag badge below, with two different click actions.
+                             Still fixed; the row's removal does not touch it.
 
-  issue_counts predicate     The chips tap through to the board. If the count and the
-                             list you land on use different predicates, the number is a
-                             view disagreeing with the mechanism it describes.
+  stray board columns        A status with cards and no column was filed under To Do,
+                             so 51 cards displayed as something they were not, and
+                             the two board view modes disagreed about the same card.
 
 The JS tests read the SHIPPED source rather than a paraphrase — the client lives in a
 Python string literal, so `ast.parse` is blind to it and `node --check` proves only
@@ -144,19 +151,6 @@ def test_worker_is_documented_and_therefore_must_work():
 
 # ───────────────── no duplicate render of one fact ───────────────────────────
 
-def test_card_renders_the_schedule_count_from_ONE_source():
-    """The card must read schedule counts from the sessions payload only.
-
-    Deriving a second count from the client `schedules` array is what put two numbers
-    for one question on one card — and they are not equivalent: `schedules` is
-    refetched on the scheduler view, `s.sched_on` on every sessions poll.
-    """
-    body = _js_block("_renderSessionCard")
-    assert "sched_on" in body, "the card stopped showing schedule counts entirely"
-    assert not re.search(r"schedules\s*\.\s*filter", body), (
-        "the card derives a schedule count from the client `schedules` array again — "
-        "that is the stale second opinion, not a second copy of the same number")
-
 
 def test_card_renders_each_group_ONCE():
     """`s.tags` is the worker's groups. It was rendered twice — as a `grp-chip` beside
@@ -198,156 +192,12 @@ def _mk_issue(srv, iid, session, status, archived=0):
     srv.get_db().commit()
 
 
-def test_issue_counts_are_grouped_by_status_per_worker(srv):
-    """The payload the chips render. Computed server-side on purpose: the client's
-    board array is only fetched when the board view is open, so a client-derived count
-    reads 0 on a fresh load of the Workers tab."""
-    _mk_session(srv, "w1")
-    _mk_session(srv, "w2")
-    _mk_issue(srv, "C-1", "w1", "todo")
-    _mk_issue(srv, "C-2", "w1", "todo")
-    _mk_issue(srv, "C-3", "w1", "doing")
-    _mk_issue(srv, "C-4", "w2", "verified")
-    by = {s["name"]: s.get("issue_counts") or {} for s in srv.list_sessions()}
-    assert by["w1"] == {"todo": 2, "doing": 1}, by["w1"]
-    assert by["w2"] == {"verified": 1}, by["w2"]
-
-
-def test_archived_cards_are_excluded_from_the_counts(srv):
-    """The chips tap through to the board's default view, which hides archived cards.
-    A count that included them would send you to a shorter list than the number
-    promised — a view disagreeing with the mechanism it describes (ethos rule 1), and
-    the exact sign-error that greeted a lane with 199 queued items when 9 were real.
-    """
-    _mk_session(srv, "w3")
-    _mk_issue(srv, "C-5", "w3", "todo")
-    _mk_issue(srv, "C-6", "w3", "todo", archived=1)
-    got = {s["name"]: s.get("issue_counts") or {} for s in srv.list_sessions()}["w3"]
-    assert got == {"todo": 1}, (
-        "archived cards are counted on the worker card but hidden on the board it "
-        "links to: %s" % got)
-
-
-def test_a_worker_with_no_cards_reports_an_empty_map_not_a_missing_key(srv):
-    """The renderer does `(s.issue_counts || {})`, so a missing key is survivable —
-    but the row's emptiness must come from having no cards, not from the field being
-    absent, or "no issues" and "field not shipped" become indistinguishable."""
-    _mk_session(srv, "w4")
-    s = [x for x in srv.list_sessions() if x["name"] == "w4"][0]
-    assert "issue_counts" in s, "issue_counts is missing from the sessions payload"
-    assert s["issue_counts"] == {}
-
-
-def test_counts_row_colours_come_from_statusStyle_not_a_second_palette():
-    """One colour source. A second map keyed by status name would drift from the board
-    columns and, worse, would not cover CUSTOM statuses at all — statusStyle() falls
-    through to the custom palette, a hand-written map returns undefined and the chip
-    renders unstyled."""
-    body = _js_block("_cardCountsRow")
-    assert "statusStyle(" in body, (
-        "the counts row no longer uses statusStyle — colours will drift from the "
-        "board columns and custom statuses will render unstyled")
-
-
-def test_counts_row_orders_by_the_board_and_drops_nothing(srv):
-    """Two properties of the ordering that are easy to get wrong in opposite ways:
-    it must follow the board's own column order, and a status the board no longer
-    lists must still be COUNTED rather than silently vanishing — hiding cards is the
-    failure this row exists to end."""
-    body = _js_block("_cardStatusCounts")
-    assert "boardStatuses" in body, "the row no longer follows the board's column order"
-    assert "known.includes" in body or "!known" in body, (
-        "statuses absent from boardStatuses are dropped instead of appended, so cards "
-        "carrying a retired status become invisible on the worker card")
-
-
 # ───────────────── the status letters must actually discriminate ─────────────
-
-def _run_abbr_js(statuses, extras):
-    """Execute the SHIPPED _statusAbbrs/_statusAbbr in node against a given status
-    set. Running the real functions rather than reimplementing them is the point:
-    a mirror would agree with whatever mistake the source makes."""
-    import json
-    import subprocess
-    js = (
-        "const boardStatuses = %s;\n" % json.dumps(statuses)
-        + "function _abbrOf(label, taken)%s\n" % _js_block("_abbrOf")
-        + "function _statusAbbrs()%s\n" % _js_block("_statusAbbrs")
-        + "function _statusAbbr(id, st)%s\n" % _js_block("_statusAbbr")
-        + "const st = _statusAbbrs();\n"
-        + "const out = {};\n"
-        + "for (const s of boardStatuses) out[s.id] = _statusAbbr(s.id, st);\n"
-        + "for (const e of %s) out[e] = _statusAbbr(e, st);\n" % json.dumps(extras)
-        + "console.log(JSON.stringify(out));\n"
-    )
-    r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    return json.loads(r.stdout)
 
 
 # The board's real columns, plus the statuses that live in the DB but have no
 # column (43 cards sat in `blocked`/`needsyou` when this shipped). The extras are
 # the harder case: they arrive one at a time, after the map is built.
-_STATUSES = [
-    {"id": "backlog", "label": "Backlog"}, {"id": "todo", "label": "To Do"},
-    {"id": "doing", "label": "In Progress"}, {"id": "review", "label": "In Review"},
-    {"id": "done", "label": "Done"}, {"id": "verified", "label": "Verified"},
-    {"id": "discarded", "label": "Discarded"},
-]
-_EXTRAS = ["blocked", "needsyou", "armed", "resolved"]
-
-
-def test_every_status_gets_a_DISTINCT_letter():
-    """The whole reason the letter exists. Colour does not separate todo from
-    discarded (both grey) or backlog from review from blocked (all blue), so if two
-    statuses also share a letter the chip is undecodable and the biggest number on
-    the card — usually discarded — reads as the queue."""
-    got = _run_abbr_js(_STATUSES, _EXTRAS)
-    letters = list(got.values())
-    dupes = {l for l in letters if letters.count(l) > 1}
-    assert not dupes, "statuses share a letter %s: %s" % (sorted(dupes), got)
-    print("checked %d statuses, all letters distinct: %s" % (len(got), got))
-
-
-def test_done_and_discarded_do_not_collide():
-    """Named explicitly because it is the pair a naive first-letter scheme gets
-    wrong, and the pair whose confusion is most expensive: 106 done and 82 discarded
-    on one card, one meaning shipped and one meaning abandoned."""
-    got = _run_abbr_js(_STATUSES, _EXTRAS)
-    assert got["done"] != got["discarded"], got
-    assert got["done"] == "D", "Done should keep the plain initial: %s" % got["done"]
-
-
-def test_multi_word_labels_use_word_INITIALS():
-    """"In Progress" and "In Review" both start with I, so a first-letter rule
-    shadows one of them. Word initials give IP and IR, which is also how people
-    already write those statuses."""
-    got = _run_abbr_js(_STATUSES, _EXTRAS)
-    assert got["doing"] == "IP", "In Progress should read IP: %s" % got["doing"]
-    assert got["review"] == "IR", "In Review should read IR: %s" % got["review"]
-    assert got["todo"] == "TD", "To Do should read TD: %s" % got["todo"]
-
-
-def test_the_LAST_WORD_rule_would_have_broken_todo():
-    """Pins WHY the rule is word-initials and not "last word", because last-word is
-    the obvious simplification someone will reach for and it shipped here first:
-    "To Do" -> last word "Do" -> D, which takes Done's letter and then READS as
-    Done. The uniqueness test caught it; this one records the reason so the fix is
-    not undone by a refactor that looks tidier."""
-    got = _run_abbr_js(_STATUSES, _EXTRAS)
-    assert got["todo"] != got["done"], (
-        "To Do and Done share a letter — the last-word rule is back: %s" % got)
-
-
-def test_a_status_with_no_column_still_gets_a_unique_letter():
-    """Extras are resolved lazily, after the map exists. If they collided with an
-    existing letter the row would show two chips reading the same thing — worse than
-    the colour collision it replaced, because a letter looks authoritative."""
-    got = _run_abbr_js(_STATUSES, _EXTRAS)
-    known = {got[s["id"]] for s in _STATUSES}
-    for e in _EXTRAS:
-        assert got[e] not in known, "%s took an existing status's letter %r" % (e, got[e])
-        known.add(got[e])
 
 
 # ───────────────── board columns must not mislabel strays (AMUX-2526) ────────

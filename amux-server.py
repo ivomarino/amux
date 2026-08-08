@@ -2396,8 +2396,15 @@ def _bu_lock_for(session: str) -> threading.Lock:
         return lk
 
 def _bu_driver_stop(session: str, explicit: bool = False):
-    """Tear down a session's driver. TAKES THE REGISTRY LOCK ITSELF — callers must
-    NOT hold it.
+    """Tear down a session's driver. TAKES BOTH LOCKS ITSELF — callers must hold
+    neither. Safe to call from inside _bu_driver_call (the session lock is an
+    RLock, so re-entry from the owning thread is fine).
+
+    The docstring said "TAKES THE REGISTRY LOCK ITSELF" after AC-290 added the
+    session lock, which is the AC-289 defect repeating in miniature: a docstring
+    that names one lock is read as naming all of them, and AC-289's whole lesson
+    was that "Serialized per session" over a global lock is why nobody checked the
+    scope. Caught by amux-cloud reviewing AC-290 (their doc nit on AC-292).
 
     The registry pop is under the lock; the process teardown is not, because it
     blocks for up to 8 seconds on proc.wait(). Holding a global lock across that
@@ -2416,7 +2423,33 @@ def _bu_driver_stop(session: str, explicit: bool = False):
     # Held across proc.wait(timeout=8) ON PURPOSE — that is the whole point, and it
     # only blocks THIS session, which is the difference between this and AC-289.
     # The REGISTRY lock still is not, because that one is global.
-    with _bu_lock_for(session):
+    # BOUNDED ACQUIRE, AND TEAR DOWN ANYWAY ON TIMEOUT (AC-292, amux-cloud).
+    # I introduced this in 438369a: teardown took the session lock with a plain
+    # `with`, i.e. unbounded, while _bu_driver_call holds that same lock across
+    # the spawn `readline()`. A driver that HANGS at spawn therefore held the lock
+    # forever, and this function — the escape hatch, and the only thing that would
+    # kill the process and unblock that readline — waited on it instead of
+    # breaking it.
+    #
+    #   pre-AC-290   stop always worked, sometimes corrupted
+    #   post-AC-290  stop is correct, and could hang on the one failure it is
+    #                most needed for
+    #
+    # The discipline already existed two functions away — _bu_driver_call bounds
+    # its acquire at max(5, timeout_s+15) for exactly this reason — and teardown
+    # did not inherit it. An escape hatch that can be blocked by the condition it
+    # escapes is not an escape hatch.
+    #
+    # So: wait a bounded time for a clean handoff, then proceed WITHOUT the lock.
+    # Racing an in-flight call is worse than corrupting one pipe only if the call
+    # can still finish; a wedged one cannot, and killing the process is what
+    # unblocks it.
+    _lk = _bu_lock_for(session)
+    _got = _lk.acquire(timeout=10.0)
+    if not _got:
+        slog(f"[browser] {session}: forcing teardown past a wedged call — could not "
+             f"take the session lock in 10s (AC-292). The in-flight call will error.")
+    try:
         with _bu_driver_lock:
             if explicit:
                 _bu_driver_ever.discard(session)
@@ -2424,6 +2457,9 @@ def _bu_driver_stop(session: str, explicit: bool = False):
         if not d:
             return
         _bu_driver_teardown(d)
+    finally:
+        if _got:
+            _lk.release()
 
 
 def _bu_driver_teardown(d: dict):
@@ -2484,6 +2520,26 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
                 [_py, "-c", _BU_DRIVER_SRC, str(udir), "1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True)
+            # BOUND THE SPAWN HANDSHAKE (AC-292 root enabler). This was a bare
+            # blocking readline with no timeout, unlike the 45s select on the
+            # call path below — so a driver that hangs at import or at browser
+            # launch (rather than DYING, which the except below handles) blocks
+            # here forever while holding this session's lock. Bounding teardown's
+            # acquire makes that escapable; bounding this makes it not happen.
+            #
+            # 60s because a cold Playwright launch with a large profile store is
+            # genuinely slow and a too-tight bound would turn a working spawn into
+            # a spurious failure — the failure mode that would send someone
+            # debugging the browser instead of the timeout.
+            import select as _sel0
+            _r0, _, _ = _sel0.select([proc.stdout], [], [], 60)
+            if not _r0:
+                try: proc.kill()
+                except Exception: pass
+                slog(f"[browser] driver spawn for '{session}' produced no ready line in 60s "
+                     f"— killed (AC-292); it would otherwise hold the session lock forever")
+                return {"error": "driver failed to start: no ready line within 60s "
+                                 "(hung at import or browser launch, not a crash)"}
             ready = proc.stdout.readline()
             try:
                 if not json.loads(ready or "{}").get("ready"):
@@ -13133,6 +13189,34 @@ def _similar_open_cards(title: str, exclude_session: str, db=None, limit: int = 
 _BOARD_SLIM_DROP = ("desc", "log")
 
 
+_BOARD_TERMINAL = ("done", "verified", "discarded")
+
+
+def _cap_terminal(items, limit: int):
+    """Cap terminal-status items to the `limit` most recent, AFTER filtering.
+
+    Returns (kept, terminal_total, terminal_kept) — the two counts are returned
+    rather than left for the caller to infer, because "did the cap bite?" derived
+    from list lengths is the kind of arithmetic that is wrong in a way nobody
+    notices, and this function exists precisely because a silent cap produced a
+    confident wrong answer (AC-291).
+
+    Active items are never capped: they are the working set, and dropping one
+    hides live work. Order is preserved for everything kept, so the caller's
+    sort survives.
+    """
+    if limit <= 0:
+        return list(items), 0, 0
+    _term = [i for i in items if str(i.get("status") or "").lower() in _BOARD_TERMINAL]
+    if len(_term) <= limit:
+        return list(items), len(_term), len(_term)
+    _keep_ids = {id(i) for i in sorted(
+        _term, key=lambda i: i.get("updated") or 0, reverse=True)[:limit]}
+    kept = [i for i in items
+            if str(i.get("status") or "").lower() not in _BOARD_TERMINAL or id(i) in _keep_ids]
+    return kept, len(_term), limit
+
+
 def _board_project(items, slim: bool, f_sess: list, f_stat: list, f_arch: str):
     """Server-side filter + projection for GET /api/board (AMUX-2223).
 
@@ -18886,25 +18970,6 @@ def list_sessions() -> list:
             _doing_ids[row["session"]] = row["id"]
     except Exception:
         _doing_tasks, _doing_updated, _doing_ids = {}, {}, {}
-    # Per-session board counts BY STATUS for the worker card (AMUX-2529). Served
-    # from the sessions payload rather than derived client-side on purpose: the
-    # client's board array is only fetched when the board view is open, so a
-    # client-derived count reads 0 on a fresh load of the Workers tab — the same
-    # divergence that put two disagreeing schedule counts on one card.
-    #
-    # `archived=0` matches the board's own default view, so the chips sum to the
-    # card count a tap-through actually lands on. A row that showed archived work
-    # would be a view disagreeing with the mechanism it describes (ethos rule 1).
-    _issue_counts: dict = {}
-    try:
-        for r in get_db().execute(
-                "SELECT session, status, COUNT(*) n FROM issues "
-                "WHERE deleted IS NULL AND COALESCE(archived,0)=0 "
-                "AND session IS NOT NULL AND session != '' "
-                "GROUP BY session, status").fetchall():
-            _issue_counts.setdefault(r["session"], {})[r["status"] or "todo"] = int(r["n"] or 0)
-    except Exception:
-        _issue_counts = {}
     for f in env_files:
         name = f.stem
         cfg = parse_env_file(f)
@@ -19123,8 +19188,6 @@ def list_sessions() -> list:
             "task_board_id": (_doing_ids.get(name, "") if _tsrc == "board" else ""),
             "sched_on": _sched_counts.get(name, (0, 0))[0],
             "sched_off": _sched_counts.get(name, (0, 0))[1],
-            # {status: count} for this worker's non-archived board cards.
-            "issue_counts": _issue_counts.get(name, {}),
             "task_updated": _bu,
             "task_board_age": int(time.time() - _bu) if (_bt and _bu and not _board_fresh) else 0,
             "tokens": tokens,
@@ -26763,31 +26826,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-weight: 600; text-transform: uppercase; white-space: nowrap; flex-shrink: 0;
   }
   .badge.yolo { background: rgba(210,153,34,0.2); color: var(--yellow); }
-  /* Worker card metrics row: board counts by status + schedules (AMUX-2529).
-     Replaced .card-sched-count, which rendered the same schedule numbers a
-     second time one line below the chip that already showed them. */
-  .card-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 3px 0 2px; }
-  .cnt-chip { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
-    font-size: 0.68rem; font-weight: 600; font-family: var(--font-mono);
-    line-height: 1.5; padding: 1px 7px; border: 1px solid transparent; border-radius: 9px; }
-  .cnt-chip:hover, .cnt-chip:active { filter: brightness(1.25); }
-  /* The status letter. Replaced a coloured dot, which was pure redundancy with
-     the chip's own background and carried no information colour did not already
-     carry — while colour itself does not separate todo from discarded, or
-     backlog from review from blocked. Same width, actually discriminates. */
-  .cnt-k { font-weight: 700; opacity: 0.7; letter-spacing: 0.02em; flex: 0 0 auto; }
-  .cnt-sched { background: rgba(139,148,158,0.1); color: var(--dim);
-    border-color: var(--border); gap: 2px; }
-  /* Marks a column the board never configured — cards carry the status but no
-     column was declared for it. Deliberately quiet: it is a prompt to decide,
-     not an error (AMUX-2526). */
-  .col-stray-flag { font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.04em; color: var(--dim); border: 1px dashed var(--border);
-    border-radius: 6px; padding: 0 5px; margin-left: 5px; cursor: help; }
-  .cnt-total { display: inline-flex; align-items: center; cursor: pointer;
-    font-size: 0.68rem; font-weight: 700; font-family: var(--font-mono);
-    color: var(--text); opacity: 0.75; padding: 1px 5px 1px 0; }
-  .cnt-total:hover { opacity: 1; }
   /* Mobile hit area: expanded to ~32px, NOT the 44px the css-mobile rule asks
      for, and that is a deliberate deviation rather than an oversight. 44px-tall
      pills would push the task label and preview below the fold on a 375px card,
@@ -26796,30 +26834,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      small target into a wrong one. Every destination here is also reachable from
      the Board tab, so a missed tap costs a tap, not the route. */
   @media (max-width: 600px) {
-    /* ONE LINE, SCROLLED — never wrapped (Ethan's 375px screenshot). A worker
-       with a real backlog has 8-10 non-zero statuses, and wrap:wrap turned that
-       into TWO full rows of pills that pushed the task label out of view and
-       dominated the card. The row is a glance, not a table: if it costs two lines
-       it has stopped being worth its space, which is the opposite of the real
-       estate this row was added to reclaim.
-       Every count stays reachable by swiping rather than being dropped, so the
-       chips still sum to the worker's card count — hiding some would make the row
-       disagree with the board it links to. */
-    .card-counts { gap: 5px; padding: 4px 0 3px; flex-wrap: nowrap;
-      overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
-      -webkit-overflow-scrolling: touch;
-      /* Fade the right edge so an off-screen chip is visibly off-screen rather
-         than absent — a scroll rail with no affordance reads as a short list. */
-      -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
-      mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent); }
-    .card-counts::-webkit-scrollbar { display: none; }
-    .cnt-chip, .cnt-total { position: relative; font-size: 0.7rem; flex: 0 0 auto; }
-    .cnt-chip { padding: 2px 8px; }
-    /* Hit-area expansion is VERTICAL ONLY here. On a horizontal rail a wider hit
-       area would overlap the neighbouring chip, and on a scroller a mis-tap is
-       worse than a small target because it navigates you somewhere. */
-    .cnt-chip::after, .cnt-total::after { content: ''; position: absolute;
-      left: 0; right: 0; top: -6px; bottom: -6px; }
   }
   .sched-toggle-label { display:flex;align-items:center;cursor:pointer;flex-shrink:0;margin-top:1px;min-width:44px;min-height:44px;justify-content:center; }
   .sched-actions { display:flex;gap:6px;margin-top:8px;flex-wrap:wrap; }
@@ -36147,12 +36161,6 @@ function render() {
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
     const pLabel = providerLabel(provider);
-    // Schedule counts come from the SESSIONS payload (s.sched_on/s.sched_off),
-    // not from the client `schedules` array. The card used to render both, and
-    // they are not the same fact: `schedules` is refetched only on the scheduler
-    // view, so it goes stale while the payload refreshes every poll. Two chips
-    // showing one number is a duplicate; two chips showing DIFFERENT numbers is
-    // the failure that made removing one non-optional (AMUX-2527).
     const taskStale = _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
@@ -36205,7 +36213,6 @@ function render() {
       ${s.dir ? `<div class="card-dir"><span class="card-dir-path" title="${esc(s.dir)}">${esc(s.dir)}</span></div>` : ''}
       ${s.creator ? `<div class="card-dir" style="font-size:0.72rem;">${esc(s.creator)}</div>` : ''}
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
-      ${_cardCountsRow(s)}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
       ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
@@ -36419,138 +36426,6 @@ function _taskIdChip(s) {
   return ' <span class="task-id-chip" onclick="event.stopPropagation();_openIssue(\'' + escJs(id) + '\')" '
     + 'title="Open board card ' + esc(id) + '" '
     + 'style="cursor:pointer;font-size:0.7rem;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:0 6px;margin-left:4px;white-space:nowrap;">' + esc(id) + '</span>';
-}
-// ── Worker card: one metrics row (AMUX-2529) ────────────────────────────────
-// Board counts by status + the schedule count, on a single wrapping line. Each
-// count taps through to the board filtered to exactly the cards it counted, so
-// the number and the list you land on cannot disagree.
-//
-// Colours come from statusStyle(), the SAME function the board columns and the
-// status dots use — not a second palette keyed by status name. A second colour
-// source is how `review` ends up amber here and purple two tabs over, and it
-// would silently stop covering custom statuses, which statusStyle() handles by
-// falling through to the custom palette.
-function _cardStatusCounts(s) {
-  const counts = (s && s.issue_counts) || {};
-  // Ordered by boardStatuses so the row reads left-to-right in the same
-  // direction work flows on the board. Statuses the payload reports but the
-  // board does not list (a status deleted while cards still carry it) are
-  // appended rather than dropped — a count row that hides cards is worse than
-  // one with an unfamiliar label on it.
-  const known = (typeof boardStatuses !== 'undefined' ? boardStatuses : []).map(x => x.id);
-  const extra = Object.keys(counts).filter(k => !known.includes(k)).sort();
-  return known.concat(extra)
-    .map(id => ({ id: id, n: counts[id] || 0 }))
-    .filter(x => x.n > 0);
-}
-// Colour alone does not discriminate these, and that is not a fixable palette
-// choice — it is what statusStyle() legitimately returns. Measured on the live
-// board: todo and discarded are BOTH grey, and backlog, review and blocked are
-// all blue (review and blocked fall through to the custom palette, whose first
-// entry is the same accent blue backlog uses). Five of nine statuses collide in
-// pairs or triples.
-//
-// That is fine in the board columns, where every colour sits under a written
-// label. In an unlabelled row it makes the largest number on the card — usually
-// discarded — indistinguishable from the queue. So each chip carries a letter.
-//
-// DERIVED from boardStatuses, not a hardcoded map: a custom status must get an
-// abbreviation too, and a second hand-maintained table keyed by status id is the
-// drift this file already paid for once. First letter, extended until unique in
-// board order, so Done stays D and Discarded becomes Di rather than one of them
-// silently shadowing the other.
-// Multi-word labels take one initial per word (To Do -> TD, In Progress -> IP,
-// In Review -> IR); single words take the first letter, lengthened only when
-// something already claimed it (Done -> D, Discarded -> Di).
-//
-// The two rules exist because either alone collides on the REAL status set. Last
-// word only: "To Do" -> Do -> D, which steals D from Done and reads as Done —
-// the single worst confusion available here, and the first version shipped it
-// until the uniqueness test caught it. First letter only: "In Progress" and "In
-// Review" both become I. Word-initials for multi-word labels sidesteps both, and
-// TD/IP/IR are how people already write those statuses.
-function _abbrOf(label, taken) {
-  const words = String(label || '').trim().split(/\s+/).filter(Boolean);
-  let a;
-  if (words.length > 1) {
-    a = words.map(w => w[0].toUpperCase()).join('');
-  } else {
-    const base = (words[0] || 'x').replace(/[^a-z]/gi, '') || 'x';
-    a = base[0].toUpperCase();
-    for (let i = 1; taken[a] && i < base.length; i++) a = base[0].toUpperCase() + base[i].toLowerCase();
-  }
-  while (taken[a]) a += '′';     // pathological: two identical labels
-  taken[a] = 1;
-  return a;
-}
-function _statusAbbrs() {
-  const list = (typeof boardStatuses !== 'undefined' ? boardStatuses : []);
-  const out = {}, taken = {};
-  // Board order, so which status keeps the plain letter is decided by the same
-  // order the row renders in rather than by object-key iteration.
-  list.forEach(x => { out[x.id] = _abbrOf(x.label || x.id, taken); });
-  return { map: out, taken: taken };
-}
-function _statusAbbr(id, st) {
-  if (st.map[id]) return st.map[id];
-  // A status the board does not list — `blocked` and `needsyou` held 43 live
-  // cards when this shipped. Resolved lazily against the same taken-set, so an
-  // extra can never shadow a real column's letter.
-  st.map[id] = _abbrOf(String(id), st.taken);
-  return st.map[id];
-}
-function _cardCountsRow(s) {
-  const cs = _cardStatusCounts(s);
-  const sched = (s.sched_on || 0) + (s.sched_off || 0);
-  if (!cs.length && !sched) return '';
-  const label = {};
-  (typeof boardStatuses !== 'undefined' ? boardStatuses : []).forEach(x => { label[x.id] = x.label; });
-  const abbr = _statusAbbrs();
-  const total = cs.reduce((a, x) => a + x.n, 0);
-  const chips = cs.map(x => {
-    const st = statusStyle(x.id);
-    const nm = label[x.id] || x.id;
-    return '<span class="cnt-chip" style="background:' + st.bg + ';color:' + st.color
-      + ';border-color:' + st.border + ';" title="' + x.n + ' ' + esc(nm)
-      + ' issue' + (x.n === 1 ? '' : 's') + ' — open the board filtered to these" '
-      + 'onclick="event.stopPropagation();openBoardFor(\'' + escJs(s.name) + '\',\'' + escJs(x.id) + '\')">'
-      + '<span class="cnt-k">' + esc(_statusAbbr(x.id, abbr)) + '</span>' + x.n + '</span>';
-  }).join('');
-  const schedChip = sched
-    ? '<span class="cnt-chip cnt-sched" title="' + (s.sched_on || 0) + ' enabled / '
-      + (s.sched_off || 0) + ' disabled schedule' + (sched === 1 ? '' : 's')
-      + '" onclick="event.stopPropagation();openPeek(\'' + escJs(s.name) + '\');'
-      + 'setTimeout(()=>setPeekTab(\'schedules\'),400)">&#x23F2;'
-      + '<span style="color:var(--green);font-weight:700;">' + (s.sched_on || 0) + '</span>'
-      + '<span style="opacity:0.5;">/</span>'
-      + '<span style="color:' + ((s.sched_off || 0) ? '#d29922' : 'inherit') + ';">'
-      + (s.sched_off || 0) + '</span></span>'
-    : '';
-  // The total is a tap target too, because "how much work does this worker
-  // have" is the question the row is usually answering, and reaching it via
-  // whichever status chip happens to be largest is a worse route.
-  const totalChip = total
-    ? '<span class="cnt-total" title="' + total + ' non-archived issue' + (total === 1 ? '' : 's')
-      + ' — open this worker\'s board" onclick="event.stopPropagation();openBoardFor(\''
-      + escJs(s.name) + '\',\'\')">' + total + '</span>'
-    : '';
-  return '<div class="card-counts">' + totalChip + chips + schedChip + '</div>';
-}
-// Board, filtered to this worker (and optionally one status). Compiles to the
-// query language rather than setting some separate filter state — same rule the
-// filter bar follows, so the search box shows what you are looking at and the
-// view is shareable via the #bq= hash.
-function openBoardFor(worker, status) {
-  const q = 'worker:' + worker + (status ? ' status:' + status : '');
-  switchView('board');
-  setTimeout(() => {
-    boardSearchQuery = q;
-    const inp = document.getElementById('board-search');
-    if (inp) inp.value = q;
-    _boardActiveView = '';
-    _bfSyncHash();
-    renderBoard();
-  }, 60);
 }
 async function _askCardStatus(id, sess) {
   // Ask the owning session to report status onto the board (AMUX-2174). The
@@ -40268,7 +40143,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.516';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.517';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -62005,7 +61880,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.516';
+const CACHE = 'amux-v0.9.517';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
@@ -67012,11 +66887,44 @@ class CCHandler(BaseHTTPRequestHandler):
                         return self._json(
                             _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch),
                             headers={"X-Amux-Done-Limit": str(done_limit)})
-                    # Same read-through-on-invalidation contract as the scoped
-                    # path: a write nulls the cached data, so this reloads.
-                    _bd = _sse_cache["board"]["data"] or _load_board(done_limit=done_limit or 100)
-                    return self._json(_board_project(_bd, _slim, _f_sess, _f_stat, _f_arch),
-                                      headers={"X-Amux-Done-Limit": "100"})
+                    # CAP THE FILTERED SET, NOT THE POPULATION IT IS DRAWN FROM
+                    # (AC-291, amux-cloud). The default path served a list already
+                    # truncated to the 100 most-recent terminal cards and THEN
+                    # applied the caller's filter, so the filter ran on the wrong
+                    # denominator. `?archived=1` was the worst case and the one
+                    # that got caught: archived cards are overwhelmingly old, so
+                    # the cap removes almost exactly the population the filter
+                    # asks for. amux-cloud queried their own 13 archived cards and
+                    # got ZERO, and nearly filed the notice that named them as
+                    # wrong. ts-gke hit the identical wall independently and
+                    # brute-forced the id space to see their own cards; that is
+                    # two sessions paying for one silent cap.
+                    #
+                    # Measured now: done 1404 / discarded 436 / verified 1418 in
+                    # the store, served as 97 / 3 / 300.
+                    #
+                    # Filtering FIRST is what makes the answer correct, and it
+                    # stays bounded because the filter is what bounds it — the cap
+                    # then applies to what the caller actually asked for. The
+                    # unfiltered path below still uses the cache and the cap
+                    # unchanged, because that is the payload-size case this limit
+                    # exists for (a 2.74MB board payload blew localStorage and
+                    # took the worker list down with it, AMUX-2515).
+                    _bd = _load_board(done_limit=0)
+                    _proj = _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch)
+                    _kept, _term_total, _term_kept = _cap_terminal(_proj, 100)
+                    return self._json(_kept, headers={
+                        "X-Amux-Done-Limit": "100",
+                        # DECLARE THE TRUNCATION. A cap that leaves no trace is
+                        # indistinguishable from an empty result, which is the
+                        # defect one layer up (ethos: no silent caps). The two
+                        # numbers are returned by the helper rather than derived
+                        # here, because the arithmetic to infer "did it bite?"
+                        # from list lengths is exactly the kind of expression that
+                        # is wrong in a way nobody notices.
+                        "X-Amux-Truncated": "1" if _term_total > _term_kept else "0",
+                        "X-Amux-Terminal-Total": str(_term_total),
+                        "X-Amux-Terminal-Returned": str(_term_kept)})
                 # HONOUR ANY EXPLICIT done_limit, not just 0 (gtm-videos, 2026-08-06).
                 # Only ==0 bypassed the cache; every other value fell through to a
                 # cache BUILT WITH 100, so `?done_limit=5000` accepted the
