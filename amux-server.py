@@ -18998,6 +18998,37 @@ def _session_recently_closed_issue(name: str) -> bool:
         return False
 
 
+def _session_recently_reviewed_issue(name: str) -> bool:
+    """True if this session recently signed off a card as its REVIEWER (AF-15).
+
+    The sibling above asks "did this lane close its own work?" — `WHERE session=?`.
+    That is the right question for an author and structurally blind to a reviewer,
+    because review->done and done->verified land on the AUTHOR's card: the reviewer
+    never owns the card they close. So a lane that spent an afternoon signing off
+    peers' work reads, to an ownership query, as a lane that did nothing.
+
+    The sibling had already reasoned about the review handoff from the author's end
+    (parking at `review` counts as handed off, not as stopping short). This is the
+    other end of that same handoff, and it is the end with no truthful way to comply:
+    a card titled "reviewed someone else's card" is not a unit of work that can be
+    honestly done or not done, so the only ways to silence the nudge were a
+    placeholder card — the fake work the sibling's docstring exists to prevent — or
+    learning to ignore it. Found by dogfooding: it fired three times in one afternoon
+    at amux-frustrations while five cards carried its sign-off.
+
+    `verified` counts as well as `done`: an independent verify is the same shape of
+    work on someone else's card, and it is what the VERIFY nudges ask for by name.
+    """
+    try:
+        row = get_db().execute(
+            "SELECT 1 FROM issues WHERE reviewer=? AND deleted IS NULL "
+            "AND LOWER(COALESCE(status,'')) IN ('done','verified') AND COALESCE(updated,0) > ? "
+            "LIMIT 1", (name, int(time.time() - _TASK_GUARD_CLOSED_WINDOW))).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
 def _task_guard_enabled() -> bool:
     """Global on/off for the idle task-guard (persisted as AMUX_TASK_GUARD in
     ~/.amux/server.env). Default OFF — opt-in, since it can nudge any session
@@ -19158,6 +19189,15 @@ def _task_guard(name: str) -> bool:
         # after marking its card done is the ledger rule working, not a session
         # hiding work, and telling it otherwise pushes it to invent a card.
         if _session_recently_closed_issue(name):
+            _task_guard_nudged[name] = True
+            return False
+        # Same question, asked from the REVIEWER's end (AF-15). The check above is
+        # `WHERE session=?`, so it cannot see work that lands on someone else's
+        # card — and every review->done and done->verified does. Sticky like the
+        # closed-issue branch rather than re-evaluating like the blocked one: both
+        # of those mean "this lane did its job and recorded it", which does not
+        # stop being true when the window lapses.
+        if _session_recently_reviewed_issue(name):
             _task_guard_nudged[name] = True
             return False
         # A lane whose entire queue is BLOCKED is not delinquent (AC-240): no todo
