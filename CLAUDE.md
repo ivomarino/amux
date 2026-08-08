@@ -114,6 +114,29 @@ somebody can pick up.
 - `mcp.json` — centralized MCP server config (shared by local and cloud)
 - `cloud/` — GCP VM provisioning (Terraform + setup script)
 
+## Claude Code hook entries: matchers are REGEXES, and tool events require one
+
+Writing a hook into `~/.claude/settings.json` has two traps that both produce an entry
+that LOOKS right in the file and never runs:
+
+- **Tool events (`PostToolUse`/`PreToolUse`) need a `matcher`; lifecycle events
+  (`Stop`/`UserPromptSubmit`) do not.** An entry without one is ignored. Every
+  pre-existing tool entry in that file carries a matcher — if yours is the only one
+  that does not, that is the tell.
+- **The matcher is a REGEX.** `"*"` is not a valid one (`nothing to repeat at
+  position 0`); use `".*"`. Existing entries look like `"Write|Edit|MultiEdit"` and
+  `"Bash"`.
+
+Both were shipped in sequence on AMUX-2538 and both were inert, across three
+verification runs, while the JSON read as correct each time.
+
+**Verify a hook by what it WROTE, not by the settings file.** The heartbeat there was
+caught only because the report records WHICH source last wrote it, so `tool-hook`
+showing zero across 79 samples was visible; a status field alone would have looked
+correct throughout. If a hook is not firing, have it write a marker file as well as
+its real action — that distinguishes "never ran" from "ran and its command failed or
+its env was missing", which testing the endpoint and the settings entry cannot.
+
 ## Workflow
 
 - **Staleness announces itself; nothing auto-pulls.** The `SessionStart` hook
