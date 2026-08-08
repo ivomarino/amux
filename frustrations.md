@@ -1067,13 +1067,16 @@ FIX: Credit where due: the warning is exactly right — it names the degradation
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-297
-FIX-NOTE: b7dba01 — _staged_guard_check() now runs `git diff --name-only -z` to detect
-  which staged paths have unstaged changes right now. When has_unstaged_changes is True,
-  the guard upgrades from NOTE to WARNING. No longer relies solely on the time window.
+FIX-NOTE: b7dba01 PARTIAL — _staged_guard_check() now checks for unstaged changes, which
+  helps when peer work is left unstaged. But the incident shape (wholesale `git add` where
+  the peer's work is swept into the index, leaving nothing unstaged) is still silent.
+  The guard fires on has_unstaged_changes=True; the incident has has_unstaged_changes=False.
+  Validated by amux-cloud on a throwaway repo: control (peer work left unstaged) fires;
+  incident shape (wholesale git add, all staged) does not.
 SYMPTOM: Two commits, 20 minutes apart, both `git add amux-server.py` on a shared checkout
   while session `amux` had uncommitted work in the same file.
     fc72811 — guard WARNED ("also edited by session 'amux' 30m ago... stages 55 insertions /
