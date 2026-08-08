@@ -19084,8 +19084,17 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
     window = _staged_guard_window()
     now = time.time()
     mine = _session_recent_edit_paths(session, window) if session else {}
+    # FIRST-HAND halves, for the provenance comparison below (AF-19). Kept
+    # separate rather than replacing `mine`: the inferred half is still the right
+    # input for the shared/legitimate-claim case, and only loses to a peer whose
+    # transcript actually names the write.
+    mine_firsthand = _session_recent_edit_paths(session, window, firsthand_only=True) \
+        if session else {}
+    theirs_firsthand: dict = {}
     theirs: dict[str, tuple[str, float]] = {}  # abspath -> (owner, newest ts)
     for other in cotenants:
+        for p in _session_recent_edit_paths(other, window, firsthand_only=True):
+            theirs_firsthand[p] = True
         for p, ts in _session_recent_edit_paths(other, window).items():
             cur = theirs.get(p)
             if not cur or ts > cur[1]:
@@ -19111,6 +19120,32 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
         ap = os.path.realpath(os.path.join(wd, rel))
         hit = theirs.get(ap)
         _is_dirty = ap in _dirty_paths
+        # PROVENANCE STRENGTH, not mere presence (AF-19). `mine` includes the
+        # INFERRED half — a Bash command naming a path whose mtime moved within
+        # _SHELL_WRITE_SLACK. This branch then `continue`s, so an inferred
+        # self-claim SUPPRESSED the foreign block below and downgraded it to a
+        # note. Measured on the incident: my staged test file, which amux had
+        # never opened, classified `shared` from their side because their
+        # `git add` named it while its mtime was moving. The block never fired
+        # and 762e06e swept it.
+        #
+        # _session_recent_edit_paths' own docstring says to pick provenance BY
+        # SAFETY DIRECTION and judges the staged-guard safe to over-claim, since
+        # "a warning about a file you did not write costs a glance". That holds
+        # where inference ADDS a warning. Here it is applied to `mine`, where
+        # over-claiming REMOVES one — same function, opposite direction.
+        #
+        # So a first-hand peer claim outranks an inferred self-claim. Both
+        # first-hand, or both inferred, is still genuinely shared: the committer
+        # keeps their legitimate claim on files they really did edit, including
+        # via heredocs and `sed -i`, and only loses it to a peer who demonstrably
+        # wrote the file.
+        if ap not in mine_firsthand and hit and ap in theirs_firsthand:
+            foreign.append({"path": rel, "owner": hit[0],
+                            "age_secs": int(max(0, now - hit[1])),
+                            "has_unstaged_changes": _is_dirty,
+                            "why": "they wrote it (transcript); your claim is inferred"})
+            continue
         if ap in mine:
             if hit or _is_dirty:
                 shared.append({"path": rel, "owner": hit[0] if hit else "(unknown)",
