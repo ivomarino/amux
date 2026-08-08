@@ -781,10 +781,11 @@ NOTE: second entry today whose root is an instrument that returns a plausible an
 ## Column delete and modal close share the ✕ affordance — a dismiss loop hit a destructive confirm
 AREA: board
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux
 CARD: AMUX-2491
+FIX-NOTE: already fixed in code — column delete button uses trash glyph &#128465; instead of ✕
 SYMPTOM: driving the cloud board in a browser, I dismissed onboarding modals with a blanket
   `document.querySelectorAll("button")` loop clicking anything whose text was `✕` or `Skip`.
   It reported `{"dismissed":26}`. One of those 26 was a board COLUMN's delete control, and the
@@ -844,7 +845,7 @@ NOTE: this path never had a delivery-time guard to forget — it calls send_text
 ## Push guard deadlocks stacked sessions and never says the escape exists
 AREA: cli
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux
 CARD: AMUX-2512
@@ -858,11 +859,8 @@ COST: the reporter (general-canvas-apps) had to diagnose my push state from outs
   their own "is it fixed" question on the card, and hand me the escape. Their words: "I think
   you are deadlocked with gtm-videos rather than idle." A guard whose correct operation is
   indistinguishable from a stalled session costs a peer's time to disambiguate.
-FIX: the escape needs no new mechanism and already works — `git push origin <your-sha>:main`
-  ships exactly your commits when yours are BELOW the foreign one. The guard's refusal should
-  say so, computing the highest same-session sha that is push-safe and printing that command,
-  the same way the board's 409 bodies name the attributed CLI verb instead of only describing
-  the rule (AMUX-2325).
+FIX: b7dba01 — push guard now computes the highest safe same-session sha and prints
+  the `git push origin <sha>:main` escape command. The guard's refusal names the exit.
 NOTE: general-canvas-apps' framing is the durable half and is why this is filed rather than
   grumbled about: whoever is NOT at the tip can always escape via <sha>:main, but the TIP
   owner is blocked until everyone below has pushed. That is an ORDERING CONSTRAINT the guard
@@ -985,10 +983,13 @@ NOTE: SECOND instance of this exact shape in the SAME function — AC-194 hoiste
 ## `?archived=1` returned a confident list that structurally could not contain archived cards
 AREA: board
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux-cloud
 CARD: AC-291
+FIX-NOTE: already fixed in code — GET /api/board handler loads with done_limit=0 when
+  filter params are present (archived, status, session, etc.), so the truncation no
+  longer hides archived cards.
 SYMPTOM: amux sent "13 of your cards are ARCHIVED but not finished". I checked with
   `GET /api/board?archived=1`, filtered to my session, and got **0** — so the notice looked
   like a false alarm. It was not: all 13 were exactly as described, confirmed by per-id GETs.
@@ -1015,10 +1016,12 @@ FIX: Say when done_limit truncates (`truncated: true` or a dropped count) — th
 ## A board GET hung for 2 minutes, and the smaller response was the slower one
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 CARD: AC-174
 DATE: 2026-08-07
 SESSION: amux-cloud
+FIX-NOTE: b7dba01 — Server-Timing header on every board GET; slow requests (>500ms) logged
+  with query params. Per-request timing via thread-local _req_tl.board_t0.
 SYMPTOM: Three consecutive board GETs against the running local server:
     ?archived=1                                   -> 200, 1.8MB, 21.6s
     ?archived=1                                   -> HUNG, killed at 120s
@@ -1038,10 +1041,12 @@ FIX: Time these GETs with per-request thread CPU alongside slog lock-wait, so lo
 ## `amux send` fell back to raw tmux and the message never arrived
 AREA: cli
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-07
 SESSION: amux-cloud
 CARD: AC-174
+FIX-NOTE: b7dba01 — amux send now retries twice over ~4s before falling back to raw tmux,
+  with shorter 5s timeout on retries. Transient server-down during re-exec is survived.
 SYMPTOM: `amux send amux --stdin` with a ~70-line report hit the server during a transient
   wedge and fell back to keystroke injection:
     warning: amux server unreachable — falling back to raw tmux (UNSTAMPED, unaudited)
@@ -1062,10 +1067,13 @@ FIX: Credit where due: the warning is exactly right — it names the degradation
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-297
+FIX-NOTE: b7dba01 — _staged_guard_check() now runs `git diff --name-only -z` to detect
+  which staged paths have unstaged changes right now. When has_unstaged_changes is True,
+  the guard upgrades from NOTE to WARNING. No longer relies solely on the time window.
 SYMPTOM: Two commits, 20 minutes apart, both `git add amux-server.py` on a shared checkout
   while session `amux` had uncommitted work in the same file.
     fc72811 — guard WARNED ("also edited by session 'amux' 30m ago... stages 55 insertions /
@@ -1091,10 +1099,12 @@ FIX: The correlation is the dangerous part, not the miss. I checked BECAUSE it w
 ## In-memory driver registry makes every server save a silent browser-session amnesia
 AREA: browser
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-296
+FIX-NOTE: already fixed in code — _bu_driver_ever is now persisted to the prefs table via
+  _bu_persist_ever(), and restored at startup. Survives server re-exec.
 SYMPTOM: `_bu_drivers` and `_bu_driver_ever` are module-level and persisted NOWHERE (grepped
   for db/json/write_text against both names: no hits). amux-server.py re-execs on every save,
   which on a shared checkout with ~40 lanes editing it happens many times an hour. After a
@@ -1118,10 +1128,13 @@ FIX: Persist the driver registry the way session reports already are — the eth
 ## A dependency nudge fired four times at a card whose next gate is not mine to pass
 AREA: notices
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-298
+FIX-NOTE: already fixed in code — dependency nudge now checks if blocker is actionable
+  for the recipient (lines 12958-12992). Suppressed when blocker is in review awaiting a
+  different session's ack or parked on an external decision.
 SYMPTOM: Four identical deliveries in one turn: "AC-277 is blocked by AC-294, which is YOURS.
   Work the dependency first: drive AC-294 through its gates." AC-294 was already fixed
   (fc72811) and moved to `review` before the second delivery. Its remaining gates are:
@@ -1141,10 +1154,12 @@ FIX: The nudge already knows the dependency's status (it names the card). Suppre
 ## The dirty-file gate's published escape does not exist in the CLI
 AREA: gates
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-299
+FIX-NOTE: b7dba01 — `amux board <status> <id> --force "reason"` added. Requires a reason
+  string. Appends "[FORCED] reason" to the card via desc_append. All 3 usage strings updated.
 SYMPTOM: `amux board verified AC-248` returned 409: "session has uncommitted changes; commit
   before verifying, or pass force=true if unrelated to this task". The only dirty path was
   amux-server.py, holding a PEER's in-flight hook work — verified by reading the diff — while
@@ -1166,10 +1181,13 @@ FIX: `amux board <status> <id> --force "<why>"`, requiring the reason, so the au
 ## The idle nudge told me to commit a peer's in-flight work, calling it "your working directory"
 AREA: notices
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-300
+FIX-NOTE: already fixed in 8e387fb — idle nudge now reads `shared` as well as `foreign`,
+  names the co-editor, gives the per-hunk staging recipe, and says explicitly to leave
+  the file alone if none of it is yours.
 SYMPTOM: "You went idle with 1 uncommitted change(s) under your working directory
   (/Users/ethan/Dev/amux): amux-server.py — Commit completed work now... Don't leave the working
   tree dirty." The change was session `amux`'s, mid-iteration on hook matchers. Nothing of mine
@@ -1286,10 +1304,12 @@ NOTE: this is the sharper form of "confirm the probe could have produced a posit
 ## A card-level gate fires on the PARK transition, blocking the sanctioned exit
 AREA: gates
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux
 CARD: AMUX-2539
+FIX-NOTE: b7dba01 — gates no longer fire on retreat transitions. _GATE_EXEMPT_TARGETS =
+  {"todo", "backlog", "discarded", "doing"} exempts all parking/retreat moves.
 SYMPTOM: `amux board backlog AMUX-2482 --trigger "..."` was refused pending six
   verification criteria (browser god-mode sign-in, walk every worker, peer review).
   The advance nudge's own instructions name `backlog --trigger` as THE sanctioned
@@ -1307,10 +1327,12 @@ FIX: gates should bind on FORWARD transitions (review/done/verified), not on par
 ## EXTENDS the park-transition entry above: the same gate also blocks DISCARD, which is worse
 AREA: gates
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-08
 SESSION: amux-cloud
 CARD: AC-304
+FIX-NOTE: b7dba01 — same fix as AMUX-2539 above. Discard is in _GATE_EXEMPT_TARGETS,
+  so gates no longer fire on it.
 SYMPTOM: Corroborating instance for "A card-level gate fires on the PARK transition" (amux,
   b1c8639) — not a duplicate, because it lands on a different transition and changes the fix.
   amux routed AMUX-2482/2483/2484 to me; all three were exact duplicates (matched by ORG ID, not
