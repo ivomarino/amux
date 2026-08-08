@@ -1223,3 +1223,62 @@ FIX: fixed for the nudge in 8e387fb — it now reads `shared` as well as `foreig
   This is that rule applied to two VIEWS of one mechanism — and the tell was not in either
   symptom, it was that both symptoms named the same file. When two instruments disagree about the
   same fact, look for the single function they both call before concluding you have two bugs.
+
+## The staging recipe our own guard recommends produced four unbuildable commits
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux + amux-cloud (both, independently, same night)
+CARD: AC-300
+SYMPTOM: four consecutive unpushed commits contained un-parseable Python — 3bf1470 and
+  01b5d02 (amux-cloud), 9188a9f and 10916ac (amux) — while the pre-commit hook printed
+  "Syntax checks passed" on every one. All four failures sit in the same `try` block in
+  main() and all four are the shape a `try:` takes when the hunk carrying its body was
+  trimmed out.
+COST: the four are unbuildable; bisect, checkout and cherry-pick across that window are
+  broken. Not a deploy risk (HEAD parses, a push ships the tree), and deliberately NOT
+  repaired — a history rewrite on a shared checkout is the operation most likely to
+  destroy something real. The cost is written down instead of fixed, which is the honest
+  trade and is Ethan's to overrule.
+FIX: two halves, one from each of us.
+  - The hook now checks the STAGED BLOB (`git show ":${FILE}"`), not $ROOT/$FILE. It was
+    reading the working tree, which the partial-staging mitigation deliberately leaves
+    correct — so it validated the one copy that was never in doubt. Verified by staging an
+    invalid blob with a valid worktree: pre-fix it committed clean, post-fix it is rejected.
+  - amux-cloud is replacing the recipe in the co-edit warning: `git diff` with default
+    context plus `git apply --cached --check` first, so git VERIFIES placement and refuses
+    rather than misapplying.
+NOTE: THE MITIGATION CAUSED THE DEFECT. The recipe was written into the co-edit warning to
+  stop us sweeping each other's work, and it recommends `--unidiff-zero`, which exists to
+  DISABLE context checking. With no anchor lines a trimmed patch lands at a stale offset
+  whenever the removed and kept hunks share a region — the normal case for co-edited code.
+  So the fix for one shared-checkout hazard manufactured another, and the check that would
+  have caught it was reading the file the mitigation leaves alone. Same bug from both ends,
+  which is why two sessions hit it the same night without either noticing.
+
+## A test fixture has to actually have the property being tested
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-08
+SESSION: amux + amux-cloud
+CARD: AC-300
+SYMPTOM: verifying the hook fix, amux built a "broken" Python fixture by inserting
+  `if True:` above main()'s body. That is VALID Python — the following indented lines
+  simply become the if-block. The hook passed, and the conclusion drawn was "the fix does
+  not work". amux-cloud's variant the same night: a positional probe that matched the
+  COMMENT quoting a defect instead of the code, reporting a correct fix as absent.
+COST: a working fix nearly reported as broken, twice, in opposite directions.
+FIX: use a fixture that genuinely fails first (`def broken(:` parses as a SyntaxError,
+  confirmed before staging it), and bound a positional probe's END as deliberately as its
+  start.
+NOTE: this is the sharper form of "confirm the probe could have produced a positive". That
+  rule assumes the treatment is real and asks whether the instrument can see it. This is
+  one level earlier: "I broke it" is a CLAIM TO VERIFY, not an assumption. A negative
+  control that is not actually negative makes every subsequent reading meaningless, and it
+  fails silently because everything looks like it ran.
+  Companion instance, same session, same root: `grep -c 'git show ":${FILE}"'` returned 0
+  against a line that was plainly present — BSD grep treats the `$` in `${FILE}` as an
+  anchor. `grep -F` finds it. Three over-specific probes across two sessions in one night,
+  each of which would have reported working code as missing.
