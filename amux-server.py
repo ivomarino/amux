@@ -30180,7 +30180,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .bf-chip-x:hover { opacity: 1; }
   .board-search-wrap {
     position: relative; margin-bottom: 4px;
+    display: flex; align-items: center; gap: 6px;
   }
+  .board-search-wrap .search-input { flex: 1 1 auto; min-width: 0; }
   /* The peek Board tab reuses .board-search-wrap, but its panel is a flex
      COLUMN while the global board's header is a flex ROW. The mobile rule
      below sets `flex: 1 1 100%` so the search takes a full line in that row —
@@ -30303,7 +30305,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .board-new-icon { display: none; }
   @media (max-width: 640px) {
     .board-toolbar { flex-wrap: wrap; gap: 6px; }
-    .board-search-wrap { order: 1; flex: 1 1 100% !important; min-width: 0; }
+    /* The [+ Filter | search] pair owns the full first row (AMUX-2569).
+       width:100% rather than flex-basis:100%: desktop Chromium breaks the
+       line on a percentage BASIS, real iOS WebKit does not (verified on the
+       iPhone 17 Pro sim, 2026-08-08 — same CSS, one row crammed, and the
+       driver browser at 390px looked fine, which is why phone-width driver
+       checks don't certify Safari). An explicit width wraps in both. */
+    #bf-add { font-size: 0.78rem; }
+    .board-search-wrap { order: 1; flex: 1 1 auto !important; width: 100%; min-width: 0; }
     .board-new-btn { order: 2; padding: 6px; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; }
     .board-new-label { display: none; }
     .board-new-icon { display: inline; font-size: 1.1rem; font-weight: 700; line-height: 1; }
@@ -30330,9 +30339,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     /* A collapsed column is a stub, not a screen. At 86vw the default-collapsed
        BACKLOG/TODO made the board's first paint an empty header over blank
-       space — the real columns were two swipes away. */
+       space — the real columns were two swipes away. And at a FIXED 120-136px
+       the stub truncated its own label to "B.." while wasting the rest of the
+       box on a floating Gate button and empty padding (AMUX-2569) — content-
+       size it, show the full name, and drop the controls a collapsed column
+       cannot use anyway. */
     .board-col.col-collapsed {
-      flex: 0 0 auto; min-width: 120px; max-width: 136px;
+      flex: 0 0 auto; min-width: auto; max-width: 40vw; padding: 4px 8px;
+    }
+    .board-col.col-collapsed .col-gate-btn,
+    .board-col.col-collapsed .col-del-btn { display: none; }
+    .board-col.col-collapsed .board-col-header {
+      position: static; border-bottom: none; padding-bottom: 2px; margin-bottom: 0;
     }
     /* Column header stays visible while scrolling a tall column. */
     .board-col-header { position: sticky; top: 0; z-index: 2;
@@ -30490,37 +30508,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #grp-scope-strip { margin:0 0 10px; }
   /* Groups overview (AMUX-2537) — collapsed by default so it costs nothing
      until asked for, and mobile-first: rows stack, nothing relies on hover. */
-  .grp-ov { margin:6px 0 4px; }
-  .grp-ov-head { display:flex; align-items:center; gap:7px; cursor:pointer;
-    font-size:0.74rem; color:var(--dim); padding:5px 2px; user-select:none;
-    min-height:34px; }
-  .grp-ov-head:hover .grp-ov-title { color:var(--text); }
-  .grp-ov-caret { width:9px; color:var(--dim); }
-  .grp-ov-title { font-weight:700; color:var(--text); letter-spacing:0.02em; }
-  .grp-ov-count { font-family:var(--font-mono); font-size:0.68rem; color:var(--dim);
-    border:1px solid var(--border); border-radius:8px; padding:0 6px; }
-  .grp-ov-hint { color:var(--dim); opacity:0.75; overflow:hidden;
-    text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  /* Groups tab rows (AMUX-2568). The head/hint/who classes from the old
+     overview band went with the band; rows/name/sum/links carry over. */
+  #groups-view { padding: 0 12px calc(20px + env(safe-area-inset-bottom)); }
+  .grp-ov-caret { width:9px; color:var(--dim); font-size:0.7rem; }
   .grp-ov-rows { display:flex; flex-direction:column; gap:1px;
     border:1px solid var(--border); border-radius:10px; overflow:hidden; }
-  .grp-ov-row { padding:8px 10px; background:rgba(255,255,255,0.015);
+  .grp-ov-row { padding:10px 12px; background:rgba(255,255,255,0.015);
     border-bottom:1px solid var(--border); }
   .grp-ov-row:last-child { border-bottom:none; }
+  .grp-tab-row { cursor:pointer; user-select:none; min-height:44px;
+    display:flex; flex-direction:column; justify-content:center; }
+  .grp-tab-row:hover { background:rgba(255,255,255,0.04); }
   .grp-ov-r1 { display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; }
-  .grp-ov-name { font-weight:700; font-size:0.82rem; color:var(--accent);
-    cursor:pointer; }
-  .grp-ov-name:hover { text-decoration:underline; }
+  .grp-ov-name { font-weight:700; font-size:0.82rem; color:var(--accent); }
   .grp-ov-sum { font-size:0.7rem; color:var(--dim); display:flex; gap:8px;
     flex-wrap:wrap; }
-  .grp-ov-who { font-size:0.68rem; color:var(--dim); opacity:0.8; margin-top:3px;
-    font-family:var(--font-mono); overflow:hidden; text-overflow:ellipsis;
-    white-space:nowrap; }
-  .grp-ov-links { display:flex; gap:6px; margin-top:6px; }
+  .grp-mem-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .grp-mem { display:inline-flex; align-items:center; gap:5px; font-size:0.72rem;
+    color:var(--text); border:1px solid var(--border); border-radius:12px;
+    padding:5px 10px; min-height:30px; cursor:pointer; }
+  .grp-mem:hover, .grp-mem:active { border-color:var(--accent); }
+  .grp-mem-dot { width:7px; height:7px; border-radius:50%; background:var(--dim);
+    display:inline-block; flex:0 0 auto; }
+  .grp-mem-dot.active { background:var(--green, #3fb950); }
+  .grp-mem-dot.waiting { background:#d29922; }
+  .grp-tab-empty { color:var(--dim); padding:18px 4px; font-size:0.85rem; }
+  .grp-ov-links { display:flex; gap:6px; margin-top:8px; }
   .grp-ov-link { font-size:0.68rem; color:var(--dim); cursor:pointer;
     border:1px solid var(--border); border-radius:8px; padding:3px 9px;
     min-height:26px; display:inline-flex; align-items:center; }
   .grp-ov-link:hover, .grp-ov-link:active { color:var(--accent);
     border-color:var(--accent); }
+  /* Bare per-card figures: schedules on/off and in-progress issues
+     (AMUX-2552 — "just numbers no outline"). */
+  .meta-count { color:var(--dim); font-size:0.7rem; white-space:nowrap; }
   .grp-scope-panel { border:1px solid var(--accent); border-radius:10px; padding:10px 12px;
     margin:0; background:var(--card); position:relative; }
   /* Horizontal on anything with room: identity on the left, configs taking the
@@ -30705,7 +30727,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
        started below the fold and the columns were clipped mid-word.
        Everything here buys VERTICAL SPACE back; nothing hides information. */
     .board-stats { gap: 5px; margin-bottom: 6px; padding: 0; }
-    .bstat { min-width: 0; padding: 5px 8px; border-radius: 7px; }
+    /* flex-grow so the rail fills the row edge-to-edge instead of leaving a
+       dead zone to the right of the last tile (AMUX-2569); overflow-x still
+       scrolls when they genuinely don't fit. */
+    .bstat { min-width: 0; padding: 5px 8px; border-radius: 7px; flex: 1 1 auto; }
     .bstat-v { font-size: 0.9rem; line-height: 1.1; }
     .bstat-l { font-size: 0.56rem; letter-spacing: 0.02em; }
     .bstat-prog { min-width: 104px; max-width: 132px; }
@@ -32388,6 +32413,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div class="tab-bar">
   <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Workers</span></button>
   <button id="tab-board" onclick="switchView('board')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span></button>
+  <button id="tab-groups" onclick="switchView('groups')"><span class="tab-ico">&#x2756;</span><span class="tab-lbl">Groups</span></button>
   <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
   <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
@@ -32434,7 +32460,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="active-filters" class="active-filters"></div>
 <div id="tag-filters" class="tag-filters"></div>
-<div id="grp-overview"></div>
 <div id="grp-scope-strip"></div>
 <div id="offline-banner" class="offline-banner">
   <div class="offline-banner-header">
@@ -32447,13 +32472,21 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="cards" class="cards"></div>
 <div id="archived-section"></div>
 </div>
+<div id="groups-view" style="display:none;">
+  <div id="groups-container"></div>
+</div>
 <div id="board-view" style="display:none;">
   <div class="board-toolbar">
     <div id="bf-chips" style="display:none;flex-basis:100%;order:3;flex-wrap:wrap;gap:6px;padding-top:6px;"></div>
+    <!-- #bf-add is the FIRST flex child of the wrap (AMUX-2569): as a later
+         sibling of a block-layout input it stacked underneath, burning a whole
+         toolbar row at every width. The wrap is a flex row now, so the pair
+         shares one line; the absolute search-clear stays anchored over the
+         input's right edge because the input is the last child. -->
     <div class="board-search-wrap" style="flex:1;">
+      <button class="btn" id="bf-add" onclick="_bfOpenMenu(event)" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
       <input id="board-search" class="search-input" type="text" placeholder="Search or filter: is:rotting, status:doing, -worker:none" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="boardSearchQuery=this.value;_boardActiveView='';_bfSyncHash();renderBoard()">
       <button class="search-clear" onclick="document.getElementById('board-search').value='';boardSearchQuery='';_boardActiveView='';_bfSyncHash();renderBoard()">&#x2715;</button>
-      <button class="btn" id="bf-add" onclick="_bfOpenMenu(event)" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
     </div>
     <button class="btn primary board-new-btn" onclick="openBoardAdd('todo')"><span class="board-new-label">+ New issue</span><span class="board-new-icon">+</span></button>
     <div class="board-owner-toggle">
@@ -36880,6 +36913,15 @@ let _grpCollapsed = (function() {
 // than patched into the DOM — a DOM patch would be wiped by the very next
 // guarded re-render.
 let _grpSchedCache = {};   // group -> {n, ts}
+// This worker's in-progress board issues, from the boardItems the client
+// already holds (SSE-synced) — no fetch, same derivation _grpSummary uses.
+function _cardDoingCount(name) {
+  let n = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && c.session === name && c.status === 'doing') n++;
+  });
+  return n;
+}
 function _grpMembers(g) {
   const all = (sessions || []).filter(s => !s.archived);
   return g === _GLOBAL_SCOPE ? all : all.filter(s => (s.tags || []).includes(g));
@@ -36985,14 +37027,9 @@ function render() {
   // flag, so its position depended on which worker happened to sort first and
   // it scrolled away with the list. Ethan: "the group thing should be
   // horizontal above the workers below the pills."
-  // Groups overview above the scope strip (AMUX-2537). Same only-touch-the-DOM-
-  // when-it-changes rule as the strip below: an unconditional innerHTML write
-  // every render wipes scroll position and interrupts a tap mid-gesture.
-  const ovEl = document.getElementById('grp-overview');
-  if (ovEl) {
-    const _ovWant = _grpOverviewHtml();
-    if (ovEl._want !== _ovWant) { ovEl.innerHTML = _ovWant; ovEl._want = _ovWant; }
-  }
+  // The groups overview band that lived here moved to its own tab (AMUX-2568);
+  // _renderGroupsTab self-guards on activeView, so this is free off-tab.
+  _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl) {
     if (_grpOpen) {
@@ -37133,7 +37170,7 @@ function render() {
           <div class="card-menu-item danger" onclick="event.stopPropagation();deleteSession('${s.name}')"><span class="mi">&#x2716;</span> Delete</div>
         </div>
         </div>
-        ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || !online) ? `<div class="card-header-meta">
+        ${(s.status || s.tokens || s.last_activity || s.rate_limited_until || s.credit_limited || s.sched_on || s.sched_off || !online) ? `<div class="card-header-meta">
 ${/* A lane at a limit banner is not WORKING, and a working lane is not
               limited — showing both asserts a contradiction (Ethan's screenshot:
               three lanes wearing WORKING + RATE-LIMITED at once, because a turn
@@ -37149,6 +37186,19 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
           ${s.tokens ? `<span class="token-count">${fmtTokens(s.tokens)}</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
+          ${(() => {
+            /* Bare numbers, no chips (Ethan: "just numbers no outline ...
+               conservative with real estate"). sched = active/inactive
+               schedules from the payload; doing = this worker's in-progress
+               board issues, computed from the boardItems the client already
+               holds. Successor to the counts row 09aa88e removed — this is
+               the two-figure version of it. */
+            const d = _cardDoingCount(s.name);
+            const parts = [];
+            if (s.sched_on || s.sched_off) parts.push(`${s.sched_on}/${s.sched_off} sched`);
+            if (d) parts.push(`${d} doing`);
+            return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
+          })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
         </div>` : ''}
       </div>
@@ -37763,6 +37813,7 @@ document.addEventListener('click', e => {
 const ALL_TABS = [
   { id: 'sessions',      label: 'Sessions',   required: true },
   { id: 'board',         label: 'Board' },
+  { id: 'groups',        label: 'Groups' },
   { id: 'calendar',      label: 'Calendar' },
   { id: 'scheduler',     label: 'Scheduler' },
   { id: 'files',         label: 'Files' },
@@ -37796,13 +37847,25 @@ let tabOrder = (function() {
     const s = localStorage.getItem('amux_tab_order');
     if (s) {
       const saved = JSON.parse(s);
-      // Merge: keep saved order, append any new tabs not yet in saved.
+      // Merge: keep saved order; new tabs enter at their CANONICAL position
+      // (right of the nearest ALL_TABS predecessor the user already has), not
+      // appended 19th — a new top-level view stuck at the end of a long-saved
+      // order is a new view nobody finds (the Groups tab shipped invisible-
+      // at-the-front for the opposite reason: unregistered in ALL_TABS, it
+      // was skipped by the reorder entirely).
       // DEDUPE (new Set): a corrupted saved order with a repeated id — e.g.
       // 'browser' twice from an earlier reorder bug — otherwise rendered two
       // checkboxes for that tab and made hide/show behave inconsistently, and
       // re-saved itself on every reorder. Set() heals it on load.
       const all = ALL_TABS.map(t => t.id);
-      return [...new Set([...saved.filter(id => all.includes(id)), ...all.filter(id => !saved.includes(id))])];
+      const kept = saved.filter(id => all.includes(id));
+      all.forEach((id, i) => {
+        if (!kept.includes(id)) {
+          const prev = all.slice(0, i).reverse().find(p => kept.includes(p));
+          kept.splice(prev ? kept.indexOf(prev) + 1 : 0, 0, id);
+        }
+      });
+      return [...new Set(kept)];
     }
   } catch(e) {}
   return ALL_TABS.map(t => t.id);
@@ -39274,58 +39337,70 @@ function _grpScopeRehydrate() {
   }
 }
 
-// ── Groups overview (AMUX-2537) ─────────────────────────────────────────────
+// ── Groups tab (AMUX-2568, successor to the AMUX-2537 overview band) ────────
 // Every group at once, with the summary that already existed per-group and the
-// three entry points you otherwise reach only THROUGH a worker card.
+// three entry points you otherwise reach only THROUGH a worker card. Promoted
+// from a collapsible band above the workers list to a top-level tab (Ethan:
+// "instead of the group row below the group pills lets make a groups tab") —
+// the band cost every workers-view visit vertical space to answer a question
+// you only sometimes ask, which is the definition of a separate view.
 //
-// The gap this closes, from Ethan's Groups-page screenshot: _grpSummary() has
-// always computed members, active/idle split, board doing/todo and schedules —
-// but only for the ONE group you had selected, so comparing two groups meant
-// selecting each in turn and holding the first in your head. A list of pills
-// tells you groups EXIST; it does not tell you which one is busy, which is
-// idle, or which has work queued.
-//
-// Deliberately NOT the full mockup (dedicated page, sortable table, per-group
-// detail drawer). That is a bigger build and this is the part that is useful on
-// its own: same data, all groups, one glance, and a way in. Built from the
-// existing primitives rather than a new surface — the ethos rule about not
-// re-expressing a primitive under a new name applies to views too.
-let _grpOverviewOpen = localStorage.getItem('amux_grp_overview') === '1';
-function _grpOverviewToggle() {
-  _grpOverviewOpen = !_grpOverviewOpen;
-  localStorage.setItem('amux_grp_overview', _grpOverviewOpen ? '1' : '0');
-  render();
+// The row IS the expand control — no separate Expand button (Ethan's 10:39
+// screenshot: "the expand thing can be collapsed into the thing above it per
+// row per group"). Built from the existing primitives rather than a new
+// surface — _grpMembers/_grpSummary/_grpSchedFetch are the same functions the
+// scope panel reads; the ethos rule about not re-expressing a primitive under
+// a new name applies to views too.
+let _grpTabOpen = {};   // group -> expanded? (in-memory; a tab visit is a fresh look)
+function _grpTabToggle(g) {
+  _grpTabOpen[g] = !_grpTabOpen[g];
+  const el = document.getElementById('groups-container');
+  if (el) el._want = '';        // force the guarded re-render to repaint
+  _renderGroupsTab();
 }
-function _grpOverviewHtml() {
-  const groups = [...new Set((sessions || []).filter(s => !s.archived)
-                   .flatMap(s => s.tags || []))].sort();
-  if (!groups.length) return '';
-  const head = '<div class="grp-ov-head" onclick="_grpOverviewToggle()">'
-    + '<span class="grp-ov-caret">' + (_grpOverviewOpen ? '\u25BE' : '\u25B8') + '</span>'
-    + '<span class="grp-ov-title">Groups</span>'
-    + '<span class="grp-ov-count">' + groups.length + '</span>'
-    + '<span class="grp-ov-hint">' + (_grpOverviewOpen ? 'members, activity and a way in' : 'show all groups at a glance') + '</span>'
+function _renderGroupsTab() {
+  if (activeView !== 'groups') return;
+  const el = document.getElementById('groups-container');
+  if (!el) return;
+  const all = (sessions || []).filter(s => !s.archived);
+  const groups = [...new Set(all.flatMap(s => s.tags || []))].sort();
+  const grouped = new Set(all.filter(s => (s.tags || []).length).map(s => s.name));
+  const activeN = all.filter(s => s.status === 'active').length;
+  const tile = (v, l) => '<div class="bstat"><div class="bstat-v">' + v + '</div><div class="bstat-l">' + l + '</div></div>';
+  let html = '<div class="board-stats" role="group" aria-label="Groups summary">'
+    + tile(groups.length, 'groups')
+    + tile(grouped.size, 'grouped')
+    + tile(all.length - grouped.size, 'ungrouped')
+    + tile(activeN, 'active now')
     + '</div>';
-  if (!_grpOverviewOpen) return '<div class="grp-ov">' + head + '</div>';
-  const rows = groups.map(g => {
-    const m = _grpMembers(g);
-    // Name the members. "6 workers" is a number; the names are what let you
-    // recognise the group you actually meant.
-    const who = m.slice(0, 4).map(x => esc(x.name)).join(', ')
-              + (m.length > 4 ? ' +' + (m.length - 4) : '');
-    return '<div class="grp-ov-row">'
+  if (!groups.length) {
+    html += '<div class="grp-tab-empty">No groups yet. Add a worker to one from its card menu &rarr; Groups.</div>';
+  }
+  html += '<div class="grp-ov-rows">' + groups.map(g => {
+    const gj = escJs(g);
+    const open = !!_grpTabOpen[g];
+    _grpSchedFetch(g);   // cached 60s; folds in via the guarded re-render
+    let body = '';
+    if (open) {
+      const m = _grpMembers(g);
+      const dot = s => '<span class="grp-mem-dot ' + esc(s.status || 'off') + '"></span>';
+      body = '<div class="grp-mem-list">' + m.map(s =>
+          '<span class="grp-mem" onclick="event.stopPropagation();openPeek(\'' + escJs(s.name) + '\')">' + dot(s) + esc(s.name) + '</span>'
+        ).join('') + '</div>'
+        + '<div class="grp-ov-links">'
+        +   '<span class="grp-ov-link" onclick="event.stopPropagation();switchView(\'sessions\');toggleTagFilter(\'' + gj + '\')">workers</span>'
+        +   '<span class="grp-ov-link" onclick="event.stopPropagation();_grpOpenBoard(\'' + gj + '\')">board</span>'
+        +   '<span class="grp-ov-link" onclick="event.stopPropagation();switchView(\'sessions\');toggleGroupScope(\'' + gj + '\')">scope</span>'
+        + '</div>';
+    }
+    return '<div class="grp-ov-row grp-tab-row" onclick="_grpTabToggle(\'' + gj + '\')">'
       + '<div class="grp-ov-r1">'
-      +   '<span class="grp-ov-name" onclick="event.stopPropagation();toggleGroupScope(\'' + escJs(g) + '\')" title="Open this group\u2019s scope">' + esc(g) + '</span>'
+      +   '<span class="grp-ov-caret">' + (open ? '\u25BE' : '\u25B8') + '</span>'
+      +   '<span class="grp-ov-name">' + esc(g) + '</span>'
       +   '<span class="grp-ov-sum">' + (_grpSummary(g) || '') + '</span>'
-      + '</div>'
-      + '<div class="grp-ov-who">' + who + '</div>'
-      + '<div class="grp-ov-links">'
-      +   '<span class="grp-ov-link" onclick="event.stopPropagation();toggleTagFilter(\'' + escJs(g) + '\')">workers</span>'
-      +   '<span class="grp-ov-link" onclick="event.stopPropagation();_grpOpenBoard(\'' + escJs(g) + '\')">board</span>'
-      +   '<span class="grp-ov-link" onclick="event.stopPropagation();toggleGroupScope(\'' + escJs(g) + '\')">scope</span>'
-      + '</div></div>';
-  }).join('');
-  return '<div class="grp-ov">' + head + '<div class="grp-ov-rows">' + rows + '</div></div>';
+      + '</div>' + body + '</div>';
+  }).join('') + '</div>';
+  if (el._want !== html) { el.innerHTML = html; el._want = html; }
 }
 // Board at this group's scope. Compiles to the query language like every other
 // filter entry point, so the search box shows what you are looking at and the
@@ -41154,7 +41229,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.523';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.524';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -50087,17 +50162,18 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
-  const _svNames = ['sessions', 'board', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
   // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
+  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
     const te = document.getElementById('tab-' + _svNames[i]);
     if (te) te.classList.toggle('active', view === _svNames[i]);
   }
+  if (view === 'groups') { _renderGroupsTab(); fetchBoard().then(() => _renderGroupsTab()); }
   if (view === 'calendar') { fetchBoard().then(() => { _fcInit(); }); }
   if (view === 'torrents') _torrentLoad(); else _torrentStopTimer();
   if (view === 'terminal') _termInit();
@@ -57802,6 +57878,34 @@ toggleSettings = function() {
 // Deep-link: #path=/some/path (or ?path= for backwards compat)
 // Hash-based routing works in PWA mode — SW never strips fragments, no iOS query-param loss
 async function _handleDeeplink(hash) {
+  // #view=<tab> (or ?view=<tab>) — land on a top-level view directly. Rig
+  // deeplink like #peek= below: simulator verification needs to reach a TAB on
+  // real WebKit without tap automation (the Groups tab shipped with no way to
+  // open it headlessly). The query form exists because `simctl openurl` does
+  // not reliably deliver a #fragment to an already-open Safari tab — verified
+  // 2026-08-08: the reload hit the server, the hash never reached the page.
+  // The walkthrough stands down for any '='-bearing hash; ?view= is handled
+  // in its gate as well.
+  if ((!hash || hash.indexOf('=') < 0) && location.search) {
+    const m = location.search.match(/[?&]view=([^&]+)/);
+    if (m) hash = '#view=' + m[1];
+  }
+  if (hash && hash.startsWith('#view=')) {
+    const v = decodeURIComponent(hash.slice(6));
+    // Deferred like #peek= below: this runs from the early inline script,
+    // where switchView still null-derefs on #grid-view (parsed later). A bare
+    // try/catch here SWALLOWED that throw and the deeplink silently no-oped —
+    // the same half-boot trap _restoreScreen's own comment documents.
+    const tryView = (attempt) => {
+      if (document.getElementById('grid-view') && document.getElementById('tab-' + v)) {
+        try { switchView(v); } catch(e) {}
+        return;
+      }
+      if (attempt < 25) setTimeout(() => tryView(attempt + 1), 200);
+    };
+    tryView(0);
+    return;
+  }
   // #peek=<session>[&tab=<tab>] — open a session's peek directly, optionally on
   // a specific tab (shareable links; also lets headless/simulator test rigs land
   // exactly where they need to without tap automation, which is how the PWA gets
@@ -57900,8 +58004,13 @@ function _restoreScreen() {
   // defined later in the HTML than this inline script — calling it during boot
   // (setTimeout 0) null-derefs and throws. The app never calls switchView on
   // load (it relies on the hardcoded default tab), so ours is the first.
-  // Don't override an explicit file deeplink (#path=...).
-  const _hasDeeplink = location.hash && location.hash.startsWith('#path=');
+  // Don't override an explicit deeplink: a file link (#path=) or a view link
+  // (#view= / ?view=, the rig entry). The saved-tab restore silently beat the
+  // view deeplink on 2026-08-08 — the rig asked for ?view=groups, got last
+  // session's Workers tab, and the deeplink looked broken while working fine.
+  const _hasDeeplink = (location.hash && (location.hash.startsWith('#path=')
+                                          || location.hash.startsWith('#view=')))
+                     || /[?&]view=/.test(location.search);
   // 1. Restore the tab.
   if (!_hasDeeplink) {
     try {
@@ -58525,6 +58634,7 @@ async function pullFromRemote(btn) {
   setTimeout(function() {
     try { if (localStorage.getItem(WT_KEY)) return; } catch(e) {}
     if (location.hash && location.hash.indexOf('=') !== -1) return;
+    if (/[?&]view=/.test(location.search)) return;   // rig deeplink, not a first visit
     _wtShow();
   }, 1500);
 
@@ -62961,7 +63071,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.523';
+const CACHE = 'amux-v0.9.524';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
