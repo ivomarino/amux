@@ -137,3 +137,38 @@ def test_quota_eviction_never_sacrifices_the_sessions_cache():
     # Positive half: the history quota path must shed the REBUILDABLE caches.
     assert re.search(r"amux_cmd_history[\s\S]{0,900}removeItem\('amux_board_cache'\)", src), (
         "the cmd-history quota handler no longer sheds the board cache first")
+
+
+def test_no_client_assignment_to_the_dead_workers_global():
+    """CLASS INVARIANT, not a positional window (AF-10). b009f6e's vocab rename
+    produced TWO `workers = ...` assignments in client code — the offline seed
+    (caught, cb40d22) and the SSE sessions handler (missed for two days, because
+    the polling fallback that DOES write `sessions` masks it whenever SSE is
+    down: the healthier your SSE, the staler your list).
+
+    My own AMUX-2553 test could not catch the second one: it anchored on the
+    offline seed and read a 900-char window, 17,831 chars short — in the same
+    commit whose OTHER test was rewritten from a positional window to a global
+    invariant for exactly this reason. The lesson applied to one sibling and not
+    the other. This is the invariant both should have been.
+
+    Scoped to <script> blocks: the Python half legitimately uses `workers` as a
+    local (the env-export builder). In client code the only legal uses are
+    declared locals (let/const/var) — a BARE assignment is the rename bug."""
+    import re
+    blocks = re.findall(r"<script>(.*?)</script>", CLIENT, re.S)
+    assert blocks, "no script blocks found — extraction broke"
+    # The naive extractor manufactures one FALSE block: a literal <script> inside
+    # a Python string pairs with a later real tag and swallows server code
+    # between them (block 8 here starts mid-string and contains `def` — the same
+    # artifact the pre-commit JS checker has always skipped by failing it
+    # silently). Python at line-start is the tell; real client JS has none.
+    blocks = [b for b in blocks if not re.search(r"^\s*def \w+\(", b, re.M)]
+    bad = []
+    for b in blocks:
+        for m in re.finditer(r"^\s*workers\s*=[^=]", b, re.M):
+            line = b[:m.start()].count("\n") + 1
+            bad.append("block line %d: %s" % (line, m.group(0).strip()[:40]))
+    assert not bad, (
+        "bare assignment(s) to the dead `workers` global in client code — the "
+        "b009f6e rename bug is back: %s" % bad)

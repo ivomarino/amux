@@ -40792,7 +40792,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.521';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.522';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -55650,7 +55650,16 @@ function connectSSE() {
         if (j !== lastSessionsJSON) {
           const firstLoad = !lastSessionsJSON;
           lastSessionsJSON = j;
-          workers = msg.payload;
+          // `sessions`, NOT `workers` — the SECOND casualty of the b009f6e vocab
+          // rename (AF-10, found by amux-frustrations). Same undeclared-global
+          // shape as the offline seed cb40d22 fixed: the SSE payload went into a
+          // dead name, render() read stale `sessions`, and the fleet list only
+          // refreshed on reconnect or a user action. Invisible for two days
+          // because the 5s polling fallback (which DOES write `sessions`) masks
+          // it whenever SSE is down — the healthier your SSE, the staler your
+          // list. The class test now forbids any bare `workers =` assignment in
+          // client code.
+          sessions = msg.payload;
           // Quota-full store: drop the cache rather than let the throw break SSE handling
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
@@ -62590,7 +62599,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.521';
+const CACHE = 'amux-v0.9.522';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
