@@ -23187,7 +23187,22 @@ def _install_amux_commit_hook(work_dir: str) -> None:
             except Exception:
                 return
             if _AMUX_HOOK_MARKER in existing:
-                return  # already installed
+                # RECONCILE, don't just detect (AMUX-2567 family). This returned
+                # on marker-presence alone, so a FIXED template never reached any
+                # repo that already had the hook — the leading-newline trailer
+                # bug stayed live in every existing checkout after its fix
+                # shipped, verified by regenerating and re-grepping the stale
+                # printf. The pre-push installer already does full-content
+                # reconciliation; this one owns appended-snippet cases too, so
+                # it reconciles surgically: replace the known-stale stamp line
+                # wherever it appears, leave everything else alone.
+                _stale = "printf '\\nAmux-Session: %s\\n'"
+                _fresh = "printf 'Amux-Session: %s\\n'"
+                if _stale in existing:
+                    with open(hook_path, "w") as fh:
+                        fh.write(existing.replace(_stale, _fresh))
+                    os.chmod(hook_path, 0o755)
+                return  # already installed (now reconciled)
             # Foreign hook present — append our stamping logic so both run.
             snippet = (
                 "\n" + _AMUX_HOOK_MARKER + "\n"
