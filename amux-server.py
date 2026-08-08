@@ -68585,17 +68585,22 @@ class CCHandler(BaseHTTPRequestHandler):
                                 return self._json(_resp, 409)
                     # ── Gate enforcement on status transitions ──────────────────
                     # Gates bind on FORWARD transitions that assert progress or
-                    # completion: review, done, verified. They do NOT bind on
-                    # retreats or parking moves: todo, backlog, discarded, doing.
-                    # A discard does not claim the work is done — it claims the
-                    # CARD is redundant. A backlog move parks not-ready work.
-                    # Gating those forces a false ack or an unaudited bypass,
-                    # which is worse than no gate (AMUX-2539, AC-304).
-                    _GATE_EXEMPT_TARGETS = {"todo", "backlog", "discarded", "doing"}
+                    # completion. They do NOT bind on retreats or parking moves.
+                    # backlog and discarded are unconditionally exempt (neither
+                    # asserts progress). todo and doing are exempt only when the
+                    # move is a RETREAT — review->doing pulls work back, which
+                    # should not gate; todo->doing is a forward claim and SHOULD
+                    # gate (AMUX-2539, AC-304, regression fix).
+                    _ALWAYS_EXEMPT = {"backlog", "discarded"}
+                    _STATUS_RANK = {"backlog": 0, "todo": 1, "doing": 2,
+                                    "review": 3, "done": 4, "verified": 5}
                     new_status = body.get("status")
+                    _is_retreat = (_STATUS_RANK.get(new_status, 99)
+                                  < _STATUS_RANK.get(prior["status"], 0)) if prior else False
                     if (new_status is not None and prior
                             and new_status != prior["status"]
-                            and new_status not in _GATE_EXEMPT_TARGETS):
+                            and new_status not in _ALWAYS_EXEMPT
+                            and not _is_retreat):
                         # Resolve the gate against the item as it WILL be after this
                         # PATCH (session and/or card gate may change in the same call).
                         gate_item = _item_by_id(bid) or {}

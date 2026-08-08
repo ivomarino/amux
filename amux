@@ -1732,6 +1732,9 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    card's source_ref and stamps last_verified_at, so a
                                    stale trigger is detectable (is:sourcestale) instead
                                    of the card sleeping forever
+    --force "reason"               bypass a gate that cannot be satisfied honestly
+                                   (e.g. peer's dirt in a shared checkout). The reason
+                                   is recorded on the card and the bypass is audited.
   e.g.  amux board review AC-12 --checked "Findings written up" "Ready for eyes"
 
   amux board import gh:owner/repo#N [--workspace W] [--project P]
