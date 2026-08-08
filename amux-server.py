@@ -22113,10 +22113,36 @@ def main():
                      "MORE than you wrote, their work is in it." % (_ns[0], _ns[1])
         except Exception:
             _n = ""
+        # RECIPE CORRECTED (AC-303). This printed `git diff -U0` + `git apply
+        # --cached`, and that pairing produced FOUR unbuildable commits on
+        # 2026-08-08 (amux-cloud 3bf1470/01b5d02, amux 9188a9f/10916ac) — all the
+        # same shape, a `try:` in main() whose body came from the hunk that was
+        # trimmed out. Zero-context hunks carry no anchor lines, so a trimmed
+        # patch lands at a stale offset precisely when the hunks you dropped share
+        # a region with the ones you kept, which is the normal case for co-edited
+        # code and therefore the only case this notice fires in.
+        #
+        # Worse than the amux-server.py copy of this text: `git apply --cached`
+        # WITHOUT --unidiff-zero on a -U0 patch is not even the working form, so
+        # this hint was never walkable as printed — a sanctioned escape that does
+        # not run is the AMUX-2325 shape, and it sends the reader off-trail to
+        # improvise the dangerous flag themselves.
+        #
+        # Default context + --check makes git VERIFY placement and refuse. The
+        # staged-blob parse is the second half and belongs in the hint rather than
+        # only in the pre-commit hook: the hook was fixed the same night to read
+        # `git show ":$FILE"` instead of the worktree, but a reader whose hook is
+        # older gets no protection at all from a hint that omits it.
         w("amux staged-guard: NOTE — %s was also edited by session '%s' %dm ago.%s\\n"
-          "  Stage only your hunks:  git diff -U0 %s > /tmp/mine.patch  "
-          "(trim to yours)  &&  git apply --cached /tmp/mine.patch\\n"
-          % (f.get("path"), f.get("owner"), mins, _n, f.get("path")))
+          "  Reconcile the count above against what you believe you wrote — that is the "
+          "check that caught this class twice.\\n"
+          "  Keep only your hunks:  git diff %s > /tmp/mine.patch  (trim to yours)  &&  "
+          "git apply --cached --check /tmp/mine.patch  &&  git apply --cached /tmp/mine.patch\\n"
+          "  Do NOT use -U0/--unidiff-zero: it disables context checking and lands hunks at "
+          "stale offsets (four unbuildable commits, 2026-08-08).\\n"
+          "  Then verify the STAGED blob, not the worktree:  git show \\":%s\\" | "
+          "python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'\\n"
+          % (f.get("path"), f.get("owner"), mins, _n, f.get("path"), f.get("path")))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
