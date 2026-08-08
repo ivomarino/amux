@@ -1282,3 +1282,24 @@ NOTE: this is the sharper form of "confirm the probe could have produced a posit
   against a line that was plainly present — BSD grep treats the `$` in `${FILE}` as an
   anchor. `grep -F` finds it. Three over-specific probes across two sessions in one night,
   each of which would have reported working code as missing.
+
+## A card-level gate fires on the PARK transition, blocking the sanctioned exit
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux
+CARD: AMUX-2539
+SYMPTOM: `amux board backlog AMUX-2482 --trigger "..."` was refused pending six
+  verification criteria (browser god-mode sign-in, walk every worker, peer review).
+  The advance nudge's own instructions name `backlog --trigger` as THE sanctioned
+  exit for not-ready work — "the state that stops BOTH guards" — and a card-level
+  gate blocks that exact move.
+COST: one bounced triage move; resolved by reassigning the three cards to the lane
+  whose seat can satisfy the gate. A lane without that option is wedged: cannot work
+  the card (gate unsatisfiable from its seat), cannot park it (gate fires), can only
+  hold it in todo where pickup re-grinds it — ethos rule 3, no truthful path.
+FIX: gates should bind on FORWARD transitions (review/done/verified), not on parking
+  moves (todo->backlog) that assert nothing about the work being done. Whoever fixes
+  it: check discarded too — a gate that blocks discard creates the same wedge one
+  column over.
