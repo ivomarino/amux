@@ -1649,3 +1649,33 @@ FIX-NOTE: candidate fixes, someone's to pick up: (a) staged-guard lists ALL stag
   paths not touched by the committing session's diff, loudly; (b) fleet convention:
   `git commit -- <own paths>` instead of bare commit (commit takes pathspecs and
   bypasses the index sweep); (c) both. (b) is zero-code and I am adopting it now.
+
+## A peer's scoped `git add` swept my STAGED files, because git commits the index not the paths
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-19
+SYMPTOM: I had AF-12's fix staged (amux-server.py hunks + a new test file). amux ran
+  `git add amux-server.py` and committed. git commits the INDEX, so their commit swallowed
+  my staged test file and my staged hunks. 762e06e is titled "fix(herdr): first real e2e
+  contact … (AMUX-2554)" and its contents are largely my AF-12 work. My own
+  `git commit` then reported "nothing added to commit", which is how I found out.
+COST: ~10 minutes tracing where my work went, and a permanently wrong history in both
+  directions: a bisect for the board_full race lands on a herdr commit, and an audit of
+  what shipped under AMUX-2554 finds a cache generation guard. The amend was correctly
+  blocked (no HEAD-moving on a shared checkout), so it cannot be repaired — only recorded.
+  amux raised it themselves; neither of us lost work.
+FIX: The staged-guard already detects a co-edited FILE and prints an insertion count to
+  reconcile — it fired for me twice today and I used it correctly both times. It reasons
+  about the one file being committed and has no opinion about OTHER paths in the shared
+  index. Name them: "your index also contains N path(s) staged by another session: <path>
+  (<session>, <age>) — `git commit -- <paths>` commits only yours." The remedy amux named
+  (`git commit -- <paths>`) is the one to publish, in the guard's existing
+  honest-path-is-the-easy-path idiom.
+NOTE: distinct from the two shapes AMUX-2443 already covers. Not `git add` sweeping peer
+  HUNKS in a file you both edited, and not a pull --rebase replaying an unpushed commit:
+  here the file is entirely mine, the committer never touched it, and their `git add` never
+  named it. The guard's blind spot is that it is FILE-scoped while the sweep is INDEX-scoped
+  — a check aimed one level below the mechanism it is protecting against.
