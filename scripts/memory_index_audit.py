@@ -8,10 +8,12 @@ unreachable, and unreachable is what a reader experiences as deleted.
 
 Two assertions, both with their denominator printed, and note they are scoped DIFFERENTLY:
 
-  A. Every pointer in this dir's index resolves FROM THIS DIR. Scoped locally on purpose: a
-     pointer the reader cannot open is unopenable regardless of what exists elsewhere. This is
-     the assertion that found the severe bug (a lane whose index carried 138 pointers and could
-     open 1, its files sitting one directory up).
+  A. Every pointer in this dir's index AND ARCHIVE resolves FROM THIS DIR. Scoped locally on
+     purpose: a pointer the reader cannot open is unopenable regardless of what exists elsewhere.
+     This is the assertion that found the severe bug (a lane whose index carried 138 pointers and
+     could open 1, its files sitting one directory up). It covered only MEMORY.md until 2026-08-08,
+     which left ~440 archive pointers unchecked while B counted them as coverage — the archive was
+     trusted to supply reachability without ever being audited for it.
   B. Every memory file is referenced by SOME index, anywhere. Scoped globally, and it was
      scoped locally and WRONG when first written. Files in a cwd-derived pool are shared by many
      lanes while each lane's index is written to its own projects/<slug>/memory, so "absent from
@@ -199,17 +201,50 @@ def audit(d, claims=None):
     # underlying split is still real and still worth seeing: it is a working
     # workaround, not an absence of the condition.
     hinted_dirs = re.findall(r"^>\s+-\s+`([^`]+)`", idx, re.M)
-    # Report the RAW link (what the index actually says, so the reader can find the line) but
-    # resolve the stripped PATH. Anchor-only and URL pointers carry no path and are not file claims.
-    unresolved = [(raw, p) for raw, p in file_ptrs if not os.path.exists(os.path.join(d, p))]
-    hinted = [(raw, p) for raw, p in unresolved
-              if any(os.path.exists(os.path.join(h, p)) for h in hinted_dirs)]
-    dangling = [raw for raw, p in unresolved if (raw, p) not in hinted]
+
+    # A COVERS THE ARCHIVE TOO. It did not, and that was the third reader gap in this file — found
+    # independently by creative-dna and general-canvas-apps (2026-08-08). A was scoped to MEMORY.md,
+    # so ~440 archive pointers were never resolution-checked while B counted those same pointers as
+    # coverage. An asymmetry, and in the dangerous direction: the archive was trusted to SUPPLY
+    # evidence of reachability without ever being AUDITED for it.
+    #
+    # "Keep it local" was right and is unchanged. The gap was that the archive is also local, and is
+    # also read — being read when the index has no answer is its entire purpose. creative-dna's
+    # argument, which is better than a bug report: my own comment justifying A is the argument for
+    # widening it.
+    #
+    # Measured across all project dirs when the gap was closed: 523 archive pointers had never been
+    # checked. 57 do not resolve locally, but 49 of those are openable via the index's own resolution
+    # block, so only 8 are genuinely dangling, max 3 in any one dir. Targets live in other lanes'
+    # ~/.amux/memory/, i.e. the additive-merge class documented at IN BOTH below, and it GROWS with
+    # every sync while the only assertion that could see it looked away.
+    #
+    # A MEASUREMENT NOTE THAT COST A FEATURE, kept because the mistake is more useful than the code:
+    # my first pass at these numbers used a plain exists() loop and reported 57 dangling with one dir
+    # at 31 of 31. On that figure I wrote an aggregation branch here — "31 from one merge is ONE
+    # finding, not 31" — to stop a flood. The flood was an artifact. The script's own logic applies
+    # the HINTED path, which absorbs 49 of the 57, and no dir exceeds 3. I had measured with a cruder
+    # instrument than the one I was documenting, then written the cruder number into its comments as
+    # though the script had produced it. The branch was removed: it was untested (no live input could
+    # reach it), and an aggregation that collapses individual pointers is itself a silent cap. When a
+    # tool already implements the discrimination you need, measure THROUGH it, not beside it.
+    #
+    # Report the RAW link (what the file actually says, so the reader can find the line) but resolve
+    # the stripped PATH. Anchor-only and URL pointers carry no path and are not file claims.
+    def resolve(ptrs):
+        unres = [(raw, p) for raw, p in ptrs if not os.path.exists(os.path.join(d, p))]
+        hint = [(raw, p) for raw, p in unres
+                if any(os.path.exists(os.path.join(h, p)) for h in hinted_dirs)]
+        return unres, hint, [raw for raw, p in unres if (raw, p) not in hint]
+
+    arch_file_ptrs = [(raw, p) for raw, p in pointers(arch) if p]
+    unresolved, hinted, dangling = resolve(file_ptrs)
+    arch_unresolved, arch_hinted, arch_dangling = resolve(arch_file_ptrs)
 
     # B: is each file referenced anywhere at all? Match on the pointer target, never on a
     # substring of the file — a filename can appear in prose and would read as indexed.
     idx_targets = {p for _, p in file_ptrs}
-    arch_targets = {p for _, p in pointers(arch) if p}
+    arch_targets = {p for _, p in arch_file_ptrs}
     # Which index links were anchored, so IN-BOTH can say WHICH SHAPE it found. Index-at-a-section
     # plus archive-whole-file is a different situation from both-whole-file: one lane promoted a
     # section out of a memory another lane had retired. Same contradiction, different cause, and the
@@ -223,15 +258,27 @@ def audit(d, claims=None):
     orphaned = [f for f in unref if not elsewhere[f]]
     remote = [f for f in unref if elsewhere[f]]
 
-    bad = len(dangling) + len(both) + len(orphaned)
+    bad = len(dangling) + len(arch_dangling) + len(both) + len(orphaned)
     print(f"{d}")
     print(f"  A. index pointers resolving here:   {len(file_ptrs) - len(unresolved)}/{len(file_ptrs)}"
           + (f"  (+{len(hinted)} openable via the index's own resolution block)" if hinted else "")
           + (f"  [{len(idx_ptrs) - len(file_ptrs)} non-file pointer(s) skipped]"
              if len(idx_ptrs) != len(file_ptrs) else ""))
+    print(f"  A'. archive pointers resolving here: {len(arch_file_ptrs) - len(arch_unresolved)}/{len(arch_file_ptrs)}"
+          + (f"  (+{len(arch_hinted)} openable via the resolution block)" if arch_hinted else ""))
     print(f"  B. files referenced by some index:  {len(files) - len(orphaned)}/{len(files)}")
     for f in dangling:
         print(f"     DANGLING  {f}  (this index points at a file it cannot open)")
+    # Labelled separately from the index's own dangling because MEMORY.md loads every session while
+    # the archive is read on demand — not the same urgency, and the reader needs to know which file
+    # holds the dead link. Enumerated individually, never aggregated: see the note on measurement in
+    # the A' block above for why an aggregation branch was written here and then removed.
+    for f in arch_dangling:
+        print(f"     DANGLING(archive)  {f}  (the archive points at a file it cannot open)")
+        print("                 If its name appears under ~/.amux/memory/, this is the additive merge: a")
+        print("                 lane contributed an archive line whose target memory lives in THAT lane's")
+        print("                 dir. Not fixable here — editing the shared archive undoes itself on that")
+        print("                 lane's next sync (no delete semantics).")
     for f in both:
         shape = ("index points at a SECTION of it, archive retires the WHOLE file"
                  if f in anchored else "both point at the whole file")
@@ -306,9 +353,18 @@ def self_test():
         open(os.path.join(t, "f.md"), "w").write("---\nname: f\n---\nbody\n")
         open(os.path.join(t, INDEX), "a").write("- [E](e.md) / [F second on the line](f.md) — hook\n")
         print("[self-test] two links on one index line, expect BOTH seen (no new violation):")
-        if (audit(t, all_claims([t])) or 0) != n_dang:
+        n_multi = audit(t, all_claims([t])) or 0
+        if n_multi != n_dang:
             print("  FAIL: a pointer after the first on a line is invisible — its file reads ORPHANED")
             ok = False
+
+        # ARCHIVE RESOLUTION. A dead pointer in the archive must fire, because A ignored the archive
+        # entirely until 2026-08-08 while B counted its pointers as coverage. Seeded in the ARCHIVE
+        # only, so if A ever narrows back to MEMORY.md this case is the one that catches it.
+        open(os.path.join(t, ARCHIVE), "a").write("- [Retired but gone](vanished.md) — hook\n")
+        print("[self-test] archive pointer to a MISSING file, expect it to fire:")
+        if (audit(t, all_claims([t])) or 0) <= n_multi:
+            print("  FAIL: the archive's pointers are not resolution-checked"); ok = False
     print(f"[self-test] {'PASS' if ok else 'FAIL'}")
     return ok
 
