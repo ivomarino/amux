@@ -199,3 +199,29 @@ def test_human_owned_limbo_cards_are_surfaced_not_swept(srv):
     st = srv.get_db().execute("SELECT status, archived FROM issues WHERE id='H-1'").fetchone()
     assert st[0] == "todo" and st[1] == 1, (
         "a human-owned card was mutated by the surfacing pass: %s" % (tuple(st),))
+
+
+def test_an_expired_rate_limit_is_not_reported(srv):
+    """AMUX-2566 (Ethan: "some are just workers I haven't touched in a long time").
+
+    The stored limit flag cleared only on ACTIVITY EVIDENCE in the pane, which an
+    untouched worker never produces — so the flag outlived its own reset time
+    indefinitely, and card badges rendering on truthiness kept the lane dressed as
+    rate-limited for days. A rate limit is a claim about TIME; the payload now
+    gates it on the clock at the one choke point every render site reads."""
+    import time as _t
+    (Path(srv.CC_SESSIONS) / "rlprobe.env").write_text("CC_DIR=/tmp\n")
+    srv._session_auto_actions["rlprobe"] = {
+        "rate_limit_reset_at": _t.time() - 3600, "rate_limit_weekly": True}
+    s = [x for x in srv.list_sessions() if x["name"] == "rlprobe"][0]
+    assert s["rate_limited_until"] == 0, (
+        "an hour-expired limit is still reported — untouched workers stay badged "
+        "(AMUX-2566): %r" % s["rate_limited_until"])
+    assert s["rate_limit_weekly"] is False
+
+    # Counter-case: a GENUINE future limit must still be reported, or the fix
+    # "cures" the false badge by killing the true one.
+    fut = _t.time() + 3600
+    srv._session_auto_actions["rlprobe"]["rate_limit_reset_at"] = fut
+    s = [x for x in srv.list_sessions() if x["name"] == "rlprobe"][0]
+    assert s["rate_limited_until"] == fut and s["rate_limit_weekly"] is True

@@ -6823,6 +6823,21 @@ def _rate_limit_auto_respond():
             # 'active', so this clear never fired. A running spinner line or
             # a ⏺/● turn marker in the live tail is proof of generation
             # regardless of what the classifier makes of the whole frame).
+            # EXPIRY CLEARS TOO, not only activity (AMUX-2566). This branch was
+            # the ONLY clear, and it requires generation evidence in the pane —
+            # which an untouched worker never produces, so a limit flag outlived
+            # its reset by days and the lane stayed badged. The reset time is the
+            # flag's own claim about when it stops being true; honour it. A
+            # 10-minute grace covers auto-resume racing the clock.
+            _ra_exp = existing.get("rate_limit_reset_at") if existing else None
+            if _ra_exp and time.time() > float(_ra_exp) + 600:
+                for _k in ("rate_limit_reset_at", "rate_limit_reset_at_fallback",
+                           "rate_limit_weekly", "rate_limit_banner",
+                           "rate_limit_credits", "rate_limit_model_name"):
+                    existing.pop(_k, None)
+                slog(f"[rate-limit] session={name} reset time passed — flag expired "
+                     f"(no activity needed; the clock is the authority)")
+                continue
             _tail12 = "\n".join(clean.splitlines()[-12:])
             _activity_evident = bool(
                 _detect_claude_status(raw) == "active"
@@ -19622,8 +19637,20 @@ def list_sessions() -> list:
             # Archiving kills the tmux session, so a lingering limit flag can't be
             # acted on and must not count in badges/bulk-actions/auto-resume —
             # report an archived session as unlimited (_aa is empty when archived).
-            "rate_limited_until": _aa.get("rate_limit_reset_at", 0),
-            "rate_limit_weekly": bool(_aa.get("rate_limit_weekly")),
+            # EXPIRED LIMITS ARE NOT LIMITS (AMUX-2566, Ethan: "some are just
+            # workers I haven't touched in a long time"). The stored flag is
+            # cleared only on ACTIVITY EVIDENCE in the pane — but an untouched
+            # worker never produces any, so its flag outlived its own reset time
+            # indefinitely, and several card-badge render sites show the field
+            # on truthiness rather than checking `> now` (five sites, two
+            # predicates — the drift again). A rate limit is a claim ABOUT TIME;
+            # it expires by the clock, not by the pane. Gate it here, at the one
+            # choke point every consumer reads, so no render site can disagree.
+            "rate_limited_until": (_aa.get("rate_limit_reset_at", 0)
+                                   if _aa.get("rate_limit_reset_at", 0) > time.time()
+                                   else 0),
+            "rate_limit_weekly": bool(_aa.get("rate_limit_weekly")
+                                      and _aa.get("rate_limit_reset_at", 0) > time.time()),
             # True for any menu-less usage-cap banner (weekly OR 5-hour session) —
             # these auto-resume at their reset time, no manual action needed.
             "rate_limit_banner": bool(_aa.get("rate_limit_banner")),
