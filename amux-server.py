@@ -22299,20 +22299,23 @@ _AMUX_HOOK_BODY = """#!/bin/sh
 # it does nothing.
 msg_file="$1"
 [ -n "$AMUX_SESSION" ] || exit 0
-grep -q "^Amux-Session: " "$msg_file" 2>/dev/null && exit 0
-# CONDITIONAL BLANK LINE (2026-08-08) — both unconditional forms were wrong.
-# git parses only the LAST paragraph as trailers. An unconditional leading
-# newline started a SECOND block and orphaned every trailer above it: 152 of
-# 152 hook-stamped commits in ~/Dev/mixpeek have unparseable Co-Authored-By
-# (gtm-videos' cross-tab, zero off-diagonal). NO newline glued the stamp onto
-# the last body paragraph of trailer-LESS messages — amux's own convention —
-# and parsed as nothing, which the push guard reads as an unclaimable commit.
-# Append INTO an existing trailer block; START one otherwise.
-last_line=$(grep -v '^[[:space:]]*$' "$msg_file" | tail -1)
-case "$last_line" in
-  [A-Za-z-]*": "*) printf 'Amux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file" ;;
-  *)               printf '\\nAmux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file" ;;
-esac
+# git interpret-trailers, NOT a hand-rolled append (2026-08-08, third failure
+# mode in one day). The history: an unconditional leading newline started a
+# SECOND trailer block and orphaned every trailer above it (152/152 mixpeek
+# commits, unparseable Co-Authored-By); no newline glued the stamp onto
+# trailer-LESS bodies; and the conditional case-glob that replaced them
+# matched any CONVENTIONAL-COMMIT SUBJECT ("docs(x): ..." contains ': '), so
+# a bodyless commit got the stamp glued into its subject paragraph (35c2755,
+# rendered as an untrailered '[]' in the push guard). Trailer placement has
+# comment-lines, subject-only, existing-block and dedupe cases — git ships
+# the parser that handles all four; stop reimplementing it.
+git interpret-trailers --in-place --if-exists doNothing \\
+  --trailer "Amux-Session: $AMUX_SESSION" "$msg_file" 2>/dev/null || {
+  # Ancient git without interpret-trailers: fall back to a plain paragraph
+  # append, correct for the common subject+body shape.
+  grep -q "^Amux-Session: " "$msg_file" 2>/dev/null \\
+    || printf '\\nAmux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file"
+}
 exit 0
 """
 
