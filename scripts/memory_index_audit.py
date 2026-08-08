@@ -33,6 +33,20 @@ MEMORY.preamble-backup.md and amux.md, the latter opening "CLAUDE-TAG-MEM-MARKER
 amux-tagged lanes". Neither is a memory. Without the exclusion this reports a defect on a clean
 directory, which is how a good check gets switched off by the second person who runs it.
 
+BEFORE YOU BULK-ACT ON THIS TOOL'S OUTPUT, RE-RUN IT. general-canvas-apps' lesson from using it
+(2026-08-08), and the most transferable thing in its history: mid-way through a 151-file indexing pass
+they appended a file to the archive because it appeared in the orphan list, and it was in that list
+only because of the fragment bug below. It had been correctly indexed all along, so the batch
+MANUFACTURED the IN-BOTH contradiction the tool then reported. Nobody was careless — the input was
+wrong and the action was faithful to it.
+
+The general shape: when someone bulk-acts on a detector's output, a defect in the detector becomes
+THEIR defect at the scale of the batch. A one-file bug cost one bad edit here; the same bug spread
+across a class would have cost 151. So a detector aimed at bulk remediation owes its users a way to
+check itself cheaply, which is what --self-test is for, and the batch owes the detector one fresh run
+before it writes. Two reader bugs have been found in this file so far and both made correct markdown
+look broken, so treat "the index is wrong" as the less likely explanation until the reader is proven.
+
 Usage:
   memory_index_audit.py                 # audit every project memory dir
   memory_index_audit.py --dir <path>    # audit one
@@ -46,14 +60,44 @@ import re
 import sys
 import tempfile
 
-PTR = re.compile(r"^- \[[^\]]+\]\(([^)]+)\)", re.M)
+LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 INDEX, ARCHIVE = "MEMORY.md", "memory-archive.md"
 SKIP_NAMES = {INDEX, ARCHIVE, "MEMORY.preamble-backup.md"}
 SKIP_HEADER = "CLAUDE-TAG-MEM-MARKER"
 
 
 def pointers(text):
-    """[(raw_link, file_path)] for each index pointer, fragment stripped.
+    """[(raw_link, file_path)] for EVERY link on EVERY index line, fragment stripped.
+
+    TWO reader bugs lived here, both the same mistake: my model of an index line was narrower than
+    the format, so correct markdown read as broken. Both were found by general-canvas-apps
+    (2026-08-08) while bulk-indexing orphans, and in both cases they declined to edit the index to
+    satisfy the tool — right call, the index was correct and the reader was wrong.
+
+    ONE POINTER PER LINE. The old pattern was anchored (`^- \\[...\\]\\((...)\\)` with re.M), so
+    findall matched once per LINE and then moved to the next line, never the next link. A deliberate
+    two-memory entry —
+        - [Artifacts have producers](a.md) / [check the WRITER](b.md) — hook
+    — hid b.md completely, and b.md then read as referenced by nobody. All three of their remaining
+    violations were this shape, every one a link #2 of 2.
+
+    ANCHORS. `foo.md#retention` is a valid pointer at a section; treating the whole string as a path
+    broke three call sites at once, and the two directions had opposite signs:
+      over-report  A reported DANGLING on correct markdown. Worse than a noisy line, because
+                   DANGLING is the SEVERE class in this script's own triage split, so a reader
+                   chases an unopenable link that opens fine.
+      UNDER-report B compared bare filenames against pointer strings, so an anchored index entry
+                   never matched and IN-BOTH could not fire. The one live instance was genuinely
+                   both live and retired and this bug HID it; it escaped ORPHANED only because the
+                   archive happened to carry an unanchored second reference, i.e. by luck.
+    The under-report is the worse half and nobody reported it, because a false negative produces no
+    output to complain about.
+
+    Both fixes are normalised HERE rather than at each call site, so a future consumer cannot forget.
+
+    Non-file targets (a bare `#section` self-link, an http(s) URL) return an empty path and are
+    dropped by both assertions — they make no claim about a local file. Zero instances of either
+    exist today; handled because they are the same cry-wolf shape and cost one line.
 
     A markdown anchor belongs to the LINK, not to the filename: `foo.md#retention` is a valid,
     openable pointer at a section of foo.md. Treating the whole string as a path broke this in
@@ -81,9 +125,12 @@ def pointers(text):
     cost one line, not because they were observed.
     """
     out = []
-    for raw in PTR.findall(text):
-        path = "" if raw.startswith(("#", "http://", "https://")) else raw.split("#", 1)[0]
-        out.append((raw, path))
+    for line in text.splitlines():
+        if not line.lstrip().startswith("- "):
+            continue
+        for raw in LINK.findall(line):
+            path = "" if raw.startswith(("#", "http://", "https://")) else raw.split("#", 1)[0]
+            out.append((raw, path))
     return out
 
 
@@ -248,8 +295,20 @@ def self_test():
 
         open(os.path.join(t, INDEX), "a").write("- [Gone](missing.md#sec) — hook\n")
         print("[self-test] anchored pointer to a MISSING file, expect it to still fire:")
-        if (audit(t, all_claims([t])) or 0) <= n_both:
+        n_dang = audit(t, all_claims([t])) or 0
+        if n_dang <= n_both:
             print("  FAIL: stripping the fragment blinded DANGLING — the fix broke the check"); ok = False
+
+        # MULTI-LINK LINE. A deliberate two-memory entry must have BOTH links seen. The old anchored
+        # pattern matched once per line, so link #2 was invisible and its file read as ORPHANED.
+        # Both files exist and only the SECOND is at risk, so if this case regresses the count rises.
+        open(os.path.join(t, "e.md"), "w").write("---\nname: e\n---\nbody\n")
+        open(os.path.join(t, "f.md"), "w").write("---\nname: f\n---\nbody\n")
+        open(os.path.join(t, INDEX), "a").write("- [E](e.md) / [F second on the line](f.md) — hook\n")
+        print("[self-test] two links on one index line, expect BOTH seen (no new violation):")
+        if (audit(t, all_claims([t])) or 0) != n_dang:
+            print("  FAIL: a pointer after the first on a line is invisible — its file reads ORPHANED")
+            ok = False
     print(f"[self-test] {'PASS' if ok else 'FAIL'}")
     return ok
 
