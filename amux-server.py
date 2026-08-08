@@ -26796,9 +26796,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      small target into a wrong one. Every destination here is also reachable from
      the Board tab, so a missed tap costs a tap, not the route. */
   @media (max-width: 600px) {
-    .card-counts { gap: 6px; padding: 5px 0 3px; }
-    .cnt-chip, .cnt-total { position: relative; font-size: 0.72rem; }
-    .cnt-chip { padding: 2px 9px; }
+    /* ONE LINE, SCROLLED — never wrapped (Ethan's 375px screenshot). A worker
+       with a real backlog has 8-10 non-zero statuses, and wrap:wrap turned that
+       into TWO full rows of pills that pushed the task label out of view and
+       dominated the card. The row is a glance, not a table: if it costs two lines
+       it has stopped being worth its space, which is the opposite of the real
+       estate this row was added to reclaim.
+       Every count stays reachable by swiping rather than being dropped, so the
+       chips still sum to the worker's card count — hiding some would make the row
+       disagree with the board it links to. */
+    .card-counts { gap: 5px; padding: 4px 0 3px; flex-wrap: nowrap;
+      overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+      /* Fade the right edge so an off-screen chip is visibly off-screen rather
+         than absent — a scroll rail with no affordance reads as a short list. */
+      -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+      mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent); }
+    .card-counts::-webkit-scrollbar { display: none; }
+    .cnt-chip, .cnt-total { position: relative; font-size: 0.7rem; flex: 0 0 auto; }
+    .cnt-chip { padding: 2px 8px; }
+    /* Hit-area expansion is VERTICAL ONLY here. On a horizontal rail a wider hit
+       area would overlap the neighbouring chip, and on a scroller a mis-tap is
+       worse than a small target because it navigates you somewhere. */
     .cnt-chip::after, .cnt-total::after { content: ''; position: absolute;
       left: 0; right: 0; top: -6px; bottom: -6px; }
   }
@@ -40249,7 +40268,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.515';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.516';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -61986,7 +62005,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.515';
+const CACHE = 'amux-v0.9.516';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
