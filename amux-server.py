@@ -12380,8 +12380,19 @@ def _pickup_junk_reason(title: str, desc: str) -> str:
     # returned first, so the protection built for exactly this case could
     # never fire. Dormancy still beats structure (a structured tripwire is
     # still not dispatchable); it just has to actually BE one.
-    if re.search(r"^\s*\[?(probe|temp|test|probe-stale|canary|tripwire|armed watch)\b",
-                 title or "", re.I):
+    # ...and the word must END as a subject too (creative-dna's residual, found
+    # sweeping all 1,642 cards with the pre-fix pattern): `\b` matches at a
+    # hyphen, so `[test-hygiene]` fired on `test` — the fleet's own title
+    # convention is `[area] subject`, and when the area word RUNS INTO a
+    # compound it is vocabulary, not an artifact marker. The lookahead accepts
+    # ]/:/,/whitespace/EOL; the comma is load-bearing (MG-1372 is titled
+    # "[TRIPWIRE, fires on recurrence]" and is a genuine armed tripwire — a
+    # boundary without the comma would have released a true positive while
+    # closing a false one). probe-stale is ordered before probe so the longer
+    # alternative wins the match instead of failing the lookahead at its own
+    # hyphen.
+    if re.search(r"^\s*\[?(probe-stale|probe|temp|test|canary|tripwire|armed watch)"
+                 r"(?=[\s:,\]]|$)", title or "", re.I):
         return "looks like a test artifact or armed tripwire"
     _caps_heads = len(re.findall(r"^[A-Z][A-Z0-9 /'-]{3,40}:", desc or "", re.M))
     if (_caps_heads >= 2

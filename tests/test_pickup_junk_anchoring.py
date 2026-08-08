@@ -90,3 +90,37 @@ def test_mid_title_mention_loses_to_structure_even_without_heads(srv):
         "[api/collections] values failed with an impossible tripwire",
         "ROOT CAUSE: the enum drifted.\nFix merged as 7535398ac3.")
     assert why == "", why
+
+
+# ───── the word must END as a subject too (creative-dna's residual) ──────────
+
+def test_an_area_prefix_that_RUNS_INTO_a_compound_is_vocabulary(srv):
+    """BACKE-2832's exact title shape. The fleet's convention is `[area] subject`;
+    `[test-hygiene]` is a card about test hygiene, not a test artifact. `\\b` matches
+    at a hyphen, so the anchored pattern still fired on it — found by creative-dna
+    sweeping all 1,642 cards with the pre-fix pattern (23 false positives across ~10
+    lanes, 1 actively blocked: this one)."""
+    why = srv._pickup_junk_reason(
+        "[test-hygiene] retriever integration tests silently SKIPPED — stale imports "
+        "give false coverage", "no structure heads here, on purpose")
+    assert why == "", (
+        "a compound area word ([test-hygiene]) is classified as a test artifact "
+        "again: %r" % why)
+
+
+def test_the_comma_boundary_keeps_a_REAL_tripwire_firing(srv):
+    """MG-1372 is titled '[TRIPWIRE, fires on recurrence]' and is a genuine armed
+    tripwire — creative-dna verified it as a surviving true positive. A subject
+    boundary without the comma would have released it while closing BACKE-2832:
+    fixing the false positive by manufacturing a false negative, silently."""
+    why = srv._pickup_junk_reason("[TRIPWIRE, fires on recurrence] re-check demo data",
+                                  "short desc")
+    assert why == "looks like a test artifact or armed tripwire", why
+
+
+def test_probe_stale_still_matches_despite_its_own_hyphen(srv):
+    """probe-stale contains the hyphen the boundary rejects, so it must be ordered
+    BEFORE probe in the alternation — otherwise `probe` matches first, fails the
+    lookahead at the hyphen, and the whole pattern misses a genuine artifact."""
+    why = srv._pickup_junk_reason("probe-stale sweep of the fixtures", "x")
+    assert why == "looks like a test artifact or armed tripwire", why
