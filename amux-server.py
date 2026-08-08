@@ -30010,6 +30010,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
      away with the list. Out here it spans the full width at every breakpoint. */
   #grp-scope-strip:empty { display:none; }
   #grp-scope-strip { margin:0 0 10px; }
+  /* Groups overview (AMUX-2537) — collapsed by default so it costs nothing
+     until asked for, and mobile-first: rows stack, nothing relies on hover. */
+  .grp-ov { margin:6px 0 4px; }
+  .grp-ov-head { display:flex; align-items:center; gap:7px; cursor:pointer;
+    font-size:0.74rem; color:var(--dim); padding:5px 2px; user-select:none;
+    min-height:34px; }
+  .grp-ov-head:hover .grp-ov-title { color:var(--text); }
+  .grp-ov-caret { width:9px; color:var(--dim); }
+  .grp-ov-title { font-weight:700; color:var(--text); letter-spacing:0.02em; }
+  .grp-ov-count { font-family:var(--font-mono); font-size:0.68rem; color:var(--dim);
+    border:1px solid var(--border); border-radius:8px; padding:0 6px; }
+  .grp-ov-hint { color:var(--dim); opacity:0.75; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .grp-ov-rows { display:flex; flex-direction:column; gap:1px;
+    border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .grp-ov-row { padding:8px 10px; background:rgba(255,255,255,0.015);
+    border-bottom:1px solid var(--border); }
+  .grp-ov-row:last-child { border-bottom:none; }
+  .grp-ov-r1 { display:flex; align-items:baseline; gap:9px; flex-wrap:wrap; }
+  .grp-ov-name { font-weight:700; font-size:0.82rem; color:var(--accent);
+    cursor:pointer; }
+  .grp-ov-name:hover { text-decoration:underline; }
+  .grp-ov-sum { font-size:0.7rem; color:var(--dim); display:flex; gap:8px;
+    flex-wrap:wrap; }
+  .grp-ov-who { font-size:0.68rem; color:var(--dim); opacity:0.8; margin-top:3px;
+    font-family:var(--font-mono); overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; }
+  .grp-ov-links { display:flex; gap:6px; margin-top:6px; }
+  .grp-ov-link { font-size:0.68rem; color:var(--dim); cursor:pointer;
+    border:1px solid var(--border); border-radius:8px; padding:3px 9px;
+    min-height:26px; display:inline-flex; align-items:center; }
+  .grp-ov-link:hover, .grp-ov-link:active { color:var(--accent);
+    border-color:var(--accent); }
   .grp-scope-panel { border:1px solid var(--accent); border-radius:10px; padding:10px 12px;
     margin:0; background:var(--card); position:relative; }
   /* Horizontal on anything with room: identity on the left, configs taking the
@@ -31923,6 +31956,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="active-filters" class="active-filters"></div>
 <div id="tag-filters" class="tag-filters"></div>
+<div id="grp-overview"></div>
 <div id="grp-scope-strip"></div>
 <div id="offline-banner" class="offline-banner">
   <div class="offline-banner-header">
@@ -36473,6 +36507,14 @@ function render() {
   // flag, so its position depended on which worker happened to sort first and
   // it scrolled away with the list. Ethan: "the group thing should be
   // horizontal above the workers below the pills."
+  // Groups overview above the scope strip (AMUX-2537). Same only-touch-the-DOM-
+  // when-it-changes rule as the strip below: an unconditional innerHTML write
+  // every render wipes scroll position and interrupts a tap mid-gesture.
+  const ovEl = document.getElementById('grp-overview');
+  if (ovEl) {
+    const _ovWant = _grpOverviewHtml();
+    if (ovEl._want !== _ovWant) { ovEl.innerHTML = _ovWant; ovEl._want = _ovWant; }
+  }
   const stripEl = document.getElementById('grp-scope-strip');
   if (stripEl) {
     if (_grpOpen) {
@@ -38745,6 +38787,72 @@ function _grpScopeRehydrate() {
   }
 }
 
+// ── Groups overview (AMUX-2537) ─────────────────────────────────────────────
+// Every group at once, with the summary that already existed per-group and the
+// three entry points you otherwise reach only THROUGH a worker card.
+//
+// The gap this closes, from Ethan's Groups-page screenshot: _grpSummary() has
+// always computed members, active/idle split, board doing/todo and schedules —
+// but only for the ONE group you had selected, so comparing two groups meant
+// selecting each in turn and holding the first in your head. A list of pills
+// tells you groups EXIST; it does not tell you which one is busy, which is
+// idle, or which has work queued.
+//
+// Deliberately NOT the full mockup (dedicated page, sortable table, per-group
+// detail drawer). That is a bigger build and this is the part that is useful on
+// its own: same data, all groups, one glance, and a way in. Built from the
+// existing primitives rather than a new surface — the ethos rule about not
+// re-expressing a primitive under a new name applies to views too.
+let _grpOverviewOpen = localStorage.getItem('amux_grp_overview') === '1';
+function _grpOverviewToggle() {
+  _grpOverviewOpen = !_grpOverviewOpen;
+  localStorage.setItem('amux_grp_overview', _grpOverviewOpen ? '1' : '0');
+  render();
+}
+function _grpOverviewHtml() {
+  const groups = [...new Set((sessions || []).filter(s => !s.archived)
+                   .flatMap(s => s.tags || []))].sort();
+  if (!groups.length) return '';
+  const head = '<div class="grp-ov-head" onclick="_grpOverviewToggle()">'
+    + '<span class="grp-ov-caret">' + (_grpOverviewOpen ? '\u25BE' : '\u25B8') + '</span>'
+    + '<span class="grp-ov-title">Groups</span>'
+    + '<span class="grp-ov-count">' + groups.length + '</span>'
+    + '<span class="grp-ov-hint">' + (_grpOverviewOpen ? 'members, activity and a way in' : 'show all groups at a glance') + '</span>'
+    + '</div>';
+  if (!_grpOverviewOpen) return '<div class="grp-ov">' + head + '</div>';
+  const rows = groups.map(g => {
+    const m = _grpMembers(g);
+    // Name the members. "6 workers" is a number; the names are what let you
+    // recognise the group you actually meant.
+    const who = m.slice(0, 4).map(x => esc(x.name)).join(', ')
+              + (m.length > 4 ? ' +' + (m.length - 4) : '');
+    return '<div class="grp-ov-row">'
+      + '<div class="grp-ov-r1">'
+      +   '<span class="grp-ov-name" onclick="event.stopPropagation();toggleGroupScope(\'' + escJs(g) + '\')" title="Open this group\u2019s scope">' + esc(g) + '</span>'
+      +   '<span class="grp-ov-sum">' + (_grpSummary(g) || '') + '</span>'
+      + '</div>'
+      + '<div class="grp-ov-who">' + who + '</div>'
+      + '<div class="grp-ov-links">'
+      +   '<span class="grp-ov-link" onclick="event.stopPropagation();toggleTagFilter(\'' + escJs(g) + '\')">workers</span>'
+      +   '<span class="grp-ov-link" onclick="event.stopPropagation();_grpOpenBoard(\'' + escJs(g) + '\')">board</span>'
+      +   '<span class="grp-ov-link" onclick="event.stopPropagation();toggleGroupScope(\'' + escJs(g) + '\')">scope</span>'
+      + '</div></div>';
+  }).join('');
+  return '<div class="grp-ov">' + head + '<div class="grp-ov-rows">' + rows + '</div></div>';
+}
+// Board at this group's scope. Compiles to the query language like every other
+// filter entry point, so the search box shows what you are looking at and the
+// view is shareable via #bq= (same rule the filter bar follows).
+function _grpOpenBoard(g) {
+  switchView('board');
+  setTimeout(() => {
+    boardSearchQuery = 'group:' + g;
+    const inp = document.getElementById('board-search');
+    if (inp) inp.value = boardSearchQuery;
+    _boardActiveView = '';
+    _bfSyncHash(); renderBoard();
+  }, 60);
+}
 function toggleGroupScope(g) { _selectGroup(g); }
 
 let _scopeRowOpen = {};   // capability rows are CONTRACTED by default
