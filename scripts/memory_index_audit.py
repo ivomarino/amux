@@ -52,6 +52,41 @@ SKIP_NAMES = {INDEX, ARCHIVE, "MEMORY.preamble-backup.md"}
 SKIP_HEADER = "CLAUDE-TAG-MEM-MARKER"
 
 
+def pointers(text):
+    """[(raw_link, file_path)] for each index pointer, fragment stripped.
+
+    A markdown anchor belongs to the LINK, not to the filename: `foo.md#retention` is a valid,
+    openable pointer at a section of foo.md. Treating the whole string as a path broke this in
+    THREE places at once, and the two directions had opposite signs:
+
+      over-report  A reported DANGLING on a pointer that is correct markdown. Worse than a noisy
+                   line, because DANGLING is the SEVERE class in this script's own triage split,
+                   so a reader chases an unopenable link that opens fine. (Found by
+                   general-canvas-apps 2026-08-08 while indexing orphans; the pointer was another
+                   writer's line and correct — the defect was in the reader.)
+      UNDER-report B compares bare filenames against pointer strings, so an anchored index entry
+                   never matched and IN-BOTH could not fire. The one live instance
+                   (a-zero-means-the-token-is-absent-not-the-thing.md, indexed at #retention and
+                   archived whole) was genuinely simultaneously live and retired, and this bug
+                   HID it. It also escaped ORPHANED only because the archive happened to carry an
+                   unanchored second reference — luck, not correctness.
+
+    The under-report is the worse half and nobody reported it, because a false negative produces
+    no output to complain about. Normalising at extraction is what makes it structural: every
+    consumer of a pointer gets the same path, rather than three call sites each remembering to strip.
+
+    Non-file targets (a bare `#section` self-link, or an http(s) URL) are returned with an empty
+    path and dropped by both assertions — they make no claim about a local file. Zero instances of
+    either exist today across all projects; handled because they are the same cry-wolf shape and
+    cost one line, not because they were observed.
+    """
+    out = []
+    for raw in PTR.findall(text):
+        path = "" if raw.startswith(("#", "http://", "https://")) else raw.split("#", 1)[0]
+        out.append((raw, path))
+    return out
+
+
 def read(p):
     try:
         with open(p, encoding="utf-8", errors="replace") as fh:
@@ -84,7 +119,8 @@ def all_claims(dirs):
     claims = {}
     for d in dirs:
         proj = os.path.basename(os.path.dirname(d))
-        for t in set(PTR.findall(read(os.path.join(d, INDEX)))) | set(PTR.findall(read(os.path.join(d, ARCHIVE)))):
+        paths = {p for _, p in pointers(read(os.path.join(d, INDEX))) + pointers(read(os.path.join(d, ARCHIVE))) if p}
+        for t in paths:
             claims.setdefault(os.path.basename(t), set()).add(proj)
     return claims
 
@@ -100,7 +136,8 @@ def audit(d, claims=None):
     # A: pointers resolve FROM WHERE THE INDEX LIVES. Correctly scoped to this dir — a pointer
     # the reader cannot open is unopenable no matter what exists elsewhere. This is the
     # assertion that found the severe bug; keep it local.
-    ptrs = PTR.findall(idx)
+    idx_ptrs = pointers(idx)
+    file_ptrs = [(raw, p) for raw, p in idx_ptrs if p]  # only these claim a local file
     # A pointer that does not resolve LOCALLY but does resolve at a path the index
     # itself publishes is not the bug this assertion exists to catch. amux now
     # writes a resolution block at generation time (AMUX-2446):
@@ -115,14 +152,22 @@ def audit(d, claims=None):
     # underlying split is still real and still worth seeing: it is a working
     # workaround, not an absence of the condition.
     hinted_dirs = re.findall(r"^>\s+-\s+`([^`]+)`", idx, re.M)
-    unresolved = [p for p in ptrs if not os.path.exists(os.path.join(d, p))]
-    hinted = [p for p in unresolved
+    # Report the RAW link (what the index actually says, so the reader can find the line) but
+    # resolve the stripped PATH. Anchor-only and URL pointers carry no path and are not file claims.
+    unresolved = [(raw, p) for raw, p in file_ptrs if not os.path.exists(os.path.join(d, p))]
+    hinted = [(raw, p) for raw, p in unresolved
               if any(os.path.exists(os.path.join(h, p)) for h in hinted_dirs)]
-    dangling = [p for p in unresolved if p not in hinted]
+    dangling = [raw for raw, p in unresolved if (raw, p) not in hinted]
 
     # B: is each file referenced anywhere at all? Match on the pointer target, never on a
     # substring of the file — a filename can appear in prose and would read as indexed.
-    idx_targets, arch_targets = set(ptrs), set(PTR.findall(arch))
+    idx_targets = {p for _, p in file_ptrs}
+    arch_targets = {p for _, p in pointers(arch) if p}
+    # Which index links were anchored, so IN-BOTH can say WHICH SHAPE it found. Index-at-a-section
+    # plus archive-whole-file is a different situation from both-whole-file: one lane promoted a
+    # section out of a memory another lane had retired. Same contradiction, different cause, and the
+    # triager should not have to open two files to tell them apart.
+    anchored = {p for raw, p in file_ptrs if "#" in raw}
     both = [f for f in files if f in idx_targets and f in arch_targets]
     unref = [f for f in files if f not in idx_targets and f not in arch_targets]
     if claims is None:
@@ -133,13 +178,17 @@ def audit(d, claims=None):
 
     bad = len(dangling) + len(both) + len(orphaned)
     print(f"{d}")
-    print(f"  A. index pointers resolving here:   {len(ptrs) - len(unresolved)}/{len(ptrs)}"
-          + (f"  (+{len(hinted)} openable via the index's own resolution block)" if hinted else ""))
+    print(f"  A. index pointers resolving here:   {len(file_ptrs) - len(unresolved)}/{len(file_ptrs)}"
+          + (f"  (+{len(hinted)} openable via the index's own resolution block)" if hinted else "")
+          + (f"  [{len(idx_ptrs) - len(file_ptrs)} non-file pointer(s) skipped]"
+             if len(idx_ptrs) != len(file_ptrs) else ""))
     print(f"  B. files referenced by some index:  {len(files) - len(orphaned)}/{len(files)}")
     for f in dangling:
         print(f"     DANGLING  {f}  (this index points at a file it cannot open)")
     for f in both:
-        print(f"     IN BOTH   {f}  (simultaneously live and retired)")
+        shape = ("index points at a SECTION of it, archive retires the WHOLE file"
+                 if f in anchored else "both point at the whole file")
+        print(f"     IN BOTH   {f}  (simultaneously live and retired; {shape})")
         # Where to fix it, because the obvious edit undoes itself. The shared project archive is
         # built by a purely ADDITIVE merge (amux 5877f38: _add = lines in the LANE's
         # ~/.amux/memory/<lane>.archive.md not already present). There is no delete semantics, so a
@@ -183,8 +232,24 @@ def self_test():
         # seeded: b.md in BOTH -> must fire
         open(os.path.join(t, INDEX), "a").write("- [B](b.md) — hook\n")
         print("[self-test] seeded in-both, expect >=2:")
-        if (audit(t, all_claims([t])) or 0) < 2:
+        n_both = audit(t, all_claims([t])) or 0
+        if n_both < 2:
             print("  FAIL: missed a file listed live AND retired"); ok = False
+
+        # ANCHOR CASES, both directions. Splitting on '#' fixes a false DANGLING; the way that fix
+        # goes wrong is by making DANGLING unreachable, and a detector that cannot fire passes every
+        # test. So prove the anchored-and-present case is quiet AND the anchored-and-MISSING case
+        # still fires. (Regression for general-canvas-apps' 2026-08-08 report.)
+        open(os.path.join(t, "d.md"), "w").write("---\nname: d\n---\nbody\n")
+        open(os.path.join(t, INDEX), "a").write("- [D at a section](d.md#some-heading) — hook\n")
+        print("[self-test] anchored pointer to an EXISTING file, expect no new violation:")
+        if (audit(t, all_claims([t])) or 0) != n_both:
+            print("  FAIL: cried wolf on a valid anchored link — the false positive is back"); ok = False
+
+        open(os.path.join(t, INDEX), "a").write("- [Gone](missing.md#sec) — hook\n")
+        print("[self-test] anchored pointer to a MISSING file, expect it to still fire:")
+        if (audit(t, all_claims([t])) or 0) <= n_both:
+            print("  FAIL: stripping the fragment blinded DANGLING — the fix broke the check"); ok = False
     print(f"[self-test] {'PASS' if ok else 'FAIL'}")
     return ok
 
