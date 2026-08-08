@@ -22077,7 +22077,19 @@ _AMUX_HOOK_BODY = """#!/bin/sh
 msg_file="$1"
 [ -n "$AMUX_SESSION" ] || exit 0
 grep -q "^Amux-Session: " "$msg_file" 2>/dev/null && exit 0
-printf 'Amux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file"
+# CONDITIONAL BLANK LINE (2026-08-08) — both unconditional forms were wrong.
+# git parses only the LAST paragraph as trailers. An unconditional leading
+# newline started a SECOND block and orphaned every trailer above it: 152 of
+# 152 hook-stamped commits in ~/Dev/mixpeek have unparseable Co-Authored-By
+# (gtm-videos' cross-tab, zero off-diagonal). NO newline glued the stamp onto
+# the last body paragraph of trailer-LESS messages — amux's own convention —
+# and parsed as nothing, which the push guard reads as an unclaimable commit.
+# Append INTO an existing trailer block; START one otherwise.
+last_line=$(grep -v '^[[:space:]]*$' "$msg_file" | tail -1)
+case "$last_line" in
+  [A-Za-z-]*": "*) printf 'Amux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file" ;;
+  *)               printf '\\nAmux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file" ;;
+esac
 exit 0
 """
 
@@ -23196,18 +23208,25 @@ def _install_amux_commit_hook(work_dir: str) -> None:
                 # reconciliation; this one owns appended-snippet cases too, so
                 # it reconciles surgically: replace the known-stale stamp line
                 # wherever it appears, leave everything else alone.
-                _stale = "printf '\\nAmux-Session: %s\\n'"
-                _fresh = "printf 'Amux-Session: %s\\n'"
-                if _stale in existing:
+                # Wholly-ours hook: FULL-CONTENT reconcile (the pre-push
+                # pattern) — a surgical string swap went stale the same day it
+                # shipped, when the stamp became a conditional case block.
+                if (existing.lstrip().startswith("#!/bin/sh")
+                        and "amux-session-stamp" in existing
+                        and existing != _AMUX_HOOK_BODY):
                     with open(hook_path, "w") as fh:
-                        fh.write(existing.replace(_stale, _fresh))
+                        fh.write(_AMUX_HOOK_BODY)
                     os.chmod(hook_path, 0o755)
                 return  # already installed (now reconciled)
             # Foreign hook present — append our stamping logic so both run.
             snippet = (
                 "\n" + _AMUX_HOOK_MARKER + "\n"
                 'if [ -n "$AMUX_SESSION" ] && ! grep -q "^Amux-Session: " "$1" 2>/dev/null; then\n'
-                "  printf 'Amux-Session: %s\\n' \"$AMUX_SESSION\" >> \"$1\"\n"
+                "  _ll=$(grep -v '^[[:space:]]*$' \"$1\" | tail -1)\n"
+                '  case "$_ll" in\n'
+                "    [A-Za-z-]*\": \"*) printf 'Amux-Session: %s\\n' \"$AMUX_SESSION\" >> \"$1\" ;;\n"
+                "    *) printf '\\nAmux-Session: %s\\n' \"$AMUX_SESSION\" >> \"$1\" ;;\n"
+                '  esac\n'
                 "fi\n"
             )
             with open(hook_path, "a") as fh:
