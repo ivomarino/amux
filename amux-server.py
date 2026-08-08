@@ -4920,10 +4920,19 @@ def _herdr_create_and_start(name: str, kind: str, args: list, work_dir: str,
     d2, _err_code = None, ""
     for _attempt in range(10):
         r2 = _herdr(start_args, timeout=90)
-        try:
-            _payload = json.loads(r2.stdout) if r2 and r2.stdout else None
-        except Exception:
-            _payload = None
+        # SUCCESS JSON arrives on stdout; ERROR JSON arrives on STDERR with
+        # rc=1 (herdr 0.8.0, measured — the first instrumented failure line
+        # showed rc=1 with the agent_pane_busy payload sitting in stderr while
+        # stdout was empty, which is why the stdout-only parse read every
+        # error as "no-json" and never retried the busy race).
+        _payload = None
+        for _stream in ((r2.stdout, r2.stderr) if r2 else ()):
+            try:
+                _payload = json.loads(_stream) if _stream and _stream.strip() else None
+            except Exception:
+                _payload = None
+            if _payload:
+                break
         if _payload and ((_payload.get("result") or {}).get("agent")):
             d2 = _payload
             break
