@@ -22077,7 +22077,7 @@ _AMUX_HOOK_BODY = """#!/bin/sh
 msg_file="$1"
 [ -n "$AMUX_SESSION" ] || exit 0
 grep -q "^Amux-Session: " "$msg_file" 2>/dev/null && exit 0
-printf '\\nAmux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file"
+printf 'Amux-Session: %s\\n' "$AMUX_SESSION" >> "$msg_file"
 exit 0
 """
 
@@ -22202,6 +22202,57 @@ def main():
     w("  - or ask that session to push its own commits, or\\n"
       "  - if the human explicitly asked you to ship everything:\\n"
       "      AMUX_ALLOW_FOREIGN=1 git push ...\\n\\n")
+    # NAME THE BLOCKING RUN AND ITS LANE'S LIVE STATUS (gtm-videos +
+    # creative-dna, 2026-08-08: 55 commits, 28 interleaved runs, four owners —
+    # draining needs SEQUENTIAL handoffs, and the common stall is an IDLE lane
+    # at the bottom that nothing addresses). Three cases, three actions:
+    #   owner ACTIVE    -> wait, clears itself
+    #   owner IDLE/GONE -> nudge THAT named lane (previously invisible)
+    #   untrailered     -> only a human push clears it; say so
+    # NB: this lives in _AMUX_PUSH_BODY because the hook file is GENERATED —
+    # an edit to .git/hooks/pre-push is silently clobbered on the next server
+    # restart (learned by doing exactly that; the fix in edc5e75's message
+    # was overwritten within the hour).
+    try:
+        _bottom = ordered[-1] if ordered else None
+        if _bottom and _bottom[1] != sess:
+            _bown = _bottom[1] or "(no Amux-Session trailer)"
+            _brun = 0
+            for _sha2, _who2 in reversed(ordered):
+                if (_who2 or "(no Amux-Session trailer)") != _bown:
+                    break
+                _brun += 1
+            if _bown.startswith("("):
+                w("  BLOCKING RUN: the %d commit(s) at the BOTTOM of the queue carry no\\n"
+                  "  Amux-Session trailer — NO lane can claim them, so selective pushes\\n"
+                  "  can never drain past this point. A HUMAN push clears it (this guard\\n"
+                  "  no-ops without AMUX_SESSION), or an entitled AMUX_ALLOW_FOREIGN=1,\\n"
+                  "  or re-attribute them if the author is known. Waiting will not.\\n" % _brun)
+            else:
+                _bstat = "unknown"
+                try:
+                    import json as _json, ssl as _ssl, urllib.request as _rq
+                    _ctx = _ssl.create_default_context()
+                    _ctx.check_hostname = False; _ctx.verify_mode = _ssl.CERT_NONE
+                    _rows = _json.loads(_rq.urlopen(
+                        (os.environ.get("AMUX_URL") or "https://localhost:8822")
+                        + "/api/sessions", context=_ctx, timeout=3).read())
+                    _hit = next((r for r in _rows if r.get("name") == _bown), None)
+                    _bstat = ("not a session on this machine" if _hit is None
+                              else "%s%s" % (_hit.get("status") or "stopped",
+                                             "" if _hit.get("running") else " (not running)"))
+                except Exception:
+                    _bstat = "unknown (api unreachable)"
+                w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s\\n"
+                  "  (currently: %s). Nobody above them can push until that run ships.\\n"
+                  % (_brun, _bown, _bstat))
+                if ("idle" in _bstat or "not running" in _bstat
+                        or "not a session" in _bstat or "stopped" in _bstat):
+                    w("  That lane is NOT actively working — waiting will not clear this.\\n"
+                      "  Nudge it:  amux send %s \\"your %d-commit run blocks the shared\\n"
+                      "  push queue — push yours\\"\\n" % (_bown, _brun))
+    except Exception:
+        pass
     return 1
 
 
@@ -23141,7 +23192,7 @@ def _install_amux_commit_hook(work_dir: str) -> None:
             snippet = (
                 "\n" + _AMUX_HOOK_MARKER + "\n"
                 'if [ -n "$AMUX_SESSION" ] && ! grep -q "^Amux-Session: " "$1" 2>/dev/null; then\n'
-                "  printf '\\nAmux-Session: %s\\n' \"$AMUX_SESSION\" >> \"$1\"\n"
+                "  printf 'Amux-Session: %s\\n' \"$AMUX_SESSION\" >> \"$1\"\n"
                 "fi\n"
             )
             with open(hook_path, "a") as fh:
