@@ -22749,11 +22749,33 @@ def _install_state_report_hooks() -> None:
             arr = hooks.setdefault(event, [])
             if any(_STATE_HOOK_MARKER in json.dumps(e) for e in arr):
                 continue
-            arr.append({"hooks": [{"type": "command", "command": _cmd(state, source)}]})
+            _entry = {"hooks": [{"type": "command", "command": _cmd(state, source)}]}
+            # TOOL EVENTS NEED A `matcher`; LIFECYCLE EVENTS DO NOT. Shipped
+            # without one first and the heartbeat silently never fired — the
+            # entry was written to settings.json, the file looked right, and
+            # Claude Code ignored it. Every pre-existing PostToolUse entry in
+            # that file carries a matcher; mine was the only one that did not,
+            # which is the shape a working example would have shown me if I had
+            # read one before writing rather than after it failed.
+            #
+            # Caught only because the probe recorded WHICH source last wrote the
+            # report: 79 samples across two workers, sources stop-hook and
+            # prompt-hook, tool-hook zero. A status field alone would have looked
+            # correct the whole time.
+            if event in ("PostToolUse", "PreToolUse"):
+                # ".*", NOT "*". Matchers are REGEXES — the existing entries in
+                # settings.json are "Write|Edit|MultiEdit" and "Bash" — and "*"
+                # is not a valid one ("nothing to repeat at position 0"), so it
+                # matched no tool and the heartbeat stayed silent through a
+                # second full verification run. Two shipped attempts, both
+                # looking correct in the file, both inert.
+                _entry["matcher"] = ".*"
+            arr.append(_entry)
             changed = True
         if changed:
             sp.write_text(json.dumps(cfg, indent=2) + "\n")
-            slog("[hooks] installed state-report hooks (Stop->idle, UserPromptSubmit->active)")
+            slog("[hooks] installed state-report hooks "
+                 "(Stop->idle, UserPromptSubmit->active, PostToolUse->active heartbeat)")
     except Exception as e:
         slog(f"[hooks] state-report install failed (scraper fallback still active): {e}")
 
