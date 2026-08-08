@@ -118,9 +118,29 @@ def test_the_comma_boundary_keeps_a_REAL_tripwire_firing(srv):
     assert why == "looks like a test artifact or armed tripwire", why
 
 
-def test_probe_stale_still_matches_despite_its_own_hyphen(srv):
-    """probe-stale contains the hyphen the boundary rejects, so it must be ordered
-    BEFORE probe in the alternation — otherwise `probe` matches first, fails the
-    lookahead at the hyphen, and the whole pattern misses a genuine artifact."""
+def test_probe_stale_is_a_recognised_subject(srv):
+    """probe-stale contains the very hyphen the subject boundary rejects, and must
+    still classify as an artifact.
+
+    RETITLED after creative-dna showed the original docstring taught a false
+    mechanism ("probe-stale must be ordered before probe or the lookahead misses").
+    Python's alternation BACKTRACKS: `probe` matches, the lookahead fails at the
+    hyphen, and the engine tries the remaining branches — so BOTH orderings fire,
+    measured on every probe-stale shape. The ordering is readability, not
+    correctness. The false version was in three places (commit message, source
+    comment, this docstring); a wrong mechanism that happens to produce passing
+    tests is exactly the kind that gets exported to a context where it breaks —
+    atomic groups, possessive quantifiers, or a consuming suffix, where
+    backtracking really is blocked.
+    """
     why = srv._pickup_junk_reason("probe-stale sweep of the fixtures", "x")
     assert why == "looks like a test artifact or armed tripwire", why
+    # Pin the REAL mechanism: both orderings must agree. If this ever fails, the
+    # engine semantics changed and the ordering has BECOME load-bearing — which is
+    # worth knowing loudly, not via a silently-missed artifact.
+    import re
+    for pat in (r"^\s*\[?(probe-stale|probe)(?=[\s:,\]]|$)",
+                r"^\s*\[?(probe|probe-stale)(?=[\s:,\]]|$)"):
+        assert re.search(pat, "probe-stale sweep", re.I), (
+            "alternation no longer backtracks past a failed lookahead — the "
+            "ordering now matters and the source comment is wrong again")

@@ -12388,9 +12388,14 @@ def _pickup_junk_reason(title: str, desc: str) -> str:
     # ]/:/,/whitespace/EOL; the comma is load-bearing (MG-1372 is titled
     # "[TRIPWIRE, fires on recurrence]" and is a genuine armed tripwire — a
     # boundary without the comma would have released a true positive while
-    # closing a false one). probe-stale is ordered before probe so the longer
-    # alternative wins the match instead of failing the lookahead at its own
-    # hyphen.
+    # closing a false one). probe-stale is listed before probe for READABILITY
+    # only — creative-dna measured both orderings firing on every probe-stale
+    # shape, because Python's alternation BACKTRACKS: `probe` matches, the
+    # lookahead fails at the hyphen, and the engine tries the remaining
+    # branches. The ordering would become load-bearing only where backtracking
+    # is blocked (atomic groups, possessive quantifiers) or the suffix CONSUMES
+    # instead of looking ahead — do not carry "longer first or it misses" out
+    # of this file as a rule; it is false here.
     if re.search(r"^\s*\[?(probe-stale|probe|temp|test|canary|tripwire|armed watch)"
                  r"(?=[\s:,\]]|$)", title or "", re.I):
         return "looks like a test artifact or armed tripwire"
