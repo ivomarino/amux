@@ -3667,6 +3667,14 @@ def _term_alive(tid: str) -> bool:
 _sse_cache = {
     "sessions": {"data": None, "json": "", "time": 0},
     "board": {"data": None, "json": "", "time": 0},
+    # The UNCAPPED board, for the filtered/projecting GET path (AMUX-2560).
+    # AC-291's filter-then-cap fix loaded the full board PER REQUEST — an
+    # uncapped 5k-row scan with the tags join on the hottest endpoint. Under the
+    # dashboard's normal request rate those scans stacked on SQLite until every
+    # board route hung: six threads measured queued in that branch while the
+    # peek Board sat on "Loading the board...". Same invalidation as "board"
+    # (_board_changed nulls it), so filtered answers stay write-fresh.
+    "board_full": {"data": None, "json": "", "time": 0},
 }
 _sse_cache_lock = threading.Lock()  # prevents thundering herd on cache refresh
 _SSE_CACHE_TTL = 2  # seconds
@@ -4130,8 +4138,19 @@ def _refresh_token_cache():
 # SESSION FILE HELPERS
 # ═══════════════════════════════════════════
 
+_env_file_cache: dict[str, tuple[float, dict]] = {}
+
 def parse_env_file(path: Path) -> dict:
-    """Parse a amux session .env file into a dict."""
+    """Parse a amux session .env file into a dict, cached by mtime."""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        _env_file_cache.pop(key, None)
+        return {}
+    cached = _env_file_cache.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
     data = {}
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -4148,6 +4167,7 @@ def parse_env_file(path: Path) -> dict:
         m = re.match(r"^(\w+)=(.*)$", line)
         if m:
             data[m.group(1)] = m.group(2)
+    _env_file_cache[key] = (mtime, data)
     return data
 
 
@@ -4281,12 +4301,12 @@ def _tmux_sessions_set() -> set[str]:
     source of subprocess overhead (~18ms * N calls per tick). One shared
     cache with a 3s TTL collapses all of them to at most 1 call per 3s.
     """
+    global _tmux_sessions_cache
     now = time.time()
     cached = _tmux_sessions_cache
     if now - cached[0] < _TMUX_SESSIONS_CACHE_TTL:
         return cached[1]
     with _tmux_sessions_cache_lock:
-        # Re-check after acquiring lock (another thread may have refreshed)
         if time.time() - _tmux_sessions_cache[0] < _TMUX_SESSIONS_CACHE_TTL:
             return _tmux_sessions_cache[1]
         try:
@@ -4297,7 +4317,6 @@ def _tmux_sessions_set() -> set[str]:
             result = set(r.stdout.splitlines()) if r.returncode == 0 else set()
         except Exception:
             result = set()
-        global _tmux_sessions_cache
         _tmux_sessions_cache = (time.time(), result)
         return result
 
@@ -6734,16 +6753,9 @@ def _rate_limit_auto_respond():
     for the auto-resume scheduler to pick up later.
     """
     now = time.time()
-    running_sessions = set()
-    try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            running_sessions = set(r.stdout.splitlines())
-    except Exception:
-        return  # tmux not available
+    running_sessions = _tmux_sessions_set()
+    if not running_sessions:
+        return
     for f in CC_SESSIONS.glob("*.env"):
         name = f.stem
         try:
@@ -7143,15 +7155,8 @@ def _rate_limit_auto_resume():
                  f"auto-resume disabled (mode=off)")
         return
 
-    running_sessions = set()
-    try:
-        r = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            running_sessions = set(r.stdout.splitlines())
-    except Exception:
+    running_sessions = _tmux_sessions_set()
+    if not running_sessions:
         return
 
     resumed = 0
@@ -8590,14 +8595,18 @@ def _snapshot_all_sessions_inner():
     _running_amux = sum(1 for _e in CC_SESSIONS.glob("*.env")
                         if tmux_name(_e.stem) in running_sessions)
     _hibernate_enabled = _HIBERNATE_IDLE_SECS > 0 and _running_amux >= _hib_min
+    _snap_targets = []
     for f in CC_SESSIONS.glob("*.env"):
         name = f.stem
         if _is_session_blocked(name):
             continue
         if tmux_name(name) not in running_sessions:
             continue
+        _snap_targets.append(name)
+    _snap_captures = _tmux_capture_batch(_snap_targets, 500) if _snap_targets else {}
+    for name in _snap_targets:
         try:
-            output = tmux_capture(name, 500)
+            output = _snap_captures.get(name, "")
             if not output:
                 continue
 
@@ -16555,6 +16564,26 @@ _sched_last_fire: dict = {}               # sched_id -> epoch of last fire (even
 # Recognized event types (kept deliberately generic / model-agnostic).
 SCHED_EVENT_TYPES = ("session_idle", "board")
 
+def _board_full_cached() -> list:
+    """The uncapped board, cached with write-invalidation (AMUX-2560).
+
+    One full load per write/TTL instead of one per filtered request. The lock
+    serialises the stampede: the queued requests that used to each run their own
+    full scan now wait for one rebuild and share it.
+    """
+    now = time.time()
+    _bf = _sse_cache["board_full"]
+    if _bf["data"] is not None and now - _bf["time"] < _SSE_CACHE_TTL * 5:
+        return _bf["data"]
+    with _sse_cache_lock:
+        if _bf["data"] is not None and time.time() - _bf["time"] < _SSE_CACHE_TTL * 5:
+            return _bf["data"]
+        data = _load_board(done_limit=0)
+        _bf["data"] = data
+        _bf["time"] = time.time()
+        return data
+
+
 def _board_changed():
     """Invalidate the board SSE cache and emit a closed-loop 'board' event.
     (Written without the literal cache-assignment substring so the bulk
@@ -16569,6 +16598,8 @@ def _board_changed():
     makes the next GET take the synchronous path and rebuild. TTL expiry still
     serves stale-while-revalidate, which is what keeps the multi-MB payload
     cheap for pollers; only an explicit write forces the slow path."""
+    _bf = _sse_cache["board_full"]
+    _bf["data"] = None
     _bc = _sse_cache["board"]
     _bc["time"] = 0
     _bc["data"] = None
@@ -67660,7 +67691,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     # unchanged, because that is the payload-size case this limit
                     # exists for (a 2.74MB board payload blew localStorage and
                     # took the worker list down with it, AMUX-2515).
-                    _bd = _load_board(done_limit=0)
+                    _bd = _board_full_cached()
                     _proj = _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch)
                     _kept, _term_total, _term_kept = _cap_terminal(_proj, 100)
                     return self._json(_kept, headers={
