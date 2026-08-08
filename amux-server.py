@@ -2399,6 +2399,88 @@ _bu_drivers: dict = {}          # session -> {proc, profile, udir}
 # Cleared ONLY on an explicit stop (the /api/browser/stop endpoint), never on
 # death or replacement — the whole point is to outlive the registry entry.
 _bu_driver_ever: set = set()
+
+
+def _bu_persist_ever() -> None:
+    """Mirror the had-a-driver marker into prefs so it survives a re-exec (AC-296).
+
+    In-memory state is fiction across a restart, and this process re-execs on
+    every save of amux-server.py — many times an hour on a shared checkout. So
+    the one marker whose entire job is to OUTLIVE the registry entry was itself
+    dying with it, and a session that had a live driver became indistinguishable
+    from one that never had one. _bu_eval then found no driver and no marker and
+    fell through to the browser-use CLI — a different browser process — which is
+    precisely the silent fallback AC-233 exists to forbid.
+
+    Reproduced live before fixing: after a night of restarts, an eval returned
+    {"ok": true, "result": 1, "backend": "cli"} for a session whose v3 driver I
+    had started myself. `ok: true` and a plausible result, from the wrong browser.
+    """
+    try:
+        get_db().execute(
+            "INSERT INTO prefs (key, value) VALUES ('bu_driver_ever', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(sorted(_bu_driver_ever)),))
+        get_db().commit()
+    except Exception as e:
+        try: slog(f"[browser] persist driver-ever failed: {e}")
+        except Exception: pass
+
+
+def _bu_hydrate_ever() -> None:
+    """Restore the had-a-driver markers at boot, and REAP the orphans.
+
+    Two things die differently across an execv. The marker is recoverable, so it
+    is restored. The driver PROCESS is not: execv replaces the image but does NOT
+    kill children, so the subprocess keeps running with its stdin/stdout pipes
+    held by a process that no longer exists. It cannot be talked to and it cannot
+    be closed by anything except a kill — a pure leak holding a profile store
+    open. Measured on this machine: 4 orphaned browser processes with PPID 1, the
+    oldest 24 days.
+    """
+    try:
+        row = get_db().execute(
+            "SELECT value FROM prefs WHERE key='bu_driver_ever'").fetchone()
+        if row:
+            for s in (json.loads(row["value"]) or []):
+                _bu_driver_ever.add(str(s))
+        pidrow = get_db().execute(
+            "SELECT value FROM prefs WHERE key='bu_driver_pids'").fetchone()
+        reaped = 0
+        for _sess, _pid in (json.loads(pidrow["value"]) if pidrow else {}).items():
+            try:
+                os.kill(int(_pid), 0)          # alive?
+            except Exception:
+                continue                        # already gone — nothing to reap
+            try:
+                os.kill(int(_pid), signal.SIGTERM)
+                reaped += 1
+                slog(f"[browser] reaped orphaned driver pid={_pid} from session "
+                     f"{_sess} (unreachable after re-exec, AC-296)")
+            except Exception:
+                pass
+        get_db().execute("INSERT INTO prefs (key, value) VALUES ('bu_driver_pids','{}') "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        get_db().commit()
+        if _bu_driver_ever or reaped:
+            slog(f"[browser] hydrated {len(_bu_driver_ever)} driver marker(s), "
+                 f"reaped {reaped} orphan(s)")
+    except Exception as e:
+        try: slog(f"[browser] hydrate driver-ever failed: {e}")
+        except Exception: pass
+
+
+def _bu_persist_pids() -> None:
+    """Record live driver pids so the NEXT process can reap what it cannot reach."""
+    try:
+        pids = {s: d["proc"].pid for s, d in _bu_drivers.items()
+                if d.get("proc") is not None}
+        get_db().execute(
+            "INSERT INTO prefs (key, value) VALUES ('bu_driver_pids', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(pids),))
+        get_db().commit()
+    except Exception:
+        pass
 # REGISTRY lock — guards _bu_drivers / _bu_driver_ever / _bu_session_locks only,
 # and is never held across IO. It used to guard the driver CALL as well, which
 # made it a fleet-wide serialiser: _bu_driver_call held it across subprocess
@@ -2504,6 +2586,8 @@ def _bu_driver_stop(session: str, explicit: bool = False):
             if explicit:
                 _bu_driver_ever.discard(session)
             d = _bu_drivers.pop(session, None)
+        _bu_persist_ever()
+        _bu_persist_pids()
         if not d:
             return
         _bu_driver_teardown(d)
@@ -2606,6 +2690,11 @@ def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None =
             with _bu_driver_lock:
                 _bu_drivers[session] = d
                 _bu_driver_ever.add(session)   # AC-233: survives every death path
+            # Durable now, not just in-memory (AC-296): the marker must outlive a
+            # re-exec, and the pid must be recorded so the next process can reap
+            # a driver it can no longer talk to.
+            _bu_persist_ever()
+            _bu_persist_pids()
             slog(f"[browser] v3 driver up session={session} profile={profile!r} store={udir}")
         req = dict(params or {})
         req.update(id="r", verb=verb)
@@ -75968,6 +76057,9 @@ def main():
     for _host in bind_hosts:
         for _attempt in range(10):
             try:
+    # Restore had-a-driver markers and reap drivers orphaned by the last
+    # re-exec — their pipes died with the old process image (AC-296).
+    _bu_hydrate_ever()
                 servers.append(ResilientHTTPSServer((_host, port), CCHandler))
                 break
             except OSError as e:
