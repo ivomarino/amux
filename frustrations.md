@@ -1114,3 +1114,51 @@ FIX: Persist the driver registry the way session reports already are — the eth
   alone restores the AC-233 guard: the pid may be dead after a restart, but "a driver existed
   for this session" is exactly the durable fact that turns a silent cli result into an honest
   error. Related: [[AC-233]], AC-293.
+
+## A dependency nudge fired four times at a card whose next gate is not mine to pass
+AREA: notices
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-298
+SYMPTOM: Four identical deliveries in one turn: "AC-277 is blocked by AC-294, which is YOURS.
+  Work the dependency first: drive AC-294 through its gates." AC-294 was already fixed
+  (fc72811) and moved to `review` before the second delivery. Its remaining gates are:
+  review->done needs the REVIEWER's sign-off (amux-gtm, not me), and done->verified needs the
+  fix deployed to cloud, which needs a push that ships 11 of a peer's commits and is explicitly
+  Ethan's decision. So the nudge asks its recipient for something no honest action of theirs can
+  produce, and it keeps asking.
+COST: Four interruptions, and worse, a pull toward the dishonest exit — the only way to make the
+  nudge stop is to force a gate I cannot satisfy. A nudge whose sole satisfiable response is a
+  false ack is working against the gate system it is enforcing.
+FIX: The nudge already knows the dependency's status (it names the card). Suppress it when the
+  blocker is not in an actionable state FOR THE RECIPIENT: in `review` awaiting a different
+  session's ack, or parked on an external/owner decision. Same predicate the advance nudge needs.
+  And if it must re-fire, dedupe per turn — four identical deliveries in one turn is not
+  persistence, it is the same message four times.
+
+## The dirty-file gate's published escape does not exist in the CLI
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-cloud
+CARD: AC-299
+SYMPTOM: `amux board verified AC-248` returned 409: "session has uncommitted changes; commit
+  before verifying, or pass force=true if unrelated to this task". The only dirty path was
+  amux-server.py, holding a PEER's in-flight hook work — verified by reading the diff — while
+  every change of mine was committed. So "unrelated to this task" was exactly true and force was
+  the sanctioned exit. `amux board --help` has no --force, and grepping the CLI finds none.
+  The only way to take the published exit is a hand-rolled `curl -X PATCH ... force=true`.
+COST: ~10 min, and it is AMUX-2325 recurring one gate over. That defect was "the sanctioned
+  escape is unwalkable from the audited path, so it gets walked from an unaudited one", fixed by
+  giving the CLI gate_ack. The dirty gate's escape never got the same treatment. I passed
+  X-Amux-Session on the curl so the force stayed attributed, but that is me remembering the
+  lesson, which is precisely what the fix was supposed to make unnecessary.
+FIX: `amux board <status> <id> --force "<why>"`, requiring the reason, so the audit records WHY
+  the bypass was taken and not merely that it was. On a shared checkout the common honest case —
+  a peer's uncommitted work in a file unrelated to my card — is frequent enough that it deserves
+  a first-class exit rather than a curl. Bonus: the gate could name the dirty paths' OWNER, since
+  it already computes why each path is dirty; "dirty because amux is mid-edit" answers the
+  question the message raises.
