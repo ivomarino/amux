@@ -19121,10 +19121,44 @@ def _commit_guard(name: str) -> bool:
                     f"\n\nCO-EDITED — {_paths} {'was' if len(_sh) == 1 else 'were'} also "
                     f"edited by {_who} recently, so some hunks in "
                     f"{'it' if len(_sh) == 1 else 'them'} are probably NOT yours. "
-                    f"`git add <file>` takes the whole file. Read `git diff` first and "
-                    f"stage only your hunks (`git diff -U0 <file> > /tmp/mine.patch`, trim, "
-                    f"`git apply --cached --unidiff-zero /tmp/mine.patch`). If none of it is "
-                    f"yours, leave it — say so and do not commit.")
+                    f"`git add <file>` takes the whole file. Read `git diff` first. "
+                    f"If none of it is yours, leave it — say so and do not commit. "
+                    f"To keep only your hunks: `git diff <file> > /tmp/mine.patch`, trim to "
+                    f"yours, then `git apply --cached --check /tmp/mine.patch` and only apply "
+                    f"if that passes. Do NOT use `-U0`/`--unidiff-zero`: it disables context "
+                    f"checking, so a trimmed patch lands at a stale offset when the hunks you "
+                    f"dropped share a region with the ones you kept — that produced four "
+                    f"unbuildable commits on 2026-08-08. "
+                    f"Then confirm the STAGED blob is valid, not the worktree: "
+                    f"`git show \":{_sh[0].get('path')}\" | python3 -c "
+                    f"'import ast,sys; ast.parse(sys.stdin.read())'`.")
+                # THE RECIPE THIS USED TO RECOMMEND PRODUCED FOUR UNBUILDABLE
+                # COMMITS (2026-08-08). It said `git diff -U0` + `git apply
+                # --cached --unidiff-zero`, and --unidiff-zero exists precisely to
+                # DISABLE context checking — git's own docs call it not fully
+                # safe. With zero context a trimmed patch has no anchor lines, so
+                # when the hunks you removed share a region with the hunks you
+                # kept — the normal case for co-edited code, which is the only
+                # case this warning fires in — the kept hunk lands at a stale
+                # offset. amux-cloud 3bf1470/01b5d02 and amux 9188a9f/10916ac all
+                # broke the same way: a `try:` in main() whose body came from the
+                # hunk that was trimmed out.
+                #
+                # So the mitigation caused the defect. This text was written to
+                # stop two lanes sweeping each other's work, and the pre-commit
+                # syntax check that should have caught its failure was parsing the
+                # WORKING TREE — the one file the mitigation deliberately leaves
+                # alone. Same bug from both ends, which is why two sessions walked
+                # into it on one night without either noticing.
+                #
+                # Default context + `--check` makes git VERIFY placement and
+                # REFUSE rather than misapply, and the staged-blob parse is the
+                # belt to the hook's braces (the hook now checks
+                # `git show ":$FILE"` too). Both halves are here on purpose: a
+                # recipe whose failure is only caught by a hook is a recipe that
+                # breaks for anyone whose hook is older.
+                slog(f"[commit-guard] {name}: co-edited with {_who} on {_paths} — "
+                     f"nudging WITH the contested-file warning")
                 slog(f"[commit-guard] {name}: co-edited with {_who} on {_paths} — "
                      f"nudging WITH the contested-file warning")
             # FOREIGN FILES — a peer edited it and this session did NOT (AC-300).

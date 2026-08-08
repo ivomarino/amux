@@ -91,9 +91,19 @@ def test_coedited_file_gets_a_contested_warning(guard):
         "no instruction for the case where NONE of it is the recipient's — which was the "
         "actual situation, and the nudge's own WIP-checkpoint advice would have committed "
         "a peer's known-broken intermediate")
-    assert "--unidiff-zero" in t, (
+    assert "--check" in t, (
         "no per-hunk staging recipe, so the only actionable reading is still "
         "`git add <file>`, which takes the whole file")
+    assert "--unidiff-zero" not in t or "Do NOT use" in t, (
+        "the warning recommends --unidiff-zero as the recipe again. That flag DISABLES "
+        "context checking, and recommending it here produced four unbuildable commits on "
+        "2026-08-08 (3bf1470, 01b5d02, 9188a9f, 10916ac) — a trimmed zero-context patch "
+        "lands at a stale offset exactly when the removed and kept hunks share a region, "
+        "which is the only case this warning fires in")
+    assert "ast.parse" in t, (
+        "the recipe no longer tells the reader to verify the STAGED blob. The pre-commit "
+        "hook parsed the WORKING TREE, so partial staging could commit unparseable code "
+        "with the check reporting success — do not rely on the hook alone")
 
 
 def test_all_foreign_still_does_not_nudge(guard):
