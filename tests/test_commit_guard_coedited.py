@@ -164,3 +164,28 @@ def test_shared_entries_for_files_already_dropped_are_ignored(guard):
                "shared": [{"path": "other.py", "owner": "peer", "age_secs": 30}],
                "cotenants": ["peer"]})
     assert "other.py" not in t.split("CO-EDITED")[-1] if "CO-EDITED" in t else True
+
+
+def test_unclaimed_staged_paths_get_their_own_verdict():
+    """AMUX-2443 / AF-19 residual / AC-297 — three sightings of one gap: a
+    staged path with NO edit record from ANY session fell through both the
+    shared and foreign branches and was never mentioned, which is how a peer's
+    pre-window staged file (762e06e's sweep) shipped silently. It cannot be
+    BLOCKED (no owner to defer to; possibly the committer's own pre-window
+    work) — the verdict is a loud list, present with consistent shape on every
+    return path. Drives the REAL classifier (the `guard` fixture stubs it)."""
+    spec = importlib.util.spec_from_file_location("amux_cg_unclaimed", SRC)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["amux_cg_unclaimed"] = mod
+    spec.loader.exec_module(mod)
+    mod._all_session_workdirs = lambda: {"me": "/tmp/repo", "peer": "/tmp/repo"}
+    mod._repo_root = lambda p: "/tmp/repo"
+    mod._session_recent_edit_paths = lambda s, w, firsthand_only=False: {}
+    d = mod._staged_guard_check("me", "/tmp/repo", ["ghost.py"])
+    assert "unclaimed" in d, "shape: the key must exist on the populated path"
+    assert [f["path"] for f in d["unclaimed"]] == ["ghost.py"], d
+    assert d["foreign"] == [] and d["shared"] == []
+    # Shape consistency on the cotenant-less early return too.
+    mod._all_session_workdirs = lambda: {"me": "/tmp/repo"}
+    d2 = mod._staged_guard_check("me", "/tmp/repo", ["ghost.py"])
+    assert "unclaimed" in d2 and d2["unclaimed"] == []
