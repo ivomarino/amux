@@ -24,7 +24,7 @@ anyhow = "1"
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
 rust-embed = "8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
