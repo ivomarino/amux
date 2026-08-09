@@ -216,6 +216,46 @@ impl Runtime {
             tracing::warn!(error = %e, "command pump failed this tick");
         }
 
+        // RR-0072: rate-limit recovery. A worker whose reset instant has
+        // passed returns to Idle automatically — the fleet must not stay
+        // parked on a limit that already lifted. Workers rate-limited with
+        // NO reset time stay parked until an event or a human moves them:
+        // inventing a retry time for an unknown window would be guessing
+        // (Invariant 20), and a Credit cap clears on payment, not a clock.
+        for w in &workers {
+            if let amux_core::worker::WorkerState::RateLimited { reset_at: Some(reset) } = &w.state {
+                if now >= *reset {
+                    let wid = w.id().to_string();
+                    self.store
+                        .write_async(move |conn| {
+                            let n = crate::db::queries::update_worker_state(
+                                conn,
+                                &wid,
+                                &amux_core::worker::WorkerState::Idle { since: Utc::now() },
+                                &Utc::now().to_rfc3339(),
+                            )?;
+                            Ok(WriteOutcome {
+                                applied: n > 0,
+                                events: if n > 0 {
+                                    vec![PendingEvent {
+                                        entity_type: EntityType::Worker,
+                                        entity_id: wid.clone(),
+                                        mutation: MutationKind::StatusChanged {
+                                            from: "rate_limited".into(),
+                                            to: "idle".into(),
+                                        },
+                                    }]
+                                } else {
+                                    vec![]
+                                },
+                            })
+                        })
+                        .await?;
+                    tracing::info!(worker = %w.id(), "rate limit reset passed — worker recovered");
+                }
+            }
+        }
+
         let tasks = self.load_board_tasks(&workers)?;
         let hints = BTreeMap::new();
         let attempts = BTreeMap::new();
@@ -364,7 +404,10 @@ impl Runtime {
 
     fn load_state(&self) -> anyhow::Result<(Vec<Worker>, Vec<Lease>, u64)> {
         let conn = self.store.read()?;
-        let (rows, _total) = crate::db::queries::list_workers(&conn, 10_000, 0)?;
+        // (offset, limit) — a swapped pair here silently loads ZERO workers,
+        // which the recovery test caught: name the intent.
+        let (offset, limit) = (0u64, 10_000u64);
+        let (rows, _total) = crate::db::queries::list_workers(&conn, offset, limit)?;
         let workers: Vec<Worker> = rows
             .into_iter()
             .filter_map(|row| {
@@ -1042,5 +1085,86 @@ mod pump_tests {
             "{:?}", cmd.state
         );
         assert_eq!(cmd.attempts, 1, "failure recorded for the retry budget");
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_recovery_tests {
+    use super::*;
+    use amux_core::worker::{WorkerConfig, WorkerState};
+
+    #[tokio::test]
+    async fn expired_rate_limit_recovers_to_idle_and_unexpired_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: SharedStore = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        std::mem::forget(dir);
+        let now = Utc::now();
+        let seed = |n: u128, reset: Option<DateTime<Utc>>| {
+            let id = amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, n));
+            let idc = id.clone();
+            store
+                .write(move |conn| {
+                    let row = crate::db::queries::WorkerRow::new(
+                        &idc,
+                        &WorkerConfig {
+                            display_name: format!("w{n}"),
+                            name_aliases: vec![],
+                            cwd: "/tmp".into(),
+                            provider: amux_core::provider::ProviderId("claude".into()),
+                            model: None,
+                            backend: amux_core::session::BackendId::herdr(),
+                            environment: Default::default(),
+                            permissions: vec![],
+                            group: None,
+                        },
+                        "2026-01-01T00:00:00Z",
+                    );
+                    crate::db::queries::insert_worker(conn, &row)?;
+                    crate::db::queries::update_worker_state(
+                        conn,
+                        idc.as_str(),
+                        &WorkerState::RateLimited { reset_at: reset },
+                        "2026-01-01T00:00:00Z",
+                    )?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+            id
+        };
+        let expired = seed(1, Some(now - chrono::Duration::minutes(5)));
+        let future = seed(2, Some(now + chrono::Duration::hours(1)));
+        let unknown = seed(3, None);
+
+        let rt = Runtime {
+            store: store.clone(),
+            backends: vec![],
+            tick_secs: 3,
+            heartbeat_every: 1000,
+            breaker: amux_core::circuit::FleetCircuitBreaker {
+                window_budget_tokens: u64::MAX,
+                window_secs: 3600,
+                min_progress_per_window: 0,
+                max_failures_per_window: 1000,
+            },
+            fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+            protocol: None,
+            pickup_unowned: false,
+        };
+        rt.tick_once(false).await.unwrap();
+
+        let conn = store.read().unwrap();
+        let state_of = |id: &amux_core::ids::WorkerId| -> String {
+            conn.query_row(
+                "SELECT json_extract(state,'$.state') FROM _amux_workers WHERE id = ?1",
+                rusqlite::params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state_of(&expired), "idle", "past reset -> recovered");
+        assert_eq!(state_of(&future), "rate_limited", "future reset stays parked");
+        // No reset time: stays parked — inventing a retry would be guessing
+        // (Inv 20), and Credit caps clear on payment, not clocks (AF-14).
+        assert_eq!(state_of(&unknown), "rate_limited");
     }
 }
