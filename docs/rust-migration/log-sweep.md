@@ -12,6 +12,17 @@ All queries are GET against the rust origin. `SINCE=$(( $(date +%s) - 86400 ))`.
 `total_matched` is the pre-limit count — use it for volumes; never infer volume
 from a capped `events` page (limit max 2000).
 
+**COVERAGE (changed 2026-08-09, AF-36 — read this before trusting an all-clear.)**
+The table now carries BOTH origins. It used to hold only rust-served requests, and
+on 2026-08-09 that was 1,494 rows against python's 129,940 in the same window —
+1.1% of traffic — so the sweep reported "0 5xx, 0 auth failures, no latency
+outliers" while 52 x 400, 3 x 401, 5 x 403 and a 3.3s board GET sat unseen on the
+other origin. Every sweep below was correctly specified and structurally blind.
+Discriminate with `answered_by`: `native` = rust, `python` = python origin,
+`python-proxy` = proxied through. If a sweep ever returns zero 400s across a whole
+day again, check `SELECT answered_by, COUNT(*)` before believing it — a
+single-origin result is the tell that coverage regressed.
+
 ## The five sweeps, in order
 
 1. **Errors, grouped by family.**
