@@ -12,6 +12,7 @@ pub mod schedules;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
+pub mod verify;
 pub mod workers;
 
 use crate::db::SharedStore;
@@ -38,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/board", board::routes())
         .nest("/api/workers", workers::routes())
         .nest("/api/schedules", schedules::routes())
+        .nest("/api/verify", verify::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

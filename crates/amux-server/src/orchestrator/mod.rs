@@ -8,6 +8,7 @@
 
 pub mod runtime;
 pub mod sim;
+pub mod verify;
 
 use chrono::{DateTime, Utc};
 
