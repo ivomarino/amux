@@ -76168,12 +76168,39 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                                   f" ≤ your commit "
                                                   f"{time.strftime('%H:%M', time.localtime(_cts))}")
                                 else:
-                                    _outstanding.append(
-                                        f"{_pr}: you edited it at "
-                                        f"{time.strftime('%H:%M', time.localtime(_edit)) if _edit else 'an unrecorded time'}"
-                                        + (f" and have not committed it since "
-                                           f"{time.strftime('%H:%M', time.localtime(_cts))}"
-                                           if _cts else " and have no commit of your own touching it"))
+                                    # THE PREMISE IS CONTENT, NOT CLOCKS (AC-318,
+                                    # 3 false positives in 4 firings, the third
+                                    # PERMANENT): "edited at T, not committed since"
+                                    # is reconciled the moment ANYONE's commit
+                                    # absorbs the edit (638500c took amux-cloud's
+                                    # 09:18 edit at 09:19) — the recipient's own
+                                    # commit clock then never catches up and the
+                                    # notice fires on every later peer commit to
+                                    # the file, forever. The decidable question is
+                                    # whether the path still carries uncommitted
+                                    # changes at all: clean means the edit is in
+                                    # history under whoever's sha, and there is
+                                    # nothing left to sweep.
+                                    _dirty_now = True
+                                    try:
+                                        _dirty_now = bool(subprocess.run(
+                                            ["git", "-C", _cdir, "status", "--porcelain", "--", _pr],
+                                            capture_output=True, text=True, timeout=8
+                                        ).stdout.strip())
+                                    except Exception:
+                                        pass   # cannot check -> keep speaking (fail loud)
+                                    if not _dirty_now:
+                                        _basis.append(
+                                            f"{_pr}: your {time.strftime('%H:%M', time.localtime(_edit)) if _edit else ''} "
+                                            f"edit is reconciled — the path has no uncommitted "
+                                            f"changes (a peer's commit carried it into history)")
+                                    else:
+                                        _outstanding.append(
+                                            f"{_pr}: you edited it at "
+                                            f"{time.strftime('%H:%M', time.localtime(_edit)) if _edit else 'an unrecorded time'}"
+                                            + (f" and have not committed it since "
+                                               f"{time.strftime('%H:%M', time.localtime(_cts))}"
+                                               if _cts else " and have no commit of your own touching it"))
                             # Log BOTH cases — the audit trail is why the base rate is
                             # measurable at all — but only SPEAK when it discriminates.
                             # Suppressing the routine case is the fix: it makes the
