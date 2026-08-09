@@ -1707,3 +1707,29 @@ NOTE: ethos rule 6 — the published contract and the enforced one disagree. The
   `amux` (name them)", which I satisfied and named. The refusal comes from a check the gate
   text never mentions. A card can therefore pass every criterion it publishes and still be
   refused, which is the state that makes --force feel like the honest move.
+
+## The co-edit notice asserts a git fact that was true at emission and false by delivery
+AREA: notices
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-21
+SYMPTOM: Two consecutive co-edit notices said "amux-server.py: you edited it at 18:58 and
+  have not committed it since 18:33". My commit 44bd9fe touched that file at 19:36, so the
+  sentence was false when I read it. It was TRUE when emitted — the notices fired for
+  commits at 19:06 and 19:14 — and expired before delivery.
+COST: The sentence exists to make you suspect your work was swept, and is followed by "your
+  next git commit may say nothing to commit". So a stale one sends you to audit a commit for
+  work that is not in it: `git show --stat 902e9d8` -> 8 insertions, 0 of mine. Two audits of
+  two clean commits. Small each time, but it also cannot distinguish itself from the REAL
+  case — 762e06e genuinely had swept my staged AF-12 work and carried the identical sentence.
+FIX: Re-check at delivery, exactly as c32cf8a did for the decompose nudge (AC-252) and 7504abf
+  for the three other perishable-state nudges. If the reader has committed that path since the
+  notice was queued, drop the sentence or replace it with "you have since committed it in
+  <sha>". The co-edit notice asserts perishable GIT state and was not in that sweep.
+NOTE: distinct from the already-fixed "co-edit notice asks the reader to resolve a condition
+  it is better placed to check". That was the notice ASKING; this is the notice ASSERTING
+  something that has since become false — worse, because an out-of-date question costs a
+  moment while a false statement sends you hunting a defect that does not exist. The emitter
+  is right to be conservative; over-warning about a sweep beats under-warning. Only re-check it.
