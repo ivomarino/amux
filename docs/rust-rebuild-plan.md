@@ -646,7 +646,7 @@ struct GateRejection {
 
 Phase 0 generates an OpenAPI spec from the `JsonSchema` derives. The Playwright tests
 validate against the spec. The Python server's responses are validated against the same
-spec during shadow mode (phase 11).
+spec during strangler-fig migration (phases 1-10).
 
 ### Invariant 14: Offline-first with optimistic sync
 
@@ -3871,6 +3871,30 @@ harness that will verify every subsequent phase.
    - Seed state fixtures (empty, populated, migrated, per-worker-state, per-issue-state)
    - Crawler self-test (fixture pages with intentionally hidden/nested controls)
    - Generated artifacts: `interaction-graph.json`, `interaction-coverage.json`
+10. **OpenCode provider spike** (week 1, before any other provider work):
+   - Connect to each of the four providers (Claude Code, Gemini CLI, Codex CLI,
+     Ollama) via OpenCode's structured agent protocol.
+   - For each provider, verify: session start, prompt delivery, event streaming
+     (turn start/end, progress, tool use), rate-limit detection, graceful shutdown.
+   - Record a coverage matrix:
+
+     ```
+     | Provider   | Start | Prompt | Events | Rate-limit | Shutdown | OpenCode |
+     |------------|-------|--------|--------|------------|----------|----------|
+     | Claude Code| ?     | ?      | ?      | ?          | ?        | ?        |
+     | Gemini CLI | ?     | ?      | ?      | ?          | ?        | ?        |
+     | Codex CLI  | ?     | ?      | ?      | ?          | ?        | ?        |
+     | Ollama     | ?     | ?      | ?      | ?          | ?        | ?        |
+     ```
+
+   - **Written branch**: if OpenCode coverage < 3 of 4 providers for core lifecycle
+     events (start, prompt, turn events), the terminal adapter (`TerminalAdapter`)
+     promotes from scraping-fallback to peer of `OpenCodeAdapter`. The provider
+     coverage matrix in Phase 4 gets rewritten to show which providers use which
+     adapter, and the D1 exit condition changes from "scrapers demoted to liveness
+     check" to "scrapers demoted for providers with OpenCode coverage, primary for
+     providers without."
+   - This spike determines the architecture's viability by week 1, not week 24.
 
 **Test plan**:
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
@@ -3946,7 +3970,7 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: mention delivery state machine: Queued->Delivered->Acknowledged->ActedOn (Invariant 17)
 - Unit: `Message` CRUD -- create, thread, delivery state tracking (Invariant 29)
 - Unit: `Message` addressed to group fans out to all group members (Invariant 29)
-- Unit: `WorkerCommand::Steer` wraps `DeliverMessage(MessageId)` (Invariant 29)
+- Unit: `WorkerCommand::DeliverMessage(MessageId)` delivers message to worker (Invariant 29)
 - Unit: command queue FIFO ordering within priority (Invariant 34)
 - Unit: command queue rejects at capacity with 429 (Invariant 34)
 - Unit: duplicate idempotency key returns existing result, no re-dispatch (Invariant 34)
@@ -4321,9 +4345,21 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 - Playwright: start profile, navigate, screenshot renders in dashboard
 - Playwright: file browser navigable
 
-### Phase 8: Dashboard + CLI (est. 2 weeks)
+### Phase 8: Dashboard + CLI (est. 4 weeks — re-estimated)
 
 **Goal**: extract SPA, build CLI binary, full interaction coverage infrastructure.
+
+**This phase is a rewrite, not an extraction.** The dashboard is normalized to
+EntityStore, revision-ordered application, 487+ instrumented controls, offline-first
+client state, and the full UX discovery harness. The est. 2 weeks was from before
+the UI interaction coverage (Invariant 44) and UX discovery (Invariant 46)
+requirements. Realistic estimate: 4 weeks.
+
+**Strangler-fig interaction**: before this phase, Playwright tests run against the
+Python dashboard proxied through Rust. Those tests prove API behavior and data flow,
+not Rust dashboard rendering. From Phase 8 onward, Playwright tests run against the
+native Rust-served dashboard. Phase 8 is the transition point — all Playwright tests
+must pass on both the proxied and native dashboard before the proxy is removed.
 
 1. Extract 44k-line inline SPA into `amux-dashboard/static/`
 2. `rust-embed` for compile-time inclusion
@@ -4498,15 +4534,37 @@ SQLite schema is preserved, so the DB file is directly compatible. But:
 3. **Worker config migration**: `.env` files -> validated `WorkerConfig` structs.
    Any validation failure produces a report, not a silent skip.
 
-#### Cutover sequence
+#### Cutover sequence: strangler-fig (continuous, not six-month shadow)
 
-1. **Week 1: shadow mode.** Rust server runs on port 8823 alongside Python on 8822.
-   Both read the same DB (WAL allows concurrent readers). Dashboard traffic stays on
-   Python. Automated traffic replay compares responses.
-2. **Week 2: swap.** Update launchd plist to start Rust binary on 8822. Python moves
-   to 8823 as fallback. Monitor for 48h.
-3. **Day 15: cut fallback.** If no rollback needed, stop Python server. Keep binary
-   available for 30 days.
+Rust goes on port 8822 from Phase 1 -- not Phase 11. It serves migrated route
+groups natively and proxies the rest to Python on 8823. Cutover is continuous:
+each phase migrates more routes to native Rust, shrinking the proxy surface.
+Rollback is per-route (revert to proxying), not all-or-nothing.
+
+```
+Phase 1:  /health, /api/workers, /api/sessions  → native Rust
+          everything else                        → proxy to Python:8823
+Phase 2:  + /api/board, /api/issues              → native Rust
+Phase 3:  + /api/schedules                       → native Rust
+Phase 4:  + /api/sessions/*/send, steering       → native Rust
+Phase 5:  + /api/board/*/status-request, verify  → native Rust
+Phase 6:  + /api/email, /api/cal-events, /api/crm → native Rust
+Phase 7:  + /api/browser, /api/files             → native Rust
+Phase 8:  + / (dashboard), /api/sync, SSE        → native Rust
+Phase 9:  + /api/debug, /api/metrics             → native Rust
+Phase 10: remove proxy entirely -- Python stops
+```
+
+Benefits over shadow mode:
+- The agent gets production signal on its own architecture by week 8, not week 24.
+- Each migrated route is immediately validated under real traffic.
+- A bug in the Rust board handler doesn't block email or scheduling.
+- Week-2 architectural decisions are validated in production, not deferred to a
+  single big-bang in week 24.
+
+The proxy is a simple HTTP reverse proxy in the Rust binary: unmigrated routes
+forward to `http://localhost:8823` with headers preserved. It is the first thing
+deleted, not a permanent abstraction.
 
 #### Backend migration
 
@@ -4547,22 +4605,26 @@ Backend rollback: switch any worker from herdr back to tmux by changing its
 
 | Phase | Duration | Running total |
 |---|---|---|
-| 0 - Foundation + test harness | 3 weeks | 3 weeks |
-| 1 - Workers + Orchestrator | 3 weeks | 6 weeks |
+| 0 - Foundation + test harness + OpenCode spike | 3 weeks | 3 weeks |
+| 1 - Workers + Orchestrator (Rust on 8822, proxy to Python) | 3 weeks | 6 weeks |
 | 2 - Board + dependency graph | 3 weeks | 9 weeks |
 | 3 - Scheduling | 2 weeks | 11 weeks |
 | 4 - Control plane | 2 weeks | 13 weeks |
 | 5 - Verification | 2 weeks | 15 weeks |
 | 6 - Email/Calendar/CRM | 2 weeks | 17 weeks |
 | 7 - Browser/files/misc | 2 weeks | 19 weeks |
-| 8 - Dashboard + CLI | 2 weeks | 21 weeks |
-| 9 - Observability + performance | 2 weeks | 23 weeks |
-| 10 - CI/CD pipeline | 1 week | 24 weeks |
-| 11 - Migration + go-live | 2 weeks | **26 weeks** |
+| 8 - Dashboard + CLI (rewrite, not extraction) | 4 weeks | 23 weeks |
+| 9 - Observability + performance | 2 weeks | 25 weeks |
+| 10 - CI/CD pipeline | 1 week | 26 weeks |
+| 11 - Migration + go-live (proxy removed, Python stops) | 2 weeks | **28 weeks** |
 
-~6 months. Phases 0-5 (the core: orchestrator, board, workers, verification) take 15
-weeks and produce a functionally complete system. Phases 6-7 are the integration long
-tail (parallelizable, saves ~2 weeks). Phases 8-11 are polish, testing, and cutover.
+~7 months. Phase 8 re-estimated from 2 to 4 weeks to account for the normalized
+EntityStore, 487+ instrumented controls, UX discovery harness, and the Playwright
+transition from proxied to native dashboard. Phases 0-5 (the core) take 15 weeks.
+The strangler-fig model means Rust serves production traffic from Phase 1 --
+architectural decisions are validated continuously, not in a single shadow-mode
+week at the end. Phases 6-7 are the integration long tail (parallelizable, saves
+~2 weeks). Phase 11 is cleanup: remove the proxy, stop Python, finalize migration.
 
 ## Risks
 
@@ -6051,6 +6113,21 @@ consistent with their dependencies.
     paths creates false confidence.
   Tests: crawler self-verification suite
   Verify: Implementation, Unit tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0028e — OpenCode provider spike (week 1)
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 5
+  Requirement: Connect to each of the four providers (Claude Code, Gemini CLI,
+    Codex CLI, Ollama) via OpenCode. For each, verify: session start, prompt
+    delivery, event streaming (turn start/end, progress, tool use), rate-limit
+    detection, graceful shutdown. Record a coverage matrix.
+    Written branch: if OpenCode coverage < 3 of 4 providers for core lifecycle
+    events, TerminalAdapter promotes from fallback to peer of OpenCodeAdapter.
+    Provider coverage matrix in Phase 4 gets rewritten accordingly.
+  Tests: coverage matrix committed, all four providers tested, branch decision recorded
+  Verify: Implementation, Integration tests
   Status: TODO
 
 ---
@@ -7737,33 +7814,44 @@ consistent with their dependencies.
     Offline behavior, Migration (net-new)
   Status: TODO
 
-- [ ] RR-0134 — Shadow mode: Rust on 8823 alongside Python on 8822
-  Phase: 11
-  Depends on: RR-0117 through RR-0133 (all migration + acceptance items incl. sub-IDs)
+- [ ] RR-0134 — Strangler-fig proxy: Rust on 8822, Python on 8823
+  Phase: 1
+  Depends on: RR-0029, RR-0019
   Invariant: —
-  Requirement: Both servers read same DB (WAL concurrent readers). Automated
-    traffic replay compares responses. Run for 1 week.
-  Tests: response comparison, no divergence
+  Requirement: Rust binary serves on 8822. Routes not yet implemented in Rust proxy
+    to Python on 8823 via simple HTTP reverse proxy. Headers preserved. Response
+    bodies unmodified. The proxy is the mechanism for continuous cutover, not shadow
+    validation. Each subsequent phase removes routes from the proxy as they become
+    native. Automated comparison of proxied vs direct Python responses for migrated
+    routes validates correctness during migration.
+  Tests: proxy forwards unmigrated routes, native routes served directly, response
+    comparison green for all proxied routes
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0135 — Swap: Rust on 8822, Python on 8823 as fallback
+- [ ] RR-0135 — Proxy removal: all routes native, Python stops
   Phase: 11
-  Depends on: RR-0134
+  Depends on: RR-0134, all Phase 1-10 items
   Invariant: —
-  Requirement: Update launchd plist. Monitor for 48h. Python available as fallback.
-  Tests: health check, 48h stability
-  Verify: Implementation, Persistence/restart
+  Requirement: Zero routes remain in the proxy table. Python process stops. Rust
+    serves all traffic natively. Monitor for 48h. Python binary kept available for
+    30 days as cold fallback.
+  Tests: zero proxied routes, health check, 48h stability, all Playwright green
+  Verify: Implementation, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0136 — Rollback verification
+- [ ] RR-0136 — Rollback verification (per-route and full)
   Phase: 11
   Depends on: RR-0135
   Invariant: —
-  Requirement: Stop Rust, start Python on 8822. DB compatible in both directions
-    (no destructive migrations). Any worker switches herdr -> tmux without data
-    migration or identity change.
-  Tests: rollback executed, Python serves correctly with same DB
+  Requirement: Two rollback modes:
+    1. Per-route: re-enable proxy for a specific route group, traffic flows to Python.
+    2. Full: stop Rust, start Python on 8822. DB compatible in both directions
+       (no destructive migrations). Any worker switches herdr -> tmux without data
+       migration or identity change.
+    Both modes verified with automated tests.
+  Tests: per-route rollback tested for board + worker routes, full rollback tested,
+    Python serves correctly with same DB
   Verify: Implementation, Integration tests, Persistence/restart
   Status: TODO
 
