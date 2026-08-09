@@ -192,6 +192,20 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   a published wrong conclusion: a filtered-board hang (AMUX-2562) was measured, blamed on
   a restart, and "disproved" by a re-measurement that had silently run against the FIXED
   build. The instrument was already there and nobody was routed to it.
+- **For a pre-fix specimen, use `<your-sha>^` — NEVER `HEAD~1`.** Every fix here is
+  supposed to be checked against the code it fixed (ethos rule 7), so this recipe gets
+  reached for constantly, and on a shared checkout it is wrong the moment another lane
+  commits between your commit and your check:
+  ```bash
+  git show "$(git log -1 --format=%H --author-date-order --grep='<your subject>')^:amux-server.py"
+  git show 523df63^:amux-server.py     # or just: the parent of YOUR sha, read off git log
+  ```
+  On 2026-08-09 `HEAD~1` was another lane's commit landed seconds earlier, so the "pre-fix"
+  specimen WAS the fix. The probe reported the new behaviour already present and concluded
+  the regression test was vacuous — a false verdict whose natural remedy is to rewrite a
+  correctly-discriminating test into a worse one. This is the loud-wrong probe, not the
+  silent one: it answers, and its answer looks exactly like the failure rule 7 warns about,
+  so it corroborates itself. The tell is cheap — `git log -3` and check whose sha is where.
 - **Client JS changes need `APP_VER` and the sw.js `CACHE` bumped together**, or a
   browser holding the cached script never receives the fix.
 - Always verify Python syntax after edits: `python3 -c "import ast; ast.parse(open('amux-server.py').read())"`

@@ -1795,3 +1795,27 @@ FIX: unknown pending diagnosis. The thing worth protecting is the signal: this g
   load-bearing (it is what catches another session's work riding along in your commit, which
   has happened twice here), and a warning that fires on your own edits is how a real one gets
   waved through. Whatever the cause, the guard should be able to say "this was you".
+
+
+## `HEAD~1` is not "before my change" here — the pre-fix specimen check tested the wrong commit
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-25
+SYMPTOM: Verifying AF-23's regression test against a pre-fix specimen via
+  `git show HEAD~1:amux-server.py`. amux-cloud committed 939064d between my commit
+  (523df63) and the check, so HEAD~1 WAS MY OWN FIX. The probe reported the disclosure
+  string already present pre-fix and concluded "the test would PASS - VACUOUS - bad test!".
+  Re-run against `523df63^` - the parent of MY commit - it correctly reports FAIL.
+COST: ~5 min, and it was one step from costing much more: the false verdict was that a
+  correctly-discriminating test was vacuous, whose natural remedy is to rewrite a good test
+  into a worse one. This is the LOUD WRONG probe, not the silent one - it answers, and the
+  answer looks exactly like the failure ethos rule 7 warns about, so it is self-corroborating.
+FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited here: writing
+  one before the commit exists is the fabrication ethos rule 7 records, and I did it in the
+  first draft of this very entry). Use `git show <your-sha>^:<file>`, never HEAD~1, on
+  a checkout where other lanes commit. The trap is invisible on a single-session repo, which
+  is precisely why it needs writing down here: every fix in this repo is supposed to be
+  checked against a pre-fix specimen, so the wrong recipe is reached for constantly.
