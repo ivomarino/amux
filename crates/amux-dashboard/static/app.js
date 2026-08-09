@@ -6460,7 +6460,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.533';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.534';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -11910,7 +11910,14 @@ function _fileHighlightHTML(data) {
     inner = esc(content);
   }
   const note = big ? '<div style="padding:4px 12px;font-size:0.7rem;color:var(--dim);">Large file — syntax highlighting skipped for performance.</div>' : '';
-  return note + '<pre class="hljs-pre"><code class="hljs">' + inner + '</code></pre>';
+  const lines = inner.split('\n');
+  const lineCount = lines.length;
+  const gutterW = String(lineCount).length;
+  const numbered = lines.map((l, i) => {
+    const num = String(i + 1).padStart(gutterW);
+    return '<span class="hljs-ln">' + num + '</span>' + l;
+  }).join('\n');
+  return note + '<pre class="hljs-pre"><code class="hljs">' + numbered + '</code></pre>';
 }
 
 function _renderFileBody(data, mode) {

@@ -670,8 +670,12 @@
   .file-overlay-body.file-code { padding: 0; }
   .file-overlay-body.file-code .hljs-pre { margin: 0; padding: 12px 14px; overflow: auto; }
   .file-overlay-body.file-code code.hljs { display: block; background: transparent; padding: 0;
+    color: #c9d1d9;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
-    line-height: 1.5; tab-size: 2; white-space: pre; }
+    line-height: 1.6; tab-size: 2; white-space: pre; }
+  .file-overlay-body.file-code .hljs-ln {
+    display: inline-block; width: 3.5ch; text-align: right; margin-right: 1.5ch;
+    color: #484f58; user-select: none; -webkit-user-select: none; }
   /* github-dark ships NO .hljs-punctuation rule, and hljs 11.9 emits exactly three
      classes for JSON: hljs-attr, hljs-string, hljs-punctuation. So every brace,
      bracket, colon and comma fell back to the base colour while keys and values
@@ -683,6 +687,8 @@
      should recede while staying legible. */
   .file-overlay-body.file-code .hljs-punctuation { color: #8b949e; }
   body.light .file-overlay-body.file-code .hljs-punctuation { color: #6e7781; }
+  body.light .file-overlay-body.file-code code.hljs { color: #24292f; }
+  body.light .file-overlay-body.file-code .hljs-ln { color: #8c959f; }
   .file-overlay-body.file-image { display:flex;align-items:center;justify-content:center;background:var(--bg);white-space:normal;position:relative; }
   /* Zoomable image preview (pinch / trackpad / double-tap). */
   .img-zoom-wrap { position:absolute;inset:0;overflow:hidden;touch-action:none;display:flex;align-items:center;justify-content:center; }
