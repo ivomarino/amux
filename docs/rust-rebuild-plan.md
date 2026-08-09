@@ -3873,28 +3873,49 @@ Performance measurement:
 
 ### Phase 10: CI/CD pipeline (est. 1 week)
 
-**Goal**: zero-regression guarantee.
+**Goal**: zero-regression guarantee with tiered CI gates. The acceptance suite that
+proves the rebuild becomes the permanent regression suite that protects it (see
+§Acceptance suite vs permanent regression suite).
 
-Pipeline stages:
-1. `cargo check` + `clippy` -- compile-time correctness
-2. `cargo test` -- all unit + integration + simulation + proptest tests
-3. Backend conformance suite -- MockBackend + HerdrBackend + TmuxBackend (Invariant 21)
-4. Provider conformance suite -- MockProvider + all adapter tests (Invariant 21)
-5. Playwright suite -- all golden scenarios + all UI flows
-6. **UI interaction coverage audit** -- DOM inventory vs contract registry,
-   fail if any interactive control has no registered test (Invariant 44)
-7. Performance benchmarks -- compared against baseline, regression = failure
-8. SQLite migration test -- apply migrations to a copy of prod DB, verify no data loss
-9. Binary size check -- regression if binary grows >20%
-10. Incident regression corpus -- all `incident_regression::*` tests pass
+**Tiered pipeline** (see §CI tiers for full definitions):
 
-Regression detection:
+1. **PR Fast Gate** (every PR, < 10 min): cargo check + clippy, unit tests,
+   simulations, property tests (bounded), API contract, MockBackend/MockProvider
+   conformance, migration/schema compat, targeted Playwright smoke, static
+   interaction-coverage validation, fast historical regressions. No merge if red.
+
+2. **PR Full Gate** (merge candidates): all unit + integration, Herdr + tmux
+   conformance, all 4 provider adapters, full API/CLI/browser suites (desktop +
+   mobile), offline/reconnect, SSE/revision/fault-injection, config mutation,
+   historical regression corpus (full), migrated-data + net-new fixtures. No
+   deployment if red.
+
+3. **Nightly deep gate**: multi-provider golden scenarios, 40+ Herdr workers, extended
+   simulation/fuzz, migration against sanitized prod snapshot, browser matrix,
+   performance benchmarks, resource leak tests, fault-injection matrix.
+
+4. **Release gate**: Full Gate green + migration dry-run + real Herdr scenario +
+   offline + UI coverage + production smoke.
+
+5. **Periodic soak gate** (weekly): 24h soak, lifecycle churn, session replacement,
+   rate-limit cycling, DB growth/compaction, SSE reconnect, FD/RSS leak detection.
+
+**Spec-to-test traceability** (CI-enforced):
+- Every `RR-XXXX` maps to at least one test (or is marked documentation-only)
+- Every `VERIFIED` item's tests exist and pass
+- Test deletion/rename without updating the requirement fails CI
+- New user-facing capability without acceptance test fails CI
+
+**Regression detection thresholds**:
 - Latency regression: any p95 increase >10% vs baseline is a CI failure
 - Memory regression: RSS increase >20% vs baseline is a CI failure
 - Feature regression: any Playwright scenario that was green and turns red blocks merge
 - Interaction coverage regression: any interactive control without a test blocks merge
+- Binary size regression: growth >20% blocks merge
 
-The pipeline runs on every PR. No merge without green.
+**Migrated-data regression fixture**: sanitized representative fixture from the
+real Python AMUX dataset. Permanent -- future schema changes must load it
+successfully and preserve its semantics.
 
 ### Phase 11: Migration + go-live (est. 2 weeks)
 
@@ -4679,6 +4700,330 @@ Remaining blockers: 0
 ```
 
 Anything less means the executor should continue working.
+
+### Acceptance suite vs permanent regression suite
+
+The Rust rebuild requires a comprehensive **Acceptance Test Suite** derived directly
+from this document. This suite serves two purposes and its lifecycle extends beyond
+the rebuild itself.
+
+#### 1. Rebuild acceptance
+
+During implementation and migration, the acceptance suite proves the Rust system
+satisfies the complete `docs/rust-rebuild-plan.md` contract.
+
+Every applicable `RR-XXXX` checklist item must map to one or more acceptance tests.
+A checklist item may only become `VERIFIED` when its mapped acceptance tests and
+required evidence pass.
+
+The acceptance suite exercises:
+
+- Migrated production data AND net-new Rust-created data
+- API behavior, CLI behavior, real browser behavior
+- Deep nested UI interactions (not just DOM existence)
+- Herdr-backed workers AND tmux fallback
+- Provider behavior (Claude, Gemini, Codex, Ollama)
+- Model/provider/backend/cwd/worker configuration changes
+- Board lifecycle, gates, dependencies, leases
+- Messages, @worker mentions, delivery semantics
+- Schedules, search, logs, compaction, memory
+- Token accounting, provider quotas, capacity routing
+- Browser profiles, email, calendar, CRM
+- Persistence/restart, offline operation
+- Conflict resolution, realtime UI reconciliation
+- Failures and recovery (fault injection)
+- Migration integrity (manifest reconciliation)
+- Historical incident regressions
+- Performance and soak requirements
+
+Passing ordinary unit tests is not sufficient for rebuild acceptance.
+
+#### 2. Permanent regression protection
+
+After the Rust rebuild is accepted and becomes production, the acceptance suite does
+NOT disappear. The relevant portions become the permanent **AMUX Regression Suite**
+and run continuously in CI/CD.
+
+> **Every behavior required to accept the rebuild becomes protected behavior after
+> the rebuild.**
+
+A future PR must not be able to silently regress something that was required for
+Rust acceptance. The suite evolves as:
+
+```
+Rust rebuild specification
+        ↓
+RR execution checklist
+        ↓
+Acceptance tests (prove the rebuild)
+        ↓
+Rust production acceptance
+        ↓
+Permanent CI/CD regression suite (protect the rebuild forever)
+```
+
+Acceptance testing is the source of truth for product behavior; CI/CD is the
+mechanism that continuously re-runs it.
+
+> **The Rust rebuild acceptance suite becomes AMUX's permanent regression suite.
+> The rewrite is not merely tested once; its verified behavior becomes the baseline
+> that every future commit must continue to satisfy.**
+
+#### Test classification
+
+Every acceptance test must be tagged by execution class so CI runs the correct
+subsets efficiently:
+
+```
+unit                   integration           simulation
+property               api                   cli
+browser                browser-mobile        offline
+sync                   herdr                 tmux
+provider-claude        provider-codex        provider-gemini
+provider-ollama        migration             historical-regression
+performance            soak                  destructive
+production-smoke
+```
+
+Do not duplicate test logic to create a faster CI tier. Reuse the same scenario/fixture
+definitions at different scales where possible.
+
+#### CI tiers (permanent, post-migration)
+
+##### PR Fast Gate
+
+Runs on every PR. Must complete quickly enough to be practical (target: < 10 min).
+
+```
+cargo check + clippy
+unit tests
+deterministic orchestrator simulations
+property tests (bounded cases)
+API contract tests (schema validation)
+MockBackend conformance
+MockProvider conformance
+migration/schema compatibility tests
+targeted Playwright smoke for modified surfaces
+static interaction-coverage validation (DOM inventory vs registry)
+fast deterministic historical regressions
+```
+
+No PR merges if this fails.
+
+##### PR Full Gate
+
+Runs for every merge candidate or protected-branch update.
+
+```
+all unit + integration tests
+Herdr backend conformance
+tmux backend conformance
+provider adapter conformance (Claude, Gemini, Codex, Ollama)
+full API suite
+full CLI suite
+full browser interaction suite (desktop + mobile)
+offline/reconnect suite
+SSE/revision/fault-injection suite
+config mutation tests (rename, cwd, model, provider, backend)
+historical incident regression corpus (full)
+migrated-data fixture suite
+net-new-data suite
+```
+
+No production deployment if this fails.
+
+##### Nightly deep gate
+
+Expensive scenarios that should not slow every PR:
+
+```
+complete multi-provider golden scenarios (all 10)
+high-volume UI interaction crawling
+40+ Herdr worker concurrency
+thousands of deterministic simulation/fuzz runs
+extended property testing (higher case count)
+migration against recent sanitized production snapshot
+browser matrix (Chromium + WebKit where available)
+performance benchmark suite (p50/p95/p99 baselines)
+resource leak tests (FD, RSS over 4h)
+fault-injection matrix (all 18 fault types)
+```
+
+##### Release gate
+
+Before any production deployment:
+
+```
+all Full Gate tests green
+current-release migration dry-run green
+real Herdr golden scenario green (not mock)
+offline suite green
+UI interaction coverage: zero unexplained holes
+production smoke tests defined for the release green
+```
+
+##### Periodic soak gate
+
+Run independently (weekly or on-demand):
+
+```
+24h Rust server soak
+sustained Herdr worker lifecycle churn
+repeated session replacement (cwd/provider/backend changes)
+provider rate-limit/recovery cycling
+DB growth and compaction under continuous writes
+SSE reconnect churn (connect/disconnect cycles)
+browser/offline reconnect cycles
+file descriptor leak detection (48h)
+RSS leak detection (48h)
+```
+
+#### Spec-to-test traceability
+
+The repository must maintain machine-readable traceability between requirements and
+tests:
+
+```
+Requirement: RR-0035
+Acceptance tests:
+  worker_rename::api_preserves_worker_id
+  worker_rename::cli_alias_resolves
+  worker_rename::ui_list_updates
+  worker_rename::herdr_session_continues
+  worker_rename::restart_preserves_alias
+```
+
+The Execution Checklist records test IDs in its `Evidence:` field upon verification.
+
+CI must validate:
+
+1. Every `RR-XXXX` requirement has at least one mapped test unless explicitly marked
+   documentation-only.
+2. Every `VERIFIED` requirement's tests currently exist and pass.
+3. Tests referenced by checklist items have not been deleted or renamed without
+   updating the requirement.
+4. Newly introduced user-facing capabilities have acceptance requirements and tests.
+
+A feature must not become unprotected because someone removed its test accidentally.
+
+#### UI interaction coverage is permanent
+
+The deep UI interaction inventory is not only a rebuild exercise. Every CI run
+compares the rendered interactive UI inventory against registered interaction
+contracts:
+
+```
+UI controls discovered:           493
+controls with semantic IDs:       493
+registered interaction actions:   721
+covered actions:                  721
+uncovered:                          0
+```
+
+If a PR adds `<button data-action-id="worker-change-model">` without adding the
+appropriate behavioral acceptance test, CI fails. If a component is removed, its
+associated interaction tests and requirement mappings must be intentionally updated.
+
+#### Test the behavior, not just the implementation
+
+Permanent CI must preserve the acceptance philosophy:
+
+```
+API handler exists               != behavior verified
+DOM node exists                  != UI verified
+process is alive                 != worker verified
+terminal accepted keystrokes     != message delivered
+worker said "done"               != issue verified
+cache contains data              != UI is current
+```
+
+Tests assert the externally observable contract, not implementation internals.
+
+#### Migrated-data regression fixtures
+
+After successful migration, preserve a sanitized representative fixture derived from
+the real Python AMUX dataset. The permanent CI suite uses this fixture to ensure
+future migrations/schema changes continue to support historically valid AMUX data.
+
+Include representative examples of:
+
+- Old workers/sessions with legacy config shapes
+- Old board issue shapes, legacy statuses/types
+- Messages with threading and delivery states
+- Groups with scoped configuration
+- Schedules with run history and source discrimination
+- Memory entries with scope and provenance
+- Token ledger entries
+- Prefs in legacy format
+- Browser profile metadata
+- Integration configuration
+- Historical edge cases (451-fold cards, archived-with-gate, etc.)
+
+Future migrations must load this fixture successfully and preserve its semantics.
+
+#### Historical bugs stay fixed forever
+
+Every historical incident converted into a regression test becomes permanent.
+Do not delete a historical regression because the implementation that originally
+caused it no longer exists. The purpose of the test is to preserve the behavioral
+invariant:
+
+```
+no read-after-write stale board
+no sent-message resurrection
+no duplicate seed convergence
+no stale automation delivery
+no false-positive verification from echoed prompts
+no "healthy" provider based on shell output
+no split-brain browser profile store
+no silent provider-state inference failure
+no lost state during restart
+no gates derived from stale item type
+no zero-height rendered component passing checks
+```
+
+Implementation can change completely; these behaviors must remain protected.
+
+#### Performance regressions are regressions
+
+The performance targets defined by this document become CI baselines after acceptance.
+Track at minimum:
+
+```
+API p50/p95/p99 per route group
+dashboard cold and cached load time
+SSE propagation latency (state change -> client)
+worker start latency (button press -> running)
+search latency (query -> results)
+idle CPU (40 workers parked)
+RSS (40 workers parked)
+DB write throughput (mutations/sec)
+context assembly time
+token overhead (harness tokens / productive tokens)
+tokens per verified issue
+```
+
+After the accepted Rust baseline is established, CI compares future changes against
+it. Material regression outside defined tolerance fails the appropriate gate.
+
+#### Acceptance-suite completion criterion
+
+The rebuild may only pass final acceptance when:
+
+```
+Every RR requirement has verification evidence
+AND every applicable acceptance test is green
+AND migrated production data passes
+AND net-new data passes
+AND real Herdr workflows pass
+AND browser/UI deep interaction coverage passes
+AND offline/reconciliation passes
+AND historical regressions pass
+AND performance/reliability gates pass
+```
+
+After that moment, these tests become the permanent minimum behavioral contract for
+AMUX. Future functionality must extend this contract, not bypass it.
 
 ---
 
@@ -5989,39 +6334,143 @@ consistent with their dependencies.
 
 ---
 
-### Phase 10: CI/CD Pipeline
+### Phase 10: CI/CD Pipeline + Test Infrastructure
 
-- [ ] RR-0114 — CI pipeline: all stages
+- [ ] RR-0114 — CI tiered pipeline: PR Fast Gate
   Phase: 10
-  Depends on: RR-0028, RR-0112
-  Invariant: 21, 44
-  Requirement: Pipeline stages: cargo check + clippy -> cargo test -> backend
-    conformance (Mock + Herdr + tmux) -> provider conformance -> Playwright -> UI
-    interaction coverage audit -> performance benchmarks -> SQLite migration test ->
-    binary size check -> incident regression corpus.
-  Tests: pipeline executes all stages
+  Depends on: RR-0028, RR-0027
+  Invariant: 21, 44, 45
+  Requirement: PR Fast Gate (< 10 min): cargo check + clippy, unit tests,
+    deterministic orchestrator simulations, property tests (bounded), API contract
+    tests, MockBackend conformance, MockProvider conformance, migration/schema
+    compatibility, targeted Playwright smoke for modified surfaces, static
+    interaction-coverage validation (DOM inventory vs registry), fast deterministic
+    historical regressions. No PR merges if this fails.
+  Tests: gate blocks merge on any failure
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0115 — Regression detection rules
+- [ ] RR-0115 — CI tiered pipeline: PR Full Gate
   Phase: 10
   Depends on: RR-0114
+  Invariant: 21, 44
+  Requirement: PR Full Gate (merge candidates): all unit + integration, Herdr +
+    tmux backend conformance, all 4 provider adapter conformance, full API/CLI/browser
+    suites (desktop + mobile viewports), offline/reconnect suite, SSE/revision/fault-
+    injection suite, config mutation tests, historical incident regression corpus
+    (full), migrated-data fixture suite, net-new-data suite. No production deployment
+    if this fails.
+  Tests: gate blocks deployment on any failure
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0116 — CI tiered pipeline: nightly deep gate
+  Phase: 10
+  Depends on: RR-0115
+  Invariant: —
+  Requirement: Nightly deep gate: complete multi-provider golden scenarios (all 10),
+    high-volume UI interaction crawling, 40+ Herdr worker concurrency, thousands of
+    simulation/fuzz runs, extended property testing, migration against sanitized
+    production snapshot, browser matrix (Chromium + WebKit), performance benchmarks
+    (p50/p95/p99), resource leak tests (FD/RSS over 4h), fault-injection matrix
+    (all 18 fault types).
+  Tests: nightly gate executes all expensive scenarios
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0117a — CI tiered pipeline: release gate + periodic soak gate
+  Phase: 10
+  Depends on: RR-0115
+  Invariant: 7, 45
+  Requirement: Release gate: Full Gate green + migration dry-run + real Herdr scenario
+    + offline + UI coverage + production smoke. Periodic soak gate (weekly): 24h soak,
+    Herdr lifecycle churn, session replacement, rate-limit cycling, DB growth/
+    compaction, SSE reconnect, FD/RSS leak detection (48h).
+  Tests: release gate blocks production on any failure, soak gate alerts on leak
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0117b — Regression detection thresholds
+  Phase: 10
+  Depends on: RR-0114, RR-0112
   Invariant: —
   Requirement: Latency p95 increase > 10% = CI failure. RSS increase > 20% = CI
     failure. Playwright scenario green-to-red blocks merge. Uncovered interactive
-    control blocks merge.
-  Tests: regression thresholds enforced
+    control blocks merge. Binary size > 20% growth blocks merge.
+  Tests: regression thresholds enforced in appropriate gates
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0116 — Historical incident regression corpus
+- [ ] RR-0117c — Historical incident regression corpus
   Phase: 10
   Depends on: RR-0074
   Invariant: 41
-  Requirement: All incident_regression::* tests from the corpus (20+ incidents).
-    Each references the original incident/commit. All must pass in CI.
+  Requirement: All 20+ incident_regression::* tests from the corpus. Each references
+    the original incident/commit. All must pass in PR Fast Gate (deterministic subset)
+    and Full Gate (complete). Tests are PERMANENT -- never deleted even when the
+    original implementation no longer exists. They protect behavioral invariants.
   Tests: all regression tests pass
   Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0117d — Spec-to-test traceability infrastructure
+  Phase: 10
+  Depends on: RR-0114
+  Invariant: 45
+  Requirement: Machine-readable mapping: every RR-XXXX -> acceptance test IDs.
+    CI validates: (1) every RR item has at least one mapped test (or marked
+    documentation-only), (2) every VERIFIED item's tests exist and pass, (3) tests
+    referenced by checklist items not deleted/renamed without updating the requirement,
+    (4) new user-facing capabilities have acceptance requirements and tests.
+    Traceability format:
+    ```
+    Requirement: RR-0035
+    Tests: worker_rename::api, worker_rename::cli, worker_rename::ui,
+           worker_rename::herdr, worker_rename::restart
+    ```
+  Tests: traceability validation runs in PR Fast Gate
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0117e — Migrated-data regression fixture
+  Phase: 10
+  Depends on: RR-0118, RR-0128
+  Invariant: 36
+  Requirement: After successful migration, preserve sanitized representative fixture
+    from real Python AMUX dataset. Includes: old workers/sessions, old board issue
+    shapes, legacy statuses/types, messages with threading, groups with scoped config,
+    schedules with run history, memory entries, token ledger, prefs, browser profile
+    metadata, integration config, historical edge cases (451-fold, archived-with-gate).
+    Permanent -- future migrations must load this fixture and preserve semantics.
+  Tests: fixture loads successfully in every CI run, semantics preserved
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0117f — Test classification tags
+  Phase: 10
+  Depends on: RR-0114
+  Invariant: —
+  Requirement: Every acceptance test tagged by execution class: unit, integration,
+    simulation, property, api, cli, browser, browser-mobile, offline, sync, herdr,
+    tmux, provider-claude, provider-codex, provider-gemini, provider-ollama, migration,
+    historical-regression, performance, soak, destructive, production-smoke. CI gates
+    select tests by tag. No test logic duplicated to create faster tiers -- same
+    scenario/fixture definitions at different scales.
+  Tests: tag coverage, gate selection correctness
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0117g — Performance baseline establishment
+  Phase: 10
+  Depends on: RR-0112
+  Invariant: —
+  Requirement: After accepted Rust baseline established, CI tracks: API p50/p95/p99
+    per route group, dashboard cold/cached load, SSE propagation latency, worker
+    start latency, search latency, idle CPU/RSS (40 workers), DB write throughput,
+    context assembly time, token overhead, tokens per verified issue. Material
+    regression outside defined tolerance fails the appropriate gate.
+  Tests: baseline recorded, future regressions detected
+  Verify: Implementation, Performance
   Status: TODO
 
 ---
@@ -6375,7 +6824,7 @@ consistent with their dependencies.
 
 - [ ] RR-0151 — Historical incident regression: full corpus
   Phase: 10
-  Depends on: RR-0074, RR-0116
+  Depends on: RR-0074, RR-0117c
   Invariant: 41
   Requirement: All 20+ incident regression tests pass. Each references original
     incident. No known architectural failure class reproducible in Rust.
