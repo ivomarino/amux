@@ -15,6 +15,7 @@
 //!   (Invariant 35).
 
 pub mod migrate;
+pub mod queries;
 
 use amux_core::revision::{MutationKind, StateEvent, StateRevision};
 use r2d2_sqlite::SqliteConnectionManager;

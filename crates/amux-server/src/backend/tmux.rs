@@ -4,7 +4,7 @@
 //! ONLY via `super::backend_ref` — Invariant 43). Verbs:
 //!
 //! - spawn      -> `new-session -d -s <ref> -x 220 -y 50 -c <cwd> [-e K=V..]`,
-//!                 `set-option remain-on-exit on`, then `send-keys -l` + Enter
+//!   `set-option remain-on-exit on`, then `send-keys -l` + Enter
 //! - terminate  -> `kill-session -t '=<ref>'`
 //! - status     -> `has-session` then `list-panes #{pane_dead}...`
 //! - reconcile  -> `list-sessions -F '#{session_name}'`, `amux-` prefix only

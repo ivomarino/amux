@@ -4,11 +4,13 @@
 //! in the OpenAPI spec (RR checklist) and — for legacy-compat paths — in the
 //! alias registry (RR-0018a).
 
+pub mod aliases;
 pub mod auth;
 pub mod health;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
+pub mod workers;
 
 use crate::db::SharedStore;
 use axum::Router;
@@ -31,15 +33,22 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
+        .nest("/api/workers", workers::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
         ));
 
-    Router::new()
+    let app = Router::new()
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
         .merge(static_files::routes())
         .merge(protected)
-        .with_state(state)
+        .with_state(state);
+
+    // Legacy route aliases (RR-0018a): /api/sessions/* rewrites to
+    // /api/workers/* BEFORE routing, so the rewrite must wrap the finished
+    // router. Auth is inside the wrapper — legacy paths are exactly as
+    // protected as canonical ones.
+    aliases::alias_layer(app)
 }

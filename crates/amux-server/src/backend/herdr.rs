@@ -9,9 +9,9 @@
 //! (`amux-wrk_<ulid>`, derived ONLY via `super::backend_ref` — Invariant 43):
 //!
 //! - spawn      -> `workspace create --cwd .. --label <ref> --env K=V --no-focus`
-//!                 then `pane run <pane> "cd .. && exec <cmd>"`
+//!   then `pane run <pane> "cd .. && exec <cmd>"`
 //! - terminate  -> `workspace close <workspace_id>` (verified: kills the pane
-//!                 process — a probe `sleep 300` was gone after close)
+//!   process — a probe `sleep 300` was gone after close)
 //! - status     -> workspace-with-label present? (see HERDR-GAP on exit codes)
 //! - reconcile  -> `workspace list`, filter labels with the `amux-` prefix
 //! - capture    -> `pane read <pane> --lines N --format text`
