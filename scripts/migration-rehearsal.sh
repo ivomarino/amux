@@ -73,4 +73,51 @@ assert db.execute("SELECT value FROM prefs WHERE key='rehearsal_probe'").fetchon
 print(f"ok: python reads+writes post-migration (open_issues={open_issues}, enabled_schedules={schedules}, prefs={len(prefs)})")
 PY
 
+echo "== 6. data CONTINUITY through the Rust APIs (every subsystem serves its migrated data)"
+PORT=18931
+AMUX_HOME="$WORK" AMUX_DB="$COPY" AMUX_RS_PORT=$PORT \
+  "${AMUX_RS_BIN:-./target/debug/amux-server}" >"$WORK/server.log" 2>&1 &
+SRV=$!
+trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+for _ in $(seq 1 60); do
+  curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 0.5
+done
+TOKEN=$(cat "$WORK/auth-token")
+probe() { # name url jq_count sql_count
+  local name=$1 url=$2 api_n sql_n
+  api_n=$(curl -sk --max-time 10 -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT$url" | python3 -c "$3" 2>/dev/null || echo ERR)
+  sql_n=$(sqlite3 "$COPY" "$4")
+  if [ "$api_n" = "$sql_n" ]; then
+    echo "ok: $name — API serves all $sql_n migrated rows"
+  else
+    echo "FAIL: $name — API $api_n vs SQL $sql_n"; exit 1
+  fi
+}
+PYC_LEN="import json,sys; print(len(json.load(sys.stdin)))"
+probe board "/api/board?done_limit=0&archived=all" "$PYC_LEN" \
+  "SELECT COUNT(*) FROM issues WHERE deleted IS NULL;"
+# deleted IS NULL: the Python GET filters soft-deleted (amux-server.py:70800)
+# — a probe counting them would fail the API for agreeing with Python.
+probe schedules "/api/schedules" "$PYC_LEN" \
+  "SELECT COUNT(*) FROM schedules WHERE deleted IS NULL;"
+probe prefs "/api/prefs" "import json,sys; print(len(json.load(sys.stdin)))" \
+  "SELECT COUNT(*) FROM prefs;"
+probe cal_events "/api/cal-events" "$PYC_LEN" \
+  "SELECT COUNT(*) FROM cal_events WHERE deleted IS NULL;"
+probe journal "/api/journal?limit=100000" "$PYC_LEN" \
+  "SELECT COUNT(*) FROM journal_entries WHERE deleted IS NULL;"
+probe history "/api/history?limit=1000000" \
+  "import json,sys; d=json.load(sys.stdin); print(len(d if isinstance(d,list) else d.get('items',d.get('history',[]))))" \
+  "SELECT COUNT(*) FROM cmd_history;"
+# Continuity WRITE through the Rust API, visible to a Python-shaped read:
+NEW=$(curl -sk --max-time 10 -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"continuity probe (rehearsal)","status":"todo"}' "https://localhost:$PORT/api/board" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+python3 - "$COPY" "$NEW" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1]); db.row_factory = sqlite3.Row
+r = db.execute("SELECT title, status, typeof(created) t FROM issues WHERE id=?", (sys.argv[2],)).fetchone()
+assert r and r["title"] == "continuity probe (rehearsal)" and r["t"] == "integer", dict(r or {})
+print(f"ok: rust-written card {sys.argv[2]} readable Python-side with int timestamps")
+PY
+kill "$SRV" 2>/dev/null || true
 echo "== REHEARSAL PASSED"
