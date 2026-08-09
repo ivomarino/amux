@@ -626,6 +626,8 @@ struct CreateTaskResponse {
     status: Status,
     item_type: ItemType,
     worker: Option<String>,
+    #[serde(skip_serializing_if = "field_style_is_modern")]
+    session: Option<String>,  // legacy alias, same value as worker (Invariant 53)
     // ... all fields
 }
 
@@ -3346,6 +3348,85 @@ Irreversible actions (`SendEmail`, `GitPush`, `DeleteData`, `SpendMoney`) get
 records the evidence (what would happen), and then executes for real. No
 approval gate, but a mandatory evidence trail.
 
+### Invariant 53: Terminology is opt-in and backward-compatible
+
+The vernacular rename (session -> worker, issue -> task) must not break
+existing users. Every consumer of the amux API -- scripts, hooks, CLI
+muscle memory, dashboard bookmarks, CLAUDE.md instructions referencing
+`/api/sessions`, board cards with `session` fields -- must keep working
+without modification. The new terminology is the *default for new
+installations*; existing deployments adopt it at their own pace.
+
+**API routes**: both old and new paths are served. The canonical (new)
+routes are `/api/workers`, `/api/tasks`. The legacy routes `/api/sessions`,
+`/api/issues` are aliases that resolve to the same handlers. A
+`Deprecated` response header on legacy routes signals the rename without
+breaking callers. There is no removal timeline in the Rust rebuild --
+aliases are permanent until a future major version.
+
+```rust
+// axum route registration -- aliases are first-class, not middleware hacks
+fn register_board_routes(router: Router) -> Router {
+    let handler = board_handler();
+    router
+        .route("/api/tasks", handler.clone())
+        .route("/api/issues", handler.clone())  // legacy alias
+        .route("/api/tasks/:id", detail_handler.clone())
+        .route("/api/issues/:id", detail_handler.clone())
+}
+
+fn register_worker_routes(router: Router) -> Router {
+    let handler = worker_handler();
+    router
+        .route("/api/workers", handler.clone())
+        .route("/api/sessions", handler.clone())  // legacy alias
+        .route("/api/workers/:id", detail_handler.clone())
+        .route("/api/sessions/:id", detail_handler.clone())
+}
+```
+
+**API response fields**: JSON responses include both field names.
+`session` and `worker` both appear in board task responses, carrying
+the same value. A pref (`api_field_style`: `"modern"` | `"legacy"` |
+`"both"`) controls which fields are emitted:
+
+- `"both"` (default): `{"session": "wrk-1", "worker": "wrk-1", ...}`
+- `"modern"`: `{"worker": "wrk-1", ...}` (no `session` field)
+- `"legacy"`: `{"session": "wrk-1", ...}` (no `worker` field)
+
+Request bodies accept either field name. If both are present,
+`worker` wins and `session` is ignored with a warning in the response.
+
+**CLI commands**: `amux session` and `amux worker` are both valid.
+`amux issue` and `amux task` are both valid. Tab completion shows both.
+The `--help` output uses the new terminology but notes the alias:
+`amux worker (alias: session)`.
+
+**Dashboard UI**: a pref (`terminology`: `"modern"` | `"legacy"`)
+controls display labels. Default is `"modern"` (shows "Workers",
+"Tasks"). Setting `"legacy"` shows "Sessions", "Issues". The toggle
+is in Settings. Internal logic, data-testid attributes, and CSS
+classes use the new names only; the pref only affects rendered text.
+
+**SSE events**: `EventKind` variants use the new names internally
+(`TaskCreated`, `WorkerStarted`). The SSE wire format includes a
+`legacy_kind` field when `api_field_style != "modern"`:
+`{"kind": "TaskCreated", "legacy_kind": "IssueCreated", ...}`.
+Consumers filtering on the old string still match.
+
+**Migration**: the Python -> Rust migration reads old field/table
+names and writes new ones. No consumer-side migration is required
+because aliases handle the translation at the API boundary.
+
+**DB table names**: internal. The Rust schema uses `tasks` and
+`workers`. This is invisible to API consumers and does not affect
+backward compatibility.
+
+**What is NOT aliased**: Rust type names (`Task`, `Worker`, `Session`,
+`TaskId`, `WorkerId`), internal module paths, invariant IDs, and
+RR item names use the new terminology only. These are not part of the
+public contract.
+
 ---
 
 ## The Orchestrator (updated mental model)
@@ -3910,6 +3991,11 @@ harness that will verify every subsequent phase.
 - Unit: `#[serde(deny_unknown_fields)]` rejects unknown mutation fields (Invariant 37)
 - Unit: `PagedResponse` always reports `total` >= `returned` (Invariant 40)
 - Unit: API request/response types match OpenAPI spec (generated from JsonSchema derives)
+- Unit: legacy route aliases (/api/sessions, /api/issues) resolve to canonical handlers
+  and include Deprecated header (Invariant 53)
+- Unit: response field aliasing -- api_field_style=both emits both session+worker,
+  modern omits session, legacy omits worker (Invariant 53)
+- Unit: request body accepts `session` as alias for `worker` field (Invariant 53)
 - Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
 - Unit: backpressure -- bounded channels reject/drop correctly at capacity (Invariant 26)
 - Unit: `ContextFragment` priority ordering is deterministic (Invariant 16)
@@ -4365,7 +4451,9 @@ must pass on both the proxied and native dashboard before the proxy is removed.
 2. `rust-embed` for compile-time inclusion
 3. Version stamping via `build.rs`
 4. CLI: `clap` subcommand tree mirroring the bash script
-5. Rename all `session` references to `worker` in dashboard + CLI
+5. Terminology aliases: `session`/`worker` and `issue`/`task` coexist (Invariant 53).
+   New terminology is the default; old terminology works via route aliases,
+   response field aliasing (pref-controlled), and CLI command aliases.
 6. `data-testid` on every interactive element (Invariant 44)
 7. Interaction contract registry for all components
 8. DOM inventory crawler + CI coverage gate
@@ -4542,9 +4630,9 @@ each phase migrates more routes to native Rust, shrinking the proxy surface.
 Rollback is per-route (revert to proxying), not all-or-nothing.
 
 ```
-Phase 1:  /health, /api/workers, /api/sessions  → native Rust
-          everything else                        → proxy to Python:8823
-Phase 2:  + /api/board, /api/tasks              → native Rust
+Phase 1:  /health, /api/workers (+/api/sessions alias)  → native Rust
+          everything else                               → proxy to Python:8823
+Phase 2:  + /api/board, /api/tasks (+/api/issues alias) → native Rust
 Phase 3:  + /api/schedules                       → native Rust
 Phase 4:  + /api/sessions/*/send, steering       → native Rust
 Phase 5:  + /api/board/*/status-request, verify  → native Rust
@@ -4712,8 +4800,9 @@ The semantic ID is:
 | 50 | `INV-CRITERIA-AUTHORSHIP` | Acceptance criteria authorship separation |
 | 51 | `INV-DECOMP-CAP` | Decomposition depth cap |
 | 52 | `INV-CAPABILITY-POLICY` | Capability policy |
+| 53 | `INV-TERMINOLOGY-COMPAT` | Terminology is opt-in and backward-compatible |
 
-The numbering is non-sequential (1-21, 33-41, 22-32, 42-52) because invariants
+The numbering is non-sequential (1-21, 33-41, 22-32, 42-53) because invariants
 were added over time. The semantic IDs are the stable identifiers; numbers are
 retained for backward compatibility with existing cross-references but are not
 the canonical reference. New invariants get the next number AND a semantic ID.
@@ -6091,6 +6180,21 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
+- [ ] RR-0018a — API route + field aliasing infrastructure (backward compat)
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 13, 53
+  Requirement: Route alias registry: canonical path + legacy path(s), both resolve
+    to the same handler. Legacy routes add `Deprecated: true` response header.
+    Response field aliasing middleware controlled by pref `api_field_style`
+    (both/modern/legacy; default: both). Request body deserialization accepts
+    either field name (`session` or `worker`, `issue` or `task`).
+    This infrastructure is used from Phase 1 onward by every route handler.
+  Tests: alias resolution, Deprecated header, field style pref controls output,
+    request body accepts legacy field names, OpenAPI spec lists both route paths
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
 - [ ] RR-0019 — SQLite schema: all tables as migrations
   Phase: 0
   Depends on: RR-0002 through RR-0018
@@ -7176,13 +7280,24 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, CLI verification
   Status: TODO
 
-- [ ] RR-0099 — Rename session -> worker in dashboard + CLI
+- [ ] RR-0099 — Terminology aliases: session/worker, issue/task (backward-compat)
   Phase: 8
   Depends on: RR-0097, RR-0098
-  Invariant: 1
-  Requirement: All `session` references become `worker` in dashboard UI and CLI output.
-  Tests: no remaining `session` references in user-facing text (grep)
-  Verify: Implementation, Browser verification, CLI verification
+  Invariant: 1, 53
+  Requirement: New terminology is the DEFAULT for new installations. Existing
+    deployments keep working unchanged. API route aliases: /api/workers and
+    /api/sessions both resolve to the same handlers; /api/tasks and /api/issues
+    likewise. Legacy routes return Deprecated header. Response field aliasing
+    controlled by pref `api_field_style` (both/modern/legacy; default: both).
+    CLI accepts both `amux worker` and `amux session`, `amux task` and `amux issue`.
+    Dashboard display controlled by pref `terminology` (modern/legacy; default:
+    modern). SSE events include `legacy_kind` when style != modern.
+    No removal timeline for aliases in the Rust rebuild.
+  Tests: legacy route returns same response as canonical route + Deprecated header,
+    api_field_style=legacy omits new fields, api_field_style=modern omits old fields,
+    api_field_style=both includes both, CLI alias resolution, dashboard pref toggle,
+    SSE legacy_kind present when configured, request body accepts either field name
+  Verify: Implementation, Browser verification, CLI verification, Integration tests
   Status: TODO
 
 - [ ] RR-0100 — data-testid on every interactive element
