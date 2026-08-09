@@ -110,12 +110,14 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
         )),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
-    // Update watcher (serve-time layer, never touching the extracted SPA):
-    // polls /health and, when the server's build hash moves — the builder
-    // installed a new backend — offers a RELOAD the user chooses to take.
-    // Backend changes flow live regardless (SSE reconnects on its own and
-    // re-pushes full state); this banner is only about adopting new CLIENT
-    // code, and that adoption is the user's call, never forced.
+    // Client update adoption is the SSE ping's job, exactly like Python
+    // (amux-server.py:65292): every ping carries `v` = the embedded APP_VER
+    // (see sse.rs::ping_payload) and the SPA self-reloads on mismatch,
+    // rate-limited and SW-nudged. The earlier /health-polling banner is
+    // deliberately GONE (Ethan 2026-08-09: "frontend clients should also
+    // restart just like the python server") — a banner on backend-only
+    // build changes was noise Python never showed, and the reload it
+    // offered is now automatic when it matters (client code changed).
     // CRM is removed from the Rust build (Ethan, 2026-08-09): hide its tab
     // and view via the serve-time layer — the extracted SPA stays
     // byte-identical, the decision lives HERE where it is one greppable
@@ -124,28 +126,7 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
 [onclick="switchView('crm')"], #crm-view { display: none !important; }
 </style>
 "#;
-    let watcher = format!(
-        r#"<script>/* AMUX-UPDATE-WATCH (injected at serve time) */
-(function() {{
-  var atLoad = {build:?};
-  function check() {{
-    fetch('/health').then(function(r) {{ return r.json(); }}).then(function(h) {{
-      if (h && h.build && h.build !== atLoad && !document.getElementById('amux-update-bar')) {{
-        var bar = document.createElement('div');
-        bar.id = 'amux-update-bar';
-        bar.style.cssText = 'position:fixed;bottom:calc(12px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);z-index:9998;background:#1f6feb;color:#fff;padding:10px 14px;border-radius:10px;font:600 0.85rem -apple-system,system-ui,sans-serif;display:flex;gap:12px;align-items:center;box-shadow:0 4px 16px rgba(0,0,0,0.4);';
-        bar.innerHTML = 'Server updated (' + h.build.slice(0,8) + ') <button onclick="location.reload()" style="min-width:44px;min-height:32px;background:#fff;color:#1f6feb;border:0;border-radius:8px;font-weight:700;cursor:pointer;padding:6px 12px;">Reload</button><button onclick="this.parentNode.remove()" style="min-width:32px;min-height:32px;background:transparent;color:#fff;border:0;font-size:1rem;cursor:pointer;">&#215;</button>';
-        document.body.appendChild(bar);
-      }}
-    }}).catch(function() {{}});
-  }}
-  setInterval(check, 30000);
-}})();
-</script>
-"#,
-        build = state.build_hash,
-    );
-    with_bootstrap.replacen("</body>", &format!("{crm_hide}{watcher}</body>"), 1)
+    with_bootstrap.replacen("</body>", &format!("{crm_hide}</body>"), 1)
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -194,15 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn update_watcher_carries_the_serving_build() {
+    fn no_update_banner_is_injected() {
+        // Client adoption rides the SSE ping's `v` (sse.rs::ping_payload,
+        // Python parity) — the old /health-polling banner must stay gone,
+        // or a backend-only deploy shows UI Python never showed.
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
         let out = inject_bootstrap(html, &s);
-        assert!(out.contains("AMUX-UPDATE-WATCH"));
-        assert!(out.contains(&format!("var atLoad = {:?}", s.build_hash)));
-        // The banner is offered, never forced: reload only behind a click.
-        assert!(out.contains(">Reload</button>"));
-        assert!(!out.contains("location.reload();</script>"), "no unconditional reload");
+        assert!(!out.contains("AMUX-UPDATE-WATCH"));
+        assert!(!out.contains("amux-update-bar"));
+        // The CRM feature-flag layer still injects.
+        assert!(out.contains("AMUX-FEATURE-FLAGS"));
     }
 
     #[test]

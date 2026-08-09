@@ -100,10 +100,59 @@ pub async fn events(
 
     Sse::new(stream).keep_alive(
         // The keep-alive IS the ping contract: 10s cadence, real data event.
+        // `v` = the APP_VER of the app.js THIS binary embeds (Python parity,
+        // amux-server.py:65292): the SPA's ping handler self-reloads on
+        // mismatch (rate-limited, SW-nudged), which is how clients adopt a
+        // new build without a human clicking anything — the server restarts
+        // on deploy, the next ping carries the new version, every open
+        // window follows. Ethan 2026-08-09: clients restart like the Python
+        // server's, not behind a banner.
         KeepAlive::new()
             .interval(Duration::from_secs(10))
-            .text("{\"type\":\"ping\"}"),
+            .text(ping_payload()),
     )
+}
+
+/// `{"type":"ping","v":"<APP_VER>"}` with the version parsed ONCE from the
+/// embedded app.js — the same file this server serves, so client and ping can
+/// never disagree about what "current" means. Falls back to a bare ping if
+/// the constant ever moves (a missing `v` disables self-reload, it does not
+/// break liveness).
+fn ping_payload() -> &'static str {
+    static PAYLOAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAYLOAD.get_or_init(|| {
+        let ver = amux_dashboard::DashboardAssets::get("app.js")
+            .and_then(|f| {
+                let s = String::from_utf8_lossy(&f.data).into_owned();
+                s.split("const APP_VER = '")
+                    .nth(1)
+                    .and_then(|rest| rest.split('\'').next().map(String::from))
+            })
+            .unwrap_or_default();
+        if ver.is_empty() {
+            "{\"type\":\"ping\"}".to_string()
+        } else {
+            format!("{{\"type\":\"ping\",\"v\":\"{ver}\"}}")
+        }
+    })
+}
+
+#[cfg(test)]
+mod ping_tests {
+    #[test]
+    fn ping_carries_the_embedded_app_ver() {
+        let p = super::ping_payload();
+        // The version must be the one inside the EMBEDDED app.js — not a
+        // hardcoded copy that drifts on the next client bump.
+        let f = amux_dashboard::DashboardAssets::get("app.js").unwrap();
+        let s = String::from_utf8_lossy(&f.data).into_owned();
+        let ver = s
+            .split("const APP_VER = '")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("APP_VER present in embedded app.js");
+        assert_eq!(p, &format!("{{\"type\":\"ping\",\"v\":\"{ver}\"}}"));
+    }
 }
 
 /// Push the legacy full-list events. Returns false when the client is gone.
