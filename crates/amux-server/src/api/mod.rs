@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod messages;
 pub mod prefs;
 pub mod schedules;
+pub mod sessions_legacy;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -64,6 +65,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/email", email::routes())
         .nest("/api/cal-events", calendar::routes())
         .nest("/api/crm", crm::routes())
+        // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
+        .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
         .nest("/api/push", crate::push::routes())
