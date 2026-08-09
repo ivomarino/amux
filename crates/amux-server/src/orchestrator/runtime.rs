@@ -32,6 +32,18 @@ pub struct FleetProgress {
     pub quarantined_total: u64,
 }
 
+/// Deterministic WorkerId for a Python-fleet owner name: matches no
+/// registered worker by construction (epoch-0 timestamp + name hash), so
+/// the planner can SEE the task without ever being able to assign it.
+pub fn foreign_worker_id(name: &str) -> amux_core::ids::WorkerId {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.to_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(0, h as u128))
+}
+
 pub struct Runtime {
     pub store: SharedStore,
     pub backends: Vec<Arc<dyn SessionBackend>>,
@@ -361,17 +373,27 @@ impl Runtime {
         Ok(())
     }
 
-    /// Open board tasks the Rust orchestrator may honestly route.
-    /// Ownership rule documented on `pickup_unowned`.
+    /// Open board tasks for planning. The FULL board rides in the slice —
+    /// disposition()'s dependency lookup treats an absent row as unmet
+    /// (an absent row proves nothing), so a todo-only slice made every
+    /// satisfied dependency read as unsatisfied forever: a dependent card
+    /// could never become runnable through the runtime. Caught by the
+    /// RR-0081 golden scenario's tripwire.
+    ///
+    /// Ownership: resolvable names map to their WorkerId; a name that is
+    /// NOT a Rust worker (the Python fleet's) maps to a deterministic
+    /// FOREIGN id that matches no registered worker — the task stays
+    /// visible for dependency lookup but can never be assigned or counted
+    /// as a stall (strangler-fig safety, see `pickup_unowned`). Unowned
+    /// tasks assign only under pickup_unowned.
     fn load_board_tasks(&self, workers: &[Worker]) -> anyhow::Result<Vec<amux_core::board::Task>> {
         let conn = self.store.read()?;
         let rows = crate::db::board_store::list_issues(
             &conn,
-            &["todo".into()],
+            &[], // ALL statuses: dependencies live in done/verified
             &[],
             crate::db::board_store::ArchivedFilter::ActiveOnly,
         )?;
-        // Name directory: display names + aliases, case-insensitive.
         let mut names: BTreeMap<String, amux_core::ids::WorkerId> = BTreeMap::new();
         for w in workers {
             names.insert(w.config.display_name.to_lowercase(), w.id().clone());
@@ -383,16 +405,14 @@ impl Runtime {
         for row in rows {
             let Some(mut task) = row.to_task() else { continue };
             match row.session.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(owner_name) => {
-                    match names.get(&owner_name.to_lowercase()) {
-                        Some(wid) => task.worker = Some(wid.clone()),
-                        // Owned by a name that is not a Rust worker: the
-                        // Python fleet's card. Not ours. Skip entirely.
-                        None => continue,
-                    }
-                }
+                Some(owner_name) => match names.get(&owner_name.to_lowercase()) {
+                    Some(wid) => task.worker = Some(wid.clone()),
+                    None => task.worker = Some(foreign_worker_id(owner_name)),
+                },
                 None => {
-                    if !self.pickup_unowned {
+                    if !self.pickup_unowned && !task.status.is_terminal() {
+                        // Unowned + pickup disabled: keep terminal rows for
+                        // dependency lookup, drop assignable ones.
                         continue;
                     }
                 }

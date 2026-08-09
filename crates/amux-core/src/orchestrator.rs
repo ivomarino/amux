@@ -116,11 +116,19 @@ pub fn plan_tick(inputs: &TickInputs) -> TickPlan {
         stalls: vec![],
     };
 
-    // 1. Expired leases release first — their tasks are assignable this
-    // same tick (a crashed worker must not cost an extra tick interval).
+    // 1. Lease release: expiry (a crashed worker must not cost an extra
+    // tick) AND terminal completion — a lease on a verified/discarded/
+    // quarantined task pins its worker's WIP slot for nothing (the RR-0084
+    // golden had to time-warp expiries to converge before this existed).
+    let task_by_id: BTreeMap<&TaskId, &Task> =
+        inputs.tasks.iter().map(|t| (&t.id, t)).collect();
     let mut live_leases: Vec<&Lease> = vec![];
     for lease in inputs.leases {
-        if lease.is_expired(inputs.now) {
+        let task_terminal = task_by_id
+            .get(&lease.task)
+            .map(|t| matches!(disposition(t, inputs.tasks, inputs.gates), TaskDisposition::Terminal))
+            .unwrap_or(false);
+        if lease.is_expired(inputs.now) || task_terminal {
             plan.reclaim.push(lease.clone());
         } else {
             live_leases.push(lease);
@@ -823,5 +831,49 @@ mod prompt_tests {
         assert!(p2.contains("2 files dirty"));
         assert!(p2.contains("Do NOT repeat"));
         assert!(p2.contains("attempt 2"));
+    }
+}
+
+#[cfg(test)]
+mod lease_release_tests {
+    use super::*;
+    use crate::board::{ItemType, Task, TaskStatus};
+    use chrono::TimeZone;
+
+    #[test]
+    fn terminal_task_lease_reclaimed_before_expiry() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let tid = TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 30_001));
+        let wid = WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 30_002));
+        let mut task = Task::create(
+            tid.clone(),
+            "done deal",
+            ItemType::Code,
+            crate::events::Actor::System { component: "t".into() },
+            now,
+        );
+        task.status = TaskStatus::Verified; // terminal
+        let leases = vec![Lease {
+            task: tid.clone(),
+            worker: wid,
+            acquired_at: now,
+            expires_at: now + chrono::Duration::hours(1), // NOT expired
+            generation: 0,
+        }];
+        let tasks = vec![task];
+        let (h, a) = (BTreeMap::new(), BTreeMap::new());
+        let plan = plan_tick(&TickInputs {
+            now,
+            tasks: &tasks,
+            workers: &[],
+            leases: &leases,
+            fleet_state: &crate::circuit::FleetState::Normal,
+            hints: &h,
+            attempts: &a,
+            gates: &[],
+            lease_secs: 600,
+            wip_limit: 1,
+        });
+        assert_eq!(plan.reclaim.len(), 1, "terminal task frees its lease now");
     }
 }
