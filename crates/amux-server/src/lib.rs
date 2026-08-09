@@ -153,7 +153,21 @@ async fn async_main() {
         ),
         Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
     }
-    tokio::spawn(runtime.run());
+    tokio::spawn(runtime.clone().run());
+
+    // Terminal scan loop (RR-0067): the fallback voice for hookless
+    // interactive workers, with structured-session demotion built in.
+    let scan = Arc::new(orchestrator::scan::ScanLoop::new(
+        store.clone(),
+        runtime.backends.clone(),
+        runtime.protocol.clone(),
+    ));
+    let scan_secs = cfg
+        .env
+        .get("AMUX_RS_SCAN_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    tokio::spawn(scan.run(scan_secs));
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https)");

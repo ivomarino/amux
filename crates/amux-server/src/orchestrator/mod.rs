@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod context;
 pub mod events;
 pub mod runtime;
+pub mod scan;
 pub mod sim;
 pub mod verify;
 
