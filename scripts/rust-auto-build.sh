@@ -12,6 +12,10 @@
 # reload is bounded by whole-file saves.
 set -euo pipefail
 
+# launchd does NOT inherit the shell PATH (the restic lesson in ~/Dev/CLAUDE.md
+# — same class, same fix): name the toolchain absolutely.
+export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
 REPO="/Users/ethan/Dev/amux"
 INSTALL="$HOME/.local/bin/amux-server-rs"
 STAMP="$HOME/.amux/rust-build-stamp"
