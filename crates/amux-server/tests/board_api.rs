@@ -1030,3 +1030,71 @@ async fn second_doing_for_same_session_is_refused_with_named_escape() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+// ---- board status (column) mutations (the live 405, 2026-08-09) ----------
+
+#[tokio::test]
+async fn status_column_crud_matches_python() {
+    let (app, _dir) = app();
+
+    // PATCH on a builtin (the exact 405 repro: rename the review column).
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        "/api/board/statuses/review",
+        Some(json!({ "label": "In Review!" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"], json!(true));
+
+    // POST create -> slugified id, 201.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board/statuses",
+        Some(json!({ "label": "Waiting On Vendor" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["id"], json!("waiting-on-vendor"));
+
+    // Reorder accepts the id.
+    let (st, _, v) = send(
+        &app,
+        "PUT",
+        "/api/board/statuses/reorder",
+        Some(json!({ "order": ["waiting-on-vendor", "review"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Builtin delete refused; custom delete moves cards to todo WITH an
+    // audit line on each card (AMUX-2491).
+    let (st, _, _) = send(&app, "DELETE", "/api/board/statuses/done", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // Hand-INSERT a row in the custom status (the python-interop idiom):
+    // rust card CREATE refuses statuses outside the typed vocabulary — a
+    // known divergence from Python's dynamic columns, carded separately —
+    // but rows in custom statuses EXIST in the shared DB and the column
+    // delete must still audit + move them.
+    let cid = "PY-777".to_string();
+    {
+        let conn = rusqlite::Connection::open(_dir.path().join("amux-test.db")).unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, created, updated) \
+             VALUES ('PY-777', 'stranded', 'waiting-on-vendor', 1786300000, 1786300000)",
+            [],
+        )
+        .unwrap();
+    }
+    let (st, _, v) = send(&app, "DELETE", "/api/board/statuses/waiting-on-vendor", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["moved"], json!(1));
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{cid}"), None).await;
+    assert_eq!(detail["status"], json!("todo"));
+    assert!(detail["log"]
+        .as_str()
+        .unwrap()
+        .contains("column 'waiting-on-vendor' deleted by"));
+}

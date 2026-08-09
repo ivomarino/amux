@@ -37,7 +37,13 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_board).post(create_item))
         // Static segment outranks /{id} in axum: /statuses never collides.
-        .route("/statuses", get(list_statuses))
+        .route("/statuses", get(list_statuses).post(create_status))
+        // Static /reorder outranks /{sid}; both outrank /api/board/{id}.
+        .route("/statuses/reorder", axum::routing::put(reorder_statuses))
+        .route(
+            "/statuses/{sid}",
+            axum::routing::patch(patch_status).delete(delete_status),
+        )
         .route("/{id}", get(get_item).patch(patch_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
@@ -94,6 +100,277 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
             .collect();
     }
     Json(Value::Array(out)).into_response()
+}
+
+
+// ---- board status (column) mutations -------------------------------------
+//
+// Python parity, amux-server.py:69484-69560 + 69209 (reorder). The PATCH was
+// the live 405 Ethan hit editing a column (request_log target
+// /api/board/statuses/review, 2026-08-09) — GET was ported for AMUX-2596 and
+// the mutation verbs were not.
+
+/// POST /api/board/statuses {label} -> 201 {id,label} (py:69484).
+async fn create_status(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let label = body
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if label.is_empty() {
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "missing label" }));
+    }
+    // Python: slugify, then -2..-19 suffix on collision.
+    let mut sid: String = label
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(30)
+        .collect();
+    sid = sid.trim_matches('-').to_string();
+    if sid.is_empty() {
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "invalid label" }));
+    }
+    let out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let out_w = out.clone();
+    let label_w = label.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let existing: Vec<String> = conn
+                .prepare("SELECT id FROM statuses")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect();
+            let mut final_id = sid.clone();
+            if existing.contains(&final_id) {
+                for i in 2..20 {
+                    let candidate = format!("{sid}-{i}");
+                    if !existing.contains(&candidate) {
+                        final_id = candidate;
+                        break;
+                    }
+                }
+            }
+            let max_pos: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(position),0) FROM statuses",
+                [],
+                |r| r.get(0),
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO statuses (id, label, position, is_builtin) VALUES (?, ?, ?, 0)",
+                rusqlite::params![final_id, label_w, max_pos + 1],
+            )?;
+            *out_w.lock().expect("status slot poisoned") = Some(final_id.clone());
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: format!("statuses:{final_id}"),
+                    mutation: MutationKind::Created,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    if let Err(e) = write {
+        return internal(e);
+    }
+    let sid = out.lock().expect("status slot poisoned").take().unwrap_or_default();
+    (StatusCode::CREATED, Json(json!({ "id": sid, "label": label }))).into_response()
+}
+
+/// PATCH /api/board/statuses/{sid} {label?, gate?} -> {ok:true} (py:69550).
+async fn patch_status(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let label = body
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // Python: "gate" present -> list of non-empty strings, else NULL.
+    let gate_update = body.get("gate").map(|g| {
+        let items: Vec<String> = g
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| match x {
+                        Value::String(s) => s.trim().to_string(),
+                        other => other.to_string().trim().to_string(),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if items.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&items).ok()
+        }
+    });
+    let sid_w = sid.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            if let Some(l) = &label {
+                conn.execute(
+                    "UPDATE statuses SET label = ? WHERE id = ?",
+                    rusqlite::params![l, sid_w],
+                )?;
+            }
+            if let Some(g) = &gate_update {
+                conn.execute(
+                    "UPDATE statuses SET gate = ? WHERE id = ?",
+                    rusqlite::params![g, sid_w],
+                )?;
+            }
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: format!("statuses:{sid_w}"),
+                    mutation: MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match write {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// DELETE /api/board/statuses/{sid} — refuse builtins; audit the bulk
+/// status rewrite onto every moved card (AMUX-2491: a column delete used to
+/// leave no trace) -> {ok, moved, ids[:50]} (py:69512-69549).
+async fn delete_status(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    const BUILTINS: [&str; 7] =
+        ["backlog", "todo", "doing", "review", "done", "verified", "discarded"];
+    if BUILTINS.contains(&sid.as_str()) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "cannot delete built-in status" }),
+        );
+    }
+    let (_, actor_name) = actor_from_headers(&headers);
+    let actor = if actor_name == "api-anonymous" { "human".to_string() } else { actor_name };
+    let out: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+    let out_w = out.clone();
+    let sid_w = sid.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let moved: Vec<String> = conn
+                .prepare("SELECT id FROM issues WHERE status = ?1 AND deleted IS NULL")?
+                .query_map([&sid_w], |r| r.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect();
+            let stamp = hhmm();
+            let mut events = Vec::new();
+            for card in &moved {
+                let line = format!(
+                    "status: {sid_w} -> todo (column '{sid_w}' deleted by {actor})"
+                );
+                conn.execute(
+                    "UPDATE issues SET log = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        bs::append_log(
+                            conn.query_row(
+                                "SELECT log FROM issues WHERE id = ?1",
+                                [card],
+                                |r| r.get::<_, Option<String>>(0),
+                            )?
+                            .as_deref(),
+                            &stamp,
+                            &line,
+                        ),
+                        card
+                    ],
+                )?;
+                events.push(PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: card.clone(),
+                    mutation: MutationKind::StatusChanged {
+                        from: sid_w.clone(),
+                        to: "todo".into(),
+                    },
+                    payload: None,
+                });
+            }
+            conn.execute(
+                "DELETE FROM statuses WHERE id = ?1 AND is_builtin = 0",
+                [&sid_w],
+            )?;
+            conn.execute(
+                "UPDATE issues SET status = 'todo' WHERE status = ?1 AND deleted IS NULL",
+                [&sid_w],
+            )?;
+            *out_w.lock().expect("status slot poisoned") = Some(moved);
+            Ok(WriteOutcome { applied: true, events })
+        })
+        .await;
+    if let Err(e) = write {
+        return internal(e);
+    }
+    let moved = out.lock().expect("status slot poisoned").take().unwrap_or_default();
+    Json(json!({
+        "ok": true,
+        "moved": moved.len(),
+        "ids": moved.iter().take(50).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// PUT /api/board/statuses/reorder {order:[ids]} -> {ok:true} (py:69210).
+async fn reorder_statuses(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let Some(order) = body.get("order").and_then(Value::as_array).filter(|a| !a.is_empty())
+    else {
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "missing order" }));
+    };
+    let ids: Vec<String> = order
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            for (pos, sid) in ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE statuses SET position = ?1 WHERE id = ?2",
+                    rusqlite::params![pos as i64, sid],
+                )?;
+            }
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: "statuses:reorder".into(),
+                    mutation: MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match write {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 // ---- shared helpers ------------------------------------------------------
