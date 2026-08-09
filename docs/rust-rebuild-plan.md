@@ -285,11 +285,37 @@ enum VerificationResult {
 }
 ```
 
-An issue moves `done -> verified` only when:
-1. CI/CD green on the merged commit
-2. Deployed to prod
-3. Confirmed working in prod (Playwright, smoke, manual)
-4. Zero regressions
+An issue moves `done -> verified` only when ALL applicable layers pass:
+
+1. **Implementation**: code compiles, no warnings, clippy clean
+2. **Unit tests**: all relevant unit tests pass
+3. **Integration tests**: all relevant integration tests pass
+4. **Backend conformance**: HerdrBackend and TmuxBackend pass conformance suite
+   where applicable (Invariant 21)
+5. **Provider conformance**: provider adapters pass conformance suite where
+   applicable (Invariant 21)
+6. **API**: endpoint returns correct response shapes, status codes, error bodies
+7. **CLI**: command produces correct output and side effects
+8. **Browser UI**: Playwright verifies the feature renders, is interactive, and
+   produces correct results -- DOM existence alone is NOT sufficient
+9. **Visual/rendering**: nonzero bounding boxes, no clipping, correct stacking,
+   usable touch targets, mobile geometry (Invariant 44)
+10. **Persistence/restart**: create/mutate -> stop server -> restart -> reconcile ->
+    read through API/CLI/UI -> verify unchanged/correct
+11. **Migration of existing data**: Python-era data loads and works correctly
+12. **Creation of net-new data**: fresh data through Rust system works correctly
+13. **Offline behavior**: applicable mutations work offline and replay correctly
+14. **Sync/reconciliation**: SSE events, delta sync, gap detection, convergence
+15. **Audit/event provenance**: DurableEvent emitted with correct actor, timestamp,
+    correlation IDs
+16. **Searchability**: entity appears in universal search (Invariant 32)
+17. **Performance**: meets target latency/memory constraints
+
+Not every layer applies to every item, but the Execution Checklist (§Execution
+Checklist) must state which layers are applicable for each item. The implementation
+agent may never mark a UI-facing capability verified based only on unit tests, API
+tests, DOM existence, code inspection, or a worker claiming success. For user-facing
+functionality, browser verification is required.
 
 This is what distinguishes amux from "workers with a kanban board."
 
@@ -2690,6 +2716,85 @@ made. This is enforced structurally, not by discipline:
 The bar: a new contributor should be able to understand the system by reading types,
 running tests, and querying the API -- without opening a single markdown file.
 
+### Invariant 45: Autonomous execution -- the plan is executable, not advisory
+
+An implementation agent given only this document and the instruction `execute` must be
+able to continue from the current repository state until every acceptance criterion is
+verified. It must not require a human to repeatedly tell it what to do next.
+
+The agent loop:
+
+1. Inspect the repository and current implementation state.
+2. Read this document.
+3. Find the first incomplete item in the Execution Checklist (§Execution Checklist).
+4. Implement it.
+5. Run its required tests.
+6. Repair failures.
+7. Collect evidence.
+8. Mark it `VERIFIED` only after all applicable acceptance criteria pass.
+9. Commit progress.
+10. Continue to the next runnable item (dependencies satisfied, not blocked).
+11. Repeat until the checklist contains no incomplete items.
+
+Human input is appropriate only when genuinely blocked on something external that
+cannot be safely inferred or tested: unavailable credentials, an irreversible business
+decision, or access to a system the agent cannot reach. Ordinary implementation
+uncertainty is NOT a reason to stop -- the agent should inspect the existing Python
+behavior, tests, database, browser behavior, Git history, APIs, and current Rust
+implementation and make the best evidence-supported decision.
+
+```rust
+enum BlockerKind {
+    ImplementationFailure,  // fix and continue -- never stop
+    TestFailure,            // fix and continue -- never stop
+    ExternalBlocker {       // credential, service, hardware
+        what: String,
+        evidence: String,
+        attempted: Vec<String>,
+        independent_work_remains: bool,
+    },
+    HumanDecisionRequired { // irreversible business decision
+        decision: String,
+        options: Vec<String>,
+        recommendation: Option<String>,
+    },
+}
+```
+
+`ImplementationFailure` and `TestFailure` never justify stopping. An `ExternalBlocker`
+creates a structured checklist entry and continues all unrelated runnable items. A
+single blocked integration must never halt the entire rebuild.
+
+**Progress rules:**
+
+At startup and after every completed item:
+1. Read the Execution Checklist.
+2. Reconcile checklist against actual repository/test state.
+3. Never trust stale `VERIFIED` markers if current tests fail -- reopen the item.
+4. Choose the first/highest-priority runnable non-verified item whose dependencies are
+   all `VERIFIED`.
+5. Work it to verification.
+6. Record evidence.
+7. Update checklist status.
+8. Commit.
+9. Continue.
+
+The checklist is a projection of reality, not a substitute for reality. If the
+checklist says `VERIFIED` but acceptance tests fail, the item is automatically reopened.
+
+**Ownership and parallelism:**
+
+If the implementation agent decomposes work to multiple workers:
+- Each checklist item has one current owner/lease at a time.
+- Workers may not implement the same item concurrently unless explicitly decomposed
+  into child items.
+- Child items link to parent.
+- Ownership expires/reconciles after crashes.
+- All worker output eventually resolves into the checklist item and its verification
+  evidence.
+
+This uses the same board/lease philosophy amux itself implements (Invariant 3/34).
+
 ---
 
 ## The Orchestrator (updated mental model)
@@ -4140,3 +4245,2193 @@ in the header shows "6 active / 41 idle / 67 stopped" -- three numbers, not one.
 - `done` as final state -> `done` (worker claim) vs `verified` (harness conclusion)
 - 30 Python threads -> single tokio select! loop + spawned tasks
 - Port doc -> system invariant doc with behavioral acceptance tests
+
+---
+
+## Autonomous Execution Contract
+
+This section defines the execution semantics that make this document sufficient for
+an autonomous agent to receive the instruction `execute` and continue until the
+rebuild is complete. The Execution Checklist at the bottom is the system of record.
+Everything above defines WHAT; this section and the checklist define HOW, WHEN, and
+WHAT COUNTS.
+
+### Definition of Verified
+
+A checklist item may be marked `VERIFIED` only when all applicable verification
+layers pass. Not every item uses every layer, but the checklist states which are
+applicable.
+
+```
+Layer                          Applies to
+─────────────────────────────  ──────────────────────────────────
+Implementation                 all items
+Unit tests                     all code items
+Integration tests              all subsystem items
+Backend conformance            worker, session, orchestrator items
+Provider conformance           provider, capacity, routing items
+API verification               all server-side items
+CLI verification               all CLI-exposed items
+Browser UI verification        all dashboard-visible items
+Visual/rendering               layout-sensitive UI items
+Persistence/restart            all durable-state items
+Migration (existing data)      all data-bearing subsystems
+Migration (net-new data)       all data-bearing subsystems
+Offline behavior               all user-facing mutations
+Sync/reconciliation            all SSE/revision items
+Audit/event provenance         all state transitions
+Searchability                  all entity types
+Performance                    latency/memory-sensitive items
+```
+
+Statuses:
+
+```
+TODO            — not started
+IN_PROGRESS     — implementation underway
+BLOCKED         — external dependency prevents progress (documented)
+IMPLEMENTED     — code exists but NOT verified
+VERIFYING       — acceptance tests running
+VERIFIED        — all applicable layers pass with evidence
+```
+
+Only `VERIFIED` counts as complete. `IMPLEMENTED` explicitly does NOT mean complete.
+
+### Migration requirements
+
+The Rust implementation must migrate real existing AMUX data, not merely create
+equivalent fresh data.
+
+**Before changing anything**, inventory the existing Python installation. Record
+counts and checksums where feasible for every durable data category:
+
+```
+workers/sessions                worker configuration
+groups                          board issues
+columns                         issue relationships
+gates                           messages/history
+schedules                       schedule runs
+memories                        prefs/settings
+browser profiles metadata       CRM contacts
+email metadata                  calendar events
+files/file metadata             interaction/event history
+token/cost ledger               integration configuration
+MCP configuration               alerts
+journal                         other SQLite tables
+```
+
+Do not assume the documented table count remains current. Discover the actual schema:
+`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;`
+
+**Migration manifest** -- one row per source entity:
+
+```
+source table/entity      source row count
+destination table/entity destination row count
+migration method         transformations applied
+validation method        status (Migrated/Transformed/Deprecated)
+```
+
+For every source row/entity, it must be one of:
+- **Migrated** -- exists in Rust with equivalent semantics
+- **Intentionally transformed** -- exists with documented changes
+- **Intentionally deprecated** -- removed with explicit reason, approval if semantic
+  data would be lost, and preservation/export path where appropriate
+
+Nothing may silently disappear.
+
+**Every major subsystem must be tested two ways:**
+
+1. **Existing-data path**: use data migrated from Python and prove it works in Rust.
+   Open a migrated issue, search migrated messages, run a migrated schedule, start a
+   migrated worker, view migrated logs, resolve migrated scoped config, access migrated
+   browser profile metadata.
+
+2. **Net-new path**: create new data through the Rust system and prove the complete
+   lifecycle works. Create worker, rename worker, change cwd, change model, create
+   group, create issue, create gate, create schedule, send message, perform search.
+
+A subsystem is not verified if only migration works or only fresh creation works.
+
+### Migration rehearsal
+
+Before production cutover:
+
+1. Clone/copy the current production AMUX data (DB file + `~/.amux/` state).
+2. Run migration end-to-end against the copy.
+3. Run all migration validation (manifest reconciliation).
+4. Start Rust server on migrated copy.
+5. Run browser/UI/CLI/API verification.
+6. Run representative workers through Herdr.
+7. Test offline/reconnect.
+8. Generate migration report.
+9. Destroy rehearsal copy.
+10. Repeat from a fresh production snapshot for actual cutover.
+
+The first attempt must not happen against the only copy of production data.
+
+### Herdr acceptance criteria
+
+Herdr is the default backend. The rebuild is not complete merely because
+`HerdrBackend` compiles. Verification must include real Herdr-backed E2E execution.
+
+**Mandatory Herdr golden scenario:**
+
+```
+create worker (Herdr backend)
+  → Herdr agent/session created
+  → create/assign issue
+  → worker executes via OpenCode AgentProtocol
+  → messages deliver at turn boundary
+  → status updates flow through SSE
+  → logs appear in structured events
+  → rate-limit state representable
+  → context/turn tracking works
+  → issue progresses through board states
+  → verification executes
+  → issue reaches verified
+  → restart AMUX server
+  → reconcile worker/session state
+  → continue functioning normally
+```
+
+**Additional Herdr verification:**
+
+- Worker rename with active Herdr session (session continues, no orphan)
+- Worker cwd change with Herdr (session replaced atomically)
+- Worker model change with Herdr (hot-switch or session restart)
+- Worker provider change with Herdr (session restart, state preserved)
+- AMUX restart while Herdr agent process exists (reconciliation)
+- Herdr process disappears unexpectedly (detect, report, recover)
+- Stale Herdr process discovered during reconciliation (clean up)
+- Multiple concurrent Herdr workers (10+, no cross-talk)
+- 40-worker load/conformance target (Herdr-backed)
+
+tmux must pass the same `SessionBackend` conformance contract as fallback, but
+successful Herdr verification is mandatory for release.
+
+### Browser verification depth
+
+DOM existence is not proof that something rendered correctly. For meaningful layout
+components, assert:
+
+- Nonzero bounding boxes
+- Expected visibility
+- No unintended clipping
+- No viewport overflow on desktop and mobile
+- Modal/menu position correct
+- Correct stacking (z-index)
+- Usable touch targets (>= 44px on mobile)
+- Mobile geometry at 375px
+- Scroll behavior
+
+Test at minimum: desktop Chromium, mobile viewport (375px), touch-enabled
+configuration. If practical, include WebKit/iOS tests for PWA-critical flows.
+
+**Deep nested workflows to test:**
+
+1. Board card edit: open board -> open card -> open menu -> edit -> focus field ->
+   type -> press Enter -> observe loading -> receive API response -> observe toast ->
+   receive SSE reconciliation -> verify final card state.
+
+2. Drag/drop with gate rejection: drag issue -> optimistic move -> gate rejects
+   with 409 -> gate UI appears -> card returns correctly -> satisfy gate -> retry ->
+   issue moves -> toast appears -> backend and UI revisions agree.
+
+3. Worker model change: open worker -> settings -> change model -> save -> session
+   replacement if needed -> state remains -> model indicator updates -> send message ->
+   new model answers.
+
+4. Worker rename: rename worker -> save -> list updates -> detail title updates ->
+   @old-name alias still resolves -> @new-name resolves -> issue ownership unchanged ->
+   Herdr session continues/reconciles.
+
+5. Worker cwd change: change cwd -> replacement session starts -> correct directory
+   visible -> issue/context preserved -> old session retired -> work continues.
+
+### Fault injection
+
+Provide deterministic test-harness fault injection for:
+
+```
+API 400                        API 401/403
+API 409 (conflict)             API 429 (rate limit)
+API 500                        timeout
+latency injection              connection loss
+server restart                 worker crash
+Herdr process loss             provider rate limit
+provider unavailable           dropped SSE events
+duplicate SSE events           out-of-order SSE events
+missed revision                offline during mutation
+offline during message         restart during sync
+```
+
+Test-only controls must never be exposed in production (`#[cfg(test)]` or equivalent).
+Every fault scenario asserts eventual consistency or an explicit durable blocked/error
+state.
+
+### Independent verification evidence
+
+Testing must verify outcomes, not implementation activity.
+
+| Bad | Good |
+|---|---|
+| Process produced output | Agent performed operation, result independently verifiable |
+| Worker says tests passed | Test harness independently executes tests, captures exit status |
+| Page contains HTML | AMUX-specific hydrated component is visible, interactive, correct |
+| Message was inserted into terminal | MessageId progressed through durable delivery semantics |
+
+### Persistent-data restart tests
+
+For every durable subsystem:
+
+```
+create/mutate data
+  → stop Rust server
+  → restart Rust server
+  → reconcile state
+  → read through API → correct
+  → read through CLI → correct
+  → inspect in UI → correct
+  → verify unchanged/correct
+```
+
+For worker-backed functionality, also test Herdr state reconciliation after restart.
+
+### Offline verification
+
+For each applicable UI mutation, classify its offline behavior:
+
+```
+offline-capable and queued     — mutation works offline, replays on reconnect
+read-only from cache           — data viewable but not mutable offline
+requires server                — explicitly disabled with clear indicator
+conflict-aware                 — offline mutation may conflict with server state
+```
+
+Offline-capable operations must be tested:
+
+```
+online baseline
+  → disconnect
+  → mutate
+  → verify optimistic UI
+  → reconnect
+  → replay
+  → backend accepts
+  → SSE/revision reconciliation
+  → final UI equals backend
+  → no duplicate side effect
+```
+
+### UI/backend convergence
+
+The backend database is authoritative. Every durable mutation receives a global
+revision and entity version (Invariant 35). The browser must:
+
+- Ignore stale events (rev <= last seen)
+- Deduplicate duplicate events (same rev)
+- Detect revision gaps (missing rev)
+- Delta-sync missing events (`/api/sync?since_rev=N`)
+- Reconcile after reconnect, tab wake, server restart
+
+**Convergence E2E tests:**
+
+- Drop every 5th SSE event -> client detects gap, delta syncs, converges
+- Deliver duplicate event -> client deduplicates, no phantom state
+- Deliver events out of order -> client applies in rev order
+- Disconnect/reconnect -> delta sync fills gap
+- Two browser tabs concurrently editing same issue -> both converge
+- Offline mutation conflicting with newer backend state -> conflict resolution
+- 1000 rapid board changes -> final UI equals final backend state
+
+### Historical incident regression corpus
+
+Create regression tests for architectural failure classes from the AMUX Git history:
+
+```
+incident_regression::duplicate_draft_resurrects_sent_message
+incident_regression::board_read_after_write_staleness
+incident_regression::stale_cache_overwrites_newer_state
+incident_regression::duplicate_plan_seeding
+incident_regression::session_record_exists_process_dead
+incident_regression::rate_limit_glyph_rendering_difference
+incident_regression::backend_delivery_false_success
+incident_regression::provider_smoke_passes_on_shell_prompt
+incident_regression::verification_matches_echoed_prompt
+incident_regression::tls_error_page_passes_health_check
+incident_regression::missing_cache_invalidation
+incident_regression::stale_queued_automation
+incident_regression::journal_treated_as_executable_issue
+incident_regression::manual_vs_scheduled_run_provenance
+incident_regression::browser_profile_split_brain
+incident_regression::spend_writers_overwriting
+incident_regression::process_restart_loses_oauth_state
+incident_regression::hidden_swallowed_exception
+incident_regression::gates_derived_from_stale_type
+incident_regression::dom_correct_zero_rendered_height
+```
+
+Each test references the incident/commit where useful. The Rust rebuild is not
+successful if it can reproduce a known architectural incident.
+
+### Final parity audit
+
+Before retiring Python, automatically compare Python and Rust behavior. Inventory:
+
+- API routes (all 212+ method/path combos)
+- Request/response shapes
+- CLI commands
+- Dashboard actions
+- Database entities
+- Scheduled jobs
+- Integrations
+- Worker operations
+- Prefs/config
+- Search
+- Offline capabilities
+
+Every current Python capability must be classified:
+
+```
+Parity              — identical behavior in Rust
+Improved/replaced   — better behavior, documented difference
+Intentionally deprecated — removed with explicit reason
+```
+
+No unknown/missing capability is acceptable.
+
+### Final release gate
+
+The rebuild is complete ONLY when all of the following are true:
+
+```
+[ ] Every Execution Checklist item is VERIFIED
+[ ] Zero TODO items
+[ ] Zero IN_PROGRESS items
+[ ] Zero VERIFYING items
+[ ] Zero unexplained BLOCKED items
+[ ] Full current Python data migration complete
+[ ] Migration manifest reconciles (every source entity accounted for)
+[ ] Net-new data tested for every subsystem
+[ ] Existing migrated data tested for every subsystem
+[ ] API acceptance suite green
+[ ] CLI acceptance suite green
+[ ] Playwright deep-interaction suite green
+[ ] Interaction coverage threshold satisfied (Invariant 44)
+[ ] Offline suite green
+[ ] Sync/revision fault suite green
+[ ] Herdr backend conformance green
+[ ] Real Herdr golden scenarios green (not just mock)
+[ ] tmux fallback conformance green
+[ ] Provider conformance green (Claude, Gemini, Codex, Ollama)
+[ ] Historical incident regression corpus green
+[ ] Property tests green
+[ ] Deterministic simulation green
+[ ] Performance targets green (latency, memory, CPU)
+[ ] 24h soak test green (no leaks, no drift)
+[ ] Restart/reconciliation tests green
+[ ] Search indexes rebuilt and verified
+[ ] All user-visible screens render correctly at desktop and mobile
+[ ] No browser console errors in golden scenarios
+[ ] No schema/data integrity failures
+[ ] Production migration rehearsal green
+[ ] Production cutover green
+[ ] Post-cutover verification green
+[ ] Rollback path tested
+```
+
+### Terminal completion condition
+
+The implementation agent may consider the assignment complete only when:
+
+1. The Rust server is the active AMUX implementation on port 8822.
+2. Real existing Python AMUX data has been migrated successfully.
+3. All applicable features work for migrated data AND newly-created data.
+4. API, CLI, browser, Herdr, offline, sync, restart, and failure tests pass.
+5. Every Execution Checklist item is `VERIFIED`.
+6. There are no unexplained parity gaps.
+7. The final verification report is generated:
+
+```
+RUST REBUILD: VERIFIED
+
+Checklist: X/X verified
+Migrated entities: X
+Migration failures: 0
+API tests: X/X
+CLI tests: X/X
+Browser tests: X/X
+UI interactions: X/X covered
+Offline tests: X/X
+Backend conformance:
+  Herdr: PASS
+  tmux: PASS
+Provider conformance:
+  Claude: PASS
+  Codex: PASS
+  Gemini: PASS
+  Ollama: PASS
+Historical regressions: X/X
+Performance: PASS
+Soak: PASS
+Remaining blockers: 0
+```
+
+Anything less means the executor should continue working.
+
+---
+
+## Execution Checklist
+
+This is the authoritative system of record for the Rust rebuild. Every implementation
+requirement elsewhere in this document maps to at least one checklist item. The
+checklist is maintained in this document -- there is no separate TODO file.
+
+An autonomous agent starts here: find the first incomplete item whose dependencies are
+all `VERIFIED`, implement it, verify it, mark it, commit, continue.
+
+**Notation:**
+- `Phase:` which migration phase this belongs to
+- `Depends on:` items that must be `VERIFIED` first
+- `Invariant:` which system invariant(s) this implements
+- `Verify:` which verification layers apply (from §Definition of Verified)
+- `Status:` TODO / IN_PROGRESS / BLOCKED / IMPLEMENTED / VERIFYING / VERIFIED
+- `Evidence:` what was produced to justify VERIFIED (filled in during execution)
+
+Items are grouped by phase. Within a phase, items may be worked in any order
+consistent with their dependencies.
+
+---
+
+### Phase 0: Foundation
+
+- [ ] RR-0001 — Rust workspace scaffold
+  Phase: 0
+  Depends on: none
+  Invariant: —
+  Requirement: Create Cargo workspace with crate structure: `amux-core`, `amux-server`,
+    `amux-cli`, `amux-dashboard`. Workspace-level dependencies for serde, tokio, sqlx,
+    axum, tracing.
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0002 — Core types: Scope, ScopeLevel, ScopedValue
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 2
+  Requirement: Three-tier scope (Global/Group/Worker) with deterministic merge. Worker
+    overrides Group overrides Global. `effective_config` resolves the full chain.
+  Tests: scope resolver merges correctly, worker wins conflicts, group gates override
+    global gates, worker env overrides group env
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0003 — Core types: Worker, WorkerConfig, WorkerCapabilities, WorkerState
+  Phase: 0
+  Depends on: RR-0001, RR-0002
+  Invariant: 1, 43
+  Requirement: Worker struct with immutable WorkerId, mutable WorkerConfig (display_name,
+    name_aliases, cwd, provider, model, backend, environment, permissions), WorkerState.
+    WorkerId is `wrk_01J...` format (ULID or similar). Version field for optimistic
+    concurrency.
+  Tests: WorkerId immutability, config mutation does not change identity, version
+    increments on mutation
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0004 — Core types: Session, BackendKind, ProcessRef
+  Phase: 0
+  Depends on: RR-0001, RR-0003
+  Invariant: 1, 33
+  Requirement: Session struct with SessionId, WorkerId, BackendKind (Herdr/Tmux),
+    ProcessRef, started_at/ended_at/exit_reason. Backend refs derive from WorkerId:
+    `format!("amux-{}", worker.id)`.
+  Tests: backend ref derives from WorkerId not display_name, session lifecycle states
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0005 — Core types: Issue, BoardTransition, IssueRelation
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 3, 4, 19
+  Requirement: Issue struct with all board fields. BoardTransition state machine with
+    valid/invalid transitions (including Archive/Restore). IssueRelation (Blocks,
+    DependsOn, RelatedTo, ParentOf, ChildOf). IssueDisposition (Runnable, Assigned,
+    Waiting, Terminal). Issue state vs execution state separation.
+  Tests: state machine rejects invalid transitions, Archive/Restore round-trip,
+    IssueDisposition is total, dependency graph acyclicity
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0006 — Core types: WorkerCommand, WorkerEvent, CommandState
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 5, 34
+  Requirement: Typed command/event protocol. CommandState (Queued/Dispatched/Delivered/
+    Confirmed/Failed/DeadLettered). DeliveryTiming (Immediate/AtTurnBoundary/WhenIdle).
+    CommandPrecondition (EntityVersion, EntityStatus, And). Idempotency key.
+  Tests: command state transitions, FIFO ordering, precondition evaluation,
+    dead-letter on retry exhaustion
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0007 — Core types: Provider, ProviderUsage, UsageWindow
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 8, 20
+  Requirement: Provider enum (ClaudeCode, Gemini, Codex, Ollama). ProviderUsage with
+    multiple UsageWindows (PerMinute/PerHour/Rolling/Daily/Weekly/Monthly/BillingPeriod/
+    SubscriptionAllowance). All fields Optional. UsageConfidence enum. ProviderCapabilities
+    struct. UsageProvenance enum (Api/ProviderCli/StructuredRuntime/HttpHeaders/
+    TerminalFallback/LocalAccounting/DerivedEstimate).
+  Tests: ProviderUsage windows never negative, unknown provider reports
+    UsageConfidence::Unknown, no invented numbers
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0008 — Core types: StateEvent, StateRevision, MutationResult
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 35, 37
+  Requirement: Global revision (monotonic u64) incremented in every mutating DB
+    transaction. StateEvent carries rev + entity_type + entity_id + mutation. Every
+    entity has a version field. MutationResult reports applied/rev/version/entity.
+    No-op mutations do not increment revision or version.
+  Tests: no-op mutation check, revision monotonicity, version increment
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0009 — Core types: DurableEvent, EventKind
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 24
+  Requirement: Append-only immutable event history. EventKind covers all lifecycle
+    transitions. Each event carries correlation IDs, actor, timestamp.
+  Tests: append succeeds for every EventKind variant, immutability enforced
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0010 — Core types: Message, MessageState, DeliveryState
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 29
+  Requirement: Message as durable entity (not command plumbing). Create, thread,
+    delivery state tracking (Queued/Delivered/Acknowledged/ActedOn). Group fan-out.
+  Tests: CRUD, thread linking, delivery state transitions, group fan-out
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0011 — Core types: Gate, GateEvaluator, GateCriterion
+  Phase: 0
+  Depends on: RR-0001, RR-0002
+  Invariant: 18, 28
+  Requirement: Gate as first-class entity with scope. GateEvaluator ordering:
+    Deterministic before Model. why-blocked returns gate id, criterion, missing
+    evidence, suggested command.
+  Tests: gate derivation per (item_type, scope), evaluator ordering, why-blocked output
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0012 — Core types: WaitingFor, StallReason, StallViolation
+  Phase: 0
+  Depends on: RR-0001, RR-0005
+  Invariant: 10
+  Requirement: WaitingFor enum (Dependency, Gate, User, Provider, ExternalCondition,
+    Capability). StallReason enum. StallViolation struct. Every non-terminal issue
+    resolves to exactly one IssueDisposition variant.
+  Tests: WaitingFor covers all non-terminal/non-runnable states, no-stall guarantee
+    property test
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0013 — Core types: Turn, TurnEvent, ContextFragment, ContextSnapshot
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 6, 16, 27
+  Requirement: Turn as first-class concept with TurnStarted/TurnCompleted events.
+    ContextFragment with priority ordering. ContextSnapshot recorded on every
+    assignment, content-hash stable for identical content.
+  Tests: priority ordering deterministic, hash stability
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0014 — Core types: MemoryEntry
+  Phase: 0
+  Depends on: RR-0001, RR-0002
+  Invariant: 42
+  Requirement: Memory as durable, scoped, revisioned entity. Fields: id, scope, name,
+    content, memory_type, version, created_at, updated_at, deleted_at, provenance.
+    Soft delete. Scope isolation.
+  Tests: CRUD, scope isolation, version increments, soft delete
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0015 — Core types: Verification, VerificationResult, Evidence
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 7, 28
+  Requirement: Verification struct with criteria, evidence, result. Cheapest-verifier-
+    first ordering (Command < HttpCheck < FileExists < PlaywrightAssertion <
+    ModelJudgment < HumanReview).
+  Tests: verifier ordering, short-circuit on free verifier failure
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0016 — Core types: Group, GroupConfig
+  Phase: 0
+  Depends on: RR-0001, RR-0002
+  Invariant: 12
+  Requirement: Group as first-class entity (not tags). Group-scoped configuration,
+    columns, gates, environment.
+  Tests: group scope isolation, config inheritance
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0017 — Core types: SearchHit, SearchResult, PagedResponse
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 32, 40
+  Requirement: Universal search types. SearchHit with entity_type, scope, provenance.
+    PagedResponse always reports total >= returned. Collection completeness guarantees.
+  Tests: PagedResponse invariant, search result shape
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0018 — Core types: ConfigApplyMode, ConfigChangeResult
+  Phase: 0
+  Depends on: RR-0003
+  Invariant: 43
+  Requirement: ConfigApplyMode (Immediate/NextTurn/SessionRestart). ConfigChangeResult
+    reports which mode was applied, whether session was replaced, old/new session IDs.
+    Classification: display_name/group/environment/permissions -> Immediate.
+    model (same provider, hot_model_switch) -> NextTurn. cwd/provider/backend -> SessionRestart.
+  Tests: classification correctness, session replacement atomicity
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0019 — SQLite schema: all tables as migrations
+  Phase: 0
+  Depends on: RR-0002 through RR-0018
+  Invariant: 35, 36
+  Requirement: All tables as sqlx migrations. WAL mode. Single-writer task. Global
+    revision counter table. Every entity table has a `version` column. Discover actual
+    Python schema and create migration manifest.
+  Migration: discover current Python schema (`sqlite_master`), document all tables,
+    create migration path for each
+  Tests: all tables created in in-memory DB, WAL mode active
+  Verify: Implementation, Unit tests, Data verification
+  Status: TODO
+
+- [ ] RR-0020 — Three-tier config loading (server.env, global/group/worker)
+  Phase: 0
+  Depends on: RR-0002, RR-0019
+  Invariant: 2
+  Requirement: Load `~/.amux/server.env`, merge with DB config. effective_config
+    resolver. `amux config show --effective --worker=X` shows full chain.
+  Tests: merge correctness, override precedence, env var loading
+  Verify: Implementation, Unit tests, Integration tests, CLI verification
+  Status: TODO
+
+- [ ] RR-0021 — axum HTTP server: router, static files, /health, auth
+  Phase: 0
+  Depends on: RR-0019, RR-0020
+  Invariant: 13
+  Requirement: axum router with all route groups. Static file embedding via rust-embed.
+    `/health` returns build hash, uptime, store status. Auth middleware.
+  Tests: health returns 200, auth rejects bad token, static files served
+  Verify: Implementation, Unit tests, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0022 — TLS: self-signed certificate on port 8822
+  Phase: 0
+  Depends on: RR-0021
+  Invariant: —
+  Requirement: Self-signed TLS certificate generation and loading. Port 8822 default.
+  Tests: HTTPS connection succeeds, HTTP redirect to HTTPS
+  Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0023 — SSE with revisioned StateEvents
+  Phase: 0
+  Depends on: RR-0008, RR-0021
+  Invariant: 35
+  Requirement: SSE endpoint delivers StateEvents with global revision. Client receives
+    events in rev order. Ping every 10s. Backpressure on channel overflow.
+  Tests: SSE delivers events within 2s, ping interval, backpressure behavior
+  Verify: Implementation, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0024 — Delta sync endpoint (/api/sync?since_rev=N)
+  Phase: 0
+  Depends on: RR-0008, RR-0021
+  Invariant: 35
+  Requirement: Returns all StateEvents since revision N. `full_sync_required: true`
+    when gap is too large. Bounded response size.
+  Tests: correct events returned, full_sync flag, boundary conditions
+  Verify: Implementation, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0025 — Golden scenario test harness (Playwright)
+  Phase: 0
+  Depends on: RR-0021, RR-0022
+  Invariant: 44, 45
+  Requirement: Playwright test infrastructure. Server starts, dashboard loads, health
+    returns 200. Auth flow. Mobile viewport (375px) renders without overflow.
+  Browser verification: dashboard loads in Chrome, no console errors
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0026 — UI interaction coverage infrastructure
+  Phase: 0
+  Depends on: RR-0025
+  Invariant: 44
+  Requirement: `data-testid` on every interactive element. Interaction contract
+    registry. DOM inventory crawler. Fault injection hooks (`#[cfg(test)]` only).
+  Tests: DOM crawler discovers all interactive elements, fault hooks compile-gated
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0027 — Deterministic orchestrator simulation framework
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 22
+  Requirement: Fake clock + fake backend. Orchestrator tick completes in <1ms.
+    Deterministic replay of random event sequences produces identical state.
+  Tests: simulation with 100 random sequences, deterministic replay
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028 — Property test infrastructure (proptest)
+  Phase: 0
+  Depends on: RR-0005, RR-0006, RR-0012
+  Invariant: 22
+  Requirement: proptest setup for BoardTransition, IssueDisposition, command queue,
+    scope merge, mutation/version invariants.
+  Tests: arbitrary state machine fuzzing, no-stall property, acyclicity
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+---
+
+### Phase 1: Workers + Orchestrator
+
+- [ ] RR-0029 — Orchestrator trait: WorkAssignment, Lease, tick loop
+  Phase: 1
+  Depends on: RR-0005, RR-0012, RR-0027
+  Invariant: 10, 22
+  Requirement: Orchestrator trait with work assignment, lease management, stall
+    detection. Runtime loop with configurable tick interval. Priority scoring
+    (critical-path + explicit + age + affinity + provider availability + cost).
+  Tests: 50-worker/200-issue simulation, no double-leases, optimal assignment,
+    lease expiration reclaims issue
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0030 — AgentProtocol: OpenCode implementation
+  Phase: 1
+  Depends on: RR-0006
+  Invariant: 5
+  Requirement: AgentProtocol trait impl for OpenCode. Direct communication:
+    send_prompt, deliver_message, cancel, pause, resume, state, events stream.
+    All agent interaction flows here, never through the backend.
+  Tests: protocol conformance suite (MockProtocol + OpenCodeProtocol)
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0031 — SessionBackend: HerdrBackend
+  Phase: 1
+  Depends on: RR-0004
+  Invariant: 1, 21, 33
+  Requirement: SessionBackend impl for herdr. Process lifecycle only: spawn,
+    terminate, status, attach_info, reconcile. No prompt routing through backend.
+    Agent ref: `format!("amux-{}", worker.id)`.
+  Tests: backend conformance suite, spawn/terminate/reconcile lifecycle
+  Verify: Implementation, Unit tests, Integration tests, Backend conformance
+  Status: TODO
+
+- [ ] RR-0032 — SessionBackend: TmuxBackend
+  Phase: 1
+  Depends on: RR-0004
+  Invariant: 1, 21, 33
+  Requirement: SessionBackend impl for tmux (fallback). Same trait contract as Herdr.
+    Target: `format!("=amux-{}:", worker.id)`. Pane-level commands use correct targeting.
+  Tests: backend conformance suite (same suite as Herdr)
+  Verify: Implementation, Unit tests, Integration tests, Backend conformance
+  Status: TODO
+
+- [ ] RR-0033 — Terminal adapter: ANSI stripping + rate-limit regex
+  Phase: 1
+  Depends on: RR-0006, RR-0007
+  Invariant: 5
+  Requirement: Terminal output -> WorkerEvent fallback translator. Provider-specific
+    rate-limit regexes (14 patterns for Claude, 2 for Gemini, 1 for Codex, 1 for Ollama).
+    Used only for signals OpenCode/hooks do not expose structurally.
+  Tests: ANSI stripper test corpus, all rate-limit patterns per provider
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0034 — Worker API: CRUD + start/stop/peek/send
+  Phase: 1
+  Depends on: RR-0003, RR-0021, RR-0029
+  Invariant: 13, 43
+  Requirement: Worker CRUD API. Start returns 202 (async). Stop, peek, send.
+    Worker config mutation via PATCH with ConfigApplyMode response.
+  Tests: API response shapes match OpenAPI, CRUD lifecycle, 409 on version conflict
+  Verify: Implementation, Unit tests, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0035 — Worker rename + alias resolution
+  Phase: 1
+  Depends on: RR-0003, RR-0034
+  Invariant: 17, 43
+  Requirement: Rename changes display_name, old name becomes alias. @old-name
+    still resolves. WorkerId unchanged. Backend ref unchanged. Issue ownership
+    unchanged. Herdr session continues (no orphan).
+  Tests: rename preserves WorkerId, alias resolution, @mention delivery via alias
+  Browser verification: list updates, detail title updates, @old-name resolves
+  Verify: Implementation, Unit tests, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0036 — Worker cwd change + session replacement
+  Phase: 1
+  Depends on: RR-0003, RR-0031, RR-0034
+  Invariant: 43
+  Requirement: cwd change triggers SessionRestart. Atomic session replacement:
+    checkpoint -> prepare context -> start new session in new cwd -> verify ready ->
+    atomically make current -> retire old session.
+  Tests: old session terminated only after new is healthy, worker identity preserved,
+    durable state preserved (issues, messages, memories, history, turns, gates,
+    schedules, metrics, search identity, audit/event history)
+  Browser verification: correct directory visible, context preserved, work continues
+  Verify: Implementation, Unit tests, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0037 — Worker model change (hot-switch vs restart)
+  Phase: 1
+  Depends on: RR-0003, RR-0007, RR-0034
+  Invariant: 20, 43
+  Requirement: If provider supports hot_model_switch -> NextTurn (no session restart).
+    Otherwise -> SessionRestart. Per-issue model override: issue uses specified model,
+    worker returns to configured model after completion.
+  Tests: hot-switch applied next turn, restart when needed, per-issue override lifecycle
+  Browser verification: model indicator updates
+  Verify: Implementation, Unit tests, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0038 — Worker provider change + session restart
+  Phase: 1
+  Depends on: RR-0003, RR-0031, RR-0034
+  Invariant: 43
+  Requirement: Provider change always triggers SessionRestart. All durable state
+    preserved: WorkerId, issue ownership, messages, memories, history, turns, gates,
+    schedules, metrics, search identity, audit/event history.
+  Tests: session restart, state preservation verification
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0039 — Worker backend change (Herdr <-> tmux)
+  Phase: 1
+  Depends on: RR-0031, RR-0032, RR-0034
+  Invariant: 33, 43
+  Requirement: Backend change triggers SessionRestart. Worker identity and durable
+    state preserved. Same board transitions, same WorkerEvents, same verification
+    result regardless of backend.
+  Tests: switch herdr->tmux and tmux->herdr, identical behavior above trait boundary
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0040 — Worker group/environment/permissions change
+  Phase: 1
+  Depends on: RR-0003, RR-0016, RR-0034
+  Invariant: 2, 43
+  Requirement: Group change -> Immediate (re-resolve scoped config). Environment
+    change -> Immediate. Permissions change -> Immediate. All are ConfigApplyMode::
+    Immediate.
+  Tests: scope resolution updates immediately, worker sees new config
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0041 — Orchestrator runtime loop + startup reconciliation
+  Phase: 1
+  Depends on: RR-0029, RR-0031, RR-0032
+  Invariant: 10, 11
+  Requirement: Startup reconciliation handles all mismatch states (DB vs backend).
+    Workers that exist in DB but not in backend -> report, attempt restart. Workers
+    in backend but not DB -> report stale process. Continuous stall check.
+  Tests: all mismatch states handled, stall_check fires correctly
+  Verify: Implementation, Unit tests, Integration tests, Persistence/restart
+  Status: TODO
+
+- [ ] RR-0042 — Worker SSE state stream
+  Phase: 1
+  Depends on: RR-0023, RR-0034
+  Invariant: 35
+  Requirement: Worker state changes delivered via SSE within 2s. Status transitions
+    (idle->active->rate_limited->idle) reflected in API within 1s.
+  Tests: SSE delivery timing, status transition latency
+  Verify: Implementation, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0043 — ProviderAdapter trait + conformance suite
+  Phase: 1
+  Depends on: RR-0007
+  Invariant: 20, 21
+  Requirement: ProviderAdapter trait with start_session, usage, models, capabilities.
+    ProviderCapabilities (usage_reporting, hot_model_switch, context_window_reporting,
+    rate_limit_reset_reporting, monetary_cost_reporting). Conformance suite per provider.
+  Tests: Claude/Gemini/Codex/Ollama adapter conformance, capability reporting
+  Verify: Implementation, Unit tests, Provider conformance
+  Status: TODO
+
+- [ ] RR-0044 — Provider capacity routing
+  Phase: 1
+  Depends on: RR-0007, RR-0029, RR-0043
+  Invariant: 20
+  Requirement: Scheduler uses known capacity when routing work. Three-layer usage
+    model: provider account -> model -> worker/issue. Fallback chain routes to
+    next-available provider when primary exhausted. Never silently changes configured
+    provider when policy forbids failover.
+  Tests: routing simulation with exhausted providers, policy enforcement
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0045 — @worker mention parsing + delivery
+  Phase: 1
+  Depends on: RR-0003, RR-0010
+  Invariant: 17, 29
+  Requirement: @worker mention parses from issue text, CLI input, dashboard input.
+    Delivery state machine: Queued->Delivered->Acknowledged->ActedOn. Alias resolution
+    (old worker names still match). Group mention fans out to all members.
+  Tests: mention parsing, delivery states, alias resolution, group fan-out
+  Verify: Implementation, Unit tests, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0046 — Integration: create worker on Herdr, full lifecycle
+  Phase: 1
+  Depends on: RR-0030, RR-0031, RR-0034
+  Invariant: 5, 21
+  Requirement: Create Claude worker on herdr, send prompt via OpenCode, receive events,
+    verify status transitions. End-to-end integration test with real Herdr process.
+  Tests: worker created, prompt sent, events received, status accurate
+  Verify: Implementation, Integration tests, Backend conformance
+  Status: TODO
+
+- [ ] RR-0047 — Integration: create worker on tmux, full lifecycle
+  Phase: 1
+  Depends on: RR-0030, RR-0032, RR-0034
+  Invariant: 5, 21, 33
+  Requirement: Same lifecycle as RR-0046 but with tmux backend. Identical behavior
+    above the SessionBackend trait boundary.
+  Tests: backend interchangeability verified
+  Verify: Implementation, Integration tests, Backend conformance
+  Status: TODO
+
+- [ ] RR-0048 — Playwright: worker list, start, status updates
+  Phase: 1
+  Depends on: RR-0025, RR-0034, RR-0042
+  Invariant: 44
+  Requirement: Worker list renders. Start button responds within 1s. Status badge
+    updates within 2s. Worker with group assignment shows group scope. Stall warning
+    when idle worker has non-terminal issues.
+  Browser verification: list, start, status, group, stall warning
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+---
+
+### Phase 2: Board + Dependency Graph
+
+- [ ] RR-0049 — Board API: all routes, 409 gate contract, force+audit
+  Phase: 2
+  Depends on: RR-0005, RR-0011, RR-0021
+  Invariant: 3, 13, 18
+  Requirement: Full board CRUD. 409 response with gate criteria, missing evidence,
+    suggested CLI command. `force=true` bypasses gate, writes audit trail with actor +
+    reason. API response shapes match OpenAPI contract.
+  Tests: gate derivation per (item_type, scope), force bypass audit, 409 body shape
+  Verify: Implementation, Unit tests, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0050 — Board dependency graph resolution
+  Phase: 2
+  Depends on: RR-0005, RR-0049
+  Invariant: 4
+  Requirement: Dependency graph with typed relations. Circular dependency detected
+    and rejected at creation. `board.runnable_issues()` uses dependency graph +
+    capabilities + scope. Topological ordering.
+  Tests: A blocks C + B blocks C -> both complete -> C runnable, circular rejection,
+    100-issue graph simulation
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0051 — Scoped gates: global/group/worker gate resolution
+  Phase: 2
+  Depends on: RR-0011, RR-0016, RR-0049
+  Invariant: 2, 18
+  Requirement: Global gates apply when group has no override. Group gate overrides
+    global. Worker-level gate overrides group. Gate inheritance chain:
+    global defines 3, group removes 1, worker adds 1 -> effective gates correct.
+  Tests: all inheritance combinations, column definitions scoped to group
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0052 — Atomic claim + lease management
+  Phase: 2
+  Depends on: RR-0029, RR-0049
+  Invariant: 3, 22
+  Requirement: Two concurrent claims -> exactly one succeeds (sqlx test with two
+    connections). Lease expiration releases issue. Original worker's claim is void
+    after expiration.
+  Tests: concurrent claim race, lease expiry, void claim
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0053 — Board auto-capture: prompt -> issue
+  Phase: 2
+  Depends on: RR-0049
+  Invariant: 3
+  Requirement: Every prompt creates a board issue. Title derived from first clause
+    of prompt (no model call -- Lesson L6). No throttle needed.
+  Tests: title derivation, every prompt gets a card
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0054 — Board full lifecycle: todo through verified
+  Phase: 2
+  Depends on: RR-0049, RR-0051
+  Invariant: 3, 7
+  Requirement: Complete lifecycle (todo->claimed->doing->review->done->verified) with
+    proper gate acks at each transition. DurableEvent emitted for every transition.
+  Tests: full lifecycle integration test, event emission
+  Verify: Implementation, Integration tests, API verification, Audit/event provenance
+  Status: TODO
+
+- [ ] RR-0055 — Archive/Restore transitions
+  Phase: 2
+  Depends on: RR-0005, RR-0049
+  Invariant: 3
+  Requirement: Archive { reason } and Restore { reason } transitions. Round-trip
+    preserves all issue fields. Archived issues excluded from default views but
+    discoverable.
+  Tests: archive/restore round-trip, field preservation, view filtering
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0056 — why-blocked API + gate explainability
+  Phase: 2
+  Depends on: RR-0011, RR-0049
+  Invariant: 18
+  Requirement: `GET /api/board/:id/why-blocked` returns gate id, criterion, missing
+    evidence, suggested CLI command. 409 body teaches what to do next.
+  Tests: why-blocked returns actionable info for all gate types
+  Verify: Implementation, Integration tests, API verification, Browser verification
+  Status: TODO
+
+- [ ] RR-0057 — Playwright: board rendering, drag-and-drop, gates
+  Phase: 2
+  Depends on: RR-0025, RR-0049, RR-0051
+  Invariant: 44
+  Requirement: Board renders. Drag-and-drop transitions work. Gate 409 shown as toast
+    with exact gate criteria and CLI command. Mobile board usable at 375px, touch
+    targets >= 44px. why-blocked detail panel.
+  Browser verification: all board interactions exercised
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+---
+
+### Phase 3: Scheduling
+
+- [ ] RR-0058 — DurableSchedule: CRUD + run history + audit trail
+  Phase: 3
+  Depends on: RR-0019, RR-0021
+  Invariant: 24
+  Requirement: Persist in DB with run history, missed-run behavior, timezone semantics,
+    retry policy. Scoped to global/group/worker. X-Amux-Session attribution on every
+    mutation. Source field distinguishes manual vs cron fires.
+  Tests: CRUD, run history, source discrimination, scope isolation
+  Verify: Implementation, Unit tests, Integration tests, API verification, Audit/event provenance
+  Status: TODO
+
+- [ ] RR-0059 — Cron expression parser
+  Phase: 3
+  Depends on: RR-0058
+  Invariant: —
+  Requirement: Parse all formats: `daily at HH:MM`, `every Nm`, `every weekday at
+    HH:MM`, `weekly on Monday at HH:MM`, `monthly on 1 at 9am`, 5-field cron.
+  Tests: all format variants, edge cases (DST, leap seconds)
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0060 — Missed-run behavior + retry
+  Phase: 3
+  Depends on: RR-0058
+  Invariant: —
+  Requirement: Configurable behavior on missed runs (skip vs catch-up). Retry policy
+    for failed runs.
+  Tests: skip and catch-up behaviors, retry with backoff
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0061 — Internal PeriodicTask system
+  Phase: 3
+  Depends on: RR-0001
+  Invariant: —
+  Requirement: In-memory, no run history. `tokio::time::interval`, not threads with
+    `time.sleep`. A slow task doesn't block others (spawned as separate tokio tasks).
+    Separate type from DurableSchedule.
+  Tests: tick at interval, no blocking, type separation
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0062 — Schedule API + Playwright
+  Phase: 3
+  Depends on: RR-0058, RR-0025
+  Invariant: 13, 44
+  Requirement: Schedule list, create, edit, run-now APIs. DurableEvent emitted for
+    fire, manual run, missed run. Dashboard schedule management.
+  Tests: API CRUD, run-now, events
+  Browser verification: schedule list, create, edit, run-now button
+  Verify: Implementation, Integration tests, API verification, Browser verification
+  Status: TODO
+
+---
+
+### Phase 4: Control Plane
+
+- [ ] RR-0063 — Command queue: DB-backed per-worker queue
+  Phase: 4
+  Depends on: RR-0006, RR-0019
+  Invariant: 34
+  Requirement: Per-worker command queue in DB. FIFO within priority. Bounded at 16
+    per worker, rejects with 429 at capacity. Idempotency key prevents duplicate
+    delivery. Survives server restart.
+  Tests: FIFO ordering, capacity rejection, idempotency, restart persistence
+  Verify: Implementation, Unit tests, Integration tests, Persistence/restart
+  Status: TODO
+
+- [ ] RR-0064 — WorkerCommand dispatch via AgentProtocol
+  Phase: 4
+  Depends on: RR-0030, RR-0063
+  Invariant: 5, 34
+  Requirement: Commands dispatched through AgentProtocol (OpenCode). Delivery
+    confirmation. Retry with backoff. Dead-letter after 3 retries with StallViolation.
+    CommandPrecondition revalidated at delivery time.
+  Tests: dispatch/confirm, retry/dead-letter, precondition evaluation
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0065 — WorkerEvent processing + turn tracking
+  Phase: 4
+  Depends on: RR-0013, RR-0030
+  Invariant: 5, 6
+  Requirement: OpenCode -> WorkerEvent translation. TurnStarted/TurnCompleted events
+    drive orchestrator. Terminal adapter as fallback for provider-specific detection.
+    Sequence numbers monotonic per worker, gap detection.
+  Tests: event translation, turn lifecycle, sequence gaps flagged
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0066 — Message delivery at turn boundaries
+  Phase: 4
+  Depends on: RR-0010, RR-0065
+  Invariant: 29
+  Requirement: Messages delivered at turn boundaries (not mid-turn) unless
+    DeliveryTiming::Immediate. Offline messages queued, delivered on reconnect.
+  Tests: boundary delivery, offline queue, reconnect replay
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0067 — Scan demotion + auto-responder
+  Phase: 4
+  Depends on: RR-0041
+  Invariant: —
+  Requirement: Hook-reported workers get demoted capture frequency (once per 60s
+    instead of every 13s). Hookless workers remain full-rate. Auto-responder for
+    `--dangerously-skip-permissions` workers.
+  Tests: demotion classification, rate reduction
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0068 — Dead-letter handling + visibility
+  Phase: 4
+  Depends on: RR-0064
+  Invariant: 34
+  Requirement: Commands that exhaust retries produce StallViolation + DurableEvent.
+    Dead-letter visible via `GET /api/workers/:id/dead-letters`. Queue depth in worker
+    health. Deep queue warns.
+  Tests: dead-letter creation, API visibility, health warning
+  Verify: Implementation, Integration tests, API verification, Browser verification
+  Status: TODO
+
+- [ ] RR-0069 — Compaction subsystem
+  Phase: 4
+  Depends on: RR-0013, RR-0014
+  Invariant: 31
+  Requirement: Context 70% -> prepare indicator. 85% -> compact (compacted fragment
+    created, source turns preserved, token_after < token_before). 95% -> checkpoint +
+    new session. New session hydrates from compacted context. Compaction never deletes
+    source turns/messages/logs. Compacted summary references source entries by ID.
+  Tests: threshold triggers, token reduction, source preservation, hydration
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0070 — ContextSnapshot on every assignment
+  Phase: 4
+  Depends on: RR-0013, RR-0029
+  Invariant: 27
+  Requirement: ContextSnapshot recorded on every work assignment. Content-hash stable
+    for identical content. Context assembly priority: issue > deps > memory > turns >
+    history.
+  Tests: snapshot creation, hash stability, priority ordering
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0071 — Memory entity CRUD (runtime)
+  Phase: 4
+  Depends on: RR-0014, RR-0019
+  Invariant: 42
+  Requirement: MemoryEntry CRUD with scope isolation, version increments, soft delete.
+    MEMORY.md generated from MemoryEntry table (read-only, derived data). Concurrent
+    writes to same entry -> 409 conflict.
+  Tests: CRUD, scope isolation, version conflict, MEMORY.md generation
+  Verify: Implementation, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0072 — Rate-limit detection + recovery
+  Phase: 4
+  Depends on: RR-0033, RR-0043
+  Invariant: 20
+  Requirement: Rate-limit auto-wait fires on structured or terminal output. Fleet
+    redistributes to available providers within 3 ticks. ProviderQuota state machine
+    for all ProviderState variants.
+  Tests: 10-worker simultaneous rate-limit simulation, redistribution timing
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0073 — Integration degradation tracking
+  Phase: 4
+  Depends on: RR-0021
+  Invariant: 23
+  Requirement: IntegrationState transitions reflected in /health. Gmail unavailable ->
+    email operations queue, recover on reconnect. Degradation visible in dashboard.
+  Tests: degradation state machine, queue/recover lifecycle
+  Verify: Implementation, Integration tests, API verification
+  Status: TODO
+
+- [ ] RR-0074 — Incident regression tests (Phase 4 subset)
+  Phase: 4
+  Depends on: RR-0063, RR-0069, RR-0071
+  Invariant: 41
+  Requirement: Create regression tests for: duplicate_draft_resurrects_sent_message,
+    board_read_after_write_staleness, stale_steering (command freshness).
+  Tests: incident_regression::* tests pass
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0075 — Playwright: control plane dashboard elements
+  Phase: 4
+  Depends on: RR-0025, RR-0042, RR-0068, RR-0069
+  Invariant: 44
+  Requirement: Worker status updates live. Rate-limit shown within 2s. Provider quota
+    dashboard shows fleet-level capacity. Compaction indicator on worker card (>70%).
+    Dead-letter badge. Queue health warning.
+  Browser verification: all control plane UI elements
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+---
+
+### Phase 5: Verification + Golden Scenarios
+
+- [ ] RR-0076 — Verification pipeline
+  Phase: 5
+  Depends on: RR-0015, RR-0054
+  Invariant: 7, 28
+  Requirement: done -> verification execution -> verified or rejected. Cheapest-
+    verifier-first ordering. Free verifier failure short-circuits (model verifier
+    never called). DurableEvent::VerificationStarted/Failed/Passed with evidence.
+  Tests: verification state machine, cost ordering, short-circuit, events
+  Verify: Implementation, Unit tests, Integration tests, Audit/event provenance
+  Status: TODO
+
+- [ ] RR-0077 — Issue detail: correlated views
+  Phase: 5
+  Depends on: RR-0076
+  Invariant: 30
+  Requirement: Issue detail API returns activity, messages, worker output, tool calls,
+    transitions, gate evaluations, verification evidence. Clicking a gate evaluation
+    traces to the tool call, turn, and worker output that produced the evidence.
+  Tests: correlated view assembly, trace navigation
+  Verify: Implementation, Integration tests, API verification, Browser verification
+  Status: TODO
+
+- [ ] RR-0078 — Golden scenario 1: Happy path (per provider)
+  Phase: 5
+  Depends on: RR-0046, RR-0076
+  Invariant: 7, 10
+  Requirement: User submits work -> decomposed into issues -> orchestrator assigns ->
+    worker executes -> completes -> verification -> verified. Per provider: Claude,
+    Gemini, Codex, Ollama. No stalls. Status never stale > 2s.
+  Browser verification: full end-to-end in real browser with Herdr
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0079 — Golden scenario 2: Failure + retry
+  Phase: 5
+  Depends on: RR-0076, RR-0078
+  Invariant: 7
+  Requirement: Verification rejects -> issue returns to doing with rejection reason
+    visible in UI -> worker retries -> succeeds -> verified.
+  Browser verification: rejection reason as toast and in issue detail
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0080 — Golden scenario 3: Rate limit recovery (per provider)
+  Phase: 5
+  Depends on: RR-0072, RR-0078
+  Invariant: 20
+  Requirement: Worker hits rate limit -> dashboard shows "rate limited" within 2s ->
+    reset time displayed -> worker auto-resumes -> issue completes. No manual
+    intervention.
+  Browser verification: rate-limit status, reset time, auto-resume
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0081 — Golden scenario 4: Dependency chain
+  Phase: 5
+  Depends on: RR-0050, RR-0078
+  Invariant: 4
+  Requirement: Parent with 3 children -> children run concurrently -> all complete ->
+    parent runnable -> assigned -> completed -> verified. Dependency graph respected.
+  Browser verification: dependency resolution visible in board
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0082 — Golden scenario 5: Scoped gates
+  Phase: 5
+  Depends on: RR-0051, RR-0078
+  Invariant: 2, 18
+  Requirement: Group A requires code review gate, Group B does not. Worker in A
+    blocked at review gate. Worker in B moves straight to done.
+  Browser verification: gate enforcement matches group scope
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0083 — Golden scenario 6: Offline mode
+  Phase: 5
+  Depends on: RR-0025, RR-0078
+  Invariant: 14
+  Requirement: Dashboard goes offline -> user creates 3 board cards + 2 worker
+    commands -> reconnects -> all 5 replay successfully -> no duplicates -> conflicts
+    shown as toasts.
+  Browser verification: offline create, reconnect replay, conflict handling
+  Offline verification: full offline mutation lifecycle
+  Verify: Browser verification, Offline behavior
+  Status: TODO
+
+- [ ] RR-0084 — Golden scenario 7: No-stall invariant
+  Phase: 5
+  Depends on: RR-0041, RR-0078
+  Invariant: 10
+  Requirement: 5 issues, 2 workers -> workers process -> at every 5s checkpoint:
+    no worker idle with non-terminal issues in scope -> all issues terminal.
+  Tests: zero stall violations across entire run
+  Verify: Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0085 — Golden scenario 8: Multi-provider fleet
+  Phase: 5
+  Depends on: RR-0043, RR-0078
+  Invariant: 8
+  Requirement: 1 Claude + 1 Gemini + 1 Ollama worker -> different issues each ->
+    all complete independently. Each provider's status updates timely.
+  Browser verification: no cross-provider confusion
+  Verify: Browser verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0086 — Golden scenario 9: Backend interchangeability
+  Phase: 5
+  Depends on: RR-0046, RR-0047
+  Invariant: 33
+  Requirement: Run happy path with AMUX_BACKEND=herdr, then identically with
+    AMUX_BACKEND=tmux. Same board transitions, WorkerEvents, verification result,
+    final issue state.
+  Tests: backend is invisible above SessionBackend trait
+  Verify: Integration tests, Backend conformance
+  Status: TODO
+
+- [ ] RR-0087 — Golden scenario 10: Real-time convergence
+  Phase: 5
+  Depends on: RR-0023, RR-0024
+  Invariant: 35
+  Requirement: Two tabs. Tab 1 creates 10 cards rapidly. SSE drops every 3rd event
+    to Tab 2. Tab 2 delta syncs. Both tabs identical. Kill server, restart, both
+    reconnect and delta sync. Mutate same issue from both tabs -> loser gets 409,
+    reconciles. Both converge to identical state.
+  Browser verification: two-tab convergence test
+  Verify: Browser verification, Sync/reconciliation
+  Status: TODO
+
+---
+
+### Phase 6: Email, Calendar, CRM
+
+- [ ] RR-0088 — Email: Gmail OAuth2, send/reply/inbox/search
+  Phase: 6
+  Depends on: RR-0021
+  Invariant: 13, 23
+  Requirement: Gmail OAuth2 via reqwest. Send, reply (correct In-Reply-To/References
+    threading), inbox, search. Scoped to worker. Integration degradation on failure.
+  Tests: OAuth token refresh (mock HTTP), send/reply threading, search
+  Migration: migrate email metadata from Python DB
+  Data verification: migrated email metadata accessible and correct
+  Verify: Implementation, Integration tests, API verification, Migration (existing),
+    Migration (net-new)
+  Status: TODO
+
+- [ ] RR-0089 — Calendar: events CRUD, iCal RFC 5545, S3 upload
+  Phase: 6
+  Depends on: RR-0021
+  Invariant: 13
+  Requirement: Calendar events CRUD. iCal generation (RFC 5545: line folding, UTC,
+    VALUE=DATE). S3 upload for Google/Apple Calendar subscriptions. Random key for
+    feed URL (never commit to public repo).
+  Tests: RFC 5545 compliance, S3 upload (LocalStack or mock), feed content
+  Migration: migrate calendar events from Python DB
+  Data verification: migrated calendar events appear in feed
+  Verify: Implementation, Integration tests, API verification, Migration (existing),
+    Migration (net-new)
+  Status: TODO
+
+- [ ] RR-0090 — CRM: contacts, tags, interactions
+  Phase: 6
+  Depends on: RR-0021
+  Invariant: 13
+  Requirement: Contact CRUD, tags, interactions. Scoped to global.
+  Tests: CRUD on in-memory DB, tag operations
+  Migration: migrate CRM contacts from Python DB
+  Data verification: migrated contacts accessible
+  Verify: Implementation, Integration tests, API verification, Migration (existing),
+    Migration (net-new)
+  Status: TODO
+
+- [ ] RR-0091 — Playwright: email/calendar/CRM dashboard
+  Phase: 6
+  Depends on: RR-0025, RR-0088, RR-0089, RR-0090
+  Invariant: 44
+  Requirement: Email compose form. Calendar event creation. CRM contact card. All
+    interactive elements have data-testid.
+  Browser verification: compose, create event, contact card
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+---
+
+### Phase 7: Browser Profiles, Files, Misc
+
+- [ ] RR-0092 — Browser profiles: CRUD, CDP, screenshots, lock cleanup
+  Phase: 7
+  Depends on: RR-0021
+  Invariant: 13
+  Requirement: BrowserProfile CRUD (native, no browser-use Python dep). Chrome
+    launched via CDP flags. Lock-file cleanup on server start (reconciliation).
+    Profile inventory shows saved auth domains. Screenshots via CDP
+    `Page.captureScreenshot`.
+  Tests: profile lifecycle, lock cleanup, CDP screenshot dimensions
+  Migration: migrate browser profile metadata from Python DB
+  Data verification: migrated profiles accessible
+  Verify: Implementation, Integration tests, API verification, Migration (existing),
+    Migration (net-new), Persistence/restart
+  Status: TODO
+
+- [ ] RR-0093 — Files: browse, upload, download
+  Phase: 7
+  Depends on: RR-0021
+  Invariant: 13
+  Requirement: File browser, upload, download. Ebook reader if applicable.
+  Tests: upload/download roundtrip
+  Verify: Implementation, Integration tests, API verification, Browser verification
+  Status: TODO
+
+- [ ] RR-0094 — Push notifications: VAPID + RFC 8291
+  Phase: 7
+  Depends on: RR-0021
+  Invariant: —
+  Requirement: Web Push encryption (RFC 8291). VAPID JWT generation. Subscription
+    lifecycle.
+  Tests: encryption roundtrip, JWT generation, subscription lifecycle
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0095 — Graph, journal, proxy, torrent, alerts, metrics
+  Phase: 7
+  Depends on: RR-0021
+  Invariant: —
+  Requirement: Remaining subsystems from Python server. Each must be inventoried
+    against the Python implementation and either ported or explicitly deprecated.
+  Migration: discover all subsystem tables, create manifest entries
+  Verify: Implementation, Integration tests, Migration (existing), Migration (net-new)
+  Status: TODO
+
+- [ ] RR-0096 — Playwright: browser profiles, files dashboard
+  Phase: 7
+  Depends on: RR-0025, RR-0092, RR-0093
+  Invariant: 44
+  Requirement: Browser tab shows profile inventory with auth domains. Start profile,
+    navigate, screenshot renders in dashboard. File browser navigable.
+  Browser verification: profile inventory, start/screenshot, file browser
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+---
+
+### Phase 8: Dashboard + CLI
+
+- [ ] RR-0097 — Extract SPA into amux-dashboard/static/
+  Phase: 8
+  Depends on: RR-0025
+  Invariant: —
+  Requirement: Extract ~44k-line inline SPA into separate static files. rust-embed
+    for compile-time inclusion. Version stamping via build.rs.
+  Tests: served dashboard matches extracted source
+  Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0098 — CLI: clap subcommand tree
+  Phase: 8
+  Depends on: RR-0034, RR-0049, RR-0058
+  Invariant: 13
+  Requirement: `amux` CLI mirroring the bash script. All subcommands: board (add, todo,
+    doing, done, type, claim), send, config (show), why, search, schedule, worker
+    (create, rename, config, start, stop).
+  Tests: `amux board add "test"` creates card, `amux send <worker> "hello"` delivers,
+    all subcommands produce correct output
+  CLI verification: all commands exercised
+  Verify: Implementation, Integration tests, CLI verification
+  Status: TODO
+
+- [ ] RR-0099 — Rename session -> worker in dashboard + CLI
+  Phase: 8
+  Depends on: RR-0097, RR-0098
+  Invariant: 1
+  Requirement: All `session` references become `worker` in dashboard UI and CLI output.
+  Tests: no remaining `session` references in user-facing text (grep)
+  Verify: Implementation, Browser verification, CLI verification
+  Status: TODO
+
+- [ ] RR-0100 — data-testid on every interactive element
+  Phase: 8
+  Depends on: RR-0097
+  Invariant: 44
+  Requirement: Every button, link, input, textarea, select, [role=button],
+    [role=menuitem], [tabindex], [data-action] has a stable semantic data-testid.
+  Tests: DOM inventory crawler finds all interactive elements, all have testid
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0101 — Interaction contract registry + DOM inventory crawler
+  Phase: 8
+  Depends on: RR-0100
+  Invariant: 44
+  Requirement: Machine-readable component capabilities registry. DOM crawler discovers
+    all data-testid elements across reachable UI states, diffs against registry, fails
+    on uncovered controls. CI gate: new data-testid without registered interaction
+    contract -> build fails.
+  Tests: crawler discovers all elements, coverage diff, CI gate enforcement
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0102 — Service worker + offline PWA shell
+  Phase: 8
+  Depends on: RR-0097
+  Invariant: 14
+  Requirement: Service worker caches shell URLs. Dashboard renders offline. Cache
+    invalidation on version bump (APP_VER + sw.js CACHE bumped together).
+  Tests: cache shell, disconnect, dashboard renders
+  Offline verification: PWA shell loads offline
+  Verify: Implementation, Integration tests, Offline behavior
+  Status: TODO
+
+- [ ] RR-0103 — Playwright: SSE revision convergence suite
+  Phase: 8
+  Depends on: RR-0023, RR-0024, RR-0025
+  Invariant: 35
+  Requirement: SSE delivers revisioned StateEvents in rev order. Rev gap triggers
+    delta sync. Two tabs mutate same issue -> both converge. Kill server, restart ->
+    client reconnects and delta-syncs. 1000 rapid board mutations -> UI finishes at
+    exact backend rev. Connection indicator (LIVE/STALE/OFFLINE/SYNCING). Optimistic
+    write rejected (409) -> rollback visible.
+  Browser verification: all convergence scenarios
+  Verify: Browser verification, Sync/reconciliation
+  Status: TODO
+
+- [ ] RR-0104 — Playwright: deep nested interaction paths
+  Phase: 8
+  Depends on: RR-0100, RR-0101
+  Invariant: 44
+  Requirement: Board card full nested path (open menu -> Move -> column picker ->
+    gate modal -> ack -> loading -> server accepts -> modal closes -> card moves ->
+    toast -> SSE reconciliation). Drag/drop as transaction. Drag/drop failure (409
+    -> return to original). Double-click on mutation buttons -> no duplicate.
+    Keyboard navigation (Enter/Space on all [role=button]). Text entry (empty + long
+    + Unicode). Loading states (every mutation disables control + shows spinner).
+    Server 500 -> error shown, local state sane.
+  Browser verification: all interaction paths
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+- [ ] RR-0105 — Playwright: fault injection suite
+  Phase: 8
+  Depends on: RR-0026, RR-0104
+  Invariant: 44
+  Requirement: sse_drop_every=5 -> verify convergence. latency_ms=1500 -> verify
+    loading states. Server restart mid-modal -> verify recovery. Offline during
+    mutation -> verify queue/replay.
+  Browser verification: all fault scenarios
+  Verify: Browser verification, Sync/reconciliation, Offline behavior
+  Status: TODO
+
+- [ ] RR-0106 — Playwright: mobile/touch/geometry assertions
+  Phase: 8
+  Depends on: RR-0100
+  Invariant: 44
+  Requirement: Touch targets >= 44px on mobile viewport (375px). Important containers
+    have height > 0. No viewport overflow. Browser back/forward restores state. Tab
+    sleep 10min -> wake -> delta sync -> UI current.
+  Browser verification: mobile geometry, touch, back/forward, sleep/wake
+  Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+- [ ] RR-0107 — Playwright: model-based state machine testing
+  Phase: 8
+  Depends on: RR-0104
+  Invariant: 44
+  Requirement: IssueModal state machine -- no impossible states reachable via
+    generated action sequences. Browser state matches model state.
+  Browser verification: model-based testing
+  Verify: Browser verification
+  Status: TODO
+
+---
+
+### Phase 9: Observability + Performance
+
+- [ ] RR-0108 — Correlation-ID tracing
+  Phase: 9
+  Depends on: RR-0009
+  Invariant: 24, 30
+  Requirement: Every operation traceable: issue -> assignment -> worker -> session ->
+    turn -> command -> tool -> outcome. Correlation IDs flow through entire stack.
+  Tests: correlation IDs present in all log entries for traced operation
+  Verify: Implementation, Integration tests, Audit/event provenance
+  Status: TODO
+
+- [ ] RR-0109 — Generalized `why` query system
+  Phase: 9
+  Depends on: RR-0108
+  Invariant: 24
+  Requirement: `amux why issue AR-42`, `amux why worker backend`, `amux why command
+    CMD-83`, `amux why schedule SCHED-108`, `amux why integration gmail`. All answered
+    from structured provenance, not grep over logs.
+  Tests: why query returns full provenance chain for each entity type
+  CLI verification: all `amux why` subcommands
+  Verify: Implementation, Integration tests, CLI verification, API verification
+  Status: TODO
+
+- [ ] RR-0110 — Universal search (FTS5)
+  Phase: 9
+  Depends on: RR-0017, RR-0019
+  Invariant: 32
+  Requirement: `GET /api/search?q=...` returns hits across issues, messages, events,
+    logs, workers, schedules, email, CRM. SearchHit provenance (entity_type, scope,
+    issue_id, worker_id, timestamp). FTS5 works completely offline. Search stack:
+    exact/filter -> SQLite index -> FTS5 -> optional semantic reranking.
+  Tests: cross-entity search, provenance chips, offline FTS5
+  Performance: FTS5 over 10k entities returns < 50ms
+  Verify: Implementation, Integration tests, API verification, Browser verification,
+    Performance, Searchability
+  Status: TODO
+
+- [ ] RR-0111 — Structured events + append-only logs
+  Phase: 9
+  Depends on: RR-0009, RR-0108
+  Invariant: 30
+  Requirement: Structured events for machines, append-only logs for humans. Same
+    issue shows both views, correlated by turn_id.
+  Tests: dual views present and correlated
+  Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0112 — Performance baselines + measurement
+  Phase: 9
+  Depends on: RR-0021
+  Invariant: —
+  Requirement: Dashboard load < 500ms cold / < 100ms cached. SSE latency < 2s.
+    Worker start < 3s. API p50/p95/p99 for all routes. RSS < 200MB with 40 idle
+    workers. CPU < 5% at idle. All targets measured under load (40 workers, 100 board
+    items). RSS flat over 24h soak. No FD leaks over 24h.
+  Tests: all latency targets met, memory stable, no leaks
+  Performance: all targets
+  Verify: Implementation, Performance
+  Status: TODO
+
+- [ ] RR-0113 — Playwright: search bar + provenance navigation
+  Phase: 9
+  Depends on: RR-0025, RR-0110
+  Invariant: 32, 44
+  Requirement: Universal search bar. Type query, results span all entity types with
+    provenance chips. Click navigates to entity detail with context.
+  Browser verification: search bar, results, navigation
+  Verify: Browser verification
+  Status: TODO
+
+---
+
+### Phase 10: CI/CD Pipeline
+
+- [ ] RR-0114 — CI pipeline: all stages
+  Phase: 10
+  Depends on: RR-0028, RR-0112
+  Invariant: 21, 44
+  Requirement: Pipeline stages: cargo check + clippy -> cargo test -> backend
+    conformance (Mock + Herdr + tmux) -> provider conformance -> Playwright -> UI
+    interaction coverage audit -> performance benchmarks -> SQLite migration test ->
+    binary size check -> incident regression corpus.
+  Tests: pipeline executes all stages
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0115 — Regression detection rules
+  Phase: 10
+  Depends on: RR-0114
+  Invariant: —
+  Requirement: Latency p95 increase > 10% = CI failure. RSS increase > 20% = CI
+    failure. Playwright scenario green-to-red blocks merge. Uncovered interactive
+    control blocks merge.
+  Tests: regression thresholds enforced
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0116 — Historical incident regression corpus
+  Phase: 10
+  Depends on: RR-0074
+  Invariant: 41
+  Requirement: All incident_regression::* tests from the corpus (20+ incidents).
+    Each references the original incident/commit. All must pass in CI.
+  Tests: all regression tests pass
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+---
+
+### Phase 11: Migration + Go-Live
+
+- [ ] RR-0117 — Schema discovery + diff validation
+  Phase: 11
+  Depends on: RR-0019
+  Invariant: 36
+  Requirement: Discover actual Python schema (`sqlite_master`). Run both servers'
+    migration code against same DB, diff schemas. Any mismatch blocks go-live.
+    Record actual table count (do not assume 47/51).
+  Data verification: schema diff clean
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0118 — Migration manifest: all tables
+  Phase: 11
+  Depends on: RR-0117
+  Invariant: 36
+  Requirement: One manifest row per source table/entity. Source row count, destination
+    row count, migration method, transformations, validation method, status. Every
+    source row is Migrated/Transformed/Deprecated. Nothing silently disappears.
+    Deprecated data has explicit reason and preservation path.
+  Data verification: manifest reconciles (source total = migrated + transformed + deprecated)
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0119 — Worker config migration (.env -> WorkerConfig)
+  Phase: 11
+  Depends on: RR-0003, RR-0118
+  Invariant: 43
+  Requirement: Python `.env` files -> validated WorkerConfig structs. Any validation
+    failure produces a report, not a silent skip. All worker identities preserved.
+  Data verification: all workers migrated with correct config
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0120 — Migration: board issues + relationships
+  Phase: 11
+  Depends on: RR-0049, RR-0118
+  Invariant: 3, 4
+  Requirement: All board issues, columns, relationships, gates migrated. Issue
+    IDs preserved. Dependency graph intact. Gate history preserved.
+  Data verification: row counts match, spot-check content
+  Verify: Implementation, Data verification, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0121 — Migration: messages + history
+  Phase: 11
+  Depends on: RR-0010, RR-0118
+  Invariant: 29
+  Requirement: All messages, threads, delivery state migrated. History preserved.
+  Data verification: message counts match, thread integrity
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0122 — Migration: schedules + schedule runs
+  Phase: 11
+  Depends on: RR-0058, RR-0118
+  Invariant: —
+  Requirement: All schedules and run history migrated. Source field preserved.
+  Data verification: schedule counts match, run history intact
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0123 — Migration: memories
+  Phase: 11
+  Depends on: RR-0071, RR-0118
+  Invariant: 42
+  Requirement: All memory entries migrated with scope, version, provenance.
+  Data verification: memory counts match, scope isolation preserved
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0124 — Migration: prefs/settings
+  Phase: 11
+  Depends on: RR-0020, RR-0118
+  Invariant: 2
+  Requirement: All prefs and settings migrated.
+  Data verification: pref counts match, values correct
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0125 — Migration: email, calendar, CRM data
+  Phase: 11
+  Depends on: RR-0088, RR-0089, RR-0090, RR-0118
+  Invariant: —
+  Requirement: Email metadata, calendar events, CRM contacts all migrated.
+  Data verification: row counts match per table
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0126 — Migration: browser profiles, files, interaction history
+  Phase: 11
+  Depends on: RR-0092, RR-0093, RR-0118
+  Invariant: —
+  Requirement: Browser profile metadata, files/file metadata, interaction/event
+    history, token/cost ledger migrated.
+  Data verification: row counts match, spot-check content
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0127 — Migration: integration config, MCP config, alerts, journal
+  Phase: 11
+  Depends on: RR-0095, RR-0118
+  Invariant: —
+  Requirement: All remaining Python tables migrated or explicitly deprecated.
+    Integration configuration, MCP configuration, alerts, journal entries.
+  Data verification: no table left unaccounted in manifest
+  Verify: Implementation, Data verification
+  Status: TODO
+
+- [ ] RR-0128 — Migration existing-data acceptance: board subsystem
+  Phase: 11
+  Depends on: RR-0120
+  Invariant: 3, 7
+  Requirement: Open a migrated issue in Rust server. View transitions. Check gates.
+    Edit. Search. Verify behavior identical to Python.
+  Browser verification: migrated board data works in UI
+  Verify: Integration tests, Browser verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0129 — Migration existing-data acceptance: worker subsystem
+  Phase: 11
+  Depends on: RR-0119
+  Invariant: 1, 43
+  Requirement: Start a migrated worker on Rust server. Verify config loaded correctly.
+    Verify worker identity preserved. Send prompt. Receive events.
+  Verify: Integration tests, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0130 — Migration existing-data acceptance: messages
+  Phase: 11
+  Depends on: RR-0121
+  Invariant: 29
+  Requirement: Search migrated messages. View thread. Verify delivery states.
+  Browser verification: migrated messages visible in UI
+  Verify: Integration tests, Browser verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0131 — Migration existing-data acceptance: schedules
+  Phase: 11
+  Depends on: RR-0122
+  Invariant: —
+  Requirement: View migrated schedules. Edit one. Run-now. Verify run history.
+  Browser verification: migrated schedules in dashboard
+  Verify: Integration tests, Browser verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0132 — Migration existing-data acceptance: scoped config
+  Phase: 11
+  Depends on: RR-0124
+  Invariant: 2
+  Requirement: Resolve migrated scoped config via `amux config show --effective`.
+    Verify inheritance chain correct.
+  CLI verification: effective config output
+  Verify: Integration tests, CLI verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0133 — Migration net-new acceptance: full lifecycle
+  Phase: 11
+  Depends on: RR-0078, RR-0118
+  Invariant: 7, 45
+  Requirement: Create new worker, new group, new issue, new gate, new schedule,
+    send message, rename worker, change cwd, change model, upload file, perform
+    search. Full lifecycle through Rust system with fresh data.
+  Verify: Integration tests, Browser verification, CLI verification, Migration (net-new)
+  Status: TODO
+
+- [ ] RR-0134 — Shadow mode: Rust on 8823 alongside Python on 8822
+  Phase: 11
+  Depends on: RR-0118 through RR-0133
+  Invariant: —
+  Requirement: Both servers read same DB (WAL concurrent readers). Automated
+    traffic replay compares responses. Run for 1 week.
+  Tests: response comparison, no divergence
+  Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0135 — Swap: Rust on 8822, Python on 8823 as fallback
+  Phase: 11
+  Depends on: RR-0134
+  Invariant: —
+  Requirement: Update launchd plist. Monitor for 48h. Python available as fallback.
+  Tests: health check, 48h stability
+  Verify: Implementation, Persistence/restart
+  Status: TODO
+
+- [ ] RR-0136 — Rollback verification
+  Phase: 11
+  Depends on: RR-0135
+  Invariant: —
+  Requirement: Stop Rust, start Python on 8822. DB compatible in both directions
+    (no destructive migrations). Any worker switches herdr -> tmux without data
+    migration or identity change.
+  Tests: rollback executed, Python serves correctly with same DB
+  Verify: Implementation, Integration tests, Persistence/restart
+  Status: TODO
+
+- [ ] RR-0137 — Cloud deployment: Rust Docker image
+  Phase: 11
+  Depends on: RR-0135
+  Invariant: —
+  Requirement: Update deploy-cloud.yml. Rust binary built with
+    `--target x86_64-unknown-linux-musl` for Alpine. Same single-codebase rule:
+    one binary, no cloud/local branching.
+  Tests: Docker image builds, container starts, health returns 200
+  Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0138 — Migration rehearsal
+  Phase: 11
+  Depends on: RR-0118 through RR-0133
+  Invariant: 45
+  Requirement: Clone production data -> run migration end-to-end -> validate
+    manifest -> start Rust on migrated copy -> browser/CLI/API verification ->
+    representative Herdr workers -> offline/reconnect -> generate report ->
+    destroy copy -> repeat for actual cutover.
+  Data verification: rehearsal report generated, all checks pass
+  Verify: Data verification, Integration tests, Browser verification, Offline behavior
+  Status: TODO
+
+- [ ] RR-0139 — Production cutover
+  Phase: 11
+  Depends on: RR-0135, RR-0138
+  Invariant: 45
+  Requirement: Execute cutover sequence from fresh production snapshot. Rust
+    becomes active on port 8822.
+  Data verification: all migrated data accessible and correct
+  Verify: Data verification, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0140 — Post-cutover verification
+  Phase: 11
+  Depends on: RR-0139
+  Invariant: 7, 45
+  Requirement: After cutover, verify all user-visible screens render. API/CLI/browser
+    acceptance suites pass against live server. No browser console errors. No schema
+    integrity failures.
+  Browser verification: all screens, no console errors
+  Verify: Browser verification, API verification, CLI verification, Data verification
+  Status: TODO
+
+---
+
+### Cross-Cutting
+
+- [ ] RR-0141 — Herdr backend conformance: full E2E
+  Phase: 5 (after Phase 1 impl)
+  Depends on: RR-0031, RR-0046
+  Invariant: 21, 33
+  Requirement: Herdr golden scenario (create worker -> issue -> execute -> messages ->
+    status -> logs -> rate-limit -> context -> issue verified -> restart AMUX ->
+    reconcile -> continue). Worker rename/cwd/model/provider change with Herdr.
+    AMUX restart while Herdr agent exists. Herdr process disappears. Stale process
+    reconciliation. 10+ concurrent Herdr workers. 40-worker load target.
+  Verify: Backend conformance, Integration tests, Persistence/restart
+  Status: TODO
+
+- [ ] RR-0142 — tmux backend conformance: same contract
+  Phase: 5 (after Phase 1 impl)
+  Depends on: RR-0032, RR-0047
+  Invariant: 21, 33
+  Requirement: tmux passes identical SessionBackend conformance suite as fallback.
+    All operations that work on Herdr also work on tmux.
+  Verify: Backend conformance, Integration tests
+  Status: TODO
+
+- [ ] RR-0143 — Provider conformance: Claude adapter
+  Phase: 1
+  Depends on: RR-0043
+  Invariant: 20, 21
+  Requirement: Claude adapter passes full provider conformance suite. 14 rate-limit
+    patterns. OAuth + API key auth. ProviderCapabilities correctly reported.
+    UsageWindow normalization.
+  Verify: Provider conformance, Unit tests
+  Status: TODO
+
+- [ ] RR-0144 — Provider conformance: Gemini adapter
+  Phase: 1
+  Depends on: RR-0043
+  Invariant: 20, 21
+  Requirement: Gemini adapter passes conformance suite. 2 rate-limit patterns.
+    API key auth. Daily limit handling.
+  Verify: Provider conformance, Unit tests
+  Status: TODO
+
+- [ ] RR-0145 — Provider conformance: Codex adapter
+  Phase: 1
+  Depends on: RR-0043
+  Invariant: 20, 21
+  Requirement: Codex adapter passes conformance suite. 1 rate-limit pattern.
+    Usage-limit handling.
+  Verify: Provider conformance, Unit tests
+  Status: TODO
+
+- [ ] RR-0146 — Provider conformance: Ollama adapter
+  Phase: 1
+  Depends on: RR-0043
+  Invariant: 20, 21
+  Requirement: Ollama adapter passes conformance suite. Connection/model-not-found
+    handling. UsageConfidence::Unknown (no invented numbers).
+  Verify: Provider conformance, Unit tests
+  Status: TODO
+
+- [ ] RR-0147 — Offline PWA: mutation classification + queue/replay
+  Phase: 8
+  Depends on: RR-0102
+  Invariant: 14
+  Requirement: Classify every UI mutation: offline-capable/read-only/requires-server/
+    conflict-aware. Offline-capable mutations: queue -> optimistic UI -> reconnect ->
+    replay -> backend accepts -> SSE reconciliation -> UI equals backend -> no
+    duplicate side effect.
+  Offline verification: per-mutation offline classification and test
+  Verify: Offline behavior, Browser verification
+  Status: TODO
+
+- [ ] RR-0148 — Sync/reconciliation: convergence under faults
+  Phase: 8
+  Depends on: RR-0023, RR-0024, RR-0103
+  Invariant: 35
+  Requirement: Drop every 5th event -> converge. Duplicate events -> deduplicate.
+    Out-of-order -> apply in rev order. Disconnect/reconnect -> delta sync. Two tabs
+    editing -> both converge. Offline mutation conflicting -> resolution. 1000 rapid
+    changes -> final UI equals backend.
+  Verify: Sync/reconciliation, Browser verification
+  Status: TODO
+
+- [ ] RR-0149 — Durable events: complete lifecycle coverage
+  Phase: 4 (extends through all phases)
+  Depends on: RR-0009
+  Invariant: 24
+  Requirement: DurableEvent emitted for: all board transitions, worker lifecycle,
+    schedule fires/manual runs, verification started/passed/failed, command dispatch/
+    delivery/dead-letter, message delivery, config changes, gate evaluations.
+  Tests: event emission for every lifecycle transition
+  Verify: Implementation, Integration tests, Audit/event provenance
+  Status: TODO
+
+- [ ] RR-0150 — Persistent-data restart tests: all subsystems
+  Phase: 9 (after all subsystems implemented)
+  Depends on: RR-0041, RR-0054, RR-0058, RR-0071, RR-0092
+  Invariant: 7
+  Requirement: For every durable subsystem: create/mutate -> stop server -> restart ->
+    reconcile -> read through API -> read through CLI -> inspect in UI -> verify
+    unchanged/correct. Herdr state reconciliation after restart.
+  Verify: Persistence/restart, API verification, CLI verification, Browser verification
+  Status: TODO
+
+- [ ] RR-0151 — Historical incident regression: full corpus
+  Phase: 10
+  Depends on: RR-0074, RR-0116
+  Invariant: 41
+  Requirement: All 20+ incident regression tests pass. Each references original
+    incident. No known architectural failure class reproducible in Rust.
+  Tests: full corpus green
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0152 — 24h soak test
+  Phase: 10
+  Depends on: RR-0112
+  Invariant: —
+  Requirement: RSS stays flat over 24h. No file descriptor leaks. No degradation.
+    40 workers, 100 board items, continuous activity.
+  Performance: 24h stability
+  Verify: Performance
+  Status: TODO
+
+- [ ] RR-0153 — Final parity audit: Python vs Rust
+  Phase: 11
+  Depends on: RR-0118
+  Invariant: 45
+  Requirement: Inventory all Python capabilities: 212+ API routes, CLI commands,
+    dashboard actions, database entities, scheduled jobs, integrations, worker
+    operations, prefs/config, search, offline capabilities. Every capability
+    classified: Parity / Improved / Intentionally deprecated. No unknown/missing.
+  Data verification: parity manifest complete, zero unknown gaps
+  Verify: Data verification
+  Status: TODO
+
+- [ ] RR-0154 — Python shutdown criteria
+  Phase: 11
+  Depends on: RR-0140, RR-0153
+  Invariant: 45
+  Requirement: Python server may be retired only when: every RR item is VERIFIED,
+    parity audit complete, 48h soak on Rust in production, zero rollback-worthy
+    incidents. Keep Python binary available for 30 days after cutover.
+  Verify: Data verification
+  Status: TODO
+
+---
+
+### Release Gate
+
+- [ ] RR-0155 — Final release gate verification
+  Phase: 11
+  Depends on: RR-0001 through RR-0154
+  Invariant: 7, 45
+  Requirement: Every item above is VERIFIED. Zero TODO/IN_PROGRESS/VERIFYING items.
+    Zero unexplained BLOCKED items. All release gate checks pass (see §Final release
+    gate). Generate terminal verification report.
+  Evidence: terminal verification report with all metrics
+  Verify: all layers
+  Status: TODO
+
+---
+
+**The document is complete when implementation no longer requires interpretation of the
+intended end state. The implementation is complete when every requirement has independent
+evidence that it works.**
