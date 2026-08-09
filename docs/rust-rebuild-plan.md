@@ -141,7 +141,8 @@ enum BoardTransition {
     Complete { evidence: Vec<Evidence> },
     Verify { criteria: Vec<Criterion>, evidence: Vec<Evidence> },
     Force { status: Status, reason: String },
-    Archive,
+    Archive { reason: String },
+    Restore { reason: String },
 }
 
 // Every transition: one function, one code path, audited by construction
@@ -358,6 +359,11 @@ async fn reconcile_on_startup(ctx: &AppContext) {
 system failure.** Terminal states are: `verified`, `archived`, `discarded`, and
 `blocked_by_user`. Everything else must keep moving.
 
+**Every non-terminal issue must have exactly one of: a runnable next action, a named
+actor responsible for the next action, or a structured wait reason.** "Nothing is
+driving this" is an impossible state, not a thing the stall detector discovers
+afterward.
+
 ```rust
 enum TerminalStatus {
     Verified,
@@ -366,11 +372,34 @@ enum TerminalStatus {
     BlockedByUser { reason: String },
 }
 
+enum WaitingFor {
+    Dependency(IssueId),
+    Gate { gate: GateId, missing: Vec<GateCriterion> },
+    User { actor: Actor, question: String },
+    Provider { kind: WaitReason },
+    ExternalCondition { description: String, check: Option<VerifierKind> },
+    Capability { needed: Vec<String>, available_workers: Vec<WorkerId> },
+}
+
+// Every non-terminal issue resolves to exactly one of these:
+enum IssueDisposition {
+    Runnable,                            // can be picked up now
+    Assigned { worker: WorkerId },       // someone is working on it
+    Waiting(WaitingFor),                 // blocked, with structured reason
+    Terminal(TerminalStatus),            // done, nothing to do
+}
+
+fn disposition(issue: &Issue, board: &Board) -> IssueDisposition {
+    // This function must be total -- every issue resolves to one variant.
+    // If none of the conditions match, that is a compile-time error
+    // (exhaustive match), not a runtime discovery.
+}
+
 // The orchestrator runs this check on every tick:
 fn stall_check(worker: &Worker, board: &Board) -> Vec<StallViolation> {
     if worker.state != WorkerState::Idle { return vec![]; }
     board.issues_for_worker(worker.id)
-        .filter(|i| !i.status.is_terminal())
+        .filter(|i| matches!(disposition(i, board), IssueDisposition::Runnable))
         .map(|i| StallViolation {
             worker_id: worker.id,
             issue_id: i.id,
@@ -383,13 +412,19 @@ fn stall_check(worker: &Worker, board: &Board) -> Vec<StallViolation> {
 
 When the orchestrator detects a stall:
 1. If the worker is rate-limited: wait (not idle, not a stall)
-2. If the issue is blocked by a dependency: no stall (it is waiting for another issue)
-3. If the worker has no runnable issues left in its scope: escalate to the group or
+2. If the issue is blocked by a dependency: no stall (it is `Waiting(Dependency(...))`)
+3. If the issue is waiting on a gate: no stall (it is `Waiting(Gate(...))`)
+4. If the worker has no runnable issues left in its scope: escalate to the group or
    reassign
-4. Otherwise: the worker MUST be given the issue and told to continue
+5. Otherwise: the worker MUST be given the issue and told to continue
+
+The dashboard shows `WaitingFor` inline on every non-terminal, non-assigned issue.
+A user looking at the board sees exactly WHY each item is waiting, not just that it
+is stuck. `IssueDisposition::Waiting` with no resolution path (e.g., waiting on a
+capability no worker has) triggers an escalation alert.
 
 This is tested in every Playwright golden scenario: at the end of every test, assert
-that no worker is idle with non-terminal issues. A stall is a CI failure.
+that no worker is idle with runnable issues. A stall is a CI failure.
 
 ### Invariant 11: Worker state is always current
 
@@ -956,6 +991,8 @@ struct QueuedCommand {
     command: WorkerCommand,
     idempotency_key: Uuid,
     enqueued_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    precondition: Option<CommandPrecondition>,
     deliver_at: DeliveryTiming,    // Immediate | AtTurnBoundary | After(Duration)
     attempts: u32,
     max_attempts: u32,             // default 3
@@ -1002,6 +1039,53 @@ If step 5 never arrives: after timeout, mark DeadLettered + StallViolation
 Duplicate commands with the same idempotency key return the existing result without
 re-dispatching. This is critical during restarts: the reconciliation loop
 (Invariant 9) reprocesses pending commands, and idempotency prevents double delivery.
+
+#### Command preconditions (freshness at delivery)
+
+A queued command may have been valid at creation time but false at delivery time.
+From the commit history: notifications keyed off current state instead of the
+assignment event; nudges told workers to act on work whose state had since changed;
+steering re-checked whether a board card still existed before delivery.
+
+The fix: automated commands that depend on state carry preconditions and are
+revalidated at delivery time.
+
+```rust
+enum CommandPrecondition {
+    EntityVersion { entity_type: EntityType, entity_id: EntityId, version: u64 },
+    EntityStatus { entity_type: EntityType, entity_id: EntityId, status: Status },
+    And(Vec<CommandPrecondition>),
+}
+```
+
+At delivery, the orchestrator evaluates the precondition against current state.
+If it fails:
+
+```rust
+enum PreconditionResult {
+    Satisfied,
+    Failed { expected: String, actual: String },
+    EntityGone,
+}
+
+// Failed precondition -> command expires, never delivered
+CommandState::Expired { reason: PreconditionResult }
+```
+
+Human-authored messages (user sends text to a worker) carry no precondition and
+always deliver. State assertions and automation commands (nudges, advance,
+reassignment) carry preconditions. This is the root fix for an entire family of
+stale-nudge bugs.
+
+Example:
+```
+"Tell worker to review AR-42"
+precondition: AR-42.version == 17 AND AR-42.status == review
+
+At delivery, AR-42 is now verified:
+  -> CommandState::Expired { PreconditionResult::Failed }
+  -> not delivered, DurableEvent emitted
+```
 
 #### Event ordering guarantees
 
@@ -1284,6 +1368,220 @@ The ugly cases, tested explicitly:
 - Entity version conflict (two clients edit same issue) -> loser gets 409
 - Optimistic write applied then server rejects -> rollback visible to user
 
+### Invariant 36: Single source of truth
+
+**Every durable fact has exactly one canonical owner. Everything else is a projection,
+cache, index, or derived representation.**
+
+This is the most frequently violated principle in the commit history. The 30-day
+audit found it in multiple independent subsystems:
+
+- `acceb79f`: composer draft lived in 3 stores; clearing one let two others resurrect it
+- `59a90e9`: browser profile you logged into vs. profile the agent opened were different stores
+- `89e7981`: two things wrote spend; the approximate poller overwrote exact proxy metering
+- `b63e0e3`: every UI surface independently guessed what kind of message something was
+- `04b2dfc`: server and client had different ideas of valid statuses
+
+The canonical owners:
+
+```
+Issue state         -> Board (Invariant 3)
+Worker state        -> Worker state machine (Invariant 11)
+Message             -> Message store (Invariant 29)
+Gate definition     -> Gate store (Invariant 18)
+Memory              -> MemoryEntry table (Invariant 42)
+Provider state      -> Runtime event stream (Invariant 20)
+Browser profile     -> BrowserProfile store
+Schedule            -> DurableSchedule table
+Scope config        -> Scope resolver (Invariant 2)
+Search index        -> Derived from source entities (Invariant 32)
+UI state            -> Projection of EntityStore (Invariant 35)
+```
+
+The dashboard cache is NOT state. `MEMORY.md` is NOT memory. Herdr output is NOT
+worker state. Search index is NOT content. A compacted summary is NOT history.
+
+Implementation: every entity store has a single write path. Caches and projections
+are regenerated from the canonical source, never written back. When a cache
+disagrees with its source, the source wins unconditionally -- there is no merge.
+
+### Invariant 37: Mutation truthfulness
+
+**A successful mutation response states exactly what was applied. Revision increments
+iff authoritative state changed. Unknown mutation fields are errors, never silently
+ignored.**
+
+From the commit history: PATCHes that returned 200 but applied nothing; fields
+silently dropped from requests; `rev` bumped on no-ops (making "did it change?"
+unreliable); `ignored_fields` carried in the response body but never read.
+
+```rust
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]  // unknown fields are errors, not silent drops
+struct IssuePatch {
+    status: Option<Status>,
+    desc: Option<String>,
+    // ...
+    base_rev: u64,             // required for optimistic concurrency (Invariant 35)
+}
+
+struct MutationResult {
+    applied: bool,             // false if the mutation was a no-op
+    rev: u64,                  // incremented only if applied == true
+    version: u64,              // entity version, incremented only if applied == true
+    entity: Issue,             // current state after (possibly no-op) mutation
+}
+```
+
+A no-op mutation (setting status to its current value) returns `applied: false`
+with the current revision unchanged. The client can distinguish "I changed it"
+from "it was already there." Entity version and global revision ONLY increment
+on actual state changes.
+
+### Invariant 38: Command freshness
+
+**Automated queued commands that depend on state carry preconditions and are
+revalidated at delivery time.** Human-authored messages always deliver.
+
+Defined in Invariant 34 (command preconditions section). Elevated to a standalone
+invariant because the commit history shows this as a distinct recurring failure
+class: notifications keyed off current state instead of the assignment event,
+nudges driving work whose state had changed, steering messages arriving for
+issues that no longer exist.
+
+The invariant: a command whose precondition fails at delivery time is expired,
+not delivered. The expiration is recorded as a `DurableEvent` (Invariant 24).
+Blindly redelivering a durable stale instruction makes the system more reliable
+at doing the wrong thing.
+
+### Invariant 39: Derived-data direction
+
+**Source -> derived, never reverse. Search indexes, compacted context, generated
+memory files, caches, and UI state never write themselves back into their source
+without an explicit user mutation.**
+
+```
+canonical entity (DB)
+      |
+      +-> search index (FTS5)
+      +-> worker context (assembled)
+      +-> compacted summary (lossy)
+      +-> MEMORY.md (projected)
+      +-> dashboard cache (IndexedDB)
+      +-> iCal feed (generated)
+
+NONE of these arrows reverse.
+```
+
+A compacted summary may supersede old content for prompt assembly (Invariant 31),
+but it never overwrites or becomes the source history. Search results point to
+source entities; modifying a search result modifies the entity, not the index.
+Memory is read from `MemoryEntry` rows; `MEMORY.md` is a generated projection,
+not a source file.
+
+The violation pattern from the commit history:
+```
+canonical state
+     |
+generated representation
+     |
+gets read back as canonical
+     |
+old/generated data overwrites newer source
+```
+
+This invariant makes that arrow structurally impossible: derived representations
+have no write path back to their source.
+
+### Invariant 40: Collection completeness
+
+**Every truncated or paginated response declares whether it is complete and
+provides `total/returned/cursor` semantics.**
+
+From the commit history: "we fetched 50 and didn't find it" became "it doesn't
+exist" because nothing distinguished a complete result from a truncated one.
+
+```rust
+struct PagedResponse<T> {
+    items: Vec<T>,
+    total: usize,              // total matching items (not just this page)
+    returned: usize,           // items in this response
+    cursor: Option<String>,    // None = this is the last page
+    is_complete: bool,         // true iff returned == total
+}
+```
+
+Every list endpoint uses `PagedResponse`. The dashboard shows "showing N of M"
+when truncated. Search results that hit a limit display the limit. API consumers
+can always distinguish "empty result" from "result truncated before the item you
+wanted."
+
+### Invariant 41: Test oracle correctness
+
+**Tests must prove externally observable outcomes, not implementation activity.**
+
+The commit history shows tests that passed while the system was broken:
+
+- `8bc9eb3`: a shell prompt was output, so the cloud provider smoke test passed
+  (the provider was completely broken)
+- `7870384`: the echoed prompt contained expected words, so verification passed
+  (the worker never executed anything)
+- `9cd2892`: "dashboard renders" passed against Chrome's Privacy error interstitial
+  (TLS cert was invalid)
+- `2cdbd8a`: "Security scan passed" even though the grep itself errored and never
+  scanned anything (exit code not checked)
+
+These are oracle correctness problems, not missing-test problems.
+
+Three testing layers beyond example-based Playwright:
+
+**1. Property testing** (`proptest`) for system invariants (already in Invariant 22):
+```rust
+proptest! {
+    fn single_source_of_truth(ops in arb_ops()) {
+        // after any sequence of operations, every derived representation
+        // matches its canonical source
+    }
+    fn liveness(ops in arb_ops()) {
+        // every non-terminal issue has a runnable action, assigned actor,
+        // or structured wait reason
+    }
+    fn revision_monotonicity(ops in arb_ops()) {
+        // global rev never decreases; entity version never decreases
+    }
+    fn convergence(events in arb_sse_events()) {
+        // after applying any permutation of events with gap detection,
+        // client state matches server state
+    }
+}
+```
+
+**2. Deterministic orchestrator simulation** (Invariant 22) with fake
+time/providers/backends.
+
+**3. Historical incident regression corpus**: encode the last month's incidents
+as concrete test cases. Every Rust build proves the architecture cannot reproduce
+them.
+
+```rust
+mod incident_regression {
+    fn incident_2026_07_30_451_fold_card();       // card with 451 tasks
+    fn incident_2026_07_30_duplicate_draft();     // draft in 3 stores
+    fn incident_2026_07_30_board_read_after_write(); // stale cache
+    fn incident_2026_07_31_glyph_mismatch();      // Unicode rate-limit
+    fn incident_2026_08_xx_stale_steering();       // nudge to changed card
+    fn incident_2026_08_xx_shell_prompt_passes();  // wrong oracle
+    fn incident_2026_08_xx_echo_satisfies_verify(); // self-reported evidence
+    fn incident_2026_08_xx_tls_error_renders();    // interstitial passes
+    fn incident_2026_08_xx_two_spend_writers();    // poller overwrites meter
+    fn incident_2026_08_xx_profile_store_split();  // login vs agent profiles
+    fn incident_2026_08_xx_archived_doing();       // nonsensical state combo
+}
+```
+
+Each test reconstructs the incident's preconditions and asserts the architecture
+rejects them structurally, not by a test that happens to check for them.
+
 ### Invariant 22: Deterministic orchestrator simulation
 
 Instead of requiring real workers for all orchestration tests, the orchestrator runs
@@ -1461,7 +1759,7 @@ Behavior becomes reproducible: "worker X failed AR-123 using context snapshot C-
 Context caching becomes trivial: if the hash matches, reuse. Token optimization
 becomes measurable: compare snapshot sizes across attempts.
 
-### Invariant 28: Cheapest verifier first
+### Invariant 28: Cheapest verifier first + evidence independence
 
 Verification uses the cheapest/most deterministic verifier that can prove each
 criterion:
@@ -1479,6 +1777,32 @@ criterion:
 Never call a model when a deterministic check suffices. This is Invariant 15 rule 1
 applied to verification specifically.
 
+**Evidence independence: verification cannot be satisfied solely by output produced
+by the actor whose claim is being verified, when independent evidence is available.**
+
+This principle comes directly from the commit history:
+
+- `8bc9eb3`: a shell prompt was output, so the test said the provider was healthy
+- `7870384`: the echoed prompt contained the expected words, so verification passed
+- `9cd2892`: Chrome's "Privacy error" page had a title, so "dashboard renders" passed
+
+The fix is structural: verifiers check externally observable outcomes, not
+implementation activity.
+
+```
+BAD:  process emitted output
+GOOD: provider returned structured result matching expected schema
+
+BAD:  page title exists
+GOOD: known amux DOM element is visible + hydrated + contains expected data
+
+BAD:  worker said "tests passed"
+GOOD: harness independently executed tests and observed exit code
+
+BAD:  message was injected into terminal
+GOOD: recipient acknowledged MessageId via WorkerEvent
+```
+
 ```rust
 enum VerifierKind {
     Command { cmd: String, expected_exit: i32 },
@@ -1488,9 +1812,22 @@ enum VerifierKind {
     ModelJudgment { prompt: String },
     HumanReview,
 }
+
+struct Verification {
+    kind: VerifierKind,
+    evidence_source: EvidenceSource,
+}
+
+enum EvidenceSource {
+    Independent,              // harness/external tool ran the check
+    SelfReported,             // the actor being verified reported it
+    Corroborated,             // self-reported + independently confirmed
+}
 ```
 
 Verifiers run in cost order. If the free checks fail, expensive ones never run.
+When independent evidence is available, self-reported evidence alone is
+insufficient -- the verifier must corroborate or independently confirm.
 
 ### Invariant 29: Message is a durable entity, not command plumbing
 
@@ -1671,6 +2008,74 @@ Two governing principles:
 > **A user can navigate from any entity to any related entity without knowing where
 > it was stored.** Clicking a gate evaluation reaches the tool call, the turn, the
 > worker output, and the message that triggered the work.
+
+### Invariant 42: Memory is a durable, scoped, revisioned entity
+
+Memory is the largest architectural gap the commit history exposes. The recurring
+pattern:
+
+```
+canonical state (worker memory)
+     |
+generated representation (MEMORY.md, compacted summary)
+     |
+gets read back as canonical
+     |
+old/generated data overwrites newer source
+```
+
+or:
+
+```
+worker A memory --+
+                  +-> shared file -> last writer wins
+worker B memory --+
+```
+
+The fix: memory is a first-class entity in SQLite, not a file.
+
+```rust
+struct MemoryEntry {
+    id: MemoryId,
+    scope: Scope,              // global, group, or worker
+    name: String,              // kebab-case slug, unique within scope
+    content: String,
+    memory_type: MemoryType,   // user, feedback, project, reference
+    version: u64,              // entity version (Invariant 35)
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    deleted_at: Option<DateTime<Utc>>,  // soft delete, never lose history
+    provenance: Provenance,    // who created/updated this and why
+}
+```
+
+The canonical store is the `memory_entries` table. Everything else is derived
+(Invariant 39):
+
+```
+SQLite MemoryEntry (canonical)
+      |
+      +-> search index (FTS5, Invariant 32)
+      +-> worker context (assembled by context pipeline, Invariant 27)
+      +-> compacted summary (lossy, Invariant 31)
+      +-> MEMORY.md projection (generated file, read-only)
+      +-> inter-session API response (read from DB)
+
+NONE of these write back to MemoryEntry without an explicit user mutation.
+```
+
+Scope isolation: a worker's memory is private to that worker. Group memory is
+shared within the group. Global memory is visible to all. The scope resolver
+(Invariant 2) determines which memories a worker sees at context assembly time.
+
+Compaction may summarize old memories for prompt assembly (Invariant 31), but the
+original `MemoryEntry` rows are never deleted or overwritten by compaction. The
+compacted summary is a separate entity type (`CompactedContext`) that references
+the source entries by ID.
+
+Additive merging, deletion tracking, and concurrent writes are all handled by
+the entity version + optimistic concurrency (Invariant 35). Two workers writing
+to the same memory entry get a 409 conflict, not last-writer-wins.
 
 ### Design rule: self-documenting by construction
 
@@ -2214,7 +2619,7 @@ harness that will verify every subsequent phase.
 2. `amux-core`: Scope, Worker, Session, Issue, BoardTransition, WorkerCommand/Event,
    Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
    system's vocabulary. Every entity type carries a `version: u64` field.
-3. `amux-server/db`: all 49 tables as SQL migrations, WAL mode, single-writer task
+3. `amux-server/db`: all 51 tables as SQL migrations, WAL mode, single-writer task
 4. `amux-server/config`: three-tier config loading (global/group/worker), `server.env`
 5. `amux-server/api`: axum router, static file embedding, `/health`, auth,
    `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
@@ -2228,8 +2633,15 @@ harness that will verify every subsequent phase.
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
 - Unit: scope resolver with group gates overriding global gates
 - Unit: scope resolver with worker env overriding group env
-- Unit: all 49 tables created in in-memory DB
+- Unit: all 51 tables created in in-memory DB
 - Unit: `BoardTransition` state machine rejects invalid transitions
+- Unit: `BoardTransition` rejects nonsensical combos (archived + doing) (Invariant 3)
+- Unit: Archive/Restore round-trip preserves all issue fields (Invariant 3)
+- Unit: `IssueDisposition` is total -- every issue resolves to exactly one variant (Invariant 10)
+- Unit: `WaitingFor` variants cover all non-terminal, non-runnable states (Invariant 10)
+- Unit: `MutationResult.applied == false` when mutation is a no-op (Invariant 37)
+- Unit: `#[serde(deny_unknown_fields)]` rejects unknown mutation fields (Invariant 37)
+- Unit: `PagedResponse` always reports `total` >= `returned` (Invariant 40)
 - Unit: API request/response types match OpenAPI spec (generated from JsonSchema derives)
 - Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
 - Unit: backpressure -- bounded channels reject/drop correctly at capacity (Invariant 26)
@@ -2238,6 +2650,9 @@ harness that will verify every subsequent phase.
 - Simulation: fake clock + fake backend, orchestrator tick completes in <1ms (Invariant 22)
 - Simulation: deterministic replay of 100 random event sequences produces identical state
 - proptest: `BoardTransition` state machine rejects all invalid (from, to) pairs (Invariant 22)
+- proptest: every non-terminal issue resolves to exactly one IssueDisposition (Invariant 10)
+- proptest: no-op mutation never increments revision or entity version (Invariant 37)
+- proptest: derived data never writes back to source (Invariant 39)
 - proptest: scope merge is idempotent (merge(a, a) == a for arbitrary config)
 - Integration: `GET /` returns dashboard HTML with version string
 - Integration: `GET /health` returns 200 with build hash
@@ -2449,6 +2864,9 @@ compaction subsystem.
 - Simulation: command delivery under backpressure -- no lost commands, 429 for overflow (Invariant 26)
 - Simulation: server restart with 5 pending commands -- all redelivered via
   idempotency, no duplicates (Invariant 34)
+- Simulation: command with precondition -- entity changes before delivery,
+  command expires with PreconditionResult::Failed (Invariant 38)
+- Simulation: human message has no precondition, always delivers (Invariant 38)
 - Simulation: command dispatch fails 2x then succeeds -- retry backoff, final
   Confirmed state (Invariant 34)
 - Simulation: command exhausts 3 retries -- dead-lettered, StallViolation emitted,
@@ -2466,6 +2884,13 @@ compaction subsystem.
 - Integration: offline message queued, delivered on reconnect (Invariant 29)
 - Integration: compaction at 85% context -- compacted fragment created, source turns
   preserved, token_after < token_before (Invariant 31)
+- Integration: MemoryEntry CRUD -- scope isolation, version increments, soft delete (Invariant 42)
+- Integration: MEMORY.md generated from MemoryEntry table, read-only (Invariant 39/42)
+- Integration: compacted summary references source entries by ID, never overwrites (Invariant 39)
+- Integration: concurrent memory writes to same entry -> 409 conflict (Invariant 42)
+- Incident regression: incident_2026_07_30_duplicate_draft (Invariant 41)
+- Incident regression: incident_2026_07_30_board_read_after_write (Invariant 41)
+- Incident regression: incident_2026_08_xx_stale_steering (Invariant 38/41)
 - Integration: context 95% triggers checkpoint + new session, new session hydrates
   from compacted context (Invariant 31)
 - Integration: compaction never deletes source turns/messages/logs (Invariant 31)
@@ -2674,6 +3099,18 @@ Issue #421
          └─ blocked waiting on #419
             └─ #419 verification failed: test X
 ```
+
+Generalized `why` query -- not just "why is this stuck" but "why did this happen":
+
+```
+amux why issue AR-42       # full provenance chain
+amux why worker backend    # current state + how it got there
+amux why command CMD-83    # dispatch path, precondition result, delivery
+amux why schedule SCHED-108 # last N fires, source (cron/manual), outcomes
+amux why integration gmail  # auth state, last success/failure, degradation
+```
+
+All answered from structured provenance (Invariant 24), not grep over logs.
 
 Performance measurement:
 - Dashboard load time (target: <500ms cold, <100ms cached)
@@ -2912,16 +3349,18 @@ compensate. There is no single place that answers "why isn't this issue moving?"
 tick. When it detects a stall, it produces a `StallViolation` with the reason:
 
 ```rust
+// StallReason is the PROBLEM; WaitingFor (Invariant 10) is the STRUCTURED STATE.
+// A StallViolation fires when an issue has no WaitingFor and no assigned worker.
 enum StallReason {
     WorkerIdle,                          // worker has capacity but isn't assigned
-    WorkerRateLimited { reset_at: DateTime },  // waiting, not stalled
-    DependencyBlocked { blocked_by: IssueId }, // not stalled, just waiting
     NoCapableWorker,                     // no worker can do this work
     ProcessDown { error: String },       // backend reports process not running
     ProtocolUnreachable { error: String }, // OpenCode not responding
-    GateBlocked { gate: Vec<String> },   // needs human ack
     Orphaned,                            // assigned to a worker that no longer exists
+    CommandExpired { command: CommandId }, // precondition failed at delivery (Inv 38)
 }
+// Note: rate-limited, dependency-blocked, and gate-blocked are WaitingFor variants,
+// not stalls. They have structured wait reasons and expected resolution paths.
 ```
 
 The dashboard shows stall reasons inline on each card. A user looking at the board
