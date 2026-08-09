@@ -2795,6 +2795,210 @@ If the implementation agent decomposes work to multiple workers:
 
 This uses the same board/lease philosophy amux itself implements (Invariant 3/34).
 
+### Invariant 46: UX path discovery generates the browser acceptance test plan
+
+Do not manually guess the complete browser test surface. Discover it from the running
+product, turn the discovered UX graph into the acceptance plan, and preserve that
+graph as a permanent regression contract.
+
+The manually-written golden scenarios in this document answer **"what is this path
+supposed to mean?"**. Automatic UX discovery answers **"what paths exist?"**. Both are
+required. The acceptance suite must be capable of finding a UI path the author of this
+document forgot existed.
+
+**The UX interaction graph:**
+
+A dedicated UX discovery harness starts AMUX against deterministic test fixtures and
+automatically explores every reachable user-facing surface by recursively discovering
+visible actions, executing them, observing the resulting UI state, and discovering
+newly available actions.
+
+```rust
+struct UiState {
+    id: UiStateId,
+    route: String,
+    visible_components: Vec<ComponentId>,
+    modal_stack: Vec<ComponentId>,
+    entity_context: Vec<EntityRef>,
+    state_hash: Hash,  // semantic, not raw HTML
+}
+
+struct UiAction {
+    id: UiActionId,
+    source_state: UiStateId,
+    target: SemanticLocator,
+    action: ActionKind,
+    expected_effects: Vec<ExpectedEffect>,
+}
+
+enum ActionKind {
+    Click,
+    DoubleClick,
+    Type { value_class: InputClass },
+    Press { key: Key },
+    Select { option: String },
+    Toggle,
+    DragDrop { destination: SemanticLocator },
+    Scroll,
+    OpenContextMenu,
+    Close,
+    Back,
+    Forward,
+    Refresh,
+}
+
+struct UiEdge {
+    from: UiStateId,
+    action: UiActionId,
+    to: UiStateId,
+}
+```
+
+The graph represents `state -> user action -> resulting state`, not merely an
+inventory of DOM nodes.
+
+**Semantic state hashing.** Raw HTML must not be the state identity. Normalize
+volatile values (timestamps, random IDs, animation classes, transient DOM attributes)
+before hashing. State identity reflects meaningful user-visible structure: route,
+active tab, open modal/drawer/menu, selected entity, visible controls, relevant
+entity states, form mode, error/loading/offline state.
+
+**Interactive control discovery.** At every discovered state, inspect: `button`,
+`a[href]`, `input`, `textarea`, `select`, `[role=button]`, `[role=menuitem]`,
+`[role=tab]`, `[role=checkbox]`, `[role=switch]`, `[role=radio]`, `[role=option]`,
+`[contenteditable]`, `[tabindex]`, `[data-action]`, `[data-testid]`, draggable
+elements. Also inspect controls revealed only by hover, focus, right-click/context
+menu, scroll, responsive layout, overflow menus, nested dropdowns, drawers, modals,
+tabs, accordions, expandable cards, and keyboard shortcuts.
+
+**State-aware safe exploration.** Discovery is NOT random clicking. The crawler
+understands action classes and uses appropriate generated fixture data:
+- Text inputs: normal, empty, unicode, long, invalid
+- Selects: each semantically-distinct option
+- Toggles: false->true, true->false
+- Modals: open, primary action, secondary action, close button, Escape, outside-click
+- Forms: valid submit, required-field omission, invalid value, keyboard Enter, cancel,
+  server rejection, reload with unsaved data, offline submit, duplicate submit
+
+**Seed states.** Discovery must not begin only from the empty/default application.
+Create deterministic fixtures for: empty installation, populated installation,
+migrated Python dataset, worker active/idle/stopped/rate-limited/errored/high-context/
+unread-messages, issue in each lifecycle state (todo/doing/review/gate-blocked/done/
+verified/dependency-blocked), offline client, pending offline mutations, sync conflict,
+provider unavailable, Herdr unavailable, schedule enabled/disabled, browser profile
+active/locked. Run UX discovery from each relevant seed. A button that only appears
+when a worker is rate-limited must be discovered.
+
+**Scope and role discovery.** Run discovery across every applicable permission/scope
+context: global, group, worker, admin, ordinary user.
+
+**Desktop/mobile discovery.** Generate separate UX graphs where responsive behavior
+differs. At minimum: desktop Chromium and mobile viewport + touch. Responsive UIs
+may expose different paths.
+
+**Offline graph discovery.** Repeat applicable exploration with the browser offline.
+Classify discovered actions as: works_offline, queues_offline, read_only_cached,
+disabled_offline, unexpected_failure. Then reconnect and discover the reconciliation
+path (edit offline -> queued indicator -> reconnect -> syncing -> server accepts ->
+toast -> authoritative state).
+
+**Network/result-state discovery.** The same action can produce multiple legitimate
+result states. For mutation actions, explore applicable outcomes via deterministic
+fault injection: success, validation failure, 401/403, 404, 409 conflict/gate, 429,
+500, timeout, offline, server restart. Thus `IssueCard -> Move -> Review` may have
+edges to: success (Review column), 409 (Gate modal), offline (queued), 500 (error
+toast + original state). All are separate UX paths requiring coverage.
+
+**Deep exploration.** Discovery must recurse through nested interactions:
+`Workers -> card -> more menu -> Settings -> Runtime -> Model selector -> choose ->
+Save -> session replacement -> status transition -> success toast`. A test that merely
+reaches Settings does NOT cover this path. The graph retains each interaction edge.
+
+**Control path explosion.** Do not require testing every arbitrary sequence. Use graph
+algorithms for meaningful coverage:
+1. 100% reachable semantic action coverage
+2. 100% known result-state edge coverage for critical mutations
+3. 100% component-state coverage for critical components
+4. Shortest-path coverage to each state/action by default
+5. Additional cycles for stateful behaviors (toggle, offline/reconnect, archive/restore)
+
+Use BFS/shortest-path exploration, bounded depth, and semantic state deduplication.
+
+**Generated test plan.** After discovery, produce machine-readable artifacts:
+
+```
+target/ux/interaction-graph.json    — full UX graph
+target/ux/interaction-coverage.json — coverage analysis
+target/ux/generated-test-plan.md    — discovered test requirements
+```
+
+Generated Playwright scenarios use a data-driven runner where practical:
+```typescript
+for (const scenario of discoveredScenarios) {
+    test(scenario.name, async ({ page }) => {
+        await executeScenario(page, scenario);
+        await assertExpectedEffects(page, scenario);
+    });
+}
+```
+Hand-written tests remain for complex/high-value flows. The discovered graph
+guarantees completeness.
+
+**Reconciliation with the RR checklist.** The autonomous executor must compare:
+spec requirements + RR checklist + automatically discovered UX graph. No one source
+is sufficient. If UX discovery finds functionality not represented by an RR item,
+automatically create or flag a checklist item before final acceptance. If an RR item
+claims a UI feature that discovery cannot reach, that is an acceptance failure.
+
+**UX graph baseline.** Commit a normalized UX contract/baseline to the repository
+(e.g. `tests/ux/contract.json`). Generated screenshots/logs remain build artifacts.
+This baseline represents the accepted reachable UX surface. Updating it requires
+corresponding test changes. Never automatically approve a changed graph simply
+because the crawler discovered it -- discovery detects product-surface changes; tests
+decide whether they are correct.
+
+**Permanent discovery in CI/CD.** After the Rust rebuild is accepted, UX discovery
+remains part of CI. For every PR: run app with fixture -> discover UX graph -> compare
+with baseline. Classify changes: new state, new action, removed state, removed action,
+changed transition, changed expected effect. Any unexplained graph change fails CI.
+This makes the UI itself a test-contract source.
+
+**Crawler self-test.** Because acceptance depends on automatic discovery, verify the
+discovery harness itself. Create fixture pages with intentionally hidden nested
+controls, hover controls, keyboard-only actions, modals, scroll-revealed controls,
+dropdowns, invalid forms, duplicate-looking controls, responsive-only controls. Assert
+the crawler discovers every expected action and state. A discovery system that silently
+misses paths is worse than no discovery because it creates false confidence.
+
+**Behavioral coverage.** An edge is verified only when its expected consequences are
+observed. For mutations: action -> UI pending/optimistic state -> request/command ->
+authoritative backend result -> durable event/revision -> UI reconciliation -> expected
+visible result -> refresh confirms persistence. For errors: action -> backend
+rejection -> correct error/gate/conflict state -> toast/modal rendered -> no unintended
+mutation -> retry path works where applicable.
+
+**Discovery coverage report:**
+```
+States discovered:                 384
+Semantic components:               127
+Interactive controls:              693
+Semantic actions:                  941
+Transition edges:                1,483
+
+Actions with test coverage:        941 / 941
+Critical result edges:             312 / 312
+Missing semantic IDs:                0
+Unreachable registered actions:      0
+Unspecified discovered actions:      0
+
+Desktop coverage:                 PASS
+Mobile coverage:                  PASS
+Offline coverage:                 PASS
+Fault-state coverage:             PASS
+```
+
+Final Rust acceptance requires zero unexplained holes.
+
 ---
 
 ## The Orchestrator (updated mental model)
@@ -3314,6 +3518,12 @@ harness that will verify every subsequent phase.
    - DOM inventory crawler: discovers all `data-testid` elements across
      reachable UI states, diffs against registry, fails on uncovered controls
    - Fault injection hooks (`#[cfg(test)]` only)
+9. **UX discovery harness** (Invariant 46):
+   - Automated UX interaction graph crawler (BFS, semantic state hashing)
+   - Interactive control detection (buttons, links, inputs, roles, draggable, etc.)
+   - Seed state fixtures (empty, populated, migrated, per-worker-state, per-issue-state)
+   - Crawler self-test (fixture pages with intentionally hidden/nested controls)
+   - Generated artifacts: `interaction-graph.json`, `interaction-coverage.json`
 
 **Test plan**:
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
@@ -3776,6 +3986,15 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 6. `data-testid` on every interactive element (Invariant 44)
 7. Interaction contract registry for all components
 8. DOM inventory crawler + CI coverage gate
+9. **UX discovery: full application graph** (Invariant 46):
+   - Run discovery against complete dashboard with all seed states
+   - Desktop + mobile separate graphs
+   - Offline graph + reconnection paths
+   - Fault-state edges (success/409/500/timeout/offline per mutation)
+   - Deep nested path verification
+   - Generated Playwright test suite from stable discovered paths
+   - Reconcile discovered graph with RR checklist
+   - Commit UX baseline to `tests/ux/contract.json`
 
 **Test plan**:
 - Integration: served dashboard matches extracted source
@@ -4640,6 +4859,9 @@ The rebuild is complete ONLY when all of the following are true:
 [ ] CLI acceptance suite green
 [ ] Playwright deep-interaction suite green
 [ ] Interaction coverage threshold satisfied (Invariant 44)
+[ ] UX discovery graph reconciles with RR checklist (Invariant 46)
+[ ] UX discovery coverage report: zero unexplained holes
+[ ] UX graph baseline committed and CI-enforced
 [ ] Offline suite green
 [ ] Sync/revision fault suite green
 [ ] Herdr backend conformance green
@@ -4733,6 +4955,7 @@ The acceptance suite exercises:
 - Conflict resolution, realtime UI reconciliation
 - Failures and recovery (fault injection)
 - Migration integrity (manifest reconciliation)
+- Auto-discovered UX interaction graph (Invariant 46)
 - Historical incident regressions
 - Performance and soak requirements
 
@@ -5017,10 +5240,16 @@ AND migrated production data passes
 AND net-new data passes
 AND real Herdr workflows pass
 AND browser/UI deep interaction coverage passes
+AND auto-discovered UX graph reconciles with RR checklist (Invariant 46)
+AND UX discovery coverage report has zero unexplained holes
 AND offline/reconciliation passes
 AND historical regressions pass
 AND performance/reliability gates pass
 ```
+
+The manually-written golden scenarios answer "what is this path supposed to mean?"
+and the auto-discovered UX graph answers "what paths exist?". Both pass. No path
+exists without a test, no test claims a path that cannot be reached.
 
 After that moment, these tests become the permanent minimum behavioral contract for
 AMUX. Future functionality must extend this contract, not bypass it.
@@ -5355,6 +5584,62 @@ consistent with their dependencies.
     scope merge, mutation/version invariants.
   Tests: arbitrary state machine fuzzing, no-stall property, acyclicity
   Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028a — UX discovery harness: core framework
+  Phase: 0
+  Depends on: RR-0025
+  Invariant: 46
+  Requirement: UX discovery harness that starts AMUX against deterministic test
+    fixtures and automatically explores every reachable user-facing surface. Produces
+    UiState/UiAction/UiEdge graph (interaction-graph.json). Semantic state hashing
+    (normalize timestamps, random IDs, animation classes). BFS/shortest-path
+    exploration with bounded depth and semantic deduplication.
+  Tests: crawler discovers all expected actions/states on fixture pages
+  Verify: Implementation, Unit tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0028b — UX discovery: interactive control detection
+  Phase: 0
+  Depends on: RR-0028a
+  Invariant: 46
+  Requirement: At every discovered state, detect: button, a[href], input, textarea,
+    select, [role=button], [role=menuitem], [role=tab], [role=checkbox], [role=switch],
+    [role=radio], [contenteditable], [tabindex], [data-action], [data-testid],
+    draggable. Also detect controls revealed by hover, focus, right-click, scroll,
+    responsive layout, overflow menus, nested dropdowns, drawers, modals, tabs,
+    accordions, expandable cards, keyboard shortcuts. Report controls missing semantic
+    identifiers. CI fails on new interactive control without semantic test identity.
+  Tests: fixture page with intentionally hidden/hover/keyboard-only/scroll-revealed
+    controls -- all discovered
+  Verify: Implementation, Unit tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0028c — UX discovery: seed state fixtures
+  Phase: 0
+  Depends on: RR-0028a
+  Invariant: 46
+  Requirement: Deterministic fixtures for UX discovery seed states: empty installation,
+    populated installation, migrated Python dataset, worker in each state (active/idle/
+    stopped/rate-limited/errored/high-context/unread-messages), issue in each lifecycle
+    state, offline client, pending offline mutations, sync conflict, provider
+    unavailable, Herdr unavailable, schedule enabled/disabled, browser profile
+    active/locked. Run discovery from each relevant seed.
+  Tests: seed states create expected conditions, discovery reaches seed-specific controls
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028d — UX discovery: crawler self-test
+  Phase: 0
+  Depends on: RR-0028a, RR-0028b
+  Invariant: 46
+  Requirement: Fixture pages/components with intentionally: hidden nested controls,
+    hover controls, keyboard-only actions, modals, scroll-revealed controls, dropdowns,
+    invalid forms, duplicate-looking controls, responsive-only controls. Assert crawler
+    discovers every expected action and state. A discovery system that silently misses
+    paths creates false confidence.
+  Tests: crawler self-verification suite
+  Verify: Implementation, Unit tests, Browser verification
   Status: TODO
 
 ---
@@ -6257,6 +6542,92 @@ consistent with their dependencies.
     generated action sequences. Browser state matches model state.
   Browser verification: model-based testing
   Verify: Browser verification
+  Status: TODO
+
+- [ ] RR-0107a — UX discovery: full application graph (desktop + mobile)
+  Phase: 8
+  Depends on: RR-0028a, RR-0028b, RR-0028c, RR-0097, RR-0100
+  Invariant: 46
+  Requirement: Run UX discovery harness against the complete AMUX dashboard with all
+    seed state fixtures. Produce interaction-graph.json, interaction-coverage.json,
+    generated-test-plan.md. Generate separate graphs for desktop Chromium and mobile
+    viewport + touch. Discover scope/role-specific paths (global, group, worker).
+    Report: states discovered, semantic components, interactive controls, semantic
+    actions, transition edges, missing semantic IDs.
+  Browser verification: discovery report has zero missing semantic IDs
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0107b — UX discovery: offline graph + reconnection paths
+  Phase: 8
+  Depends on: RR-0107a, RR-0102
+  Invariant: 46
+  Requirement: Repeat applicable UX exploration with browser offline. Classify
+    discovered actions as: works_offline, queues_offline, read_only_cached,
+    disabled_offline, unexpected_failure. Discover reconnection paths (edit offline ->
+    queued -> reconnect -> syncing -> server accepts -> toast -> authoritative state).
+  Offline verification: offline classification for every discovered action
+  Verify: Browser verification, Offline behavior
+  Status: TODO
+
+- [ ] RR-0107c — UX discovery: fault-state edges
+  Phase: 8
+  Depends on: RR-0107a, RR-0026
+  Invariant: 46
+  Requirement: For all mutation actions, discover result-state edges via fault
+    injection: success, validation failure, 401/403, 404, 409, 429, 500, timeout,
+    offline, server restart. Each outcome is a separate UiEdge in the graph.
+  Browser verification: all fault edges covered
+  Verify: Browser verification, Sync/reconciliation
+  Status: TODO
+
+- [ ] RR-0107d — UX discovery: deep nested path coverage
+  Phase: 8
+  Depends on: RR-0107a
+  Invariant: 46
+  Requirement: Verify that discovery recurses through nested interactions at full
+    depth (e.g. Workers -> card -> menu -> Settings -> Runtime -> Model -> choose ->
+    Save -> replacement -> status -> toast). Every interaction edge retained. No
+    shallow-only discovery.
+  Browser verification: deep paths verified
+  Verify: Browser verification
+  Status: TODO
+
+- [ ] RR-0107e — UX discovery: generated Playwright test suite
+  Phase: 8
+  Depends on: RR-0107a, RR-0107b, RR-0107c
+  Invariant: 46
+  Requirement: Turn stable discovered paths into reusable Playwright scenarios via
+    data-driven runner. Hand-written tests for complex/high-value flows. Discovered
+    graph guarantees completeness. Every edge verified by observing expected
+    consequences (not just action triggering): action -> pending state -> request ->
+    backend result -> revision -> UI reconciliation -> persistence confirmation.
+  Browser verification: generated tests pass
+  Verify: Implementation, Browser verification
+  Status: TODO
+
+- [ ] RR-0107f — UX discovery: reconcile with RR checklist
+  Phase: 8
+  Depends on: RR-0107a
+  Invariant: 45, 46
+  Requirement: Compare spec requirements + RR checklist + auto-discovered UX graph.
+    If discovery finds functionality not represented by an RR item, create or flag a
+    checklist item. If an RR item claims a UI feature discovery cannot reach, that is
+    an acceptance failure. No source is sufficient alone.
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0107g — UX graph baseline: committed contract
+  Phase: 8
+  Depends on: RR-0107a
+  Invariant: 46
+  Requirement: Commit normalized UX contract/baseline to `tests/ux/contract.json`.
+    Generated screenshots/logs are build artifacts. Baseline represents accepted
+    reachable UX surface. Updating requires corresponding test changes. Never auto-
+    approve changed graph -- discovery detects changes; tests decide correctness.
+    In CI: discover graph -> compare with baseline -> classify changes (new/removed
+    state/action, changed transition/effect) -> unexplained change fails CI.
+  Verify: Implementation
   Status: TODO
 
 ---
