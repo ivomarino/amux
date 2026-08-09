@@ -77399,6 +77399,19 @@ def _watch_self(server):
                     _ast.parse(script.read_text())
                 except SyntaxError as se:
                     slog(f"[restart] ABORTED — syntax error: {se}")
+                    # ALERT THE SAVER, not just the log (AC-309): the lane that
+                    # saved the broken file is mid-edit and almost certainly not
+                    # tailing server.log; every OTHER lane just lost its next
+                    # deploy. The old image keeps serving — a failed parse is
+                    # not a reason to die — but silence here is how a broken
+                    # save waits for a crash-loop to announce it.
+                    try:
+                        _push_alert("restart_parse_abort", "amux-server.py",
+                                    f"amux-server.py SAVED WITH A SYNTAX ERROR — the running "
+                                    f"server is fine and did NOT reload, but no further save "
+                                    f"deploys until this parses: {se}")
+                    except Exception:
+                        pass
                     mtime = new_mtime  # update mtime so we re-check on next change
                     continue
                 # Shutdown with timeout — don't let stuck threads block restart
