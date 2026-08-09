@@ -8585,6 +8585,10 @@ def _steer_record_history(name: str, text: str, queued_at=None, msg_id: str = ""
     try:
         hid = msg_id or f"steerh-{int(time.time()*1000)}"
         db = get_db()
+        text, _sh_hits = _redact_secrets(text)
+        if _sh_hits:
+            slog(f"[capture] {name}: redacted {_sh_hits} suspected credential(s) "
+                 f"from a steering-history row before writing it (AMUX-2525)")
         db.execute(
             "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) "
             "VALUES(?,?,?,?,?)",
@@ -8615,6 +8619,14 @@ def _cmd_hist_record(session: str, text: str, ctype: str = "user", origin: str =
         if not (session and text):
             return
         db = get_db()
+        # Same rule as the board capture (61c269d/AMUX-2502), same reason, same
+        # choke point: redact BEFORE the row exists. cmd_history is chat
+        # verbatim and outlived that fix for a day as the leak's other half
+        # (AMUX-2525).
+        text, _hits = _redact_secrets(text)
+        if _hits:
+            slog(f"[capture] {session}: redacted {_hits} suspected credential(s) "
+                 f"from a Messages-history row before writing it")
         db.execute("INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
                    (text, ctype, session, int(time.time() * 1000), (origin or "")[:80]))
         db.execute("DELETE FROM cmd_history WHERE session=? AND id NOT IN "
@@ -12450,12 +12462,22 @@ def _stamp_msg_card(session_name: str, prompt_text: str, card_id: str):
 # addition lands in both places by being in one place.
 _CAPTURE_SECRET_RES = [
     re.compile(r"sk-ant-api[0-9a-zA-Z_-]{20,}"),
+    # OpenAI (sk-, sk-proj-, sk-svcacct-) and Google (AIza…) keys — the two
+    # shapes sitting in a live transcript on 2026-08-08 that this list missed,
+    # discovered when AMUX-2525's own test fed the scrubber the specimens the
+    # backfill was ASSUMED to have caught (56 rows redacted looked like
+    # coverage; the filter had never matched these families at all).
+    re.compile(r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"ghp_[A-Za-z0-9]{36}"),
     re.compile(r"sk_(?:test|live)_[A-Za-z0-9]{20,}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|token)\b\s*[:=]\s*\S{8,}"),
+    # [\w-]* prefix: `\bapi_key` cannot match inside LOB_API_KEY (underscore is
+    # a word char, so there is no boundary), and PREFIXED_API_KEY=value is the
+    # most common real paste shape — OPENAI_API_KEY, LOB_API_KEY, GH_TOKEN…
+    re.compile(r"(?i)\b[\w-]*(?:password|passwd|secret|api[_-]?key|token)\b\s*[:=]\s*\S{8,}"),
     # The shape that actually bit: an email followed by a credential, which is how a
     # human pastes a login. "hello@amux.io (godmode) // qrP3LW7QPiUn4Hk" matched none
     # of the vendor patterns above, because it is not a vendor key — it is a password.
@@ -67083,6 +67105,10 @@ class CCHandler(BaseHTTPRequestHandler):
                 session = body.get("session", "")
                 ts = body.get("ts") or int(time.time() * 1000)
                 db = get_db()
+                text, _h_hits = _redact_secrets(text)
+                if _h_hits:
+                    slog(f"[capture] {session or 'api'}: redacted {_h_hits} suspected "
+                         f"credential(s) from a pushed history row (AMUX-2525)")
                 cur = db.execute(
                     "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?, ?, ?, ?, ?)",
                     (text, htype, session, ts, (body.get("origin") or "")[:80]))
@@ -67099,6 +67125,7 @@ class CCHandler(BaseHTTPRequestHandler):
                     text = (e.get("text") or "").strip()
                     if not text:
                         continue
+                    text, _i_hits = _redact_secrets(text)
                     db.execute(
                         "INSERT INTO cmd_history (text, type, session, ts) VALUES (?, ?, ?, ?)",
                         (text, e.get("type", "direct"), e.get("session", ""),
