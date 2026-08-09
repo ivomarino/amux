@@ -729,3 +729,99 @@ mod livelock_tests {
         assert_eq!(actions.len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Feed-forward prompt construction (RR-0048c, Invariant 49)
+// ---------------------------------------------------------------------------
+
+/// Build the execution prompt for an assignment. Attempt 1 is just the task;
+/// attempt N+1 carries every prior failure VERBATIM plus an explicit
+/// do-not-repeat instruction — a retry that cannot see why the last attempt
+/// failed is a re-roll, and re-rolls converge on the same failure at full
+/// token price (Invariant 49).
+pub fn assignment_prompt(title: &str, desc: &str, asg: &WorkAssignment) -> String {
+    let mut p = String::new();
+    p.push_str(&format!("Task {}: {title}\n", asg.task));
+    if !desc.is_empty() {
+        p.push_str(&format!("\n{desc}\n"));
+    }
+    if !asg.prior_attempts.is_empty() {
+        p.push_str(&format!(
+            "\n--- PRIOR ATTEMPTS ({} failed) ---\n",
+            asg.prior_attempts.len()
+        ));
+        for a in &asg.prior_attempts {
+            p.push_str(&format!("Attempt {}: FAILED — {}\n", a.attempt, a.failure_reason));
+            for ev in &a.rejected_evidence {
+                p.push_str(&format!("  rejected evidence: {ev}\n"));
+            }
+            if a.decomposition_attempted {
+                p.push_str("  (a decomposition was attempted this round)\n");
+            }
+            if let Some(tree) = &a.tree_status {
+                p.push_str(&format!("  tree at failure: {tree}\n"));
+            }
+        }
+        p.push_str(
+            "\nDo NOT repeat the failed approaches above. Address the stated \
+             failure reasons directly; if an approach was rejected, choose a \
+             different one rather than resubmitting it.\n",
+        );
+    }
+    p.push_str(&format!("\n(attempt {} of this task)\n", asg.attempt));
+    p
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+    use crate::limits::AttemptRecord;
+    use chrono::TimeZone;
+
+    #[test]
+    fn first_attempt_is_clean_and_retry_carries_failures() {
+        let t = TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 900));
+        let w = WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 901));
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let lease = Lease {
+            task: t.clone(),
+            worker: w.clone(),
+            acquired_at: now,
+            expires_at: now,
+            generation: 0,
+        };
+        let fresh = WorkAssignment {
+            idempotency_key: "k".into(),
+            task: t.clone(),
+            worker: w.clone(),
+            attempt: 1,
+            lease: lease.clone(),
+            prior_attempts: vec![],
+        };
+        let p1 = assignment_prompt("fix build", "the CI is red", &fresh);
+        assert!(p1.contains("fix build"));
+        assert!(!p1.contains("PRIOR ATTEMPTS"));
+
+        let retry = WorkAssignment {
+            attempt: 2,
+            prior_attempts: vec![AttemptRecord {
+                attempt: 1,
+                failure_reason: "tests failed: assertion timeout_x".into(),
+                rejected_evidence: vec!["claimed green without running e2e".into()],
+                tokens_spent: 5,
+                wall_clock_secs: 5,
+                decomposition_attempted: false,
+                tree_status: Some("2 files dirty".into()),
+                at: now,
+            }],
+            ..fresh
+        };
+        let p2 = assignment_prompt("fix build", "", &retry);
+        assert!(p2.contains("PRIOR ATTEMPTS (1 failed)"));
+        assert!(p2.contains("assertion timeout_x"));
+        assert!(p2.contains("claimed green without running e2e"));
+        assert!(p2.contains("2 files dirty"));
+        assert!(p2.contains("Do NOT repeat"));
+        assert!(p2.contains("attempt 2"));
+    }
+}
