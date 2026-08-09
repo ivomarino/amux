@@ -743,7 +743,7 @@ FIX: 13c7014 - three dots. Positive control in a scratch clone with upstream tou
 ## Shared-checkout guard blocked a commit aimed at a scratch repo, naming the shared one as fact
 AREA: cli
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux-frustrations
 CARD: AF-23
@@ -755,15 +755,12 @@ SYMPTOM: A compound command that `cd`s into a throwaway git repo under the scrat
 COST: one wasted round-trip. Small, but the next session that writes a scratch-repo test
   hits it identically, and the refusal reads as a true positive because it states the shared
   path as fact rather than as the assumption it is.
-FIX: keep the guard strict - it should stay strict - but have the refusal say it matched on
-  the session's cwd, and that a command targeting a different repo should use
-  `git -C <path>` with explicit paths. That makes the false positive self-diagnosing instead
-  of looking like a real one.
-
+FIX: 523df63 (guard) + 8ddf1d0 (4 regression tests). Verified LIVE end-to-end
+  through the real PreToolUse hook.
 ## Staged-guard attributed a session's OWN edit, seconds old, to session '(unknown)'
 AREA: attribution
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux-frustrations
 CARD: AF-24
@@ -774,12 +771,8 @@ SYMPTOM: Committing .claude/session-freshness.sh, which I had edited ~30s earlie
 COST: minutes reconciling a co-edit that did not exist. NOT root-caused - I did not
   determine whether the edit record was missing, unattributed at write time, or attributed
   but not matched against the committing session.
-FIX: unknown pending diagnosis. The thing worth protecting is the signal: this guard is
-  load-bearing (it is what catches another session's work riding along in your commit, which
-  has happened twice here), and a warning that fires on your own edits is how a real one gets
-  waved through. Whatever the cause, the guard should be able to say "this was you".
-
-
+FIX: 6bcc2f4. Verified LIVE in production on commit 273128e — the warning now reads
+  "is yours and has uncommitted changes right now - no other session edited it".
 ## `HEAD~1` is not "before my change" here — the pre-fix specimen check tested the wrong commit
 AREA: instruments
 SEVERITY: slows
@@ -807,7 +800,7 @@ FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited her
 ## staged-guard BLOCKED a commit on an edit record with no content behind it
 AREA: attribution
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux-frustrations
 CARD: AF-26
@@ -822,9 +815,6 @@ COST: ~8 min verifying the block was spurious, and a commit that had to be force
   correct-looking refusal. Worse than AF-24 (same subsystem, warns only) because this one
   BLOCKS. The compounding cost is that overriding is now normalised on a guard whose whole
   value is that its refusals mean something.
-FIX: gate on diff CONTENT rather than edit recency - does the staged patch contain hunks the
-  other session wrote? And note the ethos rule 3 shape in the escape: the only documented
-  way past is `AMUX_ALLOW_FOREIGN=1`, described as "if this cross-session commit is
-  intentional", so clearing a FALSE positive requires setting a flag whose name asserts
-  something untrue. If a record-based block is kept, give the honest case an honest name
-  (AMUX_VERIFIED_SOLO=1). Probably one root with AF-24.
+FIX: 6bcc2f4 + 21cce46 for the diagnosable halves (self-describing block, honest
+  AMUX_VERIFIED_SOLO escape). The classification half is UNRESOLVED and split to AF-27
+  with two hypotheses killed in writing. Do not read this as fully fixed.
