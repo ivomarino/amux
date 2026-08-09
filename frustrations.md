@@ -218,29 +218,6 @@ FIX: amux-frustrations initially closed as by-design (AF-2), checking only that 
   were nudged on first run.
   Validated by amux.
 
-## Auto-deploy only fires on `amux board done`, not on session idle/stop
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-06
-SESSION: amux-homepage
-CARD: AH-70
-SYMPTOM: Committed the AEO graph-agents page and ran `amux board done AH-67`. The
-  PostToolUse Bash hook matched and pushed — but by then the session had already gone
-  idle for 30+ minutes with the commit sitting unpushed. The page was live on GitHub
-  only after manual CI re-run. The hook only matches Bash commands containing
-  "amux board done" or "api/board.*status.*done", so any idle period between the last
-  commit and the done-call leaves changes stranded.
-COST: The AEO page was committed and ready but unreachable for 30+ minutes.
-  A second CI run was needed (the first had already timed out before the push happened).
-  The user checked the URL twice and reported "still not live". ~45 min of unnecessary
-  delay on a page deployment that should have been instant.
-FIX: Already fixed. `.claude/settings.json` now has a Stop hook calling
-  `auto-deploy.sh --on-stop`, which pushes unconditionally on session end/idle (bypassing
-  the board-done trigger check). The PostToolUse Bash hook remains for immediate push on
-  board-done.
-  Awaiting validation by amux-homepage (idle).
-
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
 SEVERITY: blocks
