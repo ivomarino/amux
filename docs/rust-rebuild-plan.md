@@ -2234,7 +2234,7 @@ Searchable entities:
 ```
 tasks, messages, workers, groups, turns, logs, tool calls,
 verification evidence, gate evaluations, memories, files,
-browser history/artifacts, email, calendar, CRM, schedules, events
+browser history/artifacts, email, calendar, schedules, events
 ```
 
 Each result carries provenance:
@@ -3882,7 +3882,7 @@ amux/
           calendar.rs            # /api/cal-events/*, iCal, S3
           email.rs               # /api/email/*
           browser.rs             # /api/browser/*
-          crm.rs                 # /api/crm/*
+          # CRM removed -- deprecated in Rust rebuild
           files.rs               # /api/files/*
           journal.rs             # /api/journal/*
           graph.rs               # /api/graph/*
@@ -4547,20 +4547,20 @@ the same board transitions, WorkerEvents, verification result, and final task st
     - **Assert**: both tabs converge to identical, revision-consistent state.
       No stale, duplicate, or missing entities at any point after convergence.
 
-### Phase 6: Email, Calendar, CRM (est. 2 weeks)
+### Phase 6: Email, Calendar (est. 2 weeks)
 
 **Goal**: integration subsystems, each scoped.
 
 1. Email: Gmail OAuth2 via `reqwest`, send/reply/inbox/search. Scoped to worker.
 2. Calendar: events CRUD, iCal generation (RFC 5545), S3 upload. Scoped to global.
-3. CRM: contacts, tags, interactions. Scoped to global.
+
+CRM is intentionally deprecated in the Rust rebuild.
 
 **Test plan**:
 - Unit: iCal RFC 5545 (line folding, UTC, VALUE=DATE)
-- Unit: CRM CRUD on in-memory DB
 - Integration: Gmail OAuth token refresh (mock HTTP)
 - Integration: S3 upload (LocalStack or mock)
-- Playwright: email compose, calendar event creation, CRM contact card
+- Playwright: email compose, calendar event creation
 
 ### Phase 7: Browser profiles, files, misc (est. 2 weeks)
 
@@ -4700,7 +4700,7 @@ Performance measurement:
 - Integration: correlation IDs present in all log entries for a traced operation
 - Integration: dashboard "why is this stuck?" query returns full trace
 - Integration: `GET /api/search?q=...` returns hits across tasks, messages, events,
-  logs, workers, schedules, email, CRM (Invariant 32)
+  logs, workers, schedules, email (Invariant 32)
 - Integration: search result provenance -- every `SearchHit` carries entity_type,
   scope, task_id, worker_id, timestamp (Invariant 32)
 - Integration: FTS5 search works completely offline (Invariant 32)
@@ -4791,7 +4791,7 @@ Phase 2:  + /api/board, /api/tasks (+/api/issues alias) → native Rust
 Phase 3:  + /api/schedules                       → native Rust
 Phase 4:  + /api/sessions/*/send, steering       → native Rust
 Phase 5:  + /api/board/*/status-request, verify  → native Rust
-Phase 6:  + /api/email, /api/cal-events, /api/crm → native Rust
+Phase 6:  + /api/email, /api/cal-events → native Rust
 Phase 7:  + /api/browser, /api/files             → native Rust
 Phase 8:  + / (dashboard), /api/sync, SSE        → native Rust
 Phase 9:  + /api/debug, /api/metrics             → native Rust
@@ -4854,7 +4854,7 @@ Backend rollback: switch any worker from herdr back to tmux by changing its
 | 3 - Scheduling | 2 weeks | 11 weeks |
 | 4 - Control plane | 2 weeks | 13 weeks |
 | 5 - Verification | 2 weeks | 15 weeks |
-| 6 - Email/Calendar/CRM | 2 weeks | 17 weeks |
+| 6 - Email/Calendar | 2 weeks | 17 weeks |
 | 7 - Browser/files/misc | 2 weeks | 19 weeks |
 | 8 - Dashboard + CLI (rewrite, not extraction) | 4 weeks | 23 weeks |
 | 9 - Observability + performance | 2 weeks | 25 weeks |
@@ -5415,7 +5415,7 @@ columns                         task relationships
 gates                           messages/history
 schedules                       schedule runs
 memories                        prefs/settings
-browser profiles metadata       CRM contacts
+browser profiles metadata
 email metadata                  calendar events
 files/file metadata             interaction/event history
 token/cost ledger               integration configuration
@@ -5475,14 +5475,14 @@ destination is a bug in the manifest, not an implicit deprecation.
    Open a migrated task, search migrated messages, run a migrated schedule, start a
    migrated worker, view migrated logs, resolve migrated scoped config, access migrated
    browser profile metadata, view migrated email threads, check migrated calendar events
-   in iCal feed, browse migrated CRM contacts, verify migrated group scope resolution,
+   in iCal feed, verify migrated group scope resolution,
    confirm migrated token ledger totals, exercise migrated memories with scope isolation.
 
 2. **Net-new path**: create new data through the Rust system and prove the complete
    lifecycle works. Create worker, rename worker, change cwd, change model, change
    provider, create group, create task, create gate with dependency, create schedule,
    send message with @mention, upload file, compose email, create calendar event, create
-   CRM contact, create browser profile, create memory, perform universal search, go
+   create browser profile, create memory, perform universal search, go
    offline and reconnect, verify token usage recorded.
 
 A subsystem is not verified if only migration works or only fresh creation works.
@@ -5709,18 +5709,78 @@ incident_regression::dom_correct_zero_rendered_height
 Each test references the incident/commit where useful. The Rust rebuild is not
 successful if it can reproduce a known architectural incident.
 
+### Live capability audit (Phase 0 discovery)
+
+The Rust rebuild must achieve parity with the **live amux server's actual
+capabilities**, not just the API routes listed in the plan. The Python server
+has ~165 unique API route paths across ~50 subsystems. Some of these are
+essential capabilities the plan's RR items must cover; others are personal or
+experimental features that can be intentionally deprecated.
+
+**Mechanism**: at Phase 0, the agent runs an automated audit against the live
+server (RR-0028m). For each subsystem, it classifies every route:
+
+```
+Covered      — an RR item exists and specifies this capability
+Deprecated   — intentionally not ported, with recorded rationale
+Gap          — no RR item, needs one (creates an RR item automatically)
+```
+
+The audit output is committed as `docs/capability-audit.toml` and reconciled
+against the RR checklist. Any `Gap` produces a new RR item in the appropriate
+phase. The audit re-runs at Phase 11 as part of the final parity check.
+
+**Known gaps identified from the live server** (as of 2026-08-09):
+
+Capabilities the plan covers but whose depth needs verification:
+
+| Capability | Live routes | Plan coverage | Notes |
+|---|---|---|---|
+| **File upload to worker** | `/api/upload/start`, `/api/upload/:id/chunk/:i`, `/api/upload/:id/finish` | Partial (RR-0093 covers files browse/upload/download) | Chunked upload with drag-and-drop into worker peek input is a distinct flow from the files dashboard. Worker peek accepts dropped files, uploads via chunked protocol, attaches path to the outbound message. This must be an explicit test in the worker send/message flow, not only in the files tab. |
+| **Git integration** | `/api/sessions-git`, `/api/git-branches`, `/api/suggest-branch`, `/api/settings/commit-guard` | Partial (worker peek shows git state) | Branch suggestions, tracked-files, staged-guard are worker-scoped git features used daily. |
+| **Slash commands + skills** | `/api/slash-commands/*`, `/api/skills/*` | Not covered | Worker-scoped command registry. Skills are user-defined automation. |
+| **Saved messages** | `/api/saved-messages/*` | Not covered | Bookmarked messages for quick re-send. |
+| **Usage/stats** | `/api/usage`, `/api/stats/daily` | Partial (token budgets in Inv 16) | Daily usage dashboard, cost tracking. |
+| **Layout presets** | `/api/layout-presets/*` | Not covered | Dashboard layout persistence. |
+
+Capabilities that need a deliberate keep/deprecate decision:
+
+| Capability | Live routes | Recommendation |
+|---|---|---|
+| **Dictation/TTS** | `/api/dictation/*`, `/api/tts/*` | Keep if voice input is used; deprecate if unused. |
+| **Journal** | `/api/journal/*` | Keep -- personal logging with media. |
+| **Map/pins** | `/api/map/*` | Deprecate unless actively used. |
+| **Habits** | `/api/habits` | Deprecate unless actively used. |
+| **Torrents** | `/api/torrents/*` | Deprecate unless actively used. |
+| **Tunnel** | `/api/tunnel/*` | Keep -- reverse proxy for public URLs (calendar feed, etc.). |
+| **Recordings** | `/api/recordings` | Keep if session recordings are used. |
+| **Skins/branding** | `/api/skins`, `/api/branding/*` | Keep -- UI theming is user-facing. |
+| **Templates** | `/api/templates` | Keep -- message templates. |
+| **Reports** | `/api/reports/*` | Keep -- generated reports (review digest, weekly). |
+| **SQL explorer** | `/api/sql/*` | Keep -- power-user database inspection. |
+| **Speedtest** | `/api/speedtest/*` | Deprecate -- diagnostic, rarely used. |
+| **iTerm2** | `/api/iterm2/sessions` | Deprecate -- backend-specific. |
+| **SMS** | `/api/sms` | Keep -- alert channel (wired to owner alert). |
+| **Interactions/replay** | `/api/interactions/*` | Keep -- interaction logging and replay. |
+
+The recommendations above are starting points. The Phase 0 audit (RR-0028m)
+produces the authoritative classification after reviewing actual usage data.
+Any capability classified as `Deprecated` must have a rationale recorded in
+`docs/capability-audit.toml` -- silent omission is the failure mode this
+audit exists to prevent.
+
 ### Final parity audit
 
 Before retiring Python, automatically compare Python and Rust behavior. Inventory:
 
-- API routes (all 212+ method/path combos)
+- API routes (all 212+ method/path combos, reconciled against `docs/capability-audit.toml`)
 - Request/response shapes
 - CLI commands
 - Dashboard actions
 - Database entities
 - Scheduled jobs
 - Integrations
-- Worker operations
+- Worker operations (including file upload into worker input)
 - Prefs/config
 - Search
 - Offline capabilities
@@ -5750,7 +5810,7 @@ The rebuild is complete ONLY when all of the following are true:
 [ ] Migration manifest committed as machine-readable JSON/TOML (not only prose)
 [ ] Schema translation documented for every table (column-level type conversions explicit)
 [ ] Net-new data tested for every subsystem (workers, board, messages, groups, schedules,
-    memories, email, calendar, CRM, browser profiles, files, token ledger, search, offline)
+    memories, email, calendar, browser profiles, files, token ledger, search, offline)
 [ ] Existing migrated data tested for every subsystem (same list -- both paths required)
 [ ] API acceptance suite green
 [ ] CLI acceptance suite green
@@ -5847,7 +5907,7 @@ The acceptance suite exercises:
 - Messages, @worker mentions, delivery semantics
 - Schedules, search, logs, compaction, memory
 - Token accounting, provider quotas, capacity routing
-- Browser profiles, email, calendar, CRM
+- Browser profiles, email, calendar
 - Persistence/restart, offline operation
 - Conflict resolution, realtime UI reconciliation
 - Failures and recovery (fault injection)
@@ -6586,7 +6646,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: e2e/ux-discovery/self-test.spec.ts (73 lines, 3 tests) + fixtures/self-test.html (77 lines). Tests inventory discovery, multi-step crawl, semantic hash deduplication. Commit ece692f.
 
-- [ ] RR-0028e — OpenCode provider spike (week 1)
+- [x] RR-0028e — OpenCode provider spike (week 1)
   Phase: 0
   Depends on: RR-0001
   Invariant: 5
@@ -6599,7 +6659,8 @@ consistent with their dependencies.
     Provider coverage matrix in Phase 4 gets rewritten accordingly.
   Tests: coverage matrix committed, all four providers tested, branch decision recorded
   Verify: Implementation, Integration tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: docs/provider-coverage.csv + docs/opencode-spike-results.md. 3/4 providers covered (Claude Code stream-json, Gemini CLI stream-json, Codex CLI JSONL). Ollama is a model server, not an agent CLI. Written branch does NOT fire. Rate-limit detection remains terminal-adapter-only across all providers.
 
 - [x] RR-0028f — Core types: ExecutionLimits, AttemptRecord, RetrySchedule
   Phase: 0
@@ -6703,7 +6764,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: crates/amux-core/src/isolation.rs (123 lines, 4 tests). Commit ece692f.
 
-- [ ] RR-0028l — Phase 1+4 re-estimate if OpenCode spike triggers written branch
+- [x] RR-0028l — Phase 1+4 re-estimate if OpenCode spike triggers written branch
   Phase: 0
   Depends on: RR-0028e
   Invariant: 45
@@ -6716,6 +6777,31 @@ consistent with their dependencies.
     timeline table.
   Tests: written-branch decision recorded in docs/provider-coverage.csv,
     phase re-estimates committed if triggered
+  Verify: Implementation
+  Status: IMPLEMENTED
+  Evidence: Written branch did NOT fire (3/4 coverage). No re-estimate needed. Decision recorded in docs/opencode-spike-results.md.
+
+- [ ] RR-0028m — Live capability parity audit
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 45
+  Requirement: Automated audit of the live amux Python server's API routes
+    (~165 unique paths, ~50 subsystems) against the RR checklist. For each
+    route, classify as Covered (RR item exists), Deprecated (intentional,
+    rationale recorded), or Gap (needs an RR item). Output committed as
+    docs/capability-audit.toml. Any Gap produces a new RR item in the
+    appropriate phase. Key capabilities to verify coverage for:
+    - Chunked file upload to worker input (drag-drop into peek, /api/upload/*)
+    - Git integration (branches, staged-guard, tracked-files)
+    - Slash commands + skills registry
+    - Saved messages, templates, layout presets
+    - Usage/stats dashboard
+    - Journal, tunnel, recordings, skins/branding, reports, SQL explorer
+    - SMS (alert channel), interactions/replay
+    Capabilities classified Deprecated must have rationale -- silent omission
+    is the failure mode. Audit re-runs at Phase 11 as final parity check.
+  Tests: audit covers all live routes, no unclassified routes, Gap items
+    have corresponding RR entries
   Verify: Implementation
   Status: TODO
 
@@ -6778,13 +6864,18 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0034 — Worker API: CRUD + start/stop/peek/send
+- [ ] RR-0034 — Worker API: CRUD + start/stop/peek/send + file upload
   Phase: 1
   Depends on: RR-0003, RR-0021, RR-0029
   Invariant: 13, 43
   Requirement: Worker CRUD API. Start returns 202 (async). Stop, peek, send.
     Worker config mutation via PATCH with ConfigApplyMode response.
-  Tests: API response shapes match OpenAPI, CRUD lifecycle, 409 on version conflict
+    Chunked file upload to worker input: /api/upload/start (returns upload_id),
+    /api/upload/:id/chunk/:i (binary chunk), /api/upload/:id/finish (assembles
+    file, returns path). Upload path attached to outbound worker message.
+    Dashboard peek textarea accepts drag-and-drop files via this protocol.
+  Tests: API response shapes match OpenAPI, CRUD lifecycle, 409 on version conflict,
+    chunked upload roundtrip, upload path appears in sent message
   Verify: Implementation, Unit tests, Integration tests, API verification
   Status: TODO
 
@@ -7448,7 +7539,7 @@ consistent with their dependencies.
 
 ---
 
-### Phase 6: Email, Calendar, CRM
+### Phase 6: Email, Calendar
 
 - [ ] RR-0088 — Email: Gmail OAuth2, send/reply/inbox/search
   Phase: 6
@@ -7477,25 +7568,13 @@ consistent with their dependencies.
     Migration (net-new)
   Status: TODO
 
-- [ ] RR-0090 — CRM: contacts, tags, interactions
+- [ ] RR-0091 — Playwright: email/calendar dashboard
   Phase: 6
-  Depends on: RR-0021
-  Invariant: 13
-  Requirement: Contact CRUD, tags, interactions. Scoped to global.
-  Tests: CRUD on in-memory DB, tag operations
-  Migration: migrate CRM contacts from Python DB
-  Data verification: migrated contacts accessible
-  Verify: Implementation, Integration tests, API verification, Migration (existing),
-    Migration (net-new)
-  Status: TODO
-
-- [ ] RR-0091 — Playwright: email/calendar/CRM dashboard
-  Phase: 6
-  Depends on: RR-0025, RR-0088, RR-0089, RR-0090
+  Depends on: RR-0025, RR-0088, RR-0089
   Invariant: 44
-  Requirement: Email compose form. Calendar event creation. CRM contact card. All
+  Requirement: Email compose form. Calendar event creation. All
     interactive elements have data-testid.
-  Browser verification: compose, create event, contact card
+  Browser verification: compose, create event
   Verify: Browser verification, Visual/rendering
   Status: TODO
 
@@ -7818,7 +7897,7 @@ consistent with their dependencies.
   Depends on: RR-0017, RR-0019
   Invariant: 32
   Requirement: `GET /api/search?q=...` returns hits across tasks, messages, events,
-    logs, workers, schedules, email, CRM. SearchHit provenance (entity_type, scope,
+    logs, workers, schedules, email. SearchHit provenance (entity_type, scope,
     task_id, worker_id, timestamp). FTS5 works completely offline. Search stack:
     exact/filter -> SQLite index -> FTS5 -> optional semantic reranking.
   Tests: cross-entity search, provenance chips, offline FTS5
@@ -8274,18 +8353,6 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0125b — Migration: CRM contacts + interactions
-  Phase: 11
-  Depends on: RR-0090, RR-0118
-  Invariant: —
-  Requirement: Migrate all CRM contacts, tags, and interaction records. Translation:
-    - Python CRM contact records -> Rust `CrmContact` entities
-    - Tags preserved
-    - Interaction history preserved with timestamps
-  Data verification: contact count matches, tags intact, interaction history present
-  Verify: Implementation, Data verification, Integration tests
-  Status: TODO
-
 - [ ] RR-0126 — Migration: browser profiles + metadata
   Phase: 11
   Depends on: RR-0092, RR-0118
@@ -8436,17 +8503,16 @@ consistent with their dependencies.
   Verify: Integration tests, API verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131c — Acceptance: migrated email/calendar/CRM
+- [ ] RR-0131c — Acceptance: migrated email/calendar
   Phase: 11
-  Depends on: RR-0125, RR-0125a, RR-0125b
+  Depends on: RR-0125, RR-0125a
   Invariant: —
   Requirement: Exercise migrated integration data through the Rust server:
     - Email inbox -> migrated email metadata renders
     - Email search -> migrated emails appear in results
     - Calendar -> migrated events render, iCal feed correct
-    - CRM -> migrated contacts render with tags and interaction history
     - Reply to migrated email thread -> threading correct (In-Reply-To preserved)
-  Browser verification: email, calendar, CRM dashboards show migrated data
+  Browser verification: email, calendar dashboards show migrated data
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
@@ -8499,7 +8565,6 @@ consistent with their dependencies.
     - Upload file -> download -> verify content
     - Compose email -> send -> verify in sent
     - Create calendar event -> verify in iCal feed
-    - Create CRM contact -> add tag -> add interaction
     - Create browser profile -> start -> screenshot -> stop
     - Perform universal search -> results span all new entities
     - Go offline -> create board card -> reconnect -> replay -> verify
