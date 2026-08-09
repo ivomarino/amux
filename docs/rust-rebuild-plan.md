@@ -189,12 +189,12 @@ boundary.
 enum WorkerCommand {
     ExecuteIssue(IssueId),
     Continue,
-    Steer { text: String },
+    DeliverMessage(MessageId),
     Verify(IssueId),
     Review(IssueId),
-    Cancel,
-    Pause,
-    Resume,
+    Cancel,      // DeliveryTiming::Immediate
+    Pause,       // DeliveryTiming::Immediate
+    Resume,      // DeliveryTiming::Immediate
 }
 
 enum WorkerEvent {
@@ -927,6 +927,140 @@ restart on a different backend while preserving all durable amux state. Backend
 choice does not require DB/schema changes and does not change worker identity or
 issue ownership.
 
+### Invariant 34: Explicit queue semantics
+
+Every queue in the system has a defined delivery contract. The contract specifies
+persistence, ordering, dedup, delivery confirmation, retry policy, and dead-letter
+behavior. This is especially important with herdr as the default backend: the queue
+between the orchestrator and the backend is the critical delivery path, and its
+semantics must be testable independently of any backend implementation.
+
+#### The five queues
+
+```rust
+struct CommandQueue {
+    worker_id: WorkerId,
+    commands: VecDeque<QueuedCommand>,
+    capacity: usize,               // configurable, default 16
+    overflow: OverflowPolicy,      // Reject429
+}
+
+struct QueuedCommand {
+    id: CommandId,
+    command: WorkerCommand,
+    idempotency_key: Uuid,
+    enqueued_at: DateTime<Utc>,
+    deliver_at: DeliveryTiming,    // Immediate | AtTurnBoundary | After(Duration)
+    attempts: u32,
+    max_attempts: u32,             // default 3
+    state: CommandState,
+}
+
+enum CommandState {
+    Queued,
+    Dispatched { at: DateTime<Utc>, backend_ack: bool },
+    Delivered { at: DateTime<Utc> },
+    Confirmed { at: DateTime<Utc>, outcome: CommandOutcome },
+    Failed { at: DateTime<Utc>, reason: String },
+    DeadLettered { at: DateTime<Utc>, reason: String },
+}
+```
+
+| Queue | Persistence | Ordering | Overflow | Retry | Dead letter |
+|---|---|---|---|---|---|
+| **Command queue** (per worker) | DB-backed, survives restart | FIFO within priority | Reject 429 at capacity | 3 attempts, backoff | Dead-letter after max attempts, alert |
+| **Event channel** (per worker) | In-memory, lossy | Causal (per worker) | Drop oldest, gap marker | No retry (events are facts) | N/A |
+| **SSE channel** (per subscriber) | In-memory, lossy | Sequence-numbered | Drop oldest + reconnect hint | Client reconnects from last seq | N/A |
+| **DB write queue** | In-memory, bounded | Serialized (single writer) | Backpressure -> 503 | Retry on SQLITE_BUSY (3x) | Fail request |
+| **Message queue** (Invariant 29) | DB-backed, durable | FIFO per thread | No bound (durable) | Deliver at next turn boundary | Never (messages are durable) |
+
+#### Command delivery contract
+
+The command queue is DB-backed because commands must survive server restarts (the
+Python system lost pending steering messages on every restart). The delivery
+protocol:
+
+```
+1. API/orchestrator enqueues command (persisted to DB, idempotency key recorded)
+2. Orchestrator tick: pick next command for each idle/waiting worker
+3. Dispatch to SessionBackend.send()
+4. Backend acknowledges dispatch (command reached the process host)
+5. WorkerEvent confirms delivery (worker acted on it)
+6. Command marked Confirmed with outcome
+
+If step 3 fails: retry with backoff (backend may be restarting)
+If step 4 times out: retry (herdr/tmux may be slow but alive)
+If step 5 never arrives: after timeout, mark DeadLettered + StallViolation
+```
+
+Duplicate commands with the same idempotency key return the existing result without
+re-dispatching. This is critical during restarts: the reconciliation loop
+(Invariant 9) reprocesses pending commands, and idempotency prevents double delivery.
+
+#### Event ordering guarantees
+
+WorkerEvents are causally ordered per worker but NOT globally ordered across workers.
+This matches reality: worker A's TurnCompleted and worker B's TurnStarted have no
+causal relationship.
+
+```rust
+struct WorkerEvent {
+    // ...
+    sequence: u64,       // monotonic per worker, for gap detection
+    worker_id: WorkerId, // causal ordering is per-worker
+}
+```
+
+The event channel uses sequence numbers so consumers detect gaps. A gap means
+events were dropped under backpressure; the consumer must re-read current state
+from the DB rather than inferring it from the event stream.
+
+#### Delivery timing
+
+Not all commands should fire immediately:
+
+```rust
+enum DeliveryTiming {
+    Immediate,
+    AtTurnBoundary,     // steering messages, memory refresh
+    After(Duration),    // delayed retry, scheduled commands
+    WhenIdle,           // queue until worker finishes current turn
+}
+```
+
+`AtTurnBoundary` is where messages (Invariant 29) and context refresh are delivered.
+`WhenIdle` prevents interrupting a worker mid-turn with a lower-priority command.
+`Immediate` is for Cancel, Pause, and Resume -- they override turn boundaries.
+
+#### Dead-letter and observability
+
+Commands that exhaust retries become dead letters. A dead letter is a system failure
+(something the orchestrator wanted to happen did not happen) and produces:
+
+1. A `DurableEvent::CommandDeadLettered` with the full command and failure reason
+2. A `StallViolation` if the command was issue-related (Invariant 10)
+3. A dashboard alert on the worker card
+
+Dead letters are queryable: `GET /api/workers/:id/dead-letters`. The dashboard shows
+a count badge on the worker card when dead letters exist. This replaces the Python
+system's silent failure mode where steering messages vanished on restart with no trace.
+
+#### Queue depth as a health signal
+
+```rust
+struct QueueHealth {
+    worker_id: WorkerId,
+    depth: usize,
+    oldest_command_age: Duration,
+    dead_letter_count: u32,
+    delivery_rate: f32,     // commands confirmed / commands enqueued, trailing 1h
+}
+```
+
+A delivery rate below 90% or an oldest command older than 60s triggers a dashboard
+warning. The orchestrator uses queue depth as an input to work assignment: a worker
+with a deep queue is not a good candidate for new work.
+
 ### Invariant 22: Deterministic orchestrator simulation
 
 Instead of requiring real workers for all orchestration tests, the orchestrator runs
@@ -1643,7 +1777,7 @@ amux/
           queries.rs             # typed query functions with GroupScope
         api/
           mod.rs                 # axum router
-          workers.rs             # /api/workers/*
+          workers.rs             # /api/workers/*, dead-letters, queue health
           board.rs               # /api/board/*
           scheduler.rs           # /api/schedules/*
           calendar.rs            # /api/cal-events/*, iCal, S3
@@ -1857,12 +1991,23 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: `Message` CRUD -- create, thread, delivery state tracking (Invariant 29)
 - Unit: `Message` addressed to group fans out to all group members (Invariant 29)
 - Unit: `WorkerCommand::Steer` wraps `DeliverMessage(MessageId)` (Invariant 29)
+- Unit: command queue FIFO ordering within priority (Invariant 34)
+- Unit: command queue rejects at capacity with 429 (Invariant 34)
+- Unit: duplicate idempotency key returns existing result, no re-dispatch (Invariant 34)
+- Unit: `CommandState` transitions: Queued->Dispatched->Delivered->Confirmed (Invariant 34)
+- Unit: `DeliveryTiming::Immediate` bypasses turn boundary wait (Invariant 34)
+- Unit: `DeliveryTiming::AtTurnBoundary` holds until turn ends (Invariant 34)
+- Unit: `WorkerEvent` sequence numbers are monotonic per worker (Invariant 34)
+- Unit: event gap detection flags missing sequence numbers (Invariant 34)
 - Simulation: 50 workers, 200 issues, fake clock -- orchestrator assigns optimally with
   no double-leases (Invariant 22)
 - Simulation: provider rate-limit + recovery -- fleet redistributes within 2 ticks (Invariant 20)
 - Simulation: worker crash mid-issue -- lease reclaimed, issue re-assigned (Invariant 22)
 - proptest: no double-lease for arbitrary event sequences (Invariant 22)
 - proptest: verified implies done occurred previously (Invariant 22)
+- proptest: no duplicate delivery for same idempotency key (Invariant 34)
+- proptest: command queue FIFO preserved under arbitrary enqueue/dequeue (Invariant 34)
+- proptest: dead-lettered command always has a DurableEvent (Invariant 34)
 - Backend conformance: HerdrBackend passes full suite (Invariant 21)
 - Backend conformance: TmuxBackend passes full suite (Invariant 21)
 - Backend conformance: MockBackend passes full suite (Invariant 21)
@@ -1977,13 +2122,15 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
 **Goal**: WorkerCommand delivery, WorkerEvent processing, message delivery, and
 compaction subsystem.
 
-1. WorkerCommand -> terminal adapter (steering delivery with dedup, idempotency)
-2. Terminal adapter -> WorkerEvent (rate-limit detection per provider, crash detection)
-3. Scan demotion: hook-reported workers get demoted capture frequency
-4. Auto-responder for `--dangerously-skip-permissions` workers
-5. Turn tracking: TurnStarted/TurnCompleted events drive the orchestrator
-6. Message delivery: `Message` entities delivered at turn boundaries (Invariant 29)
-7. Compaction subsystem: context 70% -> prepare, 85% -> compact, 95% -> checkpoint +
+1. Command queue: DB-backed per-worker queue with delivery protocol (Invariant 34)
+2. WorkerCommand dispatch through SessionBackend.send() with delivery confirmation
+3. Terminal adapter -> WorkerEvent (rate-limit detection per provider, crash detection)
+4. Scan demotion: hook-reported workers get demoted capture frequency
+5. Auto-responder for `--dangerously-skip-permissions` workers
+6. Turn tracking: TurnStarted/TurnCompleted events drive the orchestrator
+7. Message delivery: `Message` entities delivered at turn boundaries (Invariant 29)
+8. Dead-letter handling: commands that exhaust retries produce StallViolation (Invariant 34)
+9. Compaction subsystem: context 70% -> prepare, 85% -> compact, 95% -> checkpoint +
    new session, new session -> hydrate from compacted context (Invariant 31)
 
 **Test plan**:
@@ -1999,7 +2146,18 @@ compaction subsystem.
 - Simulation: 10 workers rate-limiting simultaneously, orchestrator redistributes
   to available providers within 3 ticks (Invariant 20/22)
 - Simulation: command delivery under backpressure -- no lost commands, 429 for overflow (Invariant 26)
+- Simulation: server restart with 5 pending commands -- all redelivered via
+  idempotency, no duplicates (Invariant 34)
+- Simulation: command dispatch fails 2x then succeeds -- retry backoff, final
+  Confirmed state (Invariant 34)
+- Simulation: command exhausts 3 retries -- dead-lettered, StallViolation emitted,
+  dashboard alert (Invariant 34)
+- Simulation: 40 workers, mixed DeliveryTiming -- Immediate commands bypass turn
+  boundary, AtTurnBoundary commands wait, WhenIdle commands queue (Invariant 34)
 - Integration: enqueue command, verify delivery within 4s
+- Integration: command survives server restart -- pending command redelivered (Invariant 34)
+- Integration: dead-letter visible via `GET /api/workers/:id/dead-letters` (Invariant 34)
+- Integration: queue depth reflected in worker health, deep queue warns (Invariant 34)
 - Integration: rate-limit auto-wait fires on simulated terminal output
 - Integration: `IntegrationState` transitions reflected in `/health` endpoint (Invariant 23)
 - Integration: Gmail unavailable -> email operations queue, recover on reconnect (Invariant 23)
@@ -2015,6 +2173,8 @@ compaction subsystem.
 - Playwright: worker status updates live in dashboard, rate-limit shown within 2s
 - Playwright: provider quota dashboard shows fleet-level capacity (Invariant 20)
 - Playwright: compaction indicator on worker card when context > 70% (Invariant 31)
+- Playwright: dead-letter badge on worker card when commands fail delivery (Invariant 34)
+- Playwright: queue health warning when delivery rate < 90% (Invariant 34)
 
 ### Phase 5: Verification (est. 2 weeks)
 
