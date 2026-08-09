@@ -628,7 +628,7 @@ SYMPTOM: I staged amux-server.py and committed; the commit also carried
 COST: a peer's test shipped under my sha and message; two sessions spent time on
   notice/acknowledgement; the same sweep with a SECRETS or WIP file staged would be
   worse than misattribution.
-FIX-NOTE: candidate fixes, someone's to pick up: (a) staged-guard lists ALL staged
+FIX: candidate fixes, someone's to pick up: (a) staged-guard lists ALL staged
   paths not touched by the committing session's diff, loudly; (b) fleet convention:
   `git commit -- <own paths>` instead of bare commit (commit takes pathspecs and
   bypasses the index sweep); (c) both. (b) is zero-code and I am adopting it now.
