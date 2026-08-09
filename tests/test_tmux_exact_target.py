@@ -41,12 +41,24 @@ def test_no_bare_tmux_name_reaches_a_dash_t_flag():
         "kills/types-into the live longer name (AMUX-2544): %s" % bad)
 
 
-def test_tmux_target_is_exact_by_construction():
+def test_tmux_target_is_exact_with_pane_colon():
+    """tmux_target must return '=name:' — not just '=name'.
+
+    The '=' forces exact session match (no prefix). The trailing ':' is
+    required for pane-targeting commands (capture-pane, send-keys, pipe-pane,
+    respawn-pane, display-message). Without it, tmux returns 'can't find pane'
+    and exits 1. Session-level commands (has-session, kill-session) tolerate
+    both forms, which is why the original test passed while every pane
+    operation across 62 sessions was silently failing.
+    """
     src = SERVER_PATH.read_text()
     m = re.search(r"def tmux_target\(.*?\n(.*?)\n\ndef ", src, re.S)
-    assert m and 'return "=" + tmux_name(session)' in m.group(0), (
-        "tmux_target no longer returns the exact '=' form — every one of its "
-        "~57 call sites regresses to prefix matching at once")
+    assert m, "tmux_target function not found"
+    body = m.group(0)
+    assert 'return "=" + tmux_name(session) + ":"' in body, (
+        "tmux_target must return '=name:' — the colon resolves the pane "
+        "within the exact-matched session. Without it, capture-pane/send-keys/"
+        "pipe-pane all fail with 'can\'t find pane' (the 2026-08-08 outage)")
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
@@ -81,3 +93,52 @@ def test_the_prefix_hazard_is_real_and_the_exact_form_averts_it():
     finally:
         subprocess.run(["tmux", "kill-session", "-t", "=" + longer],
                        capture_output=True, timeout=5)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+def test_pane_commands_need_colon_after_exact_match():
+    """The original test only verified session commands (has-session, kill-session).
+    Pane commands (capture-pane, send-keys, pipe-pane) require '=name:' — without
+    the trailing colon they fail with 'can't find pane' even though the session
+    exists. This gap caused the 2026-08-08 outage: every capture and send-keys
+    across all 62 sessions was silently failing."""
+    tag = "amuxtest-" + uuid.uuid4().hex[:8]
+    try:
+        subprocess.run(["tmux", "new-session", "-d", "-s", tag, "-x", "20", "-y", "5"],
+                       capture_output=True, timeout=10, check=True)
+        # '=name' alone: session exists, but pane commands fail
+        cap_bare = subprocess.run(
+            ["tmux", "capture-pane", "-t", "=" + tag, "-p"],
+            capture_output=True, text=True, timeout=5)
+        assert cap_bare.returncode != 0, (
+            "'=name' without colon should fail for capture-pane — if tmux "
+            "changed this behavior upstream, the colon is redundant but harmless")
+        # '=name:' — the correct form for pane commands
+        cap_colon = subprocess.run(
+            ["tmux", "capture-pane", "-t", "=" + tag + ":", "-p"],
+            capture_output=True, text=True, timeout=5)
+        assert cap_colon.returncode == 0, (
+            "'=name:' should succeed for capture-pane")
+        # send-keys with colon must also work
+        sk = subprocess.run(
+            ["tmux", "send-keys", "-t", "=" + tag + ":", ""],
+            capture_output=True, timeout=5)
+        assert sk.returncode == 0, "'=name:' should succeed for send-keys"
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", "=" + tag],
+                       capture_output=True, timeout=5)
+
+
+def test_raw_pipe_pane_sites_use_colon():
+    """pipe-pane call sites that bypass tmux_target() and build the target
+    directly as '=' + tmux_name(name) must also include the trailing colon."""
+    src = SERVER_PATH.read_text()
+    bad = []
+    for m in re.finditer(r'"=" \+ tmux_name\([^)]*\)(?!\s*\+\s*":")', src):
+        line_no = src[:m.start()].count("\n") + 1
+        line = src.splitlines()[line_no - 1].strip()
+        if "pipe-pane" in src[max(0, m.start()-200):m.start()]:
+            bad.append("line %d: %s" % (line_no, line))
+    assert not bad, (
+        "pipe-pane site(s) using '=' + tmux_name without trailing colon — "
+        "pipe-pane is a pane command and needs '=name:': %s" % bad)
