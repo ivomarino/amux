@@ -10,14 +10,17 @@ pub mod board;
 pub mod criteria;
 pub mod browser;
 pub mod calendar;
+pub mod dictation;
 pub mod email;
 pub mod files;
+pub mod gmail_auth;
 pub mod health;
 pub mod history;
 pub mod journal;
 pub mod memories;
 pub mod metrics;
 pub mod messages;
+pub mod org;
 pub mod prefs;
 pub mod schedules;
 pub mod sessions_legacy;
@@ -25,6 +28,7 @@ pub mod settings;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
+pub mod torrents;
 pub mod verify;
 pub mod workers;
 pub mod workers_deadletters;
@@ -74,6 +78,15 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/history", history::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
+        .nest("/api/dictation", dictation::routes())
+        // Python serves transcription at the TOP-LEVEL /api/dictate (the
+        // dictation module owns it; here it is an honest 501).
+        .route("/api/dictate", axum::routing::post(dictation::dictate))
+        .nest("/api/torrents", torrents::routes())
+        .nest("/api/org", org::routes())
+        // Absolute-path routes (merged, not nested): the gmail callback
+        // below is public, and a nest wildcard at /api/gmail would shadow it.
+        .merge(gmail_auth::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
@@ -84,6 +97,11 @@ pub fn router(state: AppState) -> Router {
         .route("/health", axum::routing::get(health::health))
         // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
         .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
+        // Public: Google's OAuth redirect carries no bearer token. Python
+        // admits it via the localhost auth bypass; require_bearer has no
+        // such bypass, so the callback must sit outside it (single-use
+        // server-minted state is the guard).
+        .merge(gmail_auth::callback_routes())
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
