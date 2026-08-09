@@ -23388,6 +23388,26 @@ def main():
               os.environ.get("AMUX_SHARED_CHECKOUTS", "~/Dev/mixpeek").split(":") if p.strip()]
     mC = re.search(r'-C\s+(\S+)', scrubbed)
     run_dir = os.path.realpath(os.path.expanduser(mC.group(1))) if mC else os.path.realpath(cwd)
+    # WHERE run_dir CAME FROM, said out loud in the refusal (AF-23). Otherwise the
+    # message asserts a repo path as FACT, and when the inference is wrong it still
+    # reads as a true positive: a compound command that `cd`s into a throwaway clone
+    # and commits THERE is blocked as though it targeted the shared checkout, naming
+    # a repo the command never touched. Hit 2026-08-09 building a scratch clone.
+    #
+    # Deliberately NOT parsing `cd` out of the command, and that is the whole design
+    # decision. A wrong parse fails OPEN on a real cross-session sweep — the exact
+    # thing this guard exists to catch — and `cd a; cd b && git ...` is not safely
+    # parseable. The asymmetry is decisive: a false positive costs one retry, a false
+    # negative costs another session's uncommitted work.
+    #
+    # `-C` already resolves one line up, so a precise escape ALREADY EXISTS and the
+    # refusal simply never named it. That was the real defect — an escape nobody is
+    # told about is not an escape. Point at the path that works rather than guessing.
+    _dir_note = ("" if mC else
+                 "\n  (Repo INFERRED from this session's working directory — the guard cannot "
+                 "see a `cd` inside a compound command. If you meant a different repo, such as "
+                 "a scratch clone, re-run as `git -C <path> ... -- <paths>` and the guard will "
+                 "evaluate THAT repo instead.)")
     # The discard check runs BEFORE the static-scope gate below, and deliberately so.
     # AMUX_SHARED_CHECKOUTS is unset in every session env, in the shell, and in
     # amux-server.py, so `shared` is the hardcoded default ~/Dev/mixpeek — while
@@ -23454,7 +23474,7 @@ def main():
         else:
             sys.stderr.write(
                 f"BLOCKED by amux shared-checkout guard: {discard_why}.\n"
-                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.{_dir_note}\n"
                 f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
                 f"and re-run (consumed once, audit-logged).\n")
             return 2
@@ -23484,7 +23504,7 @@ def main():
         else:
             sys.stderr.write(
                 f"BLOCKED by amux shared-checkout guard: {amend_why}.\n"
-                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.{_dir_note}\n"
                 f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
                 f"and re-run (consumed once, audit-logged).\n")
             return 2
@@ -23544,7 +23564,7 @@ def main():
         else:
             sys.stderr.write(
                 f"BLOCKED by amux shared-checkout guard: {discard_why}.\n"
-                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions.{_dir_note}\n"
                 f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
                 f"and re-run (consumed once, audit-logged).\n")
             return 2
@@ -23558,7 +23578,7 @@ def main():
                 f"'{run_dir}' is a SHARED checkout used by multiple agent sessions — this discards or "
                 f"sweeps up EVERY session's uncommitted work. Scope to YOUR OWN paths instead: "
                 f"`git checkout -- <yourfile>`, `git stash push -- <yourpath>`, or commit your files. "
-                f"For pulls, fetch+rebase on committed state or verify the autostash popped.\n"
+                f"For pulls, fetch+rebase on committed state or verify the autostash popped.{_dir_note}\n"
                 f"OWNER-AUTHORIZED one-off: after sign-off, write the exact command to "
                 f"~/.amux/guard-allow-once and re-run (consumed once, audit-logged) — do NOT route around "
                 f"the guard via reflog.\n")
