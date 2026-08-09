@@ -156,3 +156,24 @@ def test_self_test_the_detector(srv):
         "test_gate_layers_emits_exactly_the_published_scopes cannot catch a missing tier"
     )
     print("self-test: dropping the group tier is detected")
+
+
+def test_reviewer_signoff_has_two_rules_not_one(srv):
+    """AF-20: reviewing (do the findings hold) and verifying (is it true in
+    prod) are different edges. One identity rule for both refused the
+    independent verifier amux's own sweep dispatched — two forced writes on
+    2026-08-08. The shipped shape: review->done demands the named reviewer;
+    verified (and done from any other status) demands anyone-but-the-author.
+    Structural pin — the full behavioral matrix ran against the live endpoint
+    on AMUX-2576 (7/7 cells, recorded on AF-20); this stops the two rules
+    collapsing back into one during a refactor."""
+    src = SERVER_PATH.read_text()
+    seg = src[src.find("TWO ROLES, TWO RULES"):]
+    seg = seg[:2500]
+    assert seg and "_from_review and new_status == \"done\"" in seg, (
+        "the review->done reviewer-specific branch is gone — one rule again")
+    assert "_acker == _author" in seg, (
+        "the independence (anyone-but-author) branch is gone — one rule again")
+    assert '"transition"' in seg, (
+        "the 409 no longer names the transition it refused — the misdescribed "
+        "error is what cost two forces before AF-20 was filed")
