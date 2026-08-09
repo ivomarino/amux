@@ -27,8 +27,14 @@ pub async fn require_bearer(
         // which cannot set headers.
         .or_else(|| {
             req.uri().query().and_then(|q| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("token="))
+                q.split('&').find_map(|kv| {
+                    // The SPA's _authUrl sends `_token=` (underscore); accept
+                    // both spellings — rejecting the dashboard's own param
+                    // silently killed SSE for every client (browser-golden
+                    // finding #1: the SPA degraded to 5s polling forever).
+                    kv.strip_prefix("token=")
+                        .or_else(|| kv.strip_prefix("_token="))
+                })
             })
         });
     match provided {
