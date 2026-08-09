@@ -927,3 +927,20 @@ FIX: crates/amux-server/src/api/sse.rs — replace `.text(ping_payload())` with
   `.event(Event::default().data(ping_payload()))` (KeepAlive::event exists in axum
   0.8.9); consider an unconditional 10s ping task for Python parity. Regression
   test: read the raw stream and assert the ping arrives as a `data:` frame.
+
+---
+## Browser profile DELETE can rmtree a real Chrome profile (python, live)
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2602
+SYMPTOM: DELETE /api/browser/profile/<name> (amux-server.py:74351) resolves via
+  _bu_profile_dir, which for some names lands inside the user's REAL Chrome
+  user-data-dir — and then rmtree's it. An API meant to manage amux-owned
+  automation profiles can delete a human's actual browser profile.
+COST: Data-loss class on the live server; found only because the Rust port had
+  to decide what the guard SHOULD be (native port refuses non-amux-owned dirs).
+FIX: Python needs the same containment guard while it lives; the Rust deviation
+  is documented in docs/rust-migration/server-boundary.md.
