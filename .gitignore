@@ -38,3 +38,6 @@ amux.db
 amux.db-*
 
 .gstack/
+
+# Rust build artifacts
+/target

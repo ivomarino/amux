@@ -1,0 +1,39 @@
+[package]
+name = "amux-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "amux server binary: HTTP API, SQLite store, orchestrator runtime, backends."
+
+[dependencies]
+amux-core = { path = "../amux-core" }
+amux-dashboard = { path = "../amux-dashboard" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+cron.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+sha2.workspace = true
+hex.workspace = true
+toml.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

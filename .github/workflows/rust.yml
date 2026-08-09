@@ -1,0 +1,31 @@
+name: rust
+# CI for the Rust rebuild (Phase 0 seed of the RR-Phase-10 pipeline).
+# Grows stages as phases land: Playwright golden scenarios, perf baselines,
+# migration rehearsal. Every stage here must be able to FAIL (ethos rule 7).
+on:
+  push:
+    branches: [main]
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'docs/invariant-hashes.json', 'docs/rust-rebuild-plan.md', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'docs/invariant-hashes.json', 'docs/rust-rebuild-plan.md']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Invariant hashes match the plan doc
+        # A doc edit without its hash stamp is either an unreviewed weakening
+        # or a clarification missing its commit-mate — both block (RR-0028j).
+        run: python3 scripts/invariant-hashes.py --check
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test (workspace)
+        run: cargo test --workspace

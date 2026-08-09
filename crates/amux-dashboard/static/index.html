@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>amux</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #0d1117; color: #e6edf3;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .shell { text-align: center; }
+  .shell h1 { font-weight: 600; letter-spacing: -0.02em; }
+  .shell p { color: #8b949e; font-size: 0.9rem; }
+  #health { margin-top: 12px; font-size: 0.8rem; color: #3fb950; }
+</style>
+</head>
+<body>
+<div class="shell" data-testid="dashboard-shell">
+  <h1 data-testid="dashboard-title">amux</h1>
+  <p>Rust server — Phase 0 shell. The full dashboard lands in Phase 8.</p>
+  <div id="health" data-testid="health-status">checking…</div>
+</div>
+<script>
+fetch('/health').then(r => r.json()).then(h => {
+  document.getElementById('health').textContent =
+    'server ok · build ' + (h.build || '?').slice(0, 8) + ' · rev ' + (h.rev ?? '?');
+}).catch(() => {
+  document.getElementById('health').textContent = 'server unreachable';
+});
+</script>
+</body>
+</html>
