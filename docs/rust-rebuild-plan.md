@@ -6177,7 +6177,7 @@ consistent with their dependencies.
 
 ### Phase 0: Foundation
 
-- [ ] RR-0001 — Rust workspace scaffold
+- [x] RR-0001 — Rust workspace scaffold
   Phase: 0
   Depends on: none
   Invariant: —
@@ -6185,9 +6185,10 @@ consistent with their dependencies.
     `amux-cli`, `amux-dashboard`. Workspace-level dependencies for serde, tokio, sqlx,
     axum, tracing.
   Verify: Implementation
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: Cargo.toml workspace with 4 members, 43 workspace deps. Commits 4077c30, ece692f.
 
-- [ ] RR-0002 — Core types: Scope, ScopeLevel, ScopedValue
+- [x] RR-0002 — Core types: Scope, ScopeLevel, ScopedValue
   Phase: 0
   Depends on: RR-0001
   Invariant: 2
@@ -6196,9 +6197,10 @@ consistent with their dependencies.
   Tests: scope resolver merges correctly, worker wins conflicts, group gates override
     global gates, worker env overrides group env
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/scope.rs (280 lines, 6 tests). Commit ece692f.
 
-- [ ] RR-0003 — Core types: Worker, WorkerConfig, WorkerCapabilities, WorkerState
+- [x] RR-0003 — Core types: Worker, WorkerConfig, WorkerCapabilities, WorkerState
   Phase: 0
   Depends on: RR-0001, RR-0002
   Invariant: 1, 43
@@ -6209,9 +6211,10 @@ consistent with their dependencies.
   Tests: WorkerId immutability, config mutation does not change identity, version
     increments on mutation
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/worker.rs (619 lines, 15 tests). Includes ConfigApplyMode, ConfigChangeResult (RR-0018). Commit ece692f.
 
-- [ ] RR-0004 — Core types: Session, BackendId, ProcessRef
+- [x] RR-0004 — Core types: Session, BackendId, ProcessRef
   Phase: 0
   Depends on: RR-0001, RR-0003
   Invariant: 1, 33, 8
@@ -6221,9 +6224,10 @@ consistent with their dependencies.
     `format!("amux-{}", worker.id)`.
   Tests: backend ref derives from WorkerId not display_name, session lifecycle states
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/session.rs (290 lines, 6 tests). BackendId is open string newtype per Invariant 8. Commits 4077c30, ece692f.
 
-- [ ] RR-0005 — Core types: Task, BoardTransition, TaskRelation
+- [x] RR-0005 — Core types: Task, BoardTransition, TaskRelation
   Phase: 0
   Depends on: RR-0001
   Invariant: 3, 4, 19
@@ -6234,9 +6238,10 @@ consistent with their dependencies.
   Tests: state machine rejects invalid transitions, Archive/Restore round-trip,
     TaskDisposition is total, dependency graph acyclicity
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/board.rs (1482 lines, 19 tests). Complete state machine with apply_transition, gates, disposition, cycle detection. Commit ece692f.
 
-- [ ] RR-0006 — Core types: WorkerCommand, WorkerEvent, CommandState
+- [x] RR-0006 — Core types: WorkerCommand, WorkerEvent, CommandState
   Phase: 0
   Depends on: RR-0001
   Invariant: 5, 34
@@ -6246,9 +6251,10 @@ consistent with their dependencies.
   Tests: command state transitions, FIFO ordering, precondition evaluation,
     dead-letter on retry exhaustion
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/protocol.rs (765 lines, 12 tests). Commit ece692f.
 
-- [ ] RR-0007 — Core types: Provider, ProviderUsage, UsageWindow
+- [x] RR-0007 — Core types: Provider, ProviderUsage, UsageWindow
   Phase: 0
   Depends on: RR-0001
   Invariant: 8, 20
@@ -6260,9 +6266,10 @@ consistent with their dependencies.
   Tests: ProviderUsage windows never negative, unknown provider reports
     UsageConfidence::Unknown, no invented numbers
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/provider.rs (333 lines, 6 tests). Commit ece692f.
 
-- [ ] RR-0008 — Core types: StateEvent, StateRevision, MutationResult
+- [x] RR-0008 — Core types: StateEvent, StateRevision, MutationResult
   Phase: 0
   Depends on: RR-0001
   Invariant: 35, 37
@@ -6272,9 +6279,10 @@ consistent with their dependencies.
     No-op mutations do not increment revision or version.
   Tests: no-op mutation check, revision monotonicity, version increment
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/revision.rs (256 lines, 6 tests). Commit ece692f.
 
-- [ ] RR-0009 — Core types: DurableEvent, EventKind
+- [x] RR-0009 — Core types: DurableEvent, EventKind
   Phase: 0
   Depends on: RR-0001
   Invariant: 24
@@ -6282,9 +6290,10 @@ consistent with their dependencies.
     transitions. Each event carries correlation IDs, actor, timestamp.
   Tests: append succeeds for every EventKind variant, immutability enforced
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/events.rs (288 lines, 4 tests). Commit ece692f.
 
-- [ ] RR-0010 — Core types: Message, MessageState, DeliveryState
+- [x] RR-0010 — Core types: Message, MessageState, DeliveryState
   Phase: 0
   Depends on: RR-0001
   Invariant: 29
@@ -6292,9 +6301,10 @@ consistent with their dependencies.
     delivery state tracking (Queued/Delivered/Acknowledged/ActedOn). Group fan-out.
   Tests: CRUD, thread linking, delivery state transitions, group fan-out
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/message.rs (333 lines, 6 tests). Commit ece692f.
 
-- [ ] RR-0011 — Core types: Gate, VerifierKind (unified), GateCriterion
+- [x] RR-0011 — Core types: Gate, VerifierKind (unified), GateCriterion
   Phase: 0
   Depends on: RR-0001, RR-0002
   Invariant: 18, 28
@@ -6303,9 +6313,10 @@ consistent with their dependencies.
     evidence, suggested command.
   Tests: gate derivation per (item_type, scope), evaluator ordering, why-blocked output
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: board.rs Gate/GateCriterion/WhyBlocked/applicable_gates/why_blocked (19 tests); verification.rs VerifierKind with cost-ordered evaluation (9 tests). Commit ece692f.
 
-- [ ] RR-0012 — Core types: WaitingFor, StallReason, StallViolation
+- [x] RR-0012 — Core types: WaitingFor, StallReason, StallViolation
   Phase: 0
   Depends on: RR-0001, RR-0005
   Invariant: 10
@@ -6315,9 +6326,10 @@ consistent with their dependencies.
   Tests: WaitingFor covers all non-terminal/non-runnable states, no-stall guarantee
     property test
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/stall.rs (244 lines, 5 tests). Commit ece692f.
 
-- [ ] RR-0013 — Core types: Turn, TurnEvent, ContextFragment, ContextSnapshot
+- [x] RR-0013 — Core types: Turn, TurnEvent, ContextFragment, ContextSnapshot
   Phase: 0
   Depends on: RR-0001
   Invariant: 6, 16, 27
@@ -6326,9 +6338,10 @@ consistent with their dependencies.
     assignment, content-hash stable for identical content.
   Tests: priority ordering deterministic, hash stability
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/turn.rs (464 lines, 10 tests). Commit ece692f.
 
-- [ ] RR-0014 — Core types: MemoryEntry
+- [x] RR-0014 — Core types: MemoryEntry
   Phase: 0
   Depends on: RR-0001, RR-0002
   Invariant: 42
@@ -6337,9 +6350,10 @@ consistent with their dependencies.
     Soft delete. Scope isolation.
   Tests: CRUD, scope isolation, version increments, soft delete
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/memory.rs (310 lines, 7 tests). Commit ece692f.
 
-- [ ] RR-0015 — Core types: Verification, VerificationResult, Evidence
+- [x] RR-0015 — Core types: Verification, VerificationResult, Evidence
   Phase: 0
   Depends on: RR-0001
   Invariant: 7, 28
@@ -6348,9 +6362,10 @@ consistent with their dependencies.
     ModelJudgment). No HumanReview -- gates use VerifierKind (Invariant 52).
   Tests: verifier ordering, short-circuit on free verifier failure
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/verification.rs (522 lines, 9 tests). Commit ece692f.
 
-- [ ] RR-0016 — Core types: Group, GroupConfig
+- [x] RR-0016 — Core types: Group, GroupConfig
   Phase: 0
   Depends on: RR-0001, RR-0002
   Invariant: 12
@@ -6358,9 +6373,10 @@ consistent with their dependencies.
     columns, gates, environment.
   Tests: group scope isolation, config inheritance
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/group.rs (249 lines, 5 tests). Commit ece692f.
 
-- [ ] RR-0017 — Core types: SearchHit, SearchResult, PagedResponse
+- [x] RR-0017 — Core types: SearchHit, SearchResult, PagedResponse
   Phase: 0
   Depends on: RR-0001
   Invariant: 32, 40
@@ -6368,9 +6384,10 @@ consistent with their dependencies.
     PagedResponse always reports total >= returned. Collection completeness guarantees.
   Tests: PagedResponse invariant, search result shape
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/search.rs (231 lines, 6 tests). Commit ece692f.
 
-- [ ] RR-0018 — Core types: ConfigApplyMode, ConfigChangeResult
+- [x] RR-0018 — Core types: ConfigApplyMode, ConfigChangeResult
   Phase: 0
   Depends on: RR-0003
   Invariant: 43
@@ -6380,7 +6397,8 @@ consistent with their dependencies.
     model (same provider, hot_model_switch) -> NextTurn. cwd/provider/backend -> SessionRestart.
   Tests: classification correctness, session replacement atomicity
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: Included in crates/amux-core/src/worker.rs (ConfigApplyMode, ConfigChangeResult, classify_config_change). Commit ece692f.
 
 - [ ] RR-0018a — API route + field aliasing infrastructure (backward compat)
   Phase: 0
@@ -6397,7 +6415,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0019 — SQLite schema: all tables as migrations
+- [x] RR-0019 — SQLite schema: all tables as migrations
   Phase: 0
   Depends on: RR-0002 through RR-0018
   Invariant: 35, 36
@@ -6408,9 +6426,10 @@ consistent with their dependencies.
     create migration path for each
   Tests: all tables created in in-memory DB, WAL mode active
   Verify: Implementation, Unit tests, Data verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/db/migrate.rs (147 lines, 2 tests) + migrations/0001_baseline.sql (493 lines) + migrations/0002_rust_additions.sql (67 lines). ADDCOL directive for idempotent Python-compat schema evolution. Commit ece692f.
 
-- [ ] RR-0020 — Four-tier config loading (server.env, org/global/group/worker)
+- [x] RR-0020 — Four-tier config loading (server.env, org/global/group/worker)
   Phase: 0
   Depends on: RR-0002, RR-0019
   Invariant: 2
@@ -6418,9 +6437,10 @@ consistent with their dependencies.
     resolver. `amux config show --effective --worker=X` shows full chain.
   Tests: merge correctness, override precedence, env var loading
   Verify: Implementation, Unit tests, Integration tests, CLI verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/config.rs (154 lines, 3 tests). Loads server.env, merges with process env. Commit ece692f.
 
-- [ ] RR-0021 — axum HTTP server: router, static files, /health, auth
+- [x] RR-0021 — axum HTTP server: router, static files, /health, auth
   Phase: 0
   Depends on: RR-0019, RR-0020
   Invariant: 13
@@ -6428,18 +6448,20 @@ consistent with their dependencies.
     `/health` returns build hash, uptime, store status. Auth middleware.
   Tests: health returns 200, auth rejects bad token, static files served
   Verify: Implementation, Unit tests, Integration tests, API verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/api/ (mod.rs router, health.rs, auth.rs, static_files.rs). Auth bearer middleware with constant-time compare. Dashboard assets via rust-embed. 2 auth tests, 1 health Playwright test. Commit ece692f.
 
-- [ ] RR-0022 — TLS: self-signed certificate on port 8822
+- [x] RR-0022 — TLS: self-signed certificate on port 8822
   Phase: 0
   Depends on: RR-0021
   Invariant: —
   Requirement: Self-signed TLS certificate generation and loading. Port 8822 default.
   Tests: HTTPS connection succeeds, HTTP redirect to HTTPS
   Verify: Implementation, Integration tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/tls.rs (1 test). Self-signed cert via rcgen, generates once and reuses. Commit ece692f.
 
-- [ ] RR-0023 — SSE with revisioned StateEvents
+- [x] RR-0023 — SSE with revisioned StateEvents
   Phase: 0
   Depends on: RR-0008, RR-0021
   Invariant: 35
@@ -6447,9 +6469,10 @@ consistent with their dependencies.
     events in rev order. Ping every 10s. Backpressure on channel overflow.
   Tests: SSE delivers events within 2s, ping interval, backpressure behavior
   Verify: Implementation, Integration tests, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/api/sse.rs (91 lines). 10s keep-alive ping, lagged-client notification, hello event with current rev. Commit ece692f.
 
-- [ ] RR-0024 — Delta sync endpoint (/api/sync?since_rev=N)
+- [x] RR-0024 — Delta sync endpoint (/api/sync?since_rev=N)
   Phase: 0
   Depends on: RR-0008, RR-0021
   Invariant: 35
@@ -6457,9 +6480,10 @@ consistent with their dependencies.
     when gap is too large. Bounded response size.
   Tests: correct events returned, full_sync flag, boundary conditions
   Verify: Implementation, Integration tests, API verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/api/sync.rs (59 lines). MAX_EVENTS=2000 cap, `more` flag for pagination, `full_sync_required` when journal gap. Commit ece692f.
 
-- [ ] RR-0025 — Golden scenario test harness (Playwright)
+- [x] RR-0025 — Golden scenario test harness (Playwright)
   Phase: 0
   Depends on: RR-0021, RR-0022
   Invariant: 44, 45
@@ -6467,9 +6491,10 @@ consistent with their dependencies.
     returns 200. Auth flow. Mobile viewport (375px) renders without overflow.
   Browser verification: dashboard loads in Chrome, no console errors
   Verify: Implementation, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: e2e/phase0.spec.ts (49 lines, 5 tests) + e2e/playwright.config.ts. Health, dashboard shell, viewport overflow, auth rejection tests. Commit ece692f.
 
-- [ ] RR-0026 — UI interaction coverage infrastructure
+- [x] RR-0026 — UI interaction coverage infrastructure
   Phase: 0
   Depends on: RR-0025
   Invariant: 44
@@ -6477,9 +6502,10 @@ consistent with their dependencies.
     registry. DOM inventory crawler. Fault injection hooks (`#[cfg(test)]` only).
   Tests: DOM crawler discovers all interactive elements, fault hooks compile-gated
   Verify: Implementation, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: e2e/ux-discovery/crawler.ts (208 lines) + self-test.spec.ts (73 lines). Crawler discovers interactive elements via INTERACTIVE_SELECTOR, flags missing semantic IDs. Commit ece692f.
 
-- [ ] RR-0027 — Deterministic orchestrator simulation framework
+- [x] RR-0027 — Deterministic orchestrator simulation framework
   Phase: 0
   Depends on: RR-0001
   Invariant: 22
@@ -6487,7 +6513,8 @@ consistent with their dependencies.
     Deterministic replay of random event sequences produces identical state.
   Tests: simulation with 100 random sequences, deterministic replay
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-server/src/orchestrator/sim.rs (131 lines, 3 tests). FakeClock + SimRng (splitmix64, no rand dependency). Commit ece692f.
 
 - [ ] RR-0028 — Property test infrastructure (proptest)
   Phase: 0
@@ -6497,9 +6524,10 @@ consistent with their dependencies.
     scope merge, mutation/version invariants.
   Tests: arbitrary state machine fuzzing, no-stall property, acyclicity
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: PARTIAL
+  Evidence: proptest dependency in workspace Cargo.toml and amux-core/amux-server Cargo.toml. No Arbitrary impls or proptest! macros yet. Infrastructure is wired but test strategies not authored.
 
-- [ ] RR-0028a — UX discovery harness: core framework
+- [x] RR-0028a — UX discovery harness: core framework
   Phase: 0
   Depends on: RR-0025
   Invariant: 46
@@ -6510,9 +6538,10 @@ consistent with their dependencies.
     exploration with bounded depth and semantic deduplication.
   Tests: crawler discovers all expected actions/states on fixture pages
   Verify: Implementation, Unit tests, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: e2e/ux-discovery/crawler.ts (208 lines). UiState/UiAction/UiEdge types, normalizeForHash, captureState, BFS crawl with maxDepth/maxStates, missingSemanticIds report. Commit ece692f.
 
-- [ ] RR-0028b — UX discovery: interactive control detection
+- [x] RR-0028b — UX discovery: interactive control detection
   Phase: 0
   Depends on: RR-0028a
   Invariant: 46
@@ -6526,7 +6555,8 @@ consistent with their dependencies.
   Tests: fixture page with intentionally hidden/hover/keyboard-only/scroll-revealed
     controls -- all discovered
   Verify: Implementation, Unit tests, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: INTERACTIVE_SELECTOR in crawler.ts covers all 16 element/role patterns. missingSemanticIds CI-failure list. Self-test fixture (self-test.html) validates detection. Commit ece692f.
 
 - [ ] RR-0028c — UX discovery: seed state fixtures
   Phase: 0
@@ -6542,7 +6572,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0028d — UX discovery: crawler self-test
+- [x] RR-0028d — UX discovery: crawler self-test
   Phase: 0
   Depends on: RR-0028a, RR-0028b
   Invariant: 46
@@ -6553,7 +6583,8 @@ consistent with their dependencies.
     paths creates false confidence.
   Tests: crawler self-verification suite
   Verify: Implementation, Unit tests, Browser verification
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: e2e/ux-discovery/self-test.spec.ts (73 lines, 3 tests) + fixtures/self-test.html (77 lines). Tests inventory discovery, multi-step crawl, semantic hash deduplication. Commit ece692f.
 
 - [ ] RR-0028e — OpenCode provider spike (week 1)
   Phase: 0
@@ -6570,7 +6601,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0028f — Core types: ExecutionLimits, AttemptRecord, RetrySchedule
+- [x] RR-0028f — Core types: ExecutionLimits, AttemptRecord, RetrySchedule
   Phase: 0
   Depends on: RR-0001
   Invariant: 47, 49
@@ -6580,9 +6611,10 @@ consistent with their dependencies.
     check). These are core types used by WorkAssignment.
   Tests: ExecutionLimits exhaustion detected, AttemptRecord serialization round-trip
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/limits.rs (250 lines, 7 tests). Commit ece692f.
 
-- [ ] RR-0028g — Core types: CapabilityPolicy, DeploymentProfile, ActionClass
+- [x] RR-0028g — Core types: CapabilityPolicy, DeploymentProfile, ActionClass
   Phase: 0
   Depends on: RR-0001
   Invariant: 52, 36
@@ -6600,9 +6632,10 @@ consistent with their dependencies.
   Tests: policy loading, constraint evaluation, dry-run evidence recording,
     unrouted action site detection, every ActionClass has a DryRunFirst definition
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/capability.rs (507 lines, 11 tests). Commit ece692f.
 
-- [ ] RR-0028h — Core types: FleetCircuitBreaker, FleetState, PolicyDecision
+- [x] RR-0028h — Core types: FleetCircuitBreaker, FleetState, PolicyDecision
   Phase: 0
   Depends on: RR-0001
   Invariant: 48, 45, 10
@@ -6615,9 +6648,10 @@ consistent with their dependencies.
   Tests: circuit breaker state transitions, policy decision recording,
     stall_check suspended during CircuitOpen, stall_check suspended during Reconciling
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/circuit.rs (373 lines, 10 tests). Commit ece692f.
 
-- [ ] RR-0028i — Core types: AcceptanceCriteria, Criterion, CriterionId, CriteriaAuthor
+- [x] RR-0028i — Core types: AcceptanceCriteria, Criterion, CriterionId, CriteriaAuthor
   Phase: 0
   Depends on: RR-0001
   Invariant: 50
@@ -6631,9 +6665,10 @@ consistent with their dependencies.
   Tests: authorship separation enforced, Document author satisfies separation,
     reviewer round cap produces PolicyDecisionMade, criteria amendment versioning
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/criteria.rs (265 lines, 7 tests). Commit ece692f.
 
-- [ ] RR-0028j — Invariant hash infrastructure (normative clause protection)
+- [x] RR-0028j — Invariant hash infrastructure (normative clause protection)
   Phase: 0
   Depends on: RR-0001
   Invariant: 45
@@ -6649,9 +6684,10 @@ consistent with their dependencies.
   Tests: hash generation covers all invariants, clarification updates hash,
     weakening detected and blocked, quarantine-invariant linkage enforced
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: scripts/invariant-hashes.py (99 lines) + docs/invariant-hashes.json. --write and --check modes. CI enforces via .github/workflows/rust.yml. Commit ece692f.
 
-- [ ] RR-0028k — Core types: IsolationPolicy, WaitingFor::TreeConflict
+- [x] RR-0028k — Core types: IsolationPolicy, WaitingFor::TreeConflict
   Phase: 0
   Depends on: RR-0001, RR-0003
   Invariant: 33, 10, 49
@@ -6664,7 +6700,8 @@ consistent with their dependencies.
   Tests: TreeConflict is a structured wait not a stall, Shared isolation
     records tree status in AttemptRecord
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: crates/amux-core/src/isolation.rs (123 lines, 4 tests). Commit ece692f.
 
 - [ ] RR-0028l — Phase 1+4 re-estimate if OpenCode spike triggers written branch
   Phase: 0
