@@ -10367,6 +10367,112 @@ def get_db() -> sqlite3.Connection:
     return _db_local.conn
 
 
+# ── Request log: the python origin writes the SAME table the rust origin reads ──
+# AF-36. The daily log sweep (docs/rust-migration/log-sweep.md) reads
+# `_amux_request_log`, which only the rust origin wrote. Measured over one 24h
+# window: rust 1,494 rows, python 129,940 — so the sweep was reading 1.1% of API
+# traffic and honestly reporting "0 5xx, 0 auth failures, no latency outliers"
+# about the 1%. It could not see 52 x 400, 3 x 401, 5 x 403 (sweep 4's entire
+# purpose), or a GET /api/board that took 3320ms. A check that cannot see the
+# failure is the ethos rule 7 shape, and no amount of tuning the queries fixes it.
+#
+# The table lives in ~/.amux/amux.db, which this process already opens, so this
+# needs no schema, no new endpoint and no contract change — GET /api/logs starts
+# covering both origins the moment these rows land. `answered_by` discriminates.
+#
+# BUFFERED ON PURPOSE. A synchronous insert per request, at the sustained ~1.5/s
+# this server actually serves, is precisely AC-174: slog used to open+write+close
+# under a process-global lock and during the 2026-08-03 wedge 33 of ~65 threads
+# were parked on that one line with /api/board returning HTTP 000. So the hot path
+# only appends to a deque, and one daemon thread with its own connection does the
+# I/O in batches.
+_REQLOG_MAX = 5000
+_reqlog_buf: "collections.deque" = collections.deque(maxlen=_REQLOG_MAX)
+_reqlog_dropped = 0
+_reqlog_started = False
+_reqlog_lock = threading.Lock()
+
+
+def _reqlog_family(path: str) -> str:
+    """`/api/board/AF-1/x` -> `/api/board`. Mirrors the rust origin's derivation so
+    rows from the two origins group together instead of forming parallel families."""
+    p = (path or "").split("?", 1)[0]
+    parts = [x for x in p.split("/") if x]
+    return ("/" + "/".join(parts[:2])) if len(parts) >= 2 else (p or "/")
+
+
+def _reqlog_worker(path: str) -> str:
+    """Path-derived worker, per the contract: worker logs are a FILTER over this
+    table, never a second log. `/api/sessions/{name}/*` and `/api/workers/{id}/*`."""
+    parts = [x for x in (path or "").split("?", 1)[0].split("/") if x]
+    if len(parts) >= 3 and parts[0] == "api" and parts[1] in ("sessions", "workers"):
+        return parts[2]
+    return ""
+
+
+def _reqlog_flusher():
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=30000")
+    global _reqlog_dropped
+    while True:
+        try:
+            time.sleep(2.0)
+            batch = []
+            while _reqlog_buf:
+                try:
+                    batch.append(_reqlog_buf.popleft())
+                except IndexError:
+                    break
+            if not batch:
+                continue
+            conn.executemany(
+                "INSERT INTO _amux_request_log (ts, method, path, family, status, latency_ms,"
+                " client_ip, user_agent, amux_session, worker, req_bytes, resp_bytes,"
+                " answered_by, error_body, req_meta)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+            conn.commit()
+            # Report drops rather than swallowing them: a silently truncated log is
+            # how this whole class of blindness started (rule 4 — a wrong answer has
+            # to be visible from the data you keep).
+            if _reqlog_dropped:
+                d, _reqlog_dropped = _reqlog_dropped, 0
+                slog("[reqlog] dropped %d rows — buffer full (max %d)" % (d, _REQLOG_MAX))
+        except Exception as e:
+            slog("[reqlog] flush failed: %s" % e)
+
+
+def _reqlog_record(method, path, status, latency_ms, ip, headers, resp_bytes=0, error_body=""):
+    """Hot path. Appends only — never touches the DB, never raises."""
+    global _reqlog_started, _reqlog_dropped
+    try:
+        p = (path or "").split("?", 1)[0]
+        # Same exclusions as the rust writer: SSE is long-lived, /api/debug/* is
+        # the sweep's own tooling, and non-API paths are static assets.
+        if not p.startswith("/api/") or p == "/api/events" or p.startswith("/api/debug/"):
+            return
+        if not _reqlog_started:
+            with _reqlog_lock:
+                if not _reqlog_started:
+                    threading.Thread(target=_reqlog_flusher, daemon=True,
+                                     name="reqlog-flush").start()
+                    _reqlog_started = True
+        if len(_reqlog_buf) >= _REQLOG_MAX:
+            _reqlog_dropped += 1
+            return
+        try:
+            sess = _hdr_worker(headers) if headers is not None else ""
+        except Exception:
+            sess = ""
+        _reqlog_buf.append((
+            time.time(), method or "", p, _reqlog_family(p), int(status or 0),
+            float(latency_ms or 0.0), ip or "",
+            (headers.get("User-Agent", "") if headers is not None else "")[:200],
+            sess or "", _reqlog_worker(p), 0, int(resp_bytes or 0),
+            "python", (error_body or "")[:2000], ""))
+    except Exception:
+        pass  # a logging bug must never break a request
+
+
 # ── SQL workbench ────────────────────────────────────────────────────────────
 # A lightweight query surface over amux.db. Reads run on a READ-ONLY connection
 # (bulletproof — the app's ~40 internal tables can't be mutated). Writes are
@@ -65415,6 +65521,10 @@ class CCHandler(BaseHTTPRequestHandler):
                 dt_ms = (time.monotonic() - t0) * 1000
                 ip = self.client_address[0]
                 slog(f"[{ip}] {method} {path} {self._resp_status} {dt_ms:.0f}ms")
+                # Same event, structured, into the table the sweep reads (AF-36).
+                # Deliberately alongside the slog line rather than replacing it: the
+                # text log is what a human tails, the row is what a query groups.
+                _reqlog_record(method, path, self._resp_status, dt_ms, ip, self.headers)
                 # Emit structured event — handlers may enrich via _req_tl.event
                 etype, action, target, session = _classify_request(method, path)
                 tl = getattr(_req_tl, "event", None)
