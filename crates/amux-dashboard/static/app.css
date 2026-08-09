@@ -2805,7 +2805,7 @@
   .bf-chip-x { cursor: pointer; opacity: 0.7; padding: 2px 2px; }
   .bf-chip-x:hover { opacity: 1; }
   .board-search-wrap {
-    position: relative; margin-bottom: 4px;
+    position: relative; margin-bottom: 2px;
     display: flex; align-items: center; gap: 6px;
   }
   .board-search-wrap .search-input { flex: 1 1 auto; min-width: 0; }
@@ -3250,11 +3250,11 @@
     transition: border-color 0.15s;
   }
   .new-status-input:focus { border-color: var(--accent); }
-  .board-filters { display: flex; gap: 6px; flex-wrap: nowrap; padding: 6px 0 8px; align-items: center; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .board-filters { display: flex; gap: 6px; flex-wrap: nowrap; padding: 2px 0 4px; align-items: center; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .board-filters::-webkit-scrollbar { display: none; }
   /* Saved-view chips. Horizontally scrollable so 8 views don't wrap the board
      off-screen on a 375px phone; scrollbar hidden to match .board-filters. */
-  .board-views { display: flex; gap: 6px; flex-wrap: nowrap; padding: 8px 0 4px; align-items: center;
+  .board-views { display: flex; gap: 6px; flex-wrap: nowrap; padding: 4px 0 2px; align-items: center;
                  overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .board-views::-webkit-scrollbar { display: none; }
   /* Message-kind filter chips (peek Messages tab + Message history modal).
@@ -3291,7 +3291,7 @@
        vertical breathing room, the row keeps its compact look. */
     .board-view-chip { min-height: 34px; padding: 8px 12px; font-size: 0.74rem; }
     .board-view-chip .bvc-x { padding: 0 6px; font-size: 0.8rem; }
-    .board-views { padding: 8px 0 6px; }
+    .board-views { padding: 4px 0 4px; }
   }
   .board-filter-label { font-size: 0.68rem; color: var(--dim); white-space: nowrap; }
   .board-filter-chip {
@@ -3309,20 +3309,20 @@
      figures) so the 44px rule does not bind, but the rail keeps 44px height so it
      matches the toolbar it sits under. */
   .board-stats {
-    display: flex; gap: 8px; align-items: stretch;
-    margin: 0 0 10px; padding: 2px;
+    display: flex; gap: 6px; align-items: stretch;
+    margin: 0 0 4px; padding: 2px;
     overflow-x: auto; -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
   .board-stats::-webkit-scrollbar { display: none; }
   .bstat {
-    flex: 0 0 auto; min-width: 74px; padding: 7px 11px;
-    border: 1px solid var(--border); border-radius: 8px;
+    flex: 0 0 auto; min-width: 64px; padding: 5px 9px;
+    border: 1px solid var(--border); border-radius: 7px;
     background: var(--panel); text-align: left;
   }
-  .bstat-v { font-size: 1.05rem; font-weight: 650; line-height: 1.15; color: var(--fg); }
+  .bstat-v { font-size: 0.92rem; font-weight: 650; line-height: 1.15; color: var(--fg); }
   .bstat-l {
-    font-size: 0.66rem; color: var(--dim); margin-top: 2px;
+    font-size: 0.62rem; color: var(--dim); margin-top: 1px;
     text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
   }
   .bstat.c-doing .bstat-v   { color: var(--yellow); }
