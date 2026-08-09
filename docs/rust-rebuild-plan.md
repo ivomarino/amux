@@ -245,10 +245,14 @@ enum WorkerEvent {
 ```
 
 When Claude Code hooks fire, they emit `WorkerEvent` variants directly. When hooks
-don't cover something (rate limits today), the terminal scraper infers a `WorkerEvent`
-from the captured text. The consumer never knows which source produced the event -- it
-just processes `WorkerEvent`s. As Claude Code's hook coverage grows, scrapers shrink
-to liveness checks.
+don't cover something, the terminal scraper infers a `WorkerEvent` from the captured
+text. The consumer never knows which source produced the event -- it just processes
+`WorkerEvent`s. As structured coverage grows, scrapers shrink to liveness checks.
+
+RR-0030 live evidence: Claude Code emits `rate_limit_event` and Codex CLI emits
+`error`/`turn.failed` for usage limits in their structured streams (events.rs).
+Gemini CLI rate limits remain terminal-scrape-only. Claude Code's interactive
+rate-limit MENU is still terminal-only.
 
 This is the actual D1 exit. Backend scraping becomes a fallback adapter that emits
 `WorkerEvent::RateLimited` instead of the orchestrator matching regexes. OpenCode's
@@ -567,7 +571,7 @@ Event sources, in priority order:
 
 The consumer code is identical regardless of source. OpenCode handles structured
 lifecycle transitions for all providers; the terminal adapter handles only
-provider-specific rate-limit patterns that no structured protocol exposes yet.
+provider-specific rate-limit patterns.
 
 **Per-provider event coverage** (what each source can report):
 
@@ -576,7 +580,7 @@ provider-specific rate-limit patterns that no structured protocol exposes yet.
 | TurnStarted | structured event | UserPromptSubmit hook | regex (fallback) |
 | TurnCompleted | structured event | Stop hook | regex (fallback) |
 | Waiting/Blocked | structured event | -- | regex (fallback) |
-| RateLimited | -- | -- | provider-specific regexes |
+| RateLimited | Claude: rate_limit_event; Codex: error/turn.failed | -- | Gemini + Claude menu (fallback) |
 | ContextLow | structured event | -- | regex (fallback) |
 | Failed (crash) | structured event | -- | process check (fallback) |
 
@@ -6745,7 +6749,7 @@ consistent with their dependencies.
   Tests: coverage matrix committed, all four providers tested, branch decision recorded
   Verify: Implementation, Integration tests
   Status: IMPLEMENTED
-  Evidence: docs/provider-coverage.csv + docs/opencode-spike-results.md. 3/4 providers covered (Claude Code stream-json, Gemini CLI stream-json, Codex CLI JSONL). Ollama is a model server, not an agent CLI. Written branch does NOT fire. Rate-limit detection remains terminal-adapter-only across all providers.
+  Evidence: docs/provider-coverage.csv + docs/opencode-spike-results.md. 3/4 providers covered (Claude Code stream-json, Gemini CLI stream-json, Codex CLI JSONL). Ollama is a model server, not an agent CLI. Written branch does NOT fire. CORRECTION (RR-0030 live evidence): Claude Code emits rate_limit_event and Codex CLI emits error/turn.failed for usage limits structurally; Gemini rate limits remain terminal-scrape-only. CSV and spike doc updated.
 
 - [x] RR-0028f — Core types: ExecutionLimits, AttemptRecord, RetrySchedule
   Phase: 0

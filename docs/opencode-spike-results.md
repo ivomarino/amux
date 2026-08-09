@@ -21,22 +21,22 @@ Lifecycle coverage:
 - Session start: `--print -p` or `--input-format stream-json`
 - Turn boundaries: stream-json events (turn start/end)
 - Tool use: PostToolUse hook events in stream
-- Rate limit: NOT exposed structurally (terminal scrape only)
+- Rate limit: `rate_limit_event` with `rate_limit_info.{status,resetsAt,rateLimitType}` (live evidence: events.rs fixtures, RR-0030). Interactive rate-limit menu remains terminal-only.
 - Graceful shutdown: SIGINT, `--max-turns`
-
-Rate-limit detection remains a terminal-adapter concern. All other
-lifecycle events are available structurally.
 
 ### Gemini CLI (v0.53.1) -- COVERED
 
-`--output-format stream-json` mirrors Claude Code's structured output
-shape. Gemini CLI also has a hooks system (`gemini hooks`).
+`--output-format stream-json` provides structured output but with a FLAT
+event shape (`init`, `message`, `tool_use`, `tool_result`, `result` with
+`delta: true` chunks) — does NOT mirror Claude Code's nested shape
+(live evidence: events.rs fixtures, RR-0030). Gemini CLI also has a hooks
+system (`gemini hooks`).
 
 Lifecycle coverage:
 - Session start: `-p` prompt mode
 - Turn boundaries: stream-json events
 - Progress/tool use: partial coverage via stream-json
-- Rate limit: NOT exposed structurally
+- Rate limit: NOT exposed structurally (terminal scrape only)
 - Graceful shutdown: SIGINT
 
 ### Codex CLI (v0.141.0) -- COVERED
@@ -49,7 +49,7 @@ Lifecycle coverage:
 - Session start: `exec` subcommand
 - Turn boundaries: JSONL events
 - Tool use: JSONL tool events
-- Rate limit: NOT exposed structurally
+- Rate limit: `error` + `turn.failed` JSONL events for usage limits (live evidence: captured against exhausted quota, events.rs fixtures, RR-0030). Limit-shaped messages become `RateLimited`.
 - Graceful shutdown: SIGINT
 
 ### Ollama (v0.20.5) -- NOT COVERED
@@ -83,15 +83,18 @@ No Phase 1+4 re-estimate required (RR-0028l).
 
 ## Remaining Gap: Rate Limits
 
-All three covered providers lack structured rate-limit detection. Rate-limit
-patterns are provider-specific and terminal-only:
-- Claude Code: regex matching rate-limit menu patterns
-- Gemini CLI: regex matching quota/retry patterns
-- Codex CLI: regex matching rate-limit patterns
+**Updated by RR-0030 live evidence** (crates/amux-server/src/opencode/events.rs):
 
-The terminal adapter's rate-limit detection remains load-bearing for all
-providers. This is consistent with the plan's event coverage table
-(Invariant 5): `RateLimited` shows `--` for both OpenCode and hooks columns.
+Claude Code and Codex CLI both expose rate limits structurally — the spike
+incorrectly recorded these as terminal-scrape-only:
+- Claude Code: `rate_limit_event` with `rate_limit_info.{status,resetsAt,rateLimitType}` in stream-json. The interactive rate-limit MENU remains terminal-only.
+- Codex CLI: `error` + `turn.failed` JSONL events with limit-shaped messages (captured live against exhausted quota).
+- Gemini CLI: still NOT exposed structurally (terminal scrape only).
+
+The terminal adapter's rate-limit detection remains load-bearing for Gemini
+and for Claude Code's interactive menu. The D1 exit (report endpoint replaces
+scrapers) is further along than the spike originally recorded: 2 of 3
+providers now have a structured rate-limit path.
 
 ## herdr Agent Detection
 
