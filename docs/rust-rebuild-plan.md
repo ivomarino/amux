@@ -1166,6 +1166,92 @@ against known limits. Distinct failure types get distinct recovery:
 | `AuthExpired` | Alert user, block provider until re-auth |
 | `NetworkFailure` | Retry with backoff, degrade to local (Ollama) |
 
+#### Fleet-wide rate-limit and subscription coordination
+
+When 20 workers share one Claude subscription and the subscription limit hits,
+all 20 must pause — not each independently discover the limit, thrash against it,
+and wait for a human to press continue. This is fleet-level coordination using
+existing primitives, not a new subsystem.
+
+**The problem the Python server already solves:** rate-limit detection + auto-resume
+with a per-session daily budget. The Rust version elevates this from a regex-matching
+watchdog to a structural property of the provider layer.
+
+```rust
+struct ProviderFleetState {
+    provider: ProviderId,
+    state: ProviderState,
+    affected_workers: Vec<WorkerId>,
+    parked_commands: Vec<(WorkerId, CommandId)>,
+    resume_strategy: ResumeStrategy,
+}
+
+enum ResumeStrategy {
+    WaitForReset {
+        reset_at: DateTime<Utc>,
+        auto_resume: bool,         // default: true -- no human intervention
+    },
+    Redistribute {
+        fallback: ProviderId,
+        workers_moved: Vec<WorkerId>,
+    },
+    Stagger {
+        interval: Duration,        // resume workers N seconds apart
+        order: Vec<WorkerId>,      // avoid thundering herd
+    },
+}
+```
+
+**Lifecycle (no user intervention required):**
+
+```
+1. Worker A hits rate limit
+   -> WorkerEvent::RateLimited { reset_at }
+   -> ProviderState transitions to QuotaExhausted { reset_at }
+
+2. Orchestrator sees provider is exhausted
+   -> STOPS assigning new work to ANY worker on this provider
+   -> Workers already running complete their current turn, then park
+   -> Commands queue in each worker's command queue (not lost)
+
+3. While waiting:
+   -> Workers with fallback chains get redistributed to fallback providers
+   -> Workers without fallbacks enter execution state `rate_limited`
+   -> Dashboard shows provider card: "Exhausted, resets in 2h 14m, 14 workers parked"
+
+4. Reset time arrives (or provider reports capacity recovered)
+   -> ProviderState transitions back to Available
+   -> Parked workers resume STAGGERED (not all at once — thundering herd)
+   -> Queued commands drain in priority order
+   -> No user interaction at any step
+```
+
+**Subscription exhaustion** (monthly plan runs out) is the same flow with a longer
+`reset_at` (next billing cycle). The orchestrator treats it identically — redistribute
+to fallback providers, park workers without fallbacks, auto-resume when the window
+resets. If no fallback is configured and the subscription is truly exhausted, the
+dashboard surfaces this clearly and the workers stay parked until the subscription
+renews — but the user never has to press "continue" on each worker individually.
+
+**Stagger protocol** prevents thundering herd on resume:
+
+```rust
+fn resume_parked_workers(provider: &ProviderFleetState) -> Vec<ScheduledResume> {
+    let interval = Duration::from_secs(5);  // configurable
+    provider.affected_workers.iter().enumerate().map(|(i, w)| {
+        ScheduledResume {
+            worker: *w,
+            resume_at: provider.reset_at + interval * i as u32,
+        }
+    }).collect()
+}
+```
+
+This replaces the Python server's regex-based rate-limit watchdog + daily budget
+counter with structural provider state that the orchestrator reasons about directly.
+The auto-resume is not a scraper pressing keys — it is the orchestrator unparking
+workers when `ProviderState` transitions back to `Available`.
+
 #### Dashboard provider card
 
 ```
@@ -7172,6 +7258,33 @@ consistent with their dependencies.
   Tests: budget enforcement (native + local), pause/resume lifecycle,
     group-level inheritance, dashboard spend visibility, CLI budget management
   Verify: Implementation, Unit tests, Integration tests, Browser verification
+  Status: TODO
+
+- [ ] RR-0044b — Fleet-wide rate-limit/subscription coordination + auto-resume
+  Phase: 4
+  Depends on: RR-0043, RR-0044
+  Invariant: 20, 22
+  Requirement: When a provider hits rate limit or subscription exhaustion, the
+    orchestrator coordinates ALL workers on that provider — not each discovering
+    independently. ProviderFleetState tracks affected workers and parked commands.
+    No user intervention required at any step:
+    1. First worker hits limit -> ProviderState transitions to QuotaExhausted
+    2. Orchestrator stops new assignments to ALL workers on this provider
+    3. Workers with fallback chains redistribute to fallback providers
+    4. Workers without fallbacks enter rate_limited execution state, commands queue
+    5. On reset: workers resume STAGGERED (configurable interval, default 5s)
+       to prevent thundering herd
+    Subscription exhaustion (monthly plan out) follows same flow with longer
+    reset_at. Dashboard shows: provider exhausted, reset time, N workers parked,
+    M redistributed to fallback. Replaces the Python server's regex-based
+    rate-limit watchdog with structural ProviderState the orchestrator reasons
+    about directly.
+    Simulation coverage (Invariant 22): rate-limit -> park -> redistribute ->
+    reset -> staggered resume -> all workers productive, zero user interaction.
+  Tests: fleet-wide pause on single worker rate limit, staggered resume,
+    fallback redistribution, subscription exhaustion, thundering herd prevention,
+    simulation scenario (t=3 rate-limit, t=20 reset, all workers resume)
+  Verify: Implementation, Unit tests, Integration tests, Simulation
   Status: TODO
 
 - [ ] RR-0045 — @worker mention parsing + delivery
