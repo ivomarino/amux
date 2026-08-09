@@ -10,7 +10,6 @@ pub mod board;
 pub mod criteria;
 pub mod browser;
 pub mod calendar;
-pub mod crm;
 pub mod email;
 pub mod files;
 pub mod health;
@@ -67,7 +66,6 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/metrics", metrics::routes())
         .nest("/api/email", email::routes())
         .nest("/api/cal-events", calendar::routes())
-        .nest("/api/crm", crm::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
         .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
         .nest("/api/browser", browser::routes())

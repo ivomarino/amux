@@ -93,6 +93,14 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
     // Backend changes flow live regardless (SSE reconnects on its own and
     // re-pushes full state); this banner is only about adopting new CLIENT
     // code, and that adoption is the user's call, never forced.
+    // CRM is removed from the Rust build (Ethan, 2026-08-09): hide its tab
+    // and view via the serve-time layer — the extracted SPA stays
+    // byte-identical, the decision lives HERE where it is one greppable
+    // line to reverse.
+    let crm_hide = r#"<style>/* AMUX-FEATURE-FLAGS (injected) */
+[onclick="switchView('crm')"], #crm-view { display: none !important; }
+</style>
+"#;
     let watcher = format!(
         r#"<script>/* AMUX-UPDATE-WATCH (injected at serve time) */
 (function() {{
@@ -114,7 +122,7 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
 "#,
         build = state.build_hash,
     );
-    with_bootstrap.replacen("</body>", &format!("{watcher}</body>"), 1)
+    with_bootstrap.replacen("</body>", &format!("{crm_hide}{watcher}</body>"), 1)
 }
 
 fn mime_for(path: &str) -> &'static str {

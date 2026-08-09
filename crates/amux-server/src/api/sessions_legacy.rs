@@ -53,6 +53,65 @@ pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
     }
 }
 
+/// The PYTHON fleet's sessions, from the same sources the Python server
+/// reads: ~/.amux/sessions/*.env registry + live tmux state. Read-only —
+/// the Rust server OBSERVES the Python fleet during coexistence; managing
+/// it stays Python's job until cutover. Without this the dashboard on the
+/// Rust port says "no workers yet" while 60+ real sessions run (Ethan's
+/// first verification finding).
+fn python_fleet_sessions() -> Vec<serde_json::Value> {
+    let home = std::env::var("AMUX_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+        });
+    let sessions_dir = home.join("sessions");
+    let running: std::collections::BTreeSet<String> = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        let env = crate::config::parse_env_file(&path);
+        let is_running = running.contains(&format!("amux-{name}"));
+        out.push(json!({
+            "name": name,
+            // Status detail (active/idle) is the Python scanner's judgment;
+            // the honest cells from HERE are running-blank vs stopped-blank
+            // plus the running flag the list renders.
+            "status": "",
+            "running": is_running,
+            "provider": env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into()),
+            "model": env.get("CC_MODEL").cloned().unwrap_or_default(),
+            "dir": env.get("CC_DIR").cloned().unwrap_or_default(),
+            "preview": "",
+            "task_name": "",
+            "desc": env.get("CC_DESC").cloned().unwrap_or_default(),
+            "tags": env.get("CC_TAGS").map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default(),
+            "steering_queue": [],
+            "managed_by": "python",
+        }));
+    }
+    out
+}
+
 fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
@@ -86,7 +145,30 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             "steering_queue": [],
         }))
     })?;
-    rows.collect()
+    let mut out: Vec<serde_json::Value> = rows.collect::<Result<_, _>>()?;
+    // The Python fleet rides alongside Rust-managed workers, deduped by
+    // name (a name registered in BOTH belongs to the Rust row — it carries
+    // real state).
+    let rust_names: std::collections::BTreeSet<String> = out
+        .iter()
+        .filter_map(|v| v["name"].as_str().map(|s| s.to_lowercase()))
+        .collect();
+    for s in python_fleet_sessions() {
+        if let Some(n) = s["name"].as_str() {
+            if !rust_names.contains(&n.to_lowercase()) {
+                out.push(s);
+            }
+        }
+    }
+    // Running first, then name — the Python list's ordering instinct.
+    out.sort_by(|a, b| {
+        let ra = a["running"].as_bool().unwrap_or(false);
+        let rb = b["running"].as_bool().unwrap_or(false);
+        rb.cmp(&ra).then_with(|| {
+            a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        })
+    });
+    Ok(out)
 }
 
 #[cfg(test)]

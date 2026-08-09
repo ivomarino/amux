@@ -107,13 +107,12 @@ async fn async_main() {
     };
     let app = api::router(state);
 
-    let tls = tls::load_or_generate(&cfg.tls_dir()).expect("tls material");
-    let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem(
-        tls.cert_pem.into_bytes(),
-        tls.key_pem.into_bytes(),
-    )
-    .await
-    .expect("rustls config");
+    // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
+    // for localhost/IPs — Python-server parity (its _sni_cb), so the PWA's
+    // service worker registers over https://<host>.ts.net:<port>.
+    let server_config = tls::build_server_config(&cfg.tls_dir()).expect("tls material");
+    let rustls_cfg =
+        axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config));
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
     let runtime = Arc::new(orchestrator::runtime::Runtime {
