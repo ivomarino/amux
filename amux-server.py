@@ -68632,10 +68632,39 @@ class CCHandler(BaseHTTPRequestHandler):
                     # truncated list establishes nothing, and they had already re-paid
                     # that lesson tonight.
                     if done_limit != 100:
-                        _bd = _load_board(done_limit=done_limit)
-                        return self._json(
-                            _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch),
-                            headers={"X-Amux-Done-Limit": str(done_limit)})
+                        # FOURTH TIME THIS SHAPE, and this time the remedy was
+                        # eleven lines below the early return that skipped it
+                        # (AC-301). The comment above notes "the remedy exists and
+                        # something upstream never reaches it" as the third
+                        # instance; this branch WAS that upstream, for the two
+                        # defects the AC-291 block underneath it fixes:
+                        #   - it capped in SQL BEFORE _board_project filtered, so
+                        #     the cap applied to the whole board and the filter ran
+                        #     on that window — the wrong denominator, exactly what
+                        #     AC-291 fixed for done_limit=100
+                        #   - it announced WHICH limit was asked for and never
+                        #     whether the limit BIT
+                        # Measured before this change:
+                        #   ?archived=1&session=amux-cloud             -> 48 rows
+                        #   ?archived=1&session=amux-cloud&done_limit=3 ->  1 row,
+                        #     X-Amux-Done-Limit only. One row is not "the 3 newest
+                        #     of mine"; it is what survives filtering a 3-row global
+                        #     window. A caller passes done_limit precisely WHEN they
+                        #     suspect truncation, so this is the worst possible path
+                        #     to answer with a confident, unannounced fragment.
+                        # Same load-0-then-cap shape as the block below, so both
+                        # halves of this branch now agree about what a limit means.
+                        _bd = _load_board(done_limit=0)
+                        _proj_e = _board_project(_bd, _slim, _f_sess, _f_stat, _f_arch)
+                        if done_limit == 0:
+                            _kept_e, _tt_e, _tk_e = _proj_e, 0, 0
+                        else:
+                            _kept_e, _tt_e, _tk_e = _cap_terminal(_proj_e, done_limit)
+                        return self._json(_kept_e, headers={
+                            "X-Amux-Done-Limit": str(done_limit),
+                            "X-Amux-Truncated": "1" if _tt_e > _tk_e else "0",
+                            "X-Amux-Terminal-Total": str(_tt_e),
+                            "X-Amux-Terminal-Returned": str(_tk_e)})
                     # CAP THE FILTERED SET, NOT THE POPULATION IT IS DRAWN FROM
                     # (AC-291, amux-cloud). The default path served a list already
                     # truncated to the 100 most-recent terminal cards and THEN
@@ -68688,13 +68717,45 @@ class CCHandler(BaseHTTPRequestHandler):
                 # open card is a re-cut of this asset"), and absence from a
                 # silently-truncated list establishes nothing.
                 if done_limit == 0 or done_limit != 100:
-                    _fresh = _load_board(done_limit=done_limit)
-                    # Say what was withheld, in a header so the array shape that
-                    # every consumer parses is unchanged. A list that can omit must
-                    # announce it; otherwise every negative derived from it inherits
-                    # the omission silently.
-                    return self._json(_board_project(_fresh, _slim, _f_sess, _f_stat, _f_arch),
-                                      headers={"X-Amux-Done-Limit": str(done_limit)})
+                    # FILTER FIRST, THEN CAP — and announce whether the cap BIT
+                    # (AC-301). Two defects lived here, and the comment below was
+                    # already right about both while the code did neither.
+                    #
+                    # 1. It emitted X-Amux-Done-Limit (which limit was requested)
+                    #    and never X-Amux-Truncated (whether anything was withheld).
+                    #    "A list that can omit must announce it" is exactly the
+                    #    principle, and naming the knob is not announcing the
+                    #    omission — a caller cannot tell a complete 12-row answer
+                    #    from a 12-row window onto 2000.
+                    # 2. `_load_board(done_limit=N)` truncates in SQL BEFORE
+                    #    _board_project filters, so the cap applied to the whole
+                    #    board and the filter then ran on that window. That is the
+                    #    SAME wrong-denominator bug AC-291 fixed for the default
+                    #    path, reachable through the explicit parameter — and worse
+                    #    here, because a caller passes done_limit precisely WHEN
+                    #    they suspect truncation. Measured before this change:
+                    #    ?archived=1&session=amux-cloud            -> 46 rows
+                    #    ?archived=1&session=amux-cloud&done_limit=3 -> [] and no
+                    #    headers, i.e. a confident empty, which is AC-291's exact
+                    #    original symptom surviving one door over.
+                    #
+                    # Loading with 0 and capping after the filter costs a full board
+                    # read on an explicitly-parameterised (rare) path, which is the
+                    # same trade the filtered branch above already makes. Correctness
+                    # is not optional here: these lists are used to derive ABSENCE
+                    # claims, and absence from a silently-truncated list establishes
+                    # nothing.
+                    _fresh = _load_board(done_limit=0)
+                    _proj_x = _board_project(_fresh, _slim, _f_sess, _f_stat, _f_arch)
+                    if done_limit == 0:
+                        _kept_x, _tt_x, _tk_x = _proj_x, 0, 0
+                    else:
+                        _kept_x, _tt_x, _tk_x = _cap_terminal(_proj_x, done_limit)
+                    return self._json(_kept_x, headers={
+                        "X-Amux-Done-Limit": str(done_limit),
+                        "X-Amux-Truncated": "1" if _tt_x > _tk_x else "0",
+                        "X-Amux-Terminal-Total": str(_tt_x),
+                        "X-Amux-Terminal-Returned": str(_tk_x)})
                 # Default done_limit=100 → use the shared SSE board cache
                 bc = _sse_cache["board"]
                 now = time.time()
