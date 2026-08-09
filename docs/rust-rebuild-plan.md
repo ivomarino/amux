@@ -59,17 +59,19 @@ Worker (durable entity)
  ├── Session 1 (ran, hit context limit, ended)
  ├── Session 2 (ran, crashed via OOM, ended)
  └── Session 3 (currently running)
-       └── Backend: herdr agent "worker-name"
+       └── Backend: herdr agent "amux-wrk_01J..."
 ```
 
 ```rust
 struct Worker {
-    id: WorkerId,
-    name: String,
+    id: WorkerId,                    // immutable, e.g. wrk_01J...
+    display_name: String,            // mutable, user-facing
+    name_aliases: Vec<String>,       // old names still resolve (for @worker mentions)
     group: Option<GroupId>,
     config: WorkerConfig,
     capabilities: WorkerCapabilities,
     state: WorkerState,
+    version: u64,                    // entity version (Invariant 35)
 }
 
 struct Session {
@@ -82,6 +84,12 @@ struct Session {
     exit_reason: Option<ExitReason>,
 }
 ```
+
+Backend process identifiers derive from immutable `WorkerId`, not display name:
+`format!("amux-{}", worker.id)`. Renaming a worker (`backend` -> `rust-backend`)
+changes its display name instantly without affecting its backend reference,
+process identity, or any durable state. Old names become aliases so `@backend`
+still resolves after renaming to `@rust-backend` (Invariant 17).
 
 ### Invariant 2: Three-tier scope with deterministic inheritance
 
@@ -298,12 +306,15 @@ enum Provider {
 }
 
 struct WorkerConfig {
+    cwd: PathBuf,                    // process working directory
     provider: Provider,
-    model: Option<String>,
-    #[serde(default)]  // default: Herdr
-    backend: BackendKind,
+    model: Option<ModelId>,
+    backend: BackendKind,            // default: Herdr
+    environment: ScopedEnv,
+    permissions: Permissions,
     // ...
 }
+// All fields are mutable without changing WorkerId (Invariant 43).
 ```
 
 Every provider needs:
@@ -815,19 +826,142 @@ The orchestrator bridges them: when execution state reaches `completed`, the boa
 transition to `done` fires (with evidence). When execution state reaches `crashed`,
 the orchestrator retries (new session) without touching the board.
 
-### Invariant 20: Fleet-level provider quota management
+### Invariant 20: Provider capacity and usage are normalized, best-effort runtime primitives
 
 Rate limiting is not just detection/recovery. The orchestrator knows provider
-capacity BEFORE assignment.
+capacity BEFORE assignment. Provider usage is normalized across fundamentally
+different billing/quota models without inventing numbers that don't exist.
+
+#### Normalized provider usage
+
+"Tokens remaining" means different things per provider:
+
+```
+API account:       8.2M tokens used / budget
+Subscription:      usage window 73% consumed, resets in 2h 14m
+Rate limit:        120k TPM remaining
+Daily allowance:   830 requests remaining today
+Local Ollama:      effectively unlimited
+```
+
+These are not one `tokens_remaining: Option<u64>`.
+
+```rust
+struct ProviderUsage {
+    provider: ProviderId,
+    account: Option<AccountId>,
+    windows: Vec<UsageWindow>,
+    cost: Option<CostUsage>,
+    observed_at: DateTime<Utc>,
+    source: UsageSource,
+    confidence: UsageConfidence,
+}
+
+struct UsageWindow {
+    kind: UsageWindowKind,
+    tokens_used: Option<u64>,
+    tokens_limit: Option<u64>,
+    requests_used: Option<u64>,
+    requests_limit: Option<u64>,
+    utilization: Option<f32>,      // 0.0-1.0, computed when both used+limit known
+    resets_at: Option<DateTime<Utc>>,
+}
+
+enum UsageWindowKind {
+    PerMinute,
+    PerHour,
+    Rolling,
+    Daily,
+    Weekly,
+    Monthly,
+    BillingPeriod,
+    SubscriptionAllowance,
+}
+
+struct CostUsage {
+    currency: String,              // USD
+    spent: f64,
+    budget: Option<f64>,
+}
+
+enum UsageSource {
+    ProviderApi,                   // provider reports directly
+    HeaderParsing,                 // X-RateLimit-* headers
+    TerminalDetection,             // rate-limit regex match
+    SelfAccounting,                // amux's own token counting
+}
+
+enum UsageConfidence {
+    Authoritative,                 // provider API
+    Observed,                      // derived from signals
+    Estimated,                     // amux's approximation
+    Unknown,                       // no data available
+}
+```
+
+`Option` everywhere. If Claude exposes remaining plan allowance, amux shows it.
+If it only exposes "rate limited until X", amux records that. If no API exists
+(Ollama), amux does not invent a number.
+
+#### Three layers of usage
+
+```
+PROVIDER ACCOUNT              WORKER / ISSUE
+Claude plan                   backend-worker
+12% allowance remaining       AR-421 consumed 73,221 tokens
+resets 8:00 PM
+        |
+        v
+      MODEL
+      Sonnet
+      input/output usage + pricing
+```
+
+This lets the orchestrator answer:
+```
+Claude has 8% remaining.
+AR-421 is estimated at 120k tokens.
+Codex has 63% remaining.
+-> route AR-421 to Codex.
+```
+
+#### Provider capability interface
+
+```rust
+#[async_trait]
+trait ProviderAdapter: Send + Sync {
+    async fn start_session(&self, spec: ProviderSessionSpec) -> Result<ProcessRef>;
+    async fn usage(&self) -> Result<ProviderUsage>;
+    fn models(&self) -> &[ModelDescriptor];
+    fn capabilities(&self) -> ProviderCapabilities;
+}
+
+struct ProviderCapabilities {
+    usage_reporting: UsageReporting,
+    hot_model_switch: bool,
+    context_window_reporting: bool,
+    rate_limit_reset_reporting: bool,
+    monetary_cost_reporting: bool,
+}
+
+enum UsageReporting {
+    Full,                          // API returns usage windows
+    Partial,                       // headers or rate-limit only
+    None,                          // no usage data (Ollama)
+}
+```
+
+Prevents amux from expecting the same observability from Ollama, Claude Code
+OAuth, an Anthropic API key, Gemini, and Codex.
+
+#### Fleet-level quota state
 
 ```rust
 struct ProviderQuota {
-    provider: Provider,
+    provider: ProviderId,
     concurrency_limit: usize,
     active_workers: usize,
-    requests_remaining: Option<u64>,
-    tokens_remaining: Option<u64>,
-    reset_at: Option<DateTime<Utc>>,
+    usage: ProviderUsage,          // normalized usage from above
     rolling_error_rate: f32,
     state: ProviderState,
 }
@@ -835,7 +969,7 @@ struct ProviderQuota {
 enum ProviderState {
     Available,
     Degraded { reason: String },
-    QuotaExhausted { reset_at: DateTime<Utc> },
+    QuotaExhausted { window: UsageWindowKind, reset_at: DateTime<Utc> },
     ConcurrencyLimited,
     Unavailable { since: DateTime<Utc> },
     AuthExpired,
@@ -860,6 +994,25 @@ against known limits. Distinct failure types get distinct recovery:
 | `Unavailable` | Circuit breaker, exponential backoff + jitter |
 | `AuthExpired` | Alert user, block provider until re-auth |
 | `NetworkFailure` | Retry with backoff, degrade to local (Ollama) |
+
+#### Dashboard provider card
+
+```
+Claude
+Sonnet 4.5
+
+Plan allowance     [|||||||---]  72%
+Resets             2h 14m
+Current context    84k / 200k
+Today              4.1M tokens
+This issue         83k tokens
+Fleet active       14 workers
+Rate state         Available
+```
+
+Unsupported values show `--`, never a guessed number. Aggregate metrics:
+tokens/verified-issue, tokens/worker, tokens/provider, tokens/model, provider
+allowance remaining, context remaining per active worker.
 
 ### Invariant 21: Backend and provider conformance suites
 
@@ -916,12 +1069,16 @@ worker identity, issue lifecycle, messages, context, turns, gates, verification
 behavior, scheduling behavior, or observable API semantics.
 
 ```rust
-// Backend is configuration, not identity
+// All of WorkerConfig is mutable configuration, not identity (Invariant 43).
 struct WorkerConfig {
-    // ...
+    cwd: PathBuf,
+    provider: Provider,
+    model: Option<ModelId>,
     backend: BackendKind,  // default: Herdr
-    // Changing this field and restarting the worker is a valid operation.
-    // Everything above the SessionBackend trait is unchanged.
+    environment: ScopedEnv,
+    permissions: Permissions,
+    // Changing any field is valid. Some changes require session restart.
+    // Everything above the SessionBackend/AgentProtocol traits is unchanged.
 }
 
 enum BackendKind {
@@ -2077,6 +2234,127 @@ Additive merging, deletion tracking, and concurrent writes are all handled by
 the entity version + optimistic concurrency (Invariant 35). Two workers writing
 to the same memory entry get a 409 conflict, not last-writer-wins.
 
+### Invariant 43: Worker configuration is mutable; worker identity is not
+
+A worker can change its display name, working directory, provider, model, backend,
+environment, permissions, group, and automation preferences without creating a new
+worker. The `WorkerId` is immutable. Everything else is configuration.
+
+#### Config change classification
+
+```rust
+enum ConfigApplyMode {
+    Immediate,           // applied to the running session now
+    NextTurn,            // applied when the current turn ends
+    SessionRestart,      // requires terminating and replacing the session
+}
+```
+
+| Field | Apply mode |
+|---|---|
+| `display_name` | Immediate |
+| `group` | Immediate |
+| `permissions` | Immediate |
+| `schedules` | Immediate |
+| `automation_prefs` | Immediate |
+| `model` (same provider, provider supports hot-switch) | NextTurn |
+| `context_policy` | NextTurn |
+| `tool_availability` | NextTurn |
+| `cwd` | SessionRestart |
+| `provider` | SessionRestart |
+| `model` (provider requires process-level selection) | SessionRestart |
+| `backend` | SessionRestart |
+| `environment` (affecting process startup) | SessionRestart |
+
+The API response for a config change declares which mode was used:
+
+```rust
+struct ConfigChangeResult {
+    applied: ConfigApplyMode,
+    worker: Worker,                // updated entity
+    session_replaced: bool,        // true if a new session was spawned
+    old_session_id: Option<SessionId>,
+    new_session_id: Option<SessionId>,
+}
+```
+
+#### Session replacement (atomic)
+
+When a config change requires `SessionRestart`:
+
+```
+old session running
+       |
+checkpoint current turn/context
+       |
+spawn new session with updated config
+       |
+health/ready check on new session
+       |
+switch worker.current_session_id
+       |
+terminate old session
+```
+
+The worker never disappears during reconfiguration. If the new session fails to
+start, the old session remains active and the config change is rejected.
+
+**A config change restarts the session when necessary, never replaces the worker.**
+The following remain unchanged across any config mutation:
+
+```
+WorkerId, issues, messages, memory, turn history, gates,
+schedules, metrics, search identity, audit history
+```
+
+#### Per-issue model override
+
+Workers have a default model. Individual issues can request a different model
+without changing the worker default:
+
+```rust
+struct IssueHints {
+    requested_model: Option<ModelId>,  // override worker default for this issue
+    // ...
+}
+```
+
+After the issue completes, the worker returns to its configured model. This
+supports the orchestrator's cost optimization: route expensive issues to capable
+models while keeping worker defaults economical.
+
+#### Rename and alias
+
+Display names can change instantly (Immediate). Backend process identifiers
+derive from immutable `WorkerId` (`format!("amux-{}", worker.id)`), so renaming
+never affects the process host.
+
+Old display names become aliases. `@backend` still resolves after renaming to
+`@rust-backend` until the alias is explicitly removed. This makes `@worker`
+addressing (Invariant 17) durable across renames.
+
+```rust
+// Name resolution priority:
+// 1. Exact match on display_name
+// 2. Exact match on any alias
+// 3. Prefix match on display_name (if unambiguous)
+fn resolve_worker_name(name: &str, workers: &[Worker]) -> Option<WorkerId>;
+```
+
+#### Working directory
+
+`cwd` is an explicit field in `WorkerConfig`, distinct from `FsScope`
+(authorization/capability). `cwd` is where the process starts; `FsScope` is what
+it is allowed to access.
+
+```
+PATCH /api/workers/:id/config
+{ "cwd": "/Users/ethan/code/mixpeek", "base_rev": 17 }
+
+Response:
+{ "applied": "session_restart", "session_replaced": true, ... }
+```
+
 ### Design rule: self-documenting by construction
 
 The system is its own documentation. No separate design doc, wiki, or README should
@@ -2470,11 +2748,12 @@ amux/
           commands.rs            # WorkerCommand -> OpenCode translation
           transport.rs           # HTTP/WebSocket transport to OpenCode process
         provider/
-          mod.rs                 # provider dispatch
-          claude.rs              # Claude Code specifics (hooks, regexes, auth)
-          gemini.rs              # Gemini specifics
-          codex.rs               # Codex specifics
-          ollama.rs              # Ollama specifics
+          mod.rs                 # ProviderAdapter trait, ProviderUsage, ProviderCapabilities
+          usage.rs               # normalized usage windows, confidence, cost
+          claude.rs              # Claude Code specifics (hooks, regexes, auth, usage API)
+          gemini.rs              # Gemini specifics (quota API)
+          codex.rs               # Codex specifics (usage headers)
+          ollama.rs              # Ollama specifics (no usage data)
         push/
           mod.rs                 # Web Push (VAPID, RFC 8291)
         ebook/
@@ -2721,6 +3000,9 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - proptest: no duplicate delivery for same idempotency key (Invariant 34)
 - proptest: command queue FIFO preserved under arbitrary enqueue/dequeue (Invariant 34)
 - proptest: dead-lettered command always has a DurableEvent (Invariant 34)
+- proptest: worker config mutation never changes WorkerId (Invariant 43)
+- proptest: session replacement preserves all durable state (Invariant 43)
+- proptest: ProviderUsage windows never report negative utilization (Invariant 20)
 - Backend conformance: HerdrBackend passes process lifecycle suite (Invariant 21)
 - Backend conformance: TmuxBackend passes process lifecycle suite (Invariant 21)
 - Backend conformance: MockBackend passes process lifecycle suite (Invariant 21)
@@ -2732,6 +3014,21 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
 - Integration: switch worker from herdr to tmux, restart -- worker identity, issue
   ownership, messages, context all preserved (Invariant 33)
+- Integration: rename worker -- display_name changes, WorkerId unchanged, old name
+  becomes alias, @mention resolves via alias (Invariant 43)
+- Integration: change worker cwd -- session replaced atomically, worker identity
+  preserved, old session terminated after new session healthy (Invariant 43)
+- Integration: change worker model (same provider, hot-switch) -- applied next turn,
+  no session restart (Invariant 43)
+- Integration: change worker provider -- session restart, all durable state preserved
+  (Invariant 43)
+- Integration: per-issue model override -- issue uses Opus, worker returns to Sonnet
+  after completion (Invariant 43)
+- Integration: config change during active turn -- queued until turn ends for
+  NextTurn/SessionRestart modes (Invariant 43)
+- Integration: ProviderUsage windows correctly normalized per provider (Invariant 20)
+- Integration: Ollama reports UsageConfidence::Unknown, no invented numbers (Invariant 20)
+- Integration: ProviderCapabilities.hot_model_switch drives ConfigApplyMode (Invariant 20/43)
 - Integration: SSE delivers worker state within 2s of WorkerEvent
 - Integration: worker status transitions (idle->active->rate_limited->idle) reflected
   in API response within 1s
