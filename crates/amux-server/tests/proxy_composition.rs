@@ -12,12 +12,14 @@
 //! auth probe into reporting an unauthenticated 200 on /api/fs.
 //!
 //! Post-AMUX-2597 this file also pins the BOUNDARY itself:
-//! - every family py_proxy::PROXIED_FAMILIES declares actually routes to
-//!   the proxy (honest 502 against a dead python — deterministic anywhere);
+//! - py_proxy::PROXIED_FAMILIES is EMPTY and must STAY empty (AMUX-2608:
+//!   /api/scope was the last row) — a reappearing row fails here, which is
+//!   what makes the empty table the cutover's standing proof rather than a
+//!   coincidence of the moment;
 //! - the families that went NATIVE (/api/fs, /api/groups, /api/tags,
-//!   /api/ls) answer WITHOUT the `x-amux-answered-by: python-proxy` stamp,
-//!   so a regression back to proxying (or forward to the SPA shell) fails
-//!   loudly;
+//!   /api/ls, /api/scope, …) answer WITHOUT the `x-amux-answered-by:
+//!   python-proxy` stamp, so a regression back to proxying (or forward to
+//!   the SPA shell) fails loudly;
 //! - the registry cannot drift from mod.rs: every /api route literal mod.rs
 //!   mounts must be claimed by NATIVE_FAMILIES or PROXIED_FAMILIES (a view
 //!   must share the predicate of the mechanism it describes — ethos rule 1).
@@ -81,24 +83,44 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
 
     let (app, _dir) = app();
 
-    // -- PROXIED families (from the registry) reach the proxy: honest 502
-    //    naming the unreachable python, never the static shell.
-    for path in [
-        // scope/capabilities — the one family still python-owned
-        "/api/scope",
-    ] {
-        let (status, ct, body, _) = get(&app, path).await;
-        assert!(
-            !ct.starts_with("text/html"),
-            "{path} answered by the static shell: {ct}"
-        );
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{path}: {body}");
-        let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
-        assert_eq!(
-            v["error"], "python server unreachable for proxied path",
-            "{path}: {body}"
-        );
-    }
+    // -- The registry is EMPTY (AMUX-2608: /api/scope was the last row) and
+    //    the assertion is what keeps it empty — a new proxy row must delete
+    //    this check to land, which is the loud conversation it deserves.
+    assert!(
+        py_proxy::PROXIED_FAMILIES.is_empty(),
+        "PROXIED_FAMILIES must stay empty post-cutover; a new row reintroduces \
+         the python proxy: {:?}",
+        py_proxy::PROXIED_FAMILIES.iter().map(|f| f.family).collect::<Vec<_>>()
+    );
+
+    // -- /api/scope answers NATIVELY (was the last proxied family): with
+    //    AMUX_PY_URL pointing at a dead port, a proxy regression would be a
+    //    502 here; the SPA-shell swallow would be text/html.
+    let (status, ct, body, proxied) = get(&app, "/api/scope").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied, "/api/scope must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["level"], "global");
+    assert_eq!(
+        v["capabilities"].as_array().map(|a| a.len()),
+        Some(5),
+        "all five capabilities reported: {body}"
+    );
+    // The hermetic fleet (w1: alpha, beta) shows through the global read.
+    assert_eq!(v["groups"], serde_json::json!(["alpha", "beta"]));
+    let (status, _, body, proxied) = get(&app, "/api/scope?level=worker&name=w1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["groups"], serde_json::json!(["alpha", "beta"]));
+    // Sub-paths: python's generic JSON 404, never the shell.
+    let (status, ct, body, proxied) = get(&app, "/api/scope/definitely-not").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["error"], "not found", "{body}");
 
     // -- NATIVE families answer themselves: no proxy stamp, no 502, no
     //    static shell. /api/fs, /api/groups, /api/tags, /api/ls were
@@ -267,10 +289,9 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!proxied);
     let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
-    // No minimum on `proxied`: AMUX-2598 is retiring rows one by one (file
-    // viewer + library went native here), and the registry legitimately
-    // shrinks toward empty — the shape is the contract, not the count.
-    assert!(v["proxied"].is_array(), "{body}");
+    // The registry reached empty (AMUX-2608) and the LIVE VIEW must say so —
+    // an empty `proxied` array is the runtime half of the cutover proof.
+    assert_eq!(v["proxied"], serde_json::json!([]), "{body}");
     assert!(v["native"].as_array().unwrap().len() > 20, "{body}");
     assert_eq!(v["doc"], "docs/rust-migration/server-boundary.md");
 

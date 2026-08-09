@@ -87,15 +87,16 @@ async fn not_found() -> Response {
     j(404, json!({"error": "not found"}))
 }
 
-fn amux_home() -> PathBuf {
+pub(crate) fn amux_home() -> PathBuf {
     std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
     })
 }
 
 /// Python `_hdr_worker` (py:15100 region): X-Amux-Worker is canonical,
-/// X-Amux-Session still honored.
-fn hdr_worker(headers: &HeaderMap) -> String {
+/// X-Amux-Session still honored. Shared with api/scope.rs (same attribution
+/// rule for scope writes).
+pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
     for h in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
@@ -109,7 +110,7 @@ fn hdr_worker(headers: &HeaderMap) -> String {
 
 /// Quarantined session names (`~/.amux/blocked-sessions.txt`,
 /// py `_blocked_session_names`): excluded from the fleet scan.
-fn blocked_names(home: &Path) -> BTreeSet<String> {
+pub(crate) fn blocked_names(home: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(home.join("blocked-sessions.txt"))
         .map(|t| {
             t.lines()

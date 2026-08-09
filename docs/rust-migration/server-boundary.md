@@ -1,17 +1,24 @@
 # Server boundary: what Rust owns, what Python owns (AMUX-2597)
 
-Two servers run on this machine pre-cutover: **Python** (`amux-server.py`, :8822)
-owns the live fleet; **Rust** (`crates/amux-server`, :8824) serves the same SPA and
-answers natively where it can. This file is the ownership matrix. The code twin is
-the registry in `crates/amux-server/src/api/py_proxy.rs` (`PROXIED_FAMILIES` /
-`NATIVE_FAMILIES`) — mounts derive from it, `tests/proxy_composition.rs`
-cross-checks it against the routes mod.rs actually mounts, and it is served live at
-**`GET /api/debug/boundary`**. Every proxied response carries
-`x-amux-answered-by: python-proxy`; no header means Rust answered.
+**Every /api family is RUST-NATIVE. Zero families proxy to Python (AMUX-2608:
+`/api/scope` was the last row; its native port emptied `PROXIED_FAMILIES`).**
 
-Rules:
-- A family proxies only via a `PROXIED_FAMILIES` row. No ad-hoc proxy mounts.
+Two servers still run on this machine during the migration soak: **Rust**
+(`crates/amux-server`, :8824) answers everything natively; **Python**
+(`amux-server.py`, :8822) is the deprecated predecessor kept alive until the
+cutover-runbook gates retire it. The code twin of this file is the registry in
+`crates/amux-server/src/api/py_proxy.rs` (`PROXIED_FAMILIES` — **empty, and
+asserted empty** by `tests/proxy_composition.rs` — plus `NATIVE_FAMILIES`),
+served live at **`GET /api/debug/boundary`**, which now reports `proxied: []`.
+Any proxied response would carry `x-amux-answered-by: python-proxy`; no
+response does.
+
+Rules (the mechanism outlives its last row on purpose):
+- A family may proxy only via a `PROXIED_FAMILIES` row. No ad-hoc proxy mounts —
+  and re-adding a row means deleting the composition test's empty-registry
+  assertion, which is the loud conversation such a regression deserves.
 - Cutover of a family = delete its row, mount a native router, update this table.
+  All rows are now deleted; this table records where each family landed.
 - Both servers share `~/.amux` (SQLite DB, session env files, uploads dir); SHARED-DB
   notes below say which store a native family reads.
 
@@ -29,6 +36,7 @@ Rules:
 | `/api/upload`, `/api/uploads` | RUST-NATIVE | chunked upload protocol + serving `~/.amux/uploads` (api/upload.rs) |
 | `/api/identity` | RUST-NATIVE | cloud user + auth-config introspection (X-Amux-User-Email, server.env key/proxy presence, ~/.claude.json oauth) — py:73349. `key_valid`/`key_error` answer null/"" (python's pre-validation state): this server runs no key validator and does not invent one |
 | `/api/browser` | RUST-NATIVE (AMUX-2598) | Full family: launch/status/stop/profiles + driver verbs (navigate/screenshot(+`/screenshot/file` serving the bytes)/state/action/inspect/search/sessions/pw-profiles/save-profile/DELETE profile) over a native CDP **websocket** client (`integrations/browser.rs`) against the Chrome the server spawned. **Invariant (owner directive): browser automation always executes on the server machine; the dashboard is a remote viewer** — the CDP client refuses non-loopback endpoints, and screenshots are served through the API for remote clients (Python returns only a server filesystem `path`; its dashboard bridges via `/api/file/raw` — the native response carries both `path` and `serve`). `/agent` (Python's server-side model loop) answers an honest **501**: the session's own model drives the native verbs instead (ethos D1/D3). Deviation: `DELETE /profile/{name}` refuses dirs outside `playwright-auth/` (Python would rmtree inside the real Chrome user-data-dir) |
+| `/api/scope` | RUST-NATIVE (AMUX-2608 — the LAST proxied family) | uniform per-capability scope contract (`api/scope.rs`): GET reads every capability (memory/rules/env/gates/status_mode) at one level with level decorations (worker→groups, group→members, global→all groups); PUT is descriptor-driven — 409 on an unsupported (level, capability) pair with the teaching error (level=`type`/`card` reach it), 403 under the restrictive-by-policy write authorization (`AMUX_SCOPE_WRITE_AGENTS=1` opens all levels to sessions). Storage is Python's byte-for-byte: memory/rules `.md` files under `~/.amux/memory`, env files (0600), shared-DB `statuses`/`session_gates` (`group:<name>` key)/`status_scope`. Every write inserts Python's `interaction_log` audit row (kind `scope`, per-(kind,target) seq). Method routing is Python's: PUT writes, EVERY other method answers the read (live-verified — no 405s). **Deviation:** worker-level memory writes update the store file but do NOT push into Claude's project MEMORY.md (`_write_claude_memory` is the memory-compose machinery session_verbs names as its gap; Python's composer picks the edit up during the soak) |
 | `/api/dictate`, `/api/dictation/*` | RUST-NATIVE (AMUX-2598) | full dictation family, engine included: warm openai-whisper worker subprocess (same inline worker script as python, `~/.cache/whisper/<AMUX_WHISPER_MODEL>.pt` presence-detected, interpreter found by ABSOLUTE path — launchd has no shell PATH), Gemini `generateContent` fallback + AI-edit (`AMUX_DICTATION_MODEL`, BYO pref `dictation_gemini_key` beats `GOOGLE_API_KEY`), and the deterministic session-name recovery pass with a difflib-exact `SequenceMatcher.ratio` port. `/config` GET is byte-compatible with python's `json.dumps` output. No engine present = python's honest 503 naming what to install |
 | everything else mounted in `api/mod.rs` (memories, messages, schedules, prefs, email, cal-events, branding, skills, map, journal, history, settings, push, torrents, org, gmail, metrics, usage, alerts, stats, debug, health, calendar.ics) | RUST-NATIVE | see `NATIVE_FAMILIES` notes per family |
 
@@ -92,9 +100,12 @@ Rules:
   (`tests/fixtures/boundary/live_recorded.json`, GET-only capture) against the native
   handlers — hermetic, runs in CI.
 - Live oracle: `tests/boundary_live_oracle.rs` (`--ignored`) runs identical GETs
-  against :8822 and the native router; 2026-08-09 run: **29 paths agreed, 0 diffs**
-  (fs list/read/search, ls, autocomplete, groups both spellings, all 14 live group
-  configs, 3 scoped callers), `/health build` bracket held.
+  against :8822 and the native router; 2026-08-09 run post-AMUX-2608: **51 paths
+  agreed, 0 diffs** (fs list/read/search, ls, autocomplete, groups both spellings,
+  all 14 live group configs, 3 scoped callers, and `/api/scope`: global read,
+  4 validation shapes, all 14 group-level reads against live-seeded
+  statuses/session_gates/status_scope, 2 worker-level reads), `/health build`
+  bracket held.
 - File-viewer live oracle: `tests/file_viewer_live_oracle.rs` (`--ignored`,
   GET-only) diffs /api/file (9 payload kinds + 5 error shapes), /api/file/raw
   (full + bounded range on a text fixture, 3 range shapes on a real media file

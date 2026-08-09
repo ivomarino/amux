@@ -1,15 +1,18 @@
 //! Strangler-fig passthrough: endpoint families the PYTHON server still owns
-//! forward to it until cutover.
+//! forward to it until cutover. **Post-AMUX-2608 that set is EMPTY — every
+//! /api family answers natively** — and this module survives as the registry
+//! that PROVES it stays empty, plus the machinery a future row would need.
 //!
 //! **The boundary is a TABLE, not archaeology** (AMUX-2597: "there needs to
-//! be a clear separation between the two servers"). Every family that still
-//! proxies is declared ONCE in [`PROXIED_FAMILIES`] — path, why Python owns
+//! be a clear separation between the two servers"). Any family that proxies
+//! must be declared ONCE in [`PROXIED_FAMILIES`] — path, why Python owns
 //! it, and the exit condition that retires the proxy — and the axum mounts
 //! derive from that table ([`family_routes`], called from mod.rs). A
 //! module-internal proxy hop (`ProxyMount::Module`) must also be declared in
 //! the same table with its mount site named, so nothing proxies without a
-//! row here (no such row remains). Runtime view: `GET /api/debug/boundary`
-//! (ethos rule 4 — the separation must be enumerable where people look).
+//! row here. Runtime view: `GET /api/debug/boundary` (ethos rule 4 — the
+//! separation must be enumerable where people look), which now reports
+//! `proxied: []`; `tests/proxy_composition.rs` asserts the table is empty.
 //! Full ownership matrix: docs/rust-migration/server-boundary.md.
 //!
 //! What no longer rides this: `/api/fs` (native, api/fs.rs), `/api/groups` +
@@ -20,7 +23,10 @@
 //! `POST /api/dictate` + `/api/dictation/config` (native, api/dictation.rs —
 //! AMUX-2598: the whisper worker + Gemini fallback run in THIS process),
 //! `/api/browser/{driver verbs}` (native, api/browser.rs — AMUX-2598: CDP
-//! websocket client against the server-machine Chrome; /agent = honest 501).
+//! websocket client against the server-machine Chrome; /agent = honest 501),
+//! `/api/scope` (native, api/scope.rs — AMUX-2608: the LAST row; python
+//! storage — memory .md files, env files, statuses/session_gates/
+//! status_scope tables — shared byte-for-byte).
 //!
 //! Rust-managed workers (wrk_ ids) never proxied — that guard moved to
 //! api/session_verbs.rs with the session-verb cutover (same 501 pointer).
@@ -84,16 +90,15 @@ pub struct ProxiedFamily {
 
 /// Everything that still proxies, in one place. Runtime view:
 /// `GET /api/debug/boundary`. Doc: docs/rust-migration/server-boundary.md.
-pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[
-    ProxiedFamily {
-        family: "/api/scope",
-        why: "environment/capabilities per worker/group/global — reads CC_TAGS, \
-              session list, and the scope_caps table python owns",
-        exit: "nativize: read scope_caps from sqlite + CC_TAGS env, write via the \
-               same table; retire when the capabilities UI works against rust",
-        mount: ProxyMount::Namespace(&["/api/scope"]),
-    },
-];
+///
+/// **EMPTY, and it MUST stay empty (AMUX-2608).** `/api/scope` was the last
+/// row; its native port (api/scope.rs) retired it, and an empty table that
+/// is asserted empty — `tests/proxy_composition.rs` fails the build if a row
+/// reappears — is the cutover's standing proof. The registry MECHANISM stays
+/// on purpose: if a future family ever must proxy again, a table row here is
+/// still the only sanctioned way, and `/api/debug/boundary` will say so
+/// where a debugging session already looks.
+pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 
 /// The RUST-NATIVE /api families, with one-line notes — the other half of
 /// `GET /api/debug/boundary`. Kept adjacent to [`PROXIED_FAMILIES`] so a
@@ -136,6 +141,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/tags", "legacy spelling of the group list (api/groups.rs)"),
     ("/api/journal", "journal"),
     ("/api/layout-presets", "tab layout presets save/load/delete (api/layout_presets.rs)"),
+    ("/api/scope", "uniform per-capability scope read/write — memory/rules/env/gates/status_mode at global/group/worker, python storage shared byte-for-byte (api/scope.rs, AMUX-2608: the family whose cutover emptied PROXIED_FAMILIES)"),
     ("/api/skills", "skills list"),
     ("/api/slash-commands", "slash commands"),
     ("/api/map", "map + geocoding"),

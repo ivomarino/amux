@@ -1002,3 +1002,72 @@ FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displa
   Cheap detector while it is open: `amux whoami` already contrasts live worker
   identity against inherited env — extend it to compare against the pane title, so
   the disagreement is reported instead of discovered.
+
+## Auto-builder script hardcoded the developer's checkout path — any other clone would rebuild the wrong repo
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (AMUX-2608 install-script lane)
+CARD: AMUX-2608
+SYMPTOM: scripts/rust-auto-build.sh (run by com.amux.server-rs-builder every 60s)
+  read `REPO="/Users/ethan/Dev/amux"` and `INSTALL="$HOME/.local/bin/amux-server-rs"`
+  as literals. Found while making ./install.sh write the builder plist for a fresh
+  clone: the plist would point at the cloned script, and the script would then
+  silently build ETHAN'S path, not the clone — or fail on a machine where that path
+  does not exist while exiting 0-shaped from launchd's point of view (log-only).
+COST: None realized here (caught during install.sh work, before any user hit it),
+  but the failure it sets up is the install.sh e2e passing while the auto-upgrade
+  seam serves a different repo's commits — a wrong-build deploy that nothing labels.
+FIX: fixed in the AMUX-2608 change: REPO now derives from the script's own location
+  (`$(dirname "${BASH_SOURCE[0]}")/..`) with AMUX_REPO/AMUX_RS_INSTALL/
+  AMUX_RS_BUILD_STAMP/AMUX_RS_BUILD_LOG env overrides for the temp-prefix e2e.
+  Behavior on this machine is unchanged (script lives at the same path it named).
+
+
+## Idle nudge told me to commit 11 files I never touched, while the staged-guard said I owned none
+AREA: notices
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-38
+SYMPTOM: The idle dirty-tree nudge listed 11 files as mine to "commit completed work now",
+  excluding only 2 as not-mine. I had touched none of the 11 - they are amux-rust's in-flight
+  rust migration (crates/amux-server/src/api/*.rs, tests, install.sh, scripts/rust-auto-build.sh).
+  The staged-guard, queried on the same dirty list at the same moment, disagreed completely:
+  `POST /api/git/staged-guard` returned foreign=4 (owner=amux), unclaimed=18, shared/mine=0.
+  My own work was already committed; git status showed nothing of mine.
+COST: none, because I checked before committing - but only because I had spent the day on this
+  exact defect class from the other side. Following the instruction literally sweeps a peer's
+  whole in-flight rust migration into a commit under my name, which is the AMUX-2554 incident
+  the fleet has already paid for twice. The instruction IS the hazard.
+FIX: have the nudge resolve ownership through the same call the staged-guard uses instead of
+  deriving "yours" from dirty-tree membership. Two components answering the same question
+  differently is the duplicated-precedence bug AMUX-2330 already fixed once for gates: one
+  answer, one owner. Note the nudge is not blind - it correctly excluded 2 files - so it has
+  SOME signal and is wrong in one direction only, which is the more dangerous shape.
+
+## Two entries validated and deleted today have already recurred
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-38
+SYMPTOM: Under the new protocol (fix -> originating session validates -> delete the entry), 35
+  entries were deleted on 2026-08-09. Within hours, two of that day's validated-fixed classes
+  recurred: AC-284 (assignment notices for deleted cards - amux-cloud produced counter-evidence
+  DURING the sweep, so it was caught and reopened before deletion) and AC-300 (the idle nudge
+  telling a session to commit a peer's in-flight work - deleted as confirmed-fixed, then hit me
+  hours later, now AF-38).
+COST: no work lost yet. The cost is diagnostic: when AC-300's class recurred, the entry
+  describing it was gone, so recognising it as a RECURRENCE rather than a novel bug depended on
+  me happening to remember deleting it that morning. The next session will not have that.
+FIX: not a request to reverse the protocol - deletion is Ethan's call and he made it, and git
+  history at e35bf7d preserves the text. The cheap mitigation is already half-built: the sweep
+  appends each deleted entry's COST line to its card before deleting (30 done). Extending that
+  to carry the SYMPTOM line too would make a recurrence recognisable from the card alone, which
+  is where someone hitting it again would actually look. amux-cloud argued the general form of
+  this before the deletions and was told, correctly, that the call was made; this entry is the
+  evidence they asked for rather than a re-litigation.

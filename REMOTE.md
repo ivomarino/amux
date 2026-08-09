@@ -1,5 +1,12 @@
 # Remote amux over Tailscale
 
+> **LEGACY NOTE:** `amux-remote` is a bash companion to the deprecated Python
+> server, and every port in this guide is its **8822**. During the migration
+> soak this still works as written; the Rust server (`./install.sh`, port
+> **8824**) serves the same REST API, so pointing `AMUX_URL` at
+> `https://<host>:8824` works for the API verbs. Retirement plan:
+> [docs/rust-migration/cutover-runbook.md](docs/rust-migration/cutover-runbook.md).
+
 Drive an amux server running on another machine — list, peek, message, and **attach**
 to its sessions from your laptop, with the attach rendered as **native iTerm2 tabs**
 so a remote session feels local.

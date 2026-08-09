@@ -16,10 +16,13 @@ set -euo pipefail
 # — same class, same fix): name the toolchain absolutely.
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
-REPO="/Users/ethan/Dev/amux"
-INSTALL="$HOME/.local/bin/amux-server-rs"
-STAMP="$HOME/.amux/rust-build-stamp"
-LOG="$HOME/.amux/logs/rust-auto-build.log"
+# The repo is wherever this script lives (scripts/ under the checkout), so a
+# clone installed via ./install.sh builds ITSELF rather than a hardcoded
+# developer path. Env overrides exist for the temp-prefix install self-test.
+REPO="${AMUX_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+INSTALL="${AMUX_RS_INSTALL:-$HOME/.local/bin/amux-server-rs}"
+STAMP="${AMUX_RS_BUILD_STAMP:-$HOME/.amux/rust-build-stamp}"
+LOG="${AMUX_RS_BUILD_LOG:-$HOME/.amux/logs/rust-auto-build.log}"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$INSTALL")"
 
 head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo none)

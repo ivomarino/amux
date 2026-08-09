@@ -34,6 +34,7 @@ pub mod prefs;
 pub mod py_proxy;
 pub mod request_log;
 pub mod schedules;
+pub mod scope;
 pub mod session_verbs;
 pub mod sessions_legacy;
 pub mod settings;
@@ -108,10 +109,15 @@ pub fn router(state: AppState) -> Router {
         // this server already reads — NATIVE, not a fleet capability
         // (AMUX-2597 addendum: the SPA's _initIdentity boot call 404'd here).
         .route("/api/identity", axum::routing::get(identity))
-        // EVERY python-proxied mount below derives from py_proxy's
-        // PROXIED_FAMILIES table (AMUX-2597: the rust/python boundary is a
-        // registry, not scattered mounts). Enumerable at
-        // GET /api/debug/boundary; matrix:
+        // Uniform per-capability scope read/write — NATIVE (AMUX-2608: the
+        // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
+        .nest("/api/scope", scope::routes())
+        // Any python-proxied mount derives from py_proxy's PROXIED_FAMILIES
+        // table (AMUX-2597: the rust/python boundary is a registry, not
+        // scattered mounts). The table is EMPTY post-AMUX-2608 and must stay
+        // that way — this merge (now a no-op) plus the registry, the
+        // /api/debug/boundary view and tests/proxy_composition.rs are the
+        // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .merge(py_proxy::family_routes())
         .nest("/api/browser", browser::routes())
@@ -184,6 +190,10 @@ pub fn router(state: AppState) -> Router {
         // each. Route names only — nothing secret, so public like its
         // debug sibling above.
         .route("/api/debug/boundary", axum::routing::get(py_proxy::boundary))
+        // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
+        // routed, with which methods" is a GET, not a grep. Public like its
+        // debug siblings (route names only, nothing secret).
+        .route("/api/debug/routes", axum::routing::get(request_log::debug_routes))
         // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
         .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
         // Dynamic manifest: PWA name/color follow the branding prefs (the
@@ -231,9 +241,9 @@ const PLACEHOLDER_API_KEYS: &[&str] = &[
     "sk-ant-xxx", "sk-ant-your-key", "sk-ant-example", "sk-ant-placeholder",
 ];
 
-/// Python truthiness for the `oauthAccount` value in ~/.claude.json
-/// (`bool(json.loads(...).get("oauthAccount"))`): {} and "" are falsy.
-fn py_truthy(v: &serde_json::Value) -> bool {
+/// Python truthiness for a JSON value ({} , "" , [] , 0 falsy) — identity's
+/// `oauthAccount` check and scope's `if items:` gate share it.
+pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Null => false,
         serde_json::Value::Bool(b) => *b,
