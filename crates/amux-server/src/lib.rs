@@ -190,8 +190,13 @@ async fn async_main() {
     });
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
-    tracing::info!(%addr, "listening (https)");
-    axum_server::bind_rustls(addr, rustls_cfg)
+    tracing::info!(%addr, "listening (https, plain-http redirected)");
+    let acceptor = tls::RedirectingAcceptor::new(
+        axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg),
+        format!("localhost:{}", cfg.port),
+    );
+    axum_server::bind(addr)
+        .acceptor(acceptor)
         .serve(app.into_make_service())
         .await
         .expect("server run");

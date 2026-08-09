@@ -131,6 +131,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tower",
  "tower-http",

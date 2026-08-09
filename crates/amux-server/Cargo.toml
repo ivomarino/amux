@@ -15,6 +15,7 @@ axum.workspace = true
 axum-server.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rusqlite.workspace = true

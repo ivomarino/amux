@@ -59,6 +59,20 @@ pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
 /// it stays Python's job until cutover. Without this the dashboard on the
 /// Rust port says "no workers yet" while 60+ real sessions run (Ethan's
 /// first verification finding).
+/// Sessions quarantined via blocked-sessions.txt — the Python "archived"
+/// flag's source of truth (CC_BLOCKED_SESSIONS, amux-server.py:65).
+fn blocked_names(home: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(home.join("blocked-sessions.txt"))
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn python_fleet_sessions() -> Vec<serde_json::Value> {
     let home = std::env::var("AMUX_HOME")
         .map(std::path::PathBuf::from)
@@ -77,6 +91,7 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let blocked = blocked_names(&home);
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return vec![];
     };
@@ -91,7 +106,9 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
         };
         let env = crate::config::parse_env_file(&path);
         let is_running = running.contains(&format!("amux-{name}"));
+        let archived = blocked.contains(&name);
         out.push(json!({
+            "archived": archived,
             "name": name,
             // Status detail (active/idle) is the Python scanner's judgment;
             // the honest cells from HERE are running-blank vs stopped-blank
@@ -104,7 +121,11 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
             "preview": "",
             "task_name": "",
             "desc": env.get("CC_DESC").cloned().unwrap_or_default(),
-            "tags": env.get("CC_TAGS").map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default(),
+            // TRIMMED, matching Python's t.strip(): CC_TAGS="mvs, gtm"
+            // otherwise yields " gtm" beside "gtm" — TWO gtm groups in the
+            // UI (Ethan's finding).
+            "tags": env.get("CC_TAGS").map(|t| t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default(),
+            "pinned": env.get("CC_PINNED").map(|v| v == "1").unwrap_or(false),
             "steering_queue": [],
             "managed_by": "python",
         }));
@@ -160,6 +181,27 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             }
         }
     }
+    // task_name: the session's current doing card, the board linkage the
+    // Python cards carry (one query for the whole list, not N).
+    {
+        let mut stmt = conn.prepare(
+            "SELECT session, title FROM issues
+             WHERE deleted IS NULL AND status = 'doing' AND session != ''
+             GROUP BY session",
+        )?;
+        let doing: std::collections::BTreeMap<String, String> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .flatten()
+            .collect();
+        for v in out.iter_mut() {
+            if let Some(name) = v["name"].as_str() {
+                if let Some(title) = doing.get(name) {
+                    v["task_name"] = json!(title);
+                }
+            }
+        }
+    }
+
     // Running first, then name — the Python list's ordering instinct.
     out.sort_by(|a, b| {
         let ra = a["running"].as_bool().unwrap_or(false);
