@@ -74,11 +74,15 @@ pub enum TaskStatus {
     /// structured wait, not an exemption (the inert-watch incident, ethos
     /// rule 1: an exemption list with no surfacing mechanism is invisibility).
     Armed,
+    /// Execution limits exhausted and decomposition failed twice
+    /// (Invariant 47): the anti-livelock terminal. A quarantined task is
+    /// counted in FleetProgress — terminal but never invisible.
+    Quarantined,
 }
 
 impl TaskStatus {
     /// Every status, for totality tests and exhaustive UI enumeration.
-    pub const ALL: [TaskStatus; 10] = [
+    pub const ALL: [TaskStatus; 11] = [
         TaskStatus::Backlog,
         TaskStatus::Todo,
         TaskStatus::Doing,
@@ -89,14 +93,16 @@ impl TaskStatus {
         TaskStatus::Verified,
         TaskStatus::Discarded,
         TaskStatus::Armed,
+        TaskStatus::Quarantined,
     ];
 
     /// Terminal STATUSES. Invariant 10's terminal set also includes archived
-    /// (a flag here — see [`Task::archived`]); `quarantined` (Invariant 47)
-    /// is not yet in the status set and lands additively with the limits
-    /// subsystem.
+    /// (a flag here — see [`Task::archived`]).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskStatus::Verified | TaskStatus::Discarded)
+        matches!(
+            self,
+            TaskStatus::Verified | TaskStatus::Discarded | TaskStatus::Quarantined
+        )
     }
 }
 
@@ -415,6 +421,10 @@ pub enum BoardTransition {
     /// Any non-terminal -> Discarded. Verified work cannot be discarded —
     /// it is history; archive it instead.
     Discard { reason: String },
+    /// Anti-livelock terminal (Invariant 47): produced by the
+    /// orchestrator when ExecutionLimits are exhausted AND decomposition
+    /// failed twice. Never a human verb — humans discard.
+    Quarantine { reason: String },
     /// The audited bypass: any status -> any status, gates skipped. Tolerable
     /// ONLY because judgment stays with a named actor: the store MUST persist
     /// a `DurableEvent` carrying the actor and reason. The Python board
@@ -753,6 +763,14 @@ pub fn apply_transition(
             }
         },
 
+        T::Quarantine { .. } => match task.status {
+            s if s.is_terminal() => Err(invalid(
+                "quarantine",
+                "already terminal — quarantine marks exhausted LIVE work",
+            )),
+            _ => Ok(finish(task, now, |t| t.status = S::Quarantined)),
+        },
+
         T::Force { status, .. } => {
             if status == task.status {
                 return Err(TransitionError::NoOp);
@@ -835,7 +853,9 @@ pub fn disposition(task: &Task, board: &[Task], effective_gates: &[Gate]) -> Tas
         return TaskDisposition::Terminal;
     }
     match task.status {
-        TaskStatus::Verified | TaskStatus::Discarded => TaskDisposition::Terminal,
+        TaskStatus::Verified | TaskStatus::Discarded | TaskStatus::Quarantined => {
+            TaskDisposition::Terminal
+        }
 
         // Parked awaiting human triage — deliberately not auto-claimed, so
         // the named next actor is the user (ethos rule 8: triage is theirs).
