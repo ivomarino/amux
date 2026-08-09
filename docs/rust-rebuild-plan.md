@@ -2355,6 +2355,302 @@ Response:
 { "applied": "session_restart", "session_replaced": true, ... }
 ```
 
+### Invariant 44: UI interaction coverage
+
+**Every interactive UI element has an executable interaction contract. Every
+contract is exercised in at least one E2E path, including resulting state, error,
+toast, navigation, or mutation. A new interactive control without a registered
+behavioral test fails CI.**
+
+Coverage is measured over interaction edges, not rendered components. A component
+is not considered tested merely because it appeared on screen.
+
+```
+Button rendered         != tested
+Button clicked          != tested
+Click -> mutation -> server result -> UI reconciliation = tested
+```
+
+#### Stable semantic test IDs
+
+Every interactive element exposes a stable semantic identifier. Tests never use
+CSS selectors like `div:nth-child(3) > button:nth-child(2)` or rely solely on
+visible copy (wording changes must not break behavioral tests).
+
+```html
+<button data-testid="issue-menu" data-entity-id="AR-421">
+<input data-testid="issue-title-input" data-entity-id="AR-421" />
+```
+
+The instrumented set (all must have `data-testid` or `data-action-id`):
+
+```
+button, a[href], input, select, textarea,
+[role=button], [role=tab], [role=menuitem],
+[tabindex], [data-action]
+```
+
+#### Interaction contracts
+
+Each reusable component has a machine-readable registry of capabilities:
+
+```rust
+struct UiContract {
+    component: String,
+    actions: Vec<UiAction>,
+    observable_results: Vec<ObservableResult>,
+}
+
+struct UiAction {
+    name: String,                      // "edit", "move", "archive"
+    testid: String,                    // data-testid value
+    input_type: InputType,             // Click, TextEntry, DragDrop, ...
+}
+
+enum ObservableResult {
+    EntityUpdated { entity_type: EntityType },
+    Toast { kind: ToastKind },
+    ModalOpen { component: String },
+    Navigation { to: String },
+    Error { kind: ErrorKind },
+    StateTransition { from: String, to: String },
+}
+```
+
+#### Standard interaction matrix
+
+Every interactive control is tested against this matrix:
+
+| Interaction | Must test |
+|---|---|
+| click | normal result |
+| double click | no duplicate mutation |
+| keyboard | Enter/Space works |
+| text entry | normal + empty + long + Unicode |
+| submit | button + Enter |
+| loading | control disabled/indicates pending |
+| success | state updates + correct toast |
+| server error | error shown, local state sane |
+| validation error | field feedback |
+| 409 conflict | reconciliation UI (Invariant 35) |
+| offline | queued/disabled behavior (Invariant 14) |
+| reconnect | eventually converges |
+| rapid repeat | idempotent |
+| navigation away | pending state handled |
+| back/forward | state restored correctly |
+
+#### UI as a state graph
+
+The UI is modeled as a graph of reachable states and transitions:
+
+```
+Page/View
+  +-- Component
+      +-- Control
+          +-- Action
+              +-- Resulting state
+                  +-- Next available controls
+```
+
+Example -- full nested path:
+
+```
+Board
+ +-- Issue card
+     +-- ... menu
+         +-- Move
+             +-- column picker
+                 +-- choose Review
+                     +-- gate modal appears
+                         +-- enter acknowledgement
+                             +-- press Enter
+                                 +-- loading state
+                                 +-- server accepts
+                                 +-- modal closes
+                                 +-- card moves
+                                 +-- toast appears
+                                 +-- SSE revision arrives
+                                 +-- card remains in correct column
+```
+
+Not just "PATCH /api/board worked."
+
+#### State-machine-based UI testing
+
+Complex components define legal states and transitions:
+
+```typescript
+type IssueModalState =
+    | "closed"
+    | "viewing"
+    | "editing"
+    | "saving"
+    | "gate_blocked"
+    | "conflict"
+    | "error";
+```
+
+Generated action sequences test that no sequence leaves the component in an
+impossible state:
+
+```
+open -> edit -> type -> save -> server_409 -> ack_gate -> save -> close -> reopen
+```
+
+#### Model-based testing
+
+Model state and browser state are kept in sync:
+
+```
+Model state              Browser state
+-----------              -------------
+issue.status=review  <=> card appears in Review column
+modal=open           <=> modal visible in DOM
+saving=true          <=> save button disabled/spinner
+offline=true         <=> queued indicator visible
+```
+
+After every action: `await assertBrowserMatchesModel()`. This catches cases where
+the DOM is correct but rendering is wrong, or the server is correct but client
+state is stale.
+
+#### Interaction telemetry
+
+Every E2E step automatically captures:
+
+```json
+{
+    "interaction_id": "int_92871",
+    "test_id": "board_move_with_gate",
+    "component": "IssueCard",
+    "action": "press_enter",
+    "target": "issue-title-input",
+    "entity": "AR-421",
+    "server_rev_before": 8821,
+    "server_rev_after": 8822,
+    "network": [
+        { "method": "PATCH", "path": "/api/board/AR-421", "status": 200 }
+    ],
+    "toast": "Issue updated",
+    "console_errors": [],
+    "duration_ms": 142
+}
+```
+
+This feeds the existing structured event ledger (Invariant 30), not a separate
+logging system.
+
+#### Visual state assertions
+
+DOM/state assertions for most behavior:
+
+```
+visible, enabled, selected, value,
+aria-expanded, aria-pressed,
+row/card location, toast text
+```
+
+Screenshot checks for geometry-dependent cases:
+
+```
+mobile menus, drawers, drag/drop, board columns,
+tooltips, popovers, modals, responsive layout,
+sticky headers
+```
+
+For important containers, assert geometry (catches `height: 0` bugs that
+DOM-only assertions miss):
+
+```typescript
+const box = await locator.boundingBox();
+expect(box?.height).toBeGreaterThan(44);
+```
+
+#### Real user mechanics
+
+Test all input modalities:
+
+```
+mouse, touch, keyboard, mobile viewport (375px),
+scroll, pinch, drag/drop, long lists,
+browser back, page refresh, tab sleep/wake
+```
+
+Board drag interactions tested as full transactions:
+
+```
+pointerDown(card) -> pointerMove(column) -> drop
+-> optimistic card move
+-> API request
+-> response
+-> authoritative SSE/revision
+-> final card location matches backend
+```
+
+And the failure path:
+
+```
+drop -> 409 gate failure
+-> card returns to original column
+-> gate toast/modal
+-> no phantom local move
+```
+
+#### Fault injection hooks (test mode only)
+
+Internal test harness controls for systematic failure testing:
+
+```rust
+struct TestFaults {
+    next_board_patch: Option<u16>,     // e.g. 500
+    sse_drop_every: Option<u32>,       // drop every Nth event
+    latency_ms: Option<u64>,           // added latency
+    next_request_status: Option<u16>,  // e.g. 409
+    offline_after: Option<u32>,        // go offline after N requests
+}
+```
+
+Available only when compiled with `#[cfg(test)]` or `--test-mode` flag.
+Never exposed in production. Enables systematic testing of:
+
+```
+slow response, timeout, 500, 409, duplicate response,
+dropped SSE, out-of-order SSE, offline mid-submit,
+server restart mid-modal, worker disappears while menu open
+```
+
+#### CI interaction coverage report
+
+```
+Component                   Actions    Covered
+-----------------------------------------------
+IssueCard                   12/12      100%
+IssueMenu                    8/8       100%
+WorkerCard                  14/14      100%
+WorkerSettings              21/21      100%
+GateModal                    9/9       100%
+MessagesComposer            15/15      100%
+ScheduleEditor              18/18      100%
+BrowserProfileControls      11/11      100%
+
+Interactive controls discovered:  487
+Controls with test contract:      487
+Controls exercised E2E:           481
+Missing coverage:                   6  <- CI FAILS
+```
+
+A Playwright helper crawls the rendered DOM across all reachable UI states,
+records every `data-testid`/`data-action-id`, and diffs against the interaction
+contract registry. New interactive controls without coverage fail CI:
+
+```
+UNTESTED INTERACTION:
+  data-testid="worker-change-model"
+
+No E2E test exercised:
+  WorkerSettings -> change_model
+```
+
 ### Design rule: self-documenting by construction
 
 The system is its own documentation. No separate design doc, wiki, or README should
@@ -2907,6 +3203,12 @@ harness that will verify every subsequent phase.
    that will run against every phase. Start with:
    - Server starts, dashboard loads, health returns 200
    - Auth rejects bad token, accepts good token
+8. **UI interaction coverage infrastructure** (Invariant 44):
+   - `data-testid` on every interactive element from day one
+   - Interaction contract registry (machine-readable component capabilities)
+   - DOM inventory crawler: discovers all `data-testid` elements across
+     reachable UI states, diffs against registry, fails on uncovered controls
+   - Fault injection hooks (`#[cfg(test)]` only)
 
 **Test plan**:
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
@@ -3359,13 +3661,16 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 
 ### Phase 8: Dashboard + CLI (est. 2 weeks)
 
-**Goal**: extract SPA, build CLI binary.
+**Goal**: extract SPA, build CLI binary, full interaction coverage infrastructure.
 
 1. Extract 44k-line inline SPA into `amux-dashboard/static/`
 2. `rust-embed` for compile-time inclusion
 3. Version stamping via `build.rs`
 4. CLI: `clap` subcommand tree mirroring the bash script
 5. Rename all `session` references to `worker` in dashboard + CLI
+6. `data-testid` on every interactive element (Invariant 44)
+7. Interaction contract registry for all components
+8. DOM inventory crawler + CI coverage gate
 
 **Test plan**:
 - Integration: served dashboard matches extracted source
@@ -3380,6 +3685,30 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 - Playwright: 1,000 rapid board mutations -> UI finishes at exact backend rev (Invariant 35)
 - Playwright: connection indicator shows LIVE/STALE/OFFLINE/SYNCING (Invariant 35)
 - Playwright: optimistic write rejected (409) -> rollback visible to user (Invariant 35)
+- Playwright: **interaction coverage audit** -- DOM crawl discovers all interactive
+  controls, diffs against registry, 100% coverage required (Invariant 44)
+- Playwright: board card full nested path -- open menu -> Move -> column picker ->
+  gate modal -> ack -> loading -> server accepts -> modal closes -> card moves ->
+  toast -> SSE reconciliation -> card stays (Invariant 44)
+- Playwright: board drag/drop as transaction -- pointerDown -> pointerMove -> drop ->
+  optimistic move -> API -> revision -> card location matches backend (Invariant 44)
+- Playwright: board drag/drop failure -- drop -> 409 gate -> card returns to original
+  column -> gate toast -> no phantom local move (Invariant 44)
+- Playwright: double-click on every mutation button -> no duplicate mutation (Invariant 44)
+- Playwright: keyboard navigation -- Enter/Space on all [role=button] (Invariant 44)
+- Playwright: text entry -- empty + long + Unicode on all text inputs (Invariant 44)
+- Playwright: loading states -- every mutation disables control and shows spinner (Invariant 44)
+- Playwright: server 500 on mutation -> error shown, local state sane (Invariant 44)
+- Playwright: fault injection -- sse_drop_every=5, verify convergence (Invariant 44)
+- Playwright: fault injection -- latency_ms=1500, verify loading states (Invariant 44)
+- Playwright: fault injection -- server restart mid-modal, verify recovery (Invariant 44)
+- Playwright: touch targets >= 44px on mobile viewport (Invariant 44)
+- Playwright: geometry assertion -- important containers have height > 0 (Invariant 44)
+- Playwright: browser back/forward restores state correctly (Invariant 44)
+- Playwright: tab sleep 10min -> wake -> delta sync -> UI current (Invariant 44)
+- Playwright: model-based test -- IssueModal state machine, no impossible states
+  reachable via generated action sequences (Invariant 44)
+- **CI gate**: new data-testid without registered interaction contract -> build fails
 
 ### Phase 9: Observability + performance (est. 2 weeks)
 
@@ -3447,14 +3776,18 @@ Pipeline stages:
 3. Backend conformance suite -- MockBackend + HerdrBackend + TmuxBackend (Invariant 21)
 4. Provider conformance suite -- MockProvider + all adapter tests (Invariant 21)
 5. Playwright suite -- all golden scenarios + all UI flows
-6. Performance benchmarks -- compared against baseline, regression = failure
-7. SQLite migration test -- apply migrations to a copy of prod DB, verify no data loss
-8. Binary size check -- regression if binary grows >20%
+6. **UI interaction coverage audit** -- DOM inventory vs contract registry,
+   fail if any interactive control has no registered test (Invariant 44)
+7. Performance benchmarks -- compared against baseline, regression = failure
+8. SQLite migration test -- apply migrations to a copy of prod DB, verify no data loss
+9. Binary size check -- regression if binary grows >20%
+10. Incident regression corpus -- all `incident_regression::*` tests pass
 
 Regression detection:
 - Latency regression: any p95 increase >10% vs baseline is a CI failure
 - Memory regression: RSS increase >20% vs baseline is a CI failure
 - Feature regression: any Playwright scenario that was green and turns red blocks merge
+- Interaction coverage regression: any interactive control without a test blocks merge
 
 The pipeline runs on every PR. No merge without green.
 
