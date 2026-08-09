@@ -39829,11 +39829,15 @@ async function sendFromInput(name) {
     inp.value = '';
     _draftClear(name);
     inp.style.height = 'auto';
+    const splitMain = inp.closest('.panel, .card')?.querySelector('.send-split-main');
+    if (splitMain) { splitMain.dataset.prevText = splitMain.textContent; splitMain.textContent = 'Queuing…'; splitMain.disabled = true; splitMain.style.opacity = '0.6'; }
     await steerSession(name, _expandAtMentions(text));
+    if (splitMain) { splitMain.textContent = splitMain.dataset.prevText || 'Queue'; splitMain.disabled = false; splitMain.style.opacity = ''; }
     inp.style.borderColor = '#a371f7';
     setTimeout(() => { inp.style.borderColor = ''; }, 600);
-    if (typeof showToast === 'function') showToast('Queued for ' + name + "'s next turn");
-    _cardQueuedBadge(name);
+    const sess = sessions.find(s => s.name === name);
+    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
+    if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
     return;
   }
   cmdHistoryAdd(text);
@@ -40754,17 +40758,16 @@ async function _steeringSendNow(msgId) {
   const sess = sessions.find(s => s.name === peekSession);
   const msg = ((sess && sess.steering) || []).find(m => m.id === msgId);
   if (!msg) return;
+  const btn = document.querySelector(`[onclick*="_steeringSendNow('${msgId}')"]`);
+  if (btn) { btn.textContent = 'Sending…'; btn.disabled = true; btn.style.opacity = '0.6'; }
   try {
-    // Deliver FIRST with deliver_now (forces a direct send instead of the
-    // defer-at-a-selector path that used to silently re-queue it), and only
-    // remove it from the queue once it actually lands — so a failed send never
-    // loses the message.
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/send', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text: msg.text, deliver_now: true})
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || !d.ok || String(d.message || '').startsWith('queued')) {
+      if (btn) { btn.textContent = 'Send now'; btn.disabled = false; btn.style.opacity = ''; }
       showToast(d.message ? ('Not sent: ' + d.message) : 'Not sent — kept in queue');
       return;
     }
@@ -40772,34 +40775,44 @@ async function _steeringSendNow(msgId) {
       method: 'DELETE', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({id: msgId, sent: true})
     });
-    await fetchSessions();
+    if (sess && sess.steering) sess.steering = sess.steering.filter(m => m.id !== msgId);
     _steeringRender();
     _steeringLoadHistory();
     _steeringUpdateBadge();
+    render();
     showToast('Sent to ' + peekSession);
-  } catch(e) { showToast('Failed to send'); }
+    fetchSessions();
+  } catch(e) { if (btn) { btn.textContent = 'Send now'; btn.disabled = false; btn.style.opacity = ''; } showToast('Failed to send'); }
 }
 
 async function _steeringCancel(msgId) {
   if (!peekSession) return;
+  const sess = sessions.find(s => s.name === peekSession);
+  if (sess && sess.steering) sess.steering = sess.steering.filter(m => m.id !== msgId);
+  _steeringRender();
+  _steeringUpdateBadge();
+  render();
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', {
       method: 'DELETE', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({id: msgId})
     });
-    await fetchSessions();
-    _steeringRender();
-    _steeringUpdateBadge();
+    fetchSessions();
   } catch(e) { showToast('Failed to cancel message'); }
 }
 
 async function _steeringClearAll() {
   if (!peekSession) return;
+  const sess = sessions.find(s => s.name === peekSession);
+  const had = sess && sess.steering ? sess.steering.length : 0;
+  if (sess) sess.steering = [];
+  _steeringRender();
+  _steeringUpdateBadge();
+  render();
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: '{}' });
-    await fetchSessions();
-    _steeringRender();
-    _steeringUpdateBadge();
+    if (had) showToast('Cleared ' + had + ' queued message' + (had > 1 ? 's' : ''));
+    fetchSessions();
   } catch(e) { showToast('Failed to clear queue'); }
 }
 
@@ -41855,7 +41868,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.527';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.528';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -43874,7 +43887,13 @@ async function sendPeekCmd() {
     inp.value = '';
     inp.style.height = 'auto';
     _draftClear(peekSession);
+    const peekSendBtn = document.querySelector('.peek-cmd-bar .send-split-main, .peek-cmd-bar .btn.primary');
+    if (peekSendBtn) { peekSendBtn.dataset.prevText = peekSendBtn.textContent; peekSendBtn.textContent = 'Queuing…'; peekSendBtn.disabled = true; peekSendBtn.style.opacity = '0.6'; }
     await steerSession(peekSession, text);
+    if (peekSendBtn) { peekSendBtn.textContent = peekSendBtn.dataset.prevText || 'Queue'; peekSendBtn.disabled = false; peekSendBtn.style.opacity = ''; }
+    const sess = sessions.find(s => s.name === peekSession);
+    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
+    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
     return;
   }
   // 'send' mode + active session sends immediately. The old confirmation dialog
@@ -43980,14 +43999,22 @@ function _showSteerPrompt(text) {
 }
 async function steerSession(name, text) {
   if (!text) return;
+  const msgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
   const r = await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/steer', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    // msg_id makes retries idempotent — see doSend
-    body: JSON.stringify({ text, record_history: true, msg_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()) })
+    body: JSON.stringify({ text, record_history: true, msg_id: msgId })
   });
   if (r) {
-    showToast('Steering queued — will deliver at next turn boundary');
+    const d = await r.json().catch(() => ({}));
+    const newEntry = { id: d.id || ('steer-' + Date.now()), text, queued_at: Date.now() / 1000, guard: '' };
+    const sess = sessions.find(s => s.name === name);
+    if (sess) {
+      if (!sess.steering) sess.steering = [];
+      sess.steering.push(newEntry);
+    }
+    if (peekSession === name && _peekTab === 'steering') _steeringRender();
     _steeringUpdateBadge();
+    render();
   }
 }
 function peekDownloadLog() {
@@ -63751,7 +63778,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.527';
+const CACHE = 'amux-v0.9.528';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
