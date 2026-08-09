@@ -169,23 +169,23 @@ enum BoardTransition {
 
 // Every transition: one function, one code path, audited by construction
 fn apply_transition(
-    item: &Issue,
+    item: &Task,
     tx: BoardTransition,
     actor: &Actor,
     scope: &EffectiveConfig,  // gates come from scope
-) -> Result<Issue, GateError>;
+) -> Result<Task, GateError>;
 ```
 
 Gates are scoped: global gates apply to all groups, group gates override for that
 group, worker-level gates can further specialize. A group might require code review
 while another group does not.
 
-### Invariant 4: Board issues form a dependency graph
+### Invariant 4: Board tasks form a dependency graph
 
 Issues have typed relations:
 
 ```rust
-enum IssueRelation {
+enum TaskRelation {
     Blocks,
     DependsOn,
     Parent,
@@ -216,11 +216,11 @@ most scraping entirely.
 
 ```rust
 enum WorkerCommand {
-    ExecuteIssue(IssueId),
+    ExecuteTask(TaskId),
     Continue,
     DeliverMessage(MessageId),
-    Verify(IssueId),
-    Review(IssueId),
+    Verify(TaskId),
+    Review(TaskId),
     Cancel,      // DeliveryTiming::Immediate
     Pause,       // DeliveryTiming::Immediate
     Resume,      // DeliveryTiming::Immediate
@@ -232,7 +232,7 @@ enum WorkerEvent {
     Progress(ProgressReport),
     Waiting(WaitReason),
     ToolUsed(ToolEvent),
-    IssueUpdated(IssueId),
+    TaskUpdated(TaskId),
     TurnCompleted(TurnResult),
     RateLimited(RateLimit),
     ContextLow(u8),
@@ -262,7 +262,7 @@ processing, ends when it yields (waiting for input, rate-limited, idle, done).
 struct Turn {
     id: TurnId,
     session_id: SessionId,
-    issue_id: Option<IssueId>,
+    task_id: Option<TaskId>,
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     outcome: Option<TurnOutcome>,
@@ -285,7 +285,7 @@ Done is a worker's claim. Verified is the harness's conclusion.
 
 ```rust
 struct Verification {
-    issue_id: IssueId,
+    task_id: TaskId,
     verifier: Actor,
     criteria: Vec<Criterion>,
     evidence: Vec<Evidence>,
@@ -295,11 +295,11 @@ struct Verification {
 
 enum VerificationResult {
     Passed,
-    Failed { reason: String },  // -> issue returns to InProgress
+    Failed { reason: String },  // -> task returns to InProgress
 }
 ```
 
-An issue moves `done -> verified` only when ALL applicable layers pass:
+A task moves `done -> verified` only when ALL applicable layers pass:
 
 1. **Implementation**: code compiles, no warnings, clippy clean
 2. **Unit tests**: all relevant unit tests pass
@@ -390,7 +390,7 @@ operation gets an idempotency key.
 
 ```rust
 struct WorkAssignment {
-    issue_id: IssueId,
+    task_id: TaskId,
     worker_id: WorkerId,
     attempt: u32,
     lease: Lease,
@@ -407,10 +407,10 @@ struct Lease {
 }
 ```
 
-Claiming is atomic: `UPDATE issues SET status='claimed', worker_id=?, generation=?
+Claiming is atomic: `UPDATE tasks SET status='claimed', worker_id=?, generation=?
 WHERE id=? AND status='todo' AND generation=?`. Exactly one claimant.
 
-Dead workers: lease expires -> issue becomes runnable again. No manual intervention.
+Dead workers: lease expires -> task becomes runnable again. No manual intervention.
 
 Startup reconciliation:
 
@@ -418,7 +418,7 @@ Startup reconciliation:
 async fn reconcile_on_startup(ctx: &AppContext) {
     // DB says running + backend says missing -> mark interrupted, restart
     // Backend exists + DB says stopped -> adopt or kill
-    // Issue claimed + lease expired -> release, requeue
+    // Task claimed + lease expired -> release, requeue
     // Pending steering message -> redeliver
     // Schedule fire persisted but execution missing -> retry
 }
@@ -426,14 +426,14 @@ async fn reconcile_on_startup(ctx: &AppContext) {
 
 ### Invariant 10: No-stall guarantee (the cardinal acceptance criterion)
 
-**If a worker is idle and any of its issues are not in a terminal state, that is a
+**If a worker is idle and any of its tasks are not in a terminal state, that is a
 system failure.** Terminal states are: `verified`, `archived`, `discarded`, and
 `quarantined`. Everything else must keep moving. There is no `blocked_by_user` --
 a terminal state with no observer is where autonomous work goes to die. External
 blocks carry a machine-checkable `VerifierKind` condition and a `retry_at`
 timestamp; they re-enter the runnable set when the check passes.
 
-**Every non-terminal issue must have exactly one of: a runnable next action, a named
+**Every non-terminal task must have exactly one of: a runnable next action, a named
 actor responsible for the next action, or a structured wait reason.** "Nothing is
 driving this" is an impossible state, not a thing the stall detector discovers
 afterward.
@@ -450,7 +450,7 @@ enum TerminalStatus {
 }
 
 enum WaitingFor {
-    Dependency(IssueId),
+    Dependency(TaskId),
     Gate { gate: GateId, missing: Vec<GateCriterion> },
     BlockedExternal {   // replaces BlockedByUser -- must carry re-entry condition
         condition: VerifierKind,
@@ -462,16 +462,16 @@ enum WaitingFor {
     Capability { needed: Vec<String>, available_workers: Vec<WorkerId> },
 }
 
-// Every non-terminal issue resolves to exactly one of these:
-enum IssueDisposition {
+// Every non-terminal task resolves to exactly one of these:
+enum TaskDisposition {
     Runnable,                            // can be picked up now
     Assigned { worker: WorkerId },       // someone is working on it
     Waiting(WaitingFor),                 // blocked, with structured reason
     Terminal(TerminalStatus),            // done, nothing to do
 }
 
-fn disposition(issue: &Issue, board: &Board) -> IssueDisposition {
-    // This function must be total -- every issue resolves to one variant.
+fn disposition(task: &Task, board: &Board) -> TaskDisposition {
+    // This function must be total -- every task resolves to one variant.
     // If none of the conditions match, that is a compile-time error
     // (exhaustive match), not a runtime discovery.
 }
@@ -479,11 +479,11 @@ fn disposition(issue: &Issue, board: &Board) -> IssueDisposition {
 // The orchestrator runs this check on every tick:
 fn stall_check(worker: &Worker, board: &Board) -> Vec<StallViolation> {
     if worker.state != WorkerState::Idle { return vec![]; }
-    board.issues_for_worker(worker.id)
-        .filter(|i| matches!(disposition(i, board), IssueDisposition::Runnable))
+    board.tasks_for_worker(worker.id)
+        .filter(|i| matches!(disposition(i, board), TaskDisposition::Runnable))
         .map(|i| StallViolation {
             worker_id: worker.id,
-            issue_id: i.id,
+            task_id: i.id,
             status: i.status,
             idle_since: worker.idle_since,
         })
@@ -493,20 +493,20 @@ fn stall_check(worker: &Worker, board: &Board) -> Vec<StallViolation> {
 
 When the orchestrator detects a stall:
 1. If the worker is rate-limited: wait (not idle, not a stall)
-2. If the issue is blocked by a dependency: no stall (it is `Waiting(Dependency(...))`)
-3. If the issue is waiting on a gate: no stall (it is `Waiting(Gate(...))`)
-4. If the worker has no runnable issues left in its scope: reassign the worker to a
-   different scope or mark it idle (an idle worker with zero runnable issues is not a
+2. If the task is blocked by a dependency: no stall (it is `Waiting(Dependency(...))`)
+3. If the task is waiting on a gate: no stall (it is `Waiting(Gate(...))`)
+4. If the worker has no runnable tasks left in its scope: reassign the worker to a
+   different scope or mark it idle (an idle worker with zero runnable tasks is not a
    stall -- it is correct)
-5. Otherwise: the worker MUST be given the issue and told to continue
+5. Otherwise: the worker MUST be given the task and told to continue
 
-The dashboard shows `WaitingFor` inline on every non-terminal, non-assigned issue.
+The dashboard shows `WaitingFor` inline on every non-terminal, non-assigned task.
 A user looking at the board sees exactly WHY each item is waiting, not just that it
-is stuck. `IssueDisposition::Waiting` with no resolution path (e.g., waiting on a
+is stuck. `TaskDisposition::Waiting` with no resolution path (e.g., waiting on a
 capability no worker has) triggers an escalation alert.
 
 This is tested in every Playwright golden scenario: at the end of every test, assert
-that no worker is idle with runnable issues. A stall is a CI failure.
+that no worker is idle with runnable tasks. A stall is a CI failure.
 
 ### Invariant 11: Worker state is always current
 
@@ -605,7 +605,7 @@ Every API route has a documented contract:
 ```rust
 // Example: POST /api/board
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct CreateIssueRequest {
+struct CreateTaskRequest {
     title: String,
     #[serde(default)]
     desc: Option<String>,
@@ -614,18 +614,18 @@ struct CreateIssueRequest {
     #[serde(default)]
     item_type: Option<ItemType>,
     #[serde(default)]
-    depends_on: Vec<IssueId>,
+    depends_on: Vec<TaskId>,
     #[serde(default)]
     tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct CreateIssueResponse {
-    id: IssueId,
+struct CreateTaskResponse {
+    id: TaskId,
     title: String,
     status: Status,
     item_type: ItemType,
-    session: Option<String>,
+    worker: Option<String>,
     // ... all fields
 }
 
@@ -637,7 +637,7 @@ struct GateRejection {
     blocked: bool,  // true
     gate: Vec<String>,
     attempted_status: Status,
-    item: IssueId,
+    item: TaskId,
     item_type: ItemType,
     how_to_ack: GateAckInstructions,
     cli: String,    // amux board command to satisfy
@@ -755,12 +755,12 @@ Elevated from lessons learned to architectural law:
 1. **No LLM invocation unless the operation requires semantic judgment.** Title
    derivation, label generation, string formatting, gate evaluation, scope resolution,
    context assembly, dependency resolution -- all deterministic, all free. The token
-   cost metric (tokens per verified issue) is a first-class dashboard number alongside
+   cost metric (tokens per verified task) is a first-class dashboard number alongside
    latency, CPU, and RSS.
 
 2. **No state transition without durable provenance.** Every mutation emits an
    append-only event with actor, timestamp, and cause. Provenance is queryable:
-   `amux issue AR-123 history` returns the full chain.
+   `amux task AR-123 history` returns the full chain.
 
 3. **No backend/provider-specific behavior above its adapter boundary.** The
    orchestrator, board, scheduler, and dashboard never know whether herdr, tmux, or
@@ -771,13 +771,13 @@ Elevated from lessons learned to architectural law:
 ### Invariant 16: Token budgets are a runtime primitive
 
 Not just a context-assembler concern. Budgets govern context assembly, turn execution,
-and issue-level cost tracking.
+and task-level cost tracking.
 
 ```rust
 struct TokenBudget {
     max_input: u32,
     reserved_output: u32,
-    max_per_issue: Option<u64>,
+    max_per_task: Option<u64>,
     max_per_turn: Option<u32>,
 }
 
@@ -791,10 +791,10 @@ struct ContextFragment {
 
 Context assembly is deterministic priority order:
 
-`issue + acceptance criteria > immediate dependencies > relevant memory > recent turns > broad history`
+`task + acceptance criteria > immediate dependencies > relevant memory > recent turns > broad history`
 
-Never dump entire issue graphs, logs, memories, or prior transcripts. Summarize/cache
-once, reference by ID/hash, hydrate on demand. **Tokens consumed per verified issue**
+Never dump entire task graphs, logs, memories, or prior transcripts. Summarize/cache
+once, reference by ID/hash, hydrate on demand. **Tokens consumed per verified task**
 is a core metric on the dashboard.
 
 ### Invariant 17: Structural @worker addressing
@@ -826,7 +826,7 @@ enum MentionState {
 ```
 
 `@worker-3 investigate auth regression` parses into a durable command addressed to
-worker-3. Works in issue descriptions, comments, board activity, CLI, and dashboard.
+worker-3. Works in task descriptions, comments, board activity, CLI, and dashboard.
 Offline safe (queued -> delivered on reconnect). Crash safe (persisted in DB before
 delivery attempt).
 
@@ -857,7 +857,7 @@ struct Gate {
 The critical query:
 
 ```
-amux issue AR-123 why-blocked
+amux task AR-123 why-blocked
 
 blocked by gate G-9 (scope: group/engineering)
   criterion: integration tests green
@@ -868,7 +868,7 @@ blocked by gate G-9 (scope: group/engineering)
 
 No opaque "gate failed."
 
-### Invariant 19: Issue state != Execution state
+### Invariant 19: Task state != Execution state
 
 These are separate concepts that must never bleed into each other.
 
@@ -979,7 +979,7 @@ If it only exposes "rate limited until X", amux records that. If no API exists
 #### Three layers of usage
 
 ```
-PROVIDER ACCOUNT              WORKER / ISSUE
+PROVIDER ACCOUNT              WORKER / TASK
 Claude plan                   backend-worker
 12% allowance remaining       AR-421 consumed 73,221 tokens
 resets 8:00 PM
@@ -1078,13 +1078,13 @@ Plan allowance     [|||||||---]  72%
 Resets             2h 14m
 Current context    84k / 200k
 Today              4.1M tokens
-This issue         83k tokens
+This task         83k tokens
 Fleet active       14 workers
 Rate state         Available
 ```
 
 Unsupported values show `--`, never a guessed number. Aggregate metrics:
-tokens/verified-issue, tokens/worker, tokens/provider, tokens/model, provider
+tokens/verified-task, tokens/worker, tokens/provider, tokens/model, provider
 allowance remaining, context remaining per active worker.
 
 ### Invariant 21: Backend and provider conformance suites
@@ -1138,7 +1138,7 @@ agent protocol implementation is in use.**
 ### Invariant 33: Backend independence
 
 Switching a worker between herdr, tmux, and a future native PTY must not alter its
-worker identity, issue lifecycle, messages, context, turns, gates, verification
+worker identity, task lifecycle, messages, context, turns, gates, verification
 behavior, scheduling behavior, or observable API semantics.
 
 ```rust
@@ -1190,11 +1190,11 @@ When OpenCode is unavailable (e.g., a provider that does not support it yet),
 the terminal adapter falls back to scraping for state and to `send-keys`-style
 input -- but this is the degraded path, not the design center.
 
-Rate limits, turns, compaction, messages, issue state, gates, verification,
+Rate limits, turns, compaction, messages, task state, gates, verification,
 scheduling, and worker state are completely backend-independent. A worker can
 restart on a different backend while preserving all durable amux state. Backend
 choice does not require DB/schema changes and does not change worker identity or
-issue ownership.
+task ownership.
 
 ### Invariant 34: Explicit queue semantics
 
@@ -1356,7 +1356,7 @@ Commands that exhaust retries become dead letters. A dead letter is a system fai
 (something the orchestrator wanted to happen did not happen) and produces:
 
 1. A `DurableEvent::CommandDeadLettered` with the full command and failure reason
-2. A `StallViolation` if the command was issue-related (Invariant 10)
+2. A `StallViolation` if the command was task-related (Invariant 10)
 3. A dashboard alert on the worker card
 
 Dead letters are queryable: `GET /api/workers/:id/dead-letters`. The dashboard shows
@@ -1397,7 +1397,7 @@ is the single source of ordering for all state changes across all entity types.
 ```rust
 struct StateRevision {
     rev: u64,                  // monotonically increasing, never reset
-    entity_type: EntityType,   // Worker, Issue, Message, Group, Gate, Session, ...
+    entity_type: EntityType,   // Worker, Task, Message, Group, Gate, ...
     entity_id: EntityId,
     mutation: Mutation,        // what changed
     at: DateTime<Utc>,
@@ -1415,9 +1415,9 @@ Each entity carries its own version in addition to the global revision. Global
 this exact entity stale?"
 
 ```rust
-struct Issue {
-    id: IssueId,
-    version: u64,              // incremented on every mutation to THIS issue
+struct Task {
+    id: TaskId,
+    version: u64,              // incremented on every mutation to THIS task
     // ...
 }
 
@@ -1543,7 +1543,7 @@ One canonical local entity cache. Every screen reads from the same entities:
 ```typescript
 interface EntityStore {
     workers: Map<WorkerId, Worker>;
-    issues: Map<IssueId, Issue>;
+    tasks: Map<TaskId, Task>;
     groups: Map<GroupId, Group>;
     messages: Map<MessageId, Message>;
     gates: Map<GateId, Gate>;
@@ -1552,7 +1552,7 @@ interface EntityStore {
 }
 ```
 
-The board does not maintain one copy of an issue while the issue-detail modal has
+The board does not maintain one copy of a task while the task-detail modal has
 another. Views are projections over the store, not independent state. A mutation
 from any source (SSE event, API response, optimistic write) updates the store
 once; every view re-renders from the same data.
@@ -1601,12 +1601,12 @@ The ugly cases, tested explicitly:
 - Duplicate events -> no duplicate effects (idempotent apply)
 - Kill/restart server -> UI reconnects and catches up via delta sync
 - Sleep browser for 10 minutes -> wakes and delta-syncs to current
-- Two tabs mutate same issue -> both converge to same state
+- Two tabs mutate same task -> both converge to same state
 - Offline mutation conflicts with newer backend state -> explicit 409, toast
 - 1,000 rapid board mutations -> UI finishes at exactly backend rev/state
 - SSE backpressure drops 50 events -> gap detection triggers reconcile
 - Server changelog pruned (since_rev too old) -> full sync, not partial
-- Entity version conflict (two clients edit same issue) -> loser gets 409
+- Entity version conflict (two clients edit same task) -> loser gets 409
 - Optimistic write applied then server rejects -> rollback visible to user
 
 ### Invariant 36: Single source of truth
@@ -1626,7 +1626,7 @@ audit found it in multiple independent subsystems:
 The canonical owners:
 
 ```
-Issue state         -> Board (Invariant 3)
+Task state          -> Board (Invariant 3)
 Worker state        -> Worker state machine (Invariant 11)
 Message             -> Message store (Invariant 29)
 Gate definition     -> Gate store (Invariant 18)
@@ -1670,7 +1670,7 @@ struct MutationResult {
     applied: bool,             // false if the mutation was a no-op
     rev: u64,                  // incremented only if applied == true
     version: u64,              // entity version, incremented only if applied == true
-    entity: Issue,             // current state after (possibly no-op) mutation
+    entity: Task,              // current state after (possibly no-op) mutation
 }
 ```
 
@@ -1688,7 +1688,7 @@ Defined in Invariant 34 (command preconditions section). Elevated to a standalon
 invariant because the commit history shows this as a distinct recurring failure
 class: notifications keyed off current state instead of the assignment event,
 nudges driving work whose state had changed, steering messages arriving for
-issues that no longer exist.
+tasks that no longer exist.
 
 The invariant: a command whose precondition fails at delivery time is expired,
 not delivered. The expiration is recorded as a `DurableEvent` (Invariant 24).
@@ -1784,7 +1784,7 @@ proptest! {
         // matches its canonical source
     }
     fn liveness(ops in arb_ops()) {
-        // every non-terminal issue has a runnable action, assigned actor,
+        // every non-terminal task has a runnable action, assigned actor,
         // or structured wait reason
     }
     fn revision_monotonicity(ops in arb_ops()) {
@@ -1829,17 +1829,17 @@ Instead of requiring real workers for all orchestration tests, the orchestrator 
 against a fake clock + fake provider + fake backend:
 
 ```
-t=0   issue created
+t=0   task created
 t=1   worker claims (lease 30s)
 t=3   provider rate-limits
 t=20  rate-limit resets
 t=21  worker resumes
 t=25  worker crashes (OOM)
 t=26  lease reclaimed
-t=27  worker-2 takes issue
+t=27  worker-2 takes task
 t=40  worker-2 completes
 t=41  verification passes
-t=42  issue verified
+t=42  task verified
 ```
 
 Assert the entire event stream. Fuzz thousands of workflows in seconds. Catch race
@@ -1851,7 +1851,7 @@ Use `proptest` for property/invariant testing:
 // For arbitrary generated event sequences, assert:
 proptest! {
     fn no_double_lease(events in arb_events()) {
-        // an issue cannot have two live leases simultaneously
+        // a task cannot have two live leases simultaneously
     }
     fn verified_implies_done(events in arb_events()) {
         // verified implies done occurred previously
@@ -1902,14 +1902,14 @@ struct DurableEvent {
     timestamp: DateTime<Utc>,
     actor: Actor,
     kind: EventKind,
-    entity_id: String,  // issue, worker, schedule, etc.
+    entity_id: String,  // task, worker, schedule, etc.
     payload: Value,
 }
 
 enum EventKind {
-    IssueCreated,
-    IssueClaimed,
-    IssueStarted,
+    TaskCreated,
+    TaskClaimed,
+    TaskStarted,
     GateBlocked,
     GateSatisfied,
     WorkerMentioned,
@@ -1921,13 +1921,13 @@ enum EventKind {
     RateLimitCleared,
     VerificationStarted,
     VerificationFailed,
-    IssueVerified,
+    TaskVerified,
     ProviderDegraded,
     ProviderRecovered,
     PolicyDecisionMade,       // Invariant 45 -- agent chose a pre-committed default
     CriteriaAmended,          // Invariant 50 -- acceptance criteria changed post-start
-    IssueDecomposed,          // Invariant 47 -- auto-split on exhaustion
-    IssueQuarantined,         // Invariant 47 -- terminal failure
+    TaskDecomposed,          // Invariant 47 -- auto-split on exhaustion
+    TaskQuarantined,         // Invariant 47 -- terminal failure
     CircuitOpened,            // Invariant 48 -- fleet halt
     CircuitClosed,            // Invariant 48 -- fleet resumed
     Extension(String),        // open variant -- plugins and future event kinds
@@ -1937,7 +1937,7 @@ enum EventKind {
 
 This is not event sourcing (current state is still the DB row). It is an append-only
 audit log. It enables: debugging ("why did AR-421 end up here?"), replay (offline
-sync), metrics (tokens per verified issue, time-in-state), and the `why-blocked`
+sync), metrics (tokens per verified task, time-in-state), and the `why-blocked`
 query.
 
 ### Invariant 25: Priority and scheduling hints
@@ -1995,7 +1995,7 @@ Every assignment records exactly what the worker received.
 ```rust
 struct ContextSnapshot {
     id: ContextSnapshotId,
-    issue_id: IssueId,
+    task_id: TaskId,
     worker_id: WorkerId,
     hash: Hash,
     fragments: Vec<FragmentRef>,
@@ -2085,7 +2085,7 @@ insufficient -- the verifier must corroborate or independently confirm.
 
 ### Invariant 29: Message is a durable entity, not command plumbing
 
-Steering messages, `@worker` mentions, issue discussion, and offline commands are all
+Steering messages, `@worker` mentions, task discussion, and offline commands are all
 the same thing: a **Message**. Making it an explicit durable entity gives you threads,
 unread state, delivery tracking, search, and audit history without building each one
 separately.
@@ -2095,7 +2095,7 @@ struct Message {
     id: MessageId,
     from: ActorRef,
     to: Vec<ActorRef>,       // worker/group/user/orchestrator
-    issue_id: Option<IssueId>,
+    task_id: Option<TaskId>,
     thread_id: ThreadId,
     body: String,
     created_at: DateTime<Utc>,
@@ -2112,9 +2112,9 @@ enum DeliveryState {
 
 `WorkerCommand::Steer` becomes `WorkerCommand::DeliverMessage(MessageId)`. The
 orchestrator delivers messages at turn boundaries (Invariant 6). Offline messages
-queue in IndexedDB and sync on reconnect (Invariant 14). `@worker-3` in an issue
-description creates a Message addressed to worker-3 with the issue_id set. Threads
-let a worker reply to a steering message and the reply appears in the issue activity.
+queue in IndexedDB and sync on reconnect (Invariant 14). `@worker-3` in a task
+description creates a Message addressed to worker-3 with the task_id set. Threads
+let a worker reply to a steering message and the reply appears in the task activity.
 
 ### Invariant 30: Structured events for machines, append-only logs for humans
 
@@ -2128,10 +2128,10 @@ transitions, metrics, and the `why-blocked` query.
 output, tool call results, error messages, debug traces. Humans read these when
 debugging.
 
-An issue detail exposes both, correlated by issue/worker/session/turn IDs:
+A task detail exposes both, correlated by task/worker/turn IDs:
 
 ```
-Issue AR-421 detail:
+Task AR-421 detail:
   Activity          — messages + transitions (human timeline)
   Messages          — thread of steering/discussion
   Worker output     — raw terminal capture per turn
@@ -2155,7 +2155,7 @@ Compaction creates a cheaper derived context layer without destroying source his
 struct Compaction {
     id: CompactionId,
     worker_id: WorkerId,
-    issue_id: Option<IssueId>,
+    task_id: Option<TaskId>,
     source_turns: Vec<TurnId>,
     summary: String,
     retained_facts: Vec<Fact>,
@@ -2173,7 +2173,7 @@ Lifecycle triggers:
 context 70%  -> prepare compaction (build summary in background)
 context 85%  -> compact (swap full history for compacted representation)
 context 95%  -> checkpoint + new session
-new session  -> hydrate: issue state + compacted history + unresolved work
+new session  -> hydrate: task state + compacted history + unresolved work
 ```
 
 **Source history is never replaced by compaction.** The original turns, messages,
@@ -2181,7 +2181,7 @@ logs, and artifacts remain in the DB. Compaction produces a `ContextFragment` wi
 `source: Compacted` that the context assembler (Invariant 16) uses instead of the
 originals, but a worker or human can always drill into the full source.
 
-Worker identity and issue assignment survive session replacement. The worker is
+Worker identity and task assignment survive session replacement. The worker is
 durable (Invariant 1); the session is ephemeral. A new session hydrates from the
 compacted context and continues where the previous session left off.
 
@@ -2197,7 +2197,7 @@ GET /api/search?q=rate+limited+anthropic+AR-421
 Searchable entities:
 
 ```
-issues, messages, workers, groups, turns, logs, tool calls,
+tasks, messages, workers, groups, turns, logs, tool calls,
 verification evidence, gate evaluations, memories, files,
 browser history/artifacts, email, calendar, CRM, schedules, events
 ```
@@ -2209,7 +2209,7 @@ struct SearchHit {
     entity_type: EntityType,
     entity_id: EntityId,
     scope: Scope,
-    issue_id: Option<IssueId>,
+    task_id: Option<TaskId>,
     worker_id: Option<WorkerId>,
     timestamp: DateTime<Utc>,
     snippet: String,
@@ -2313,7 +2313,7 @@ SQLite MemoryEntry (canonical)
       +-> worker context (assembled by context pipeline, Invariant 27)
       +-> compacted summary (lossy, Invariant 31)
       +-> MEMORY.md projection (generated file, read-only)
-      +-> inter-session API response (read from DB)
+      +-> inter-worker API response (read from DB)
 
 NONE of these write back to MemoryEntry without an explicit user mutation.
 ```
@@ -2400,24 +2400,24 @@ start, the old session remains active and the config change is rejected.
 The following remain unchanged across any config mutation:
 
 ```
-WorkerId, issues, messages, memory, turn history, gates,
+WorkerId, tasks, messages, memory, turn history, gates,
 schedules, metrics, search identity, audit history
 ```
 
-#### Per-issue model override
+#### Per-task model override
 
-Workers have a default model. Individual issues can request a different model
+Workers have a default model. Individual tasks can request a different model
 without changing the worker default:
 
 ```rust
-struct IssueHints {
-    requested_model: Option<ModelId>,  // override worker default for this issue
+struct TaskHints {
+    requested_model: Option<ModelId>,  // override worker default for this task
     // ...
 }
 ```
 
-After the issue completes, the worker returns to its configured model. This
-supports the orchestrator's cost optimization: route expensive issues to capable
+After the task completes, the worker returns to its configured model. This
+supports the orchestrator's cost optimization: route expensive tasks to capable
 models while keeping worker defaults economical.
 
 #### Rename and alias
@@ -2475,8 +2475,8 @@ CSS selectors like `div:nth-child(3) > button:nth-child(2)` or rely solely on
 visible copy (wording changes must not break behavioral tests).
 
 ```html
-<button data-testid="issue-menu" data-entity-id="AR-421">
-<input data-testid="issue-title-input" data-entity-id="AR-421" />
+<button data-testid="task-menu" data-entity-id="AR-421">
+<input data-testid="task-title-input" data-entity-id="AR-421" />
 ```
 
 The instrumented set (all must have `data-testid` or `data-action-id`):
@@ -2553,7 +2553,7 @@ Example -- full nested path:
 
 ```
 Board
- +-- Issue card
+ +-- Task card
      +-- ... menu
          +-- Move
              +-- column picker
@@ -2601,7 +2601,7 @@ Model state and browser state are kept in sync:
 ```
 Model state              Browser state
 -----------              -------------
-issue.status=review  <=> card appears in Review column
+task.status=review  <=> card appears in Review column
 modal=open           <=> modal visible in DOM
 saving=true          <=> save button disabled/spinner
 offline=true         <=> queued indicator visible
@@ -2621,14 +2621,14 @@ Every E2E step automatically captures:
     "test_id": "board_move_with_gate",
     "component": "IssueCard",
     "action": "press_enter",
-    "target": "issue-title-input",
+    "target": "task-title-input",
     "entity": "AR-421",
     "server_rev_before": 8821,
     "server_rev_after": 8822,
     "network": [
         { "method": "PATCH", "path": "/api/board/AR-421", "status": 200 }
     ],
-    "toast": "Issue updated",
+    "toast": "Task updated",
     "console_errors": [],
     "duration_ms": 142
 }
@@ -2769,7 +2769,7 @@ made. This is enforced structurally, not by discipline:
    No separate "troubleshooting" doc.
 
 4. **Event history IS the audit trail.** `DurableEvent` (Invariant 24) means every
-   state transition is queryable: `amux issue AR-123 history` shows who did what,
+   state transition is queryable: `amux task AR-123 history` shows who did what,
    when, and why. No separate audit log to maintain.
 
 5. **Test names ARE the requirements.** Each Playwright golden scenario and each
@@ -2781,7 +2781,7 @@ made. This is enforced structurally, not by discipline:
    `amux config show --effective --worker=X` shows exactly what is in effect and where
    each value came from (global, group, or worker override).
 
-7. **The dependency graph IS the project plan.** `IssueRelation` (Invariant 4) means
+7. **The dependency graph IS the project plan.** `TaskRelation` (Invariant 4) means
    the board itself shows what blocks what. No separate Gantt chart or project tracker.
 
 The bar: a new contributor should be able to understand the system by reading types,
@@ -3000,7 +3000,7 @@ understands action classes and uses appropriate generated fixture data:
 **Seed states.** Discovery must not begin only from the empty/default application.
 Create deterministic fixtures for: empty installation, populated installation,
 migrated Python dataset, worker active/idle/stopped/rate-limited/errored/high-context/
-unread-messages, issue in each lifecycle state (todo/doing/review/gate-blocked/done/
+unread-messages, task in each lifecycle state (todo/doing/review/gate-blocked/done/
 verified/dependency-blocked), offline client, pending offline mutations, sync conflict,
 provider unavailable, Herdr unavailable, schedule enabled/disabled, browser profile
 active/locked. Run UX discovery from each relevant seed. A button that only appears
@@ -3120,7 +3120,7 @@ Final Rust acceptance requires zero unexplained holes.
 
 No-stall (Invariant 10) guarantees forward motion. Without a complementary
 no-thrash guarantee, the agent burns tokens retrying verification forever.
-Every issue carries execution limits:
+Every task carries execution limits:
 
 ```rust
 struct ExecutionLimits {
@@ -3135,12 +3135,12 @@ struct ExecutionLimits {
 
 On exhaustion of any limit:
 
-1. **Automatic decomposition**: split the issue into child issues, each covering a
+1. **Automatic decomposition**: split the task into child tasks, each covering a
    smaller, independently verifiable piece. The children inherit the parent's
    acceptance criteria, narrowed to their scope. The parent moves to
    `Waiting(Dependency(...))` on the children.
 2. If decomposition itself fails twice (children also exhaust their limits), the
-   issue moves to `Quarantined` with the full failure chain:
+   task moves to `Quarantined` with the full failure chain:
 
 ```rust
 struct AttemptRecord {
@@ -3156,7 +3156,7 @@ struct AttemptRecord {
 `Quarantined` is terminal, counted in `FleetProgress`, and reported in the
 diagnostic output. It is never silently retried. The quarantine count is a
 fleet-level health signal: rising quarantine count = systemic problem, not
-bad luck on individual issues.
+bad luck on individual tasks.
 
 ### Invariant 48: Global spend and progress circuit breakers
 
@@ -3183,13 +3183,13 @@ enum CircuitOpenReason {
     ZeroProgress { hours: u32, tokens_burned: u64 },
     BudgetExhausted { window_spend: u64, budget: u64 },
     QuarantineSurge { count: u32, period: Duration },
-    AllItemsBlocked { blockers: Vec<(IssueId, BlockerKind)> },
+    AllItemsBlocked { blockers: Vec<(TaskId, BlockerKind)> },
 }
 ```
 
 When the circuit opens:
 1. The orchestrator halts new assignments.
-2. Writes a diagnostic report: every in-progress issue, every blocker, every
+2. Writes a diagnostic report: every in-progress task, every blocker, every
    quarantined item, token spend curve, last N completed items with their cost.
 3. Enters a low-power reconciliation loop: re-evaluate all blocked items'
    conditions, audit whether any `ExternalBlocker.check` now passes, attempt
@@ -3206,7 +3206,7 @@ re-rolls are how autonomous systems spend $40k on the same bug.
 
 ```rust
 struct WorkAssignment {
-    issue_id: IssueId,
+    task_id: TaskId,
     worker_id: WorkerId,
     attempt: u32,
     lease: Lease,
@@ -3250,8 +3250,8 @@ struct Criterion {
 ```
 
 Rules:
-1. An issue cannot leave `todo` without at least one `Criterion`.
-2. `AcceptanceCriteria.authored_by` must differ from the issue's executor
+1. A task cannot leave `todo` without at least one `Criterion`.
+2. `AcceptanceCriteria.authored_by` must differ from the task's executor
    `WorkerId`. Self-authored criteria are structurally rejected.
 3. Post-start criteria edits are a distinct audited transition
    (`EventKind::CriteriaAmended`) that resets verification status to
@@ -3276,16 +3276,16 @@ const MAX_DISCOVERED_ITEMS_PER_RUN: u32 = 50;
 ```
 
 Rules:
-1. **Depth limit**: an issue created by decomposition carries
+1. **Depth limit**: an task created by decomposition carries
    `decomposition_depth: u32`. Children inherit `parent_depth + 1`. At
    `MAX_DECOMPOSITION_DEPTH`, exhaustion leads directly to `Quarantined`,
    not further decomposition.
 2. **Child count limit**: a single decomposition produces at most
-   `MAX_CHILDREN_PER_ISSUE` children. If the natural split is larger,
+   `MAX_CHILDREN_PER_TASK` children. If the natural split is larger,
    group related children under intermediate parents.
 3. **Discovered items link to a gated parent**: items created by UX discovery
    (Invariant 46) or any automated discovery process must link to a parent
-   issue that is `VERIFIED`-gated. The parent cannot verify until all
+   task that is `VERIFIED`-gated. The parent cannot verify until all
    discovered children verify. This prevents discovered items from
    floating free with no completion gate.
 4. **Per-run cap**: a single discovery run (UX crawl, schema scan, etc.)
@@ -3355,7 +3355,7 @@ USER / @MENTIONS / SCHEDULES
               |
               v
           BOARD GRAPH
-    issues + gates + evidence
+    tasks + gates + evidence
     + dependency resolution
     + priority scoring
               |
@@ -3477,12 +3477,12 @@ impl Orchestrator {
         }
 
         // 3. Find runnable work (dependency graph + capabilities + scope)
-        let runnable = self.board.runnable_issues().await;
+        let runnable = self.board.runnable_tasks().await;
 
         // 4. Match to available workers
-        for issue in runnable {
-            if let Some(worker) = self.find_capable_worker(&issue).await {
-                self.assign(worker, issue).await;
+        for task in runnable {
+            if let Some(worker) = self.find_capable_worker(&task).await {
+                self.assign(worker, task).await;
             }
         }
 
@@ -3510,7 +3510,7 @@ struct WorkRequirements {
     capabilities: HashSet<Capability>,
 }
 
-fn is_capable(worker: &Worker, issue: &Issue) -> bool {
+fn is_capable(worker: &Worker, task: &Task) -> bool {
     // runnable (deps met)
     // AND group-visible (scope isolation)
     // AND worker has required capabilities
@@ -3520,7 +3520,7 @@ fn is_capable(worker: &Worker, issue: &Issue) -> bool {
 
 ### Context assembly pipeline
 
-When a worker picks up an issue, the orchestrator assembles its context:
+When a worker picks up a task, the orchestrator assembles its context:
 
 ```rust
 trait ContextProvider: Send + Sync {
@@ -3531,7 +3531,7 @@ trait ContextProvider: Send + Sync {
 // 1. Global instructions
 // 2. Group instructions (override global)
 // 3. Worker instructions (override group)
-// 4. Issue context (description, deps, related issues)
+// 4. Task context (description, deps, related tasks)
 // 5. Relevant memory (scoped: global, group, worker)
 // 6. Environment / tool configuration (scoped)
 // 7. Recent work / results from prior turns
@@ -3632,8 +3632,8 @@ amux/
         lib.rs
         scope.rs                 # Scope enum, effective_config resolver
         board/
-          mod.rs                 # Issue, BoardTransition, GateError
-          graph.rs               # IssueRelation, dependency resolution
+          mod.rs                 # Task, BoardTransition, GateError
+          graph.rs               # TaskRelation, dependency resolution
           state_machine.rs       # apply_transition (pure logic)
         worker/
           mod.rs                 # Worker, WorkerConfig, WorkerCapabilities
@@ -3681,7 +3681,7 @@ amux/
         orchestrator/
           mod.rs                 # runtime orchestrator loop
           reconcile.rs           # startup reconciliation
-          pickup.rs              # runnable-issue selection
+          pickup.rs              # runnable-task selection
           context.rs             # context assembly pipeline
           compaction.rs          # context compaction lifecycle (70/85/95% triggers)
         runtime/
@@ -3714,7 +3714,7 @@ amux/
           mod.rs                 # aria2c RPC
         observability/
           mod.rs                 # tracing, correlation IDs
-          trace.rs               # issue -> assignment -> worker -> session -> turn -> outcome
+          trace.rs               # task -> assignment -> worker -> turn -> outcome
 
     amux-dashboard/              # build-time: embeds the SPA
       build.rs
@@ -3847,7 +3847,7 @@ With 30+ jobs + HTTP + SSE + workers, SQLite needs explicit design:
 harness that will verify every subsequent phase.
 
 1. Scaffold workspace, crate structure
-2. `amux-core`: Scope, Worker, Session, Issue, BoardTransition, WorkerCommand/Event,
+2. `amux-core`: Scope, Worker, Task, BoardTransition, WorkerCommand/Event,
    Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
    system's vocabulary. Every entity type carries a `version: u64` field.
 3. `amux-server/db`: all tables as SQL migrations (count from schema discovery), WAL mode, single-writer task
@@ -3868,7 +3868,7 @@ harness that will verify every subsequent phase.
 9. **UX discovery harness** (Invariant 46):
    - Automated UX interaction graph crawler (BFS, semantic state hashing)
    - Interactive control detection (buttons, links, inputs, roles, draggable, etc.)
-   - Seed state fixtures (empty, populated, migrated, per-worker-state, per-issue-state)
+   - Seed state fixtures (empty, populated, migrated, per-worker-state, per-task-state)
    - Crawler self-test (fixture pages with intentionally hidden/nested controls)
    - Generated artifacts: `interaction-graph.json`, `interaction-coverage.json`
 10. **OpenCode provider spike** (week 1, before any other provider work):
@@ -3903,8 +3903,8 @@ harness that will verify every subsequent phase.
 - Unit: all tables (from schema discovery) created in in-memory DB
 - Unit: `BoardTransition` state machine rejects invalid transitions
 - Unit: `BoardTransition` rejects nonsensical combos (archived + doing) (Invariant 3)
-- Unit: Archive/Restore round-trip preserves all issue fields (Invariant 3)
-- Unit: `IssueDisposition` is total -- every issue resolves to exactly one variant (Invariant 10)
+- Unit: Archive/Restore round-trip preserves all task fields (Invariant 3)
+- Unit: `TaskDisposition` is total -- every task resolves to exactly one variant (Invariant 10)
 - Unit: `WaitingFor` variants cover all non-terminal, non-runnable states (Invariant 10)
 - Unit: `MutationResult.applied == false` when mutation is a no-op (Invariant 37)
 - Unit: `#[serde(deny_unknown_fields)]` rejects unknown mutation fields (Invariant 37)
@@ -3917,7 +3917,7 @@ harness that will verify every subsequent phase.
 - Simulation: fake clock + fake backend, orchestrator tick completes in <1ms (Invariant 22)
 - Simulation: deterministic replay of 100 random event sequences produces identical state
 - proptest: `BoardTransition` state machine rejects all invalid (from, to) pairs (Invariant 22)
-- proptest: every non-terminal issue resolves to exactly one IssueDisposition (Invariant 10)
+- proptest: every non-terminal task resolves to exactly one TaskDisposition (Invariant 10)
 - proptest: no-op mutation never increments revision or entity version (Invariant 37)
 - proptest: derived data never writes back to source (Invariant 39)
 - proptest: scope merge is idempotent (merge(a, a) == a for arbitrary config)
@@ -3961,12 +3961,12 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: Ollama adapter translates connection/model-not-found -> WorkerEvent::Failed
 - Unit: WorkerEvent translation from sample terminal captures (corpus per provider)
 - Unit: reconcile_on_startup handles all mismatch states (DB vs backend)
-- Unit: lease expiration releases issue back to runnable
-- Unit: stall_check fires when worker idle + non-terminal issue exists
+- Unit: lease expiration releases task back to runnable
+- Unit: stall_check fires when worker idle + non-terminal task exists
 - Unit: `ProviderQuota` state machine transitions for all `ProviderState` variants (Invariant 20)
 - Unit: fallback chain routes to next-available provider when primary is exhausted (Invariant 20)
 - Unit: execution state transitions are independent of board state transitions (Invariant 19)
-- Unit: `@worker` mention parses from issue text, CLI, and dashboard input (Invariant 17)
+- Unit: `@worker` mention parses from task text, CLI, and dashboard input (Invariant 17)
 - Unit: mention delivery state machine: Queued->Delivered->Acknowledged->ActedOn (Invariant 17)
 - Unit: `Message` CRUD -- create, thread, delivery state tracking (Invariant 29)
 - Unit: `Message` addressed to group fans out to all group members (Invariant 29)
@@ -3979,10 +3979,10 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: `DeliveryTiming::AtTurnBoundary` holds until turn ends (Invariant 34)
 - Unit: `WorkerEvent` sequence numbers are monotonic per worker (Invariant 34)
 - Unit: event gap detection flags missing sequence numbers (Invariant 34)
-- Simulation: 50 workers, 200 issues, fake clock -- orchestrator assigns optimally with
+- Simulation: 50 workers, 200 tasks, fake clock -- orchestrator assigns optimally with
   no double-leases (Invariant 22)
 - Simulation: provider rate-limit + recovery -- fleet redistributes within 2 ticks (Invariant 20)
-- Simulation: worker crash mid-issue -- lease reclaimed, issue re-assigned (Invariant 22)
+- Simulation: worker crash mid-task -- lease reclaimed, task re-assigned (Invariant 22)
 - proptest: no double-lease for arbitrary event sequences (Invariant 22)
 - proptest: verified implies done occurred previously (Invariant 22)
 - proptest: no duplicate delivery for same idempotency key (Invariant 34)
@@ -4000,7 +4000,7 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Integration: create Claude worker on herdr, send prompt via OpenCode, receive events
 - Integration: create Claude worker on tmux, send prompt via OpenCode, receive events
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
-- Integration: switch worker from herdr to tmux, restart -- worker identity, issue
+- Integration: switch worker from herdr to tmux, restart -- worker identity, task
   ownership, messages, context all preserved (Invariant 33)
 - Integration: rename worker -- display_name changes, WorkerId unchanged, old name
   becomes alias, @mention resolves via alias (Invariant 43)
@@ -4010,7 +4010,7 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
   no session restart (Invariant 43)
 - Integration: change worker provider -- session restart, all durable state preserved
   (Invariant 43)
-- Integration: per-issue model override -- issue uses Opus, worker returns to Sonnet
+- Integration: per-task model override -- task uses Opus, worker returns to Sonnet
   after completion (Invariant 43)
 - Integration: config change during active turn -- queued until turn ends for
   NextTurn/SessionRestart modes (Invariant 43)
@@ -4026,20 +4026,20 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Playwright: worker list renders, Start button responds within 1s (measured)
 - Playwright: worker status badge updates within 2s of state change (all providers)
 - Playwright: create worker with group assignment, verify group scope applied
-- Playwright: idle worker with non-terminal issue -> dashboard shows stall warning
-- Playwright: `@worker` mention in issue description triggers delivery (Invariant 17)
-- Playwright: token budget dashboard shows tokens-per-verified-issue metric (Invariant 16)
-- Playwright: message thread on issue detail -- send, reply, unread indicator (Invariant 29)
+- Playwright: idle worker with non-terminal task -> dashboard shows stall warning
+- Playwright: `@worker` mention in task description triggers delivery (Invariant 17)
+- Playwright: token budget dashboard shows tokens-per-verified-task metric (Invariant 16)
+- Playwright: message thread on task detail -- send, reply, unread indicator (Invariant 29)
 
 ### Phase 2: Board + dependency graph (est. 3 weeks)
 
 **Goal**: full board with gates, graph, scoped configuration, atomic claiming.
 
-1. `amux-core/board`: Issue, IssueRelation, dependency graph, gate derivation
+1. `amux-core/board`: Task, TaskRelation, dependency graph, gate derivation
 2. `amux-core/board/state_machine`: apply_transition with scope-aware gates
 3. `amux-server/api/board.rs`: all routes, 409 gate contract, force+audit
-4. Board auto-capture (prompt -> issue, derived title, no helper-model call)
-5. Orchestrator integration: `board.runnable_issues()` uses dependency graph +
+4. Board auto-capture (prompt -> task, derived title, no helper-model call)
+5. Orchestrator integration: `board.runnable_tasks()` uses dependency graph +
    capabilities + scope
 6. Scoped gates: global gates, group overrides, worker specialization
 
@@ -4055,20 +4055,20 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: dependency graph: circular dependency detected and rejected at create time
 - Unit: atomic claim: two concurrent claims, exactly one succeeds (sqlx test with
   two connections)
-- Unit: lease expires -> issue reclaimable, original worker's claim is void
+- Unit: lease expires -> task reclaimable, original worker's claim is void
 - Unit: `force=true` bypasses gate, writes audit trail including actor + reason
 - Unit: `Gate` entity CRUD -- create, scope, version, history (Invariant 18)
 - Unit: `why-blocked` query returns gate id, criterion, missing evidence, suggested
   command (Invariant 18)
 - Unit: VerifierKind ordering: deterministic before ModelJudgment (Invariant 28)
-- Unit: issue state vs execution state separation -- rate-limit changes execution
+- Unit: task state vs execution state separation -- rate-limit changes execution
   state only, never board state (Invariant 19)
 - Unit: priority scoring: critical-path weight + explicit priority + age starvation +
   affinity + provider availability + cost (Invariant 25)
 - proptest: dependency graph is acyclic for arbitrary relation insertions (rejects cycles)
 - proptest: force bypass always produces audit entry with actor (Invariant 22)
-- proptest: `IssueRelation::Blocks` and `IssueRelation::DependsOn` are inverse-consistent
-- Simulation: 100 issues with complex dependency graph, orchestrator resolves runnable
+- proptest: `TaskRelation::Blocks` and `TaskRelation::DependsOn` are inverse-consistent
+- Simulation: 100 tasks with complex dependency graph, orchestrator resolves runnable
   set in topological order (Invariant 22)
 - Integration: create parent + children, complete children, parent becomes runnable
 - Integration: board CRUD through full lifecycle (todo->claimed->doing->review->done
@@ -4081,9 +4081,9 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Playwright: board renders, drag-and-drop transitions work, gate 409 shown as toast
   with the exact gate criteria and CLI command to satisfy
 - Playwright: mobile board usable at 375px, touch targets >= 44px
-- Playwright: user creates issue in group A, worker in group B cannot see it
-- Playwright: no-stall check -- complete an issue, verify worker picks up next or
-  goes idle with all issues terminal
+- Playwright: user creates task in group A, worker in group B cannot see it
+- Playwright: no-stall check -- complete a task, verify worker picks up next or
+  goes idle with all tasks terminal
 - Playwright: `why-blocked` detail panel shows criteria, evidence, suggested CLI (Invariant 18)
 
 ### Phase 3: Scheduling (est. 2 weeks)
@@ -4143,7 +4143,7 @@ compaction subsystem.
 - Unit: backpressure -- command queue per worker bounded at 16, rejects with 429 (Invariant 26)
 - Unit: backpressure -- SSE channel drops oldest + sends reconnect hint on overflow (Invariant 26)
 - Unit: `ContextSnapshot` created on every assignment, hash stable for identical content (Invariant 27)
-- Unit: context assembly priority: issue > deps > memory > turns > history (Invariant 16)
+- Unit: context assembly priority: task > deps > memory > turns > history (Invariant 16)
 - Simulation: 10 workers rate-limiting simultaneously, orchestrator redistributes
   to available providers within 3 ticks (Invariant 20/22)
 - Simulation: command delivery under backpressure -- no lost commands, 429 for overflow (Invariant 26)
@@ -4199,12 +4199,12 @@ compaction subsystem.
 The user flow acceptance tests built here become the regression suite:
 
 - User submits work to a worker via the dashboard
-- Work gets decomposed into issues on the board
-- Issues get picked up by workers (orchestrator assigns)
-- Issues flow through board statuses with gate acknowledgments
-- Completed issues go through verification
+- Work gets decomposed into tasks on the board
+- Tasks get picked up by workers (orchestrator assigns)
+- Tasks flow through board statuses with gate acknowledgments
+- Completed tasks go through verification
 - Failed verification returns to in-progress
-- Successful verification closes the issue
+- Successful verification closes the task
 
 **Test plan**:
 - Unit: verification state machine (done->verification->verified|rejected->in_progress)
@@ -4212,11 +4212,11 @@ The user flow acceptance tests built here become the regression suite:
   PlaywrightAssertion < ModelJudgment (Invariant 28)
 - Unit: free verifier failure short-circuits -- model verifier never called (Invariant 28)
 - Simulation: verification pipeline with mixed verifier types, cost-ordered execution
-- Integration: issue completes, verification runs, evidence recorded
-- Integration: verification fails, issue returns to doing with rejection reason
-- Integration: `DurableEvent::VerificationStarted` and `VerificationFailed`/`IssueVerified`
+- Integration: task completes, verification runs, evidence recorded
+- Integration: verification fails, task returns to doing with rejection reason
+- Integration: `DurableEvent::VerificationStarted` and `VerificationFailed`/`TaskVerified`
   emitted with full evidence chain (Invariant 24)
-- Integration: issue detail API returns all correlated views: activity, messages, worker
+- Integration: task detail API returns all correlated views: activity, messages, worker
   output, tool calls, transitions, gate evaluations, verification evidence (Invariant 30)
 - Integration: clicking a gate evaluation traces to the tool call, turn, and worker
   output that produced the evidence (Invariant 30)
@@ -4226,32 +4226,32 @@ The user flow acceptance tests built here become the regression suite:
 Each scenario runs end-to-end in a real browser using herdr as the default backend.
 Timing is measured and asserted. At least one complete scenario (the happy path)
 executes identically with `AMUX_BACKEND=herdr` and `AMUX_BACKEND=tmux`, producing
-the same board transitions, WorkerEvents, verification result, and final issue state
+the same board transitions, WorkerEvents, verification result, and final task state
 (Invariant 33).
 
 1. **Happy path (per provider: Claude, Gemini, Codex, Ollama)**:
    - User opens dashboard, submits work text to a worker via the UI
-   - Work gets decomposed into issues on the board (< 5s)
-   - Orchestrator assigns issue to worker (< 3s)
+   - Work gets decomposed into tasks on the board (< 5s)
+   - Orchestrator assigns task to worker (< 3s)
    - Worker picks up, starts executing (status shows "active" within 2s)
-   - Worker completes, issue moves to "done" (status shows "idle" within 2s)
+   - Worker completes, task moves to "done" (status shows "idle" within 2s)
    - Verification runs (Playwright checks the work, evidence recorded)
-   - Issue moves to "verified" -- terminal state
+   - Task moves to "verified" -- terminal state
    - **Assert**: no stalls at any point. Worker status was never stale > 2s.
 
 2. **Failure + retry**:
-   - Worker fails an issue (verification rejects)
-   - Issue returns to "doing" with rejection reason visible in UI
+   - Worker fails a task (verification rejects)
+   - Task returns to "doing" with rejection reason visible in UI
    - Worker retries, succeeds
-   - Issue reaches "verified"
-   - **Assert**: rejection reason displayed as toast and in issue detail
+   - Task reaches "verified"
+   - **Assert**: rejection reason displayed as toast and in task detail
 
 3. **Rate limit recovery (per provider)**:
    - Worker hits rate limit during work
    - Dashboard shows "rate limited" status within 2s (not stale "active")
    - Reset time displayed in UI
    - Worker auto-resumes after reset
-   - Issue continues to completion
+   - Task continues to completion
    - **Assert**: no manual intervention required
 
 4. **Dependency chain**:
@@ -4263,8 +4263,8 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 
 5. **Scoped gates**:
    - Group A requires code review gate, Group B does not
-   - Worker in Group A completes issue -> blocked at review gate
-   - Worker in Group B completes issue -> moves straight to done
+   - Worker in Group A completes task -> blocked at review gate
+   - Worker in Group B completes task -> moves straight to done
    - **Assert**: gate enforcement matches group scope
 
 6. **Offline mode**:
@@ -4275,15 +4275,15 @@ the same board transitions, WorkerEvents, verification result, and final issue s
    - **Assert**: all operations applied, no duplicates, conflicts shown as toasts
 
 7. **No-stall invariant**:
-   - Create 5 issues, start 2 workers
-   - Workers process issues
-   - At every 5s checkpoint: no worker is idle with non-terminal issues in its scope
-   - All issues reach terminal state
+   - Create 5 tasks, start 2 workers
+   - Workers process tasks
+   - At every 5s checkpoint: no worker is idle with non-terminal tasks in its scope
+   - All tasks reach terminal state
    - **Assert**: zero stall violations across entire run
 
 8. **Multi-provider fleet**:
    - Start 1 Claude worker, 1 Gemini worker, 1 Ollama worker
-   - Assign different issues to each
+   - Assign different tasks to each
    - All three complete independently
    - **Assert**: each provider's status updates are timely, no cross-provider confusion
 
@@ -4291,7 +4291,7 @@ the same board transitions, WorkerEvents, verification result, and final issue s
    - Run the happy path with `AMUX_BACKEND=herdr` (default)
    - Run the identical happy path with `AMUX_BACKEND=tmux`
    - **Assert**: same board transitions, same WorkerEvents, same verification result,
-     same final issue state. The backend is invisible above the `SessionBackend` trait.
+     same final task state. The backend is invisible above the `SessionBackend` trait.
 
 10. **Real-time convergence (Invariant 35)**:
     - Open two browser tabs
@@ -4301,7 +4301,7 @@ the same board transitions, WorkerEvents, verification result, and final issue s
     - Both tabs show identical state
     - Kill server, restart
     - Both tabs reconnect, delta sync from their last rev
-    - Mutate same issue from both tabs simultaneously
+    - Mutate same task from both tabs simultaneously
     - Loser gets 409, reconciles
     - **Assert**: both tabs converge to identical, revision-consistent state.
       No stale, duplicate, or missing entities at any point after convergence.
@@ -4387,7 +4387,7 @@ must pass on both the proxied and native dashboard before the proxy is removed.
 - Playwright: all dashboard tabs render, PWA offline works
 - Playwright: SSE delivers revisioned StateEvents, client applies in rev order (Invariant 35)
 - Playwright: rev gap triggers delta sync (drop SSE events, verify convergence) (Invariant 35)
-- Playwright: two tabs mutate same issue -> both converge (Invariant 35)
+- Playwright: two tabs mutate same task -> both converge (Invariant 35)
 - Playwright: kill server, restart -> client reconnects and delta-syncs (Invariant 35)
 - Playwright: 1,000 rapid board mutations -> UI finishes at exact backend rev (Invariant 35)
 - Playwright: connection indicator shows LIVE/STALE/OFFLINE/SYNCING (Invariant 35)
@@ -4421,11 +4421,11 @@ must pass on both the proxied and native dashboard before the proxy is removed.
 
 **Goal**: correlation-ID tracing and performance baselines.
 
-Every operation is traceable: issue -> assignment -> worker -> session -> turn ->
+Every operation is traceable: task -> assignment -> worker -> turn ->
 command -> tool -> outcome. Correlation IDs flow through the entire stack.
 
 ```
-Issue #421
+Task #421
 └─ assigned worker-3
    └─ session s-8821
       └─ turn t-4
@@ -4436,7 +4436,7 @@ Issue #421
 Generalized `why` query -- not just "why is this stuck" but "why did this happen":
 
 ```
-amux why issue AR-42       # full provenance chain
+amux why task AR-42       # full provenance chain
 amux why worker backend    # current state + how it got there
 amux why command CMD-83    # dispatch path, precondition result, delivery
 amux why schedule SCHED-108 # last N fires, source (cron/manual), outcomes
@@ -4456,14 +4456,14 @@ Performance measurement:
 **Test plan**:
 - Integration: correlation IDs present in all log entries for a traced operation
 - Integration: dashboard "why is this stuck?" query returns full trace
-- Integration: `GET /api/search?q=...` returns hits across issues, messages, events,
+- Integration: `GET /api/search?q=...` returns hits across tasks, messages, events,
   logs, workers, schedules, email, CRM (Invariant 32)
 - Integration: search result provenance -- every `SearchHit` carries entity_type,
-  scope, issue_id, worker_id, timestamp (Invariant 32)
+  scope, task_id, worker_id, timestamp (Invariant 32)
 - Integration: FTS5 search works completely offline (Invariant 32)
 - Integration: exact/filter lookup -> SQLite index -> FTS5 -> optional semantic
   reranking stack (Invariant 32)
-- Integration: structured events vs logs -- same issue, both views present, correlated
+- Integration: structured events vs logs -- same task, both views present, correlated
   by turn_id (Invariant 30)
 - Playwright: universal search bar -- type query, results span all entity types with
   provenance chips (Invariant 32)
@@ -4530,7 +4530,7 @@ SQLite schema is preserved, so the DB file is directly compatible. But:
 1. **Schema diff**: run both servers' migration code against the same DB, diff the
    resulting schemas. Any mismatch blocks go-live.
 2. **Data validation**: for every table, verify row counts match and spot-check
-   content (especially `issues`, `schedules`, `prefs`, `email_events`).
+   content (especially `tasks`, `schedules`, `prefs`, `email_events`).
 3. **Worker config migration**: `.env` files -> validated `WorkerConfig` structs.
    Any validation failure produces a report, not a silent skip.
 
@@ -4544,7 +4544,7 @@ Rollback is per-route (revert to proxying), not all-or-nothing.
 ```
 Phase 1:  /health, /api/workers, /api/sessions  → native Rust
           everything else                        → proxy to Python:8823
-Phase 2:  + /api/board, /api/issues              → native Rust
+Phase 2:  + /api/board, /api/tasks              → native Rust
 Phase 3:  + /api/schedules                       → native Rust
 Phase 4:  + /api/sessions/*/send, steering       → native Rust
 Phase 5:  + /api/board/*/status-request, verify  → native Rust
@@ -4575,7 +4575,7 @@ The Rust rebuild migrates toward herdr as the primary backend:
 - Workers can be individually switched between herdr and tmux via config
   (`backend: BackendKind::Tmux` override)
 - Backend choice does not require DB/schema changes
-- Backend choice does not change worker identity or issue ownership
+- Backend choice does not change worker identity or task ownership
 - A worker can restart on a different backend while preserving all durable
   amux state (Invariant 33)
 
@@ -4663,7 +4663,7 @@ The semantic ID is:
 | 1 | `INV-WORKER-IDENTITY` | Worker != Session != Backend |
 | 2 | `INV-SCOPE-FOUR-TIER` | Four-tier scope with deterministic inheritance |
 | 3 | `INV-BOARD-SOT` | Board is the system of record |
-| 4 | `INV-BOARD-DEPGRAPH` | Board issues form a dependency graph |
+| 4 | `INV-BOARD-DEPGRAPH` | Board tasks form a dependency graph |
 | 5 | `INV-TYPED-PROTOCOL` | Typed command/event protocol |
 | 6 | `INV-TURN-ENTITY` | Turn is a first-class concept |
 | 7 | `INV-DONE-VS-VERIFIED` | Done != Verified |
@@ -4678,7 +4678,7 @@ The semantic ID is:
 | 16 | `INV-TOKEN-BUDGETS` | Token budgets are a runtime primitive |
 | 17 | `INV-WORKER-ADDRESSING` | Structural @worker addressing |
 | 18 | `INV-GATES-FIRSTCLASS` | Gates are first-class entities |
-| 19 | `INV-ISSUE-VS-EXEC-STATE` | Issue state != Execution state |
+| 19 | `INV-TASK-VS-EXEC-STATE` | Task state != Execution state |
 | 20 | `INV-PROVIDER-CAPACITY` | Provider capacity and usage normalized |
 | 21 | `INV-CONFORMANCE-SUITES` | Backend and provider conformance suites |
 | 22 | `INV-DETERMINISTIC-SIM` | Deterministic orchestrator simulation |
@@ -4732,7 +4732,7 @@ source of truth after cutover.
 | Policy defaults table | `capability-policy.toml` | Phase 0 |
 | Execution checklist (RR items) | CI traceability infra (RR -> test mapping) | Phase 10 |
 | Lessons from Python (L1-L6) | ADR files in `docs/adr/` | Phase 0 |
-| Timeline / estimates | Project tracker (board issues with deadlines) | Phase 0 |
+| Timeline / estimates | Project tracker (board tasks with deadlines) | Phase 0 |
 | Provider coverage matrix | Generated from test suite tags | Phase 1 |
 | ADR-001 (SQLite) | `docs/adr/001-sqlite-per-tenant.md` | Phase 0 |
 | This sunset table | Deleted at cutover | Phase 11 |
@@ -4858,17 +4858,17 @@ impl TmuxBackend {
 
 ### L3: Board items not flowing
 
-380 todo items, 25 doing with no session, steering messages piling up undelivered.
+380 todo items, 25 doing with no worker, steering messages piling up undelivered.
 The orchestrator logic is scattered across pickup, advance-nudge, steering, and
 snapshot -- and when any one piece breaks (as capture-pane did), the others don't
-compensate. There is no single place that answers "why isn't this issue moving?"
+compensate. There is no single place that answers "why isn't this task moving?"
 
 **Rust fix**: the explicit Orchestrator (Invariant 10) runs a stall check on every
 tick. When it detects a stall, it produces a `StallViolation` with the reason:
 
 ```rust
 // StallReason is the PROBLEM; WaitingFor (Invariant 10) is the STRUCTURED STATE.
-// A StallViolation fires when an issue has no WaitingFor and no assigned worker.
+// A StallViolation fires when a task has no WaitingFor and no assigned worker.
 enum StallReason {
     WorkerIdle,                          // worker has capacity but isn't assigned
     NoCapableWorker,                     // no worker can do this work
@@ -4888,7 +4888,7 @@ can see exactly WHY each item is stuck, not just that it is.
 
 "I have no means of knowing if progress is continuing." The dashboard shows worker
 status (active/idle/rate-limited) but not whether the fleet is making forward
-progress. A worker can be "active" for 2 hours on a single issue with no board
+progress. A worker can be "active" for 2 hours on a single task with no board
 movement.
 
 **Rust fix**: the Orchestrator emits a periodic `FleetProgress` event:
@@ -4897,10 +4897,10 @@ movement.
 struct FleetProgress {
     timestamp: DateTime<Utc>,
     active_workers: u32,
-    issues_completed_last_hour: u32,
-    issues_completed_last_24h: u32,
+    tasks_completed_last_hour: u32,
+    tasks_completed_last_24h: u32,
     stall_violations: Vec<StallViolation>,
-    longest_active_issue: Option<(IssueId, Duration)>,
+    longest_active_task: Option<(TaskId, Duration)>,
     queue_depth: u32,            // todo items with no worker assigned
     quarantined_count: u32,      // terminal failures (Invariant 47)
     blocked_count: u32,          // items with ExternalBlocker
@@ -4940,14 +4940,14 @@ should be computed, not inferred:
 
 The task summarizer was the worst offender (ethos rule 2: "are you calling the model
 for something you could just compute?"). At 12-15k input tokens per call, with 62
-sessions each potentially firing one, that is up to 930k tokens per throttle window
-for 3-word labels. It was throttled to once per 10 minutes per session, which is why
+workers each potentially firing one, that is up to 930k tokens per throttle window
+for 3-word labels. It was throttled to once per 10 minutes per worker, which is why
 most commands never reached the board at all -- the throttle was the symptom, not the
 fix.
 
 **Rust fix**: no model calls for string manipulation. The title deriver is
 `prompt.split('\n')[0].split('.')[0][:80]` -- free, instant, no throttle needed,
-every prompt gets a card. Model calls are reserved for judgment: "should this issue
+every prompt gets a card. Model calls are reserved for judgment: "should this task
 be decomposed?", "does this verification evidence satisfy the gate?" -- questions
 where the answer depends on understanding, not formatting.
 
@@ -5120,8 +5120,8 @@ counts and checksums where feasible for every durable data category:
 
 ```
 workers/sessions                worker configuration
-groups                          board issues
-columns                         issue relationships
+groups                          board tasks
+columns                         task relationships
 gates                           messages/history
 schedules                       schedule runs
 memories                        prefs/settings
@@ -5152,11 +5152,11 @@ Examples of translations that must be explicit:
 
 - `sessions.name` (TEXT) -> `workers.display_name` (TEXT) [table + column rename]
 - `sessions.name` -> `workers.name_aliases` (TEXT[]) [old name becomes alias]
-- `board.status` (TEXT "todo"/"doing"/"done"/"verified") -> `issues.status` (BoardStatus enum)
-- `board.type` (TEXT) -> `issues.issue_type` (IssueType enum)
-- `board.owner_type` (TEXT) -> `issues.owner_type` (OwnerType enum)
-- `board.created` (REAL epoch) -> `issues.created_at` (DateTime<Utc>)
-- `board.desc` (TEXT) -> `issues.desc` (TEXT) + `issues.desc_preview` (TEXT, computed)
+- `board.status` (TEXT "todo"/"doing"/"done"/"verified") -> `tasks.status` (BoardStatus enum)
+- `board.type` (TEXT) -> `tasks.task_type` (TaskType enum)
+- `board.owner_type` (TEXT) -> `tasks.owner_type` (OwnerType enum)
+- `board.created` (REAL epoch) -> `tasks.created_at` (DateTime<Utc>)
+- `board.desc` (TEXT) -> `tasks.desc` (TEXT) + `tasks.desc_preview` (TEXT, computed)
 - `board.log` (TEXT) -> `durable_events` entries (parsed where structured, legacy otherwise)
 - `interaction_log.ts` (INTEGER, MILLISECONDS) -> `events.timestamp` (DateTime<Utc>)
   [known incident: two sessions treated ms as seconds; the migration must divide by 1000]
@@ -5182,7 +5182,7 @@ destination is a bug in the manifest, not an implicit deprecation.
 **Every major subsystem must be tested two ways:**
 
 1. **Existing-data path**: use data migrated from Python and prove it works in Rust.
-   Open a migrated issue, search migrated messages, run a migrated schedule, start a
+   Open a migrated task, search migrated messages, run a migrated schedule, start a
    migrated worker, view migrated logs, resolve migrated scoped config, access migrated
    browser profile metadata, view migrated email threads, check migrated calendar events
    in iCal feed, browse migrated CRM contacts, verify migrated group scope resolution,
@@ -5190,7 +5190,7 @@ destination is a bug in the manifest, not an implicit deprecation.
 
 2. **Net-new path**: create new data through the Rust system and prove the complete
    lifecycle works. Create worker, rename worker, change cwd, change model, change
-   provider, create group, create issue, create gate with dependency, create schedule,
+   provider, create group, create task, create gate with dependency, create schedule,
    send message with @mention, upload file, compose email, create calendar event, create
    CRM contact, create browser profile, create memory, perform universal search, go
    offline and reconnect, verify token usage recorded.
@@ -5224,16 +5224,16 @@ Herdr is the default backend. The rebuild is not complete merely because
 ```
 create worker (Herdr backend)
   → Herdr agent/session created
-  → create/assign issue
+  → create/assign task
   → worker executes via OpenCode AgentProtocol
   → messages deliver at turn boundary
   → status updates flow through SSE
   → logs appear in structured events
   → rate-limit state representable
   → context/turn tracking works
-  → issue progresses through board states
+  → task progresses through board states
   → verification executes
-  → issue reaches verified
+  → task reaches verified
   → restart AMUX server
   → reconcile worker/session state
   → continue functioning normally
@@ -5278,20 +5278,20 @@ configuration. If practical, include WebKit/iOS tests for PWA-critical flows.
    type -> press Enter -> observe loading -> receive API response -> observe toast ->
    receive SSE reconciliation -> verify final card state.
 
-2. Drag/drop with gate rejection: drag issue -> optimistic move -> gate rejects
+2. Drag/drop with gate rejection: drag task -> optimistic move -> gate rejects
    with 409 -> gate UI appears -> card returns correctly -> satisfy gate -> retry ->
-   issue moves -> toast appears -> backend and UI revisions agree.
+   task moves -> toast appears -> backend and UI revisions agree.
 
 3. Worker model change: open worker -> settings -> change model -> save -> session
    replacement if needed -> state remains -> model indicator updates -> send message ->
    new model answers.
 
 4. Worker rename: rename worker -> save -> list updates -> detail title updates ->
-   @old-name alias still resolves -> @new-name resolves -> issue ownership unchanged ->
+   @old-name alias still resolves -> @new-name resolves -> task ownership unchanged ->
    Herdr session continues/reconciles.
 
 5. Worker cwd change: change cwd -> replacement session starts -> correct directory
-   visible -> issue/context preserved -> old session retired -> work continues.
+   visible -> task/context preserved -> old session retired -> work continues.
 
 ### Fault injection
 
@@ -5385,7 +5385,7 @@ revision and entity version (Invariant 35). The browser must:
 - Deliver duplicate event -> client deduplicates, no phantom state
 - Deliver events out of order -> client applies in rev order
 - Disconnect/reconnect -> delta sync fills gap
-- Two browser tabs concurrently editing same issue -> both converge
+- Two browser tabs concurrently editing same task -> both converge
 - Offline mutation conflicting with newer backend state -> conflict resolution
 - 1000 rapid board changes -> final UI equals final backend state
 
@@ -5763,7 +5763,7 @@ API handler exists               != behavior verified
 DOM node exists                  != UI verified
 process is alive                 != worker verified
 terminal accepted keystrokes     != message delivered
-worker said "done"               != issue verified
+worker said "done"               != task verified
 cache contains data              != UI is current
 ```
 
@@ -5778,7 +5778,7 @@ future migrations/schema changes continue to support historically valid AMUX dat
 Include representative examples of:
 
 - Old workers/sessions with legacy config shapes
-- Old board issue shapes, legacy statuses/types
+- Old board task shapes, legacy statuses/types
 - Messages with threading and delivery states
 - Groups with scoped configuration
 - Schedules with run history and source discrimination
@@ -5830,7 +5830,7 @@ RSS (40 workers parked)
 DB write throughput (mutations/sec)
 context assembly time
 token overhead (harness tokens / productive tokens)
-tokens per verified issue
+tokens per verified task
 ```
 
 After the accepted Rust baseline is established, CI compares future changes against
@@ -5932,16 +5932,16 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0005 — Core types: Issue, BoardTransition, IssueRelation
+- [ ] RR-0005 — Core types: Task, BoardTransition, TaskRelation
   Phase: 0
   Depends on: RR-0001
   Invariant: 3, 4, 19
-  Requirement: Issue struct with all board fields. BoardTransition state machine with
-    valid/invalid transitions (including Archive/Restore). IssueRelation (Blocks,
-    DependsOn, RelatedTo, ParentOf, ChildOf). IssueDisposition (Runnable, Assigned,
-    Waiting, Terminal). Issue state vs execution state separation.
+  Requirement: Task struct with all board fields. BoardTransition state machine with
+    valid/invalid transitions (including Archive/Restore). TaskRelation (Blocks,
+    DependsOn, RelatedTo, ParentOf, ChildOf). TaskDisposition (Runnable, Assigned,
+    Waiting, Terminal). Task state vs execution state separation.
   Tests: state machine rejects invalid transitions, Archive/Restore round-trip,
-    IssueDisposition is total, dependency graph acyclicity
+    TaskDisposition is total, dependency graph acyclicity
   Verify: Implementation, Unit tests
   Status: TODO
 
@@ -6019,8 +6019,8 @@ consistent with their dependencies.
   Depends on: RR-0001, RR-0005
   Invariant: 10
   Requirement: WaitingFor enum (Dependency, Gate, User, Provider, ExternalCondition,
-    Capability). StallReason enum. StallViolation struct. Every non-terminal issue
-    resolves to exactly one IssueDisposition variant.
+    Capability). StallReason enum. StallViolation struct. Every non-terminal task
+    resolves to exactly one TaskDisposition variant.
   Tests: WaitingFor covers all non-terminal/non-runnable states, no-stall guarantee
     property test
   Verify: Implementation, Unit tests
@@ -6187,7 +6187,7 @@ consistent with their dependencies.
   Phase: 0
   Depends on: RR-0005, RR-0006, RR-0012
   Invariant: 22
-  Requirement: proptest setup for BoardTransition, IssueDisposition, command queue,
+  Requirement: proptest setup for BoardTransition, TaskDisposition, command queue,
     scope merge, mutation/version invariants.
   Tests: arbitrary state machine fuzzing, no-stall property, acyclicity
   Verify: Implementation, Unit tests
@@ -6228,7 +6228,7 @@ consistent with their dependencies.
   Invariant: 46
   Requirement: Deterministic fixtures for UX discovery seed states: empty installation,
     populated installation, migrated Python dataset, worker in each state (active/idle/
-    stopped/rate-limited/errored/high-context/unread-messages), issue in each lifecycle
+    stopped/rate-limited/errored/high-context/unread-messages), task in each lifecycle
     state, offline client, pending offline mutations, sync conflict, provider
     unavailable, Herdr unavailable, schedule enabled/disabled, browser profile
     active/locked. Run discovery from each relevant seed.
@@ -6322,8 +6322,8 @@ consistent with their dependencies.
   Requirement: Orchestrator trait with work assignment, lease management, stall
     detection. Runtime loop with configurable tick interval. Priority scoring
     (critical-path + explicit + age + affinity + provider availability + cost).
-  Tests: 50-worker/200-issue simulation, no double-leases, optimal assignment,
-    lease expiration reclaims issue
+  Tests: 50-worker/200-task simulation, no double-leases, optimal assignment,
+    lease expiration reclaims task
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
@@ -6385,7 +6385,7 @@ consistent with their dependencies.
   Depends on: RR-0003, RR-0034
   Invariant: 17, 43
   Requirement: Rename changes display_name, old name becomes alias. @old-name
-    still resolves. WorkerId unchanged. Backend ref unchanged. Issue ownership
+    still resolves. WorkerId unchanged. Backend ref unchanged. Task ownership
     unchanged. Herdr session continues (no orphan).
   Tests: rename preserves WorkerId, alias resolution, @mention delivery via alias
   Browser verification: list updates, detail title updates, @old-name resolves
@@ -6400,7 +6400,7 @@ consistent with their dependencies.
     checkpoint -> prepare context -> start new session in new cwd -> verify ready ->
     atomically make current -> retire old session.
   Tests: old session terminated only after new is healthy, worker identity preserved,
-    durable state preserved (issues, messages, memories, history, turns, gates,
+    durable state preserved (tasks, messages, memories, history, turns, gates,
     schedules, metrics, search identity, audit/event history)
   Browser verification: correct directory visible, context preserved, work continues
   Verify: Implementation, Unit tests, Integration tests, Browser verification
@@ -6411,9 +6411,9 @@ consistent with their dependencies.
   Depends on: RR-0003, RR-0007, RR-0034
   Invariant: 20, 43
   Requirement: If provider supports hot_model_switch -> NextTurn (no session restart).
-    Otherwise -> SessionRestart. Per-issue model override: issue uses specified model,
+    Otherwise -> SessionRestart. Per-task model override: task uses specified model,
     worker returns to configured model after completion.
-  Tests: hot-switch applied next turn, restart when needed, per-issue override lifecycle
+  Tests: hot-switch applied next turn, restart when needed, per-task override lifecycle
   Browser verification: model indicator updates
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
@@ -6423,7 +6423,7 @@ consistent with their dependencies.
   Depends on: RR-0003, RR-0031, RR-0034
   Invariant: 43
   Requirement: Provider change always triggers SessionRestart. All durable state
-    preserved: WorkerId, issue ownership, messages, memories, history, turns, gates,
+    preserved: WorkerId, task ownership, messages, memories, history, turns, gates,
     schedules, metrics, search identity, audit/event history.
   Tests: session restart, state preservation verification
   Verify: Implementation, Unit tests, Integration tests
@@ -6488,7 +6488,7 @@ consistent with their dependencies.
   Depends on: RR-0007, RR-0029, RR-0043
   Invariant: 20
   Requirement: Scheduler uses known capacity when routing work. Three-layer usage
-    model: provider account -> model -> worker/issue. Fallback chain routes to
+    model: provider account -> model -> worker/task. Fallback chain routes to
     next-available provider when primary exhausted. Never silently changes configured
     provider when policy forbids failover.
   Tests: routing simulation with exhausted providers, policy enforcement
@@ -6499,7 +6499,7 @@ consistent with their dependencies.
   Phase: 1
   Depends on: RR-0003, RR-0010
   Invariant: 17, 29
-  Requirement: @worker mention parses from issue text, CLI input, dashboard input.
+  Requirement: @worker mention parses from task text, CLI input, dashboard input.
     Delivery state machine: Queued->Delivered->Acknowledged->ActedOn. Alias resolution
     (old worker names still match). Group mention fans out to all members.
   Tests: mention parsing, delivery states, alias resolution, group fan-out
@@ -6532,7 +6532,7 @@ consistent with their dependencies.
   Invariant: 44
   Requirement: Worker list renders. Start button responds within 1s. Status badge
     updates within 2s. Worker with group assignment shows group scope. Stall warning
-    when idle worker has non-terminal issues.
+    when idle worker has non-terminal tasks.
   Browser verification: list, start, status, group, stall warning
   Verify: Browser verification, Visual/rendering
   Status: TODO
@@ -6542,8 +6542,8 @@ consistent with their dependencies.
   Depends on: RR-0029, RR-0028f
   Invariant: 47
   Requirement: Orchestrator enforces ExecutionLimits on every WorkAssignment.
-    On exhaustion: auto-decompose into child issues. If decomposition fails twice,
-    issue moves to Quarantined (terminal). Quarantine count tracked in FleetProgress.
+    On exhaustion: auto-decompose into child tasks. If decomposition fails twice,
+    task moves to Quarantined (terminal). Quarantine count tracked in FleetProgress.
     AttemptRecord written to DurableEvent on every attempt.
   Tests: exhaustion triggers decomposition, double-decomposition-failure quarantines,
     quarantine is terminal and counted, FleetProgress reflects quarantined count
@@ -6580,7 +6580,7 @@ consistent with their dependencies.
   Phase: 1
   Depends on: RR-0029, RR-0028i
   Invariant: 50
-  Requirement: Issue cannot leave todo without >= 1 Criterion. authored_by !=
+  Requirement: Task cannot leave todo without >= 1 Criterion. authored_by !=
     executor WorkerId (structural rejection). Post-start criteria edit is
     CriteriaAmended event, resets verification. Adversarial reviewer worker
     (WorkerRole::CriteriaReviewer) rejects under-specified criteria before
@@ -6622,10 +6622,10 @@ consistent with their dependencies.
   Depends on: RR-0005, RR-0049
   Invariant: 4
   Requirement: Dependency graph with typed relations. Circular dependency detected
-    and rejected at creation. `board.runnable_issues()` uses dependency graph +
+    and rejected at creation. `board.runnable_tasks()` uses dependency graph +
     capabilities + scope. Topological ordering.
   Tests: A blocks C + B blocks C -> both complete -> C runnable, circular rejection,
-    100-issue graph simulation
+    100-task graph simulation
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
@@ -6645,17 +6645,17 @@ consistent with their dependencies.
   Depends on: RR-0029, RR-0049
   Invariant: 3, 22
   Requirement: Two concurrent claims -> exactly one succeeds (sqlx test with two
-    connections). Lease expiration releases issue. Original worker's claim is void
+    connections). Lease expiration releases task. Original worker's claim is void
     after expiration.
   Tests: concurrent claim race, lease expiry, void claim
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0053 — Board auto-capture: prompt -> issue
+- [ ] RR-0053 — Board auto-capture: prompt -> task
   Phase: 2
   Depends on: RR-0049
   Invariant: 3
-  Requirement: Every prompt creates a board issue. Title derived from first clause
+  Requirement: Every prompt creates a board task. Title derived from first clause
     of prompt (no model call -- Lesson L6). No throttle needed.
   Tests: title derivation, every prompt gets a card
   Verify: Implementation, Unit tests, Integration tests
@@ -6676,7 +6676,7 @@ consistent with their dependencies.
   Depends on: RR-0005, RR-0049
   Invariant: 3
   Requirement: Archive { reason } and Restore { reason } transitions. Round-trip
-    preserves all issue fields. Archived issues excluded from default views but
+    preserves all task fields. Archived tasks excluded from default views but
     discoverable.
   Tests: archive/restore round-trip, field preservation, view filtering
   Verify: Implementation, Unit tests, Integration tests
@@ -6846,7 +6846,7 @@ consistent with their dependencies.
   Depends on: RR-0013, RR-0029
   Invariant: 27
   Requirement: ContextSnapshot recorded on every work assignment. Content-hash stable
-    for identical content. Context assembly priority: issue > deps > memory > turns >
+    for identical content. Context assembly priority: task > deps > memory > turns >
     history.
   Tests: snapshot creation, hash stability, priority ordering
   Verify: Implementation, Unit tests, Integration tests
@@ -6920,11 +6920,11 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0077 — Issue detail: correlated views
+- [ ] RR-0077 — Task detail: correlated views
   Phase: 5
   Depends on: RR-0076
   Invariant: 30
-  Requirement: Issue detail API returns activity, messages, worker output, tool calls,
+  Requirement: Task detail API returns activity, messages, worker output, tool calls,
     transitions, gate evaluations, verification evidence. Clicking a gate evaluation
     traces to the tool call, turn, and worker output that produced the evidence.
   Tests: correlated view assembly, trace navigation
@@ -6935,7 +6935,7 @@ consistent with their dependencies.
   Phase: 5
   Depends on: RR-0046, RR-0076
   Invariant: 7, 10
-  Requirement: User submits work -> decomposed into issues -> orchestrator assigns ->
+  Requirement: User submits work -> decomposed into tasks -> orchestrator assigns ->
     worker executes -> completes -> verification -> verified. Per provider: Claude,
     Gemini, Codex, Ollama. No stalls. Status never stale > 2s.
   Browser verification: full end-to-end in real browser with Herdr
@@ -6946,9 +6946,9 @@ consistent with their dependencies.
   Phase: 5
   Depends on: RR-0076, RR-0078
   Invariant: 7
-  Requirement: Verification rejects -> issue returns to doing with rejection reason
+  Requirement: Verification rejects -> task returns to doing with rejection reason
     visible in UI -> worker retries -> succeeds -> verified.
-  Browser verification: rejection reason as toast and in issue detail
+  Browser verification: rejection reason as toast and in task detail
   Verify: Browser verification, Integration tests
   Status: TODO
 
@@ -6957,7 +6957,7 @@ consistent with their dependencies.
   Depends on: RR-0072, RR-0078
   Invariant: 20
   Requirement: Worker hits rate limit -> dashboard shows "rate limited" within 2s ->
-    reset time displayed -> worker auto-resumes -> issue completes. No manual
+    reset time displayed -> worker auto-resumes -> task completes. No manual
     intervention.
   Browser verification: rate-limit status, reset time, auto-resume
   Verify: Browser verification, Integration tests
@@ -6999,8 +6999,8 @@ consistent with their dependencies.
   Phase: 5
   Depends on: RR-0041, RR-0078
   Invariant: 10
-  Requirement: 5 issues, 2 workers -> workers process -> at every 5s checkpoint:
-    no worker idle with non-terminal issues in scope -> all issues terminal.
+  Requirement: 5 tasks, 2 workers -> workers process -> at every 5s checkpoint:
+    no worker idle with non-terminal tasks in scope -> all tasks terminal.
   Tests: zero stall violations across entire run
   Verify: Integration tests, Browser verification
   Status: TODO
@@ -7009,7 +7009,7 @@ consistent with their dependencies.
   Phase: 5
   Depends on: RR-0043, RR-0078
   Invariant: 8
-  Requirement: 1 Claude + 1 Gemini + 1 Ollama worker -> different issues each ->
+  Requirement: 1 Claude + 1 Gemini + 1 Ollama worker -> different tasks each ->
     all complete independently. Each provider's status updates timely.
   Browser verification: no cross-provider confusion
   Verify: Browser verification, Integration tests
@@ -7021,7 +7021,7 @@ consistent with their dependencies.
   Invariant: 33
   Requirement: Run happy path with AMUX_BACKEND=herdr, then identically with
     AMUX_BACKEND=tmux. Same board transitions, WorkerEvents, verification result,
-    final issue state.
+    final task state.
   Tests: backend is invisible above SessionBackend trait
   Verify: Integration tests, Backend conformance
   Status: TODO
@@ -7032,7 +7032,7 @@ consistent with their dependencies.
   Invariant: 35
   Requirement: Two tabs. Tab 1 creates 10 cards rapidly. SSE drops every 3rd event
     to Tab 2. Tab 2 delta syncs. Both tabs identical. Kill server, restart, both
-    reconnect and delta sync. Mutate same issue from both tabs -> loser gets 409,
+    reconnect and delta sync. Mutate same task from both tabs -> loser gets 409,
     reconciles. Both converge to identical state.
   Browser verification: two-tab convergence test
   Verify: Browser verification, Sync/reconciliation
@@ -7223,7 +7223,7 @@ consistent with their dependencies.
   Depends on: RR-0023, RR-0024, RR-0025
   Invariant: 35
   Requirement: SSE delivers revisioned StateEvents in rev order. Rev gap triggers
-    delta sync. Two tabs mutate same issue -> both converge. Kill server, restart ->
+    delta sync. Two tabs mutate same task -> both converge. Kill server, restart ->
     client reconnects and delta-syncs. 1000 rapid board mutations -> UI finishes at
     exact backend rev. Connection indicator (LIVE/STALE/OFFLINE/SYNCING). Optimistic
     write rejected (409) -> rollback visible.
@@ -7372,7 +7372,7 @@ consistent with their dependencies.
   Phase: 9
   Depends on: RR-0009
   Invariant: 24, 30
-  Requirement: Every operation traceable: issue -> assignment -> worker -> session ->
+  Requirement: Every operation traceable: task -> assignment -> worker ->
     turn -> command -> tool -> outcome. Correlation IDs flow through entire stack.
   Tests: correlation IDs present in all log entries for traced operation
   Verify: Implementation, Integration tests, Audit/event provenance
@@ -7382,7 +7382,7 @@ consistent with their dependencies.
   Phase: 9
   Depends on: RR-0108
   Invariant: 24
-  Requirement: `amux why issue AR-42`, `amux why worker backend`, `amux why command
+  Requirement: `amux why task AR-42`, `amux why worker backend`, `amux why command
     CMD-83`, `amux why schedule SCHED-108`, `amux why integration gmail`. All answered
     from structured provenance, not grep over logs.
   Tests: why query returns full provenance chain for each entity type
@@ -7394,9 +7394,9 @@ consistent with their dependencies.
   Phase: 9
   Depends on: RR-0017, RR-0019
   Invariant: 32
-  Requirement: `GET /api/search?q=...` returns hits across issues, messages, events,
+  Requirement: `GET /api/search?q=...` returns hits across tasks, messages, events,
     logs, workers, schedules, email, CRM. SearchHit provenance (entity_type, scope,
-    issue_id, worker_id, timestamp). FTS5 works completely offline. Search stack:
+    task_id, worker_id, timestamp). FTS5 works completely offline. Search stack:
     exact/filter -> SQLite index -> FTS5 -> optional semantic reranking.
   Tests: cross-entity search, provenance chips, offline FTS5
   Performance: FTS5 over 10k entities returns < 50ms
@@ -7409,7 +7409,7 @@ consistent with their dependencies.
   Depends on: RR-0009, RR-0108
   Invariant: 30
   Requirement: Structured events for machines, append-only logs for humans. Same
-    issue shows both views, correlated by turn_id.
+    task shows both views, correlated by turn_id.
   Tests: dual views present and correlated
   Verify: Implementation, Integration tests
   Status: TODO
@@ -7542,7 +7542,7 @@ consistent with their dependencies.
   Depends on: RR-0118, RR-0128
   Invariant: 36
   Requirement: After successful migration, preserve sanitized representative fixture
-    from real Python AMUX dataset. Includes: old workers/sessions, old board issue
+    from real Python AMUX dataset. Includes: old workers/sessions, old board task
     shapes, legacy statuses/types, messages with threading, groups with scoped config,
     schedules with run history, memory entries, token ledger, prefs, browser profile
     metadata, integration config, historical edge cases (451-fold, archived-with-gate).
@@ -7572,7 +7572,7 @@ consistent with their dependencies.
   Requirement: After accepted Rust baseline established, CI tracks: API p50/p95/p99
     per route group, dashboard cold/cached load, SSE propagation latency, worker
     start latency, search latency, idle CPU/RSS (40 workers), DB write throughput,
-    context assembly time, token overhead, tokens per verified issue. Material
+    context assembly time, token overhead, tokens per verified task. Material
     regression outside defined tolerance fails the appropriate gate.
   Tests: baseline recorded, future regressions detected
   Verify: Implementation, Performance
@@ -7636,7 +7636,7 @@ consistent with their dependencies.
     Translation examples that must be documented:
     - `sessions` table -> `workers` table (rename + column mapping)
     - Python `status` string values -> Rust `WorkerState` enum variants
-    - Python `item_type` strings -> Rust `IssueType` enum variants
+    - Python `item_type` strings -> Rust `TaskType` enum variants
     - Python `owner_type` strings -> Rust `OwnerType` enum variants
     - Python epoch timestamps -> Rust `DateTime<Utc>`
     - Python JSON-string columns -> Rust typed structs
@@ -7680,16 +7680,16 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0120 — Migration: board issues + columns + relationships
+- [ ] RR-0120 — Migration: board tasks + columns + relationships
   Phase: 11
   Depends on: RR-0005, RR-0049, RR-0118
   Invariant: 3, 4
-  Requirement: Migrate all board issues, columns, issue relationships. Translation:
-    - Issue IDs preserved (AR-NNN format)
+  Requirement: Migrate all board tasks, columns, task relationships. Translation:
+    - Task IDs preserved (AR-NNN format)
     - Python `status` strings -> Rust `BoardStatus` enum variants
-    - Python `type` strings -> Rust `IssueType` enum variants
+    - Python `type` strings -> Rust `TaskType` enum variants
     - Python `owner_type` strings -> Rust `OwnerType` enum variants
-    - Python `depends_on` JSON array -> Rust `IssueRelation` records
+    - Python `depends_on` JSON array -> Rust `TaskRelation` records
     - Python `gate` JSON array -> Rust `Gate` entities
     - Python `log` text -> Rust structured `DurableEvent` entries where parseable,
       preserved as legacy log text otherwise
@@ -7699,7 +7699,7 @@ consistent with their dependencies.
     - Column definitions per group preserved
     Dependency graph integrity verified (no dangling references, no orphaned
     relationships). Gate history preserved.
-  Data verification: issue count matches, all fields spot-checked, dependency graph
+  Data verification: task count matches, all fields spot-checked, dependency graph
     intact, gate evaluations preserved
   Verify: Implementation, Data verification, Integration tests, Browser verification
   Status: TODO
@@ -7798,7 +7798,7 @@ consistent with their dependencies.
     - Model name strings -> `ModelId`
     - Token counts preserved
     - Cost values preserved with currency
-    - Per-worker, per-issue, per-turn usage attribution maintained
+    - Per-worker, per-task, per-turn usage attribution maintained
     - Epoch timestamps -> `DateTime<Utc>`
   Data verification: total token counts match before/after, per-worker totals match,
     cost sums match
@@ -7908,13 +7908,13 @@ consistent with their dependencies.
   Depends on: RR-0120
   Invariant: 3, 7
   Requirement: Exercise migrated board data through the Rust server:
-    - Open a migrated issue in the dashboard -> renders correctly
-    - View issue transitions/history -> all historical transitions visible
+    - Open a migrated task in the dashboard -> renders correctly
+    - View task transitions/history -> all historical transitions visible
     - Check gate status -> gates derived correctly from migrated type
-    - Edit issue (title, desc, status) -> mutation works, revision increments
-    - Search for migrated issue by content -> appears in results
+    - Edit task (title, desc, status) -> mutation works, revision increments
+    - Search for migrated task by content -> appears in results
     - View dependency graph -> migrated relationships intact
-    - Archive/restore a migrated issue -> round-trip preserves fields
+    - Archive/restore a migrated task -> round-trip preserves fields
     - Verify `desc_preview` computed correctly from migrated `desc`
   Browser verification: migrated board data works fully in UI
   Verify: Integration tests, Browser verification, API verification, Migration (existing)
@@ -7948,7 +7948,7 @@ consistent with their dependencies.
     - View delivery states -> states migrated correctly
     - View @mentions in messages -> resolve to correct workers (via WorkerId)
     - Send new reply to migrated thread -> threads correctly
-    - Message visible in issue detail -> correlated view works
+    - Message visible in task detail -> correlated view works
   Browser verification: migrated messages visible and functional in UI
   Verify: Integration tests, Browser verification, API verification, Migration (existing)
   Status: TODO
@@ -7961,7 +7961,7 @@ consistent with their dependencies.
     - List groups -> all migrated groups appear
     - Group detail -> scoped config resolves correctly
     - Workers in migrated group -> see group-level gates, columns, env
-    - Create issue in migrated group -> group scope applied
+    - Create task in migrated group -> group scope applied
     - Verify group-scoped gates -> gate derivation correct
   Browser verification: migrated groups render and scope correctly
   Verify: Integration tests, Browser verification, Migration (existing)
@@ -7987,13 +7987,13 @@ consistent with their dependencies.
   Depends on: RR-0123a
   Invariant: 24, 30
   Requirement: Exercise migrated log/event data through the Rust server:
-    - View issue history -> migrated events appear with correct timestamps
+    - View task history -> migrated events appear with correct timestamps
     - Search events -> migrated events in search results
-    - `amux why issue <migrated-id>` -> provenance chain includes migrated events
+    - `amux why task <migrated-id>` -> provenance chain includes migrated events
     - Verify timestamp correctness (millisecond-epoch conversion validated)
     - Verify actor references -> resolve to valid workers
     - Verify structured vs legacy events -> both render appropriately
-  Browser verification: migrated events visible in issue detail and search
+  Browser verification: migrated events visible in task detail and search
   CLI verification: `amux why` returns migrated event data
   Verify: Integration tests, Browser verification, CLI verification, Migration (existing)
   Status: TODO
@@ -8066,12 +8066,12 @@ consistent with their dependencies.
     - Change worker model -> correct apply mode
     - Change worker provider -> session restart, state preserved
     - Create new group -> add worker -> verify scoped config
-    - Create new issue -> assign -> work -> complete -> verify
+    - Create new task -> assign -> work -> complete -> verify
     - Create gate -> trigger on transition -> gate modal -> satisfy -> proceed
     - Create dependency (parent + children) -> children complete -> parent runnable
     - Create schedule -> run-now -> verify run recorded with source
     - Send message -> delivery at turn boundary -> acknowledge
-    - @mention worker in issue -> mention delivered
+    - @mention worker in task -> mention delivered
     - Create memory -> read -> edit -> verify version
     - Upload file -> download -> verify content
     - Compose email -> send -> verify in sent
@@ -8178,8 +8178,8 @@ consistent with their dependencies.
   Phase: 5 (after Phase 1 impl)
   Depends on: RR-0031, RR-0046
   Invariant: 21, 33
-  Requirement: Herdr golden scenario (create worker -> issue -> execute -> messages ->
-    status -> logs -> rate-limit -> context -> issue verified -> restart AMUX ->
+  Requirement: Herdr golden scenario (create worker -> task -> execute -> messages ->
+    status -> logs -> rate-limit -> context -> task verified -> restart AMUX ->
     reconcile -> continue). Worker rename/cwd/model/provider change with Herdr.
     AMUX restart while Herdr agent exists. Herdr process disappears. Stale process
     reconciliation. 10+ concurrent Herdr workers. 40-worker load target.
