@@ -196,6 +196,21 @@ async fn async_main() {
     }
     tokio::spawn(runtime.clone().run());
 
+    // Worker event processors (RR-0065, AMUX-2613 gap 1): the durable
+    // subscriber to protocol.events(). Without this spawn the whole event
+    // module was test-only plumbing — a headless turn ran, completed, and
+    // the worker's DB row said `idle` throughout, with turn outcomes
+    // visible only in a tracing line (a store the reader never opens is
+    // the same failure as no tag, ethos rule 4). One processor per worker
+    // with a live session; TurnStarted -> Active{turn}, TurnCompleted ->
+    // Idle + command confirmation + the drift-note path, all journaled
+    // with payloads (RR-0111a). The scan loop stays the FALLBACK voice:
+    // it already demotes any worker whose protocol session is live.
+    tokio::spawn(orchestrator::events::run_event_processors(
+        store.clone(),
+        runtime.protocol.clone().expect("protocol constructed above"),
+    ));
+
     // Terminal scan loop (RR-0067): the fallback voice for hookless
     // interactive workers, with structured-session demotion built in.
     let scan = Arc::new(orchestrator::scan::ScanLoop::new(
@@ -248,6 +263,39 @@ async fn async_main() {
             }
         }
     });
+
+    // LEGACY PORT TAKEOVER (python retirement, 2026-08-09): every running
+    // fleet session carries AMUX_URL=https://localhost:8822 baked into its
+    // process env — env vars in live processes cannot be rotated, so the
+    // moment the python server stopped, the whole fleet's board/API calls
+    // started failing. The rust server therefore answers the OLD port too:
+    // same router, same TLS, same auth. Gated on AMUX_RS_LEGACY_PORT so a
+    // deliberate python resurrection (unset it) gets the port back without a
+    // code change. Set to 8822 in ~/.amux/server.env.
+    if let Some(legacy_port) = std::env::var("AMUX_RS_LEGACY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        let legacy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], legacy_port));
+        let legacy_acceptor = tls::RedirectingAcceptor::new(
+            axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg.clone()),
+            format!("localhost:{legacy_port}"),
+        );
+        let legacy_app = app.clone();
+        tracing::info!(%legacy_addr, "listening on LEGACY port (fleet AMUX_URL compatibility)");
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind(legacy_addr)
+                .acceptor(legacy_acceptor)
+                .serve(
+                    legacy_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+            {
+                // Port taken (python running?) — log loudly, keep the primary.
+                tracing::error!(error = %e, port = legacy_port, "legacy port bind failed");
+            }
+        });
+    }
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https, plain-http redirected)");
