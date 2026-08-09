@@ -8361,6 +8361,66 @@ def _steer_guard_stale(name: str, guard: str):
         if _deps_blocking(it):
             return True, f"{cid} blocked again before delivery"
         return False, ""
+    if guard.startswith("swept:"):
+        # swept:<sha>:<session> — the co-edit notice (AF-21). Its load-bearing
+        # sentence is "you edited it at HH:MM and have not committed it since
+        # HH:MM", and that fact expires: three notices on 2026-08-08 asserted a
+        # 18:33 last-commit that my own 44bd9fe had already superseded at 19:36.
+        # All three were TRUE when emitted (their commits landed 19:06/19:14/19:15)
+        # and false by the time they were read.
+        #
+        # This one matters more than an ordinary stale nudge because of what it
+        # asks: it tells the reader their work may have been swept into someone
+        # else's commit, so a false positive sends them auditing a commit that
+        # contains none of it. And it cannot be told apart from the REAL case —
+        # 762e06e genuinely did carry my staged work under the identical sentence.
+        #
+        # Re-derive rather than trust the queued text: ask git whether `name` has
+        # committed each of the commit's paths SINCE the notice was queued. If it
+        # has committed all of them, the warning has nothing left to warn about.
+        _p = guard.split(":", 2)
+        _sha = _p[1] if len(_p) > 1 else ""
+        if not _sha:
+            return False, ""
+        _wd = _session_work_dir(name)
+        if not _wd:
+            return False, ""            # cannot check -> never suppress (fail loud)
+        try:
+            _paths = [p for p in subprocess.run(
+                ["git", "-C", _wd, "show", "--name-only", "--format=", _sha],
+                capture_output=True, text=True, timeout=8).stdout.split("\n") if p.strip()]
+            if not _paths:
+                return False, ""
+            # SAME PREDICATE AS THE EMITTER, deliberately: `your last edit <= your
+            # last commit of that path`. My first cut asked "has this lane ever
+            # committed this path recently", which is a DIFFERENT question and
+            # answers yes for the genuine sweep too — it would have suppressed
+            # 762e06e, the one notice today that was real. A re-check that does not
+            # share the emitter's predicate is a second opinion about a different
+            # question (ethos: copy the predicate from the mechanism).
+            _edits = _session_recent_edit_paths(name, 24 * 3600)
+            for _p2 in _paths:
+                _abs = os.path.realpath(os.path.join(_wd, _p2))
+                _edit = _edits.get(_abs)
+                if not _edit:
+                    continue            # nothing of this lane's in that path
+                _cts = 0
+                _out = subprocess.run(
+                    ["git", "-C", _wd, "log", "-60",
+                     "--format=%ct%x09%(trailers:key=Amux-Session,valueonly)%x00", "--", _p2],
+                    capture_output=True, text=True, timeout=8).stdout
+                for _rec in _out.split("\0"):
+                    if not _rec.strip():
+                        continue
+                    _tss, _, _sn = _rec.strip().partition("\t")
+                    if _sn.strip() == name and _tss.strip().isdigit():
+                        _cts = int(_tss.strip())
+                        break
+                if not (_cts and _edit <= _cts):
+                    return False, ""     # this path is still genuinely outstanding
+            return True, f"{name} has since committed every outstanding path in {_sha[:7]}"
+        except Exception:
+            return False, ""            # any error -> speak, never silently swallow
     if guard.startswith("verify:"):
         cid = guard[7:]
         it = _item_by_id(cid)
