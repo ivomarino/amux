@@ -6460,7 +6460,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.532';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.533';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting

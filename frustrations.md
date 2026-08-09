@@ -944,3 +944,25 @@ COST: Data-loss class on the live server; found only because the Rust port had
   to decide what the guard SHOULD be (native port refuses non-amux-owned dirs).
 FIX: Python needs the same containment guard while it lives; the Rust deviation
   is documented in docs/rust-migration/server-boundary.md.
+
+---
+## Two /api/logs handlers in amux-server.py; the second is unreachable dead code
+AREA: api
+SEVERITY: misleads
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2607
+SYMPTOM: amux-server.py declares GET /api/logs twice: :67673 (category/session/
+  limit -> {"events","count"}) and :71933 (type/since/filter/lines ->
+  {"events","raw","raw_total_lines"}). Dispatch is sequential first-match, so
+  the :71933 block can never run — two handlers in the same file claim the same
+  route with DIFFERENT param and response contracts, and only reading the
+  dispatch order reveals which one is real.
+COST: The AMUX-2605 rust port was pointed at BOTH line numbers as the contract
+  to preserve; porting the dead one would have shipped an /api/logs whose shape
+  the SPA (app.js:16520) never consumes. Discriminating cost a live-fixture
+  capture against 8822 that reading the source alone could not settle.
+FIX: Delete the :71933 block or fold its useful params (since) into the live
+  handler. The rust origin ports the LIVE :67673 shape (api/request_log.rs),
+  verified against the running python server.

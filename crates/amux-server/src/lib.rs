@@ -46,14 +46,38 @@ async fn async_main() {
     // explicitly or the first TLS handshake panics the accept loop.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
+    // Config first: the log-file path below needs amux_home.
     let cfg = config::ServerConfig::from_process_env();
+
+    // Tracing tees to stdout AND ~/.amux/logs/server-rs.log (AMUX-2605):
+    // the file is what GET /api/logs/raw tails — python parity, where the
+    // Logs tab's raw view reads the server's own log. ANSI off so the file
+    // (and the SPA's raw view) gets clean text. If the file cannot be
+    // opened, stdout-only — logging setup must never stop the server.
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+    };
+    let log_file = {
+        let dir = cfg.amux_home.join("logs");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("server-rs.log"))
+            .ok()
+    };
+    match log_file {
+        Some(f) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter())
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(Arc::new(f)))
+                .init()
+        }
+        None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
+    }
+
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), "starting amux-rust");
 
     let store = match db::Store::open(&cfg.db_path) {

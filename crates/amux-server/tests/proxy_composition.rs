@@ -84,9 +84,8 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
     // -- PROXIED families (from the registry) reach the proxy: honest 502
     //    naming the unreachable python, never the static shell.
     for path in [
-        // session verbs (SessionVerbs mount, rust-worker guard first)
-        "/api/sessions/some-fleet-lane/peek",
-        "/api/sessions/some-fleet-lane",
+        // scope/capabilities — the one family still python-owned
+        "/api/scope",
     ] {
         let (status, ct, body, _) = get(&app, path).await;
         assert!(
@@ -116,6 +115,28 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
     let (status, _, body, proxied) = get(&app, "/api/tags").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!proxied, "/api/tags must be NATIVE");
+
+    // -- Session verbs are NATIVE (AMUX-2598): the per-name family answers
+    //    from the fleet substrate (env files in the hermetic AMUX_HOME), no
+    //    proxy stamp, and a missing session is Python's exact 404 shape —
+    //    never a 502 at a dead python and never the static shell.
+    let (status, _, body, proxied) = get(&app, "/api/sessions/w1/meta").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/sessions/{{name}}/meta must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["name"], serde_json::json!("w1"));
+    assert_eq!(v["tags"], serde_json::json!(["alpha", "beta"]));
+    let (status, ct, body, proxied) = get(&app, "/api/sessions/definitely-not/peek").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied, "missing-session 404 must be NATIVE, not a python 502");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["error"], serde_json::json!("session 'definitely-not' not found"));
+    let (status, _, body, proxied) = get(&app, "/api/sessions/w1/instructions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["instructions"], serde_json::json!(""));
 
     let (status, _, body, proxied) = get(&app, "/api/groups/alpha/config").await;
     assert_eq!(status, StatusCode::OK, "{body}");

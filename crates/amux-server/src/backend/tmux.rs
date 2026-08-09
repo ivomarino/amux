@@ -51,13 +51,15 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 // ---------------------------------------------------------------------------
 
 /// Target for SESSION-level tmux commands: `=<ref>` (exact match, no colon).
-fn session_target(backend_ref: &str) -> String {
+/// pub(crate): api/session_verbs.rs builds fleet targets through these two
+/// helpers so the L2 format lives in exactly one place.
+pub(crate) fn session_target(backend_ref: &str) -> String {
     format!("={backend_ref}")
 }
 
 /// Target for PANE/WINDOW-level tmux commands: `=<ref>:` (exact match, active
 /// window — the trailing colon is load-bearing, see L2 block above).
-fn pane_target(backend_ref: &str) -> String {
+pub(crate) fn pane_target(backend_ref: &str) -> String {
     format!("={backend_ref}:")
 }
 

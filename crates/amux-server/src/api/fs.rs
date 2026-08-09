@@ -965,7 +965,7 @@ fn chars_truncate(s: &str, n: usize) -> String {
 /// (missing query, access denied, engine missing, timeout), and the
 /// zero-result `note` names every filter that could be responsible — an
 /// empty result set is the one answer a caller cannot debug from the rows.
-async fn fs_search(
+pub(crate) async fn fs_search(
     root: &str,
     q: &str,
     limit: i64,

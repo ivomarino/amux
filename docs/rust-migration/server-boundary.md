@@ -21,7 +21,7 @@ Rules:
 |---|---|---|
 | `/api/board`, `/api/workers`, `/api/sync`, `/api/events` | RUST-NATIVE | shared DB (issues/workers/events) |
 | `/api/sessions` (bare list) | RUST-NATIVE | python-SHAPE array derived from env files + tmux + persisted reports |
-| `/api/sessions/{name}`, `/api/sessions/{name}/{verb}` | PYTHON-OWNED (proxied) | fleet lifecycle: peek/send/start/stop/config/YOLO rewrite env files + restart live sessions. Exit: AgentRuntime seam (#47/#48). Rust-managed `wrk_` names get a 501 pointer, never a silent proxy |
+| `/api/sessions/{name}`, `/api/sessions/{name}/{verb}` | RUST-NATIVE (AMUX-2598) | full per-name verb family (peek/send/config/start/stop/resize/duplicate/clone/steer/share/tracked-files/git/log/transcript(s)/tasks/stats/memory/report/commit-report/…) answered from the fleet substrate: `~/.amux/sessions/*.env` + `*.meta.json`, `~/.amux/logs`, tmux `amux-<n>` via the L2 target helpers, herdr CLI, shared-DB steering_queue/steering_history/share_tokens/session_events/cmd_history/send_dedup/prefs. Config PATCH ports the restart choreography (provider/model/effort/yolo swap → conv-id stash + stop + start; dir change → hard restart). Rust-managed `wrk_` names still get the 501 pointer. Named gaps in `api/session_verbs.rs` module doc: no autotask labelling, no _verify_submitted JSONL gate, no boot board-digest, no commit-hook/trust/memory-compose side effects, no commit-report sweep notice, env-explain/memory-explain = 501, iTerm2 = 501 |
 | `/api/fs/*` | RUST-NATIVE (this change) | SPA Files surface: mkdir/open/upload/rename/read/search/list/delete. Ported guards: `_is_path_allowed` py:93-121, `_is_dangerous_write` py:670-698. Pure filesystem, no DB |
 | `/api/ls`, `/api/autocomplete/dir` | RUST-NATIVE (this change) | SPA Files browser listing + dir autocomplete (api/fs.rs). Pure filesystem |
 | `/api/file` (+`/raw` `/vtt` `/prepare` `/transcode`), `/api/library` | RUST-NATIVE (AMUX-2598) | file VIEWER + media pipeline (`api/file_viewer.rs`): viewer payload (image inline-vs-stream cap `AMUX_IMG_INLINE_MAX`, pdf/video/audio cards, binary sniff, text/csv char truncation), PUT write-back, SRT→VTT, raw **Range** streaming (206/Content-Range/ETag-304; keep-alive is hyper's default — the semantic python hand-rolled in `_media_keepalive`), ffmpeg prepare/transcode with **durable job state** in shared-DB `_amux_media_jobs` (migration 0009; python's in-process `_MEDIA_PREP_JOBS` orphaned jobs on restart — a stale-heartbeat 'running' row or a 'done' row with a pruned file now restarts honestly). Cache key = python's exact sha1 derivation, so ~/.amux/media-cache survives cutover. ffmpeg/ffprobe found by ABSOLUTE path first (launchd has no shell PATH). **Deviation:** ebook→HTML (EPUB/FB2/CBZ/MOBI/AZW render) answers an honest **501** naming the missing capability (python-stdlib zip/XML/PalmDOC decoding has no rust port); non-renderable/oversize ebooks get python's download card. `/api/library` is fully native (calibre metadata.db read-only+immutable, opf sidecar scan via regex-grade extraction) |
@@ -33,6 +33,21 @@ Rules:
 | everything else mounted in `api/mod.rs` (memories, messages, schedules, prefs, email, cal-events, branding, skills, map, journal, history, settings, push, torrents, org, gmail, metrics, usage, alerts, stats, debug, health, calendar.ics) | RUST-NATIVE | see `NATIVE_FAMILIES` notes per family |
 
 ## Contract subtleties worth knowing (all fixture- or live-verified 2026-08-09)
+
+- **Session verbs, live-oracle verified (AMUX-2598)**: 16/17 read verbs match Python's
+  top-level key set + value types exactly against a live fleet session
+  (peek, peek?live=1, stats, meta, info, git?detail=1, tasks, instructions,
+  tracked-files, commit-guard, dirty, log/info, transcripts, memory, steer,
+  steer?history=1). The 17th — bare `GET /api/sessions/{name}` — serves "the SAME
+  record the list endpoint serves" (python contract, py:74892), so it inherits the
+  pre-existing `/api/sessions` LIST projection's known deltas (rust-extra
+  managed_by/model/steering_queue; task_time/tokens/worktree typed differently) —
+  fix those in sessions_legacy's projection, not per-verb.
+- **Rename is convergent, not one-shot** (owner addendum): rename-to-self is a no-op
+  (rev unmoved); a retry after a partial failure is admitted addressing the OLD name
+  and completes the remainder; journaled to session_events
+  (`session.rename.started`/`session.renamed` with per-step outcomes); migrates
+  share_tokens, cmd_history and the prefs session_reports key that Python orphans.
 
 - **/api/fs wrong-method = 404, not 405.** Python routes on (method, path) pairs and
   falls through to its generic `{"error": "not found"}`. The native port preserves it.

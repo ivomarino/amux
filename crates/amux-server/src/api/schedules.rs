@@ -257,7 +257,11 @@ pub async fn get_one(State(state): State<AppState>, Path(id): Path<String>) -> R
 pub struct ScheduleBody {
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    /// `worker` is the DASHBOARD's spelling for the same field — the sched
+    /// editor posts `worker:` (app.js:19067) and deny_unknown_fields turned
+    /// every UI create into a 422 (Ethan's repro, 2026-08-09). Alias, don't
+    /// loosen: unknown-field rejection still catches real typos.
+    #[serde(default, alias = "worker")]
     pub session: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
@@ -773,6 +777,27 @@ pub async fn audit_trail(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dashboard_worker_field_aliases_to_session() {
+        // The sched editor posts `worker:` (app.js:19067); before the alias
+        // this whole payload 422'd at the extractor (Ethan repro 2026-08-09).
+        let body: ScheduleBody = serde_json::from_value(serde_json::json!({
+            "title": "t", "worker": "amux-rust", "kind": "prompt",
+            "command": "noop", "sched_type": "recurring", "recurrence": null,
+            "run_at": "", "schedule_expr": "daily at 9am", "watch": 0,
+            "done_pattern": null, "done_action": "disable", "watch_timeout": 120,
+            "trigger_on": "", "trigger_cooldown": 120, "trigger_sessions": "",
+            "by": "dashboard"
+        }))
+        .expect("the dashboard create payload must deserialize");
+        assert_eq!(body.session.as_deref(), Some("amux-rust"));
+        // Real typos still refuse (the deny_unknown_fields value survives).
+        assert!(serde_json::from_value::<ScheduleBody>(
+            serde_json::json!({ "schedule_exp": "daily at 9am" })
+        )
+        .is_err());
+    }
     use super::*;
     use crate::db::Store;
     use axum::body::Body;

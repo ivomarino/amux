@@ -319,7 +319,12 @@ mod tests {
     #[tokio::test]
     async fn full_upload_flow() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("AMUX_HOME", tmp.path());
+        // Shared guard, not a bare set_var: AMUX_HOME is process-global and
+        // other lib tests (settings, journal, history, session_verbs) set it
+        // under settings::test_env::LOCK — an unguarded write here raced
+        // them and the flow read another test's home mid-flight (flaked in
+        // full-suite runs, 2026-08-09).
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
 
         let app: Router = Router::new()
             .nest("/api/upload", routes())
@@ -389,6 +394,5 @@ mod tests {
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"hello world");
 
-        std::env::remove_var("AMUX_HOME");
     }
 }

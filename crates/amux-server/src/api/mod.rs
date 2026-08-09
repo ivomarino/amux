@@ -32,6 +32,7 @@ pub mod messages;
 pub mod org;
 pub mod prefs;
 pub mod py_proxy;
+pub mod request_log;
 pub mod schedules;
 pub mod session_verbs;
 pub mod sessions_legacy;
@@ -64,6 +65,9 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    // For the request-log layer below — `state` itself is consumed by
+    // `.with_state` before the outermost wrap.
+    let store_for_reqlog = state.store.clone();
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
@@ -144,6 +148,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
         .nest("/api/history", history::routes())
+        // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
+        // the structured request log + tracing tail (api/request_log.rs).
+        .nest("/api/logs", request_log::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         .nest("/api/dictation", dictation::routes())
@@ -195,7 +202,12 @@ pub fn router(state: AppState) -> Router {
     // /api/workers/* BEFORE routing, so the rewrite must wrap the finished
     // router. Auth is inside the wrapper — legacy paths are exactly as
     // protected as canonical ones.
-    aliases::alias_layer(app)
+    let app = aliases::alias_layer(app);
+    // Structured request log (AMUX-2605): the OUTERMOST wrap, so every
+    // request — including alias-rewritten and fallback paths — is recorded
+    // with the RAW path the client sent. Never blocks or fails a request
+    // (rows ride a bounded channel to the single-writer store).
+    request_log::layer(app, store_for_reqlog)
 }
 
 // ---------------------------------------------------------------------------

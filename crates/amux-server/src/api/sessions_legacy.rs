@@ -278,7 +278,7 @@ pub fn active_python_sessions(conn: &rusqlite::Connection) -> BTreeSet<String> {
 /// Python's strip_ansi (amux-server.py:20225) — ported verbatim, OSC
 /// hyperlink forms included: Claude panes emit `\x1b]8;` constantly, and a
 /// simpler regex leaves fragments the intelligibility filter then rejects.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -551,7 +551,10 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
     out
 }
 
-fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
+/// pub(crate): session_verbs' bare GET /api/sessions/{name} serves ONE
+/// record from the SAME array (py:74892 — the natural URL answers the
+/// natural shape).
+pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
     let signals = FleetSignals::load(conn);
     let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
