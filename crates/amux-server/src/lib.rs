@@ -1,3 +1,4 @@
+#![recursion_limit = "256"] // 40-key json! literals (session card parity)
 //! amux server: HTTP API, SQLite store, orchestrator runtime.
 //!
 //! Module layout mirrors docs/rust-rebuild-plan.md §Crate structure. Modules

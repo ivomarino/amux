@@ -92,6 +92,22 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
         })
         .unwrap_or_default();
     let blocked = blocked_names(&home);
+    // One tmux call for the whole fleet: name -> activity ts (Python's
+    // _tmux_info_map shape, the field every card's last_activity reads).
+    let activity: std::collections::BTreeMap<String, i64> = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name} #{session_activity}"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let (n, ts) = l.rsplit_once(' ')?;
+                    Some((n.to_string(), ts.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return vec![];
     };
@@ -111,8 +127,65 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
         // conflating them reported 0 archived against a fleet with dozens.
         let archived = env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false)
             || blocked.contains(&name);
+        let flags = env.get("CC_FLAGS").cloned().unwrap_or_default();
+        let backend = env
+            .get("CC_BACKEND")
+            .map(|b| b.trim().to_lowercase())
+            .filter(|b| b == "herdr")
+            .unwrap_or_else(|| "tmux".into());
+        let session_created = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.created().or_else(|_| m.modified()).ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let last_activity = activity
+            .get(&format!("amux-{name}"))
+            .copied()
+            .unwrap_or(0);
         out.push(json!({
             "archived": archived,
+            // The lightning button's state derives from THIS field in the
+            // SPA (isYolo checks flags for the provider's skip-permissions
+            // flag) — a card without flags renders the wrong YOLO badge
+            // (Ethan: "the lightning button isn't correct").
+            "flags": flags,
+            "creator": env.get("CC_CREATOR").cloned().unwrap_or_default(),
+            "backend": backend,
+            "auto_continue": env.get("CC_AUTO_CONTINUE").map(|v| v == "1").unwrap_or(false),
+            "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
+            "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
+            "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),
+            "session_created": session_created,
+            "last_activity": last_activity,
+            // Scanner-internal state the Python server holds in memory —
+            // the Rust server does not run that scanner. Correct-TYPED
+            // honest empties (Invariant 20: never invent), so the SPA
+            // renders identically-shaped cards.
+            "active_model": "",
+            "api_error": false,
+            "api_error_code": "",
+            "api_error_count": 0,
+            "credit_limited": false,
+            "credit_limit_model": "",
+            "credit_limited_since": 0,
+            "rate_limit_banner": false,
+            "rate_limit_weekly": false,
+            "rate_limited_until": 0,
+            "last_human_ts": 0,
+            "waiting_since": 0,
+            "self_report": serde_json::Value::Null,
+            "steering": [],
+            "tokens": {"input": 0, "output": 0, "total": 0},
+            "preview_lines": 0,
+            "task_source": "",
+            "task_time": 0,
+            "task_updated": 0,
+            "task_board_id": "",
+            "task_board_age": 0,
+            "sched_on": 0,
+            "sched_off": 0,
             "name": name,
             // Status detail (active/idle) is the Python scanner's judgment;
             // the honest cells from HERE are running-blank vs stopped-blank
@@ -185,22 +258,101 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             }
         }
     }
-    // task_name: the session's current doing card, the board linkage the
-    // Python cards carry (one query for the whole list, not N).
+    // Board linkage per card: doing card title + id + updated (Python's
+    // task_name/task_board_id/task_updated/task_board_age), one query.
     {
         let mut stmt = conn.prepare(
-            "SELECT session, title FROM issues
+            "SELECT session, title, id, COALESCE(updated, 0) FROM issues
              WHERE deleted IS NULL AND status = 'doing' AND session != ''
              GROUP BY session",
         )?;
-        let doing: std::collections::BTreeMap<String, String> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        let doing: std::collections::BTreeMap<String, (String, String, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })?
+            .flatten()
+            .collect();
+        let now = chrono::Utc::now().timestamp();
+        for v in out.iter_mut() {
+            if let Some(name) = v["name"].as_str().map(String::from) {
+                if let Some((title, id, updated)) = doing.get(&name) {
+                    v["task_name"] = json!(title);
+                    v["task_board_id"] = json!(id);
+                    v["task_updated"] = json!(updated);
+                    v["task_source"] = json!("board");
+                    v["task_board_age"] = json!((now - updated).max(0));
+                }
+            }
+        }
+    }
+
+    // Schedule counts per session — Python's exact aggregation
+    // (amux-server.py:20179).
+    {
+        let mut stmt = conn.prepare(
+            "SELECT session, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) o,
+                    SUM(CASE WHEN enabled=1 THEN 0 ELSE 1 END) f
+             FROM schedules
+             WHERE deleted IS NULL AND session IS NOT NULL AND session != ''
+             GROUP BY session",
+        )?;
+        let sched: std::collections::BTreeMap<String, (i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?
             .flatten()
             .collect();
         for v in out.iter_mut() {
             if let Some(name) = v["name"].as_str() {
-                if let Some(title) = doing.get(name) {
-                    v["task_name"] = json!(title);
+                if let Some((on, off)) = sched.get(name) {
+                    v["sched_on"] = json!(on);
+                    v["sched_off"] = json!(off);
+                }
+            }
+        }
+    }
+
+    // Previews for RUNNING sessions: bounded parallel tmux capture, 15-line
+    // ANSI tail like Python's card preview. Bounded (12 at a time) so 49
+    // running sessions cannot serialize the request.
+    {
+        let running: Vec<String> = out
+            .iter()
+            .filter(|v| v["running"].as_bool().unwrap_or(false))
+            .filter_map(|v| v["name"].as_str().map(String::from))
+            .collect();
+        let mut previews: std::collections::BTreeMap<String, String> = Default::default();
+        for chunk in running.chunks(12) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|name| {
+                    let n = name.clone();
+                    std::thread::spawn(move || {
+                        let out = std::process::Command::new("tmux")
+                            .args([
+                                "capture-pane",
+                                "-t",
+                                &format!("=amux-{n}:"),
+                                "-p",
+                                "-e",
+                                "-S",
+                                "-15",
+                            ])
+                            .output()
+                            .ok()?;
+                        Some((n, String::from_utf8_lossy(&out.stdout).trim_end().to_string()))
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Ok(Some((n, p))) = h.join() {
+                    previews.insert(n, p);
+                }
+            }
+        }
+        for v in out.iter_mut() {
+            if let Some(name) = v["name"].as_str() {
+                if let Some(p) = previews.get(name) {
+                    v["preview"] = json!(p);
+                    v["preview_lines"] = json!(p.lines().count());
                 }
             }
         }
