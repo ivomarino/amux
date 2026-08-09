@@ -91,10 +91,11 @@ changes its display name instantly without affecting its backend reference,
 process identity, or any durable state. Old names become aliases so `@backend`
 still resolves after renaming to `@rust-backend` (Invariant 17).
 
-### Invariant 2: Three-tier scope with deterministic inheritance
+### Invariant 2: Four-tier scope with deterministic inheritance
 
-Everything configurable lives at one of three scopes: **Global -> Group -> Worker**.
-Worker overrides Group overrides Global. This applies uniformly to:
+Everything configurable lives at one of four scopes:
+**Org -> Global -> Group -> Worker**. Worker overrides Group overrides Global
+overrides Org. This applies uniformly to:
 
 - Environment variables
 - Board column definitions and gates
@@ -104,29 +105,42 @@ Worker overrides Group overrides Global. This applies uniformly to:
 - Permissions
 - Integrations (MCP servers, tools)
 - Automation behavior (auto-compact, auto-restart, pickup)
+- Capability policies (Invariant 52)
 
 One resolver, used everywhere:
 
 ```rust
 enum Scope {
+    Org(OrgId),
     Global,
     Group(GroupId),
     Worker(WorkerId),
 }
 
 fn effective_config<T: Mergeable>(
+    org: Option<&T>,
     global: &T,
     group: Option<&T>,
     worker: &T,
 ) -> T {
-    let mut effective = global.clone();
+    let mut effective = match org {
+        Some(o) => o.clone(),
+        None => T::default(),
+    };
+    effective.merge(global);  // global overrides org
     if let Some(g) = group {
-        effective.merge(g);  // group overrides global
+        effective.merge(g);   // group overrides global
     }
     effective.merge(worker);  // worker overrides group
     effective
 }
 ```
+
+`Org` is the outermost tier. In single-tenant (personal) mode, there is one
+implicit org and the resolver collapses to three tiers. In multi-tenant (cloud)
+mode, `OrgId` threads through every ID, every query, every index, and every SSE
+stream. Adding it retroactively means touching every query and index -- do it now.
+Scope revisions are per-org in multi-tenant mode.
 
 Do NOT implement environment inheritance separately from memory inheritance separately
 from gate inheritance. Scope resolution is a primitive.
@@ -324,24 +338,42 @@ This is what distinguishes amux from "workers with a kanban board."
 amux orchestrates work. The model runtime is pluggable:
 
 ```rust
-enum Provider {
-    ClaudeCode { auth: ClaudeAuth },
-    Gemini { api_key: String },
-    Codex { auth: CodexAuth },
-    Ollama { model: String, endpoint: Url },
+// Providers and backends are registry-resolved by string ID, not closed enums.
+// Adding a new provider or backend requires no recompilation of amux-core.
+
+struct ProviderId(String);    // "claude-code", "gemini", "codex", "ollama", etc.
+struct BackendId(String);     // "herdr", "tmux", "native-pty", etc.
+
+struct ProviderConfig {
+    id: ProviderId,
+    auth: Value,              // provider-specific auth config (JSON)
+    capabilities: ProviderCapabilities,
+}
+
+struct ProviderCapabilities {
+    supports_opencode: bool,
+    supports_hooks: bool,
+    rate_limit_pattern: Option<Regex>,
+    prompt_detection: PromptDetection,
 }
 
 struct WorkerConfig {
     cwd: PathBuf,                    // process working directory
-    provider: Provider,
+    provider: ProviderId,
+    provider_config: ProviderConfig,
     model: Option<ModelId>,
-    backend: BackendKind,            // default: Herdr
+    backend: BackendId,              // default: "herdr"
     environment: ScopedEnv,
     permissions: Permissions,
     // ...
 }
 // All fields are mutable without changing WorkerId (Invariant 43).
 ```
+
+Providers and backends are registered at startup from config, not compiled in.
+The provider registry maps `ProviderId` -> `ProviderConfig` +
+`Box<dyn ProviderTrait>`. Adding a provider means implementing the trait and
+registering it -- no changes to `amux-core`.
 
 Every provider needs:
 - A way to start a session (CLI invocation differs per provider)
@@ -809,15 +841,17 @@ struct Gate {
     scope: Scope,
     transition: TransitionSelector,  // e.g., doing -> done
     criteria: Vec<Criterion>,
-    evaluator: GateEvaluator,
+    verifier: VerifierKind,          // unified with Invariant 28 verification
     required_evidence: Vec<EvidenceType>,
 }
 
-enum GateEvaluator {
-    Manual,                    // human acknowledges
-    Deterministic(CheckFn),    // cargo test, HTTP 200, artifact exists
-    Model(ModelJudgment),      // semantic evaluation (last resort)
-}
+// GateEvaluator is now VerifierKind (Invariant 28 + 52 merged).
+// One spec, definable in config, used by both gates and verification.
+// This eliminates the duplicate evaluation path.
+//
+// Gate evaluation order: Deterministic VerifierKinds run first (Command,
+// HttpCheck, FileExists). ModelJudgment runs last and only if deterministic
+// checks pass. This is enforced by the gate runner, not by the enum.
 ```
 
 The critical query:
@@ -1120,11 +1154,9 @@ struct WorkerConfig {
     // Everything above the SessionBackend/AgentProtocol traits is unchanged.
 }
 
-enum BackendKind {
-    Herdr,      // default, process hosting + persistence + terminal access
-    Tmux,       // fallback, terminal multiplexer
-    NativePty,  // future, direct PTY ownership
-}
+// BackendId is a string, not a closed enum (see Invariant 8).
+// Built-in backends: "herdr" (default), "tmux" (fallback), "native-pty" (future).
+// New backends register via the BackendRegistry trait without recompiling amux-core.
 ```
 
 The layering:
@@ -1421,21 +1453,34 @@ struct StateEvent {
 }
 ```
 
-SSE carries `StateEvent`s. The client applies them in revision order:
+SSE carries `StateEvent`s. Each SSE stream has its own **stream sequence number**
+(`stream_seq`), separate from the global tenant revision (`rev`). The stream
+sequence is contiguous per-subscriber; the global revision is not, because
+org/group/permission filtering means a client does not see every mutation.
+Using `rev` for contiguity detection would create a permanent false-gap loop
+under filtered streams.
 
 ```typescript
 function onStateEvent(event: StateEvent) {
-    if (event.rev <= state.lastRev) return;           // stale, ignore
+    if (event.stream_seq <= state.lastStreamSeq) return;  // stale, ignore
 
-    if (event.rev !== state.lastRev + 1) {
-        reconcileFrom(state.lastRev);                 // gap detected, delta sync
+    if (event.stream_seq !== state.lastStreamSeq + 1) {
+        reconcileFrom(state.lastRev);                     // gap detected, delta sync
         return;
     }
 
     applyMutation(event);
-    state.lastRev = event.rev;
+    state.lastStreamSeq = event.stream_seq;
+    state.lastRev = event.rev;  // track global rev for delta sync requests
 }
 ```
+
+The server assigns `stream_seq` per subscriber connection. On reconnect, the
+client sends `since_rev` (the last global revision it applied) and receives a
+fresh stream with `stream_seq` starting at 1. The delta sync endpoint uses
+global `rev` (which is the tenant-wide ordering); the SSE stream uses
+`stream_seq` (which is the per-subscriber ordering). These are independent
+sequences serving different purposes.
 
 #### Delta sync endpoint
 
@@ -1879,6 +1924,14 @@ enum EventKind {
     IssueVerified,
     ProviderDegraded,
     ProviderRecovered,
+    PolicyDecisionMade,       // Invariant 45 -- agent chose a pre-committed default
+    CriteriaAmended,          // Invariant 50 -- acceptance criteria changed post-start
+    IssueDecomposed,          // Invariant 47 -- auto-split on exhaustion
+    IssueQuarantined,         // Invariant 47 -- terminal failure
+    CircuitOpened,            // Invariant 48 -- fleet halt
+    CircuitClosed,            // Invariant 48 -- fleet resumed
+    Extension(String),        // open variant -- plugins and future event kinds
+                              // without recompiling amux-core
 }
 ```
 
@@ -2000,13 +2053,18 @@ GOOD: recipient acknowledged MessageId via WorkerEvent
 ```
 
 ```rust
+// VerifierKind is the SINGLE evaluation primitive. GateEvaluator is merged into it
+// (Invariant 28 gates and Invariant 28/45 verification use the same spec).
+// Definable in config, no recompile needed.
 enum VerifierKind {
     Command { cmd: String, expected_exit: i32 },
     HttpCheck { url: Url, expected_status: u16 },
     FileExists { path: PathBuf },
     PlaywrightAssertion { script: String },
     ModelJudgment { prompt: String },
-    HumanReview,
+    Composite { all: Vec<VerifierKind> },         // all must pass
+    AnyOf { any: Vec<VerifierKind> },             // at least one must pass
+    Extension { kind: String, config: Value },    // plugin verifiers
 }
 
 struct Verification {
@@ -3592,7 +3650,7 @@ amux/
     amux-server/                 # the binary -- HTTP, DB, runtime
       src/
         main.rs
-        config.rs                # server.env, CLI args, three-tier config loading
+        config.rs                # server.env, CLI args, four-tier config loading
         db/
           mod.rs                 # connection pool (single writer), WAL mode
           schema.rs              # migrations
@@ -3793,7 +3851,7 @@ harness that will verify every subsequent phase.
    Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
    system's vocabulary. Every entity type carries a `version: u64` field.
 3. `amux-server/db`: all 51 tables as SQL migrations, WAL mode, single-writer task
-4. `amux-server/config`: three-tier config loading (global/group/worker), `server.env`
+4. `amux-server/config`: four-tier config loading (org/global/group/worker), `server.env`
 5. `amux-server/api`: axum router, static file embedding, `/health`, auth,
    `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
 6. TLS setup with self-signed cert
@@ -4522,7 +4580,7 @@ tail (parallelizable, saves ~2 weeks). Phases 8-11 are polish, testing, and cuto
 4. **SQLite under real concurrency**: Python's GIL accidentally serialized writes. Rust
    exposes latent races. Mitigation: single-writer task, WAL mode, explicit transaction
    boundaries designed in phase 0.
-5. **Scope resolution complexity**: three-tier inheritance with overrides is easy to
+5. **Scope resolution complexity**: four-tier inheritance with overrides is easy to
    spec, hard to get right in every query. Mitigation: one resolver function in
    `amux-core`, used by all consumers. Never re-derive scope logic per-query.
 
@@ -4758,19 +4816,45 @@ in the header shows "6 active / 41 idle / 67 stopped" -- three numbers, not one.
 
 ## What does NOT change
 
-- SQLite as the single data store (same schema, same file, directly compatible)
 - Self-signed TLS on port 8822
 - `~/.amux/` directory structure
 - `server.env` config mechanism
 - API route paths and response shapes (dashboard compatibility)
 - The ethos: the harness gets better as the models get better
 
+### ADR-001: SQLite per-tenant files (committed)
+
+**Decision**: SQLite remains the data store. Multi-tenant isolation uses one
+SQLite file per org/tenant, not a shared Postgres instance.
+
+**Rationale**:
+- Preserves the single-writer design that Python's GIL accidentally enforced.
+  Postgres invalidates it and introduces connection pooling, migrations,
+  schema drift, and a new class of "the pool is exhausted" failures.
+- Per-tenant files give free isolation: one tenant's backup, restore, export,
+  or corruption cannot affect another.
+- WAL mode already handles concurrent readers (dashboard, SSE, CLI).
+- The single-writer task serializes writes within a tenant; cross-tenant writes
+  are independent (no global lock).
+- Migration path is simpler: copy the file, run the migration, start the new
+  server. Rollback is: copy the file back.
+
+**Consequences**:
+- Cross-tenant queries (admin dashboard, fleet metrics) require opening
+  multiple DB files or maintaining a separate aggregate store.
+- Tenant count is bounded by filesystem handles (~1000 practical limit).
+- Schema migrations must be applied to every tenant file. A migration runner
+  iterates tenant files at startup.
+
+**Status**: committed. Do not reopen without a concrete use case that
+per-tenant SQLite cannot serve.
+
 ## What changes
 
 - `sessions` -> `workers` everywhere
 - Implicit orchestrator -> explicit Orchestrator with typed assignments and leases
 - Flat board -> dependency graph with typed relations
-- String-based scope -> three-tier Global/Group/Worker with deterministic inheritance
+- String-based scope -> four-tier Org/Global/Group/Worker with deterministic inheritance
 - Terminal scraping as control plane -> OpenCode structured agent protocol for
   commands/events/lifecycle, with herdr/tmux/native PTY as process hosts
 - tmux as sole backend -> herdr primary process host, tmux fallback, native PTY future
@@ -5621,7 +5705,7 @@ consistent with their dependencies.
   Phase: 0
   Depends on: RR-0001
   Invariant: 2
-  Requirement: Three-tier scope (Global/Group/Worker) with deterministic merge. Worker
+  Requirement: Four-tier scope (Org/Global/Group/Worker) with deterministic merge. Worker
     overrides Group overrides Global. `effective_config` resolves the full chain.
   Tests: scope resolver merges correctly, worker wins conflicts, group gates override
     global gates, worker env overrides group env
@@ -7297,7 +7381,7 @@ consistent with their dependencies.
     - Python group records -> Rust `Group` entities with `GroupId`
     - Group-scoped columns, gates, environment -> Rust typed config
     - Worker-to-group membership -> `Worker.group: Option<GroupId>`
-    - Group-scoped prefs -> three-tier scope resolution
+    - Group-scoped prefs -> four-tier scope resolution
   Data verification: group count matches, worker membership preserved, scoped config
     resolves correctly
   Verify: Implementation, Data verification, Integration tests
