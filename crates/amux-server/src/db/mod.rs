@@ -15,6 +15,7 @@
 //!   (Invariant 35).
 
 pub mod commands;
+pub mod board_store;
 pub mod migrate;
 pub mod queries;
 

@@ -6,7 +6,9 @@
 
 pub mod aliases;
 pub mod auth;
+pub mod board;
 pub mod health;
+pub mod schedules;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -33,6 +35,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
+        .nest("/api/board", board::routes())
         .nest("/api/workers", workers::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
