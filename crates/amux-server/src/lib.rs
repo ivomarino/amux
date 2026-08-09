@@ -169,6 +169,27 @@ async fn async_main() {
         .unwrap_or(15);
     tokio::spawn(scan.run(scan_secs));
 
+    // Self-adoption (parity with the Python server's own-mtime watch): when
+    // the INSTALLED binary changes underneath us — the builder agent just
+    // installed a new build — exit 0 and let launchd's KeepAlive relaunch
+    // the new code. The binary is the unit of deploy; a server that keeps
+    // running stale code after a deploy is the Python shared-checkout
+    // staleness incident wearing a compiled coat.
+    tokio::spawn(async {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(meta) = std::fs::metadata(&exe) else { return };
+        let initial = meta.modified().ok();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
+            if current.is_some() && current != initial {
+                tracing::info!("binary changed on disk — exiting for relaunch (self-adoption)");
+                std::process::exit(0);
+            }
+        }
+    });
+
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https)");
     axum_server::bind_rustls(addr, rustls_cfg)
