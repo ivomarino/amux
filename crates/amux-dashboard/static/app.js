@@ -2550,7 +2550,6 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
           ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
           ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
-          ${s.tokens ? `<span class="token-count">${fmtTokens(s.tokens)}</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
             /* Bare numbers, no chips (Ethan: "just numbers no outline ...
@@ -3189,7 +3188,6 @@ const ALL_TABS = [
   { id: 'grid',          label: 'Workspace' },
   { id: 'messages',      label: 'Messages' },
   { id: 'skills',        label: 'Skills' },
-  { id: 'crm',           label: 'People' },
   { id: 'sql',           label: 'Database' },
   { id: 'map',           label: 'Map' },
   { id: 'metrics',       label: 'Metrics' },
@@ -3205,7 +3203,7 @@ let hiddenTabs = (function() {
     if (s !== null) return new Set(JSON.parse(s));
   } catch(e) {}
   // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser
-  return new Set(['logs','metrics','crm','torrents','terminal']);
+  return new Set(['logs','metrics','torrents','terminal']);
 })();
 
 let tabOrder = (function() {
@@ -3562,7 +3560,7 @@ function _embedFitZoom() {
 const _EMBED_VIEW_EL = {
   sessions:'session-view', board:'board-view', groups:'groups-view', calendar:'calendar-view',
   scheduler:'scheduler-view', files:'files-view', proxies:'proxies-view', logs:'logs-view',
-  messages:'messages-view', crm:'crm-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
+  messages:'messages-view', map:'map-view', metrics:'metrics-view', cost:'cost-view',
   torrents:'torrents-view', terminal:'terminal-view', browser:'browser-view', sql:'sql-view',
   graph:'graph-view', journal:'journal-view', habits:'habits-view', skills:'skills-view', mcp:'mcp-view'
 };
@@ -4799,15 +4797,6 @@ function _scopeRowToggle(key) {
   _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name }, tgt);
 }
 
-// Group message history in the group panel. Uses the shared row renderer and the
-// scoped fetch, so this is a third CALLER of one implementation rather than a
-// third implementation — the distinction that stopped three message renderers
-// from becoming four (AMUX-2334, AMUX-2366).
-let _grpView = 'config';   // config | messages | board | cost — one at a time.
-                           // Was a boolean when messages was the only alternate
-                           // view; three views cannot be a boolean, and naming
-                           // the view is what lets a re-render restore it.
-
 // The view switcher for group/global scope. Every view is the SAME UX over a
 // different data source (Ethan: "same UX obviously it's calling upon different
 // data") \u2014 so they share one entry point, one header and one error path, and a
@@ -4853,115 +4842,11 @@ function _grpGoto(g, where) {
   }
 }
 
-function _grpViewHead(label, view, g) {
-  const tab = (k, t) => '<button class="btn" style="font-size:0.68rem;min-height:32px;padding:4px 9px;flex:0 0 auto;'
-    + (k === view ? 'border-color:var(--accent);color:var(--accent);' : '')
-    + '" onclick="event.stopPropagation();_grpViewOpen(\'' + escJs(g) + '\',\'' + k + '\')">' + t + '</button>';
-  return '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:7px;flex-wrap:wrap;">'
-    + '<span style="color:var(--text);font-weight:600;font-size:0.82rem;">' + esc(label) + ' \u00b7 ' + esc(view) + '</span>'
-    + '<span style="display:flex;gap:4px;flex-wrap:wrap;">'
-    + tab('config', 'Config') + tab('messages', 'Messages') + tab('board', 'Board') + tab('cost', 'Cost')
-    + '</span></div>';
-}
-
-async function _grpBoardHTML(qs, label) {
-  // slim=1 drops desc/log: this view shows ids, statuses and owners, and the
-  // full board is 4.7MB of which desc is 75%. archived=0 is stated in the
-  // caption rather than left implicit \u2014 a filtered count that presents itself
-  // as a total is what made a tag-scoped board read as a truncated one.
-  const r = await fetch(API + '/api/board?slim=1&archived=0' + qs, { headers: _authHeaders() });
-  if (!r.ok) throw new Error('board ' + r.status);
-  const d = await r.json();
-  if (!d.length) return '<div style="color:var(--dim);font-size:0.8rem;">No open cards at this scope.</div>';
-  const by = {};
-  d.forEach(c => { const s = (c.status || '?').toLowerCase(); by[s] = (by[s] || 0) + 1; });
-  const order = ['doing', 'todo', 'blocked', 'review', 'done', 'verified', 'discarded'];
-  const keys = order.filter(k => by[k]).concat(Object.keys(by).filter(k => order.indexOf(k) < 0).sort());
-  const chips = keys.map(k => '<span class="scope-chip" style="font-size:0.68rem;">' + esc(k) + ' <b>' + by[k] + '</b></span>').join('');
-  const live = d.filter(c => ['doing', 'todo', 'blocked', 'review'].indexOf((c.status || '').toLowerCase()) >= 0);
-  const show = (live.length ? live : d).slice(0, 50);
-  const rows = show.map(c =>
-    '<div style="display:flex;gap:6px;align-items:baseline;padding:3px 0;border-bottom:1px solid var(--border);">'
-    + '<span style="font-size:0.62rem;color:var(--dim);flex:0 0 auto;min-width:62px;">' + esc(c.id || '') + '</span>'
-    + '<span style="font-size:0.62rem;flex:0 0 auto;opacity:0.75;">' + esc((c.status || '').slice(0, 4)) + '</span>'
-    + '<span style="font-size:0.74rem;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(c.title || '') + '</span>'
-    + '<span style="font-size:0.6rem;color:var(--dim);flex:0 0 auto;">' + esc(c.session || '\u2014') + '</span>'
-    + '</div>').join('');
-  return '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;">' + chips + '</div>'
-    + '<div style="max-height:46vh;overflow-y:auto;">' + rows + '</div>'
-    + '<div style="font-size:0.62rem;color:var(--dim);margin-top:5px;">'
-    + d.length + ' open (unarchived) card' + (d.length === 1 ? '' : 's')
-    + (show.length < (live.length || d.length) ? ' \u00b7 showing first ' + show.length : '')
-    + '</div>';
-}
-
-async function _grpCostHTML(qs) {
-  const r = await fetch(API + '/api/observability?days=7' + qs, { headers: _authHeaders() });
-  if (!r.ok) throw new Error('cost ' + r.status);
-  const d = await r.json();
-  const big = (v, l) => '<div style="flex:1 1 80px;min-width:80px;"><div style="font-size:1.05rem;font-weight:600;color:var(--text);">' + v + '</div>'
-    + '<div style="font-size:0.62rem;color:var(--dim);">' + l + '</div></div>';
-  const per = (d.by_session || []).slice(0, 25);
-  const max = Math.max(1, ...per.map(x => x.cost || 0));
-  const rows = per.map(x =>
-    '<div style="display:flex;gap:6px;align-items:center;padding:3px 0;">'
-    + '<span style="font-size:0.7rem;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(x.session || '\u2014') + '</span>'
-    + '<span style="flex:0 0 70px;height:5px;background:var(--border);border-radius:3px;overflow:hidden;">'
-    + '<span style="display:block;height:100%;width:' + Math.round(100 * (x.cost || 0) / max) + '%;background:var(--accent);"></span></span>'
-    + '<span style="font-size:0.68rem;flex:0 0 auto;min-width:54px;text-align:right;">' + _fmtUsd(x.cost || 0) + '</span>'
-    + '</div>').join('');
-  return '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">'
-    + big(_fmtUsd(d.total_cost || 0), 'est. cost \u00b7 ' + (d.days || 7) + 'd')
-    + big((d.total_turns || 0).toLocaleString(), 'turns')
-    + big((d.cache_hit_pct || 0) + '%', 'cache hit')
-    + '</div>'
-    + (rows ? '<div style="max-height:40vh;overflow-y:auto;">' + rows + '</div>'
-            : '<div style="color:var(--dim);font-size:0.8rem;">No spend recorded at this scope.</div>')
-    + (per.length ? '<div style="font-size:0.62rem;color:var(--dim);margin-top:5px;">'
-        + (d.by_session || []).length + ' worker' + ((d.by_session || []).length === 1 ? '' : 's')
-        + ' with spend' + (per.length < (d.by_session || []).length ? ' \u00b7 showing top ' + per.length : '') + '</div>' : '');
-}
-
-async function _grpViewOpen(g, view) {
-  const isGlobal = (g === _GLOBAL_SCOPE);
-  const scope = isGlobal ? { level: 'global' } : { level: 'group', name: g };
-  const label = isGlobal ? 'Global' : g;
-  // Global scope is the ABSENCE of a filter, not group=global \u2014 passing the
-  // sentinel as a group name would resolve to an empty group and render zero
-  // under the fleet's own label.
-  const qs = isGlobal ? '' : '&group=' + encodeURIComponent(g);
-  _grpView = (_grpView === view) ? 'config' : view;
-  const host = document.getElementById('grp-scope-body-' + g);
-  if (!host) return;
-  if (_grpView === 'config') { _scopeLoad(scope, host.id); return; }
-  host.innerHTML = '<div style="color:var(--dim);font-size:0.8rem;">Loading ' + esc(view) + '\u2026</div>';
-  try {
-    let body;
-    if (view === 'messages') {
-      const rows = await _peekMsgFetch(scope);
-      const list = rows.slice().reverse().slice(0, 60);
-      const ctx = _msgCtxHistory();
-      body = list.length
-        ? '<div style="display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto;">'
-            + list.map(e => _cmdHistItemHTML(e, ctx)).join('') + '</div>'
-        : '<div style="color:var(--dim);font-size:0.8rem;">No messages at this scope yet.</div>';
-    } else if (view === 'board') {
-      body = await _grpBoardHTML(qs, label);
-    } else {
-      body = await _grpCostHTML(qs);
-    }
-    // Re-resolve the destination: two awaits have passed and render() may have
-    // rebuilt the panel, so the node captured above can be detached.
-    const dst = document.getElementById('grp-scope-body-' + g);
-    if (!dst) return;
-    dst.innerHTML = _grpViewHead(label, view, g) + body;
-    _grpScopeHtml = dst.innerHTML;
-  } catch (e) {
-    const dst = document.getElementById('grp-scope-body-' + g);
-    if (dst) dst.innerHTML = _grpViewHead(label, view, g)
-      + '<div style="color:var(--dim);font-size:0.8rem;">Could not load ' + esc(view) + ': ' + esc(e.message) + '</div>';
-  }
-}
+// The panel's inline Board/Cost/Messages miniatures (_grpViewOpen/_grpViewHead/
+// _grpBoardHTML/_grpCostHTML) were deleted with AMUX-2590: nothing had been able
+// to reach them since AMUX-2437 replaced their entry point with _grpGoto above —
+// a closed onclick cycle only its own buttons could enter. The real pages ARE
+// the group views now, scoped by their own filter controls.
 
 // The WRITE surface for one capability at one level (AMUX-2359). Renders a
 // control ONLY where the server says a value can actually be set; everywhere
@@ -6100,6 +5985,10 @@ function renderPeekIssues() {
   _peekIssuesSortables.forEach(s => { try { s.destroy(); } catch(e) {} });
   _peekIssuesSortables = [];
   list.classList.toggle('peek-issues-kanban', _peekIssuesView === 'kanban');
+  // Re-stamped per branch below: kanban stamps the inner host via the shared
+  // column renderer; a stale stamp on the outer list would claim two nested
+  // component roots.
+  list.removeAttribute('data-component');
 
   if (!items.length) {
     // "No matches" and "no issues" are different facts — saying the board is
@@ -6125,6 +6014,7 @@ function renderPeekIssues() {
   }
 
   // Shared renderer with the global List view (AMUX-2152/parity).
+  list.dataset.component = 'board-list';
   list.innerHTML = items.map(item => _issueRowHTML(item,
     { showOwner: allScope && item.session && item.session !== peekSession })).join('');
 }
@@ -6140,102 +6030,23 @@ function _renderPeekIssuesKanban(items, list) {
       + items.map(item => _issueRowHTML(item, {})).join('');
     return;
   }
-  // Group this session's issues by status, mirroring the regular board columns.
-  const cols = {};
-  boardStatuses.forEach(s => { cols[s.id] = []; });
-  items.forEach(item => {
-    const s = item.status || 'todo';
-    if (cols[s] !== undefined) cols[s].push(item);
-    else (cols['todo'] = cols['todo'] || []).push(item);
-  });
-
-  let html = '<div class="board-columns" id="peek-issues-cols">';
-  boardStatuses.forEach(stObj => {
-    const st = stObj.id;
-    const stCol = cols[st] || [];
-    const sty = statusStyle(st);
-    html += '<div class="board-col" data-col="' + st + '">';
-    html += '<div class="board-col-header" style="cursor:default;">';
-    html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
-    html += '<span style="display:flex;align-items:center;gap:6px;">';
-    html += '<span class="col-count">' + stCol.length + '</span>';
-    // Per-session gate editor — only when the board is scoped to a single session
-    // (in all-sessions scope there is no single session to attach the override to).
-    const _sgScoped = !(typeof _peekIssuesAllSessions !== 'undefined' && _peekIssuesAllSessions) && peekSession;
-    if (_sgScoped) {
-      const _sgHas = sessionGates[peekSession] && Array.isArray(sessionGates[peekSession][st]) && sessionGates[peekSession][st].length;
-      const _sgSessJs = String(peekSession).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-      html += '<button class="col-gate-btn' + (_sgHas ? ' has-gate' : '') + '" onclick="event.stopPropagation();editSessionGate(\'' + _sgSessJs + '\',\'' + st + '\')" title="Edit this worker&#39;s gate for ' + esc(stObj.label) + '">&#9745;&#xFE0E; Gate</button>';
-    }
-    html += '</span>';
-    html += '</div>';
-    if (stCol.length === 0) html += '<div class="board-empty">Nothing here</div>';
-    stCol.sort((a, b) => {
-      const pp = (b.pinned || 0) - (a.pinned || 0);
-      if (pp !== 0) return pp;
-      const ap = a.pos || 0, bp = b.pos || 0;
-      if (ap === 0 && bp === 0) return (b.updated || 0) - (a.updated || 0);
-      if (ap === 0) return 1;
-      if (bp === 0) return -1;
-      return ap - bp;
-    });
-    stCol.forEach(item => { html += _renderBoardCard(item); });
-    html += '<button class="board-add-btn" onclick="openBoardAdd(\'' + st + '\')">+ Add</button>';
-    html += '</div>';
-  });
-  html += '</div>';
-  list.innerHTML = html;
-
-  // Drag-to-change-status, scoped to this session's columns (separate Sortable
-  // group so it never interferes with the main board).
-  if (typeof Sortable === 'undefined') return;
-  list.querySelectorAll('.board-col').forEach(colEl => {
-    _peekIssuesSortables.push(Sortable.create(colEl, {
-      group: 'peek-issues',
-      animation: 120,
-      handle: '.board-drag-handle',
-      ghostClass: 'board-sortable-ghost',
-      chosenClass: 'board-sortable-chosen',
-      dragClass: 'board-sortable-drag',
-      filter: '.board-col-header, .board-add-btn, .board-empty',
-      preventOnFilter: false,
-      delay: 120,
-      delayOnTouchOnly: true,
-      touchStartThreshold: 3,
-      swapThreshold: 0.6,
-      onStart: function() { document.body.classList.add('board-dragging'); },
-      onEnd: function(evt) {
-        document.body.classList.remove('board-dragging');
-        const id = evt.item.dataset.id;
-        const newStatus = evt.to.dataset.col;
-        if (!id || !newStatus) { renderPeekIssues(); return; }
-        const cards = [...evt.to.querySelectorAll('.board-card[data-id]')];
-        const myIdx = cards.findIndex(el => el.dataset.id === id);
-        const prevEl = myIdx > 0 ? cards[myIdx - 1] : null;
-        const nextEl = myIdx >= 0 && myIdx < cards.length - 1 ? cards[myIdx + 1] : null;
-        const prevItem = prevEl ? boardItems.find(i => i.id === prevEl.dataset.id) : null;
-        const nextItem = nextEl ? boardItems.find(i => i.id === nextEl.dataset.id) : null;
-        const prevPos = prevItem && prevItem.pos ? prevItem.pos : null;
-        const nextPos = nextItem && nextItem.pos ? nextItem.pos : null;
-        let newPos;
-        if (prevPos != null && nextPos != null) newPos = (prevPos + nextPos) / 2;
-        else if (prevPos != null) newPos = prevPos + 1024;
-        else if (nextPos != null) newPos = nextPos - 1024;
-        else newPos = Date.now() / 1000;
-        const item = boardItems.find(i => i.id === id);
-        if (item && item.status !== newStatus) {
-          // Gate: confirm the status change; on cancel, revert the visual move.
-          _gateConfirm(item, newStatus).then(ok => {
-            if (!ok) { renderPeekIssues(); return; }
-            moveBoardItem(id, newStatus, newPos, ok);
-            renderPeekIssues();
-          });
-          return;
-        }
-        if (item && item.pos !== newPos) moveBoardItem(id, newStatus, newPos);
-        renderPeekIssues();
-      }
-    }));
+  // THE SAME COMPONENT as the global Board tab's column view (AMUX-2590): one
+  // renderer, scoped to this worker. This used to be a hand-maintained copy and
+  // it drifted exactly the way copies do — it kept the pre-AMUX-2526 bucketing
+  // (unknown statuses silently filed under To Do) and grouped by RAW status
+  // instead of _statusCanon for months after the global board fixed both, so
+  // the same card could read "blocked" on the board and "To Do" in the peek.
+  list.innerHTML = '<div class="board-columns" id="peek-issues-cols"></div>';
+  _renderBoardColumnsInto(document.getElementById('peek-issues-cols'), items, {
+    kind: 'worker',
+    // Per-session gate editor — only when the board is scoped to a single
+    // session (in all-sessions scope there is no single session to attach
+    // the override to).
+    session: _peekIssuesAllSessions ? '' : (peekSession || ''),
+    // Separate Sortable group so drags never interfere with the main board.
+    sortGroup: 'peek-issues',
+    sortables: _peekIssuesSortables,
+    rerender: function() { renderPeekIssues(); },
   });
 }
 // ── Peek Schedules (scheduler tasks for this session) ────────────────────────
@@ -6611,7 +6422,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.527';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.528';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -11441,7 +11252,6 @@ function _selectGlobalScope() {
   const closing = (_grpOpen === _GLOBAL_SCOPE);
   _grpScopeHtml = '';
   _grpOpen = closing ? null : _GLOBAL_SCOPE;
-  _grpView = 'config';
   if (_grpOpen) _grpSchedFetch(_grpOpen);
   render();
   if (_grpOpen) {
@@ -11456,11 +11266,6 @@ function _selectGroup(g) {
   if (_grpOpen !== g) _grpScopeHtml = '';    // never show the previous group's data
   _grpOpen = closing ? null : g;
   if (!_grpOpen) _grpScopeHtml = '';
-  // Reset the view with the data. _scopeLoad below renders config, so leaving
-  // _grpView on 'board' would make the next Board tap TOGGLE IT OFF — a dead
-  // button whose cause is invisible, because the panel it would have opened is
-  // already what you are looking at.
-  _grpView = 'config';
   if (_grpOpen) _grpSchedFetch(_grpOpen);   // summary's async half, cached 60s
   // Deliberately does NOT force-expand. That was my over-correction to "I cant
   // use the group scope stuff": the real cause was AMUX-2406, where a collapsed
@@ -15339,7 +15144,14 @@ let boardSearchQuery = '';
 // Restore a shared #bq= filter link before the first render (AMUX-2151).
 window.addEventListener('DOMContentLoaded', () => { try { _bfRestoreHash(); _bfRenderChips(); } catch(e) {} });
 let _boardDragId = null;
-let boardViewMode = localStorage.getItem('amux_board_view') || 'session';
+// Canonical mode ids: 'worker' | 'status' | 'list' — every consumer compares
+// against these. The toggle used to WRITE 'session' while every check read
+// 'worker' (a workers→sessions rename sweep hit the button but not the
+// comparisons), so "Group by worker" was unreachable: clicking it stored a
+// value nothing matched and fell through to status columns with no toggle lit.
+// Stored 'session' values are migrated to the view the user actually chose.
+let boardViewMode = localStorage.getItem('amux_board_view') || 'status';
+if (boardViewMode === 'session') boardViewMode = 'worker';
 let boardOwnerFilter = localStorage.getItem('amux_board_owner') || 'human';
 let _sessionGroupCollapsed = JSON.parse(localStorage.getItem('amux_board_collapsed') || '{}');
 let _tagGroupCollapsed = JSON.parse(localStorage.getItem('amux_status_collapsed') || '{}');
@@ -15406,16 +15218,6 @@ function statusStyle(id) {
   const palette = light ? _CUSTOM_STATUS_PALETTE_LIGHT : _CUSTOM_STATUS_PALETTE;
   return palette[Math.max(0, idx) % palette.length];
 }
-
-// ── CRM state (hoisted before switchView so SSE + tab switch can reference) ──
-let _crmContacts = [];
-let _crmActiveId = null;
-let _crmDirty = false;
-let _crmSaveTimer = null;
-let _crmQueueOpen = false;
-let _crmOpenAbort = null;
-let _crmActiveTags = [];
-let _crmSidebarOpen = localStorage.getItem('amux_crm_sidebar') !== 'closed';
 
 // ═══════ CHROME TABS ═══════
 const _isInTab = new URLSearchParams(location.search).has('_tab');
@@ -15544,11 +15346,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'crm', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
-  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
+  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'mcp'];
+  // MUST stay index-aligned with _svIds/_svNames above (19 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
+  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -15560,7 +15362,6 @@ function switchView(view) {
   if (view === 'torrents') _torrentLoad(); else _torrentStopTimer();
   if (view === 'terminal') _termInit();
   if (view === 'graph') _graphInit();
-  if (view === 'crm') { _crmDirty = false; _crmLoad(); _crmApplySidebarState(); } // always refresh on tab switch
   if (view === 'map') { _mapLoad(); _mapInit(); }
   if (view === 'metrics') { _metricsLoad(); _metricsApplySidebarState(); } // always refresh on tab switch
   if (view === 'cost') _costLoad();
@@ -18318,7 +18119,9 @@ function _renderBoardCard(item) {
   // so the LIVE emphasis just silently never lit).
   const _liveNow = item.status === 'doing' && item.session &&
     (typeof sessions !== 'undefined') && (sessions || []).some(s => s.name === item.session && s.status === 'active');
-  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.worker) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
+  // item.session, not the pre-rename item.worker — the dead field rendered
+  // 'undefined is working on this right now' in the LIVE tooltip.
+  let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
   h += '<div class="board-card-key">' + esc(item.id) + '</div>';
@@ -18352,6 +18155,244 @@ async function _togglePin(id) {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ pinned: newVal }),
   });
+}
+
+// ── Shared board surface (AMUX-2590) ────────────────────────────────────────
+// ONE column renderer for every scope that shows the board as a kanban: the
+// global Board tab, a group's board (the same tab, scoped by a `group:` query —
+// see _grpOpenBoard/_grpGoto), and a worker peek's Board tab. The scope
+// controls the item predicate, the header chrome and the drag callbacks;
+// bucketing, canonical statuses, sort order, card markup, gate flow and empty
+// states are defined once so the surfaces cannot drift. This exists because
+// they HAD drifted: the peek copy kept the pre-AMUX-2526 stray-status
+// bucketing and raw-status grouping for months after the global board fixed
+// both. The card markup itself (_renderBoardCard) and the dense row
+// (_issueRowHTML) were already shared; this closes the column layer too.
+
+// Card order within a column: pinned first, then explicit pos, then recency.
+function _boardCardSort(a, b) {
+  const pp = (b.pinned || 0) - (a.pinned || 0);
+  if (pp !== 0) return pp;
+  const ap = a.pos || 0, bp = b.pos || 0;
+  // Items without a pos (=0) sort to the bottom, ordered by recency
+  if (ap === 0 && bp === 0) return (b.updated || 0) - (a.updated || 0);
+  if (ap === 0) return 1;
+  if (bp === 0) return -1;
+  return ap - bp;
+}
+
+// Bucket items into configured columns plus stray columns (AMUX-2526): a
+// status with no configured column gets ITS OWN column, appended after the
+// configured ones — it does not get filed under To Do.
+//
+// The fallback used to be `cols['todo'].push(item)`, and 51 live cards were
+// sitting in it: 26 needsyou, 17 blocked, 6 with status 'archived', 1 armed,
+// 1 resolved. Every one of them displayed as To Do. Deliberately NOT resolved
+// by adding these to boardStatuses: what the board's statuses are is Ethan's
+// to decide, not something to infer from stray data (ethos rule 8). A stray
+// column exists only while cards are in it and vanishes when the last one
+// leaves, so this surfaces the decision instead of taking it.
+function _boardBucketByStatus(items) {
+  const cols = {};
+  boardStatuses.forEach(s => { cols[s.id] = []; });
+  const strayCols = [];
+  items.forEach(item => {
+    const s = _statusCanon(item.status);
+    if (cols[s] === undefined) { cols[s] = []; strayCols.push(s); }
+    cols[s].push(item);
+  });
+  strayCols.sort();
+  // Synthesised stObjs carry `stray:true` so the header can say what they are
+  // rather than passing for a real column.
+  return { cols: cols,
+           renderCols: boardStatuses.concat(strayCols.map(id => ({ id: id, label: id, stray: true }))) };
+}
+
+// Fractional position for a card dropped into a column, computed from its DOM
+// neighbors — shared by every drag surface so the same drop lands on the same
+// pos everywhere.
+function _boardDropPos(evtTo, id) {
+  const cards = [...evtTo.querySelectorAll('.board-card[data-id]')];
+  const myIdx = cards.findIndex(el => el.dataset.id === id);
+  const prevEl = myIdx > 0 ? cards[myIdx - 1] : null;
+  const nextEl = myIdx >= 0 && myIdx < cards.length - 1 ? cards[myIdx + 1] : null;
+  const prevItem = prevEl ? boardItems.find(i => i.id === prevEl.dataset.id) : null;
+  const nextItem = nextEl ? boardItems.find(i => i.id === nextEl.dataset.id) : null;
+  const prevPos = prevItem && prevItem.pos ? prevItem.pos : null;
+  const nextPos = nextItem && nextItem.pos ? nextItem.pos : null;
+  if (prevPos != null && nextPos != null) return (prevPos + nextPos) / 2;
+  if (prevPos != null) return prevPos + 1024;
+  if (nextPos != null) return nextPos - 1024;
+  return Date.now() / 1000;  // empty column — seed from time
+}
+
+// Per-column card Sortable with the shared gate/move flow. `rerender(reason)`
+// is the scope's own repaint: 'cancel' after a vetoed gate (revert the visual
+// move by re-rendering from the unchanged boardItems), 'settle' after a
+// completed or no-op drop.
+function _boardColSortableCreate(colEl, group, rerender) {
+  return Sortable.create(colEl, {
+    group: group,
+    animation: 120,
+    easing: 'cubic-bezier(0.2, 0, 0, 1)',
+    handle: '.board-drag-handle',
+    ghostClass: 'board-sortable-ghost',
+    chosenClass: 'board-sortable-chosen',
+    dragClass: 'board-sortable-drag',
+    filter: '.board-col-header, .board-add-btn, .board-empty',
+    preventOnFilter: false,
+    delay: 120,
+    delayOnTouchOnly: true,
+    touchStartThreshold: 3,
+    swapThreshold: 0.6,
+    onStart: function() { document.body.classList.add('board-dragging'); },
+    onEnd: function(evt) {
+      document.body.classList.remove('board-dragging');
+      const id = evt.item.dataset.id;
+      const newStatus = evt.to.dataset.col;
+      if (!id || !newStatus) { rerender('settle'); return; }
+      const newPos = _boardDropPos(evt.to, id);
+      const item = boardItems.find(i => i.id === id);
+      if (item && item.status !== newStatus) {
+        // Gate: confirm before committing a status change; on cancel, revert
+        // the visual move by re-rendering from the (unchanged) boardItems.
+        _gateConfirm(item, newStatus).then(ok => {
+          if (!ok) { rerender('cancel'); return; }
+          moveBoardItem(id, newStatus, newPos, ok);
+          rerender('settle');
+        });
+        return;
+      }
+      if (!item || item.pos !== newPos) moveBoardItem(id, newStatus, newPos);
+      rerender('settle');
+    }
+  });
+}
+
+// The column surface itself. `scope`:
+//   kind:'global'  — full chrome: collapse, purpose lines, gate criteria,
+//                    per-column paging, clear-done, column gate/delete
+//                    editors, the add-column button.
+//   kind:'worker'  — the peek Board tab: same columns, same cards, same drag
+//                    flow; per-worker gate editor when `session` names one.
+// `sortGroup`/`sortables`/`rerender` wire the drag layer for the scope.
+// Stamps data-component="board-columns" on the host so a test can assert
+// every surface renders through this one component. Returns the bucket so
+// global-only post-passes (FLIP, count bump) reuse it instead of re-deriving.
+function _renderBoardColumnsInto(host, items, scope) {
+  const isGlobal = scope.kind === 'global';
+  const bucket = _boardBucketByStatus(items);
+  const builtIn = new Set(['backlog','todo','doing','review','done','verified','discarded']);
+  let html = '';
+  bucket.renderCols.forEach(stObj => {
+    const st = stObj.id;
+    const stCol = bucket.cols[st] || [];
+    const sty = statusStyle(st);
+    const collapsed = isGlobal && _collapsedCols.has(st);
+    html += '<div class="board-col' + (collapsed ? ' col-collapsed' : '') + '" data-col="' + st + '">';
+    html += '<div class="board-col-header"' + (isGlobal ? '' : ' style="cursor:default;"') + '>';
+    html += '<span style="display:flex;align-items:center;gap:5px;">';
+    if (isGlobal) {
+      html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
+    }
+    html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
+    if (stObj.stray) {
+      html += '<span class="col-stray-flag" title="Cards carry the status &quot;' + esc(st)
+        + '&quot; but the board has no column for it. They used to display as To Do. '
+        + 'Add it as a real status, or move these cards to one — the column disappears '
+        + 'when the last card leaves.">unconfigured</span>';
+    }
+    html += '</span>';
+    html += '<span style="display:flex;align-items:center;gap:6px;">';
+    html += '<span class="col-count" data-col="' + st + '">' + stCol.length + '</span>';
+    // A stray column has no stored gate and no delete: editStatusGate would
+    // write a gate for a status that is not in the list, and deleteBoardStatus
+    // would try to remove a column that was never configured. Offering either
+    // would be a control that cannot do what it says.
+    if (isGlobal && !stObj.stray) {
+      const _hasGate = Array.isArray(stObj.gate) && stObj.gate.length;
+      html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
+      if (!builtIn.has(st)) {
+        // TRASH, NOT ✕ (AMUX-2491): the delete affordance must not look like
+        // the app's 43 consequence-free dismiss ✕s — the glyph carries the
+        // semantics, the confirm dialog is only the last line.
+        html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete the ' + esc(stObj.label) + ' column">&#128465;</button>';
+      }
+    }
+    if (!isGlobal && scope.session && !stObj.stray) {
+      const _sgHas = sessionGates[scope.session] && Array.isArray(sessionGates[scope.session][st]) && sessionGates[scope.session][st].length;
+      html += '<button class="col-gate-btn' + (_sgHas ? ' has-gate' : '') + '" onclick="event.stopPropagation();editSessionGate(\'' + escJs(scope.session) + '\',\'' + st + '\')" title="Edit this worker&#39;s gate for ' + esc(stObj.label) + '">&#9745;&#xFE0E; Gate</button>';
+    }
+    html += '</span></div>';
+    if (isGlobal) {
+      // WHAT THE COLUMN MEANS, not just what it is called (AMUX-2507). The gate
+      // criteria below say what a card must SATISFY; this says what the column
+      // IS FOR — `done` means "meets the gate to close", `verified` means
+      // "confirmed to still hold", the distinction the whole ledger rests on.
+      // Derived from the status id rather than stored per-board, so a custom
+      // column renders without an empty slot instead of demanding someone fill
+      // one in.
+      const _colPurpose = _COL_PURPOSE[st] || '';
+      if (_colPurpose) {
+        html += '<div class="board-col-purpose">' + esc(_colPurpose) + '</div>';
+      }
+      // ENTRY CRITERIA, visible on the board (AMUX-2313): a gate is an ENTRY
+      // condition for the column, not a property of cards already in it. This
+      // renders the GLOBAL column default and LABELS it as that, rather than
+      // claiming to be the effective gate: the type layer is per-card and
+      // cannot be known from a column. Re-deriving full precedence in the
+      // client is exactly what produced AMUX-2330, so it is not done here —
+      // the move dialog asks the server (GET /api/board/gate) for the real,
+      // per-card answer.
+      if (!collapsed) {
+        const _g = Array.isArray(stObj.gate) ? stObj.gate : [];
+        const _explicit = (stObj.mode || 'implicit') === 'explicit';
+        if (_g.length || _explicit) {
+          html += '<div class="col-gate-crit">';
+          html += '<div class="col-gate-crit-h">To move a card <b>into ' + esc(stObj.label) + '</b>:</div>';
+          if (_g.length) {
+            html += '<ul class="col-gate-crit-l">'
+                  + _g.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul>';
+          } else {
+            html += '<div class="col-gate-crit-n">No criteria set for this column.</div>';
+          }
+          html += '<div class="col-gate-crit-f">column default'
+               + (_explicit ? ' &middot; <span class="col-gate-optin">opt-in only</span>' : '')
+               + ' &middot; a card&rsquo;s type may require different criteria</div>';
+          html += '</div>';
+        }
+      }
+    }
+    if (stCol.length === 0) {
+      html += '<div class="board-empty">Nothing here</div>';
+    }
+    stCol.sort(_boardCardSort);
+    if (isGlobal) {
+      const PAGE_SIZE = 20;
+      const showCount = _boardColPages[st] || PAGE_SIZE;
+      const remaining = stCol.length - showCount;
+      stCol.slice(0, showCount).forEach(item => { html += _renderBoardCard(item); });
+      if (remaining > 0) {
+        html += '<button class="board-add-btn" style="color:var(--accent);border-color:var(--accent);opacity:0.8;" onclick="event.stopPropagation();_boardShowMore(\'' + st + '\',' + PAGE_SIZE + ')">Show ' + Math.min(remaining, PAGE_SIZE) + ' more (' + remaining + ' remaining)</button>';
+      }
+      if (st === 'done' && stCol.length > 0) {
+        html += '<button class="board-add-btn" style="color:var(--red);border-color:rgba(248,81,73,0.2);" onclick="clearDone()">Clear done</button>';
+      }
+    } else {
+      stCol.forEach(item => { html += _renderBoardCard(item); });
+    }
+    html += '<button class="board-add-btn" onclick="openBoardAdd(\'' + st + '\')">+ Add</button>';
+    html += '</div>';
+  });
+  if (isGlobal) html += '<button class="board-add-col-btn" onclick="addBoardStatus()">+ Add column</button>';
+  host.dataset.component = 'board-columns';
+  host.innerHTML = html;
+  if (typeof Sortable !== 'undefined') {
+    host.querySelectorAll('.board-col').forEach(colEl => {
+      scope.sortables.push(_boardColSortableCreate(colEl, scope.sortGroup, scope.rerender));
+    });
+  }
+  return bucket;
 }
 
 function _renderBoardBySession(visible, container) {
@@ -18432,6 +18473,8 @@ function _renderBoardBySession(visible, container) {
   if (!visible.length) {
     html = '<div class="board-session-empty">No board items yet</div>';
   }
+  // Cards inside are the shared _renderBoardCard component (AMUX-2590).
+  container.dataset.component = 'board-by-session';
   container.innerHTML = html;
 }
 
@@ -18567,6 +18610,9 @@ function renderBoard() {
     });
     const _sEl2 = document.getElementById('board-stats-mount');
     if (_sEl2) _sEl2.innerHTML = _boardStatsHTML(visible);
+    // Same stamp the peek Board tab's list mode carries: both are the shared
+    // _issueRowHTML row component (AMUX-2152/2590).
+    container.dataset.component = 'board-list';
     container.innerHTML = html || '<div style="color:var(--dim);font-size:0.85rem;padding:24px;text-align:center;">Nothing matches.</div>';
     return;
   }
@@ -18586,36 +18632,6 @@ function renderBoard() {
   container.classList.add('board-columns');
   container.classList.remove('board-columns-list');
 
-  const cols = {};
-  boardStatuses.forEach(s => { cols[s.id] = []; });
-  // A status with no column gets ITS OWN column, appended after the configured
-  // ones — it does not get filed under To Do (AMUX-2526).
-  //
-  // The fallback used to be `cols['todo'].push(item)`, and 51 live cards were
-  // sitting in it: 26 needsyou, 17 blocked, 6 with status 'archived', 1 armed,
-  // 1 resolved. Every one of them displayed as To Do. This file's own alias
-  // comment says a card reading "resolved" displayed as "To Do" is a lie, and
-  // then the bucketer twelve lines down told it, at scale.
-  //
-  // Worse, the two view modes DISAGREED: list mode already appends unknown
-  // statuses as their own group with the real name, so the same card read
-  // "blocked" in one view and "To Do" in the other. Column mode now shares list
-  // mode's predicate, which is the fix — not a second opinion about it.
-  //
-  // Deliberately NOT resolved by adding these to boardStatuses: what the board's
-  // statuses are is Ethan's to decide, not something to infer from stray data
-  // (ethos rule 8). A stray column exists only while cards are in it and
-  // vanishes when the last one leaves, so this surfaces the decision instead of
-  // taking it.
-  const strayCols = [];
-  visible.forEach(item => {
-    const s = _statusCanon(item.status);
-    if (cols[s] !== undefined) { cols[s].push(item); return; }
-    if (!cols[s]) { cols[s] = []; strayCols.push(s); }
-    cols[s].push(item);
-  });
-  strayCols.sort();
-
   // FLIP step 1: snapshot current card positions
   const oldRects = {};
   const oldIds = new Set();
@@ -18626,137 +18642,25 @@ function renderBoard() {
     oldRects[id] = { top: r.top, left: r.left };
   });
 
-  const builtIn = new Set(['backlog','todo','doing','review','done','verified','discarded']);
-  let html = '';
-  // Configured columns, then any stray status that has cards. Synthesised
-  // stObjs carry `stray:true` so the header can say what they are rather than
-  // passing for a real column — an unexplained extra column is its own puzzle.
-  const _renderCols = boardStatuses.concat(strayCols.map(id => ({
-    id: id, label: id, stray: true,
-  })));
-  _renderCols.forEach(stObj => {
-    const st = stObj.id;
-    const stCol = cols[st] || [];
-    const sty = statusStyle(st);
-    const isBuiltIn = builtIn.has(st);
-    const collapsed = _collapsedCols.has(st);
-    html += '<div class="board-col' + (collapsed ? ' col-collapsed' : '') + '" data-col="' + st + '">';
-    html += '<div class="board-col-header">';
-    html += '<span style="display:flex;align-items:center;gap:5px;">';
-    html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
-    html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
-    if (stObj.stray) {
-      html += '<span class="col-stray-flag" title="Cards carry the status &quot;' + esc(st)
-        + '&quot; but the board has no column for it. They used to display as To Do. '
-        + 'Add it as a real status, or move these cards to one — the column disappears '
-        + 'when the last card leaves.">unconfigured</span>';
-    }
-    html += '</span>';
-    html += '<span style="display:flex;align-items:center;gap:6px;">';
-    html += '<span class="col-count" data-col="' + st + '">' + stCol.length + '</span>';
-    const _hasGate = Array.isArray(stObj.gate) && stObj.gate.length;
-    // A stray column has no stored gate and no delete: editStatusGate would
-    // write a gate for a status that is not in the list, and deleteBoardStatus
-    // would try to remove a column that was never configured. Offering either
-    // would be a control that cannot do what it says.
-    if (!stObj.stray) {
-      html += '<button class="col-gate-btn' + (_hasGate ? ' has-gate' : '') + '" onclick="event.stopPropagation();editStatusGate(\'' + st + '\')" title="Edit gate checklist for this column">&#9745;&#xFE0E; Gate</button>';
-      if (!isBuiltIn) {
-        // TRASH, NOT ✕ (AMUX-2491). This used the same glyph as every dismiss
-        // control in the app — search-clear, filter chips, tab close, pane close,
-        // modal close: 43 uses of U+2715, most of them meaning "close this, no
-        // consequences". One of them silently meant "delete this column and
-        // rewrite the status of every card in it". A dismiss reflex, or an agent
-        // clicking every ✕ to clear overlays, lands on a destructive confirm.
-        //
-        // The codebase already had the right convention and had not applied it
-        // here: the dictionary UI uses &#128465; with class="danger" for delete.
-        // Making the glyph carry the semantics is what stops the collision — a
-        // confirm dialog is a last line, not a substitute for an affordance that
-        // never should have looked dismissible.
-        html += '<button class="col-del-btn" onclick="event.stopPropagation();deleteBoardStatus(\'' + st + '\')" title="Delete the ' + esc(stObj.label) + ' column">&#128465;</button>';
-      }
-    }
-    html += '</span></div>';
-    // WHAT THE COLUMN MEANS, not just what it is called (AMUX-2507). The gate
-    // criteria below say what a card must SATISFY; this says what the column IS
-    // FOR. Five separate defects this week came from people not knowing that
-    // `done` means "meets the gate to close" while `verified` means "confirmed
-    // to still hold" — the distinction the whole ledger rests on and the one
-    // thing the board never said out loud.
-    //
-    // Derived from the status id rather than stored per-board, so a custom
-    // column (matching / exceptions / summary in the cloud envs) renders
-    // without an empty slot instead of demanding someone fill one in.
-    const _colPurpose = _COL_PURPOSE[st] || '';
-    if (_colPurpose) {
-      html += '<div class="board-col-purpose">' + esc(_colPurpose) + '</div>';
-    }
-    // ENTRY CRITERIA, visible on the board (AMUX-2313). Ethan: "the gate
-    // configurations not hidden but easily accessible, and it should be obvious
-    // that gates are criteria for passing to the next column." The criteria used
-    // to live behind the Gate button, and nothing said a gate is an ENTRY
-    // condition for the column rather than a property of cards already in it —
-    // which is the misreading that makes people force past them.
-    //
-    // This renders the GLOBAL column default and LABELS it as that, rather than
-    // claiming to be the effective gate: the type layer is per-card and cannot
-    // be known from a column. Re-deriving full precedence in the client is
-    // exactly what produced AMUX-2330, so it is not done here — the move dialog
-    // asks the server (GET /api/board/gate) for the real, per-card answer.
-    if (!collapsed) {
-      const _g = Array.isArray(stObj.gate) ? stObj.gate : [];
-      const _explicit = (stObj.mode || 'implicit') === 'explicit';
-      if (_g.length || _explicit) {
-        html += '<div class="col-gate-crit">';
-        html += '<div class="col-gate-crit-h">To move a card <b>into ' + esc(stObj.label) + '</b>:</div>';
-        if (_g.length) {
-          html += '<ul class="col-gate-crit-l">'
-                + _g.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul>';
-        } else {
-          html += '<div class="col-gate-crit-n">No criteria set for this column.</div>';
-        }
-        html += '<div class="col-gate-crit-f">column default'
-             + (_explicit ? ' &middot; <span class="col-gate-optin">opt-in only</span>' : '')
-             + ' &middot; a card&rsquo;s type may require different criteria</div>';
-        html += '</div>';
-      }
-    }
-    if (stCol.length === 0) {
-      html += '<div class="board-empty">Nothing here</div>';
-    }
-    stCol.sort((a, b) => {
-      const pp = (b.pinned || 0) - (a.pinned || 0);
-      if (pp !== 0) return pp;
-      const ap = a.pos || 0, bp = b.pos || 0;
-      // Items without a pos (=0) sort to the bottom, ordered by recency
-      if (ap === 0 && bp === 0) return (b.updated || 0) - (a.updated || 0);
-      if (ap === 0) return 1;
-      if (bp === 0) return -1;
-      return ap - bp;
-    });
-    const PAGE_SIZE = 20;
-    const showCount = _boardColPages[st] || PAGE_SIZE;
-    const visibleCards = stCol.slice(0, showCount);
-    const remaining = stCol.length - showCount;
-    visibleCards.forEach(item => { html += _renderBoardCard(item); });
-    if (remaining > 0) {
-      html += '<button class="board-add-btn" style="color:var(--accent);border-color:var(--accent);opacity:0.8;" onclick="event.stopPropagation();_boardShowMore(\'' + st + '\',' + PAGE_SIZE + ')">Show ' + Math.min(remaining, PAGE_SIZE) + ' more (' + remaining + ' remaining)</button>';
-    }
-    if (st === 'done' && stCol.length > 0) {
-      html += '<button class="board-add-btn" style="color:var(--red);border-color:rgba(248,81,73,0.2);" onclick="clearDone()">Clear done</button>';
-    }
-    html += '<button class="board-add-btn" onclick="openBoardAdd(\'' + st + '\')">+ Add</button>';
-    html += '</div>';
+  // Tear down last render's card Sortables, then paint through the SHARED
+  // column component (AMUX-2590) — the same renderer the worker peek uses.
+  _boardSortables.forEach(s => { try { s.destroy(); } catch(e) {} });
+  _boardSortables = [];
+  const bucket = _renderBoardColumnsInto(container, visible, {
+    kind: 'global',
+    sortGroup: 'board',
+    sortables: _boardSortables,
+    rerender: function(reason) {
+      if (reason === 'cancel') { renderBoard(); return; }
+      // Flush any renderBoard() calls that were deferred during the drag
+      if (_boardRenderPending) { _boardRenderPending = false; renderBoard(); }
+    },
   });
-  html += '<button class="board-add-col-btn" onclick="addBoardStatus()">+ Add column</button>';
-  container.innerHTML = html;
+  const cols = bucket.cols;
 
-  // Init Sortable.js on each column for touch-friendly cross-column drag
+  // Column reorder Sortable — drag columns by their header (global only:
+  // reordering rewrites boardStatuses, which no narrower scope may do)
   if (typeof Sortable !== 'undefined') {
-    _boardSortables.forEach(s => { try { s.destroy(); } catch(e) {} });
-    _boardSortables = [];
-    // Column reorder Sortable — drag columns by their header
     if (_boardColSortable) { try { _boardColSortable.destroy(); } catch(e) {} }
     _boardColSortable = Sortable.create(container, {
       animation: 150,
@@ -18786,64 +18690,6 @@ function renderBoard() {
         });
         if (_boardRenderPending) { _boardRenderPending = false; renderBoard(); }
       }
-    });
-    container.querySelectorAll('.board-col').forEach(colEl => {
-      _boardSortables.push(Sortable.create(colEl, {
-        group: 'board',
-        animation: 120,
-        easing: 'cubic-bezier(0.2, 0, 0, 1)',
-        handle: '.board-drag-handle',
-        ghostClass: 'board-sortable-ghost',
-        chosenClass: 'board-sortable-chosen',
-        dragClass: 'board-sortable-drag',
-        filter: '.board-col-header, .board-add-btn, .board-empty',
-        preventOnFilter: false,
-        delay: 120,
-        delayOnTouchOnly: true,
-        touchStartThreshold: 3,
-        swapThreshold: 0.6,
-        onStart: function() { document.body.classList.add('board-dragging'); },
-        onEnd: function(evt) {
-          document.body.classList.remove('board-dragging');
-          const id = evt.item.dataset.id;
-          const newStatus = evt.to.dataset.col;
-          if (!id || !newStatus) {
-            if (_boardRenderPending) { _boardRenderPending = false; renderBoard(); }
-            return;
-          }
-          // Compute fractional position from DOM neighbors in the destination column
-          const cards = [...evt.to.querySelectorAll('.board-card[data-id]')];
-          const myIdx = cards.findIndex(el => el.dataset.id === id);
-          const prevEl = myIdx > 0 ? cards[myIdx - 1] : null;
-          const nextEl = myIdx >= 0 && myIdx < cards.length - 1 ? cards[myIdx + 1] : null;
-          const prevItem = prevEl ? boardItems.find(i => i.id === prevEl.dataset.id) : null;
-          const nextItem = nextEl ? boardItems.find(i => i.id === nextEl.dataset.id) : null;
-          const prevPos = prevItem && prevItem.pos ? prevItem.pos : null;
-          const nextPos = nextItem && nextItem.pos ? nextItem.pos : null;
-          let newPos;
-          if (prevPos != null && nextPos != null) newPos = (prevPos + nextPos) / 2;
-          else if (prevPos != null) newPos = prevPos + 1024;
-          else if (nextPos != null) newPos = nextPos - 1024;
-          else newPos = Date.now() / 1000;  // empty column — seed from time
-          const item = boardItems.find(i => i.id === id);
-          const statusChanged = item && item.status !== newStatus;
-          const posChanged = !item || item.pos !== newPos;
-          const _flush = () => { if (_boardRenderPending) { _boardRenderPending = false; renderBoard(); } };
-          if (statusChanged) {
-            // Gate: confirm before committing a status change; on cancel, revert the
-            // visual move by re-rendering from the (unchanged) boardItems.
-            _gateConfirm(item || {}, newStatus).then(ok => {
-              if (!ok) { renderBoard(); return; }
-              moveBoardItem(id, newStatus, newPos, ok);
-              _flush();
-            });
-            return;
-          }
-          if (posChanged) moveBoardItem(id, newStatus, newPos);
-          // Flush any renderBoard() calls that were deferred during the drag
-          _flush();
-        }
-      }));
     });
   }
 
@@ -18882,10 +18728,10 @@ function renderBoard() {
       el.addEventListener('animationend', () => el.classList.remove('bump'), { once: true });
     }
   });
-  // _renderCols, not boardStatuses: a stray column's count must be remembered
-  // too, or its counter re-fires the bump animation on every single render
-  // because `prev` is permanently 0.
-  _renderCols.forEach(stObj => { _prevCardRects[stObj.id] = (cols[stObj.id] || []).length; });
+  // bucket.renderCols, not boardStatuses: a stray column's count must be
+  // remembered too, or its counter re-fires the bump animation on every single
+  // render because `prev` is permanently 0.
+  bucket.renderCols.forEach(stObj => { _prevCardRects[stObj.id] = (cols[stObj.id] || []).length; });
   // An open peek Board tab reads the same boardItems this render just consumed,
   // but nothing re-rendered IT when data arrived through the normal path
   // (fetchBoard/SSE both end here) — so a peek opened before the board loaded
@@ -18899,19 +18745,46 @@ function renderBoard() {
   }
 }
 
-// Event delegation for board tag + session clicks (cards + detail)
+// Card-chip filters: a card's tag chip toggles `tag:x`, its session chip
+// toggles `worker:x` — the same query tokens the filter bar and + Filter menu
+// compile to, so there is ONE filter mechanism, not a second model beside it.
+// Both functions had been deleted in a refactor while their four call sites
+// below stayed: clicking a chip threw toggleBoardTag-is-not-defined, masked by
+// the rename bug in the listeners (next comment), so chip filtering was dead
+// on every surface. Found by the defined-vs-called diff (AMUX-2590, ethos
+// rule 7 — the same class as the closePeek() incident).
+function _bfToggleToken(token) {
+  _bfTarget = 'board';
+  const parts = (boardSearchQuery || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.includes(token)) { _bfAppend(token); return; }
+  boardSearchQuery = parts.filter(p => p !== token).join(' ');
+  const inp = document.getElementById('board-search');
+  if (inp) inp.value = boardSearchQuery;
+  _boardActiveView = '';
+  _bfSyncHash(); renderBoard();
+}
+function toggleBoardTag(t) { _bfToggleToken('tag:' + t); }
+function toggleBoardSession(s) { _bfToggleToken('worker:' + s); }
+
+// Event delegation for board tag + session chip clicks on cards.
+// Two defects lived here (AMUX-2590 cleanup):
+// 1. The matched element must be the one dereferenced — a tags→groups rename
+//    sweep renamed only the binding (`const group = …closest(…)`) and left
+//    `tag.dataset.tag` behind, so every tag-chip click threw a ReferenceError.
+// 2. CAPTURE PHASE is load-bearing: the card carries an inline
+//    onclick="openBoardDetail(…)", and a bubble-phase listener on the
+//    container runs AFTER it — stopPropagation up here was too late, so a
+//    chip click also flung the detail overlay open over the filtered board.
+//    Capturing at the container stops the event before the card handler runs.
+// (A twin listener on #board-detail-overlay was deleted: nothing renders
+// .board-card-tag/.board-card-session inside the overlay — _renderBoardCard
+// is the only emitter of either class and it paints board surfaces only.)
 document.getElementById('board-columns').addEventListener('click', function(e) {
-  const group = e.target.closest('.board-card-tag[data-tag]');
-  if (group) { e.stopPropagation(); e.preventDefault(); toggleBoardTag(tag.dataset.tag); return; }
+  const tagEl = e.target.closest('.board-card-tag[data-tag]');
+  if (tagEl) { e.stopPropagation(); e.preventDefault(); toggleBoardTag(tagEl.dataset.tag); return; }
   const sess = e.target.closest('.board-card-session[data-session]');
   if (sess) { e.stopPropagation(); e.preventDefault(); toggleBoardSession(sess.dataset.session); }
-});
-document.getElementById('board-detail-overlay').addEventListener('click', function(e) {
-  const group = e.target.closest('.board-card-tag[data-tag]');
-  if (group) { e.stopPropagation(); e.preventDefault(); closeBoardDetail(); toggleBoardTag(tag.dataset.tag); return; }
-  const sess = e.target.closest('.board-card-session[data-session]');
-  if (sess) { e.stopPropagation(); e.preventDefault(); closeBoardDetail(); toggleBoardSession(sess.dataset.session); }
-});
+}, true);
 
 function _populateSessionSelect(selectId, current) {
   const sel = document.getElementById(selectId);
@@ -20414,7 +20287,9 @@ function enterGridMode() {
   view.classList.add('active');
   _torrentStopTimer();
   // Mark Grid tab as active, deactivate others
-  ['workers','board','calendar','scheduler','files','logs','email','notes','crm'].forEach(t => document.getElementById('tab-' + t)?.classList.remove('active'));
+  // Live tab ids only — 'email'/'notes'/'crm' were removed with their views
+  // and getElementById on them was a silent no-op kept alive by the ?. guard.
+  ['workers','board','calendar','scheduler','files','logs'].forEach(t => document.getElementById('tab-' + t)?.classList.remove('active'));
   document.getElementById('tab-grid').classList.add('active');
   _renderGridChips();
   _wsRenderProfileBar();
@@ -21537,15 +21412,14 @@ function connectSSE() {
         }
       } else if (msg.type === 'invalidate') {
         for (const key of (msg.keys || [])) {
-          // 'notes' was handled here until the notes view was removed; both
-          // functions it called are gone, so this branch could only throw —
-          // inside the SSE message loop, taking the rest of the invalidate
-          // payload with it. The server may still emit the key; ignoring it is
-          // correct, because nothing in this client can render a note.
-          if (key === 'crm') {
-            if (activeView === 'crm') _crmLoad();
-            else _crmDirty = true;
-          } else if (key === 'journal') {
+          // 'notes' was handled here until the notes view was removed, and
+          // 'crm' until the People/CRM view followed it (AMUX-2590); the
+          // functions those branches called are gone, so keeping them could
+          // only throw — inside the SSE message loop, taking the rest of the
+          // invalidate payload with it. The server may still emit either key;
+          // ignoring them is correct, because nothing in this client can
+          // render a note or a contact.
+          if (key === 'journal') {
             if (activeView === 'journal') _journalLoad();
           }
         }
@@ -23815,9 +23689,6 @@ async function pullFromRemote(btn) {
       { target: '#tab-calendar', targetFallback: '.tab-bar-outer', pos: 'bottom',
         title: 'A real calendar',
         body: 'Agents create actual events that sync to a private ICS feed — subscribe from Google or Apple Calendar and your agents\u2019 scheduling shows up next to your real life.' },
-      { target: '#tab-crm', targetFallback: '.tab-bar-outer', pos: 'bottom',
-        title: 'Email & CRM built in',
-        body: 'Agents send and reply IN-THREAD from your real email accounts (with your signature), read attachments, and log contacts, interactions, and follow-ups in the CRM.' },
       { target: '#tab-browser', targetFallback: '.tab-bar-outer', pos: 'bottom',
         title: 'A real browser with your logins',
         body: 'Agents drive a browser with saved auth profiles — pull invoices, publish content, work dashboards that have no API. End-to-end business workflows, unattended.' }
@@ -23847,11 +23718,7 @@ async function pullFromRemote(btn) {
       { action: function() { try { closeSchedModal(); } catch(e) {} switchView('calendar'); setTimeout(function(){ openEventModal(null); }, 250); }, wait: 650, revealTab: 'calendar',
         target: '#event-modal .modal', targetFallback: '#fc-container', pos: 'bottom',
         title: 'Put it on a real calendar',
-        body: 'A real event \u2014 it syncs to the private ICS feed your Google/Apple calendar subscribes to. Agents create these by API, alongside in-thread email and CRM. Save one or Cancel.' },
-      { action: function() { try { closeEventModal(); } catch(e) {} switchView('crm'); }, wait: 450, revealTab: 'crm',
-        target: '#crm-view', targetFallback: '.tab-bar-outer', pos: 'top',
-        title: 'Your people live here',
-        body: 'CRM is now on your tab bar. Agents log contacts, interactions, and follow-ups here as they run outreach and support \u2014 tap \u201C+ contact\u201D to add your first. Finish to return to Workers with your command center set up.' }
+        body: 'A real event \u2014 it syncs to the private ICS feed your Google/Apple calendar subscribes to. Agents create these by API, alongside in-thread email. Save one or Cancel, then Finish to return to Workers with your command center set up.' }
     ]}
   };
   var _wtSteps = _WT_CORE;
@@ -26065,394 +25932,10 @@ const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="1
 
 // ── Pinned notes on home screen ──────────────────────────────────────────────
 
-// ── CRM / People ──────────────────────────────────────────────────────────────
-// (state vars hoisted before switchView — see above)
-
-function _crmHealthClass(d) {
-  if (!d) return 'never';
-  const days = Math.floor((Date.now() - new Date(d).getTime()) / 86400000);
-  return days < 30 ? 'fresh' : days < 90 ? 'warm' : 'cold';
-}
-function _crmDaysText(d) {
-  if (!d) return 'never contacted';
-  const days = Math.floor((Date.now() - new Date(d).getTime()) / 86400000);
-  if (days === 0) return 'today';
-  if (days === 1) return '1d ago';
-  if (days < 30) return days + 'd ago';
-  if (days < 365) return Math.floor(days / 30) + 'mo ago';
-  return Math.floor(days / 365) + 'yr ago';
-}
-function _crmFuInfo(fuDate) {
-  if (!fuDate) return null;
-  const today = new Date().toISOString().slice(0, 10);
-  const overdue = fuDate < today;
-  return { text: (overdue ? '⚠ ' : '→ ') + fuDate, overdue };
-}
-
-function _crmToggleSidebar() {
-  _crmSidebarOpen = !_crmSidebarOpen;
-  localStorage.setItem('amux_crm_sidebar', _crmSidebarOpen ? 'open' : 'closed');
-  _crmApplySidebarState();
-}
-function _crmApplySidebarState() {
-  const view = document.getElementById('crm-view');
-  if (view) view.classList.toggle('sidebar-collapsed', !_crmSidebarOpen);
-}
-
-async function _crmLoad() {
-  try {
-    const r = await fetch(API + '/api/crm/contacts');
-    if (r.ok) {
-      _crmContacts = await r.json();
-      try { localStorage.setItem('amux_crm_cache', JSON.stringify(_crmContacts)); } catch(e) {}
-    }
-  } catch(e) {
-    // offline fallback
-    try { var c = localStorage.getItem('amux_crm_cache'); if (c) _crmContacts = JSON.parse(c); } catch(e2) {}
-  }
-  _crmRenderList(_crmContacts);
-  _crmRenderQueue(_crmContacts);
-}
-
-// Patch a single contact in _crmContacts and update its list item in-place (no full re-render)
-function _crmPatchContact(updated) {
-  const idx = _crmContacts.findIndex(c => c.id === updated.id);
-  if (idx !== -1) Object.assign(_crmContacts[idx], updated);
-  // Patch the list card in-place
-  const card = document.querySelector('.crm-contact-item[data-id="' + CSS.escape(updated.id) + '"]');
-  if (!card) return;
-  const sub = [updated.company, updated.role].filter(Boolean).join(' · ');
-  const health = _crmHealthClass(updated.last_date !== undefined ? updated.last_date : (_crmContacts[idx] || {}).last_date);
-  const fu = _crmFuInfo(updated.next_followup !== undefined ? updated.next_followup : (_crmContacts[idx] || {}).next_followup);
-  const nameEl = card.querySelector('.crm-contact-name');
-  if (nameEl) nameEl.innerHTML = '<span class="crm-health ' + health + '"></span>' + esc(updated.name || '');
-  let subEl = card.querySelector('.crm-contact-sub');
-  if (sub) {
-    if (!subEl) { subEl = document.createElement('div'); subEl.className = 'crm-contact-sub'; nameEl?.after(subEl); }
-    subEl.textContent = sub;
-  } else if (subEl) { subEl.remove(); }
-  const metaEl = card.querySelector('.crm-contact-meta');
-  if (metaEl) {
-    const c = _crmContacts[idx] || {};
-    metaEl.innerHTML = '<span class="crm-days-badge">' + _crmDaysText(c.last_date) + '</span>' +
-      (fu ? '<span class="crm-fu-badge' + (fu.overdue ? ' overdue' : '') + '">' + fu.text + '</span>' : '');
-  }
-}
-
-function _crmRenderList(contacts) {
-  const el = document.getElementById('crm-contact-list');
-  if (!contacts.length) {
-    el.innerHTML = '<div style="padding:20px;color:var(--dim);font-size:0.8rem;text-align:center;">No contacts yet</div>';
-    return;
-  }
-  el.innerHTML = contacts.map(c => {
-    const active = c.id === _crmActiveId ? ' active' : '';
-    const health = _crmHealthClass(c.last_date);
-    const sub = [c.company, c.role].filter(Boolean).join(' · ');
-    const fu = _crmFuInfo(c.next_followup);
-    return '<div class="crm-contact-item' + active + '" data-id="' + esc(c.id) + '" onclick="_crmOpenContact(this.dataset.id)">' +
-      '<div class="crm-contact-name"><span class="crm-health ' + health + '"></span>' + esc(c.name) + '</div>' +
-      (sub ? '<div class="crm-contact-sub">' + esc(sub) + '</div>' : '') +
-      '<div class="crm-contact-meta">' +
-        '<span class="crm-days-badge">' + _crmDaysText(c.last_date) + '</span>' +
-        (fu ? '<span class="crm-fu-badge' + (fu.overdue ? ' overdue' : '') + '">' + fu.text + '</span>' : '') +
-      '</div>' +
-    '</div>';
-  }).join('');
-}
-
-function _crmRenderQueue(contacts) {
-  const today = new Date().toISOString().slice(0, 10);
-  const withFu = contacts.filter(c => c.next_followup).sort((a, b) => a.next_followup < b.next_followup ? -1 : 1);
-  const qEl = document.getElementById('crm-queue');
-  if (!withFu.length) { qEl.style.display = 'none'; return; }
-  qEl.style.display = '';
-  document.getElementById('crm-queue-count').textContent = withFu.length;
-  const listEl = document.getElementById('crm-queue-list');
-  listEl.style.display = _crmQueueOpen ? '' : 'none';
-  document.getElementById('crm-queue-icon').innerHTML = _crmQueueOpen ? '&#x25BC;' : '&#x25B6;';
-  listEl.innerHTML = withFu.map(c => {
-    const od = c.next_followup < today;
-    return '<div class="crm-queue-item' + (od ? ' overdue' : '') + '" onclick="_crmOpenContact(\'' + esc(c.id) + '\')">' +
-      '<div class="crm-queue-item-name">' + esc(c.name) + '</div>' +
-      '<div class="crm-queue-item-due">' + (od ? '⚠ ' : '') + c.next_followup + (c.next_followup_note ? ' — ' + esc(c.next_followup_note) : '') + '</div>' +
-    '</div>';
-  }).join('');
-}
-function _crmToggleQueue() { _crmQueueOpen = !_crmQueueOpen; _crmRenderQueue(_crmContacts); }
-
-function _crmBack() {
-  // Mobile: show sidebar, hide detail
-  const sidebar = document.querySelector('.crm-sidebar');
-  if (sidebar) sidebar.classList.remove('collapsed');
-}
-
-async function _crmOpenContact(id) {
-  if (id === _crmActiveId) return;
-  if (_crmDirty) await _crmFlushSave();
-  // Reset delete button confirm state
-  const delBtn = document.getElementById('crm-delete-btn');
-  if (delBtn) { clearTimeout(delBtn._resetTimer); delBtn.classList.remove('confirming'); delBtn.innerHTML = _CRM_TRASH_SVG; }
-  _crmActiveId = id;
-  // Optimistic: highlight immediately, fade editor
-  document.querySelectorAll('.crm-contact-item').forEach(el => el.classList.toggle('active', el.dataset.id === id));
-  const form = document.getElementById('crm-contact-form');
-  if (form.style.display !== 'none') form.style.opacity = '0.4';
-  // Mobile: collapse sidebar to show detail pane
-  const sidebar = document.querySelector('.crm-sidebar');
-  if (sidebar && window.innerWidth <= 600) sidebar.classList.add('collapsed');
-  // Cancel any in-flight fetch
-  if (_crmOpenAbort) _crmOpenAbort.abort();
-  _crmOpenAbort = new AbortController();
-  let data;
-  try {
-    const r = await fetch(API + '/api/crm/contacts/' + encodeURIComponent(id), { signal: _crmOpenAbort.signal });
-    if (!r.ok) throw new Error('not ok');
-    data = await r.json();
-    // Cache for offline
-    _idb.set('amux_crm_' + id, JSON.stringify(data));
-  } catch(e) {
-    if (e.name === 'AbortError') return;
-    // Try IDB cache
-    try { var cached = await _idb.get('amux_crm_' + id); if (cached) data = JSON.parse(cached); } catch(e2) {}
-    if (!data) {
-      // Try in-memory list as last resort
-      data = _crmContacts.find(function(c) { return c.id === id; });
-    }
-    if (!data) { form.style.opacity = ''; return; }
-  }
-  form.style.opacity = '';
-  _crmRenderDetail(data);
-}
-
-const _CRM_TRASH_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
-
-function _crmRenderDetail(c) {
-  document.getElementById('crm-detail-empty').style.display = 'none';
-  const form = document.getElementById('crm-contact-form');
-  form.style.display = 'flex';
-  form.style.opacity = '';
-  document.getElementById('crm-name').value = c.name || '';
-  document.getElementById('crm-company').value = c.company || '';
-  document.getElementById('crm-role').value = c.role || '';
-  document.getElementById('crm-email').value = c.email || '';
-  document.getElementById('crm-linkedin').value = c.linkedin || '';
-  document.getElementById('crm-phone').value = c.phone || '';
-  document.getElementById('crm-notes-field').value = c.notes || '';
-  _crmDirty = false;
-  _crmActiveTags = c.tags || [];
-  _crmRenderTagsRow(_crmActiveTags);
-  _crmRenderInteractions(c.interactions || []);
-}
-
-function _crmRenderTagsRow(tags) {
-  const el = document.getElementById('crm-tags-row');
-  el.innerHTML = tags.map(t =>
-    '<span class="crm-tag-chip" onclick="_crmRemoveTag(\'' + esc(t) + '\')" title="Click to remove">' + esc(t) + '</span>'
-  ).join('') + '<span class="crm-add-tag" onclick="_crmStartAddTag()">+ group</span>';
-}
-
-function _crmStartAddTag() {
-  const el = document.getElementById('crm-tags-row');
-  const inp = document.createElement('input');
-  inp.className = 'crm-tag-inp';
-  inp.placeholder = 'group name';
-  inp.onkeydown = async (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); await _crmAddTag(inp.value.trim()); }
-    if (e.key === 'Escape') { _crmRenderTagsRow(_crmActiveTags); }
-  };
-  inp.onblur = async () => { if (inp.value.trim()) await _crmAddTag(inp.value.trim()); else _crmRenderTagsRow(_crmActiveTags); };
-  const addBtn = el.querySelector('.crm-add-tag');
-  if (addBtn) el.replaceChild(inp, addBtn); else el.appendChild(inp);
-  inp.focus();
-}
-
-async function _crmAddTag(tag) {
-  if (!tag || !_crmActiveId) return;
-  const tags = [...new Set([..._crmActiveTags, tag])];
-  _crmActiveTags = tags;
-  _crmRenderTagsRow(tags); // optimistic
-  await apiCall(API + '/api/crm/contacts/' + _crmActiveId, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tags })
-  });
-}
-
-async function _crmRemoveTag(tag) {
-  if (!_crmActiveId) return;
-  const tags = _crmActiveTags.filter(t => t !== tag);
-  _crmActiveTags = tags;
-  _crmRenderTagsRow(tags); // optimistic
-  await apiCall(API + '/api/crm/contacts/' + _crmActiveId, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tags })
-  });
-}
-
-function _crmRenderInteractions(interactions) {
-  const el = document.getElementById('crm-ix-list');
-  if (!interactions.length) {
-    el.innerHTML = '<div style="padding:20px;color:var(--dim);font-size:0.82rem;text-align:center;">No interactions logged yet.<br>Hit <strong>+ Log</strong> to record your first one.</div>';
-    return;
-  }
-  const today = new Date().toISOString().slice(0, 10);
-  el.innerHTML = interactions.map(ix => {
-    const od = ix.follow_up_date && ix.follow_up_date < today;
-    const fuText = ix.follow_up_date
-      ? (od ? '⚠ overdue: ' : '→ follow up: ') + ix.follow_up_date + (ix.follow_up_note ? ' — ' + esc(ix.follow_up_note) : '')
-      : '';
-    return '<div class="crm-ix-item">' +
-      '<div class="crm-ix-meta">' +
-        '<span class="crm-ix-date">' + ix.date + '</span>' +
-        '<span class="crm-ix-type ' + esc(ix.type) + '">' + esc(ix.type) + '</span>' +
-        '<span class="crm-ix-del" onclick="_crmDeleteIx(\'' + esc(ix.id) + '\')" title="Delete this interaction">&#128465;</span>' +
-      '</div>' +
-      (ix.notes ? '<div class="crm-ix-notes">' + esc(ix.notes) + '</div>' : '') +
-      (fuText ? '<span class="crm-ix-fu' + (od ? ' overdue' : '') + '">' + fuText + '</span>' : '') +
-    '</div>';
-  }).join('');
-}
-
-function _crmDirtied() { _crmDirty = true; }
-
-function _crmAutoSave() {
-  if (!_crmDirty || !_crmActiveId) return;
-  if (_crmSaveTimer) clearTimeout(_crmSaveTimer);
-  _crmSaveTimer = setTimeout(_crmFlushSave, 600);
-}
-
-async function _crmFlushSave() {
-  if (_crmSaveTimer) { clearTimeout(_crmSaveTimer); _crmSaveTimer = null; }
-  if (!_crmActiveId || !_crmDirty) return;
-  _crmDirty = false;
-  const data = {
-    name: document.getElementById('crm-name').value.trim(),
-    company: document.getElementById('crm-company').value.trim(),
-    role: document.getElementById('crm-role').value.trim(),
-    email: document.getElementById('crm-email').value.trim(),
-    linkedin: document.getElementById('crm-linkedin').value.trim(),
-    phone: document.getElementById('crm-phone').value.trim(),
-    notes: document.getElementById('crm-notes-field').value.trim(),
-  };
-  if (!data.name) return;
-  await apiCall(API + '/api/crm/contacts/' + _crmActiveId, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
-  });
-  _crmPatchContact({ id: _crmActiveId, ...data });
-}
-
-async function _crmNew() {
-  if (_crmDirty) await _crmFlushSave();
-  const r = await apiCall(API + '/api/crm/contacts', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'New Contact' })
-  });
-  if (!r) return;
-  const d = await r.json();
-  // Add optimistically to top of list
-  _crmContacts.unshift({ id: d.id, name: 'New Contact', company: '', role: '', last_date: null, next_followup: null, tags: [] });
-  _crmRenderList(_crmContacts);
-  await _crmOpenContact(d.id);
-  setTimeout(() => { const ni = document.getElementById('crm-name'); ni.focus(); ni.select(); }, 50);
-}
-
-async function _crmDeleteContact() {
-  if (!_crmActiveId) return;
-  const btn = document.getElementById('crm-delete-btn');
-  if (btn && !btn.classList.contains('confirming')) {
-    btn.classList.add('confirming');
-    btn.textContent = 'Delete?';
-    const reset = () => { btn.classList.remove('confirming'); btn.innerHTML = _CRM_TRASH_SVG; };
-    btn._resetTimer = setTimeout(reset, 3000);
-    return;
-  }
-  if (btn) { clearTimeout(btn._resetTimer); btn.classList.remove('confirming'); btn.innerHTML = _CRM_TRASH_SVG; }
-  const id = _crmActiveId;
-  // Optimistic: remove from list and reset detail immediately
-  _crmContacts = _crmContacts.filter(c => c.id !== id);
-  _crmActiveId = null;
-  _crmRenderList(_crmContacts);
-  _crmRenderQueue(_crmContacts);
-  document.getElementById('crm-contact-form').style.display = 'none';
-  document.getElementById('crm-detail-empty').style.display = '';
-  // Mobile: show sidebar after delete
-  if (window.innerWidth <= 600) { const sb = document.querySelector('.crm-sidebar'); if (sb) sb.classList.remove('collapsed'); }
-  // Auto-open next contact if any
-  if (_crmContacts.length > 0) await _crmOpenContact(_crmContacts[0].id);
-  apiCall(API + '/api/crm/contacts/' + id, { method: 'DELETE' }); // fire-and-forget
-}
-
-function _crmOpenLog() {
-  document.getElementById('crm-log-date').value = new Date().toISOString().slice(0, 10);
-  document.getElementById('crm-log-type').value = 'meeting';
-  document.getElementById('crm-log-notes').value = '';
-  document.getElementById('crm-log-followup').value = '';
-  document.getElementById('crm-log-followup-note').value = '';
-  document.getElementById('crm-log-modal').classList.add('open');
-  setTimeout(() => document.getElementById('crm-log-notes').focus(), 50);
-}
-function _crmCloseLog() { document.getElementById('crm-log-modal').classList.remove('open'); }
-
-async function _crmSubmitLog() {
-  if (!_crmActiveId) return;
-  const payload = {
-    date: document.getElementById('crm-log-date').value,
-    type: document.getElementById('crm-log-type').value,
-    notes: document.getElementById('crm-log-notes').value.trim(),
-    follow_up_date: document.getElementById('crm-log-followup').value || null,
-    follow_up_note: document.getElementById('crm-log-followup-note').value.trim(),
-  };
-  _crmCloseLog();
-  const res = await apiCall(API + '/api/crm/contacts/' + _crmActiveId + '/interactions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  if (!res) return;
-  // Refresh this contact's detail + update list entry in-place
-  const c = await fetch(API + '/api/crm/contacts/' + _crmActiveId).then(r => r.json());
-  _crmRenderDetail(c);
-  // Update list card with new last_date / follow-up
-  const listEntry = _crmContacts.find(e => e.id === _crmActiveId);
-  if (listEntry) {
-    if (!listEntry.last_date || payload.date > listEntry.last_date) listEntry.last_date = payload.date;
-    if (payload.follow_up_date) { listEntry.next_followup = payload.follow_up_date; listEntry.next_followup_note = payload.follow_up_note; }
-    _crmPatchContact(listEntry);
-    _crmRenderQueue(_crmContacts);
-  }
-}
-
-async function _crmDeleteIx(id) {
-  // Optimistic: remove the item from the DOM immediately
-  document.querySelector('.crm-ix-item:has(.crm-ix-del[onclick*="' + id + '"])')?.remove();
-  await apiCall(API + '/api/crm/interactions/' + id, { method: 'DELETE' });
-  // Refresh detail to get correct state (follow-up, last_date may change)
-  const c = await fetch(API + '/api/crm/contacts/' + _crmActiveId).then(r => r.json());
-  _crmRenderDetail(c);
-  const listEntry = _crmContacts.find(e => e.id === _crmActiveId);
-  if (listEntry) {
-    listEntry.last_date = c.interactions?.length ? c.interactions[0].date : null;
-    listEntry.next_followup = c.interactions?.find(i => i.follow_up_date)?.follow_up_date || null;
-    listEntry.next_followup_note = c.interactions?.find(i => i.follow_up_date)?.follow_up_note || '';
-    _crmPatchContact(listEntry);
-    _crmRenderQueue(_crmContacts);
-  }
-}
-
-function _crmSearch(q) {
-  if (!q.trim()) { _crmRenderList(_crmContacts); return; }
-  const lq = q.toLowerCase();
-  _crmRenderList(_crmContacts.filter(c =>
-    c.name.toLowerCase().includes(lq) ||
-    (c.company || '').toLowerCase().includes(lq) ||
-    (c.role || '').toLowerCase().includes(lq) ||
-    (c.tags || []).some(t => t.toLowerCase().includes(lq))
-  ));
-}
-
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape' && document.getElementById('crm-log-modal').classList.contains('open')) _crmCloseLog();
-});
+// The CRM / People view was removed (AMUX-2590, Ethan 2026-08-09): its tab,
+// markup, styles and every _crm* function are gone from this client. The
+// /api/crm endpoints still exist for agents; the serve-time AMUX-FEATURE-FLAGS
+// CSS in static_files.rs stays as the one greppable line to reverse.
 
 // ── Gmail Inbox tab ────────────────────────────────────────────────────────────
 let _gmailAccounts = [];

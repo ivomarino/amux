@@ -475,7 +475,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-grid" onclick="enterGridMode()"><span class="tab-ico">▣</span><span class="tab-lbl">Workspace</span></button>
   <button id="tab-messages" onclick="switchView('messages')"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span></button>
   <button id="tab-skills" onclick="switchView('skills')"><span class="tab-ico">⚙</span><span class="tab-lbl">Skills</span></button>
-  <button id="tab-crm" onclick="switchView('crm')"><span class="tab-ico">👤</span><span class="tab-lbl">People</span></button>
   <button id="tab-sql" onclick="switchView('sql')"><span class="tab-ico">⛁</span><span class="tab-lbl">Database</span></button>
   <button id="tab-map" onclick="switchView('map')"><span class="tab-ico">◈</span><span class="tab-lbl">Map</span></button>
   <button id="tab-metrics" onclick="switchView('metrics')"><span class="tab-ico">↗</span><span class="tab-lbl">Metrics</span></button>
@@ -548,7 +547,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="board-view-toggle">
       <button id="bv-list" class="bv-btn" onclick="setBoardView('list')" title="Dense list grouped by status">&#x2630;</button>
-        <button id="bv-session" class="bv-btn" onclick="setBoardView('session')" title="Group by worker">&#x25A4;</button>
+        <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
   </div>
@@ -811,68 +810,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 
 <!-- Notes view -->
 
-<!-- CRM / People view -->
-<div id="crm-view" style="display:none;">
-  <!-- Sidebar -->
-  <div class="crm-sidebar">
-    <div class="crm-sidebar-hdr">
-      <span style="font-weight:600;font-size:0.85rem;">People</span>
-      <div style="display:flex;gap:4px;align-items:center;">
-        <button class="notes-new-btn" onclick="_crmNew()" title="Add contact"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
-        <button class="notes-toggle-btn" onclick="_crmToggleSidebar()" title="Collapse sidebar"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></svg></button>
-      </div>
-    </div>
-    <div class="crm-search-wrap">
-      <input type="search" id="crm-search" placeholder="Search contacts…" oninput="_crmSearch(this.value)" autocomplete="off">
-    </div>
-    <div class="crm-queue" id="crm-queue" style="display:none;">
-      <div class="crm-queue-hdr" onclick="_crmToggleQueue()">
-        <span id="crm-queue-icon">&#x25B6;</span>
-        <span>Follow-ups</span>
-        <span class="crm-queue-badge" id="crm-queue-count"></span>
-      </div>
-      <div id="crm-queue-list" style="display:none;"></div>
-    </div>
-    <div id="crm-contact-list" class="crm-contact-list"></div>
-  </div>
-  <!-- Detail pane -->
-  <div class="crm-detail" id="crm-detail">
-    <button class="crm-expand-btn" onclick="_crmToggleSidebar()" title="Show contacts list" style="position:absolute;top:10px;left:10px;z-index:2;"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg></button>
-    <div class="crm-detail-empty" id="crm-detail-empty">
-      <div style="font-size:2.2rem;">&#x1F465;</div>
-      <div style="font-size:0.85rem;">Select a contact or add one</div>
-      <button class="btn" onclick="_crmNew()" style="margin-top:8px;font-size:0.8rem;">+ Add Contact</button>
-    </div>
-    <div id="crm-contact-form" style="display:none;flex-direction:column;overflow:hidden;flex:1;">
-      <div class="crm-contact-hdr">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <button class="crm-back-btn" onclick="_crmBack()" title="Back to contacts">&#8592;</button>
-          <input id="crm-name" class="crm-name-input" placeholder="Name" oninput="_crmDirtied()" onblur="_crmAutoSave()">
-          <button id="crm-delete-btn" class="notes-delete-btn" onclick="_crmDeleteContact()" title="Delete contact"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>
-        </div>
-        <div class="crm-field-row">
-          <div class="crm-field"><span>&#x1F3E2;</span><input id="crm-company" class="crm-field-input" placeholder="Company" oninput="_crmDirtied()" onblur="_crmAutoSave()"></div>
-          <div class="crm-field"><span>&#x1F4BC;</span><input id="crm-role" class="crm-field-input" placeholder="Role / Title" oninput="_crmDirtied()" onblur="_crmAutoSave()"></div>
-          <div class="crm-field"><span>&#x1F4E7;</span><input id="crm-email" class="crm-field-input" placeholder="email" oninput="_crmDirtied()" onblur="_crmAutoSave()"></div>
-          <div class="crm-field"><span>&#x1F517;</span><input id="crm-linkedin" class="crm-field-input" placeholder="linkedin.com/in/…" oninput="_crmDirtied()" onblur="_crmAutoSave()"></div>
-          <div class="crm-field"><span>&#x1F4F1;</span><input id="crm-phone" class="crm-field-input" placeholder="phone" oninput="_crmDirtied()" onblur="_crmAutoSave()"></div>
-        </div>
-      </div>
-      <div class="crm-tags-row" id="crm-tags-row"></div>
-      <div class="crm-notes-wrap">
-        <div class="crm-notes-label">Context / Background</div>
-        <textarea id="crm-notes-field" class="crm-notes-ta" placeholder="Who is this person? How did you meet? What do they care about?" oninput="_crmDirtied()" onblur="_crmAutoSave()"></textarea>
-      </div>
-      <div class="crm-ix-wrap">
-        <div class="crm-ix-hdr">
-          <span style="font-size:0.85rem;font-weight:500;">Interactions</span>
-          <button class="btn primary" onclick="_crmOpenLog()" style="font-size:0.74rem;padding:4px 10px;">+ Log</button>
-        </div>
-        <div id="crm-ix-list" class="crm-ix-list"></div>
-      </div>
-    </div>
-  </div>
-</div>
 <!-- Map / Pins view -->
 <div id="map-view" style="display:none;">
   <div class="map-sidebar" id="map-sidebar">
@@ -961,34 +898,6 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="btn" onclick="_mapSaveTag()">Save</button>
       <button class="btn" style="background:transparent;border:1px solid var(--border);" onclick="_mapCloseTagModal()">Cancel</button>
       <button class="btn map-btn-danger" id="map-tag-delete-btn" onclick="_mapDeleteTag()" style="display:none;margin-left:auto;">Delete</button>
-    </div>
-  </div>
-</div>
-<!-- CRM log interaction modal -->
-<div class="crm-log-modal" id="crm-log-modal" onclick="if(event.target===this)_crmCloseLog()">
-  <div class="crm-log-box">
-    <div class="crm-log-title">Log Interaction</div>
-    <div class="crm-log-row">
-      <div class="crm-log-field"><label>Date</label><input type="date" id="crm-log-date"></div>
-      <div class="crm-log-field"><label>Type</label>
-        <select id="crm-log-type">
-          <option value="meeting">&#x1F91D; Meeting</option>
-          <option value="call">&#x1F4DE; Call</option>
-          <option value="email">&#x1F4E7; Email</option>
-          <option value="dm">&#x1F4AC; DM / Message</option>
-          <option value="event">&#x1F389; Event</option>
-          <option value="other">&#x1F4DD; Other</option>
-        </select>
-      </div>
-    </div>
-    <div class="crm-log-field"><label>Notes</label><textarea id="crm-log-notes" placeholder="What happened? What was discussed?"></textarea></div>
-    <div class="crm-log-row">
-      <div class="crm-log-field"><label>Follow-up date <span style="color:var(--dim)">(optional)</span></label><input type="date" id="crm-log-followup"></div>
-      <div class="crm-log-field"><label>Follow-up note</label><input type="text" id="crm-log-followup-note" placeholder="What to do?"></div>
-    </div>
-    <div class="crm-log-actions">
-      <button class="btn" onclick="_crmCloseLog()">Cancel</button>
-      <button class="btn primary" onclick="_crmSubmitLog()">Save</button>
     </div>
   </div>
 </div>
