@@ -101,6 +101,33 @@ impl WorkerRow {
         self.group_id = config.group.as_ref().map(|g| g.as_str().to_string());
     }
 
+    /// RR-0111a: the canonical replay snapshot of this row. Written into the
+    /// event journal as the event's `payload` at mutation time, and rebuilt
+    /// from the live row at verify time — ONE function on both sides, so
+    /// `db::replay::verify_replay`'s comparison cannot drift from what the
+    /// writer recorded (ethos rule 1's corollary: a view must share the
+    /// predicate of the mechanism it describes).
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "display_name": self.display_name,
+            "name_aliases": self.name_aliases,
+            "cwd": self.cwd,
+            "provider": self.provider,
+            "model": self.model,
+            "backend": self.backend,
+            "environment": self.environment,
+            "permissions": self.permissions,
+            "group_id": self.group_id,
+            "state": serde_json::to_value(&self.state)
+                .unwrap_or_else(|_| serde_json::json!({"state": "stopped"})),
+            "deleted_at": self.deleted_at,
+            "version": self.version,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        })
+    }
+
     /// The row's config as the core type, for `classify_config_change` /
     /// `apply_config`.
     pub fn config(&self) -> WorkerConfig {
@@ -287,6 +314,22 @@ pub fn list_workers(
         out.push(row?);
     }
     Ok((out, total as u64))
+}
+
+/// EVERY worker row, soft-deleted included, for replay verification
+/// (RR-0111a). Deletion is soft (the row survives with `deleted_at` set) and
+/// the Deleted event journals a snapshot of that surviving row — so verify
+/// must compare against the WHOLE table, not the resolvable subset the
+/// NOT_DELETED filter serves everywhere else.
+pub fn all_workers_for_replay(conn: &Connection) -> rusqlite::Result<Vec<WorkerRow>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT {WORKER_COLS} FROM _amux_workers ORDER BY id"))?;
+    let rows = stmt.query_map([], worker_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Optimistic config write: applies iff the stored version still equals

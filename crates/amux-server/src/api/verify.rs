@@ -127,6 +127,10 @@ async fn verify_task(
                         from: "done".into(),
                         to: target.into(),
                     },
+                    // RR-0111a: the row just saved is in hand — journal its
+                    // post-mutation snapshot so replay covers verification
+                    // outcomes too.
+                    payload: Some(row.snapshot()),
                 }],
             })
         })

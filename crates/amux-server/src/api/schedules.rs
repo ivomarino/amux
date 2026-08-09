@@ -71,6 +71,7 @@ fn ev(id: &str, mutation: MutationKind) -> PendingEvent {
         entity_type: EntityType::Schedule,
         entity_id: id.to_string(),
         mutation,
+        payload: None,
     }
 }
 
@@ -616,6 +617,7 @@ pub async fn run_now(
                         from: by.clone(),
                         to: "fired".into(),
                     },
+                    payload: None,
                 },
             ];
             finish(

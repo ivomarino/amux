@@ -82,6 +82,7 @@ fn runtime(rig: &Rig, pickup_unowned: bool) -> Runtime {
         fleet_state: std::sync::Mutex::new(FleetState::Normal),
         protocol: Some(rig.protocol.clone()),
         pickup_unowned,
+        resume_stagger_secs: 5,
     }
 }
 
@@ -651,6 +652,7 @@ async fn golden_dependency_chain() {
     );
     let fleet = FleetState::Normal;
     let (hints, attempts) = (BTreeMap::new(), BTreeMap::new());
+    let providers = BTreeMap::new();
     let plan = plan_tick(&TickInputs {
         now: Utc::now(),
         tasks: &tasks,
@@ -662,6 +664,7 @@ async fn golden_dependency_chain() {
         gates: &[],
         lease_secs: 600,
         wip_limit: 1,
+        provider_states: &providers,
     });
     let asg = plan
         .assignments

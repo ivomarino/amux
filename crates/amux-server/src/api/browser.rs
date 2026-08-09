@@ -1,9 +1,20 @@
 //! Browser API (RR-0092): HTTP surface over `integrations::browser` — the
 //! native Chrome profile manager (plan lesson L7). Route names follow the
-//! Python server's `/api/browser/*` family; the shapes cover the native
-//! subset (profiles, start/stop/status). The Python server's browser-use
-//! driver verbs (`/action`, `/state`, `/agent`, ...) are model-driven and out
-//! of scope for the native manager.
+//! Python server's `/api/browser/*` family; the NATIVE routes cover the
+//! machine-local subset (profiles, start/stop/status, profile/create).
+//!
+//! Everything else — the Python server's browser-use driver verbs
+//! (`/action`, `/state`, `/agent`, `/inspect`, `/save-profile`, `/navigate`,
+//! `/search`, `/sessions`, `/pw-profiles`, ...) and `/screenshot` — proxies
+//! to the Python server via the nest fallback (strangler-fig, same shape as
+//! the session verbs). The playwright driver and its CDP websocket live in
+//! the Python process ON THIS SAME MACHINE, which keeps the user directive
+//! "browser stuff must use the machine the server runs on" true through the
+//! proxy. Known pre-cutover seam, on purpose: a Chrome launched by the
+//! native `/start` is NOT the browser the proxied driver verbs operate —
+//! Python resolves its own per-session driver (auto-launching one on first
+//! use). Cutover replaces the proxied half with a native driver; until then
+//! one implementation stays authoritative.
 //!
 //! Routes (nested at `/api/browser`):
 //! - `POST /start {profile?, url?}`     — launch Chrome on a profile; if one
@@ -13,8 +24,9 @@
 //! - `GET  /profiles?sizes=1`           — inventory (sizes opt-in; see L7)
 //! - `POST /profile/create {name, url?}`— create a profile dir, optionally
 //!   open a headed window on it to sign in
-//! - `GET  /screenshot`                 — honest 501: needs the CDP
-//!   WebSocket, which this build does not speak (see below)
+//! - anything else                      — python-proxy fallback (incl.
+//!   `/screenshot`, which needs the CDP WebSocket this build cannot speak;
+//!   proxying replaced the former honest 501)
 
 use super::AppState;
 use crate::integrations::browser as chrome;
@@ -31,9 +43,19 @@ pub fn routes() -> Router<AppState> {
         .route("/start", post(start))
         .route("/status", get(status))
         .route("/stop", post(stop))
-        .route("/screenshot", get(screenshot))
         .route("/profiles", get(profiles))
         .route("/profile/create", post(profile_create))
+        // Unimplemented verbs (screenshot, action, state, agent, inspect,
+        // save-profile, navigate, search, sessions, pw-profiles, DELETE
+        // profile/{name}, ...) forward to the Python owner — including its
+        // helpful 404 catalog for unknown routes, which stays identical on
+        // both origins by construction. EXPLICIT wildcard routes, not
+        // `.fallback()`: in the full composition the static SPA catch-all
+        // (`/{*path}`) out-competes a nested fallback and served index.html
+        // for every driver verb (caught live on 18940; unit tests missed it
+        // because they had no competing static route).
+        .route("/", axum::routing::any(super::py_proxy::forward_handler))
+        .route("/{*rest}", axum::routing::any(super::py_proxy::forward_handler))
 }
 
 fn err(status: StatusCode, body: Value) -> Response {
@@ -95,22 +117,6 @@ async fn stop() -> Response {
     let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
     v["ok"] = json!(true);
     Json(v).into_response()
-}
-
-// TODO(RR-0092): CDP WS screenshot needs a websocket dep decision.
-// `Page.captureScreenshot` is only reachable over the DevTools WebSocket;
-// the HTTP endpoints (/json/list, /json/new) cannot express it, and this
-// workspace has no websocket client crate. 501 with the missing capability
-// named beats a fake success or a shelled-out workaround (ethos rule 7).
-async fn screenshot() -> Response {
-    err(
-        StatusCode::NOT_IMPLEMENTED,
-        json!({
-            "error": "screenshot requires the Chrome DevTools WebSocket (Page.captureScreenshot); \
-                      this build speaks CDP over HTTP only (/json/list, /json/new)",
-            "missing_capability": "websocket client dependency (undecided — see TODO(RR-0092))",
-        }),
-    )
 }
 
 #[derive(Deserialize, Default)]
@@ -178,4 +184,94 @@ async fn profile_create(Json(body): Json<CreateBody>) -> Response {
         "note": "sign in through the opened window, then POST /api/browser/stop to flush the profile",
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Tests — proxy routing only (native launch paths need a real Chrome).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::py_proxy::tests::{fake_python, PY_BASE_OVERRIDE, PY_LOCK};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        std::mem::forget(dir);
+        let state = AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        Router::new().nest("/api/browser", routes()).with_state(state)
+    }
+
+    #[tokio::test]
+    async fn driver_verbs_and_screenshot_proxy_but_status_stays_native() {
+        let _guard = PY_LOCK.lock().await;
+        let (base, log) =
+            fake_python(StatusCode::OK, r#"{"ok": true, "path": "/tmp/shot.png"}"#).await;
+        *PY_BASE_OVERRIDE.lock().unwrap() = Some(base);
+        let app = app();
+
+        // /screenshot: forwarded with full original path+query.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/browser/screenshot?session=t1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("x-amux-answered-by").unwrap(), "python-proxy");
+
+        // /action (a driver verb with no native route): forwarded too.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/browser/action")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"action":"eval","session":"t1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("x-amux-answered-by").unwrap(), "python-proxy");
+
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both requests reached the fake python");
+        assert_eq!(seen[0].path_and_query, "/api/browser/screenshot?session=t1");
+        assert_eq!(seen[1].path_and_query, "/api/browser/action");
+        assert_eq!(seen[1].body, br#"{"action":"eval","session":"t1"}"#.to_vec());
+
+        // /status is NATIVE: no third request may appear at the fake python,
+        // and with no launched Chrome it answers running:false locally.
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/browser/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("x-amux-answered-by").is_none(), "status answered locally");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["running"], json!(false));
+        assert_eq!(log.lock().unwrap().len(), 2, "status did not proxy");
+        *PY_BASE_OVERRIDE.lock().unwrap() = None;
+    }
 }

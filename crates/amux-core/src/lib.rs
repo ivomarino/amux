@@ -21,6 +21,7 @@
 //! - `limits`        RR-0028f (Invariants 47, 49)
 //! - `capability`    RR-0028g (Invariants 52, 36)
 //! - `circuit`       RR-0028h (Invariants 48, 45, 10)
+//! - `provider_fleet` RR-0044b (Invariants 20, 22)
 //! - `criteria`      RR-0028i (Invariant 50)
 //! - `isolation`     RR-0028k (Invariants 33, 10, 49)
 
@@ -39,6 +40,7 @@ pub mod message;
 pub mod orchestrator;
 pub mod protocol;
 pub mod provider;
+pub mod provider_fleet;
 pub mod revision;
 pub mod scope;
 pub mod search;

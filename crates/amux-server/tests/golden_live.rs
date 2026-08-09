@@ -154,6 +154,7 @@ fn runtime(
         fleet_state: Mutex::new(FleetState::Normal),
         protocol,
         pickup_unowned: false,
+        resume_stagger_secs: 5,
     }
 }
 

@@ -120,6 +120,7 @@ fn incident_regression_noop_write_bumps_nothing() {
                     entity_type: amux_core::revision::EntityType::Other("probe".into()),
                     entity_id: "x".into(),
                     mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
                 }],
             })
         })

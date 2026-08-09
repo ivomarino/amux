@@ -269,9 +269,10 @@ mod tests {
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: Some(protocol),
             pickup_unowned: false,
+            resume_stagger_secs: 5,
         };
         let mut rx = store.subscribe();
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
 
         // Terminal state reached...
         {

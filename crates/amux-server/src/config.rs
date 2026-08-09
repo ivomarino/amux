@@ -67,8 +67,14 @@ impl ServerConfig {
         self.amux_home.join("tls")
     }
 
+    /// Python's `_AUTH_TOKEN_FILE` (amux-server.py:700): `auth_token`,
+    /// UNDERSCORE. This crate shipped reading `auth-token` (dash) and minted
+    /// its own token there, so every client holding the real shared token got
+    /// 401s from this server while the auth docstring claimed the file was
+    /// shared. The stale dash-file may still exist on machines that ran the
+    /// old build; nothing reads it anymore.
     pub fn auth_token_path(&self) -> PathBuf {
-        self.amux_home.join("auth-token")
+        self.amux_home.join("auth_token")
     }
 }
 

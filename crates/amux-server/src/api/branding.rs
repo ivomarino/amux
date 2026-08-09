@@ -150,6 +150,7 @@ pub async fn post_branding(State(state): State<AppState>, body: Option<Json<Valu
                         entity_type: amux_core::revision::EntityType::Other("pref".into()),
                         entity_id: "branding".into(),
                         mutation: amux_core::revision::MutationKind::Updated,
+                        payload: None,
                     }],
                 })
             })
@@ -218,6 +219,7 @@ pub async fn delete_branding(State(state): State<AppState>) -> Response {
                     entity_type: amux_core::revision::EntityType::Other("pref".into()),
                     entity_id: "branding".into(),
                     mutation: amux_core::revision::MutationKind::Deleted,
+                    payload: None,
                 }],
             })
         })

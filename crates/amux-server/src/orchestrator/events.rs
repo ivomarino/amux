@@ -60,6 +60,7 @@ fn ev(entity_type: EntityType, id: &str, mutation: MutationKind) -> PendingEvent
         entity_type,
         entity_id: id.to_string(),
         mutation,
+        payload: None,
     }
 }
 
@@ -77,14 +78,20 @@ fn write_state(
 ) -> rusqlite::Result<()> {
     let n = queries::update_worker_state(conn, wid, new_state, now_s)?;
     if n > 0 {
-        events.push(ev(
-            EntityType::Worker,
-            wid,
-            MutationKind::StatusChanged {
+        // Post-mutation snapshot for the journal (RR-0111a): one indexed
+        // read inside the same transaction. Worker state events fire every
+        // turn — leaving them payload-less would advance the replay horizon
+        // on every turn, making worker replay permanently unknown.
+        let payload = queries::get_worker(conn, wid)?.map(|r| r.snapshot());
+        events.push(PendingEvent {
+            entity_type: EntityType::Worker,
+            entity_id: wid.to_string(),
+            mutation: MutationKind::StatusChanged {
                 from: prior.map(state_tag).unwrap_or_else(|| "unknown".into()),
                 to: state_tag(new_state),
             },
-        ));
+            payload,
+        });
     } else {
         tracing::warn!(
             worker = wid,

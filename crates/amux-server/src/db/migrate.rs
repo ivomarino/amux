@@ -61,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0007_criteria",
         sql: include_str!("../../migrations/0007_criteria.sql"),
     },
+    Migration {
+        version: 8,
+        name: "0008_event_payload",
+        sql: include_str!("../../migrations/0008_event_payload.sql"),
+    },
 ];
 
 pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {

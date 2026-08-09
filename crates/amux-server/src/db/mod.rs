@@ -19,6 +19,7 @@ pub mod board_store;
 pub mod memories;
 pub mod migrate;
 pub mod queries;
+pub mod replay;
 
 use amux_core::revision::{MutationKind, StateEvent, StateRevision};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -44,6 +45,19 @@ pub struct PendingEvent {
     pub entity_type: amux_core::revision::EntityType,
     pub entity_id: String,
     pub mutation: MutationKind,
+    /// RR-0111a: the POST-MUTATION snapshot of the entity row, journaled in
+    /// the same transaction as the mutation so state can be replayed from
+    /// events alone (plan Invariant 24, EventPayload::Inline). The row is in
+    /// the writer's hand when the event is built, so a snapshot costs one
+    /// serialization, never a re-read.
+    ///
+    /// `None` is honest, not lazy: it means this event records THAT the
+    /// entity changed, without the state it changed into. Replay
+    /// (`db::replay`) reports such entities under `pre_payload_horizon`
+    /// instead of pretending an older snapshot is current. Worker and board
+    /// (task) mutations populate this; other sites may stay `None` until
+    /// their entities need replay.
+    pub payload: Option<serde_json::Value>,
 }
 
 type WriteFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send>;
@@ -190,8 +204,7 @@ impl Store {
             let (rev, entity_type, entity_id, mutation, at) = row?;
             events.push(StateEvent {
                 rev: StateRevision(rev),
-                entity_type: serde_json::from_str(&format!("\"{entity_type}\""))
-                    .unwrap_or(amux_core::revision::EntityType::Other(entity_type)),
+                entity_type: parse_entity_type(&entity_type),
                 entity_id,
                 mutation: serde_json::from_str(&mutation)
                     .unwrap_or(MutationKind::Updated),
@@ -200,6 +213,25 @@ impl Store {
         }
         Ok((events, false))
     }
+}
+
+/// Parse a stored `entity_type` column back into the enum: the bare tag
+/// ("worker", "fleet_progress" — the current storage format), with tolerance
+/// for the legacy adjacently-tagged object ({"kind":"worker"} /
+/// {"kind":"other","data":"x"}) that rows written before the bare-tag fix
+/// still carry. Unknown tags land in `Other(tag)` — the open-enum contract.
+/// (The previous reader wrapped the raw value in quotes and fed it to serde,
+/// which CANNOT parse an adjacently-tagged unit variant from a JSON string —
+/// so every event round-tripped as Other(...), for typed variants too.)
+fn parse_entity_type(raw: &str) -> amux_core::revision::EntityType {
+    use amux_core::revision::EntityType;
+    if raw.starts_with('{') {
+        if let Ok(t) = serde_json::from_str::<EntityType>(raw) {
+            return t;
+        }
+    }
+    serde_json::from_str::<EntityType>(&format!("{{\"kind\":\"{raw}\"}}"))
+        .unwrap_or_else(|_| EntityType::Other(raw.to_string()))
 }
 
 fn configure_connection(c: &Connection) -> rusqlite::Result<()> {
@@ -247,14 +279,34 @@ fn apply_write(
         let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         let now = chrono::Utc::now();
         for ev in outcome.events {
-            let entity_type_json = serde_json::to_string(&ev.entity_type)
-                .unwrap_or_else(|_| "\"other\"".into());
-            let entity_type_str = entity_type_json.trim_matches('"').to_string();
+            // The COLUMN stores the BARE tag ("worker", "task",
+            // "fleet_progress"), never serde's adjacently-tagged object.
+            // Three consumers filter on `entity_type = '<tag>'` — the
+            // redistribute dedupe, /api/metrics/fleet's last-event lookups,
+            // and the breaker's window_stats — and all three silently
+            // matched NOTHING while this column held {"kind":"task"}
+            // (the previous trim_matches('"') stripped quotes from a shape
+            // serde never produces for this enum; caught by RR-0111a's
+            // replay work + the redistribute dedupe test). Old rows in
+            // existing DBs may still carry the object shape, so READERS
+            // stay tolerant of both: parse_entity_type below,
+            // db::replay::entity_tag.
+            let entity_type_str = match &ev.entity_type {
+                amux_core::revision::EntityType::Other(s) => s.clone(),
+                t => serde_json::to_value(t)
+                    .ok()
+                    .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "other".into()),
+            };
             let mutation_json = serde_json::to_string(&ev.mutation).unwrap_or_default();
+            // Snapshot rides in the same INSERT as the event it describes —
+            // journal row and payload cannot disagree about which transaction
+            // produced them (RR-0111a).
+            let payload_json = ev.payload.as_ref().map(|p| p.to_string());
             conn.execute(
-                "INSERT INTO _amux_state_events (rev, entity_type, entity_id, mutation, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![rev, entity_type_str, ev.entity_id, mutation_json, now.to_rfc3339()],
+                "INSERT INTO _amux_state_events (rev, entity_type, entity_id, mutation, at, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![rev, entity_type_str, ev.entity_id, mutation_json, now.to_rfc3339(), payload_json],
             )?;
             committed_events.push(StateEvent {
                 rev: StateRevision(rev),

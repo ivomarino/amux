@@ -27,13 +27,27 @@ async fn index(State(state): State<AppState>) -> Response {
 
 async fn serve_path(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    // UNKNOWN /api/* paths reach this catch-all (the API router only claims
+    // registered routes) and must answer the Python server's JSON 404 — not
+    // the SPA shell. Serving 200 text/html here made a probe conclude
+    // "GET /api/fs?path=/tmp returns 200 with NO token": the "endpoint" was
+    // this fallback handing back index.html (ethos rule 4 — the instrument
+    // could not express "no such route").
+    if path.starts_with("api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"error\": \"not found\"}",
+        )
+            .into_response();
+    }
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
             ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
         }
-        // SPA fallback: unknown paths get the shell so client routing works
-        // offline-first; API 404s are handled by the API router before this.
+        // SPA fallback: unknown NON-API paths get the shell so client routing
+        // works offline-first.
         None => serve_index(&state),
     }
 }
@@ -195,5 +209,43 @@ mod tests {
     fn missing_markers_serve_untouched() {
         let html = "<head>no markers</head>";
         assert_eq!(inject_bootstrap(html, &state(None)), html);
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_is_a_json_404_not_the_spa_shell() {
+        use tower::ServiceExt;
+        let app = routes().with_state(state(Some("tok")));
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/definitely-not-a-route?x=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({ "error": "not found" }));
+
+        // Non-API unknown paths still get the SPA shell (client routing).
+        let res = routes()
+            .with_state(state(Some("tok")))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/some/client/route")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct.starts_with("text/html"), "{ct}");
     }
 }

@@ -90,7 +90,14 @@ async fn async_main() {
         return;
     }
 
-    let auth_token = api::auth::load_or_create_token(&cfg.auth_token_path()).ok();
+    // AMUX_AUTH_TOKEN parity (amux-server.py:701): a non-empty env value IS
+    // the token, the literal "none" disables auth, otherwise the token file
+    // shared with the Python server.
+    let auth_token = match cfg.env.get("AMUX_AUTH_TOKEN").map(|s| s.trim()) {
+        Some(v) if v.eq_ignore_ascii_case("none") => None,
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => api::auth::load_or_create_token(&cfg.auth_token_path()).ok(),
+    };
 
     // RR-0092: at boot no amux-launched Chrome exists, so Singleton* locks in
     // amux-owned profile dirs are stale by definition and would block the next
@@ -143,6 +150,13 @@ async fn async_main() {
             opencode::structured::StructuredCliProtocol::new(),
         )),
         pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
+        // RR-0044b: staggered un-park interval after a provider rate-limit
+        // reset (thundering-herd prevention).
+        resume_stagger_secs: cfg
+            .env
+            .get("AMUX_RS_RESUME_STAGGER_SECS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(amux_core::provider_fleet::DEFAULT_RESUME_STAGGER_SECS),
     });
     match runtime.reconcile_on_startup().await {
         Ok(report) => tracing::info!(
@@ -198,7 +212,10 @@ async fn async_main() {
     );
     axum_server::bind(addr)
         .acceptor(acceptor)
-        .serve(app.into_make_service())
+        // with_connect_info: the auth middleware's localhost bypass (Python
+        // parity) needs the PEER address; without this every request looks
+        // remote and local tokenless CLI calls 401.
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
         .expect("server run");
 }

@@ -393,6 +393,48 @@ impl IssueRow {
         }
     }
 
+    /// RR-0111a: the canonical replay snapshot of this row — also the API's
+    /// detail body (`api::board::detail_body` delegates here). ONE function
+    /// serializes the row at event-write time and at verify time, so
+    /// `db::replay::verify_replay`'s comparison cannot drift from what the
+    /// journal recorded.
+    ///
+    /// `tags` are SORTED: the live read assembles them via `GROUP_CONCAT`,
+    /// whose order SQLite does not define, while an event snapshot carries
+    /// the caller's staging order — without one canonical order, replay
+    /// verification would report phantom tag divergences on identical sets.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let mut tags = self.tags.clone();
+        tags.sort();
+        serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "desc": self.desc,
+            "status": self.status,
+            "session": self.session,
+            "shepherd": self.shepherd,
+            "type": self.item_type,
+            "creator": self.creator,
+            "due": self.due,
+            "due_time": self.due_time,
+            "created": self.created,
+            "updated": self.updated,
+            "owner_type": self.owner_type,
+            "pinned": self.pinned,
+            "pos": self.pos,
+            "archived": self.archived,
+            "depends_on": self.depends_on,
+            "reviewer": self.reviewer,
+            "log": self.log,
+            "source_ref": self.source_ref,
+            "last_verified_at": self.last_verified_at,
+            "rev": self.rev,
+            "gate": self.gate_criteria(),
+            "tags": tags,
+            "version": self.version,
+        })
+    }
+
     /// Bridge into the core [`Task`] so every status change runs through
     /// [`board::apply_transition`]. `None` when the stored status string is
     /// not in the shared vocabulary (a custom Python lane) — callers must
@@ -509,14 +551,16 @@ pub fn get_issue(conn: &Connection, id: &str) -> rusqlite::Result<Option<IssueRo
     .optional()
 }
 
-/// Archived filter for the list (`archived` query param).
+/// Archived filter for the list (`archived` query param), Python's grammar
+/// (amux-server.py:14025): absent/"" = no filter, truthy = archived-only,
+/// any other value = non-archived only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchivedFilter {
-    /// Only archived=0 rows (the API default).
+    /// Only archived=0 rows (`archived=0` — and any other non-truthy value).
     ActiveOnly,
-    /// Only archived=1 rows.
+    /// Only archived=1 rows (`archived=1`/`true`/`yes`).
     ArchivedOnly,
-    /// No filter (`archived=all`).
+    /// No filter (the `archived` param absent or empty).
     All,
 }
 
@@ -617,6 +661,39 @@ pub fn cap_terminal(items: Vec<IssueRow>, limit: i64) -> (Vec<IssueRow>, usize, 
         .map(|(_, r)| r)
         .collect();
     (kept, total, limit as usize)
+}
+
+/// Python `_load_board(done_limit=100)`'s terminal quotas — the SSE board
+/// channel's shape (amux-server.py:15825-15860): active items unlimited,
+/// `verified` gets its OWN quota of max(done_limit, 300) so the flood of
+/// `done` cannot crowd prod-confirmed work out of the UI, and done/discarded
+/// share done_limit. Both quotas keep the most recently UPDATED. Discovered
+/// live 2026-08-09: ~130 cards were verified in bulk and the Rust SSE push
+/// (single lumped 100-cap) showed 9 of them while Python showed 141.
+pub fn sse_terminal_quota(items: Vec<IssueRow>, done_limit: usize) -> Vec<IssueRow> {
+    let verified_limit = done_limit.max(300);
+    let keep_top = |status_match: &dyn Fn(&str) -> bool, limit: usize| -> std::collections::HashSet<usize> {
+        let mut idx: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| status_match(&r.status.trim().to_lowercase()))
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|a, b| items[*b].updated.cmp(&items[*a].updated));
+        idx.into_iter().take(limit).collect()
+    };
+    let keep_verified = keep_top(&|s: &str| s == "verified", verified_limit);
+    let keep_done = keep_top(&|s: &str| matches!(s, "done" | "discarded"), done_limit);
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, r)| match r.status.trim().to_lowercase().as_str() {
+            "verified" => keep_verified.contains(i),
+            "done" | "discarded" => keep_done.contains(i),
+            _ => true,
+        })
+        .map(|(_, r)| r)
+        .collect()
 }
 
 /// Fields for a new card. Everything the Python POST persists (reviewer and
@@ -814,6 +891,60 @@ pub fn depends_on_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_terminal_quota_gives_verified_its_own_floor() {
+        // 400 verified + 150 done + 5 doing: Python keeps ALL doing, the 300
+        // newest verified, and the 100 newest done — the lumped 100-cap
+        // showed 9 of a 141-card bulk-verify while Python showed all of it.
+        let mk = |i: i64, status: &str| IssueRow {
+            id: format!("T-{i}"),
+            title: String::new(),
+            desc: String::new(),
+            status: status.into(),
+            session: None,
+            creator: String::new(),
+            due: None,
+            created: i,
+            updated: i,
+            owner_type: "human".into(),
+            due_time: None,
+            pinned: 0,
+            gcal_event_id: None,
+            pos: 0.0,
+            notified: 0,
+            gate: None,
+            shepherd: None,
+            item_type: "code".into(),
+            archived: 0,
+            depends_on: vec![],
+            reviewer: None,
+            log: None,
+            rev: 0,
+            source_ref: None,
+            last_verified_at: None,
+            version: 0,
+            tags: vec![],
+        };
+        let mut items: Vec<IssueRow> = Vec::new();
+        for i in 0..400 {
+            items.push(mk(i, "verified"));
+        }
+        for i in 400..550 {
+            items.push(mk(i, "done"));
+        }
+        for i in 550..555 {
+            items.push(mk(i, "doing"));
+        }
+        let kept = sse_terminal_quota(items, 100);
+        let count = |s: &str| kept.iter().filter(|r| r.status == s).count();
+        assert_eq!(count("verified"), 300);
+        assert_eq!(count("done"), 100);
+        assert_eq!(count("doing"), 5);
+        // The newest survive: verified 399 kept, verified 0 evicted.
+        assert!(kept.iter().any(|r| r.id == "T-399"));
+        assert!(!kept.iter().any(|r| r.id == "T-0"));
+    }
 
     #[test]
     fn internal_id_is_deterministic_and_distinct() {

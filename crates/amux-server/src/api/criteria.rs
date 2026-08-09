@@ -162,6 +162,7 @@ async fn put_criteria(
                     entity_type: amux_core::revision::EntityType::Other("criteria".into()),
                     entity_id: id2.clone(),
                     mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
                 }],
             })
         })

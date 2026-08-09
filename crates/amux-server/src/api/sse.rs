@@ -155,12 +155,36 @@ fn legacy_board_json(store: &crate::db::SharedStore) -> Option<String> {
         crate::db::board_store::ArchivedFilter::ActiveOnly,
     )
     .ok()?;
-    let (kept, _, _) = crate::db::board_store::cap_terminal(rows, 100);
+    // Python's SSE board channel (amux-server.py:65222-65249): the
+    // _load_board(100) TERMINAL QUOTAS (verified gets its own 300-floor so
+    // bulk-verifies stay visible), non-archived only, desc slimmed to its
+    // first line — NOT the REST path's lumped cap_terminal(100).
+    let kept = crate::db::board_store::sse_terminal_quota(rows, 100);
+    // Same stale derivation as GET /api/board (a view must share its
+    // mechanism's predicate) — skipped when no in-progress card needs it.
+    let working = if kept
+        .iter()
+        .any(|r| matches!(r.status.as_str(), "doing" | "review"))
+    {
+        crate::api::sessions_legacy::active_python_sessions(&conn)
+    } else {
+        Default::default()
+    };
+    let now = chrono::Utc::now().timestamp();
     let items: Vec<serde_json::Value> = kept
         .iter()
         // The API's own list serializer — the SSE view and the GET view can
-        // never disagree (a view must share its mechanism's predicate).
-        .map(|r| crate::api::board::list_body(r, false))
+        // never disagree (a view must share its mechanism's predicate) —
+        // plus Python's SSE-only desc slimming on top.
+        .map(|r| {
+            let mut v = crate::api::board::list_body(
+                r,
+                false,
+                crate::api::board::is_stale(r, now, &working),
+            );
+            crate::api::board::apply_sse_desc_slim(&mut v, &r.desc);
+            v
+        })
         .collect();
     serde_json::to_string(&items).ok()
 }

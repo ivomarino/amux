@@ -85,6 +85,7 @@ async fn set_pref(State(state): State<AppState>, Json(body): Json<SetPref>) -> R
                     entity_type: amux_core::revision::EntityType::Other("pref".into()),
                     entity_id: key.clone(),
                     mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
                 }],
             })
         })

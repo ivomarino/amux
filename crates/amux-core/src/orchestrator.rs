@@ -79,6 +79,12 @@ pub struct TickInputs<'a> {
     pub lease_secs: i64,
     /// Max concurrent leases per worker (WIP limit).
     pub wip_limit: usize,
+    /// Per-provider fleet state (RR-0044b). A worker on a `QuotaExhausted`
+    /// provider receives NO assignments even when the worker itself looks
+    /// idle — the provider knows first. An absent provider is not evidence
+    /// of anything and gates nothing (Invariant 20).
+    pub provider_states:
+        &'a BTreeMap<crate::provider::ProviderId, crate::provider_fleet::ProviderFleetState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,6 +153,18 @@ pub fn plan_tick(inputs: &TickInputs) -> TickPlan {
         return plan;
     }
 
+    // Fleet-wide provider pause (RR-0044b): a worker whose provider is
+    // exhausted is out of the game regardless of its own state — one
+    // worker's rate limit parks every same-provider worker, instead of each
+    // one independently discovering the limit and thrashing against it.
+    let provider_paused = |w: &Worker| {
+        inputs
+            .provider_states
+            .get(&w.config.provider)
+            .map(|p| p.state.is_exhausted())
+            .unwrap_or(false)
+    };
+
     // 3. Runnable, unleased tasks, best score first (ties: older id first
     // for determinism).
     let mut candidates: Vec<&Task> = inputs
@@ -172,7 +190,7 @@ pub fn plan_tick(inputs: &TickInputs) -> TickPlan {
         let capacity = |w: &Worker| {
             let held = lease_count.get(&w.id()).copied().unwrap_or(0)
                 + assigned_this_tick.get(&w.id()).copied().unwrap_or(0);
-            worker_available(w, held, inputs.wip_limit)
+            !provider_paused(w) && worker_available(w, held, inputs.wip_limit)
         };
         let chosen: Option<&Worker> = match &task.worker {
             Some(owner) => inputs
@@ -231,6 +249,13 @@ pub fn plan_tick(inputs: &TickInputs) -> TickPlan {
             let WorkerState::Idle { since } = &w.state else {
                 continue;
             };
+            // An exhausted provider parks its workers DELIBERATELY — that
+            // silence is not a stall, and reporting it would send the
+            // stall-fixer to fight the provider gate (the same livelock the
+            // circuit breaker suppression above exists to prevent).
+            if provider_paused(w) {
+                continue;
+            }
             for t in inputs.tasks {
                 if t.worker.as_ref() != Some(w.id()) || assigned.contains(&t.id) {
                     continue;
@@ -320,6 +345,18 @@ mod tests {
         t
     }
 
+    /// Shared empty provider map ('static so the helper below stays
+    /// signature-compatible with every existing call site).
+    fn no_providers() -> &'static BTreeMap<
+        crate::provider::ProviderId,
+        crate::provider_fleet::ProviderFleetState,
+    > {
+        static EMPTY: std::sync::OnceLock<
+            BTreeMap<crate::provider::ProviderId, crate::provider_fleet::ProviderFleetState>,
+        > = std::sync::OnceLock::new();
+        EMPTY.get_or_init(BTreeMap::new)
+    }
+
     fn inputs<'a>(
         tasks: &'a [Task],
         workers: &'a [Worker],
@@ -339,6 +376,7 @@ mod tests {
             gates: &[],
             lease_secs: 600,
             wip_limit: 1,
+            provider_states: no_providers(),
         }
     }
 
@@ -862,6 +900,7 @@ mod lease_release_tests {
         }];
         let tasks = vec![task];
         let (h, a) = (BTreeMap::new(), BTreeMap::new());
+        let providers = BTreeMap::new();
         let plan = plan_tick(&TickInputs {
             now,
             tasks: &tasks,
@@ -873,6 +912,7 @@ mod lease_release_tests {
             gates: &[],
             lease_secs: 600,
             wip_limit: 1,
+            provider_states: &providers,
         });
         assert_eq!(plan.reclaim.len(), 1, "terminal task frees its lease now");
     }

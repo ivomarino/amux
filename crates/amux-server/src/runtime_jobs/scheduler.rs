@@ -963,6 +963,7 @@ pub async fn scheduler_tick(
                                 from: edue,
                                 to: "would-fire".into(),
                             },
+                            payload: None,
                         }],
                     })
                 })
@@ -1123,11 +1124,13 @@ async fn fire_one(
                 entity_type: EntityType::Schedule,
                 entity_id: sched.id().to_string(),
                 mutation: MutationKind::Updated,
+                payload: None,
             });
             events.push(PendingEvent {
                 entity_type: EntityType::Other("schedule_fire".into()),
                 entity_id: sched.id().to_string(),
                 mutation: MutationKind::StatusChanged { from: stored_next, to: "fired".into() },
+                payload: None,
             });
             if due.overflow > 0 {
                 events.push(PendingEvent {
@@ -1137,6 +1140,7 @@ async fn fire_one(
                         from: due.overflow.to_string(),
                         to: format!("{policy:?}").to_lowercase(),
                     },
+                    payload: None,
                 });
             }
             Ok(WriteOutcome { applied: true, events })

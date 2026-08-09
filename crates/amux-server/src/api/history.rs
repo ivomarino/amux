@@ -58,6 +58,7 @@ fn ev(id: &str, mutation: MutationKind) -> PendingEvent {
         entity_type: EntityType::Other("cmd_history".into()),
         entity_id: id.to_string(),
         mutation,
+        payload: None,
     }
 }
 

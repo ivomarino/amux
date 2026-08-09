@@ -146,34 +146,215 @@ async fn create_list_detail_lifecycle() {
     assert_eq!(v["creator"], json!("orch"));
 }
 
-// ---- L1: desc truncation in lists, full in detail ------------------------
+// ---- Python-parity list payload: full desc + full log --------------------
+//
+// The earlier L1 slimming (first-line desc + log_n instead of log) diverged
+// from the Python oracle, whose plain list serves both whole — and the SPA
+// renders `item.desc` and reads `item.log` (folded badge) straight off the
+// LIST payload, so both were silently blank on the Rust dashboard
+// (AMUX-2586 fix #4, measured live 2026-08-09). slim=1 stays the diet.
 
 #[tokio::test]
-async fn list_truncates_desc_detail_serves_it_whole() {
+async fn plain_list_serves_full_desc_and_log_slim_stays_the_diet() {
     let (app, _dir) = app();
     let long_desc = format!("first line {}\nsecond line body", "x".repeat(300));
-    create(&app, json!({ "title": "Big desc", "desc": long_desc })).await;
+    let v = create(&app, json!({ "title": "Big desc", "desc": long_desc })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    // Give the card a log line via a desc_append-style PATCH (log is
+    // system-appended); a direct edit note lands in the card's log.
+    let (_, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc": format!("{long_desc} edited") })),
+    )
+    .await;
 
     let (_, _, list) = send(&app, "GET", "/api/board", None).await;
     let item = &list.as_array().unwrap()[0];
-    let shown = item["desc"].as_str().unwrap();
-    assert!(shown.chars().count() <= 200, "list desc capped at 200 chars");
-    assert!(!shown.contains("second line"), "list desc is first line only");
-    assert_eq!(item["desc_truncated"], json!(true));
-    assert!(item.get("log").is_none(), "log never ships in a list (L1)");
-    assert!(item["log_n"].is_i64() || item["log_n"].is_u64());
+    // Python's plain list: the WHOLE desc, the WHOLE log (string or null),
+    // no desc_truncated / log_n / desc_len keys.
+    assert!(item["desc"].as_str().unwrap().contains("second line"));
+    assert!(item.get("desc_truncated").is_none());
+    assert!(item.get("log_n").is_none());
+    assert!(item.get("desc_len").is_none());
+    assert!(
+        item.get("log").is_some(),
+        "log must be present in the plain list (SPA folded badge reads it)"
+    );
 
-    // slim=1 drops desc entirely and declares its length instead.
+    // slim=1 drops desc AND log, declaring desc_len + log_n instead.
     let (_, _, slim) = send(&app, "GET", "/api/board?slim=1", None).await;
     let item = &slim.as_array().unwrap()[0];
     assert!(item.get("desc").is_none());
-    assert_eq!(item["desc_len"].as_u64().unwrap() as usize, long_desc.chars().count());
+    assert!(item.get("log").is_none());
+    assert!(item["desc_len"].as_u64().is_some());
+    assert!(item["log_n"].as_u64().is_some());
 
-    // Detail: the whole desc, untruncated.
-    let id = list.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+    // Detail: the whole desc, as ever.
     let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
-    assert_eq!(detail["desc"].as_str().unwrap(), long_desc);
+    assert!(detail["desc"].as_str().unwrap().contains("second line"));
     assert!(detail.get("desc_truncated").is_none());
+}
+
+// ---- GET /api/board/statuses (AMUX-2596) ---------------------------------
+//
+// The SPA builds its kanban columns from this list and silently falls back
+// to a hardcoded default set on any failure — a 404 here meant custom
+// Python-configured columns never rendered on the Rust origin.
+
+#[tokio::test]
+async fn board_statuses_serves_columns_or_python_defaults() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(&app, "GET", "/api/board/statuses", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let cols = v.as_array().unwrap();
+    assert_eq!(cols.len(), 7, "python's builtin column set");
+    assert_eq!(cols[0]["id"], json!("backlog"));
+    assert_eq!(cols[2]["label"], json!("In Progress"));
+    assert_eq!(cols[6]["id"], json!("discarded"));
+}
+
+// ---- PATCH {archived} — the SPA/CLI archive path (AMUX-2492 parity) ------
+
+#[tokio::test]
+async fn patch_archived_round_trip_with_cross_lane_guard() {
+    let (app, _dir) = app();
+    let v = create(&app, json!({ "title": "mine", "session": "lane-a" })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // Cross-lane archive without authorized_by -> Python's 400 guard.
+    let (st, _, e) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "archived": 1 })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("authorized_by"), "{e}");
+    assert_eq!(e["card_owner"], json!("lane-a"));
+
+    // Same-lane archive: applied; the card leaves the active view.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "archived": 1 })),
+        &[("X-Amux-Session", "lane-a")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["archived"], json!(1));
+    let (_, _, active) = send(&app, "GET", "/api/board?archived=0", None).await;
+    assert!(active.as_array().unwrap().is_empty());
+
+    // authorized_by is control, not "ignored"; and it unlocks cross-lane.
+    let v2 = create(&app, json!({ "title": "theirs", "session": "lane-a" })).await;
+    let id2 = v2["id"].as_str().unwrap().to_string();
+    let (st, _, v3) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id2}"),
+        Some(json!({ "archived": "true", "authorized_by": "ethan" })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v3}");
+    assert_eq!(v3["archived"], json!(1));
+    assert!(v3
+        .get("ignored_fields")
+        .and_then(|f| f.as_array())
+        .map(|a| !a.iter().any(|x| x == "authorized_by"))
+        .unwrap_or(true));
+
+    // UN-archive is never gated — the un-do must stay reachable, even
+    // cross-lane (restoring visibility is not destruction).
+    let (st, _, r) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "archived": 0 })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["archived"], json!(0));
+}
+
+// ---- Python `archived` grammar + the tab-counter fetches (AMUX-2586 #5) --
+//
+// The SPA's board tab counters are fed by two fetches: the main list
+// (`?archived=0`) and the archived merge (`?archived=1&done_limit=0`), and
+// the full-text corpus by a BARE `?done_limit=0`. Python's grammar: absent
+// or "" = NO filter; "1"/"true"/"yes" (lowercased) = archived-only; any
+// other value = non-archived only. This pins all three against a fixture
+// mixing archived x owned states, counting exactly what the SPA counts.
+
+#[tokio::test]
+async fn archived_grammar_matches_python_and_tab_counts_pin() {
+    let (app, _dir) = app();
+    // Fixture: 2 live owned, 3 live unowned, 4 archived unowned, 1 archived
+    // owned. "Unowned" (the SPA chip) = open cards with no session.
+    for i in 0..2 {
+        create(&app, json!({ "title": format!("live owned {i}"), "session": "lane-a" })).await;
+    }
+    for i in 0..3 {
+        create(&app, json!({ "title": format!("live unowned {i}"), "session": "" })).await;
+    }
+    let mut archived_ids = Vec::new();
+    for i in 0..4 {
+        let v = create(&app, json!({ "title": format!("arch unowned {i}"), "session": "" })).await;
+        archived_ids.push(v["id"].as_str().unwrap().to_string());
+    }
+    let v = create(&app, json!({ "title": "arch owned", "session": "lane-a" })).await;
+    archived_ids.push(v["id"].as_str().unwrap().to_string());
+    for id in &archived_ids {
+        let (st, _, _) =
+            send(&app, "POST", &format!("/api/board/{id}/archive"), Some(json!({}))).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let count = |v: &Value| v.as_array().unwrap().len();
+    let unowned_open = |v: &Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| {
+                i["session"].as_str().unwrap_or("").is_empty()
+                    && i["archived"].as_i64().unwrap_or(0) == 0
+            })
+            .count()
+    };
+
+    // Main SPA fetch: non-archived only.
+    let (_, _, active) = send(&app, "GET", "/api/board?archived=0", None).await;
+    assert_eq!(count(&active), 5);
+    assert_eq!(unowned_open(&active), 3, "the Unowned chip's number");
+
+    // Archived-merge fetch: archived rows ONLY (returning everything here
+    // is what inflated the merged set the counters scan).
+    let (_, _, arch) = send(&app, "GET", "/api/board?archived=1&done_limit=0", None).await;
+    assert_eq!(count(&arch), 5);
+    assert!(arch.as_array().unwrap().iter().all(|i| i["archived"] == json!(1)));
+
+    // Case-insensitive truthy, Python's `.lower()`.
+    let (_, _, arch2) = send(&app, "GET", "/api/board?archived=TRUE", None).await;
+    assert_eq!(count(&arch2), 5);
+
+    // Bare list (param absent): NO filter — the text-search corpus.
+    let (_, _, all) = send(&app, "GET", "/api/board?done_limit=0", None).await;
+    assert_eq!(count(&all), 10);
+
+    // Python has no "all" spelling: any other value means non-archived.
+    let (_, _, not_truthy) = send(&app, "GET", "/api/board?archived=all", None).await;
+    assert_eq!(count(&not_truthy), 5);
+    let (_, _, zero) = send(&app, "GET", "/api/board?archived=false", None).await;
+    assert_eq!(count(&zero), 5);
+
+    // The two counter feeds are disjoint and together cover the board.
+    assert_eq!(count(&active) + count(&arch), count(&all));
 }
 
 // ---- done_limit + the truncation header quartet (Invariant 40) -----------
@@ -405,8 +586,13 @@ async fn archive_restore_round_trip_preserves_every_field() {
     assert_eq!(v["archived"], json!(1));
     assert_eq!(v["status"], json!("doing"), "archive is a FLAG, not a status");
 
-    // Archived cards are excluded from the default list but discoverable.
+    // Python's grammar: the BARE list has NO archived filter (the card is
+    // still in it, flagged); `?archived=0` is the SPA's active view, which
+    // excludes it; `?archived=1` finds it alone.
     let (_, _, list) = send(&app, "GET", "/api/board", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list.as_array().unwrap()[0]["archived"], json!(1));
+    let (_, _, list) = send(&app, "GET", "/api/board?archived=0", None).await;
     assert!(list.as_array().unwrap().is_empty());
     let (_, _, list) = send(&app, "GET", "/api/board?archived=1", None).await;
     assert_eq!(list.as_array().unwrap().len(), 1);
@@ -505,18 +691,20 @@ async fn noop_patch_reports_applied_false_and_moves_nothing() {
     assert_eq!(v["applied"], json!(false));
     assert_eq!(v["rev"].as_i64().unwrap(), rev0);
 
-    // Unknown keys are NAMED, never silently dropped (AC-263/AMUX-2492).
+    // Unknown keys are NAMED, never silently dropped (AC-263). `archived`
+    // is no longer among them — it is a writable field since the AMUX-2492
+    // parity port; `archived: 0` on an active card is an honest no-op.
     let (st, _, v) = send(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "archived": 1, "bogus_key": true })),
+        Some(json!({ "archived": 0, "bogus_key": true })),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v["applied"], json!(false));
     let ignored = v["ignored_fields"].as_array().unwrap();
-    assert!(ignored.contains(&json!("archived")) && ignored.contains(&json!("bogus_key")));
+    assert!(ignored.contains(&json!("bogus_key")) && !ignored.contains(&json!("archived")));
 
     // Same-status PATCH is also a no-op, not a phantom transition.
     let (st, _, v) = send(

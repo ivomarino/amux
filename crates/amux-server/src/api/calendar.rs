@@ -81,6 +81,7 @@ fn ev(id: &str, mutation: MutationKind) -> PendingEvent {
         entity_type: EntityType::Other("cal_event".into()),
         entity_id: id.to_string(),
         mutation,
+        payload: None,
     }
 }
 

@@ -44,6 +44,29 @@ pub fn foreign_worker_id(name: &str) -> amux_core::ids::WorkerId {
     amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(0, h as u128))
 }
 
+/// Hydrate every worker row into a core `Worker`. Shared by the tick loop
+/// AND the /api/metrics/fleet provider view, so the dashboard's per-provider
+/// picture is derived from the same rows by the same code as the mechanism
+/// that parks workers — a view that re-derived its own filter would drift
+/// (ethos rule 1: a view must share the predicate of the mechanism it
+/// claims to describe).
+pub fn hydrate_workers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Worker>> {
+    // (offset, limit) — a swapped pair here silently loads ZERO workers,
+    // which the recovery test caught: name the intent.
+    let (offset, limit) = (0u64, 10_000u64);
+    let (rows, _total) = crate::db::queries::list_workers(conn, offset, limit)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = amux_core::ids::WorkerId::parse(&row.id).ok()?;
+            let mut w = Worker::new(id, row.config(), Default::default());
+            w.state = row.state.clone();
+            w.version = row.version;
+            Some(w)
+        })
+        .collect())
+}
+
 pub struct Runtime {
     pub store: SharedStore,
     pub backends: Vec<Arc<dyn SessionBackend>>,
@@ -68,6 +91,12 @@ pub struct Runtime {
     /// REGISTERED Rust worker are always eligible; tasks owned by
     /// unresolvable names (the Python fleet's) are NEVER touched.
     pub pickup_unowned: bool,
+    /// RR-0044b thundering-herd prevention: seconds between successive
+    /// un-parks of same-provider workers when a rate-limit reset passes
+    /// (`AMUX_RS_RESUME_STAGGER_SECS`, default 5). Worker i in the
+    /// deterministic (sorted-id) parked order becomes eligible at
+    /// `reset_at + i * stagger`.
+    pub resume_stagger_secs: u64,
 }
 
 impl Runtime {
@@ -139,6 +168,7 @@ impl Runtime {
                                     from: "running".into(),
                                     to: "interrupted".into(),
                                 },
+                                payload: None,
                             }],
                         })
                     })
@@ -222,49 +252,97 @@ impl Runtime {
             self.publish_fleet_state(state).await.ok();
         }
 
+        // Fleet-wide provider coordination (RR-0044b): ONE derivation per
+        // tick from worker states — the same map feeds the pump gate, the
+        // planner, and the redistribute recommendation, so no two consumers
+        // can disagree about which provider is exhausted (ethos rule 4).
+        let provider_states =
+            amux_core::provider_fleet::derive(&workers, now, self.resume_stagger_secs);
+        if let Err(e) = self.recommend_redistribute(&provider_states).await {
+            tracing::warn!(error = %e, "redistribute recommendation failed this tick");
+        }
+
         // Command delivery pump (Invariant 34): drain each worker's queue
         // head through the agent protocol, honoring DeliveryTiming.
-        if let Err(e) = self.pump_commands(now).await {
+        if let Err(e) = self.pump_commands(now, &provider_states).await {
             tracing::warn!(error = %e, "command pump failed this tick");
         }
 
-        // RR-0072: rate-limit recovery. A worker whose reset instant has
-        // passed returns to Idle automatically — the fleet must not stay
-        // parked on a limit that already lifted. Workers rate-limited with
+        // RR-0072 + RR-0044b: STAGGERED rate-limit recovery. A worker whose
+        // reset instant has passed returns to Idle automatically — but not
+        // all at once: parked worker i (sorted-id order per provider)
+        // becomes eligible at reset_at + i*stagger, so a 20-worker fleet
+        // does not fire 20 simultaneous first requests at the provider that
+        // just un-throttled it (thundering herd). Workers rate-limited with
         // NO reset time stay parked until an event or a human moves them:
         // inventing a retry time for an unknown window would be guessing
         // (Invariant 20), and a Credit cap clears on payment, not a clock.
+        let stagger = chrono::Duration::seconds(self.resume_stagger_secs.min(i64::MAX as u64) as i64);
+        let mut parked_by_provider: BTreeMap<
+            amux_core::provider::ProviderId,
+            Vec<(&Worker, DateTime<Utc>)>,
+        > = BTreeMap::new();
         for w in &workers {
             if let amux_core::worker::WorkerState::RateLimited { reset_at: Some(reset) } = &w.state {
-                if now >= *reset {
-                    let wid = w.id().to_string();
-                    self.store
-                        .write_async(move |conn| {
-                            let n = crate::db::queries::update_worker_state(
-                                conn,
-                                &wid,
-                                &amux_core::worker::WorkerState::Idle { since: Utc::now() },
-                                &Utc::now().to_rfc3339(),
-                            )?;
-                            Ok(WriteOutcome {
-                                applied: n > 0,
-                                events: if n > 0 {
-                                    vec![PendingEvent {
-                                        entity_type: EntityType::Worker,
-                                        entity_id: wid.clone(),
-                                        mutation: MutationKind::StatusChanged {
-                                            from: "rate_limited".into(),
-                                            to: "idle".into(),
-                                        },
-                                    }]
-                                } else {
-                                    vec![]
-                                },
-                            })
-                        })
-                        .await?;
-                    tracing::info!(worker = %w.id(), "rate limit reset passed — worker recovered");
+                parked_by_provider
+                    .entry(w.config.provider.clone())
+                    .or_default()
+                    .push((w, *reset));
+            }
+        }
+        for (_, parked) in parked_by_provider {
+            let order: Vec<amux_core::ids::WorkerId> =
+                parked.iter().map(|(w, _)| w.id().clone()).collect();
+            for (w, reset) in parked {
+                // Slot arithmetic through the ONE implementation (core's
+                // resume_schedule, anchored at this worker's own reset so a
+                // solo limit recovers exactly at its reset, index 0).
+                let eligible_at = amux_core::provider_fleet::resume_schedule(&order, reset, stagger)
+                    .into_iter()
+                    .find(|s| &s.worker == w.id())
+                    .map(|s| s.resume_at)
+                    .unwrap_or(reset);
+                if now < eligible_at {
+                    continue;
                 }
+                let wid = w.id().to_string();
+                self.store
+                    .write_async(move |conn| {
+                        let n = crate::db::queries::update_worker_state(
+                            conn,
+                            &wid,
+                            &amux_core::worker::WorkerState::Idle { since: Utc::now() },
+                            &Utc::now().to_rfc3339(),
+                        )?;
+                        // Post-mutation snapshot for the journal (RR-0111a):
+                        // one indexed read inside the same transaction. A
+                        // payload-less Worker event would push the replay
+                        // horizon forward, leaving this worker's replayed
+                        // state permanently unknown.
+                        let payload = if n > 0 {
+                            crate::db::queries::get_worker(conn, &wid)?.map(|r| r.snapshot())
+                        } else {
+                            None
+                        };
+                        Ok(WriteOutcome {
+                            applied: n > 0,
+                            events: if n > 0 {
+                                vec![PendingEvent {
+                                    entity_type: EntityType::Worker,
+                                    entity_id: wid.clone(),
+                                    mutation: MutationKind::StatusChanged {
+                                        from: "rate_limited".into(),
+                                        to: "idle".into(),
+                                    },
+                                    payload,
+                                }]
+                            } else {
+                                vec![]
+                            },
+                        })
+                    })
+                    .await?;
+                tracing::info!(worker = %w.id(), "rate limit reset passed — worker recovered (staggered)");
             }
         }
 
@@ -283,6 +361,7 @@ impl Runtime {
             gates: &[],
             lease_secs: 600,
             wip_limit: 1,
+            provider_states: &provider_states,
         });
 
         // Anti-livelock (RR-0048a): limits filter what actually executes.
@@ -324,6 +403,7 @@ impl Runtime {
                             entity_type: EntityType::Other("fleet_progress".into()),
                             entity_id: payload.clone(),
                             mutation: MutationKind::Updated,
+                            payload: None,
                         }],
                     })
                 })
@@ -366,6 +446,7 @@ impl Runtime {
                         entity_type: EntityType::Other("fleet_state".into()),
                         entity_id: payload.clone(),
                         mutation: MutationKind::Updated,
+                        payload: None,
                     }],
                 })
             })
@@ -424,20 +505,7 @@ impl Runtime {
 
     fn load_state(&self) -> anyhow::Result<(Vec<Worker>, Vec<Lease>, u64)> {
         let conn = self.store.read()?;
-        // (offset, limit) — a swapped pair here silently loads ZERO workers,
-        // which the recovery test caught: name the intent.
-        let (offset, limit) = (0u64, 10_000u64);
-        let (rows, _total) = crate::db::queries::list_workers(&conn, offset, limit)?;
-        let workers: Vec<Worker> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let id = amux_core::ids::WorkerId::parse(&row.id).ok()?;
-                let mut w = Worker::new(id, row.config(), Default::default());
-                w.state = row.state.clone();
-                w.version = row.version;
-                Some(w)
-            })
-            .collect();
+        let workers = hydrate_workers(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT task_id, worker_id, acquired_at, expires_at, generation FROM _amux_leases",
         )?;
@@ -496,6 +564,7 @@ impl Runtime {
                                     from: format!("held:{worker}"),
                                     to: "reclaimed".into(),
                                 },
+                                payload: None,
                             }]
                         } else {
                             vec![]
@@ -535,6 +604,7 @@ impl Runtime {
                                 entity_type: EntityType::Other("context_snapshot".into()),
                                 entity_id: snap.content_hash.clone(),
                                 mutation: MutationKind::Created,
+                                payload: None,
                             }]
                         } else {
                             vec![]
@@ -590,6 +660,7 @@ impl Runtime {
                                 entity_type: EntityType::Other("lease".into()),
                                 entity_id: task.clone(),
                                 mutation: MutationKind::Created,
+                                payload: None,
                             }]
                         } else {
                             vec![]
@@ -622,10 +693,90 @@ impl Runtime {
                         entity_type: EntityType::Other("exhaustion".into()),
                         entity_id: payload.clone(),
                         mutation: MutationKind::Created,
+                        payload: None,
                     }],
                 })
             })
             .await?;
+        Ok(())
+    }
+
+    /// RR-0044b step 3, as a RECOMMENDATION: when a provider is exhausted,
+    /// publish `provider_redistribute_recommended` so a policy layer (or
+    /// the human) can move workers to a fallback via routing.rs. amux never
+    /// applies the redistribution itself — the configured provider is the
+    /// user's decision, and routing.rs's own rule is "never silently swap
+    /// the configured provider" (ethos rule 8).
+    ///
+    /// Deduped DURABLY on (provider, reset_at): the journal is the memory,
+    /// so a restart re-emits nothing for an episode already announced
+    /// (in-memory dedupe state would be fiction across the re-exec). A new
+    /// episode carries a new reset_at and announces itself again.
+    async fn recommend_redistribute(
+        &self,
+        provider_states: &BTreeMap<
+            amux_core::provider::ProviderId,
+            amux_core::provider_fleet::ProviderFleetState,
+        >,
+    ) -> anyhow::Result<()> {
+        for (pid, pstate) in provider_states {
+            let amux_core::provider_fleet::ProviderState::QuotaExhausted { reset_at, kind } =
+                &pstate.state
+            else {
+                continue;
+            };
+            // Stable episode key — parked COUNT is deliberately excluded
+            // (it grows as siblings park, and each growth would re-fire).
+            let key = serde_json::json!({
+                "provider": pid.as_str(),
+                "reset_at": reset_at.map(|r| r.to_rfc3339()),
+                "kind": kind,
+            })
+            .to_string();
+            // STORAGE FORMAT, resolved 2026-08-09: the writer (db/mod.rs
+            // apply_write) stores the BARE tag; the serde object form
+            // (`{"kind":"other","data":...}`) was an accident that left
+            // every `entity_type = '<tag>'` filter matching nothing (this
+            // dedupe, /api/metrics/fleet's `last()`, window_stats). Rows
+            // written before the fix may still carry the object form, so
+            // the dedupe reads BOTH — an old-format episode row must still
+            // suppress re-announcement.
+            let etype_legacy = serde_json::to_string(&EntityType::Other(
+                "provider_redistribute_recommended".into(),
+            ))?;
+            let already = {
+                let conn = self.store.read()?;
+                conn.query_row(
+                    "SELECT COUNT(*) FROM _amux_state_events
+                     WHERE entity_type IN ('provider_redistribute_recommended', ?1)
+                       AND entity_id = ?2",
+                    params![etype_legacy, key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            };
+            if already {
+                continue;
+            }
+            tracing::warn!(provider = %pid, workers_parked = pstate.affected_workers.len(),
+                "provider exhausted — recommending redistribution to a fallback (never applied automatically)");
+            self.store
+                .write_async(move |_conn| {
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![PendingEvent {
+                            entity_type: EntityType::Other(
+                                "provider_redistribute_recommended".into(),
+                            ),
+                            entity_id: key.clone(),
+                            mutation: MutationKind::Created,
+                            payload: None,
+                        }],
+                    })
+                })
+                .await?;
+        }
         Ok(())
     }
 
@@ -634,7 +785,21 @@ impl Runtime {
     /// Immediate always goes; AtTurnBoundary/WhenIdle require the agent to
     /// be at a boundary (Idle or WaitingForInput). Failures transition
     /// through the core state machine — retry budget 3 (Invariant 34).
-    pub(crate) async fn pump_commands(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
+    ///
+    /// `provider_states` (RR-0044b): NO delivery to a worker on an
+    /// exhausted provider, even `Immediate` — the worker may look idle, but
+    /// the provider knows first, and delivering would spend the command's
+    /// retry budget thrashing against a limit the fleet already knows
+    /// about. The command simply stays Queued: the queue IS the park, and
+    /// nothing is lost (lifecycle step 2: "commands queue, not lost").
+    pub(crate) async fn pump_commands(
+        &self,
+        now: DateTime<Utc>,
+        provider_states: &BTreeMap<
+            amux_core::provider::ProviderId,
+            amux_core::provider_fleet::ProviderFleetState,
+        >,
+    ) -> anyhow::Result<()> {
         let Some(protocol) = &self.protocol else {
             return Ok(());
         };
@@ -651,6 +816,11 @@ impl Runtime {
             let Ok(worker) = amux_core::ids::WorkerId::parse(&wid_str) else {
                 continue;
             };
+            // Fleet pause gate (RR-0044b) — sits BEFORE the timing gate so
+            // even Immediate commands park while the provider is exhausted.
+            if amux_core::provider_fleet::worker_on_exhausted_provider(provider_states, &worker) {
+                continue;
+            }
             let head = {
                 let conn = self.store.read()?;
                 crate::db::commands::next_deliverable(&conn, &worker)?
@@ -845,6 +1015,7 @@ impl Runtime {
                                             from: "queued".into(),
                                             to: "delivered".into(),
                                         },
+                                        payload: None,
                                     }]
                                 } else {
                                     vec![]
@@ -893,6 +1064,7 @@ impl Runtime {
                                     from: "failed".into(),
                                     to: format!("dead_lettered: {reason}"),
                                 },
+                                payload: None,
                             });
                         }
                     }
@@ -974,6 +1146,7 @@ mod tests {
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: None,
             pickup_unowned: false,
+            resume_stagger_secs: 5,
         }
     }
 
@@ -1130,6 +1303,7 @@ mod pump_tests {
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: Some(protocol),
             pickup_unowned: false,
+            resume_stagger_secs: 5,
         }
     }
 
@@ -1153,7 +1327,7 @@ mod pump_tests {
                 .unwrap();
         }
         let rt = runtime_with(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
         assert!(protocol.calls().is_empty(), "mid-turn: nothing delivered");
         {
             let conn = store.read().unwrap();
@@ -1163,10 +1337,92 @@ mod pump_tests {
 
         // Turn ends -> delivery goes through and the state advances.
         protocol.set_state(&wid(), AgentState::Idle, None);
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
         let calls = protocol.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(matches!(&calls[0], RecordedCall::SendPrompt { worker, .. } if worker == &wid()));
+        let conn = store.read().unwrap();
+        let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+        assert_eq!(cmd.state, CommandState::Delivered);
+    }
+
+    /// RR-0044b: the fleet gate outranks the timing gate. The worker's own
+    /// agent is Idle and the command is Immediate — every pre-existing gate
+    /// says GO — but a sibling on the same provider is rate-limited, so the
+    /// provider is exhausted and the pump must refuse. The command stays
+    /// Queued (parked, not failed): delivery burns retry budget against a
+    /// limit the fleet already knows about.
+    #[tokio::test]
+    async fn pump_refuses_delivery_on_exhausted_provider_even_immediate() {
+        let store = store();
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(wid(), AgentState::Idle);
+        let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 503));
+        {
+            let id = cmd_id.clone();
+            store
+                .write(move |conn| {
+                    crate::db::commands::enqueue(
+                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k3",
+                        &DeliveryTiming::Immediate, None, Utc::now(),
+                    )?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        // Fleet picture: target worker Idle, a same-provider sibling parked
+        // on an unexpired limit -> provider exhausted. Built through the
+        // same core derivation the tick uses.
+        let mk = |id: amux_core::ids::WorkerId, state: amux_core::worker::WorkerState| {
+            let mut w = amux_core::worker::Worker::new(
+                id,
+                amux_core::worker::WorkerConfig {
+                    display_name: "w".into(),
+                    name_aliases: vec![],
+                    cwd: "/tmp".into(),
+                    provider: amux_core::provider::ProviderId::new("claude"),
+                    model: None,
+                    backend: amux_core::session::BackendId::herdr(),
+                    environment: Default::default(),
+                    permissions: vec![],
+                    group: None,
+                },
+                Default::default(),
+            );
+            w.state = state;
+            w
+        };
+        let now = Utc::now();
+        let sibling = WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 78));
+        let workers = vec![
+            mk(wid(), amux_core::worker::WorkerState::Idle { since: now }),
+            mk(sibling, amux_core::worker::WorkerState::RateLimited {
+                reset_at: Some(now + chrono::Duration::hours(1)),
+            }),
+        ];
+        let exhausted = amux_core::provider_fleet::derive(&workers, now, 5);
+
+        let rt = runtime_with(store.clone(), protocol.clone());
+        rt.pump_commands(now, &exhausted).await.unwrap();
+        assert!(protocol.calls().is_empty(), "exhausted provider: nothing delivered");
+        {
+            let conn = store.read().unwrap();
+            let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+            assert_eq!(cmd.state, CommandState::Queued, "parked, not failed — nothing lost");
+            assert_eq!(cmd.attempts, 0, "no retry budget spent while parked");
+        }
+
+        // Provider recovers (sibling's limit lifts) -> same command drains.
+        let workers = vec![
+            mk(wid(), amux_core::worker::WorkerState::Idle { since: now }),
+            mk(
+                WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 78)),
+                amux_core::worker::WorkerState::Idle { since: now },
+            ),
+        ];
+        let recovered = amux_core::provider_fleet::derive(&workers, now, 5);
+        rt.pump_commands(now, &recovered).await.unwrap();
+        assert_eq!(protocol.calls().len(), 1, "recovered provider: delivery drains");
         let conn = store.read().unwrap();
         let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
         assert_eq!(cmd.state, CommandState::Delivered);
@@ -1191,7 +1447,7 @@ mod pump_tests {
                 .unwrap();
         }
         let rt = runtime_with(store.clone(), protocol);
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
         let conn = store.read().unwrap();
         let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
         assert!(
@@ -1263,6 +1519,7 @@ mod rate_limit_recovery_tests {
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: None,
             pickup_unowned: false,
+            resume_stagger_secs: 5,
         };
         rt.tick_once(false).await.unwrap();
 
@@ -1280,5 +1537,159 @@ mod rate_limit_recovery_tests {
         // No reset time: stays parked — inventing a retry would be guessing
         // (Inv 20), and Credit caps clear on payment, not clocks (AF-14).
         assert_eq!(state_of(&unknown), "rate_limited");
+    }
+
+    fn seed_rate_limited(
+        store: &SharedStore,
+        n: u128,
+        reset: Option<DateTime<Utc>>,
+    ) -> amux_core::ids::WorkerId {
+        let id = amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, n));
+        let idc = id.clone();
+        store
+            .write(move |conn| {
+                let row = crate::db::queries::WorkerRow::new(
+                    &idc,
+                    &WorkerConfig {
+                        display_name: format!("w{n}"),
+                        name_aliases: vec![],
+                        cwd: "/tmp".into(),
+                        provider: amux_core::provider::ProviderId("claude".into()),
+                        model: None,
+                        backend: amux_core::session::BackendId::herdr(),
+                        environment: Default::default(),
+                        permissions: vec![],
+                        group: None,
+                    },
+                    "2026-01-01T00:00:00Z",
+                );
+                crate::db::queries::insert_worker(conn, &row)?;
+                crate::db::queries::update_worker_state(
+                    conn,
+                    idc.as_str(),
+                    &WorkerState::RateLimited { reset_at: reset },
+                    "2026-01-01T00:00:00Z",
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        id
+    }
+
+    fn recovery_runtime(store: SharedStore) -> Runtime {
+        Runtime {
+            store,
+            backends: vec![],
+            tick_secs: 3,
+            heartbeat_every: 1000,
+            breaker: amux_core::circuit::FleetCircuitBreaker {
+                window_budget_tokens: u64::MAX,
+                window_secs: 3600,
+                min_progress_per_window: 0,
+                max_failures_per_window: 1000,
+            },
+            fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+            protocol: None,
+            pickup_unowned: false,
+            resume_stagger_secs: 5,
+        }
+    }
+
+    fn db_state_of(store: &SharedStore, id: &amux_core::ids::WorkerId) -> String {
+        let conn = store.read().unwrap();
+        conn.query_row(
+            "SELECT json_extract(state,'$.state') FROM _amux_workers WHERE id = ?1",
+            rusqlite::params![id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// RR-0044b staggered recovery (time-warp idiom): three same-provider
+    /// workers share a reset 7s in the past. Slot i = reset + i*5s, so at
+    /// "now" slots 0 (-7s) and 1 (-2s) have passed and slot 2 (+3s) has
+    /// not: two workers recover, the third stays parked for its turn — the
+    /// herd never fires at once.
+    #[tokio::test]
+    async fn recovery_is_staggered_across_same_provider_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: SharedStore =
+            Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        std::mem::forget(dir);
+        let now = Utc::now();
+        let shared_reset = Some(now - chrono::Duration::seconds(7));
+        let w1 = seed_rate_limited(&store, 11, shared_reset);
+        let w2 = seed_rate_limited(&store, 12, shared_reset);
+        let w3 = seed_rate_limited(&store, 13, shared_reset);
+
+        let rt = recovery_runtime(store.clone());
+        rt.tick_once(false).await.unwrap();
+
+        assert_eq!(db_state_of(&store, &w1), "idle", "slot 0: reset+0s passed");
+        assert_eq!(db_state_of(&store, &w2), "idle", "slot 1: reset+5s passed");
+        assert_eq!(
+            db_state_of(&store, &w3),
+            "rate_limited",
+            "slot 2: reset+10s is still 3s out — parked for its stagger turn"
+        );
+
+        // A tick after the last slot passes drains the straggler too: the
+        // stagger delays, it never strands (zero user interaction).
+        let w3s = w3.clone();
+        store
+            .write(move |conn| {
+                crate::db::queries::update_worker_state(
+                    conn,
+                    w3s.as_str(),
+                    &WorkerState::RateLimited {
+                        reset_at: Some(Utc::now() - chrono::Duration::seconds(11)),
+                    },
+                    "2026-01-01T00:00:00Z",
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(db_state_of(&store, &w3), "idle", "own slot passed -> recovered");
+    }
+
+    /// RR-0044b: redistribution is a RECOMMENDATION event, deduped per
+    /// exhaustion episode — amux never swaps a configured provider itself
+    /// (routing.rs's rule; the provider choice is the user's).
+    #[tokio::test]
+    async fn exhausted_provider_emits_redistribute_recommendation_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: SharedStore =
+            Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        std::mem::forget(dir);
+        let now = Utc::now();
+        seed_rate_limited(&store, 21, Some(now + chrono::Duration::hours(2)));
+
+        let rt = recovery_runtime(store.clone());
+        let mut rx = store.subscribe();
+        rt.tick_once(false).await.unwrap();
+        let mut recommendations = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if format!("{:?}", ev.entity_type).contains("provider_redistribute_recommended") {
+                recommendations.push(ev.entity_id.clone());
+            }
+        }
+        assert_eq!(recommendations.len(), 1, "{recommendations:?}");
+        assert!(
+            recommendations[0].contains("claude"),
+            "the recommendation names the provider: {}",
+            recommendations[0]
+        );
+
+        // Same episode, next tick: silence (durable dedupe via the journal,
+        // so even a restart would not re-announce this episode).
+        rt.tick_once(false).await.unwrap();
+        let mut second = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if format!("{:?}", ev.entity_type).contains("provider_redistribute_recommended") {
+                second += 1;
+            }
+        }
+        assert_eq!(second, 0, "one announcement per exhaustion episode");
     }
 }

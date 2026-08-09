@@ -170,7 +170,7 @@ fn finish<T>(
 }
 
 fn ev(entity_type: EntityType, id: &str, mutation: MutationKind) -> PendingEvent {
-    PendingEvent { entity_type, entity_id: id.to_string(), mutation }
+    PendingEvent { entity_type, entity_id: id.to_string(), mutation, payload: None }
 }
 
 fn message_body(m: &Message) -> Value {
@@ -659,6 +659,7 @@ mod tests {
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: Some(protocol),
             pickup_unowned: false,
+            resume_stagger_secs: 5,
         }
     }
 
@@ -701,7 +702,7 @@ mod tests {
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(worker.clone(), AgentState::Idle);
         let rt = pump_runtime(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
         let calls = protocol.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         match &calls[0] {
@@ -744,7 +745,7 @@ mod tests {
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(worker.clone(), AgentState::Idle);
         let rt = pump_runtime(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
 
         assert!(protocol.calls().is_empty(), "nothing must reach the agent");
         let conn = store.read().unwrap();

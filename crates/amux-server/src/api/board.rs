@@ -36,9 +36,64 @@ use std::sync::{Arc, Mutex};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_board).post(create_item))
+        // Static segment outranks /{id} in axum: /statuses never collides.
+        .route("/statuses", get(list_statuses))
         .route("/{id}", get(get_item).patch(patch_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+}
+
+/// GET /api/board/statuses — Python `_load_board_statuses` (amux-server.py
+/// :15933): the SPA builds its kanban COLUMNS from this list, silently
+/// falling back to a hardcoded default set on any failure — so a 404 here
+/// meant custom Python-configured columns never rendered on the Rust origin
+/// (AMUX-2596). Shape: [{id, label, mode, gate}] ordered by position;
+/// Python's builtin defaults when the table is empty/absent.
+async fn list_statuses(State(state): State<AppState>) -> Response {
+    const DEFAULTS: [(&str, &str); 7] = [
+        ("backlog", "Backlog"),
+        ("todo", "To Do"),
+        ("doing", "In Progress"),
+        ("review", "In Review"),
+        ("done", "Done"),
+        ("verified", "Verified"),
+        ("discarded", "Discarded"),
+    ];
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let mut out: Vec<Value> = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT id, label, gate, mode FROM statuses ORDER BY position")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        }) {
+            for (id, label, gate, mode) in rows.flatten() {
+                let gate: Value = gate
+                    .as_deref()
+                    .and_then(|g| serde_json::from_str(g).ok())
+                    .unwrap_or_else(|| json!([]));
+                let mode = mode.filter(|m| !m.is_empty()).unwrap_or_else(|| "implicit".into());
+                out.push(json!({ "id": id, "label": label, "mode": mode, "gate": gate }));
+            }
+        }
+    }
+    if out.is_empty() {
+        // Python: default columns, and note Python's dict here has NO
+        // mode/gate keys on defaults — the SPA tolerates their absence.
+        out = DEFAULTS
+            .iter()
+            .map(|(id, label)| json!({ "id": id, "label": label }))
+            .collect();
+    }
+    Json(Value::Array(out)).into_response()
 }
 
 // ---- shared helpers ------------------------------------------------------
@@ -68,11 +123,16 @@ fn no_write() -> WriteOutcome {
     }
 }
 
-fn ev(id: &str, mutation: MutationKind) -> PendingEvent {
+/// Task event carrying the post-mutation snapshot (RR-0111a). Every board
+/// event site has the freshly written row in hand inside the same write
+/// closure, so the snapshot is one serialization — never a re-read — and the
+/// journal can replay board state without consulting the live table.
+fn ev_snap(row: &IssueRow, mutation: MutationKind) -> PendingEvent {
     PendingEvent {
         entity_type: EntityType::Task,
-        entity_id: id.to_string(),
+        entity_id: row.id.clone(),
         mutation,
+        payload: Some(row.snapshot()),
     }
 }
 
@@ -124,67 +184,72 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 // ---- body shapes ---------------------------------------------------------
 
 /// Full detail body: everything, full `desc`, full `log` (L1: the full desc
-/// is never in a LIST payload; it is always here).
+/// is never in a LIST payload; it is always here). Delegates to
+/// [`IssueRow::snapshot`] — the SAME serialization the event journal records
+/// as each mutation's payload (RR-0111a), so API body, journal payload, and
+/// replay verification can never drift apart.
 fn detail_body(row: &IssueRow) -> Value {
-    json!({
-        "id": row.id,
-        "title": row.title,
-        "desc": row.desc,
-        "status": row.status,
-        "session": row.session,
-        "shepherd": row.shepherd,
-        "type": row.item_type,
-        "creator": row.creator,
-        "due": row.due,
-        "due_time": row.due_time,
-        "created": row.created,
-        "updated": row.updated,
-        "owner_type": row.owner_type,
-        "pinned": row.pinned,
-        "pos": row.pos,
-        "archived": row.archived,
-        "depends_on": row.depends_on,
-        "reviewer": row.reviewer,
-        "log": row.log,
-        "source_ref": row.source_ref,
-        "last_verified_at": row.last_verified_at,
-        "rev": row.rev,
-        "gate": row.gate_criteria(),
-        "tags": row.tags,
-        "version": row.version,
-    })
+    row.snapshot()
 }
 
-/// List body (L1, ported from Python `_board_slim_desc` + `_board_project`):
-/// desc truncated to its first line (max 200 chars) with `desc_truncated`
-/// set when it was cut; `log` never ships in a list — `log_n` (line count)
-/// stands in. `slim` additionally drops desc and adds `desc_len`.
-pub fn list_body(row: &IssueRow, slim: bool) -> Value {
+/// List body, Python-parity (AMUX-2586 fix #4). The plain list serves the
+/// FULL `desc` and FULL `log` exactly as Python's `_load_board` does — the
+/// SPA renders `item.desc` and reads `item.log` (the folded badge) straight
+/// off the LIST payload, so the earlier L1 slimming (first-line desc,
+/// `log_n` instead of `log`) silently blanked both in the dashboard.
+/// `slim=1` stays the payload diet, matching Python `_board_project`: drop
+/// desc/log, add `desc_len` + `log_n`. `stale` mirrors Python's
+/// `_board_item_stale` flag — set ONLY when true, on both paths (Python's
+/// `_BOARD_SLIM_DROP` is `("desc","log")`; `stale` rides through slim).
+pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     let mut v = detail_body(row);
     let obj = v.as_object_mut().expect("detail_body is an object");
-    obj.remove("log");
-    let log_n = row
-        .log
-        .as_deref()
-        .map(|l| l.lines().filter(|x| !x.trim().is_empty()).count())
-        .unwrap_or(0);
-    obj.insert("log_n".into(), json!(log_n));
     if slim {
         obj.remove("desc");
         obj.insert("desc_len".into(), json!(row.desc.chars().count()));
-    } else if row.desc.chars().count() > 200 {
-        let first: String = row
-            .desc
-            .split('\n')
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(200)
-            .collect();
+        obj.remove("log");
+        let log_n = row
+            .log
+            .as_deref()
+            .map(|l| l.lines().filter(|x| !x.trim().is_empty()).count())
+            .unwrap_or(0);
+        obj.insert("log_n".into(), json!(log_n));
+    }
+    if stale {
+        obj.insert("stale".into(), json!(true));
+    }
+    v
+}
+
+/// Python `_board_slim_desc` (amux-server.py:13958) — the SSE board channel
+/// ships the first desc line (200 chars) + `desc_truncated`; the full desc
+/// stays REST/detail-only. Applied by the SSE serializer, never the GET.
+pub fn apply_sse_desc_slim(v: &mut Value, desc: &str) {
+    if desc.chars().count() <= 200 {
+        return;
+    }
+    let first: String = desc.split('\n').next().unwrap_or("").chars().take(200).collect();
+    if let Some(obj) = v.as_object_mut() {
         obj.insert("desc".into(), json!(first));
         obj.insert("desc_truncated".into(), json!(true));
     }
-    v
+}
+
+/// Python `_board_item_stale` (amux-server.py:15671): an in-progress card
+/// whose owning session is not actively working and that nobody has touched
+/// for 30 minutes. `working` is the derived active-session set — the SAME
+/// derivation the session list serves, so the two views cannot disagree.
+pub fn is_stale(row: &IssueRow, now: i64, working: &std::collections::BTreeSet<String>) -> bool {
+    if !matches!(row.status.as_str(), "doing" | "review") {
+        return false;
+    }
+    let Some(sess) = row.session.as_deref().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if row.updated == 0 || now - row.updated < 1800 {
+        return false;
+    }
+    !working.contains(sess)
 }
 
 // ---- GET /api/board ------------------------------------------------------
@@ -204,7 +269,12 @@ pub struct ListParams {
 }
 
 fn truthy(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1") | Some("true") | Some("yes"))
+    // Python lowercases before the membership test (`.lower() in ("1",
+    // "true","yes")`), so `slim=TRUE` counts.
+    matches!(
+        v.map(|s| s.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 /// Bare JSON ARRAY (the Python dashboard parses exactly that shape). The
@@ -225,28 +295,56 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
     };
     let status_f = split(&p.status);
     let session_f = split(&p.session);
-    let archived = match p.archived.as_deref().map(str::trim) {
-        Some("all") | Some("") => ArchivedFilter::All,
-        Some(v) if truthy(Some(v)) => ArchivedFilter::ArchivedOnly,
-        // Default 0: active cards only.
-        _ => ArchivedFilter::ActiveOnly,
+    // Python's exact `archived` grammar (amux-server.py:68758 + 14025,
+    // ported byte-for-byte — AMUX-2586 fix #5, the tab-counter fetches):
+    //   absent or ""          -> NO filter (the bare list serves everything;
+    //                            the SPA's text-search full fetch
+    //                            `?done_limit=0` relies on archived cards
+    //                            being in it)
+    //   "1"/"true"/"yes" (lowercased) -> archived-only
+    //   any OTHER non-empty value ("0", "false", "all", "2", ...) ->
+    //                            non-archived only. Python has no "all"
+    //                            spelling — the previous mapping of it to
+    //                            no-filter was a Rust invention that
+    //                            answered the opposite of what Python does.
+    let archived = match p.archived.as_deref().map(|s| s.to_lowercase()) {
+        None => ArchivedFilter::All,
+        Some(v) if v.is_empty() => ArchivedFilter::All,
+        Some(v) if matches!(v.as_str(), "1" | "true" | "yes") => ArchivedFilter::ArchivedOnly,
+        Some(_) => ArchivedFilter::ActiveOnly,
     };
-    let done_limit = p.done_limit.unwrap_or(100).max(0);
+    // <=0 is uncapped inside cap_terminal, matching Python's `_cap_terminal`.
+    let done_limit = p.done_limit.unwrap_or(100);
     let slim = truthy(p.slim.as_deref());
 
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        Ok(bs::list_issues(&conn, &status_f, &session_f, archived)?)
+        let rows = bs::list_issues(&conn, &status_f, &session_f, archived)?;
+        // The `stale` flag needs the active-session set only when an
+        // in-progress card is present (Python computes it in `_load_board`).
+        let working = if rows
+            .iter()
+            .any(|r| matches!(r.status.as_str(), "doing" | "review"))
+        {
+            crate::api::sessions_legacy::active_python_sessions(&conn)
+        } else {
+            Default::default()
+        };
+        Ok((rows, working))
     })
     .await;
-    let rows = match joined {
+    let (rows, working) = match joined {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
     let (kept, term_total, term_kept) = bs::cap_terminal(rows, done_limit);
-    let items: Vec<Value> = kept.iter().map(|r| list_body(r, slim)).collect();
+    let now = now_secs();
+    let items: Vec<Value> = kept
+        .iter()
+        .map(|r| list_body(r, slim, is_stale(r, now, &working)))
+        .collect();
 
     let mut headers = HeaderMap::new();
     let put = |h: &mut HeaderMap, k: &'static str, v: String| {
@@ -491,13 +589,13 @@ pub async fn create_item(
                 }
             }
             let row = bs::create_issue(conn, &new, now_secs())?;
-            let id = row.id.clone();
+            let event = ev_snap(&row, MutationKind::Created);
             finish(
                 &slot_w,
                 Out::Created(Box::new(row)),
                 WriteOutcome {
                     applied: true,
-                    events: vec![ev(&id, MutationKind::Created)],
+                    events: vec![event],
                 },
             )
         })
@@ -551,12 +649,14 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
 
 /// Keys PATCH writes. Everything else lands in `ignored_fields` (reported,
 /// never silently dropped — AC-263).
-const PATCH_WRITABLE: [&str; 16] = [
+const PATCH_WRITABLE: [&str; 17] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
-    "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref",
+    "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
-const PATCH_CONTROL: [&str; 5] = ["expect_rev", "gate_ack", "gate_checked", "force", "reason"];
+/// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
+const PATCH_CONTROL: [&str; 6] =
+    ["expect_rev", "gate_ack", "gate_checked", "force", "reason", "authorized_by"];
 
 enum PatchOut {
     NotFound,
@@ -678,6 +778,13 @@ pub async fn patch_item(
     } else {
         actor_name.clone()
     };
+    // Python `_hdr_worker`: "" when the header is absent — the cross-lane
+    // archive guard only fires for a NAMED caller (AMUX-2492).
+    let caller_lane = if actor_name == "api-anonymous" {
+        String::new()
+    } else {
+        actor_name.clone()
+    };
 
     let slot: Arc<Mutex<Option<PatchOut>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -781,6 +888,63 @@ pub async fn patch_item(
                 if (p - next.pos).abs() > f64::EPSILON {
                     next.pos = p;
                     changed.push("pos".into());
+                }
+            }
+            // `archived` via PATCH — Python parity (AMUX-2492, py:70294):
+            // the SPA's card archive and the harness cleanup PATCH this
+            // field. Python's coercion: str(v).lower() in (1,true,yes,on).
+            // Cross-lane ARCHIVING (a named caller hiding another lane's
+            // card) requires `authorized_by` — it removes the card from
+            // every view and autonomy loop, a termination in effect.
+            // UN-archiving is never gated, or the un-do is unreachable.
+            if let Some(v) = map.get("archived") {
+                let raw = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+                    other => other.to_string(),
+                };
+                let arc_v: i64 = i64::from(matches!(
+                    raw.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ));
+                if arc_v == 1 {
+                    let owner = row.session.clone().unwrap_or_default().trim().to_string();
+                    let authorized = map
+                        .get("authorized_by")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !caller_lane.is_empty() && !owner.is_empty() && owner != caller_lane
+                        && authorized.is_empty()
+                    {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                                StatusCode::BAD_REQUEST,
+                                json!({
+                                    "error": "cross-lane destruction requires authorized_by",
+                                    "why": format!(
+                                        "{caller_lane} is archiving {}, which belongs to {owner}. \
+                                         Archiving hides it from every board view AND every \
+                                         autonomy loop, so it is a termination in effect even \
+                                         though the status is untouched.",
+                                        row.id
+                                    ),
+                                    "how": format!(
+                                        "add {{\"authorized_by\": \"<who asked>\"}}, or use \
+                                         `amux board archive {} --authorized-by \"<who>\"`",
+                                        row.id
+                                    ),
+                                    "card_owner": owner,
+                                }),
+                            ),
+                            no_write(),
+                        );
+                    }
+                }
+                if arc_v != next.archived {
+                    next.archived = arc_v;
+                    changed.push("archived".into());
                 }
             }
             if let Some(t) = body_str(&map, "type") {
@@ -1179,7 +1343,7 @@ pub async fn patch_item(
                 },
                 None => MutationKind::Updated,
             };
-            let id = next.id.clone();
+            let event = ev_snap(&next, mutation);
             finish(
                 &slot_w,
                 PatchOut::Applied {
@@ -1188,7 +1352,7 @@ pub async fn patch_item(
                 },
                 WriteOutcome {
                     applied: true,
-                    events: vec![ev(&id, mutation)],
+                    events: vec![event],
                 },
             )
         })
@@ -1298,13 +1462,13 @@ async fn archive_restore(
                     next.version = i64::try_from(updated.version).unwrap_or(row.version + 1);
                     next.updated = now_secs();
                     bs::save_patched(conn, &next)?;
-                    let id = next.id.clone();
+                    let event = ev_snap(&next, MutationKind::Updated);
                     finish(
                         &slot_w,
                         Out::Applied(detail_body(&next)),
                         WriteOutcome {
                             applied: true,
-                            events: vec![ev(&id, MutationKind::Updated)],
+                            events: vec![event],
                         },
                     )
                 }

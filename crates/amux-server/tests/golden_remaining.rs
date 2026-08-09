@@ -109,6 +109,7 @@ fn mock_runtime(rig: &Rig) -> Runtime {
         fleet_state: Mutex::new(FleetState::Normal),
         protocol: Some(rig.protocol.clone()),
         pickup_unowned: false,
+        resume_stagger_secs: 5,
     }
 }
 
@@ -132,6 +133,7 @@ fn runtime_with(
         fleet_state: Mutex::new(FleetState::Normal),
         protocol,
         pickup_unowned: false,
+        resume_stagger_secs: 5,
     }
 }
 
