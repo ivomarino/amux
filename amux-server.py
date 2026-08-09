@@ -14834,9 +14834,25 @@ def _age_archive_sweep():
             # amux-cloud found in the archived=0 filters, one layer up. An
             # anti-rot mechanism must not consume the cards that are supposed
             # to sit still.
+            # A card PARKED IN BACKLOG WITH A TRIGGER is exempt for exactly the
+            # reason above (MG-1456). `amux board backlog <id> --trigger "..."`
+            # writes source_ref and stamps last_verified_at; sitting untouched is
+            # then the card's DEFINING property, not rot — it is waiting on a
+            # named external condition on purpose. Archiving it hides it from the
+            # trigger-staleness nudge, i.e. from the one mechanism that would ever
+            # re-check the condition and wake it up.
+            #
+            # Measured before this change: 170 parked-with-trigger cards live, 0
+            # archived. The interlock had NOT yet fired — because the re-check
+            # nudge bumps `updated` and resets the fuse. That is a RACE the loop
+            # happens to be winning, not a safety property: any parked card the
+            # nudge rotation fails to reach within 3 days archives and then can
+            # never be reached again. This makes it a guarantee instead.
             "SELECT id, status, session, updated FROM issues WHERE deleted IS NULL "
             "AND COALESCE(archived,0)=0 AND COALESCE(pinned,0)=0 "
-            "AND COALESCE(type,'') NOT IN ('tripwire','watch') AND updated < ? "
+            "AND COALESCE(type,'') NOT IN ('tripwire','watch') "
+            "AND NOT (status='backlog' AND source_ref IS NOT NULL) "
+            "AND updated < ? "
             "LIMIT 2000", (cut,)).fetchall()
         for r in rows:
             _days = max(3, int((now - (r["updated"] or now)) / 86400))
