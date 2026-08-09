@@ -739,3 +739,22 @@ FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited her
   is precisely why it needs writing down here: every fix in this repo is supposed to be
   checked against a pre-fix specimen, so the wrong recipe is reached for constantly.
 
+
+## Dashboard's usage-limit discriminator says 'worker'; the live endpoint says 'session'
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: rust-rebuild (provider adapters, RR-0043)
+CARD: AMUX-2581
+SYMPTOM: Porting the Claude usage probe to Rust, I took the 5h-window discriminator
+  from the only in-repo consumer, loadUsage() in amux-server.py (`l.kind === 'worker'`).
+  The live /api/oauth/usage endpoint returns `kind: "session"` for that window — the JS
+  check never matches anymore, so the dashboard labels the 5h bar with the raw kind
+  string, and the stale discriminator nearly shipped into the new Rust mapper verbatim.
+COST: ~10 min re-probing the live endpoint; one step from encoding a never-matching
+  filter into the Rust adapter (an ethos-7 silent probe: it would have "worked" because
+  the top-level five_hour shape still mapped, masking the dead limits[] branch).
+FIX: loadUsage() should accept both "session" and "worker" (the Rust mapper now does);
+  better, both consumers should assert the discriminator against a recorded live
+  fixture so endpoint drift fails a test instead of silently unlabeling a bar.

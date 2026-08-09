@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod opencode;
 pub mod orchestrator;
+pub mod provider;
 pub mod tls;
 
 use std::sync::Arc;

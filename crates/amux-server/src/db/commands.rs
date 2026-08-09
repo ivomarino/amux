@@ -48,6 +48,7 @@ const COLS: &str = "id, worker_id, command, state, idempotency_key, queued_at, a
 
 /// Enqueue, deduplicating on (worker, idempotency_key): a duplicate returns
 /// the EXISTING command with `newly_created = false`, never a second row.
+#[allow(clippy::too_many_arguments)] // a queue row simply has this many fields
 pub fn enqueue(
     conn: &Connection,
     id: CommandId,
