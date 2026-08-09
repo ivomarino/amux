@@ -11,7 +11,7 @@ Rewrite of `amux-server.py` (77k-line Python single-file server) in Rust. Not a 
 | Python server (HTTP, API, jobs, integrations) | ~32,700 | 43% |
 
 - **77,050 lines**, single file, hand-rolled `BaseHTTPRequestHandler`
-- **47 SQLite tables**, single DB file
+- **SQLite tables** (actual count discovered by RR-0117), single DB file per tenant
 - **212 API routes** (250+ method/path combos)
 - **~30 background jobs** (scheduler, snapshots, rate-limit watchdog, steering, token ledger, email sync, etc.)
 - **3 terminal backends**: herdr (primary process host), tmux, iTerm2
@@ -2755,7 +2755,7 @@ be required to understand what the system does, how it works, or why a decision 
 made. This is enforced structurally, not by discipline:
 
 1. **Types ARE the spec.** `WorkerCommand`, `WorkerEvent`, `BoardTransition`,
-   `GateEvaluator`, `StallReason`, `ProviderState` -- reading the enum variants tells
+   `VerifierKind`, `StallReason`, `ProviderState` -- reading the enum variants tells
    you exactly what the system can do. No prose description of "supported commands"
    that drifts from the code.
 
@@ -3850,7 +3850,7 @@ harness that will verify every subsequent phase.
 2. `amux-core`: Scope, Worker, Session, Issue, BoardTransition, WorkerCommand/Event,
    Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
    system's vocabulary. Every entity type carries a `version: u64` field.
-3. `amux-server/db`: all 51 tables as SQL migrations, WAL mode, single-writer task
+3. `amux-server/db`: all tables as SQL migrations (count from schema discovery), WAL mode, single-writer task
 4. `amux-server/config`: four-tier config loading (org/global/group/worker), `server.env`
 5. `amux-server/api`: axum router, static file embedding, `/health`, auth,
    `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
@@ -3900,7 +3900,7 @@ harness that will verify every subsequent phase.
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
 - Unit: scope resolver with group gates overriding global gates
 - Unit: scope resolver with worker env overriding group env
-- Unit: all 51 tables created in in-memory DB
+- Unit: all tables (from schema discovery) created in in-memory DB
 - Unit: `BoardTransition` state machine rejects invalid transitions
 - Unit: `BoardTransition` rejects nonsensical combos (archived + doing) (Invariant 3)
 - Unit: Archive/Restore round-trip preserves all issue fields (Invariant 3)
@@ -3913,7 +3913,7 @@ harness that will verify every subsequent phase.
 - Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
 - Unit: backpressure -- bounded channels reject/drop correctly at capacity (Invariant 26)
 - Unit: `ContextFragment` priority ordering is deterministic (Invariant 16)
-- Unit: `GateEvaluator::Deterministic` runs before `Model` (Invariant 28)
+- Unit: VerifierKind ordering: deterministic checks run before ModelJudgment (Invariant 28)
 - Simulation: fake clock + fake backend, orchestrator tick completes in <1ms (Invariant 22)
 - Simulation: deterministic replay of 100 random event sequences produces identical state
 - proptest: `BoardTransition` state machine rejects all invalid (from, to) pairs (Invariant 22)
@@ -4060,7 +4060,7 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: `Gate` entity CRUD -- create, scope, version, history (Invariant 18)
 - Unit: `why-blocked` query returns gate id, criterion, missing evidence, suggested
   command (Invariant 18)
-- Unit: `GateEvaluator` ordering: `Deterministic` before `Model` (Invariant 28)
+- Unit: VerifierKind ordering: deterministic before ModelJudgment (Invariant 28)
 - Unit: issue state vs execution state separation -- rate-limit changes execution
   state only, never board state (Invariant 19)
 - Unit: priority scoring: critical-path weight + explicit priority + age starvation +
@@ -4209,7 +4209,7 @@ The user flow acceptance tests built here become the regression suite:
 **Test plan**:
 - Unit: verification state machine (done->verification->verified|rejected->in_progress)
 - Unit: cheapest-verifier-first ordering: Command < HttpCheck < FileExists <
-  PlaywrightAssertion < ModelJudgment < HumanReview (Invariant 28)
+  PlaywrightAssertion < ModelJudgment (Invariant 28)
 - Unit: free verifier failure short-circuits -- model verifier never called (Invariant 28)
 - Simulation: verification pipeline with mixed verifier types, cost-ordered execution
 - Integration: issue completes, verification runs, evidence recorded
@@ -4646,6 +4646,140 @@ week at the end. Phases 6-7 are the integration long tail (parallelizable, saves
    spec, hard to get right in every query. Mitigation: one resolver function in
    `amux-core`, used by all consumers. Never re-derive scope logic per-query.
 
+## Doc enforceability
+
+### Semantic invariant IDs
+
+Every invariant has a stable semantic ID (`INV-xxx`) in addition to its number.
+The semantic ID is:
+- Tagged in code: `// INV-BOARD-SOT` in the implementation
+- Tagged in tests: `#[test] fn inv_board_sot_...`
+- CI-enforced bidirectionally:
+  1. No invariant in this document without at least one test tagged with its ID
+  2. No `INV-xxx` tag in code/tests without a matching invariant in this document
+
+| Number | Semantic ID | Short name |
+|--------|-------------|------------|
+| 1 | `INV-WORKER-IDENTITY` | Worker != Session != Backend |
+| 2 | `INV-SCOPE-FOUR-TIER` | Four-tier scope with deterministic inheritance |
+| 3 | `INV-BOARD-SOT` | Board is the system of record |
+| 4 | `INV-BOARD-DEPGRAPH` | Board issues form a dependency graph |
+| 5 | `INV-TYPED-PROTOCOL` | Typed command/event protocol |
+| 6 | `INV-TURN-ENTITY` | Turn is a first-class concept |
+| 7 | `INV-DONE-VS-VERIFIED` | Done != Verified |
+| 8 | `INV-PROVIDER-AGNOSTIC` | Provider agnosticism |
+| 9 | `INV-IDEMPOTENT` | Idempotent + at-least-once |
+| 10 | `INV-NO-STALL` | No-stall guarantee |
+| 11 | `INV-WORKER-STATE-CURRENT` | Worker state is always current |
+| 12 | `INV-GROUPS-FIRSTCLASS` | Groups are first-class |
+| 13 | `INV-API-CONTRACT` | API contract is the decoupling layer |
+| 14 | `INV-OFFLINE-FIRST` | Offline-first with optimistic sync |
+| 15 | `INV-CARDINAL-RULES` | Three cardinal rules |
+| 16 | `INV-TOKEN-BUDGETS` | Token budgets are a runtime primitive |
+| 17 | `INV-WORKER-ADDRESSING` | Structural @worker addressing |
+| 18 | `INV-GATES-FIRSTCLASS` | Gates are first-class entities |
+| 19 | `INV-ISSUE-VS-EXEC-STATE` | Issue state != Execution state |
+| 20 | `INV-PROVIDER-CAPACITY` | Provider capacity and usage normalized |
+| 21 | `INV-CONFORMANCE-SUITES` | Backend and provider conformance suites |
+| 22 | `INV-DETERMINISTIC-SIM` | Deterministic orchestrator simulation |
+| 23 | `INV-INTEGRATION-DEGRADE` | Server-side integration degradation |
+| 24 | `INV-IMMUTABLE-EVENTS` | Immutable event history |
+| 25 | `INV-PRIORITY-SCHEDULING` | Priority and scheduling hints |
+| 26 | `INV-BACKPRESSURE` | Backpressure on every channel |
+| 27 | `INV-CONTEXT-SNAPSHOTS` | Immutable context snapshots |
+| 28 | `INV-CHEAPEST-VERIFIER` | Cheapest verifier first |
+| 29 | `INV-MESSAGE-DURABLE` | Message is a durable entity |
+| 30 | `INV-STRUCTURED-EVENTS` | Structured events for machines |
+| 31 | `INV-COMPACTION` | Compaction is a first-class subsystem |
+| 32 | `INV-UNIVERSAL-SEARCH` | Universal search without embeddings |
+| 33 | `INV-BACKEND-INDEPENDENCE` | Backend independence |
+| 34 | `INV-QUEUE-SEMANTICS` | Explicit queue semantics |
+| 35 | `INV-REVISIONED-STATE` | Server-authoritative revisioned state |
+| 36 | `INV-SINGLE-SOT` | Single source of truth |
+| 37 | `INV-MUTATION-TRUTH` | Mutation truthfulness |
+| 38 | `INV-CMD-FRESHNESS` | Command freshness |
+| 39 | `INV-DERIVED-DIRECTION` | Derived-data direction |
+| 40 | `INV-COLLECTION-COMPLETE` | Collection completeness |
+| 41 | `INV-TEST-ORACLE` | Test oracle correctness |
+| 42 | `INV-MEMORY-ENTITY` | Memory is a durable entity |
+| 43 | `INV-WORKER-CONFIG-MUTABLE` | Worker config is mutable; identity is not |
+| 44 | `INV-UI-COVERAGE` | UI interaction coverage |
+| 45 | `INV-AUTONOMOUS-EXEC` | Autonomous execution |
+| 46 | `INV-UX-DISCOVERY` | UX path discovery |
+| 47 | `INV-ANTI-LIVELOCK` | Anti-livelock |
+| 48 | `INV-CIRCUIT-BREAKERS` | Global circuit breakers |
+| 49 | `INV-FAILURE-FORWARD` | Failure feeds forward |
+| 50 | `INV-CRITERIA-AUTHORSHIP` | Acceptance criteria authorship separation |
+| 51 | `INV-DECOMP-CAP` | Decomposition depth cap |
+| 52 | `INV-CAPABILITY-POLICY` | Capability policy |
+
+The numbering is non-sequential (1-21, 33-41, 22-32, 42-52) because invariants
+were added over time. The semantic IDs are the stable identifiers; numbers are
+retained for backward compatibility with existing cross-references but are not
+the canonical reference. New invariants get the next number AND a semantic ID.
+
+### Doc sunset plan
+
+Every section of this document has a planned destination at cutover. Sections
+that survive as prose are stale by definition -- the implementation is the
+source of truth after cutover.
+
+| Section | Destination | When |
+|---------|-------------|------|
+| Invariant definitions (types, enums, structs) | Rust doc comments + proptest properties | Phase 0 |
+| Test plans per phase | Test files with `INV-xxx` tags | Each phase |
+| Migration manifest | Machine-readable JSON/TOML + migration code | Phase 11 |
+| Policy defaults table | `capability-policy.toml` | Phase 0 |
+| Execution checklist (RR items) | CI traceability infra (RR -> test mapping) | Phase 10 |
+| Lessons from Python (L1-L6) | ADR files in `docs/adr/` | Phase 0 |
+| Timeline / estimates | Project tracker (board issues with deadlines) | Phase 0 |
+| Provider coverage matrix | Generated from test suite tags | Phase 1 |
+| ADR-001 (SQLite) | `docs/adr/001-sqlite-per-tenant.md` | Phase 0 |
+| This sunset table | Deleted at cutover | Phase 11 |
+
+At cutover, this document reduces to: the ethos (immutable), the semantic ID
+table (index only), and the ADR index. Everything else has migrated to code,
+tests, or ADR files. If a section still contains load-bearing information at
+cutover, that is a bug -- the information should have been expressed in code.
+
+### Doc-code reconciliation (Invariant 45 extension)
+
+Invariant 45 says reopen stale `VERIFIED` markers if tests fail. This extends
+to the document itself: if the implementation diverges from a stated invariant,
+the agent must either fix the code OR amend the document with a recorded
+rationale. Silent disagreement between doc and code is the failure mode this
+rule exists to prevent.
+
+```rust
+enum DocCodeDivergence {
+    CodeMatchesDoc,
+    DocAmended { invariant: InvariantId, rationale: String, event: EventId },
+    CodeFixed { invariant: InvariantId, commit: String },
+    Disagreement { invariant: InvariantId },  // this state is a CI failure
+}
+```
+
+CI check: for every `INV-xxx` tag in code, the corresponding invariant section
+in this document must not contradict the implementation. For every invariant in
+this document, at least one `INV-xxx` tag must exist in code. Any
+`Disagreement` is a blocking CI failure.
+
+### Known inconsistencies (fixed)
+
+These were identified in the review and are fixed in place:
+
+1. **47 vs. 51 tables**: line 14 said "47 SQLite tables", Phase 0 said "all 51
+   tables." Both counts are wrong -- the actual count is whatever
+   `sqlite_master` returns. The schema discovery step (RR-0117) is authoritative;
+   fixed references now say "all tables" without a count.
+2. **Duplicate L6 section headers**: two sections were labeled L6. Renumbered.
+3. **`WorkerCommand::Steer` referenced in Phase 1 tests**: the enum in
+   Invariant 5 already has `DeliverMessage(MessageId)`, not `Steer`. The test
+   reference was stale. Fixed.
+4. **`GateEvaluator::Deterministic(CheckFn)` as a closed construct**: merged
+   into `VerifierKind` which is the single evaluation primitive, definable in
+   config.
+
 ## Lessons from the Python system (fix these structurally, not by porting)
 
 These are real incidents from the last 72 hours of operating amux at scale. Each one
@@ -4866,7 +5000,7 @@ struct BrowserSession {
 - The Anthropic model call is separate from the browser control -- you can use
   profiles without burning tokens
 
-### L6: 114 registered sessions, 62 running, 67 with no status
+### L8: 114 registered sessions, 62 running, 67 with no status
 
 Half the registered sessions are just `.env` files with no running process. The
 dashboard shows all 114 with no visual distinction. A user sees 67 blank entries mixed
@@ -5869,11 +6003,11 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0011 — Core types: Gate, GateEvaluator, GateCriterion
+- [ ] RR-0011 — Core types: Gate, VerifierKind (unified), GateCriterion
   Phase: 0
   Depends on: RR-0001, RR-0002
   Invariant: 18, 28
-  Requirement: Gate as first-class entity with scope. GateEvaluator ordering:
+  Requirement: Gate as first-class entity with scope. VerifierKind ordering:
     Deterministic before Model. why-blocked returns gate id, criterion, missing
     evidence, suggested command.
   Tests: gate derivation per (item_type, scope), evaluator ordering, why-blocked output
@@ -5920,7 +6054,7 @@ consistent with their dependencies.
   Invariant: 7, 28
   Requirement: Verification struct with criteria, evidence, result. Cheapest-verifier-
     first ordering (Command < HttpCheck < FileExists < PlaywrightAssertion <
-    ModelJudgment < HumanReview).
+    ModelJudgment). No HumanReview -- gates use VerifierKind (Invariant 52).
   Tests: verifier ordering, short-circuit on free verifier failure
   Verify: Implementation, Unit tests
   Status: TODO
@@ -6128,6 +6262,53 @@ consistent with their dependencies.
     Provider coverage matrix in Phase 4 gets rewritten accordingly.
   Tests: coverage matrix committed, all four providers tested, branch decision recorded
   Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0028f — Core types: ExecutionLimits, AttemptRecord, RetrySchedule
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 47, 49
+  Requirement: Anti-livelock types. ExecutionLimits (max_attempts, max_tokens,
+    max_wall_clock). AttemptRecord (failure reason, rejected evidence, tokens spent,
+    decomposition attempted). RetrySchedule (interval, max_attempts, VerifierKind
+    check). These are core types used by WorkAssignment.
+  Tests: ExecutionLimits exhaustion detected, AttemptRecord serialization round-trip
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028g — Core types: CapabilityPolicy, DeploymentProfile, ActionClass
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 52
+  Requirement: Capability policy types. DeploymentProfile enum (Personal, Cloud,
+    Concierge). ActionClass enum. CapabilityConstraint enum (Allowed, RateLimited,
+    DryRunFirst, SandboxOnly, RequiresEvidence, Denied). Policy loaded from
+    capability-policy.toml at startup.
+  Tests: policy loading, constraint evaluation, dry-run evidence recording
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028h — Core types: FleetCircuitBreaker, FleetState, PolicyDecision
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 48, 45
+  Requirement: Fleet-level circuit breaker types. FleetState enum (Normal,
+    CircuitOpen, Reconciling). CircuitOpenReason enum. PolicyDecision struct
+    (decision, chosen, rationale, reversible). Policy defaults table as a
+    loadable config.
+  Tests: circuit breaker state transitions, policy decision recording
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028i — Core types: AcceptanceCriteria, Criterion, CriterionId
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 50
+  Requirement: Acceptance criteria types. AcceptanceCriteria (criteria vec,
+    authored_by WorkerId, version). Criterion (id, description, VerifierKind,
+    required flag). Structural enforcement: authored_by != executor WorkerId.
+  Tests: authorship separation enforced, criteria amendment versioning
+  Verify: Implementation, Unit tests
   Status: TODO
 
 ---
@@ -6354,6 +6535,71 @@ consistent with their dependencies.
     when idle worker has non-terminal issues.
   Browser verification: list, start, status, group, stall warning
   Verify: Browser verification, Visual/rendering
+  Status: TODO
+
+- [ ] RR-0048a — Anti-livelock: execution limits + auto-decomposition + quarantine
+  Phase: 1
+  Depends on: RR-0029, RR-0028f
+  Invariant: 47
+  Requirement: Orchestrator enforces ExecutionLimits on every WorkAssignment.
+    On exhaustion: auto-decompose into child issues. If decomposition fails twice,
+    issue moves to Quarantined (terminal). Quarantine count tracked in FleetProgress.
+    AttemptRecord written to DurableEvent on every attempt.
+  Tests: exhaustion triggers decomposition, double-decomposition-failure quarantines,
+    quarantine is terminal and counted, FleetProgress reflects quarantined count
+  Verify: Implementation, Unit tests, Simulation
+  Status: TODO
+
+- [ ] RR-0048b — Fleet circuit breakers
+  Phase: 1
+  Depends on: RR-0029, RR-0028h
+  Invariant: 48
+  Requirement: FleetCircuitBreaker monitors: zero-progress hours, window budget,
+    quarantine surge, all-items-blocked. On trigger: halt assignments, write
+    diagnostic report, enter reconciliation loop. Auto-close if reconciliation
+    finds runnable work.
+  Tests: zero-progress triggers circuit open, budget exhaustion triggers,
+    reconciliation auto-closes, diagnostic report generated
+  Verify: Implementation, Unit tests, Simulation
+  Status: TODO
+
+- [ ] RR-0048c — Failure feed-forward in WorkAssignment
+  Phase: 1
+  Depends on: RR-0029, RR-0028f
+  Invariant: 49
+  Requirement: WorkAssignment.prior_attempts populated for attempt > 1.
+    Orchestrator constructs context with: prior failure reasons, rejected evidence,
+    specific verification failure messages, decomposition outcomes. Agent prompt
+    for attempt N+1 includes explicit "do not repeat" instruction.
+  Tests: attempt 2 includes attempt 1 failure, rejected evidence listed, agent
+    prompt contains prior context
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0048d — Acceptance criteria authorship separation
+  Phase: 1
+  Depends on: RR-0029, RR-0028i
+  Invariant: 50
+  Requirement: Issue cannot leave todo without >= 1 Criterion. authored_by !=
+    executor WorkerId (structural rejection). Post-start criteria edit is
+    CriteriaAmended event, resets verification. Adversarial reviewer worker
+    (WorkerRole::CriteriaReviewer) rejects under-specified criteria before
+    executor starts.
+  Tests: no-criteria blocks todo exit, self-authored rejected, amendment
+    resets verification, reviewer rejects "works correctly"
+  Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0048e — Decomposition depth cap
+  Phase: 1
+  Depends on: RR-0048a
+  Invariant: 51
+  Requirement: decomposition_depth tracked. MAX_DECOMPOSITION_DEPTH=3,
+    MAX_CHILDREN_PER_ISSUE=10, MAX_DISCOVERED_ITEMS_PER_RUN=50. At max depth,
+    exhaustion -> Quarantined. Discovered items link to VERIFIED-gated parent.
+  Tests: depth 4 rejected, child count capped, discovered items linked to parent,
+    per-run cap reported
+  Verify: Implementation, Unit tests
   Status: TODO
 
 ---
@@ -7330,6 +7576,31 @@ consistent with their dependencies.
     regression outside defined tolerance fails the appropriate gate.
   Tests: baseline recorded, future regressions detected
   Verify: Implementation, Performance
+  Status: TODO
+
+- [ ] RR-0117h — Semantic invariant ID CI check
+  Phase: 10
+  Depends on: RR-0114
+  Invariant: 45
+  Requirement: Bidirectional CI check:
+    1. Every invariant in this document has at least one test tagged `INV-xxx`.
+    2. Every `INV-xxx` tag in code/tests has a matching invariant in this document.
+    Violations block merge. The check parses the document's semantic ID table and
+    scans code for `INV-` prefixed identifiers.
+  Tests: CI script exists, detects missing test for new invariant, detects orphaned tag
+  Verify: Implementation
+  Status: TODO
+
+- [ ] RR-0117i — Doc-code reconciliation CI check
+  Phase: 10
+  Depends on: RR-0117h
+  Invariant: 45
+  Requirement: For every `INV-xxx` tag in code, the corresponding invariant section
+    must not contradict the implementation. Silent disagreement (code does X,
+    doc says Y, no amendment recorded) is a CI failure. DocCodeDivergence::Disagreement
+    blocks merge.
+  Tests: CI detects disagreement, passes on CodeMatchesDoc or DocAmended
+  Verify: Implementation
   Status: TODO
 
 ---
