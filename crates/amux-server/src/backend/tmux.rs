@@ -121,7 +121,10 @@ impl TmuxBackend {
                     "-t",
                     &pt,
                     "-F",
-                    "#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}",
+                    // ':' not '\t': in a LANG-less launchd env tmux sanitizes
+                    // non-printable chars to '_' (2026-08-09 fleet incident),
+                    // and none of these three fields can contain ':'.
+                    "#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
                 ],
                 OP_TIMEOUT,
             )
@@ -366,14 +369,14 @@ impl SessionBackend for TmuxBackend {
     }
 }
 
-/// Parse one `#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}` line.
+/// Parse one `#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}` line.
 ///
 /// dead=0 -> Running. dead=1: a recorded signal wins (Crashed), else a
 /// recorded exit status (Completed), else the process ended without either —
 /// reported as Crashed(None) because claiming an exit code nobody measured
 /// would be theatre (ethos rule 7).
 fn parse_pane_dead(line: &str) -> BackendStatus {
-    let mut parts = line.split('\t');
+    let mut parts = line.split(':');
     let dead = parts.next().unwrap_or("").trim();
     let status = parts.next().unwrap_or("").trim();
     let signal = parts.next().unwrap_or("").trim();
@@ -424,22 +427,22 @@ mod tests {
 
     #[test]
     fn pane_dead_parsing() {
-        assert_eq!(parse_pane_dead("0\t\t"), BackendStatus::Running);
+        assert_eq!(parse_pane_dead("0::"), BackendStatus::Running);
         assert_eq!(parse_pane_dead("0"), BackendStatus::Running);
         assert_eq!(
-            parse_pane_dead("1\t0\t"),
+            parse_pane_dead("1:0:"),
             BackendStatus::Completed { exit_code: 0 }
         );
         assert_eq!(
-            parse_pane_dead("1\t137\t"),
+            parse_pane_dead("1:137:"),
             BackendStatus::Completed { exit_code: 137 }
         );
         assert_eq!(
-            parse_pane_dead("1\t\t9"),
+            parse_pane_dead("1::9"),
             BackendStatus::Crashed { signal: Some(9) }
         );
         assert_eq!(
-            parse_pane_dead("1\t\t"),
+            parse_pane_dead("1::"),
             BackendStatus::Crashed { signal: None }
         );
         // Defensive: garbage line from a future tmux — never invent an exit.

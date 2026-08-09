@@ -100,11 +100,18 @@ impl FleetSignals {
         // empty fleet is indistinguishable from a dead probe (ethos rule 4;
         // live incident 2026-08-09: launchd build served running=0 for 116
         // cards while 62 tmux sessions ran, with nothing in the log).
+        //
+        // Separator is ':' NOT '\t': under launchd there is no LANG, and in
+        // the POSIX locale tmux sanitizes non-printable output chars to '_',
+        // so a tab-separated format came back as `name_123_456` and every
+        // parse silently missed (the same 2026-08-09 incident — /api/debug/tmux
+        // is what caught it). ':' is safe because tmux forbids it in session
+        // names (target syntax), and printable chars are never sanitized.
         let tmux_out = std::process::Command::new("tmux")
             .args([
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{session_activity}\t#{session_created}",
+                "#{session_name}:#{session_activity}:#{session_created}",
             ])
             .output();
         match &tmux_out {
@@ -121,7 +128,7 @@ impl FleetSignals {
         }
         if let Ok(o) = tmux_out {
             for l in String::from_utf8_lossy(&o.stdout).lines() {
-                let mut it = l.split('\t');
+                let mut it = l.split(':');
                 let (Some(n), a, c) = (it.next(), it.next(), it.next()) else {
                     continue;
                 };
