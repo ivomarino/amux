@@ -44,7 +44,6 @@ needs rebuilding. No single entry makes that argument, and free-form prose canno
 counted.
 
 ---
-
 ## The `needs:you` tag does not exempt a card from auto-pickup
 AREA: board
 SEVERITY: blocks
@@ -66,7 +65,6 @@ FIX: b4ea1d0 — the pickup query now excludes cards carrying the tag. Chose tha
   exactly 2 currently-dispatchable cards. Measured before shipping, not after. The
   tag/status split itself is still open — this closed the dispatch hole, not the
   representation question.
-
 ## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
 AREA: attribution
 SEVERITY: slows
@@ -84,7 +82,6 @@ COST: Blocked my own push, asked a peer for permission they did not need to give
 FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
   comparison step to identify cherry-picks/rebases before asking about foreign commits.
   Validated by amux-cloud.
-
 ## The co-edit sweep notice named the reporting session, not the commit's author
 AREA: attribution
 SEVERITY: slows
@@ -100,7 +97,6 @@ COST: The same message ends "Do not report a sha you did not create". Following 
   the one subject this fleet has spent the most effort getting right.
 FIX: 6ecc3cb — read the trailer for the sha it was already fetching with `git show`; fall
   back to the reporter only for untrailered commits, and say so.
-
 ## A reviewer who BLOCKS a card is re-nudged forever
 AREA: notices
 SEVERITY: annoys
@@ -120,7 +116,6 @@ FIX: e20a112 — the advance loop now checks interaction_log for deliberate revi
   on errors so a broken check never silences real review requests. AC-234 reviewed and
   closed by amux-frustrations.
   Validated by amux-cloud.
-
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
 SEVERITY: blocks
@@ -145,7 +140,6 @@ FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` w
   The author editing their own card passes, restores pass, and `force:true` remains the
   logged escape (with the prior value recorded). AC-236 already marked done on the board.
   Validated by amux-cloud.
-
 ## `git add amux-server.py` on a shared checkout ships another session's uncommitted hunk under your message
 AREA: attribution
 SEVERITY: slows
@@ -184,7 +178,6 @@ NOTE: This is the THIRD `AREA: attribution` entry filed on 2026-08-06, after AC-
   working tree and git has no concept of which session owns a hunk. Per this file's own
   thesis, three entries in one AREA is the argument that the thing needs designing rather
   than patching — that design is worth doing before a fourth.
-
 ## An unimplemented gateway admin route answers 503, not 404, and wakes a container doing it
 AREA: cloud
 SEVERITY: slows
@@ -216,7 +209,6 @@ NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for som
   answer arrives, looks plausible, and nothing prompts a recheck. When adding a route
   namespace, add its catch-all in the same commit; the fallthrough target is whatever
   happens to sit below, and here that was a side-effecting container start.
-
 ## The decompose nudge told me to patch three cards I had already closed
 AREA: notices
 SEVERITY: slows
@@ -251,7 +243,6 @@ NOTE: the general shape is a nudge asserting a fact with a shorter shelf life th
   not the code — I selected it with status='todo' and no `deleted IS NULL`, so I picked a
   deleted card. The same missing-predicate mistake in the probe that the guard fixes in the
   product, one layer down, which is the nesting ethos rule 1 describes.
-
 ## Editing amux-server.py silently disables the guard that protects amux-server.py commits
 AREA: git
 SEVERITY: blocks
@@ -282,7 +273,6 @@ NOTE: the AC-241 numstat was already on screen when I did this. It printed "114 
   as the ethos rule-4 point that a skip leaving no trace is indistinguishable from a scan
   that found nothing — and this is the third entry today whose root is that a signal could
   not distinguish two sessions or two states (see AC-256).
-
 ## Assignment notices arrive for cards that were deleted a second after being created
 AREA: notices
 SEVERITY: slows
@@ -322,7 +312,6 @@ REOPENED 2026-08-09 by amux-frustrations on COUNTER-EVIDENCE from amux-cloud, th
   existed. AC-312 exists because of this recurrence. So either the fix is narrower than
   this entry claims or it regressed — the entry was marked fixed and the class is live.
 
-
 ## `amux send` fell back to raw tmux and the message never arrived
 AREA: cli
 SEVERITY: slows
@@ -348,7 +337,6 @@ FIX: Credit where due: the warning is exactly right — it names the degradation
   keystroke injection is least likely to survive and most expensive to lose. Failing that,
   verify-after-inject (grep the recipient's history for a nonce) so the CLI itself reports the
   loss rather than leaving the sender to discover it.
-
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
@@ -395,7 +383,6 @@ SCOPED 2026-08-09 by amux-frustrations, from amux-cloud's validation: the shippe
   a peer file staged OUTSIDE the recent-edit window has no claim trail and stays
   invisible; the belt is "list every staged path not in the committer's diff".
 
-
 ## A cross-cutting finding recorded on someone else's card dies when that card closes
 AREA: board
 SEVERITY: slows
@@ -429,7 +416,6 @@ FIX: A review that produces an out-of-scope finding needs somewhere to put it th
 NOTE: related to the `watch`-type blindness in ethos.md (a card surfaced by nothing is a note,
   not a monitor) — same root, different container: here the invisible thing is a paragraph
   inside a terminal-status card rather than a card outside every query.
-
 ## A peer's save restarts the server mid-measurement, and the timings blame your subject
 AREA: instruments
 SEVERITY: slows
@@ -458,7 +444,6 @@ FIX: Any timing or availability measurement against the local server needs the r
   this is to stat the file and read the restart log, which nobody does before believing a number.
 NOTE: the shared checkout is the amplifier (see AMUX-2443, open) — my working tree was clean and
   I had made no edit, so nothing in MY session hinted that the binary under test had changed.
-
 ## SUPERSEDES the restart-framed-its-subject entry above: BOTH causes were real, and the instrument already existed
 AREA: instruments
 SEVERITY: slows
@@ -503,7 +488,6 @@ NOTE: two lessons, and the second is the transferable one. (1) A confound that e
   not a control. This is the same shape as `_build_id`'s own docstring, which was written
   for two other sessions hitting it on two other fixes in one hour; I hit it a third time
   with the instrument already sitting one curl away.
-
 ## The untracked-work nudge is blind to review work, so a reviewer is told to record what they just recorded
 AREA: notices
 SEVERITY: annoys
@@ -539,7 +523,6 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
-
 ## `amux board review` cannot name the reviewer, so completing a handoff requires leaving the audited path
 AREA: cli
 SEVERITY: slows
@@ -569,7 +552,6 @@ NOTE: this is AMUX-2325 one verb over, and the same argument applies — the gat
   the unattributed ones. The second half is the ethos rule-6 corollary in its purest form:
   the refusal destroyed the evidence needed to satisfy it. Together they are the third
   AREA: cli entry where the sanctioned command cannot express something the gate requires.
-
 ## No rig can render amux at phone width, so the mobile half of `verified` is undecidable
 AREA: browser
 SEVERITY: blocks
@@ -611,7 +593,6 @@ NOTE: this is ethos rule 3 with a tooling shape. The verified gate asks for a ch
   rather than a false ack.
 
 ---
-
 ## `git commit` on the shared checkout consumes PEERS' staged files silently
 AREA: attribution
 SEVERITY: slows
@@ -632,7 +613,6 @@ FIX: candidate fixes, someone's to pick up: (a) staged-guard lists ALL staged
   paths not touched by the committing session's diff, loudly; (b) fleet convention:
   `git commit -- <own paths>` instead of bare commit (commit takes pathspecs and
   bypasses the index sweep); (c) both. (b) is zero-code and I am adopting it now.
-
 ## A peer's scoped `git add` swept my STAGED files, because git commits the index not the paths
 AREA: attribution
 SEVERITY: slows
@@ -662,7 +642,6 @@ NOTE: distinct from the two shapes AMUX-2443 already covers. Not `git add` sweep
   here the file is entirely mine, the committer never touched it, and their `git add` never
   named it. The guard's blind spot is that it is FILE-scoped while the sweep is INDEX-scoped
   — a check aimed one level below the mechanism it is protecting against.
-
 ## The reviewer-identity check fires on done->verified, blocking the peer amux routed the verification to
 AREA: gates
 SEVERITY: slows
@@ -690,7 +669,6 @@ NOTE: ethos rule 6 — the published contract and the enforced one disagree. The
   `amux` (name them)", which I satisfied and named. The refusal comes from a check the gate
   text never mentions. A card can therefore pass every criterion it publishes and still be
   refused, which is the state that makes --force feel like the honest move.
-
 ## The co-edit notice asserts a git fact that was true at emission and false by delivery
 AREA: notices
 SEVERITY: annoys
@@ -717,7 +695,6 @@ NOTE: distinct from the already-fixed "co-edit notice asks the reader to resolve
   moment while a false statement sends you hunting a defect that does not exist. The emitter
   is right to be conservative; over-warning about a sweep beats under-warning. Only re-check it.
 
-
 ## SessionStart freshness hook named files upstream never touched
 AREA: instruments
 SEVERITY: slows
@@ -739,40 +716,6 @@ COST: ~10 min reconciling two files that had zero incoming changes. The compound
 FIX: 13c7014 - three dots. Positive control in a scratch clone with upstream touching only
   amux-server.py: two-dot -> [CLAUDE.md amux amux-server.py] (reproduces the symptom),
   three-dot -> [amux-server.py]. Line 43's rev-list two-dot deliberately left alone.
-
-## Shared-checkout guard blocked a commit aimed at a scratch repo, naming the shared one as fact
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-23
-SYMPTOM: A compound command that `cd`s into a throwaway git repo under the scratchpad and
-  runs `git commit -qam` there was blocked by ~/.amux/hooks/git-shared-guard.py, whose
-  message asserts "'/Users/ethan/Dev/amux' is a SHARED checkout" - a repo the command never
-  touched. The guard matches on command TEXT against the session's cwd and cannot see an
-  in-command `cd`.
-COST: one wasted round-trip. Small, but the next session that writes a scratch-repo test
-  hits it identically, and the refusal reads as a true positive because it states the shared
-  path as fact rather than as the assumption it is.
-FIX: 523df63 (guard) + 8ddf1d0 (4 regression tests). Verified LIVE end-to-end
-  through the real PreToolUse hook.
-## Staged-guard attributed a session's OWN edit, seconds old, to session '(unknown)'
-AREA: attribution
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-24
-SYMPTOM: Committing .claude/session-freshness.sh, which I had edited ~30s earlier and which
-  no other session had touched, printed: "WARNING - .claude/session-freshness.sh was also
-  edited by session '(unknown)' 0m ago. This commit stages 13 insertions / 1 deletions there
-  - if that is MORE than you wrote, their work is in it." The 13/1 was exactly my own edit.
-COST: minutes reconciling a co-edit that did not exist. NOT root-caused - I did not
-  determine whether the edit record was missing, unattributed at write time, or attributed
-  but not matched against the committing session.
-FIX: 6bcc2f4. Verified LIVE in production on commit 273128e — the warning now reads
-  "is yours and has uncommitted changes right now - no other session edited it".
 ## `HEAD~1` is not "before my change" here — the pre-fix specimen check tested the wrong commit
 AREA: instruments
 SEVERITY: slows
@@ -796,25 +739,3 @@ FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited her
   is precisely why it needs writing down here: every fix in this repo is supposed to be
   checked against a pre-fix specimen, so the wrong recipe is reached for constantly.
 
-
-## staged-guard BLOCKED a commit on an edit record with no content behind it
-AREA: attribution
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-26
-SYMPTOM: `git commit -- CLAUDE.md frustrations.md` refused with "COMMIT BLOCKED - staged
-  files were edited by OTHER amux sessions sharing this checkout: CLAUDE.md (edited by
-  session 'amux-cloud' 0m ago)". Checked before overriding: `git diff HEAD -- CLAUDE.md` is
-  ONE hunk, 14 insertions / 0 deletions, entirely my own text, and `git log -- CLAUDE.md`
-  shows no amux-cloud commit at all. There was no foreign content to sweep. The guard gates
-  on a recent-edit RECORD, not on whether the staged patch actually contains another
-  session's hunks.
-COST: ~8 min verifying the block was spurious, and a commit that had to be forced past a
-  correct-looking refusal. Worse than AF-24 (same subsystem, warns only) because this one
-  BLOCKS. The compounding cost is that overriding is now normalised on a guard whose whole
-  value is that its refusals mean something.
-FIX: 6bcc2f4 + 21cce46 for the diagnosable halves (self-describing block, honest
-  AMUX_VERIFIED_SOLO escape). The classification half is UNRESOLVED and split to AF-27
-  with two hypotheses killed in writing. Do not read this as fully fixed.
