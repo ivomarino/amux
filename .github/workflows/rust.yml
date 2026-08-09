@@ -29,3 +29,28 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test (workspace)
         run: cargo test --workspace
+
+  e2e:
+    # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
+    # browser against the real server + real extracted dashboard.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Install Playwright
+        run: npm ci --ignore-scripts 2>/dev/null || npm install; npx playwright install --with-deps chromium
+      - name: Build server (release of debug profile shared with webServer)
+        run: cargo build -p amux-server
+      - name: Golden scenarios (desktop + mobile)
+        run: npx playwright test --config e2e/playwright.config.ts
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: test-results/
+          retention-days: 7

@@ -12,6 +12,7 @@ pub mod browser;
 pub mod files;
 pub mod health;
 pub mod memories;
+pub mod metrics;
 pub mod messages;
 pub mod prefs;
 pub mod schedules;
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/verify", verify::routes())
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
+        .nest("/api/metrics", metrics::routes())
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
         .nest("/api/push", crate::push::routes())
