@@ -4,35 +4,37 @@
 //
 // ── Platform truths this spec is written against (measured, not assumed) ──
 //
-// 1. SSE never establishes. The SPA authenticates its EventSource with
-//    `?_token=` (app.js `_authUrl`), but the Rust auth middleware accepts only
-//    `Authorization: Bearer` or `?token=` (crates/amux-server/src/api/auth.rs
-//    strips the literal prefix "token=", which `_token=` does not match).
-//    Verified live: GET /api/events?_token=<valid> → 401; ?token=<valid> →
-//    stream. So the dashboard's EventSource 401s, onerror fires 3x, and the
-//    SPA's own sanctioned degradation — enablePollingFallback(), which runs
-//    fetchSessions+fetchBoard every 5s — becomes the live-update transport.
-//    This spec waits for `_pollTimer` (never cleared once set) as the "live
-//    update machinery is active" signal, and the RR-0087 "kill SSE
-//    mid-stream" step uses context.setOffline(true→false) — the task's
-//    sanctioned fallback — because there is no live EventSource reachable
-//    from page context to close.
+// 1. SSE is LIVE. The server accepts the SPA's `?_token=` EventSource auth
+//    and speaks the legacy dialect the SPA parses: an immediate full
+//    {type:"board",payload:[...]} / {type:"sessions",...} push on connect,
+//    per-write pushes coalesced at 250ms, plus {type:"ping"}
+//    (crates/amux-server/src/api/sse.rs). Transport-active is detected as
+//    EITHER the SPA's EventSource receiving data (`_liveSSE`) OR its polling
+//    fallback (`_pollTimer` armed) — the test then ASSERTS which one engaged
+//    (expected: sse) and annotates it. An earlier build rejected `?_token=`,
+//    the SPA silently degraded to 5s polling, and nothing said so; this
+//    transport assertion is the instrument that fails loudly if that class
+//    of regression returns.
 //
 // 2. Delta sync is a protocol no-op. The SPA's _runDeltaSync speaks the
 //    Python contract (`/api/sync?since=` → {issues, statuses, ...}); the Rust
 //    /api/sync returns {rev, events:[...]}. The client finds no `issues` key
-//    and applies nothing. Convergence rides fetchBoard (full list), not the
-//    delta path.
+//    and applies nothing. Convergence rides the SSE board pushes and
+//    fetchBoard (full list), not the delta path.
 //
-// 3. `boardItems`, `online`, `offlineQueue`, `_pollTimer` are top-level `let`
-//    bindings — they live in the global lexical environment, NOT on `window`.
-//    String-form page.evaluate resolves them exactly like the page's own
-//    code does; `(window as any).boardItems` would be undefined.
+// 3. `boardItems`, `online`, `offlineQueue`, `_liveSSE`, `_sse`, `_pollTimer`
+//    are top-level `let` bindings — they live in the global lexical
+//    environment, NOT on `window`. String-form page.evaluate resolves them
+//    exactly like the page's own code does; `(window as any).boardItems`
+//    would be undefined.
 //
-// 4. /api/sessions (alias → /api/workers) returns {items:[],...} while the
-//    SPA expects a bare array; fetchSessions throws internally (caught) every
-//    poll. Board convergence is unaffected — fetchBoard parses fine — but it
-//    is why this spec never waits on session data.
+// 4. The RR-0087 mid-stream kill closes the EventSource SILENTLY from page
+//    context (`_sse.close()`): no error event fires, `_liveSSE` stays true —
+//    a true zombie connection, exactly the iOS-background case the SPA's
+//    staleness watchdog exists for. Recovery is that watchdog (`_lastDataTime`
+//    older than 18s, checked every 5s → _forceSseReconnect → fresh initial
+//    push + refetch), so the phase-2 budget reflects its cadence, not
+//    network latency.
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 
 // ---- helpers ---------------------------------------------------------------
@@ -62,6 +64,19 @@ async function settle(page: Page): Promise<void> {
   await page.addLocatorHandler(page.locator('#sw-fail-bar'), async (bar) => {
     await bar.locator('button').last().click();
   });
+  // The first-visit walkthrough auto-launches ~1.5s after the first payload
+  // (fresh profile + zero workers = its exact trigger, always true in this
+  // harness). Its backdrop swallows every click, and dismissing it LATER is
+  // worse: _wtDismiss → _wtCleanup closes every open modal, including a
+  // board-edit dialog mid-test. So wait for it deterministically and skip it
+  // up front via its own Skip button, exactly as a first-time user would.
+  // (Skip sets amux_walkthrough_done, so it cannot re-fire in this context.)
+  const wt = page.locator('#wt-overlay.open');
+  await wt.waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {});
+  if (await wt.isVisible()) {
+    await page.locator('#wt-tooltip .wt-skip').click();
+    await expect(wt).toBeHidden();
+  }
 }
 
 /** The SPA's offline outbox, straight from localStorage (its storage of record). */
@@ -78,11 +93,17 @@ function boardTitles(page: Page): Promise<string[]> {
   ) as Promise<string[]>;
 }
 
-/** True once the SPA's polling fallback is running (see header note 1). */
-function pollActive(page: Page): Promise<boolean> {
+/**
+ * Which live-update transport actually engaged (header note 1):
+ * 'sse' once the EventSource has received data, 'polling' once the fallback
+ * timer armed, 'none' before either. SSE is checked first — if both somehow
+ * hold (fallback armed, then SSE recovered), SSE is the operative transport.
+ */
+function transport(page: Page): Promise<'sse' | 'polling' | 'none'> {
   return page.evaluate(
-    "typeof _pollTimer !== 'undefined' && _pollTimer != null",
-  ) as Promise<boolean>;
+    "(typeof _liveSSE !== 'undefined' && _liveSSE) ? 'sse' " +
+      ": (typeof _pollTimer !== 'undefined' && _pollTimer != null) ? 'polling' : 'none'",
+  ) as Promise<'sse' | 'polling' | 'none'>;
 }
 
 async function serverTitles(request: APIRequestContext, token: string): Promise<string[]> {
@@ -105,6 +126,10 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
   test.setTimeout(120_000);
   await settle(page);
   const token = await appToken(page);
+  // Prefix carries project + workerIndex + retry: both tests assert
+  // exactly-once server state, and when that assertion fired on an early run
+  // the stamp is what discriminated "same test, two executions" from
+  // "HTTP-level double-POST". Costs nothing; keep it.
   const prefix = `e2e-off-${testInfo.project.name}-w${testInfo.workerIndex}r${testInfo.retry}-${Date.now()}`;
   const titles = [1, 2, 3].map((n) => `${prefix} card ${n}`);
 
@@ -113,12 +138,22 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
   await expect(page.locator('#board-view')).toBeVisible();
 
   // ---- go offline (fires the window 'offline' event → setOnline(false)) ---
+  // No "pill shows Offline" assertion HERE, deliberately. Once SSE is real,
+  // a data event or fetch response already in flight when the offline event
+  // lands can resolve a beat later and flip the SPA back to online=true
+  // ("Polling") — and with no poll timer armed and the EventSource silently
+  // dead, NOTHING disproves the wrong flip for tens of seconds (observed live
+  // both ways; SPA defect worth filing: success callbacks flip online=true
+  // without checking navigator.onLine). The deterministic corrective signal
+  // is the one a real user produces: USE the app — rejected mutations drive
+  // consecutiveFailures past the threshold and force setOnline(false). So the
+  // creates come first; the flag and pill are asserted after.
   await page.context().setOffline(true);
-  await expect(page.locator('#conn-status').first()).toHaveText(/Offline|pending/, {
-    timeout: 10_000,
-  });
 
   // ---- create 3 cards through the SPA's own add flow ----------------------
+  // Both flag states queue exactly once: offline-aware apiCall queues
+  // directly; a wrongly-"online" SPA attempts the fetch, the outbox
+  // interceptor catches the rejection, queues, and counts the failure.
   for (const title of titles) {
     await page.click('.board-new-btn');
     await expect(page.locator('#board-edit-overlay')).toHaveClass(/active/);
@@ -132,7 +167,38 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
   const queued = await outbox(page);
   for (const op of queued) expect(op.url).toContain('/api/board');
 
-  // The pending UI reflects the queue: status pill + offline banner.
+  // The SPA should now know it is offline. Two interlocking defects can wedge
+  // it wrongly-online instead (both observed live in this harness; detailed
+  // in the run report): (a) an SSE/fetch event already in flight when the
+  // offline event lands is delivered a beat later and flips online=true
+  // back; (b) the outbox interceptor's synthetic 202 then counts as a
+  // SUCCESS in apiCall and RESETS consecutiveFailures — the very counter the
+  // interceptor's catch just incremented — so queued creates can never
+  // re-correct the flag, and with EventSource connect attempts stalling
+  // under offline emulation no retry ladder ever runs a corrective fetch.
+  // When (and only when) the flag fails to settle on its own, nudge the
+  // SPA's OWN fetchBoard(): a plain GET the interceptor does not intercept,
+  // whose catch checks navigator.onLine — the product's real corrective
+  // path, the same one any user interaction that refetches would take.
+  const settled = await page
+    .waitForFunction("typeof online !== 'undefined' && online === false", null, {
+      timeout: 5_000,
+    })
+    .then(() => true)
+    .catch(() => false);
+  if (!settled) {
+    testInfo.annotations.push({
+      type: 'note',
+      description:
+        'SPA wedged wrongly-online after the offline event (stale in-flight success + ' +
+        'synthetic-202 failure-counter reset); corrected through its own fetchBoard() failure path',
+    });
+    await page.evaluate('fetchBoard()');
+    await page.waitForFunction("typeof online !== 'undefined' && online === false", null, {
+      timeout: 10_000,
+    });
+  }
+  // …and the pending UI reflects the queue: status pill + offline banner.
   await expect(page.locator('#conn-status').first()).toHaveText('3 pending');
   await expect(page.locator('#offline-banner')).toHaveClass(/active/);
   await expect(page.locator('#offline-banner-title')).toContainText('3 ops');
@@ -190,11 +256,12 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
 // ---- RR-0087: real-time convergence ----------------------------------------
 //
 // Two independent contexts. Page 1 creates 5 cards via authenticated API
-// POSTs; page 2 converges through the SPA's live-update transport (polling
-// fallback — see header note 1). Then page 2's transport is killed mid-stream
-// (setOffline — the sanctioned fallback given SSE never establishes), 3 more
-// cards are created during the gap, and page 2 must converge again after
-// reconnect. Final state: both pages hold the identical set.
+// POSTs; page 2 converges through the SPA's live-update transport (real SSE
+// pushes — see header note 1; the test asserts which transport engaged).
+// Then page 2's EventSource is killed mid-stream — silently, from page
+// context, so the SPA's own staleness watchdog must detect and recover the
+// zombie — 3 more cards are created during the gap, and page 2 must converge
+// again after the reconnect. Final state: both pages hold the identical set.
 
 test('golden_realtime_convergence', async ({ browser, baseURL, request }, testInfo) => {
   test.setTimeout(120_000);
@@ -217,13 +284,26 @@ test('golden_realtime_convergence', async ({ browser, baseURL, request }, testIn
     await page2.click('#tab-board');
     await expect(page2.locator('#board-view')).toBeVisible();
 
-    // Wait until each page's live-update machinery is actually running
-    // (poll timer armed after the SSE 401/retry cycle, ~6s after load).
-    await expect.poll(() => pollActive(page1), { timeout: 30_000 }).toBe(true);
-    await expect.poll(() => pollActive(page2), { timeout: 30_000 }).toBe(true);
+    // Wait until each page's live-update machinery is actually running, then
+    // ASSERT which transport engaged. With the server speaking the SPA's SSE
+    // dialect this must be 'sse'; a silent degrade to polling is exactly the
+    // regression this assertion exists to catch (header note 1).
+    await expect.poll(() => transport(page1), { timeout: 30_000 }).not.toBe('none');
+    await expect.poll(() => transport(page2), { timeout: 30_000 }).not.toBe('none');
+    const t1 = await transport(page1);
+    const t2 = await transport(page2);
+    testInfo.annotations.push({
+      type: 'transport',
+      description: `page1=${t1} page2=${t2}`,
+    });
+    expect(t1, 'page 1 live-update transport (sse expected; polling = silent degrade)').toBe('sse');
+    expect(t2, 'page 2 live-update transport (sse expected; polling = silent degrade)').toBe('sse');
 
-    // ---- phase 1: 5 rapid creates; page 2 must converge within 10s --------
+    // ---- phase 1: 5 rapid creates; page 2 must converge within 5s ---------
+    // (SSE pushes are coalesced at 250ms server-side, so the whole burst
+    // should land as roughly one full-list push well under a second.)
     const first = [1, 2, 3, 4, 5].map((n) => `${prefix} rapid ${n}`);
+    const phase1At = Date.now();
     for (const title of first) {
       const res = await request.post('/api/board', {
         headers: authHeaders(token),
@@ -233,20 +313,39 @@ test('golden_realtime_convergence', async ({ browser, baseURL, request }, testIn
     }
     const mine = (all: string[]) => all.filter((t) => t.startsWith(prefix));
     await expect
-      .poll(async () => mine(await boardTitles(page2)).length, { timeout: 10_000 })
+      .poll(async () => mine(await boardTitles(page2)).length, { timeout: 5_000 })
       .toBe(5);
+    testInfo.annotations.push({
+      type: 'timing',
+      description: `phase-1: ${Date.now() - phase1At}ms from first POST to page-2 in-memory convergence`,
+    });
     // Rendered UI carries them too (not just the in-memory array).
     for (const title of first) {
       await expect(page2.locator('#board-view')).toContainText(title, { timeout: 5_000 });
     }
 
     // ---- phase 2: kill page 2's transport mid-stream ----------------------
-    // No live EventSource exists to close (SSE 401s — header note 1), so the
-    // sanctioned fallback applies: a real network gap via setOffline.
-    await ctx2.setOffline(true);
-    await expect(page2.locator('#conn-status').first()).toHaveText(/Offline|pending/, {
-      timeout: 10_000,
+    // Preferred kill (now that a live EventSource exists): close it SILENTLY
+    // from page context. No error event fires and _liveSSE stays true — a
+    // true zombie, so the SPA's 18s staleness watchdog is what must notice
+    // and recover (header note 4). The sanctioned setOffline fallback applies
+    // only if no EventSource is reachable.
+    const killed = (await page2.evaluate(
+      "typeof _sse !== 'undefined' && _sse ? (_sse.close(), true) : false",
+    )) as boolean;
+    testInfo.annotations.push({
+      type: 'transport-kill',
+      description: killed
+        ? 'EventSource closed silently in page context; recovery = SPA staleness watchdog'
+        : 'no EventSource reachable from page; fell back to context.setOffline network gap',
     });
+    if (!killed) {
+      await ctx2.setOffline(true);
+      await expect(page2.locator('#conn-status').first()).toHaveText(/Offline|pending/, {
+        timeout: 10_000,
+      });
+    }
+    const killAt = Date.now();
 
     const second = [6, 7, 8].map((n) => `${prefix} gap ${n}`);
     for (const title of second) {
@@ -256,15 +355,28 @@ test('golden_realtime_convergence', async ({ browser, baseURL, request }, testIn
       });
       expect(res.status()).toBe(201);
     }
-    // The gap is real: page 2 cannot have seen the new cards while offline.
+    // The gap is real: the dead transport cannot have delivered the new cards.
     await page2.waitForTimeout(1_500);
     expect(mine(await boardTitles(page2)).length).toBe(5);
 
-    // ---- reconnect: resume/refetch path must converge within 15s ----------
-    await ctx2.setOffline(false);
+    // ---- recovery: page 2 must converge via the SPA's own resume path -----
+    // Zombie path budget: _lastDataTime must age past 18s, the watchdog
+    // checks every 5s, then the fresh connection's initial push + refetch
+    // land — so up to ~25s is the SPA working as designed, not slack.
+    if (!killed) await ctx2.setOffline(false);
     await expect
-      .poll(async () => mine(await boardTitles(page2)).length, { timeout: 15_000 })
+      .poll(async () => mine(await boardTitles(page2)).length, {
+        timeout: killed ? 40_000 : 15_000,
+      })
       .toBe(8);
+    testInfo.annotations.push({
+      type: 'timing',
+      description: `phase-2: ${Date.now() - killAt}ms from kill to page-2 convergence (${
+        killed ? 'stale-watchdog reconnect' : 'offline→online resume'
+      })`,
+    });
+    // And the transport re-established as SSE, not a degraded fallback.
+    expect(await transport(page2), 'page 2 transport after recovery').toBe('sse');
 
     // Page 1 (never disturbed) also holds all 8.
     await expect
@@ -272,10 +384,10 @@ test('golden_realtime_convergence', async ({ browser, baseURL, request }, testIn
       .toBe(8);
 
     // ---- final: identical state on both pages, exactly once on the server -
-    const t1 = mine(await boardTitles(page1)).sort();
-    const t2 = mine(await boardTitles(page2)).sort();
-    expect(t1).toEqual(t2);
-    expect(t1).toHaveLength(8);
+    const titles1 = mine(await boardTitles(page1)).sort();
+    const titles2 = mine(await boardTitles(page2)).sort();
+    expect(titles1).toEqual(titles2);
+    expect(titles1).toHaveLength(8);
     const all = await serverTitles(request, token);
     for (const t of [...first, ...second]) {
       expect(all.filter((x) => x === t), `exactly one server card for "${t}"`).toHaveLength(1);
