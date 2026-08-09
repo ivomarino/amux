@@ -634,9 +634,482 @@ for all workers. The Rust version:
 - Playwright: deep offline -- prefetch 10 workers, go offline, navigate to each
   worker's detail, verify peek/history renders from cache
 
+### Invariant 15: Three cardinal rules
+
+Elevated from lessons learned to architectural law:
+
+1. **No LLM invocation unless the operation requires semantic judgment.** Title
+   derivation, label generation, string formatting, gate evaluation, scope resolution,
+   context assembly, dependency resolution -- all deterministic, all free. The token
+   cost metric (tokens per verified issue) is a first-class dashboard number alongside
+   latency, CPU, and RSS.
+
+2. **No state transition without durable provenance.** Every mutation emits an
+   append-only event with actor, timestamp, and cause. Provenance is queryable:
+   `amux issue AR-123 history` returns the full chain.
+
+3. **No backend/provider-specific behavior above its adapter boundary.** The
+   orchestrator, board, scheduler, and dashboard never know whether tmux or herdr is
+   running, or whether Claude or Ollama is the provider. If a feature requires
+   `if provider == "claude"` above the adapter, the adapter's interface is wrong.
+
+### Invariant 16: Token budgets are a runtime primitive
+
+Not just a context-assembler concern. Budgets govern context assembly, turn execution,
+and issue-level cost tracking.
+
+```rust
+struct TokenBudget {
+    max_input: u32,
+    reserved_output: u32,
+    max_per_issue: Option<u64>,
+    max_per_turn: Option<u32>,
+}
+
+struct ContextFragment {
+    source: ContextSource,
+    priority: u8,
+    estimated_tokens: u32,
+    content_hash: Hash,
+}
+```
+
+Context assembly is deterministic priority order:
+
+`issue + acceptance criteria > immediate dependencies > relevant memory > recent turns > broad history`
+
+Never dump entire issue graphs, logs, memories, or prior transcripts. Summarize/cache
+once, reference by ID/hash, hydrate on demand. **Tokens consumed per verified issue**
+is a core metric on the dashboard.
+
+### Invariant 17: Structural @worker addressing
+
+Mentions are not prompt syntax. They are durable, addressed intent with delivery
+tracking.
+
+```rust
+enum ActorRef {
+    Worker(WorkerId),
+    Group(GroupId),
+    Orchestrator,
+    User(UserId),
+}
+
+struct Mention {
+    id: MentionId,
+    actor: ActorRef,
+    instruction: String,
+    state: MentionState,
+}
+
+enum MentionState {
+    Queued,
+    Delivered { at: DateTime<Utc> },
+    Acknowledged { at: DateTime<Utc> },
+    ActedOn { outcome: String },
+}
+```
+
+`@worker-3 investigate auth regression` parses into a durable command addressed to
+worker-3. Works in issue descriptions, comments, board activity, CLI, and dashboard.
+Offline safe (queued -> delivered on reconnect). Crash safe (persisted in DB before
+delivery attempt).
+
+### Invariant 18: Gates are first-class entities
+
+Gates are not just scoped definitions enforced by transitions. They are database
+entities with APIs, history, versions, and explainability.
+
+```rust
+struct Gate {
+    id: GateId,
+    scope: Scope,
+    transition: TransitionSelector,  // e.g., doing -> done
+    criteria: Vec<Criterion>,
+    evaluator: GateEvaluator,
+    required_evidence: Vec<EvidenceType>,
+}
+
+enum GateEvaluator {
+    Manual,                    // human acknowledges
+    Deterministic(CheckFn),    // cargo test, HTTP 200, artifact exists
+    Model(ModelJudgment),      // semantic evaluation (last resort)
+}
+```
+
+The critical query:
+
+```
+amux issue AR-123 why-blocked
+
+blocked by gate G-9 (scope: group/engineering)
+  criterion: integration tests green
+  missing evidence: test_run
+  suggested command: cargo test --workspace
+  last attempt: 2026-08-07 14:22 — failed (3 tests)
+```
+
+No opaque "gate failed."
+
+### Invariant 19: Issue state != Execution state
+
+These are separate concepts that must never bleed into each other.
+
+**Board state** (semantic, user-visible):
+
+```
+todo -> claimed -> in_progress -> review -> done -> verified
+                                         -> blocked
+                                         -> discarded
+```
+
+**Execution state** (runtime, system-internal):
+
+```
+unassigned -> queued -> leased -> running -> waiting
+                                          -> rate_limited
+                                          -> retrying
+                                          -> crashed
+                                          -> completed
+```
+
+A rate limit changes execution state, never board state. A backend crash changes
+execution state, never board state. Context compaction, session replacement, and
+provider failover are all execution-state transitions invisible to the board.
+
+The board shows what the work IS. Execution state shows what the worker is DOING.
+The orchestrator bridges them: when execution state reaches `completed`, the board
+transition to `done` fires (with evidence). When execution state reaches `crashed`,
+the orchestrator retries (new session) without touching the board.
+
+### Invariant 20: Fleet-level provider quota management
+
+Rate limiting is not just detection/recovery. The orchestrator knows provider
+capacity BEFORE assignment.
+
+```rust
+struct ProviderQuota {
+    provider: Provider,
+    concurrency_limit: usize,
+    active_workers: usize,
+    requests_remaining: Option<u64>,
+    tokens_remaining: Option<u64>,
+    reset_at: Option<DateTime<Utc>>,
+    rolling_error_rate: f32,
+    state: ProviderState,
+}
+
+enum ProviderState {
+    Available,
+    Degraded { reason: String },
+    QuotaExhausted { reset_at: DateTime<Utc> },
+    ConcurrencyLimited,
+    Unavailable { since: DateTime<Utc> },
+    AuthExpired,
+}
+```
+
+Workers can have fallback chains:
+
+```
+preferred: Claude
+fallback_1: Codex
+fallback_2: Ollama (local, always available)
+```
+
+The orchestrator routes work to available providers instead of workers thrashing
+against known limits. Distinct failure types get distinct recovery:
+
+| Failure | Recovery |
+|---|---|
+| `QuotaExhausted` | Wait for reset_at, assign to fallback |
+| `ConcurrencyLimited` | Queue, assign when slot opens |
+| `Unavailable` | Circuit breaker, exponential backoff + jitter |
+| `AuthExpired` | Alert user, block provider until re-auth |
+| `NetworkFailure` | Retry with backoff, degrade to local (Ollama) |
+
+### Invariant 21: Backend and provider conformance suites
+
+Every backend implementation passes the same test suite unchanged. Every provider
+adapter passes the same test suite unchanged.
+
+```rust
+// One suite, runs against Mock, Tmux, Herdr, NativePty:
+mod backend_conformance {
+    async fn test_spawn_and_capture(backend: &dyn SessionBackend);
+    async fn test_send_text_roundtrip(backend: &dyn SessionBackend);
+    async fn test_interrupt(backend: &dyn SessionBackend);
+    async fn test_terminate(backend: &dyn SessionBackend);
+    async fn test_crash_recovery(backend: &dyn SessionBackend);
+    async fn test_restart_reconciliation(backend: &dyn SessionBackend);
+    async fn test_large_prompt(backend: &dyn SessionBackend);
+    async fn test_unicode(backend: &dyn SessionBackend);
+    async fn test_multiline(backend: &dyn SessionBackend);
+    async fn test_concurrent_workers(backend: &dyn SessionBackend);
+    async fn test_backend_disappears(backend: &dyn SessionBackend);
+}
+```
+
+**The invariant: no test above the backend/provider layer knows which
+backend/provider is running.**
+
+### Invariant 22: Deterministic orchestrator simulation
+
+Instead of requiring real workers for all orchestration tests, the orchestrator runs
+against a fake clock + fake provider + fake backend:
+
+```
+t=0   issue created
+t=1   worker claims (lease 30s)
+t=3   provider rate-limits
+t=20  rate-limit resets
+t=21  worker resumes
+t=25  worker crashes (OOM)
+t=26  lease reclaimed
+t=27  worker-2 takes issue
+t=40  worker-2 completes
+t=41  verification passes
+t=42  issue verified
+```
+
+Assert the entire event stream. Fuzz thousands of workflows in seconds. Catch race
+conditions that Playwright will never reliably hit.
+
+Use `proptest` for property/invariant testing:
+
+```rust
+// For arbitrary generated event sequences, assert:
+proptest! {
+    fn no_double_lease(events in arb_events()) {
+        // an issue cannot have two live leases simultaneously
+    }
+    fn verified_implies_done(events in arb_events()) {
+        // verified implies done occurred previously
+    }
+    fn blocked_dep_never_runnable(events in arb_events()) {
+        // a blocked dependency can never be marked runnable
+    }
+    fn idempotent_replay(events in arb_events()) {
+        // replaying the same events produces identical final state
+    }
+    fn no_unaudited_bypass(events in arb_events()) {
+        // every force bypass has an audit entry with actor
+    }
+}
+```
+
+### Invariant 23: Server-side integration degradation
+
+amux keeps orchestrating when external services disappear. Every integration has a
+capability state:
+
+```rust
+enum IntegrationState {
+    Available,
+    Degraded { reason: String },
+    Offline { since: DateTime<Utc> },
+    AuthExpired,
+    RateLimited { reset_at: DateTime<Utc> },
+}
+
+// The orchestrator checks before assignment:
+// Issues requiring unavailable capabilities become capability-blocked,
+// not repeatedly retried.
+```
+
+Internet disappears: local orchestrator keeps running. Claude disappears: Ollama
+workers keep going. GitHub disappears: git operations queue. Gmail disappears: email
+operations queue. The system degrades, names what's degraded, and recovers
+automatically when connectivity returns.
+
+### Invariant 24: Immutable event history
+
+Every meaningful state mutation emits an append-only event:
+
+```rust
+struct DurableEvent {
+    id: EventId,
+    timestamp: DateTime<Utc>,
+    actor: Actor,
+    kind: EventKind,
+    entity_id: String,  // issue, worker, schedule, etc.
+    payload: Value,
+}
+
+enum EventKind {
+    IssueCreated,
+    IssueClaimed,
+    IssueStarted,
+    GateBlocked,
+    GateSatisfied,
+    WorkerMentioned,
+    CommandQueued,
+    CommandDelivered,
+    TurnStarted,
+    TurnCompleted,
+    RateLimitEntered,
+    RateLimitCleared,
+    VerificationStarted,
+    VerificationFailed,
+    IssueVerified,
+    ProviderDegraded,
+    ProviderRecovered,
+}
+```
+
+This is not event sourcing (current state is still the DB row). It is an append-only
+audit log. It enables: debugging ("why did AR-421 end up here?"), replay (offline
+sync), metrics (tokens per verified issue, time-in-state), and the `why-blocked`
+query.
+
+### Invariant 25: Priority and scheduling hints
+
+Dependency graphs tell you what CAN run. Priority tells you what SHOULD run first.
+
+```rust
+struct SchedulingHints {
+    priority: Priority,
+    deadline: Option<DateTime<Utc>>,
+    estimated_cost: Option<TokenCost>,
+    preferred_worker: Option<WorkerId>,
+    affinity: Vec<Affinity>,
+}
+```
+
+The orchestrator scores candidates:
+
+```
+dependency critical path weight
++ explicit priority
++ age/starvation (prevent indefinite queue)
++ worker affinity (cached context reuse)
++ provider availability (don't assign to rate-limited)
++ estimated token cost (cheap work first when budget-constrained)
+```
+
+Without this, 380 TODO items becomes FIFO, which is the wrong order most of the time.
+
+### Invariant 26: Backpressure on every channel
+
+Rust removes Python's accidental serialization (GIL). Every async channel needs
+explicit bounds and overflow semantics.
+
+```rust
+// Every mpsc channel has a bound:
+let (tx, rx) = mpsc::channel::<DbWrite>(1024);        // DB write queue
+let (tx, rx) = mpsc::channel::<WorkerEvent>(256);      // event channel
+let (tx, rx) = mpsc::channel::<SseEvent>(64);           // per-subscriber SSE
+
+// Overflow semantics are explicit per channel:
+// DB writes: block sender (backpressure to API handler -> 503)
+// WorkerEvents: drop oldest (stale events are worse than gaps)
+// SSE: drop oldest + send "reconnect" hint
+// Command queue per worker: bounded at 16, reject with 429
+```
+
+Never use an unbounded `mpsc`. Every queue's bound is a configuration value, not a
+magic constant.
+
+### Invariant 27: Immutable context snapshots
+
+Every assignment records exactly what the worker received.
+
+```rust
+struct ContextSnapshot {
+    id: ContextSnapshotId,
+    issue_id: IssueId,
+    worker_id: WorkerId,
+    hash: Hash,
+    fragments: Vec<FragmentRef>,
+    total_tokens: u32,
+    created_at: DateTime<Utc>,
+}
+```
+
+Behavior becomes reproducible: "worker X failed AR-123 using context snapshot C-991."
+Context caching becomes trivial: if the hash matches, reuse. Token optimization
+becomes measurable: compare snapshot sizes across attempts.
+
+### Invariant 28: Cheapest verifier first
+
+Verification uses the cheapest/most deterministic verifier that can prove each
+criterion:
+
+| Criterion | Verifier | Cost |
+|---|---|---|
+| Tests green | `cargo test` exit code | Free |
+| HTTP 200 | curl | Free |
+| DOM contains element | Playwright assertion | Cheap |
+| Artifact exists | `stat` | Free |
+| Git commit merged | `git log --oneline` | Free |
+| Screenshot visually correct | Model judgment or human | Expensive |
+| Requirement semantically satisfied | Model judgment | Expensive |
+
+Never call a model when a deterministic check suffices. This is Invariant 15 rule 1
+applied to verification specifically.
+
+```rust
+enum VerifierKind {
+    Command { cmd: String, expected_exit: i32 },
+    HttpCheck { url: Url, expected_status: u16 },
+    FileExists { path: PathBuf },
+    PlaywrightAssertion { script: String },
+    ModelJudgment { prompt: String },
+    HumanReview,
+}
+```
+
+Verifiers run in cost order. If the free checks fail, expensive ones never run.
+
 ---
 
-## The Orchestrator
+## The Orchestrator (updated mental model)
+
+```
+USER / @MENTIONS / SCHEDULES
+              |
+              v
+          BOARD GRAPH
+    issues + gates + evidence
+    + dependency resolution
+    + priority scoring
+              |
+              v
+         ORCHESTRATOR
+ dependency / priority / quota
+ + stall detection
+ + lease management
+ + provider routing
+              |
+              v
+          ASSIGNMENT
+      immutable context snapshot
+      + token budget
+              |
+              v
+           WORKER
+              |
+      WorkerCommand/Event
+      (typed, durable, addressed)
+              |
+      +-------+--------+
+      v                v
+   PROVIDER          BACKEND
+ Claude/Gemini/    tmux/herdr/
+ Codex/Ollama      native PTY
+      |                |
+      +-------+--------+
+              v
+          EVIDENCE
+    (deterministic first,
+     model judgment last)
+              |
+              v
+        VERIFICATION
+              |
+              v
+           VERIFIED
+```
 
 The implicit orchestrator (currently scattered across pickup, advance-nudge, steering,
 snapshot, and session startup) becomes explicit:
@@ -979,9 +1452,19 @@ harness that will verify every subsequent phase.
 - Unit: all 47 tables created in in-memory DB
 - Unit: `BoardTransition` state machine rejects invalid transitions
 - Unit: API request/response types match OpenAPI spec (generated from JsonSchema derives)
+- Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
+- Unit: backpressure -- bounded channels reject/drop correctly at capacity (Invariant 26)
+- Unit: `ContextFragment` priority ordering is deterministic (Invariant 16)
+- Unit: `GateEvaluator::Deterministic` runs before `Model` (Invariant 28)
+- Simulation: fake clock + fake backend, orchestrator tick completes in <1ms (Invariant 22)
+- Simulation: deterministic replay of 100 random event sequences produces identical state
+- proptest: `BoardTransition` state machine rejects all invalid (from, to) pairs (Invariant 22)
+- proptest: scope merge is idempotent (merge(a, a) == a for arbitrary config)
 - Integration: `GET /` returns dashboard HTML with version string
 - Integration: `GET /health` returns 200 with build hash
 - Integration: OpenAPI spec generated at `/api/spec.json`, valid per OpenAPI 3.1
+- Integration: backend conformance suite passes for MockBackend (Invariant 21)
+- Integration: provider conformance suite passes for MockProvider (Invariant 21)
 - Playwright: dashboard loads in Chrome, no console errors
 - Playwright: mobile viewport (375px) renders without overflow
 - Playwright: offline mode -- cache shell, disconnect, dashboard still renders
@@ -1012,16 +1495,33 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: reconcile_on_startup handles all mismatch states (DB vs backend)
 - Unit: lease expiration releases issue back to runnable
 - Unit: stall_check fires when worker idle + non-terminal issue exists
+- Unit: `ProviderQuota` state machine transitions for all `ProviderState` variants (Invariant 20)
+- Unit: fallback chain routes to next-available provider when primary is exhausted (Invariant 20)
+- Unit: execution state transitions are independent of board state transitions (Invariant 19)
+- Unit: `@worker` mention parses from issue text, CLI, and dashboard input (Invariant 17)
+- Unit: mention delivery state machine: Queued->Delivered->Acknowledged->ActedOn (Invariant 17)
+- Simulation: 50 workers, 200 issues, fake clock -- orchestrator assigns optimally with
+  no double-leases (Invariant 22)
+- Simulation: provider rate-limit + recovery -- fleet redistributes within 2 ticks (Invariant 20)
+- Simulation: worker crash mid-issue -- lease reclaimed, issue re-assigned (Invariant 22)
+- proptest: no double-lease for arbitrary event sequences (Invariant 22)
+- proptest: verified implies done occurred previously (Invariant 22)
+- Backend conformance: tmux passes full suite (Invariant 21)
+- Provider conformance: Claude adapter passes full suite (Invariant 21)
 - Integration: create Claude worker, start, verify tmux session, send text, capture
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
 - Integration: SSE delivers worker state within 2s of WorkerEvent
 - Integration: worker status transitions (idle->active->rate_limited->idle) reflected
   in API response within 1s
+- Integration: `DurableEvent` emitted for every worker lifecycle transition (Invariant 24)
+- Integration: `ContextSnapshot` recorded on every assignment (Invariant 27)
 - Mock: SessionBackend mock for fast orchestrator unit tests
 - Playwright: worker list renders, Start button responds within 1s (measured)
 - Playwright: worker status badge updates within 2s of state change (all providers)
 - Playwright: create worker with group assignment, verify group scope applied
 - Playwright: idle worker with non-terminal issue -> dashboard shows stall warning
+- Playwright: `@worker` mention in issue description triggers delivery (Invariant 17)
+- Playwright: token budget dashboard shows tokens-per-verified-issue metric (Invariant 16)
 
 ### Phase 2: Board + dependency graph (est. 3 weeks)
 
@@ -1049,18 +1549,34 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
   two connections)
 - Unit: lease expires -> issue reclaimable, original worker's claim is void
 - Unit: `force=true` bypasses gate, writes audit trail including actor + reason
+- Unit: `Gate` entity CRUD -- create, scope, version, history (Invariant 18)
+- Unit: `why-blocked` query returns gate id, criterion, missing evidence, suggested
+  command (Invariant 18)
+- Unit: `GateEvaluator` ordering: `Deterministic` before `Model` (Invariant 28)
+- Unit: issue state vs execution state separation -- rate-limit changes execution
+  state only, never board state (Invariant 19)
+- Unit: priority scoring: critical-path weight + explicit priority + age starvation +
+  affinity + provider availability + cost (Invariant 25)
+- proptest: dependency graph is acyclic for arbitrary relation insertions (rejects cycles)
+- proptest: force bypass always produces audit entry with actor (Invariant 22)
+- proptest: `IssueRelation::Blocks` and `IssueRelation::DependsOn` are inverse-consistent
+- Simulation: 100 issues with complex dependency graph, orchestrator resolves runnable
+  set in topological order (Invariant 22)
 - Integration: create parent + children, complete children, parent becomes runnable
 - Integration: board CRUD through full lifecycle (todo->claimed->doing->review->done
   ->verified) with proper gate acks at each transition
 - Integration: group A board has custom columns, group B has default columns, both
   work independently
 - Integration: API responses match OpenAPI contract for every board endpoint
+- Integration: `DurableEvent` emitted for every board transition (Invariant 24)
+- Integration: `why-blocked` API returns actionable gate info (Invariant 18)
 - Playwright: board renders, drag-and-drop transitions work, gate 409 shown as toast
   with the exact gate criteria and CLI command to satisfy
 - Playwright: mobile board usable at 375px, touch targets >= 44px
 - Playwright: user creates issue in group A, worker in group B cannot see it
 - Playwright: no-stall check -- complete an issue, verify worker picks up next or
   goes idle with all issues terminal
+- Playwright: `why-blocked` detail panel shows criteria, evidence, suggested CLI (Invariant 18)
 
 ### Phase 3: Scheduling (est. 2 weeks)
 
@@ -1086,8 +1602,11 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
 - Unit: cron expression parser handles all formats (daily, every Nm, weekday, 5-field)
 - Unit: schedule CRUD respects audit trail
 - Unit: missed-run behavior (skip vs. catch-up)
+- Unit: `DurableSchedule` vs `PeriodicTask` are separate types with separate lifecycles
+- Unit: schedule scoped to group only fires for workers in that group (Invariant 2)
 - Integration: create schedule, run-now, verify `schedule_runs` with `source` field
 - Integration: periodic task ticks at interval, does not block other tasks
+- Integration: `DurableEvent` emitted for schedule fire, manual run, missed run (Invariant 24)
 - Playwright: schedule list, create, edit, run-now button works
 
 ### Phase 4: Control plane (steering, rate-limit, auto-responder) (est. 2 weeks)
@@ -1106,9 +1625,19 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
   2 for Gemini, 1 for Codex, 1 for Ollama)
 - Unit: scan demotion correctly classifies hook-reported vs. hookless
 - Unit: WorkerEvent translation from all known terminal states
+- Unit: backpressure -- command queue per worker bounded at 16, rejects with 429 (Invariant 26)
+- Unit: backpressure -- SSE channel drops oldest + sends reconnect hint on overflow (Invariant 26)
+- Unit: `ContextSnapshot` created on every assignment, hash stable for identical content (Invariant 27)
+- Unit: context assembly priority: issue > deps > memory > turns > history (Invariant 16)
+- Simulation: 10 workers rate-limiting simultaneously, orchestrator redistributes
+  to available providers within 3 ticks (Invariant 20/22)
+- Simulation: command delivery under backpressure -- no lost commands, 429 for overflow (Invariant 26)
 - Integration: enqueue command, verify delivery within 4s
 - Integration: rate-limit auto-wait fires on simulated terminal output
+- Integration: `IntegrationState` transitions reflected in `/health` endpoint (Invariant 23)
+- Integration: Gmail unavailable -> email operations queue, recover on reconnect (Invariant 23)
 - Playwright: worker status updates live in dashboard, rate-limit shown within 2s
+- Playwright: provider quota dashboard shows fleet-level capacity (Invariant 20)
 
 ### Phase 5: Verification (est. 2 weeks)
 
@@ -1131,8 +1660,14 @@ The user flow acceptance tests built here become the regression suite:
 
 **Test plan**:
 - Unit: verification state machine (done->verification->verified|rejected->in_progress)
+- Unit: cheapest-verifier-first ordering: Command < HttpCheck < FileExists <
+  PlaywrightAssertion < ModelJudgment < HumanReview (Invariant 28)
+- Unit: free verifier failure short-circuits -- model verifier never called (Invariant 28)
+- Simulation: verification pipeline with mixed verifier types, cost-ordered execution
 - Integration: issue completes, verification runs, evidence recorded
 - Integration: verification fails, issue returns to doing with rejection reason
+- Integration: `DurableEvent::VerificationStarted` and `VerificationFailed`/`IssueVerified`
+  emitted with full evidence chain (Invariant 24)
 
 **Playwright golden scenarios (the acceptance criteria)**:
 
@@ -1289,11 +1824,13 @@ Performance measurement:
 
 Pipeline stages:
 1. `cargo check` + `clippy` -- compile-time correctness
-2. `cargo test` -- all unit + integration tests
-3. Playwright suite -- all golden scenarios + all UI flows
-4. Performance benchmarks -- compared against baseline, regression = failure
-5. SQLite migration test -- apply migrations to a copy of prod DB, verify no data loss
-6. Binary size check -- regression if binary grows >20%
+2. `cargo test` -- all unit + integration + simulation + proptest tests
+3. Backend conformance suite -- MockBackend + TmuxBackend (Invariant 21)
+4. Provider conformance suite -- MockProvider + all adapter tests (Invariant 21)
+5. Playwright suite -- all golden scenarios + all UI flows
+6. Performance benchmarks -- compared against baseline, regression = failure
+7. SQLite migration test -- apply migrations to a copy of prod DB, verify no data loss
+8. Binary size check -- regression if binary grows >20%
 
 Regression detection:
 - Latency regression: any p95 increase >10% vs baseline is a CI failure
