@@ -1679,3 +1679,31 @@ NOTE: distinct from the two shapes AMUX-2443 already covers. Not `git add` sweep
   here the file is entirely mine, the committer never touched it, and their `git add` never
   named it. The guard's blind spot is that it is FILE-scoped while the sweep is INDEX-scoped
   — a check aimed one level below the mechanism it is protecting against.
+
+## The reviewer-identity check fires on done->verified, blocking the peer amux routed the verification to
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-20
+SYMPTOM: Working the VERIFY queue amux dispatched to me ("You are the independent check"),
+  done -> verified was refused twice with "review sign-off required from the reviewer ...
+  the review->done ack must come from that session". The attempted edge is done->verified,
+  not review->done. On AMUX-2385 it is unsatisfiable by construction: the card went
+  doing -> done directly (log: `status: doing -> done (by amux/session)`), so the named
+  reviewer never acked a review and has no pending ack to give.
+COST: Two forced bypasses in one afternoon (AMUX-2334, AMUX-2385) on cards I had fully
+  measured. Both logged and attributed, so nothing is hidden — but the alternative was
+  leaving a completed verification unrecorded, and a gate that trains its most careful users
+  to reach for --force is inverting its own purpose.
+FIX: Scope the identity check to the transition it is about. It exists so an author cannot
+  self-ack their own review — that is review->done. done->verified is a different edge with
+  a different role and already has its own peer criterion. Failing that, accept ANY different
+  worker in the group, which is what the gate text already asks for. At minimum fix the
+  message: naming the wrong transition sends the reader hunting an ack that cannot exist.
+NOTE: ethos rule 6 — the published contract and the enforced one disagree. The `verified`
+  gate lists four criteria; criterion 2 is "Peer-reviewed by a DIFFERENT worker in group
+  `amux` (name them)", which I satisfied and named. The refusal comes from a check the gate
+  text never mentions. A card can therefore pass every criterion it publishes and still be
+  refused, which is the state that makes --force feel like the honest move.
