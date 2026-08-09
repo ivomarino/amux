@@ -176,6 +176,12 @@ pub enum RateLimitKind {
     Daily,
     Weekly,
     SubscriptionCap,
+    /// Credit/balance exhaustion (extra-usage credits, spend caps, 402
+    /// budget errors). Distinct from time-window limits: it clears on a
+    /// PAYMENT or balance change, not on a clock — the fleet's rate-limit
+    /// handling must not schedule a wait for something a timer cannot fix
+    /// (AF-14: a credit cap clears on its remedy).
+    Credit,
     Unknown,
 }
 
