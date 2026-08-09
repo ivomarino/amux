@@ -69602,14 +69602,39 @@ class CCHandler(BaseHTTPRequestHandler):
                         if (_rev and new_status in _REVIEWER_SIGNOFF_TARGETS
                                 and not body.get("force")):
                             _acker = _hdr_worker(self.headers)
-                            if _acker != _rev:
+                            _author = (gate_item.get("session") or "").strip()
+                            _from_review = bool(prior and prior["status"] == "review")
+                            # TWO ROLES, TWO RULES (AF-20). Reviewing ("do the
+                            # findings hold") and verifying ("is it true in prod")
+                            # are different edges:
+                            #   review->done   the ack is specifically the named
+                            #                  reviewer's — unchanged.
+                            #   any->verified, done from elsewhere
+                            #                  independence is the requirement:
+                            #                  anyone EXCEPT the author qualifies,
+                            #                  because amux's own sweep routes
+                            #                  verification to a peer who is
+                            #                  usually NOT the reviewer, and the
+                            #                  old any-close identity check
+                            #                  refused the very peer it sent
+                            #                  (AMUX-2334/2385, both forced).
+                            # AMUX-2217's protection survives both branches: the
+                            # AUTHOR is refused every path (doing->verified
+                            # included); force stays the logged escape.
+                            _blocked = (_acker != _rev) if (_from_review and new_status == "done") \
+                                else (not _acker or _acker == _author)
+                            if _blocked:
+                                _need = (f"the review->done ack must come from '{_rev}' "
+                                         f"(X-Amux-Session)") if (_from_review and new_status == "done") \
+                                    else (f"'{new_status}' needs an INDEPENDENT session — anyone but "
+                                          f"the author lane '{_author}'; the attempt came from "
+                                          f"{_acker or '(no X-Amux-Session)'}")
                                 return self._json({
-                                    "error": "review sign-off required from the reviewer",
+                                    "error": "sign-off identity check failed for this transition",
                                     "blocked": True, "reviewer": _rev,
                                     "acker": _acker or "(no X-Amux-Session)",
-                                    "how": (f"this card names '{_rev}' as reviewer; the review->done ack "
-                                            f"must come from that session (X-Amux-Session), or pass "
-                                            f"force=true (logged) if the human overrides."),
+                                    "transition": f"{prior['status'] if prior else '?'}->{new_status}",
+                                    "how": _need + ", or pass force=true (logged) if the human overrides.",
                                 }, 409)
                         # The contract advertises force as "logged" in two places and
                         # NOTHING logged it — the one escape hatch from the gate system
