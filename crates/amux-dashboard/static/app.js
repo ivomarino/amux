@@ -2100,10 +2100,35 @@ function _checkSessionTransitions(newData) {
   }
 }
 
+// A remote window whose SW-cached shell carries a rotated-away token gets 401
+// on every API call and can never heal on its own — the fresh token lives in
+// the fresh shell. Nudge the SW and reload ONCE per session (rate-limited like
+// the version-mismatch reload; a broken SW must not cause a storm).
+function _staleShellRecover() {
+  try {
+    const last = parseInt(sessionStorage.getItem('amux_401_reload') || '0');
+    if (Date.now() - last < 600000) return;
+    sessionStorage.setItem('amux_401_reload', String(Date.now()));
+    console.warn('amux: API 401 with this shell’s token — refreshing the shell');
+    const upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
+      ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
+      : Promise.resolve();
+    upd.finally ? upd.finally(() => setTimeout(() => location.reload(), 1500))
+                : setTimeout(() => location.reload(), 1500);
+  } catch (e) {}
+}
+
 async function fetchSessions() {
   try {
     const r = await fetch(API + '/api/sessions');
     const data = await r.json();
+    // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
+    // must not become `sessions` — every card render maps over it.
+    if (!Array.isArray(data)) {
+      if (r.status === 401) _staleShellRecover();
+      console.warn('sessions fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      return;
+    }
     consecutiveFailures = 0;
     _lastDataTime = Date.now();
     if (_initialLoad) { _initialLoad = false; }
@@ -6422,7 +6447,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.528';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.529';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -17136,6 +17161,17 @@ async function fetchBoard() {
     }
     _boardEtag = r.headers.get('ETag') || null;
     const data = await r.json();
+    // NEVER assign a non-array into boardItems (live crash 2026-08-09: a
+    // remote window holding a stale SW-cached shell sent a stale token, the
+    // 401 body {"error":"unauthorized"} became boardItems, and every
+    // _cardDoingCount/forEach in the worker-list render threw — one bad
+    // fetch bricked the whole page). Keep the previous array; a 401 means
+    // the SHELL (and its injected token) is stale, so refresh it once.
+    if (!Array.isArray(data)) {
+      if (r.status === 401) _staleShellRecover();
+      console.warn('board fetch returned non-array (status ' + r.status + ') — keeping previous set');
+      return;
+    }
     const j = JSON.stringify(data);
     const itemsChanged = j !== lastBoardJSON;
     if (itemsChanged || statusesChanged) {
