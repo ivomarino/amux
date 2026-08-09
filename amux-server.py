@@ -13820,6 +13820,27 @@ def _similar_open_cards(title: str, exclude_session: str, db=None, limit: int = 
 _BOARD_SLIM_DROP = ("desc", "log")
 
 
+_BOARD_DESC_LIMIT = 200
+
+
+def _board_slim_desc(item: dict) -> dict:
+    """Return a shallow copy with desc truncated to the first line (max 200 chars).
+
+    The dashboard card view only shows `desc.split('\\n')[0].slice(0, 80)` — the
+    full desc is fetched on-demand when the detail editor opens. Shipping 4.4MB
+    of desc text (74% of the 6MB board payload) on every SSE push and poll was
+    the dominant cost.
+    """
+    d = item.get("desc") or ""
+    if len(d) <= _BOARD_DESC_LIMIT:
+        return item
+    first_line = d.split("\n", 1)[0]
+    c = dict(item)
+    c["desc"] = first_line[:_BOARD_DESC_LIMIT]
+    c["desc_truncated"] = True
+    return c
+
+
 _BOARD_TERMINAL = ("done", "verified", "discarded")
 
 
@@ -64890,7 +64911,7 @@ class CCHandler(BaseHTTPRequestHandler):
                 # can never disagree with the full payload the plain GET serves
                 # and no write site has to remember to maintain a second copy.
                 if bc.get("open_at") != bc.get("time"):
-                    _bopen = [i for i in (bc["data"] or []) if not i.get("archived")]
+                    _bopen = [_board_slim_desc(i) for i in (bc["data"] or []) if not i.get("archived")]
                     bc["open_json"] = json.dumps(_bopen, sort_keys=True)
                     bc["open_data"] = _bopen
                     bc["open_at"] = bc.get("time")
