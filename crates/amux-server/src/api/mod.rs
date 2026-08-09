@@ -36,6 +36,7 @@ pub mod sse;
 pub mod static_files;
 pub mod sync;
 pub mod torrents;
+pub mod upload;
 pub mod verify;
 pub mod workers;
 pub mod workers_deadletters;
@@ -98,10 +99,9 @@ pub fn router(state: AppState) -> Router {
         // proxies to the Python owner rather than aliasing (py_proxy.rs).
         .nest("/api/fs", py_proxy::passthrough_routes())
         // Chunked upload: /api/upload/start, /api/upload/:id/chunk/:n,
-        // /api/upload/:id/finish. Python owns the chunked protocol and the
-        // uploads directory; the SPA's peek drag-and-drop hits these.
-        .nest("/api/upload", py_proxy::passthrough_routes())
-        .nest("/api/uploads", py_proxy::passthrough_routes())
+        // /api/upload/:id/finish — native Rust (no Python proxy).
+        .nest("/api/upload", upload::routes())
+        .nest("/api/uploads", upload::serve_routes())
         // Groups/tags (AMUX-2594): the SPA's group picker reads /api/groups
         // ({"groups":[{name,workers,...}]}); Python owns the fleet and its
         // own groups->tags aliasing (amux-server.py:65345, config paths
@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
     let app = Router::new()
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
+        .route("/api/debug/tmux", axum::routing::get(health::debug_tmux))
         // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
         .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
         // Dynamic manifest: PWA name/color follow the branding prefs (the
