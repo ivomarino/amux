@@ -185,10 +185,11 @@ The orchestrator uses this graph to determine what to assign, not a flat queue s
 ### Invariant 5: Typed command/event protocol (the D1 exit)
 
 The terminal is an adapter, not the control plane. The system speaks typed commands
-and events internally via **OpenCode's structured agent protocol**; the backend
-(herdr, tmux, or native PTY) handles process hosting at the boundary. OpenCode
-provides the structured semantics; herdr provides persistence and human terminal
-access.
+and events internally via **OpenCode's structured agent protocol**. Prompts,
+messages, cancellation, and lifecycle queries go through OpenCode directly --
+never routed through the backend. The backend (herdr, tmux, or native PTY)
+handles only process hosting: start, stop, inspect. This separation eliminates
+most scraping entirely.
 
 ```rust
 enum WorkerCommand {
@@ -856,44 +857,47 @@ Every backend implementation passes the exact same test suite without changing t
 Every provider adapter passes the exact same test suite without changing tests.
 
 ```rust
-// One suite, runs against MockBackend, HerdrBackend, TmuxBackend,
-// and eventually NativePtyBackend:
+// Backend conformance: process lifecycle ONLY (spawn, stop, inspect).
+// Runs against MockBackend, HerdrBackend, TmuxBackend, NativePtyBackend:
 mod backend_conformance {
-    // Core lifecycle
-    async fn test_spawn_and_capture(backend: &dyn SessionBackend);
-    async fn test_send_text_roundtrip(backend: &dyn SessionBackend);
-    async fn test_multiline_input(backend: &dyn SessionBackend);
-    async fn test_large_input(backend: &dyn SessionBackend);
-    async fn test_unicode(backend: &dyn SessionBackend);
-    async fn test_read_output(backend: &dyn SessionBackend);
-
-    // State detection
-    async fn test_detect_active(backend: &dyn SessionBackend);
-    async fn test_detect_waiting(backend: &dyn SessionBackend);
-    async fn test_detect_completed(backend: &dyn SessionBackend);
-
-    // Lifecycle
-    async fn test_interrupt(backend: &dyn SessionBackend);
+    // Process lifecycle
+    async fn test_spawn(backend: &dyn SessionBackend);
     async fn test_terminate(backend: &dyn SessionBackend);
+    async fn test_status_running(backend: &dyn SessionBackend);
+    async fn test_status_after_terminate(backend: &dyn SessionBackend);
     async fn test_process_crash(backend: &dyn SessionBackend);
     async fn test_backend_daemon_disappears(backend: &dyn SessionBackend);
+    async fn test_attach_info(backend: &dyn SessionBackend);
 
     // Reconciliation
     async fn test_restart_reconciliation(backend: &dyn SessionBackend);
     async fn test_stale_session_reconciliation(backend: &dyn SessionBackend);
 
-    // Scale and concurrency
-    async fn test_concurrent_workers(backend: &dyn SessionBackend);
-    async fn test_40_worker_load(backend: &dyn SessionBackend);
+    // Scale
+    async fn test_concurrent_spawns(backend: &dyn SessionBackend);
+    async fn test_40_worker_spawn(backend: &dyn SessionBackend);
+}
 
-    // Reliability
-    async fn test_command_idempotency(backend: &dyn SessionBackend);
-    async fn test_no_duplicate_delivery_after_restart(backend: &dyn SessionBackend);
+// Protocol conformance: agent communication (prompts, messages, cancel, state).
+// Runs against MockProtocol, OpenCodeProtocol:
+mod protocol_conformance {
+    async fn test_send_prompt(proto: &dyn AgentProtocol);
+    async fn test_deliver_message(proto: &dyn AgentProtocol);
+    async fn test_cancel(proto: &dyn AgentProtocol);
+    async fn test_pause_resume(proto: &dyn AgentProtocol);
+    async fn test_state_query(proto: &dyn AgentProtocol);
+    async fn test_event_stream(proto: &dyn AgentProtocol);
+    async fn test_command_idempotency(proto: &dyn AgentProtocol);
+    async fn test_no_duplicate_delivery_after_restart(proto: &dyn AgentProtocol);
+    async fn test_multiline_prompt(proto: &dyn AgentProtocol);
+    async fn test_unicode_prompt(proto: &dyn AgentProtocol);
+    async fn test_large_prompt(proto: &dyn AgentProtocol);
 }
 ```
 
 **The invariant: no test above the backend/provider layer knows which
-backend/provider is running.**
+backend/provider is running. No test above the protocol layer knows which
+agent protocol implementation is in use.**
 
 ### Invariant 33: Backend independence
 
@@ -922,24 +926,31 @@ The layering:
 ```
 Orchestrator
     |
-WorkerCommand / WorkerEvent
-    |
-+-----+----------+
-|                 |
-OpenCode          SessionBackend trait
-(structured       (process hosting)
- agent protocol)  |
-                  +-- HerdrBackend   [default]
-                  +-- TmuxBackend    [fallback]
-                  +-- NativePtyBackend [future]
+    +------ AgentProtocol (OpenCode) ------+
+    |       prompts, messages, cancel,     |
+    |       events, state queries          |
+    |                                      |
+    +------ SessionBackend ------+         |
+            process lifecycle    |         |
+            (spawn, stop,        |         |
+             inspect only)       |         |
+            |                    |         |
+            +-- HerdrBackend    [default]  |
+            +-- TmuxBackend     [fallback] |
+            +-- NativePtyBackend [future]  |
+                                           v
+                                    WorkerEvent stream
 ```
 
-OpenCode and SessionBackend are independent axes. OpenCode provides structured agent
-semantics (typed events, lifecycle state) regardless of which process host is running.
-SessionBackend provides process hosting (spawn, send, read, terminate) regardless of
-whether OpenCode is available. When both are present, OpenCode events are primary and
-the backend is just a process host. When OpenCode is unavailable (e.g., a provider
-that does not support it yet), the terminal adapter falls back to scraping.
+OpenCode and SessionBackend are independent axes with non-overlapping
+responsibilities. OpenCode carries all agent communication: prompts, messages,
+cancellation, lifecycle queries, and events. SessionBackend carries only
+process lifecycle: spawn, terminate, inspect, reconcile. The orchestrator
+never sends a prompt through the backend.
+
+When OpenCode is unavailable (e.g., a provider that does not support it yet),
+the terminal adapter falls back to scraping for state and to `send-keys`-style
+input -- but this is the degraded path, not the design center.
 
 Rate limits, turns, compaction, messages, issue state, gates, verification,
 scheduling, and worker state are completely backend-independent. A worker can
@@ -1003,13 +1014,13 @@ protocol:
 ```
 1. API/orchestrator enqueues command (persisted to DB, idempotency key recorded)
 2. Orchestrator tick: pick next command for each idle/waiting worker
-3. Dispatch to SessionBackend.send()
-4. Backend acknowledges dispatch (command reached the process host)
-5. WorkerEvent confirms delivery (worker acted on it)
+3. Dispatch through AgentProtocol (OpenCode) -- direct to agent, not through backend
+4. OpenCode acknowledges receipt (structured response)
+5. WorkerEvent confirms execution (worker acted on it)
 6. Command marked Confirmed with outcome
 
-If step 3 fails: retry with backoff (backend may be restarting)
-If step 4 times out: retry (herdr/tmux may be slow but alive)
+If step 3 fails: check process liveness via SessionBackend.status()
+If step 4 times out: retry with backoff (OpenCode process may be busy)
 If step 5 never arrives: after timeout, mark DeadLettered + StallViolation
 ```
 
@@ -1539,13 +1550,16 @@ USER / @MENTIONS / SCHEDULES
       WorkerCommand/Event
       (typed, durable, addressed)
               |
-      +-------+--------+--------+
-      v                v        v
-   PROVIDER        OPENCODE   BACKEND
- Claude/Gemini/  (structured  herdr/tmux/
- Codex/Ollama    agent proto) native PTY
-      |                |        |
-      +-------+--------+--------+
+      +-------+--------+
+      v                v
+   PROVIDER        OPENCODE ◄── direct communication
+ Claude/Gemini/  (prompts, messages,     BACKEND
+ Codex/Ollama    cancel, events,       herdr/tmux/
+      |          state queries)        native PTY
+      |                |           (start/stop/inspect
+      +-------+--------+            process only)
+              |
+              +--- process lifecycle --►
               v
           EVIDENCE
     (deterministic first,
@@ -1580,11 +1594,15 @@ snapshot, and session startup) becomes explicit:
        │                 ┌──────────────┐
        │                 │   Sessions   │
        │                 └──────┬───────┘
-       │                        │ execution
-       │                 ┌──────▼───────┐
-       │                 │Backend(herdr/│
-       │                 │tmux/native)  │
-       │                 └──────────────┘
+       │                        │
+       │              ┌─────────┼──────────┐
+       │              │ OpenCode│ Backend  │
+       │              │ (comms) │ (process)│
+       │              │ prompts │ spawn    │
+       │              │ messages│ stop     │
+       │              │ cancel  │ inspect  │
+       │              │ events  │ attach   │
+       │              └─────────┴──────────┘
        v
 ┌──────────────┐
 │ Verification │
@@ -1726,27 +1744,35 @@ tmux subprocess call sites, ~50 compiled regexes, 5 polling loops at
 **Two layers: OpenCode for structured agent semantics + herdr for process hosting.**
 tmux as fallback host. Native PTY as future option.
 
-These are different concerns, not competing alternatives:
+These are different concerns, not competing alternatives, and their boundaries
+are strict:
 
 - **OpenCode** provides the structured agent protocol -- typed commands, lifecycle
   events, state reporting. This is what eliminates terminal scraping as the control
-  plane (the D1 exit). OpenCode gives the orchestrator typed `WorkerEvent`s instead
-  of regex matches against rendered terminal text.
+  plane (the D1 exit). **All agent communication flows through OpenCode directly**:
+  prompts, messages, cancellation, state queries, and events. The orchestrator
+  talks to OpenCode, not to the backend, for anything involving agent semantics.
 
 - **herdr** provides process hosting -- spawning, persisting, and providing human
   terminal access to agent sessions. It replaces tmux as the default process host
   because it is agent-oriented rather than terminal-oriented: cleaner lifecycle
-  management, no `send-keys` hacks, no pane geometry drift.
+  management, structured process state, no pane geometry drift. **herdr starts,
+  stops, and lets humans inspect the OpenCode process. It does not carry prompts.**
 
-Compared to tmux as a process host, herdr reduces:
+The boundary: use herdr to start/stop/inspect the OpenCode process. Prompts,
+messages, events, sessions, and cancellation go through OpenCode directly. This
+eliminates most scraping entirely -- not by replacing `send-keys` with a
+slightly better `send-keys`, but by removing the backend from the communication
+path altogether.
 
-- raw subprocess calls (agent-oriented operations vs. `tmux send-keys`)
-- `send-keys`-style input hacks (no autocomplete/ghost-text/paste-buffer fights)
-- pane targeting/geometry issues (no detached-window drift)
-- timing-sensitive delivery logic (structured send vs. keystroke injection)
+Compared to the current tmux architecture:
 
-The structured agent semantics that reduce scraping come from **OpenCode**, not
-from the process host:
+- `send-keys` hacks are eliminated entirely (prompts go through OpenCode API)
+- prompt delivery is typed and acknowledged (not fire-and-hope keystroke injection)
+- state queries return structured data (not regex matches on rendered text)
+- cancellation is a typed command (not Ctrl-C injection timing)
+
+The structured agent semantics come from **OpenCode**, not from the process host:
 
 - session/process lifecycle state (OpenCode reports, herdr hosts)
 - waiting/blocked/completed detection (OpenCode structured events)
@@ -1755,10 +1781,10 @@ from the process host:
 
 The scraping goal is no longer "port all tmux scraping behavior to Rust." Instead:
 
-1. OpenCode structured protocol is primary for agent lifecycle and state
+1. OpenCode structured protocol is the sole communication channel
 2. Provider hooks complement where available (Claude Code Stop/UserPromptSubmit)
 3. Terminal output parsing is a fallback adapter for provider-specific signals
-4. Scraping progressively shrinks toward provider-specific rate-limit patterns only
+4. Scraping shrinks to liveness checks and rate-limit pattern detection only
 
 tmux stays as a fallback process host behind the `SessionBackend` trait -- useful for
 migration, debugging, and recovery. Native PTY (Option C) is a future target once
@@ -1835,15 +1861,16 @@ amux/
           scheduler.rs           # user-facing durable schedules
           periodic.rs            # internal maintenance tasks
         backend/
-          mod.rs                 # SessionBackend trait + BackendKind dispatch
-          herdr.rs               # herdr process host (default)
-          tmux.rs                # tmux process host (fallback)
+          mod.rs                 # SessionBackend trait (process lifecycle ONLY)
+          herdr.rs               # herdr process host (default): spawn, stop, inspect
+          tmux.rs                # tmux process host (fallback): spawn, stop, inspect
           native_pty.rs          # native PTY (future/optional)
           adapter.rs             # terminal output -> WorkerEvent fallback translator
         opencode/
-          mod.rs                 # OpenCode structured agent protocol
+          mod.rs                 # AgentProtocol trait (direct agent communication)
           events.rs              # OpenCode -> WorkerEvent translation
           commands.rs            # WorkerCommand -> OpenCode translation
+          transport.rs           # HTTP/WebSocket transport to OpenCode process
         provider/
           mod.rs                 # provider dispatch
           claude.rs              # Claude Code specifics (hooks, regexes, auth)
@@ -1875,37 +1902,75 @@ amux/
         main.rs                  # clap subcommand tree
 ```
 
-### SessionBackend trait
+### SessionBackend trait (process lifecycle only)
 
-The backend trait covers the semantic operations amux needs. Higher layers never call
-herdr or tmux directly.
+The backend trait covers process hosting: start, stop, inspect. It does NOT
+carry prompts, messages, or agent commands -- those go through OpenCode directly.
+Higher layers never call herdr or tmux directly.
 
 ```rust
 #[async_trait]
 trait SessionBackend: Send + Sync {
     async fn spawn(&self, spec: SessionSpec) -> Result<ProcessRef>;
-    async fn send(&self, session: &ProcessRef, input: BackendInput) -> Result<()>;
-    async fn read(&self, session: &ProcessRef) -> Result<BackendOutput>;
-    async fn interrupt(&self, session: &ProcessRef) -> Result<()>;
     async fn terminate(&self, session: &ProcessRef) -> Result<()>;
     async fn status(&self, session: &ProcessRef) -> Result<BackendStatus>;
+    async fn attach_info(&self, session: &ProcessRef) -> Result<AttachInfo>;
     async fn reconcile(&self) -> Result<Vec<BackendSession>>;
 }
 
 enum BackendStatus {
     Running,
-    Waiting,
     Completed { exit_code: i32 },
     Crashed { signal: Option<i32> },
     NotFound,
 }
+
+struct AttachInfo {
+    command: String,     // e.g. "herdr attach worker-name" or "tmux attach -t ..."
+    pty_path: PathBuf,   // for human terminal access
+}
 ```
 
 `HerdrBackend` translates these to herdr's process hosting operations (spawn agent,
-send input, read output). `TmuxBackend` translates to `tmux new-session`,
-`send-keys`, `capture-pane`, etc. Structured agent lifecycle state comes from
-OpenCode, not from the backend -- the orchestrator consumes OpenCode events
-regardless of which process host is running underneath.
+terminate, check liveness). `TmuxBackend` translates to `tmux new-session`,
+`kill-session`, `has-session`, etc.
+
+### OpenCode trait (agent communication)
+
+All agent communication -- prompts, messages, cancellation, lifecycle queries --
+goes through OpenCode directly, not through the backend.
+
+```rust
+#[async_trait]
+trait AgentProtocol: Send + Sync {
+    async fn send_prompt(&self, worker: &WorkerId, prompt: Prompt) -> Result<()>;
+    async fn deliver_message(&self, worker: &WorkerId, msg: MessageId) -> Result<()>;
+    async fn cancel(&self, worker: &WorkerId) -> Result<()>;
+    async fn pause(&self, worker: &WorkerId) -> Result<()>;
+    async fn resume(&self, worker: &WorkerId) -> Result<()>;
+    async fn state(&self, worker: &WorkerId) -> Result<AgentState>;
+    fn events(&self, worker: &WorkerId) -> impl Stream<Item = WorkerEvent>;
+}
+
+enum AgentState {
+    Idle,
+    Working { turn: TurnId, progress: Option<ProgressReport> },
+    WaitingForInput,
+    RateLimited(RateLimit),
+    Paused,
+    Exited(ExitStatus),
+}
+```
+
+The orchestrator calls `AgentProtocol` for all worker interaction. It calls
+`SessionBackend` only for process lifecycle (spawn on first assignment, terminate
+on worker removal, reconcile on startup). This separation means:
+
+- Switching backends (herdr -> tmux -> native PTY) changes nothing about how
+  prompts, messages, or cancellation work
+- OpenCode events stream regardless of which process host is running
+- The backend never needs to understand prompt content or agent semantics
+- `send-keys` hacks are eliminated entirely, not just reduced
 
 ### Key dependencies
 
@@ -1994,14 +2059,17 @@ harness that will verify every subsequent phase.
 
 1. `amux-core/worker`: Worker struct, WorkerConfig, WorkerCapabilities
 2. `amux-core/orchestrator`: Orchestrator trait, WorkAssignment, Lease
-3. `amux-server/opencode/`: OpenCode structured agent protocol -- translates
-   between WorkerCommand/WorkerEvent and OpenCode's typed agent interface
-4. `amux-server/backend/herdr.rs`: SessionBackend impl for herdr (default process host)
-5. `amux-server/backend/tmux.rs`: SessionBackend impl for tmux (fallback process host)
+3. `amux-server/opencode/`: AgentProtocol impl -- direct communication with
+   agents (prompts, messages, cancel, state queries, event stream). All agent
+   interaction flows here, never through the backend.
+4. `amux-server/backend/herdr.rs`: SessionBackend impl for herdr -- process
+   lifecycle only (spawn, terminate, inspect, reconcile)
+5. `amux-server/backend/tmux.rs`: SessionBackend impl for tmux -- process
+   lifecycle only (fallback)
 6. `amux-server/backend/adapter.rs`: terminal output -> WorkerEvent fallback
    translator (ANSI stripping, provider-specific rate-limit regexes). Used only
    for signals OpenCode/hooks do not expose structurally.
-6. `amux-server/api/workers.rs`: CRUD, start (202 async), stop, peek, send
+7. `amux-server/api/workers.rs`: CRUD, start (202 async), stop, peek, send
 7. `amux-server/orchestrator`: runtime loop, startup reconciliation
 8. SSE: worker state stream
 
@@ -2043,12 +2111,14 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - proptest: no duplicate delivery for same idempotency key (Invariant 34)
 - proptest: command queue FIFO preserved under arbitrary enqueue/dequeue (Invariant 34)
 - proptest: dead-lettered command always has a DurableEvent (Invariant 34)
-- Backend conformance: HerdrBackend passes full suite (Invariant 21)
-- Backend conformance: TmuxBackend passes full suite (Invariant 21)
-- Backend conformance: MockBackend passes full suite (Invariant 21)
+- Backend conformance: HerdrBackend passes process lifecycle suite (Invariant 21)
+- Backend conformance: TmuxBackend passes process lifecycle suite (Invariant 21)
+- Backend conformance: MockBackend passes process lifecycle suite (Invariant 21)
+- Protocol conformance: OpenCodeProtocol passes communication suite (Invariant 21)
+- Protocol conformance: MockProtocol passes communication suite (Invariant 21)
 - Provider conformance: Claude adapter passes full suite (Invariant 21)
-- Integration: create Claude worker on herdr (default), start, send text, capture
-- Integration: create Claude worker on tmux (fallback), start, send text, capture
+- Integration: create Claude worker on herdr, send prompt via OpenCode, receive events
+- Integration: create Claude worker on tmux, send prompt via OpenCode, receive events
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
 - Integration: switch worker from herdr to tmux, restart -- worker identity, issue
   ownership, messages, context all preserved (Invariant 33)
@@ -2158,7 +2228,7 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
 compaction subsystem.
 
 1. Command queue: DB-backed per-worker queue with delivery protocol (Invariant 34)
-2. WorkerCommand dispatch through SessionBackend.send() with delivery confirmation
+2. WorkerCommand dispatch through AgentProtocol (OpenCode) with delivery confirmation
 3. OpenCode -> WorkerEvent translation (structured lifecycle), terminal adapter as
    fallback for provider-specific rate-limit detection
 4. Scan demotion: hook-reported workers get demoted capture frequency
@@ -2632,7 +2702,8 @@ enum StallReason {
     WorkerRateLimited { reset_at: DateTime },  // waiting, not stalled
     DependencyBlocked { blocked_by: IssueId }, // not stalled, just waiting
     NoCapableWorker,                     // no worker can do this work
-    BackendFailure { error: String },    // capture/send broken
+    ProcessDown { error: String },       // backend reports process not running
+    ProtocolUnreachable { error: String }, // OpenCode not responding
     GateBlocked { gate: Vec<String> },   // needs human ack
     Orphaned,                            // assigned to a worker that no longer exists
 }
