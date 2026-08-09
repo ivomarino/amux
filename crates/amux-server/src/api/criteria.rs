@@ -10,7 +10,7 @@
 
 use super::AppState;
 use crate::db::board_store;
-use amux_core::criteria::{validate_authorship, AcceptanceCriteria, CriteriaAuthor};
+use amux_core::criteria::{validate_authorship, AcceptanceCriteria};
 use amux_core::ids::WorkerId;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -175,7 +175,7 @@ async fn put_criteria(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amux_core::criteria::Criterion;
+    use amux_core::criteria::{Criterion, CriteriaAuthor};
     use amux_core::ids::CriterionId;
 
     #[test]
