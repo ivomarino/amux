@@ -225,3 +225,41 @@ def test_an_expired_rate_limit_is_not_reported(srv):
     srv._session_auto_actions["rlprobe"]["rate_limit_reset_at"] = fut
     s = [x for x in srv.list_sessions() if x["name"] == "rlprobe"][0]
     assert s["rate_limited_until"] == fut and s["rate_limit_weekly"] is True
+
+
+def _typed_issue(srv, iid, status, itype, archived=1):
+    now = int(time.time())
+    srv.get_db().execute(
+        "INSERT INTO issues (id,title,status,session,type,created,updated,owner_type,archived) "
+        "VALUES (?,?,?,?,?,?,?,'agent',?)",
+        (iid, "t " + iid, status, "busylane", itype, now, now, archived))
+    srv.get_db().commit()
+
+
+def test_done_is_terminal_for_noncode_types_but_not_for_code(srv):
+    """AC-310: a doc report or declined escalation ENDS at done — its done gate
+    is the terminal claim ("Outcome recorded") and verified is optional
+    re-confirmation. The sweep re-nagged three resolved AC cards daily forever
+    because no honest action could satisfy its predicate: verified would assert
+    what never happened, discarded would erase what did. Meanwhile code's done
+    is merged-but-unconfirmed (Ethan's done!=verified rule) and MUST still
+    surface. Untyped cards default code — strictest — and must surface too."""
+    srv._sent.clear()
+    srv._advance_last.clear()
+    srv.get_db().execute("DELETE FROM issues")
+    srv.get_db().execute("DELETE FROM session_events WHERE idem LIKE 'limbo:%'")
+    srv.get_db().commit()
+    _typed_issue(srv, "T-DOC", "done", "doc")            # terminal — must NOT surface
+    _typed_issue(srv, "T-ESC", "done", "escalation")     # terminal — must NOT surface
+    _typed_issue(srv, "T-CODE", "done", "code")          # unconfirmed — MUST surface
+    _typed_issue(srv, "T-NOTYPE", "done", "")            # defaults code — MUST surface
+    _typed_issue(srv, "T-RTODO", "todo", "research")     # unfinished at any type — MUST surface
+    srv._advance_open_card("busylane")
+    msgs = [t for (_n, t) in srv._sent if "ARCHIVED but not finished" in t]
+    assert msgs, "the limbo notice stopped firing entirely — over-filtered (the sign flips, ethos rule 1)"
+    m = msgs[0]
+    assert "T-DOC" not in m and "T-ESC" not in m, (
+        "a non-code done card still counts as limbo — the daily forever-nag is back: %s" % m[:200])
+    assert "T-CODE" in m and "T-NOTYPE" in m and "T-RTODO" in m, (
+        "the fix over-filtered: a genuinely unfinished card vanished from the notice: %s" % m[:200])
+    assert "3 of your cards" in m, "count disagrees with the sample's predicate: %s" % m[:120]

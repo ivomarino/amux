@@ -13015,14 +13015,27 @@ def _advance_limbo_check(session_name: str, db) -> bool:
         # 20 total — against an actual 182. That is the same defect as the
         # board list truncating without declaring it, committed in the
         # message that reports the truncation problem.
+        # TYPE-AWARE TERMINALITY (AC-310). `done` is unfinished only where
+        # done means merged-but-unconfirmed — i.e. code. For every other type
+        # the done gate IS the terminal claim ("Outcome recorded"; a doc
+        # report, a declined escalation), and verified ("still holds") is an
+        # optional re-confirmation, not a missing stage. Treating their done
+        # as limbo produced a notice no honest action could silence: three
+        # AC cards re-nagged daily after their reasons were written on them,
+        # since verified would assert what never happened and discarded would
+        # erase what did. Untyped cards default code (strictest), unchanged.
+        # ONE predicate string for both queries — the count and the sample
+        # must never disagree (ethos: a view shares its mechanism's predicate).
+        _limbo_where = (
+            "session=? AND deleted IS NULL AND COALESCE(archived,0)=1 "
+            "AND status NOT IN ('verified','discarded') "
+            "AND NOT (status='done' AND COALESCE(NULLIF(type,''),'code') != 'code')")
         _limbo_total = db.execute(
-            "SELECT COUNT(*) FROM issues WHERE session=? AND deleted IS NULL "
-            "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded')",
+            "SELECT COUNT(*) FROM issues WHERE " + _limbo_where,
             (session_name,)).fetchone()[0]
         _limbo = db.execute(
-            "SELECT id, title, status FROM issues WHERE session=? AND deleted IS NULL "
-            "AND COALESCE(archived,0)=1 AND status NOT IN ('verified','discarded') "
-            "ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
+            "SELECT id, title, status FROM issues WHERE " + _limbo_where +
+            " ORDER BY updated DESC LIMIT 20", (session_name,)).fetchall()
     except Exception:
         _limbo = []
         _limbo_total = 0
