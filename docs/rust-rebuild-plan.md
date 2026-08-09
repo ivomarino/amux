@@ -364,6 +364,8 @@ struct WorkAssignment {
     lease: Lease,
     context: WorkContext,
     idempotency_key: Uuid,
+    prior_attempts: Vec<AttemptRecord>,  // mandatory for attempt > 1 (Invariant 49)
+    execution_limits: ExecutionLimits,   // anti-livelock (Invariant 47)
 }
 
 struct Lease {
@@ -394,7 +396,10 @@ async fn reconcile_on_startup(ctx: &AppContext) {
 
 **If a worker is idle and any of its issues are not in a terminal state, that is a
 system failure.** Terminal states are: `verified`, `archived`, `discarded`, and
-`blocked_by_user`. Everything else must keep moving.
+`quarantined`. Everything else must keep moving. There is no `blocked_by_user` --
+a terminal state with no observer is where autonomous work goes to die. External
+blocks carry a machine-checkable `VerifierKind` condition and a `retry_at`
+timestamp; they re-enter the runnable set when the check passes.
 
 **Every non-terminal issue must have exactly one of: a runnable next action, a named
 actor responsible for the next action, or a structured wait reason.** "Nothing is
@@ -406,15 +411,22 @@ enum TerminalStatus {
     Verified,
     Archived,
     Discarded,
-    BlockedByUser { reason: String },
+    Quarantined {       // exhausted retries, decomposition failed (Invariant 47)
+        failure_chain: Vec<AttemptRecord>,
+        quarantined_at: DateTime<Utc>,
+    },
 }
 
 enum WaitingFor {
     Dependency(IssueId),
     Gate { gate: GateId, missing: Vec<GateCriterion> },
-    User { actor: Actor, question: String },
+    BlockedExternal {   // replaces BlockedByUser -- must carry re-entry condition
+        condition: VerifierKind,
+        retry_at: DateTime<Utc>,
+        description: String,
+    },
     Provider { kind: WaitReason },
-    ExternalCondition { description: String, check: Option<VerifierKind> },
+    ExternalCondition { description: String, check: VerifierKind },
     Capability { needed: Vec<String>, available_workers: Vec<WorkerId> },
 }
 
@@ -451,8 +463,9 @@ When the orchestrator detects a stall:
 1. If the worker is rate-limited: wait (not idle, not a stall)
 2. If the issue is blocked by a dependency: no stall (it is `Waiting(Dependency(...))`)
 3. If the issue is waiting on a gate: no stall (it is `Waiting(Gate(...))`)
-4. If the worker has no runnable issues left in its scope: escalate to the group or
-   reassign
+4. If the worker has no runnable issues left in its scope: reassign the worker to a
+   different scope or mark it idle (an idle worker with zero runnable issues is not a
+   stall -- it is correct)
 5. Otherwise: the worker MUST be given the issue and told to continue
 
 The dashboard shows `WaitingFor` inline on every non-terminal, non-assigned issue.
@@ -662,10 +675,10 @@ Conflicts are surfaced, never swallowed:
 
 | Conflict type | Resolution |
 |---|---|
-| Board card moved by someone else while offline | Toast with both states, user picks |
+| Board card moved by someone else while offline | Toast with both states, server wins (latest rev) |
 | Board card deleted while offline edit queued | Toast: "card was deleted", discard edit |
 | Worker command sent while worker stopped | Toast: "worker stopped", offer restart |
-| Entity version conflict (409) | Show server state, user picks or merges |
+| Entity version conflict (409) | Show server state, server wins, re-apply local intent on new base |
 
 #### Service worker caching
 
@@ -687,7 +700,7 @@ The current "Save all workers for offline" button prefetches worker peek/history
 for all workers. The Rust version:
 - Background sync: if the device has been online for 30s and battery > 20%,
   prefetch worker states incrementally (one per second, not all at once)
-- Configurable: user picks which workers to cache for offline
+- Configurable: policy determines which workers to cache for offline (default: all active)
 - Storage budget: IndexedDB size limit awareness (show usage, prune old data)
 
 **Test plan** (offline-specific; real-time convergence tests are in Invariant 35):
@@ -2752,18 +2765,64 @@ enum BlockerKind {
         evidence: String,
         attempted: Vec<String>,
         independent_work_remains: bool,
+        retry_schedule: RetrySchedule,
+        max_age: Duration,
     },
-    HumanDecisionRequired { // irreversible business decision
+    PolicyDecision {        // ambiguous choice with a pre-committed default
         decision: String,
-        options: Vec<String>,
-        recommendation: Option<String>,
+        chosen: String,
+        rationale: String,
+        reversible: bool,
     },
+}
+
+struct RetrySchedule {
+    interval: Duration,
+    max_attempts: u32,
+    check: VerifierKind,    // machine-checkable re-entry condition
 }
 ```
 
+There is no `HumanDecisionRequired`. An agent that can stop will find reasons to.
+Every ambiguous choice has a pre-committed default (see the policy defaults table
+below). The agent picks the default, records the decision as a `DurableEvent`
+(`EventKind::PolicyDecisionMade`), and continues. If the decision later proves wrong,
+it is reversible by amending the policy table and reopening the affected items.
+
 `ImplementationFailure` and `TestFailure` never justify stopping. An `ExternalBlocker`
-creates a structured checklist entry and continues all unrelated runnable items. A
-single blocked integration must never halt the entire rebuild.
+creates a structured checklist entry, carries a `RetrySchedule` with a
+machine-checkable condition, and continues all unrelated runnable items. When
+`max_age` expires without resolution, the blocker becomes `Quarantined` (see
+Invariant 47). If the checklist reaches a state where EVERY remaining item is
+blocked, that is a distinct terminal failure -- the orchestrator writes a diagnostic
+report covering every blocker's evidence, attempted resolutions, and remaining
+independent work, then enters a low-power reconciliation loop (Invariant 48).
+
+A single blocked integration must never halt the entire rebuild.
+
+#### Policy defaults table
+
+Every foreseeable ambiguous decision has a pre-committed default. The agent uses the
+default without stopping. Decisions not in this table use the meta-default: choose
+the option that preserves more data, is more reversible, and matches existing Python
+behavior.
+
+| Decision domain | Default | Rationale | Reversible |
+|---|---|---|---|
+| Ambiguous schema mapping (column purpose unclear) | Migrate as-is with `legacy_` prefix | Preserves data; rename is cheap | Yes |
+| Gate semantics (which gates apply to a new type) | Derive from closest existing type | Matches user expectation | Yes |
+| Deprecation vs. transform (table/column unused in Python) | Transform with preservation | Data loss is irreversible | Yes |
+| Dependency version (multiple compatible versions) | Latest stable | Security + maintenance | Yes |
+| Naming collision (Rust reserved word, duplicate after rename) | Append `_field` suffix | Unambiguous, greppable | Yes |
+| Enum variant ordering (no natural order) | Alphabetical | Deterministic, diffable | Yes |
+| Missing foreign key (implicit relationship in Python) | Add FK with `ON DELETE SET NULL` | Preserves referential integrity without cascade risk | Yes |
+| Ambiguous NULL semantics (Python uses empty string and NULL interchangeably) | Normalize to `Option<T>` with NULL | Explicit, queryable | Yes |
+| Event kind classification (Python log line doesn't map cleanly to EventKind) | `EventKind::Legacy { raw }` | Preserves original; reclassify later | Yes |
+| Provider-specific behavior (Python has provider-specific codepath) | Abstract behind trait; if unclear, Claude-first | Most-tested provider | Yes |
+| Config key conflict (Python has conflicting keys at different scopes) | Worker scope wins (most specific) | Matches existing resolver behavior | Yes |
+| Test flakiness (test passes 90% of the time) | Mark `#[flaky]`, quarantine after 3 consecutive failures | Doesn't block progress; doesn't hide real failures | Yes |
+| API response shape ambiguity (Python returns inconsistent shapes) | Union type with discriminator field | Backwards compatible; clients handle both | Yes |
+| Scope of a feature (unclear if global or group-scoped) | Group-scoped | Narrower default; widening is safe, narrowing breaks | Yes |
 
 **Progress rules:**
 
@@ -2999,6 +3058,236 @@ Fault-state coverage:             PASS
 
 Final Rust acceptance requires zero unexplained holes.
 
+### Invariant 47: Anti-livelock -- no-stall without no-thrash means burning tokens forever
+
+No-stall (Invariant 10) guarantees forward motion. Without a complementary
+no-thrash guarantee, the agent burns tokens retrying verification forever.
+Every issue carries execution limits:
+
+```rust
+struct ExecutionLimits {
+    max_attempts: u32,           // default: 5
+    max_cumulative_tokens: u64,  // default: 500_000
+    max_wall_clock: Duration,    // default: 4 hours
+    current_attempt: u32,
+    tokens_spent: u64,
+    started_at: Option<DateTime<Utc>>,
+}
+```
+
+On exhaustion of any limit:
+
+1. **Automatic decomposition**: split the issue into child issues, each covering a
+   smaller, independently verifiable piece. The children inherit the parent's
+   acceptance criteria, narrowed to their scope. The parent moves to
+   `Waiting(Dependency(...))` on the children.
+2. If decomposition itself fails twice (children also exhaust their limits), the
+   issue moves to `Quarantined` with the full failure chain:
+
+```rust
+struct AttemptRecord {
+    attempt: u32,
+    failure_reason: String,
+    rejected_evidence: Vec<String>,
+    tokens_spent: u64,
+    wall_clock: Duration,
+    decomposition_attempted: bool,
+}
+```
+
+`Quarantined` is terminal, counted in `FleetProgress`, and reported in the
+diagnostic output. It is never silently retried. The quarantine count is a
+fleet-level health signal: rising quarantine count = systemic problem, not
+bad luck on individual issues.
+
+### Invariant 48: Global spend and progress circuit breakers
+
+`FleetProgress` (Invariant 16) reports. This invariant makes it ACT.
+
+```rust
+struct FleetCircuitBreaker {
+    zero_progress_hours: u32,        // default: 3
+    window_budget: u64,              // tokens per rolling 4h window
+    quarantine_threshold: u32,       // halt if N quarantines in 1h
+}
+
+enum FleetState {
+    Normal,
+    CircuitOpen {
+        reason: CircuitOpenReason,
+        diagnostic_report: DiagnosticReport,
+        entered_at: DateTime<Utc>,
+    },
+    Reconciling,  // low-power: re-evaluate blocked items, audit progress
+}
+
+enum CircuitOpenReason {
+    ZeroProgress { hours: u32, tokens_burned: u64 },
+    BudgetExhausted { window_spend: u64, budget: u64 },
+    QuarantineSurge { count: u32, period: Duration },
+    AllItemsBlocked { blockers: Vec<(IssueId, BlockerKind)> },
+}
+```
+
+When the circuit opens:
+1. The orchestrator halts new assignments.
+2. Writes a diagnostic report: every in-progress issue, every blocker, every
+   quarantined item, token spend curve, last N completed items with their cost.
+3. Enters a low-power reconciliation loop: re-evaluate all blocked items'
+   conditions, audit whether any `ExternalBlocker.check` now passes, attempt
+   unblocking anything whose condition changed.
+4. If reconciliation finds runnable work, circuit closes automatically.
+5. If reconciliation finds nothing after one full cycle, the fleet halts with a
+   written report. This is the "stuck at the fleet level" signal.
+
+### Invariant 49: Failure feeds forward -- retries are not re-rolls
+
+Invariant 27 (context per attempt) snapshots context but nothing requires
+attempt N+1 to see why N failed. Without this, retries are re-rolls, and
+re-rolls are how autonomous systems spend $40k on the same bug.
+
+```rust
+struct WorkAssignment {
+    issue_id: IssueId,
+    worker_id: WorkerId,
+    attempt: u32,
+    lease: Lease,
+    context: WorkContext,
+    idempotency_key: Uuid,
+    prior_attempts: Vec<AttemptRecord>,   // MANDATORY for attempt > 1
+}
+```
+
+`WorkContext` for attempt N must include:
+- All prior attempts' failure reasons (from `AttemptRecord`)
+- Rejected evidence (what was tried and why it didn't satisfy the gate)
+- The specific verification failure message (not just "failed")
+- Any decomposition that was attempted and its outcome
+
+The agent receiving attempt 2+ is instructed: "Attempt N-1 failed because
+[specific reason]. The following approaches were tried and rejected: [...].
+Do not repeat them." This is enforced structurally -- the orchestrator
+constructs the assignment with this context. The agent cannot opt out of
+seeing it.
+
+### Invariant 50: Acceptance criteria before execution, authored by a different worker
+
+With no human reviewer, self-graded homework is the failure mode. Enforce
+structurally:
+
+```rust
+struct AcceptanceCriteria {
+    criteria: Vec<Criterion>,
+    authored_by: WorkerId,
+    authored_at: DateTime<Utc>,
+    version: u32,
+}
+
+struct Criterion {
+    id: CriterionId,
+    description: String,
+    verifier: VerifierKind,
+    required: bool,
+}
+```
+
+Rules:
+1. An issue cannot leave `todo` without at least one `Criterion`.
+2. `AcceptanceCriteria.authored_by` must differ from the issue's executor
+   `WorkerId`. Self-authored criteria are structurally rejected.
+3. Post-start criteria edits are a distinct audited transition
+   (`EventKind::CriteriaAmended`) that resets verification status to
+   `needs_reverification`. The executor sees the amendment on their next
+   tick.
+4. A dedicated adversarial reviewer worker (`WorkerRole::CriteriaReviewer`)
+   exists whose only job is rejecting under-specified criteria. It runs
+   before the executor starts, not after they finish. Under-specified =
+   no `VerifierKind`, or verifier is `Manual` when a `Deterministic`
+   check exists, or criterion is not falsifiable ("works correctly").
+
+### Invariant 51: Decomposition depth cap
+
+Auto-decomposition (Invariant 47) + auto-creation from prompts + agent-created
+checklist items (Invariant 46 says discovery can create RR items) form an
+unbounded work generator. Cap it:
+
+```rust
+const MAX_DECOMPOSITION_DEPTH: u32 = 3;
+const MAX_CHILDREN_PER_ISSUE: u32 = 10;
+const MAX_DISCOVERED_ITEMS_PER_RUN: u32 = 50;
+```
+
+Rules:
+1. **Depth limit**: an issue created by decomposition carries
+   `decomposition_depth: u32`. Children inherit `parent_depth + 1`. At
+   `MAX_DECOMPOSITION_DEPTH`, exhaustion leads directly to `Quarantined`,
+   not further decomposition.
+2. **Child count limit**: a single decomposition produces at most
+   `MAX_CHILDREN_PER_ISSUE` children. If the natural split is larger,
+   group related children under intermediate parents.
+3. **Discovered items link to a gated parent**: items created by UX discovery
+   (Invariant 46) or any automated discovery process must link to a parent
+   issue that is `VERIFIED`-gated. The parent cannot verify until all
+   discovered children verify. This prevents discovered items from
+   floating free with no completion gate.
+4. **Per-run cap**: a single discovery run (UX crawl, schema scan, etc.)
+   creates at most `MAX_DISCOVERED_ITEMS_PER_RUN` items. If more are found,
+   the run completes with a report of what was capped, and a follow-up
+   discovery is scheduled.
+
+### Invariant 52: Capability policy replaces approval gates
+
+No action gates on human approval. Instead, a typed capability policy loaded
+at startup defines what the agent may do, at what rate, and under what
+conditions:
+
+```rust
+struct CapabilityPolicy {
+    profile: DeploymentProfile,
+    capabilities: Vec<CapabilityRule>,
+}
+
+enum DeploymentProfile {
+    Personal,    // local dev machine, single user
+    Cloud,       // multi-tenant, per-user isolation
+    Concierge,   // managed service, external-facing
+}
+
+struct CapabilityRule {
+    action: ActionClass,
+    constraint: CapabilityConstraint,
+}
+
+enum ActionClass {
+    GitPush { branch_pattern: String },
+    SendEmail,
+    ExternalApiWrite { service: String },
+    DeleteData { scope: Scope },
+    SpendMoney { currency: String },
+    CreateWorker,
+    ModifySchedule,
+    DatabaseMigration,
+}
+
+enum CapabilityConstraint {
+    Allowed,
+    RateLimited { max_per_hour: u32 },
+    DryRunFirst,       // mandatory dry-run + evidence step, then execute
+    SandboxOnly,       // execute in sandbox, never production
+    RequiresEvidence { verifier: VerifierKind },
+    Denied,
+}
+```
+
+The `DeploymentProfile` selects the default policy. Per-action overrides are
+loaded from `~/.amux/capability-policy.toml`. This is also the mechanism that
+distinguishes personal/cloud/concierge deployments -- one construct, two jobs.
+
+Irreversible actions (`SendEmail`, `GitPush`, `DeleteData`, `SpendMoney`) get
+`DryRunFirst` by default: the agent executes the action in dry-run mode,
+records the evidence (what would happen), and then executes for real. No
+approval gate, but a mandatory evidence trail.
+
 ---
 
 ## The Orchestrator (updated mental model)
@@ -3123,7 +3412,7 @@ impl Orchestrator {
                     self.handle_rate_limit(rl).await;
                 }
                 WorkerEvent::Failed(f) => {
-                    self.handle_failure(f).await;  // retry, escalate, or abandon
+                    self.handle_failure(f).await;  // retry, decompose, or quarantine
                 }
                 // ...
             }
@@ -4358,7 +4647,11 @@ struct FleetProgress {
     issues_completed_last_24h: u32,
     stall_violations: Vec<StallViolation>,
     longest_active_issue: Option<(IssueId, Duration)>,
-    queue_depth: u32,  // todo items with no worker assigned
+    queue_depth: u32,            // todo items with no worker assigned
+    quarantined_count: u32,      // terminal failures (Invariant 47)
+    blocked_count: u32,          // items with ExternalBlocker
+    fleet_state: FleetState,     // Normal / CircuitOpen / Reconciling (Invariant 48)
+    tokens_this_window: u64,     // rolling 4h window spend
 }
 ```
 
@@ -4401,7 +4694,7 @@ fix.
 **Rust fix**: no model calls for string manipulation. The title deriver is
 `prompt.split('\n')[0].split('.')[0][:80]` -- free, instant, no throttle needed,
 every prompt gets a card. Model calls are reserved for judgment: "should this issue
-be escalated?", "does this verification evidence satisfy the gate?" -- questions
+be decomposed?", "does this verification evidence satisfy the gate?" -- questions
 where the answer depends on understanding, not formatting.
 
 ### L7: Browser profile management
