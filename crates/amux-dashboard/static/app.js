@@ -6460,7 +6460,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.535';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.536';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -11910,14 +11910,21 @@ function _fileHighlightHTML(data) {
     inner = esc(content);
   }
   const note = big ? '<div style="padding:4px 12px;font-size:0.7rem;color:var(--dim);">Large file — syntax highlighting skipped for performance.</div>' : '';
-  const lines = inner.split('\n');
-  const lineCount = lines.length;
-  const gutterW = String(lineCount).length;
-  const numbered = lines.map((l, i) => {
-    const num = String(i + 1).padStart(gutterW);
-    return '<span class="hljs-ln">' + num + '</span>' + l;
-  }).join('\n');
-  return note + '<pre class="hljs-pre"><code class="hljs">' + numbered + '</code></pre>';
+  // Line numbers live in their OWN sticky column, built from the source's line
+  // count — never by splitting `inner`. hljs emits spans that STRADDLE newlines
+  // (a block comment is one <span class="hljs-comment"> containing \n), so
+  // `inner.split('\n')` and prepending a gutter span per line puts that span
+  // INSIDE the still-open comment span: the number inherits the comment colour
+  // and the markup is malformed. Verified against the shipped 11.9.0 build
+  // rather than assumed — a 5-line source with a 3-line block comment emits
+  // opens=1/closes=0 on one line and opens=0/closes=1 two lines later.
+  const lineCount = content.split('\n').length;
+  let gutter = '';
+  for (let i = 1; i <= lineCount; i++) gutter += (i > 1 ? '\n' : '') + i;
+  return note + '<div class="hljs-wrap">'
+    + '<pre class="hljs-gutter" aria-hidden="true">' + gutter + '</pre>'
+    + '<pre class="hljs-pre"><code class="hljs">' + inner + '</code></pre>'
+    + '</div>';
 }
 
 function _renderFileBody(data, mode) {

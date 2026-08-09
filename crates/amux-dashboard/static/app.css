@@ -668,14 +668,28 @@
   /* Syntax-highlighted code preview (highlight.js). The theme stylesheet colors
      .hljs; we own layout + fill. */
   .file-overlay-body.file-code { padding: 0; }
-  .file-overlay-body.file-code .hljs-pre { margin: 0; padding: 12px 14px; overflow: auto; }
+  /* Gutter and code are SIBLINGS, never interleaved — see the note in
+     _fileHighlightHTML: hljs spans straddle newlines, so per-line injection into
+     the highlighted markup is malformed by construction. The two columns stay in
+     register because they share font, size and line-height EXACTLY; changing one
+     of those three here without the other breaks alignment silently, which is why
+     they are declared adjacently. */
+  .file-overlay-body.file-code .hljs-wrap { display: flex; align-items: flex-start;
+    min-width: min-content; }
+  .file-overlay-body.file-code .hljs-gutter { margin: 0; flex: 0 0 auto;
+    padding: 12px 10px 12px 14px;
+    /* sticky so the numbers stay put when a long line scrolls the code sideways */
+    position: sticky; left: 0; z-index: 1; background: #010409;
+    border-right: 1px solid var(--border);
+    color: #484f58; text-align: right; user-select: none; -webkit-user-select: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
+    line-height: 1.6; white-space: pre; }
+  .file-overlay-body.file-code .hljs-pre { margin: 0; padding: 12px 14px; overflow: visible;
+    flex: 1 1 auto; min-width: 0; }
   .file-overlay-body.file-code code.hljs { display: block; background: transparent; padding: 0;
     color: #c9d1d9;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
     line-height: 1.6; tab-size: 2; white-space: pre; }
-  .file-overlay-body.file-code .hljs-ln {
-    display: inline-block; width: 3.5ch; text-align: right; margin-right: 1.5ch;
-    color: #484f58; user-select: none; -webkit-user-select: none; }
   /* github-dark ships NO .hljs-punctuation rule, and hljs 11.9 emits exactly three
      classes for JSON: hljs-attr, hljs-string, hljs-punctuation. So every brace,
      bracket, colon and comma fell back to the base colour while keys and values
@@ -687,8 +701,9 @@
      should recede while staying legible. */
   .file-overlay-body.file-code .hljs-punctuation { color: #8b949e; }
   body.light .file-overlay-body.file-code .hljs-punctuation { color: #6e7781; }
-  body.light .file-overlay-body.file-code code.hljs { color: #24292f; }
-  body.light .file-overlay-body.file-code .hljs-ln { color: #8c959f; }
+  /* The light-mode file viewer keeps a DARK body (#1c2128, see the rule near the
+     top of this file), so the gutter must match that, not the page background. */
+  body.light .file-overlay-body.file-code .hljs-gutter { background: #1c2128; color: #6e7781; }
   .file-overlay-body.file-image { display:flex;align-items:center;justify-content:center;background:var(--bg);white-space:normal;position:relative; }
   /* Zoomable image preview (pinch / trackpad / double-tap). */
   .img-zoom-wrap { position:absolute;inset:0;overflow:hidden;touch-action:none;display:flex;align-items:center;justify-content:center; }

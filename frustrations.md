@@ -902,10 +902,10 @@ FIX: The Rust port implements AMUX_SEARCH_RG for real rather than inheriting the
 ## Rust SSE "ping" goes out as an SSE COMMENT — EventSource clients can never see it
 AREA: sse
 SEVERITY: slows
-STATUS: open
+STATUS: fixed (5899463 — KeepAlive::new().event(...data(ping_payload())), sse.rs:120-122)
 DATE: 2026-08-09
 SESSION: amux
-CARD: AMUX-2601 (found during a read-only verification run with board writes barred — needs filing)
+CARD: AMUX-2611
 SYMPTOM: Wire capture of GET /api/events on the Rust server (build 51f43c50d66e88b9)
   shows the keep-alive as `: {"type":"ping","v":"0.9.529"}` — a comment frame, not a
   `data:` event. sse.rs's own comment says "The keep-alive IS the ping contract: 10s
@@ -966,3 +966,39 @@ COST: The AMUX-2605 rust port was pointed at BOTH line numbers as the contract
 FIX: Delete the :71933 block or fold its useful params (since) into the live
   handler. The rust origin ports the LIVE :67673 shape (api/request_log.rs),
   verified against the running python server.
+
+---
+## Resume drops --name, so a session's pane title shows the CONVERSATION's old name, not the worker's
+AREA: attribution
+SEVERITY: misleads
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2612
+SYMPTOM: This worker is `amux` ($AMUX_SESSION=amux, tmux session amux-amux, log
+  ~/.amux/logs/amux.log). Its tmux PANE TITLE reads `amux-rust`. Root cause is in
+  the launcher: session_flag is EITHER `--resume <uuid>` OR `--name <name>`, never
+  both (amux-server.py:24258-24291; the rust port carries the same seam,
+  session_verbs.rs:2480). Claude Code writes the terminal title from ITS OWN
+  session name, which on a --resume path is the name baked in when the conversation
+  was created. Confirmed, not inferred: ~/.claude/sessions/53855.json and 66447.json
+  both map sessionId 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2 -> name "amux-rust", while
+  amux serves the same worker as `amux`. A model swap resumes by uuid, so EVERY
+  model swap silently re-asserts the stale name.
+COST: The model-swap continuity handoff tells the incoming model "read
+  ~/.amux/logs/amux.log, it contains THIS session's terminal history" — and the
+  banner inside it reads `amux-rust`. I spent a round trip establishing which of
+  the two names was mine before I could trust any of the log as my own context.
+  The failure mode this sets up is worse than the confusion: a session that
+  believes it is a different lane will attribute its work, its commits and its
+  board writes to that lane. Same class as AMUX-1768 (relay misattribution), except
+  here the wrong name is displayed by amux's own instruments rather than typed by
+  an agent.
+FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displayed
+  name always tracks the WORKER, which is the only identity amux stamps writes with.
+  If Claude Code rejects the combination, have amux set the pane title itself
+  (tmux select-pane -T "$name") after launch rather than leaving the harness's stale
+  name on screen. Fix in the rust launcher first; the python one is being retired.
+  Cheap detector while it is open: `amux whoami` already contrasts live worker
+  identity against inherited env — extend it to compare against the pane title, so
+  the disagreement is reported instead of discovered.
