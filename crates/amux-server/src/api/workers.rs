@@ -1097,9 +1097,15 @@ mod tests {
         assert_eq!(arr[0]["name"], json!("w"));
         assert!(arr[0]["status"].is_string());
 
-        let (st, headers, detail) = send(&app, "GET", "/api/sessions/w", None).await;
+        // Per-session verbs now PROXY to the Python fleet owner; a
+        // rust-managed worker on the legacy path gets the modern pointer,
+        // never a silent Python 404.
+        let (st, _headers, detail) = send(&app, "GET", "/api/sessions/w", None).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(detail["hint"], json!("/api/workers/w"));
+        // The modern path serves the detail.
+        let (st, _h, detail) = send(&app, "GET", "/api/workers/w", None).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(headers.get("deprecated").unwrap(), "true");
         assert_eq!(detail["id"].as_str().unwrap(), id);
     }
 

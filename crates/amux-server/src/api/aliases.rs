@@ -75,11 +75,11 @@ pub fn alias_layer(router: Router) -> Router {
 /// like `/api/sessionsfoo`, which must NOT rewrite).
 fn rewrite_legacy_uri(uri: &Uri) -> Option<Uri> {
     let path = uri.path();
-    // The bare legacy LIST path has a dedicated Python-SHAPE handler
-    // (api::sessions_legacy) — rewriting it to /api/workers would serve the
-    // modern envelope to the SPA, whose fetchSessions throws on a non-array
-    // (browser-golden finding #3). Sub-paths still rewrite.
-    if path == "/api/sessions" {
+    // /api/sessions/* never rewrites: the bare list has a dedicated
+    // Python-SHAPE handler, and per-session VERBS proxy to the Python
+    // server that owns the fleet (api::py_proxy) — rewriting them to
+    // /api/workers served the wrong contract for both.
+    if path == "/api/sessions" || path.starts_with("/api/sessions/") {
         return None;
     }
     for (legacy, canonical) in ROUTE_ALIASES {
@@ -318,9 +318,8 @@ mod tests {
         let u = |s: &str| s.parse::<Uri>().unwrap();
         // Bare /api/sessions is exempt: it has a dedicated shape handler.
         assert!(rewrite_legacy_uri(&u("/api/sessions")).is_none());
-        let r = rewrite_legacy_uri(&u("/api/sessions/abc/peek?lines=600")).unwrap();
-        assert_eq!(r.path(), "/api/workers/abc/peek");
-        assert_eq!(r.query(), Some("lines=600"));
+        // Session SUBPATHS proxy to the Python fleet owner, never rewrite.
+        assert!(rewrite_legacy_uri(&u("/api/sessions/abc/peek?lines=600")).is_none());
         assert_eq!(rewrite_legacy_uri(&u("/api/issues/5")).unwrap().path(), "/api/tasks/5");
         // Not legacy: canonical paths and prefix near-misses pass through.
         assert!(rewrite_legacy_uri(&u("/api/workers")).is_none());
@@ -338,6 +337,10 @@ mod tests {
                 )
                 .route(
                     "/api/workers/{id}/echo",
+                    get(|RawQuery(q): RawQuery| async move { q.unwrap_or_default() }),
+                )
+                .route(
+                    "/api/tasks/{id}/echo",
                     get(|RawQuery(q): RawQuery| async move { q.unwrap_or_default() }),
                 ),
         )
@@ -366,14 +369,13 @@ mod tests {
         let (st, _dep, _body) = fetch(&app, "/api/sessions").await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
-        // Path params survive the rewrite.
-        let (st, dep, body) = fetch(&app, "/api/sessions/abc").await;
-        assert_eq!(st, StatusCode::OK);
-        assert_eq!(dep.as_deref(), Some("true"));
-        assert_eq!(body, "abc");
+        // /api/sessions subpaths no longer rewrite (they proxy to the
+        // Python fleet owner) — the demo app has no proxy, so 404.
+        let (st, _dep, _body) = fetch(&app, "/api/sessions/abc").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
 
-        // Query strings survive the rewrite.
-        let (st, _, body) = fetch(&app, "/api/sessions/abc/echo?lines=600&x=1").await;
+        // Query strings survive the rewrite on a still-rewriting alias.
+        let (st, _, body) = fetch(&app, "/api/issues/5/echo?lines=600&x=1").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body, "lines=600&x=1");
     }

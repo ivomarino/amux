@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod py_proxy;
 pub mod schedules;
 pub mod sessions_legacy;
 pub mod settings;
@@ -85,6 +86,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/cal-events", calendar::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
         .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
+        .route("/api/sessions/{name}", axum::routing::any(py_proxy::proxy_session_verb))
+        .route("/api/sessions/{name}/{*verb}", axum::routing::any(py_proxy::proxy_session_verb))
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
         .nest("/api/journal", journal::routes())
