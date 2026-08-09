@@ -19374,6 +19374,42 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
                             "why": ("no edit of yours on this path in the last %dm; "
                                     "basis is edit records, not the staged diff"
                                     % int(window / 60))})
+    # BLOCK-TIME FORENSICS (AF-27). A block is the expensive verdict and the only one
+    # that was undiagnosable after the fact: on 2026-08-09 a commit was refused whose
+    # staged diff verifiably contained zero foreign hunks, and by the time anyone looked,
+    # `mine` had been recomputed and the trail was gone. Three hypotheses died to cold
+    # reasoning that ONE of these lines would have settled in a second:
+    #
+    #   1. transcript lag — DEAD, measured: a fresh Write is visible at 0.0s.
+    #   2. `mine`/`mine_firsthand` cache eviction — DEAD by construction: the two ask
+    #      different params, the cache is one entry per session and checks params, so it
+    #      always ends holding (window, True) and the next `mine` always recomputes.
+    #      Neither is ever served stale, which is why the cache is not the suspect.
+    #   3. a concurrent caller warming the cache — dead for the same reason as 2.
+    #
+    # So `mine` was FRESH and genuinely lacked a path its owner had just edited. That is
+    # the fact worth capturing, and it is only observable at the moment of refusal.
+    # Logged at the decision, not near it: what was in the committer's claim set, how it
+    # was sourced, and how old the newest entry was.
+    if foreign:
+        try:
+            _newest = max(mine.values()) if mine else 0
+            slog("[staged-guard/AF-27] %s blocked in %s — window=%ds mine=%d "
+                 "(firsthand=%d, newest=%s) cotenants=%d; per-path: %s"
+                 % (session or "(no session)", wd_root, int(window), len(mine),
+                    len(mine_firsthand),
+                    ("%.1fs ago" % (now - _newest)) if _newest else "none",
+                    len(cotenants),
+                    "; ".join("%s in_mine=%s in_firsthand=%s owner=%s age=%ds"
+                              % (f["path"],
+                                 os.path.realpath(os.path.join(wd, f["path"])) in mine,
+                                 os.path.realpath(os.path.join(wd, f["path"])) in mine_firsthand,
+                                 f.get("owner"), f.get("age_secs") or 0)
+                              for f in foreign[:8])))
+        except Exception as _e:
+            # Never let forensics break the guard — but say so, because a silent
+            # except here would recreate exactly the blindness this block fixes.
+            slog("[staged-guard/AF-27] forensics failed: %s" % _e)
     return {"ok": True, "foreign": foreign, "shared": shared,
             "cotenants": cotenants, "window_secs": int(window)}
 
