@@ -2629,6 +2629,24 @@ def _bu_driver_teardown(d: dict):
         except Exception:
             pass
 
+def _bu_dead_driver_refusal(session: str) -> dict | None:
+    """AC-233, ONE predicate for every browser verb (AC-317 found it copied
+    into eval only, so /state and /screenshot still fell back to the CLI
+    silently — a dead driver answered with about:blank findings on two of the
+    three read paths while the third refused). A driver that EXISTED and DIED
+    is a broken session, not a fallback case: only fall through to cli when no
+    driver was ever started for this session."""
+    with _bu_driver_lock:
+        _had = session in _bu_drivers or session in _bu_driver_ever
+    if not _had:
+        return None
+    slog(f"[browser] driver for '{session}' died — refusing silent cli fallback (AC-233)")
+    return {"error": f"browser driver for '{session}' has died — restart with "
+                     f"POST /api/browser/start. Refusing silent fallback to cli "
+                     f"(which would return results from about:blank).",
+            "backend": "dead-driver", "had_driver": True}
+
+
 def _bu_driver_call(session: str, profile: str, verb: str, params: dict | None = None,
                     timeout_s: int = 45) -> dict:
     """Run a verb against the profile-true driver, spawning it on demand.
@@ -2782,21 +2800,9 @@ def _bu_eval(session: str, js: str, timeout_s: int = 20) -> dict:
         if r.get("ok"):
             return {"ok": True, "result": r.get("value"), "backend": "driver"}
         return {"error": r.get("error") or "driver eval failed", "backend": "driver"}
-    # AC-233: a driver that EXISTED and DIED is not a silent fallback — it is a
-    # broken session. Returning cli results from about:blank looks like a finding
-    # about the page, which is worse than an error. Only fall through to cli when
-    # no driver was ever started for this session.
-    with _bu_driver_lock:
-        # Either still registered (process died quietly) or ever registered
-        # (registry entry already cleaned up by a death path) — both mean a
-        # driver existed for this session and is now gone.
-        _had_driver = session in _bu_drivers or session in _bu_driver_ever
-    if _had_driver:
-        slog(f"[browser] driver for '{session}' died — refusing silent cli fallback (AC-233)")
-        return {"error": f"browser driver for '{session}' has died — restart with "
-                         f"POST /api/browser/start. Refusing silent fallback to cli "
-                         f"(which would return results from about:blank).",
-                "backend": "dead-driver", "had_driver": True}
+    _dead = _bu_dead_driver_refusal(session)
+    if _dead:
+        return _dead
     r = _bu_call(["eval", js], session=session, timeout_s=timeout_s)
     if isinstance(r, dict) and r.get("error"):
         return {"error": r["error"], "backend": "cli"}
@@ -19291,11 +19297,11 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
     ALSO edited is not foreign — both touched it, the committer has a
     legitimate claim, and blocking would deadlock genuinely shared files."""
     if os.environ.get("AMUX_STAGED_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
-        return {"ok": True, "enabled": False, "foreign": [], "cotenants": []}
+        return {"ok": True, "enabled": False, "foreign": [], "shared": [], "unclaimed": [], "cotenants": []}
     try:
         wd = str(Path(work_dir).expanduser().resolve())
     except Exception:
-        return {"ok": True, "foreign": [], "cotenants": []}
+        return {"ok": True, "foreign": [], "shared": [], "unclaimed": [], "cotenants": []}
     all_dirs = _all_session_workdirs()
     # Pair sessions by GIT REPO ROOT, not by CC_DIR string (AMUX-2337).
     #
@@ -19319,7 +19325,7 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
         # Same keys on every return path: a caller that reads d["shared"] should
         # get [] here, not None. Shape-inconsistent returns are how a consumer
         # ends up special-casing one branch and silently mishandling the other.
-        return {"ok": True, "foreign": [], "shared": [], "cotenants": cotenants}
+        return {"ok": True, "foreign": [], "shared": [], "unclaimed": [], "cotenants": cotenants}
     window = _staged_guard_window()
     now = time.time()
     mine = _session_recent_edit_paths(session, window) if session else {}
@@ -19352,7 +19358,7 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
                             for p in _ds.stdout.split("\0") if p.strip()}
     except Exception:
         pass
-    foreign, shared = [], []
+    foreign, shared, unclaimed = [], [], []
     for rel in rel_paths[:2000]:
         if not isinstance(rel, str) or not rel.strip():
             continue
@@ -19411,6 +19417,17 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
                             "why": ("no edit of yours on this path in the last %dm; "
                                     "basis is edit records, not the staged diff"
                                     % int(window / 60))})
+            continue
+        # THE BELT (AMUX-2443 + the AF-19 review residual + AC-297 — three
+        # independent sightings of one gap): staged, NOT yours by any record,
+        # and no peer trail either. A file staged OUTSIDE everyone's
+        # recent-edit window was invisible to both branches above, and a bare
+        # `git commit` swept it under the committer's name — 762e06e carried
+        # amux-frustrations' staged AF-12 work for exactly this reason, just a
+        # few hours past the window. Not blockable: there is no owner to defer
+        # to, and it may be the committer's own work from before the window.
+        # But silence is what made it a sweep — say it.
+        unclaimed.append({"path": rel, "has_unstaged_changes": _is_dirty})
     # BLOCK-TIME FORENSICS (AF-27). A block is the expensive verdict and the only one
     # that was undiagnosable after the fact: on 2026-08-09 a commit was refused whose
     # staged diff verifiably contained zero foreign hunks, and by the time anyone looked,
@@ -19447,7 +19464,7 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
             # Never let forensics break the guard — but say so, because a silent
             # except here would recreate exactly the blindness this block fixes.
             slog("[staged-guard/AF-27] forensics failed: %s" % _e)
-    return {"ok": True, "foreign": foreign, "shared": shared,
+    return {"ok": True, "foreign": foreign, "shared": shared, "unclaimed": unclaimed,
             "cotenants": cotenants, "window_secs": int(window)}
 
 
@@ -23119,6 +23136,22 @@ def main():
           "  Then verify the STAGED blob, not the worktree:  git show \\":%s\\" | "
           "python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'\\n"
           % (_level, f.get("path"), _who, _n, f.get("path"), f.get("path")))
+    # THE BELT (AMUX-2443 / AF-19 residual / AC-297 — three sightings, one gap):
+    # staged paths with NO edit record from ANY session in the window were
+    # invisible to both classifications above, and a plain commit ships them
+    # under the committer's name (762e06e swept exactly this shape, hours past
+    # the window). Not blocked — no owner to defer to, and it may be the
+    # committer's own pre-window work — but silence is what made it a sweep.
+    _unc = d.get("unclaimed") or []
+    if _unc:
+        _up = ", ".join((f.get("path") or "") for f in _unc[:6]) \\
+              + ((" (+%d more)" % (len(_unc) - 6)) if len(_unc) > 6 else "")
+        w("amux staged-guard: UNCLAIMED STAGED PATHS — no edit record from ANY "
+          "session in the window: " + _up + "\\n"
+          "  If these are yours from earlier, fine. If you do not recognize one, "
+          "a peer staged it before the window and a plain commit ships it under "
+          "YOUR name. Commit path-scoped (git commit -- <your paths>) or "
+          "unstage (git restore --staged -- <path>).\\n")
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
@@ -74451,6 +74484,9 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         _f.write_bytes(_b64.b64decode(shot["b64"]))
                         return self._json({"ok": True, "backend": "driver", "path": str(_f)})
                     return self._json({"error": shot.get("error", "driver screenshot failed")}, 502)
+                _dead = _bu_dead_driver_refusal(session)   # AC-317: same refusal as eval
+                if _dead:
+                    return self._json(_dead)
                 if url_param:
                     _bu_call(["open", url_param], session=session, timeout_s=20)
                     import time as _t; _t.sleep(2)
@@ -74481,6 +74517,9 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                                                "driver backend has no indexed elements — "
                                                "click by coordinates or use eval"})
                     return self._json({"error": st.get("error", "driver state failed")}, 502)
+                _dead = _bu_dead_driver_refusal(session)   # AC-317: same refusal as eval
+                if _dead:
+                    return self._json(_dead)
                 res = _bu_call(["state"], session=session)
                 try:
                     raw = (res.get("data") or {}).get("_raw_text", "") if isinstance(res, dict) else ""
