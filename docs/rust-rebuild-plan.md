@@ -507,28 +507,116 @@ Phase 0 generates an OpenAPI spec from the `JsonSchema` derives. The Playwright 
 validate against the spec. The Python server's responses are validated against the same
 spec during shadow mode (phase 11).
 
-### Invariant 14: Offline mode with command queuing
+### Invariant 14: Offline-first with optimistic sync
 
-The dashboard works offline (PWA with service worker) and queues commands for replay
-on reconnect. This is how it works today and must be preserved.
+The dashboard is an offline-first PWA. All mutations are applied optimistically to
+local state, persisted to IndexedDB, and synced to the server when connectivity is
+available. This is not a fallback mode -- it is the primary architecture. The current
+Python system already has offline queuing (localStorage + IndexedDB), service worker
+caching, and an offline banner with manual sync. The Rust rebuild makes this the
+foundation instead of a bolt-on.
 
-```rust
-// Client-side (in the SPA JavaScript):
-// When offline, commands are queued in IndexedDB
-struct QueuedCommand {
-    id: String,          // idempotency key
-    method: String,      // POST, PATCH, DELETE
-    path: String,        // /api/board/AR-7
-    body: Option<Value>, // JSON payload
-    queued_at: number,   // timestamp
+#### Client-side architecture
+
+```
+User action
+  -> apply to local state (instant UI update)
+  -> persist to IndexedDB (survives tab close)
+  -> enqueue sync operation
+  -> attempt server sync
+     -> success: confirm, reconcile with server state
+     -> conflict: show resolution toast, keep local or accept server
+     -> offline: queue for retry on reconnect
+```
+
+```typescript
+// IndexedDB stores (idb-keyval or Dexie):
+interface QueuedOperation {
+  id: string;              // idempotency key (uuid)
+  method: string;          // POST, PATCH, DELETE
+  path: string;            // /api/board/AR-7
+  body?: any;              // JSON payload
+  queuedAt: number;        // timestamp
+  retries: number;         // retry count
+  lastError?: string;      // last sync error
+  optimisticState?: any;   // local state applied before server confirmed
 }
 
-// On reconnect:
-// 1. Replay queued commands in order
-// 2. Each command carries its idempotency key
-// 3. Server deduplicates via idempotency key (already guaranteed by Invariant 9)
-// 4. Conflicts (e.g., issue moved by someone else) surface as toasts, not silent drops
+interface CachedState {
+  workers: Worker[];       // last-known worker list
+  board: BoardItem[];      // last-known board state (desc-truncated)
+  workerDetails: Map<string, WorkerDetail>;  // peek/history per worker
+  lastSync: number;        // when server state was last confirmed
+  serverRev: number;       // server's state revision (for delta sync)
+}
 ```
+
+#### Server-side support
+
+```rust
+// Every mutating endpoint accepts an idempotency key
+#[derive(Deserialize)]
+struct MutationRequest<T> {
+    #[serde(flatten)]
+    payload: T,
+    #[serde(default)]
+    idempotency_key: Option<Uuid>,
+}
+
+// Idempotency table: stores results of completed mutations for 24h
+// A replayed operation with the same key returns the cached result
+// without re-executing
+
+// Delta sync: client sends its last-known revision, server returns
+// only what changed since then
+#[derive(Serialize)]
+struct SyncResponse {
+    rev: u64,
+    workers: Option<Vec<Worker>>,        // None = unchanged
+    board_changes: Vec<BoardDelta>,      // additions, updates, deletions since rev
+    pending_commands: Vec<PendingCmd>,    // commands queued for this client
+}
+
+enum BoardDelta {
+    Upsert(BoardItem),
+    Delete { id: IssueId },
+    StatusChange { id: IssueId, from: Status, to: Status },
+}
+```
+
+#### Conflict resolution
+
+Conflicts are surfaced, never swallowed:
+
+| Conflict type | Resolution |
+|---|---|
+| Board card moved by someone else while offline | Toast with both states, user picks |
+| Board card deleted while offline edit queued | Toast: "card was deleted", discard edit |
+| Worker command sent while worker stopped | Toast: "worker stopped", offer restart |
+| Stale optimistic state (server rev moved) | Silent merge if non-conflicting, toast if conflicting |
+
+#### Service worker caching
+
+The SW caches the app shell (HTML/CSS/JS), icons, manifest, and the last-known
+server state. On startup:
+1. Serve cached shell immediately (instant paint)
+2. Fetch fresh state in background
+3. If offline, render from IndexedDB cache
+4. Reconnect triggers delta sync, not full reload
+
+Cache invalidation: `APP_VER` stamp in the SW. Server bumps it on deploy. SW
+detects new version, fetches new shell, activates on next navigation. The current
+Python system requires manually bumping `APP_VER` and `CACHE` in sw.js together --
+the Rust build stamps both from `build.rs`.
+
+#### Prefetch for deep offline
+
+The current "Save all workers for offline" button prefetches worker peek/history
+for all workers. The Rust version:
+- Background sync: if the device has been online for 30s and battery > 20%,
+  prefetch worker states incrementally (one per second, not all at once)
+- Configurable: user picks which workers to cache for offline
+- Storage budget: IndexedDB size limit awareness (show usage, prune old data)
 
 **Test plan**:
 - Playwright: go offline, create board card, send worker command, go online, verify
@@ -536,6 +624,15 @@ struct QueuedCommand {
 - Playwright: go offline, queue 5 commands, go online, verify all 5 replay in order
 - Playwright: offline queue + conflict (another user moved the card) shows toast
 - Playwright: dashboard renders all tabs from service worker cache while offline
+- Playwright: delta sync -- make 3 board changes on server, client reconnects,
+  receives only the 3 deltas (not full board reload)
+- Playwright: idempotency -- replay same operation twice, verify no duplicate
+- Playwright: close tab while offline with queued operations, reopen, verify queue
+  survives in IndexedDB and replays on reconnect
+- Playwright: service worker update -- deploy new version, verify client picks up
+  new shell on next navigation without losing queued operations
+- Playwright: deep offline -- prefetch 10 workers, go offline, navigate to each
+  worker's detail, verify peek/history renders from cache
 
 ---
 
@@ -1114,11 +1211,14 @@ Each scenario runs end-to-end in a real browser. Timing is measured and asserted
 - Integration: S3 upload (LocalStack or mock)
 - Playwright: email compose, calendar event creation, CRM contact card
 
-### Phase 7: Browser, files, misc (est. 2 weeks)
+### Phase 7: Browser profiles, files, misc (est. 2 weeks)
 
 **Goal**: remaining subsystems.
 
-1. Browser: CDP via `tokio::process`, profile management, screenshots
+1. Browser profiles: native Chrome profile management (no Python browser-use dep),
+   CDP-direct screenshot/navigation, profile inventory with saved-auth tracking,
+   lock-file cleanup on startup, and a clean split between profile management (always
+   free) and AI-driven browsing (model call only when needed)
 2. Files: browse, upload, download, ebook reader
 3. Push notifications: VAPID + RFC 8291
 4. Graph, journal, proxy, torrent, alerts, metrics
@@ -1126,9 +1226,14 @@ Each scenario runs end-to-end in a real browser. Timing is measured and asserted
 **Test plan**:
 - Unit: Web Push encryption roundtrip
 - Unit: VAPID JWT generation
+- Integration: browser profile create -> start -> screenshot -> stop lifecycle
+- Integration: profile lock-file cleanup on server restart
+- Integration: CDP screenshot matches expected dimensions
 - Integration: file upload/download roundtrip
 - Integration: push subscription lifecycle
-- Playwright: file browser navigable, browser automation tab functional
+- Playwright: browser tab shows profile inventory with auth domains
+- Playwright: start profile, navigate, screenshot renders in dashboard
+- Playwright: file browser navigable
 
 ### Phase 8: Dashboard + CLI (est. 2 weeks)
 
@@ -1272,6 +1377,216 @@ tail (parallelizable, saves ~2 weeks). Phases 8-11 are polish, testing, and cuto
 5. **Scope resolution complexity**: three-tier inheritance with overrides is easy to
    spec, hard to get right in every query. Mitigation: one resolver function in
    `amux-core`, used by all consumers. Never re-derive scope logic per-query.
+
+## Lessons from the Python system (fix these structurally, not by porting)
+
+These are real incidents from the last 72 hours of operating amux at scale. Each one
+points to an architectural flaw that the Rust rebuild must not inherit.
+
+### L1: The 6MB board payload
+
+The board API returns every card including full `desc` fields. One card has a 94KB
+desc. The default response is 6.2MB, of which 4.4MB (74%) is desc text the dashboard
+never renders (it shows `desc.split('\n')[0].slice(0, 80)`). Every SSE push, every
+poll, every page load ships this. On a phone over cellular, this is the dominant
+latency source.
+
+**Rust fix**: the API has two shapes by design.
+- **List responses** (`GET /api/board`, SSE pushes): `desc` truncated to first line,
+  `desc_truncated: true` flag set. Full desc is never in a list payload.
+- **Detail responses** (`GET /api/board/:id`): full desc, full log, full history.
+
+This is not an optimization to add later. It is a response type definition:
+
+```rust
+#[derive(Serialize)]
+struct BoardItemSummary {
+    // all fields EXCEPT desc/log are full
+    desc_preview: String,  // first line, max 200 chars
+    desc_truncated: bool,
+    // no `log` field at all
+}
+
+#[derive(Serialize)]
+struct BoardItemDetail {
+    // everything, full desc, full log
+    desc: String,
+    log: String,
+}
+```
+
+Delta sync (Invariant 14) compounds this: after the initial load, the client receives
+only changed items, not the full board. A single card status change pushes ~200 bytes
+instead of 6.2MB.
+
+### L2: tmux target format inconsistency
+
+The `=` prefix for exact session matching works for session-level commands
+(`has-session`, `kill-session`) but silently fails for pane-level commands
+(`capture-pane`, `send-keys`, `pipe-pane`) -- they need `=name:` with a trailing
+colon. This caused a fleet-wide outage: every capture and send-keys across 62 sessions
+was silently failing. The test only verified `has-session` and `kill-session`.
+
+**Rust fix**: the `SessionBackend` trait encapsulates all tmux interaction. The target
+format is derived once, tested once, used everywhere. No raw `subprocess::Command`
+construction outside the backend module. The test harness exercises every tmux verb the
+backend uses, not just the ones that motivated the fix.
+
+```rust
+impl TmuxBackend {
+    fn target(&self, worker: &str) -> String {
+        format!("=amux-{}:", worker)  // exact + pane resolution
+    }
+    // Every tmux operation goes through this -- no raw "-t" construction elsewhere
+}
+```
+
+### L3: Board items not flowing
+
+380 todo items, 25 doing with no session, steering messages piling up undelivered.
+The orchestrator logic is scattered across pickup, advance-nudge, steering, and
+snapshot -- and when any one piece breaks (as capture-pane did), the others don't
+compensate. There is no single place that answers "why isn't this issue moving?"
+
+**Rust fix**: the explicit Orchestrator (Invariant 10) runs a stall check on every
+tick. When it detects a stall, it produces a `StallViolation` with the reason:
+
+```rust
+enum StallReason {
+    WorkerIdle,                          // worker has capacity but isn't assigned
+    WorkerRateLimited { reset_at: DateTime },  // waiting, not stalled
+    DependencyBlocked { blocked_by: IssueId }, // not stalled, just waiting
+    NoCapableWorker,                     // no worker can do this work
+    BackendFailure { error: String },    // capture/send broken
+    GateBlocked { gate: Vec<String> },   // needs human ack
+    Orphaned,                            // assigned to a worker that no longer exists
+}
+```
+
+The dashboard shows stall reasons inline on each card. A user looking at the board
+can see exactly WHY each item is stuck, not just that it is.
+
+### L4: No progress heartbeat
+
+"I have no means of knowing if progress is continuing." The dashboard shows worker
+status (active/idle/rate-limited) but not whether the fleet is making forward
+progress. A worker can be "active" for 2 hours on a single issue with no board
+movement.
+
+**Rust fix**: the Orchestrator emits a periodic `FleetProgress` event:
+
+```rust
+struct FleetProgress {
+    timestamp: DateTime<Utc>,
+    active_workers: u32,
+    issues_completed_last_hour: u32,
+    issues_completed_last_24h: u32,
+    stall_violations: Vec<StallViolation>,
+    longest_active_issue: Option<(IssueId, Duration)>,
+    queue_depth: u32,  // todo items with no worker assigned
+}
+```
+
+The dashboard renders this as a compact status bar: "5 active, 3 completed/hr, 0
+stalls" or "2 active, 0 completed/hr, 3 STALLS" (red). Clicking expands to the full
+breakdown.
+
+### L5: Server restart fragility
+
+The Python server re-execs itself on every save of `amux-server.py`. On a shared
+checkout with multiple sessions committing, this means uncontrolled restarts. A syntax
+error in a commit takes the entire fleet's server down. The server process uses 888MB
+RSS and takes 10+ seconds to restart.
+
+**Rust fix**: the compiled binary cannot have syntax errors at runtime. Hot reload is
+a `SIGHUP` handler that reloads configuration (`server.env`, gates, schedules) without
+restarting the process. The binary is updated via a separate deploy step, not a file
+watch. RSS target is <200MB.
+
+### L6: Token waste -- model calls for string manipulation
+
+The Python server makes model API calls (claude -p or Anthropic SDK) for tasks that
+should be computed, not inferred:
+
+| Call site | What it does | Tokens/call | Fix |
+|---|---|---|---|
+| Task title summarizer | `claude -p` to label a board card from a prompt | ~12-15k input | First clause of the prompt IS the title. No model needed. |
+| Email event extractor | Haiku to parse event emails | ~3k input | Structured parsing with regex + date parser. Model call only for ambiguous cases. |
+| Branch name suggester | Haiku to generate 4 git branch names | ~1k input | Template: `feat/{slug}`, `session/{slug}`, etc. No model needed. |
+| Lookup endpoint | Haiku for general "ask Claude" queries | varies | This one is legitimate -- user-facing. |
+| browser-use agent | Full Anthropic API call for browser automation | ~4k+ input | Legitimate when doing AI-driven browsing. |
+
+The task summarizer was the worst offender (ethos rule 2: "are you calling the model
+for something you could just compute?"). At 12-15k input tokens per call, with 62
+sessions each potentially firing one, that is up to 930k tokens per throttle window
+for 3-word labels. It was throttled to once per 10 minutes per session, which is why
+most commands never reached the board at all -- the throttle was the symptom, not the
+fix.
+
+**Rust fix**: no model calls for string manipulation. The title deriver is
+`prompt.split('\n')[0].split('.')[0][:80]` -- free, instant, no throttle needed,
+every prompt gets a card. Model calls are reserved for judgment: "should this issue
+be escalated?", "does this verification evidence satisfy the gate?" -- questions
+where the answer depends on understanding, not formatting.
+
+### L7: Browser profile management
+
+Browser automation uses `browser-use` with Chrome profiles for persistent auth state.
+The current system has:
+- Profile creation via `POST /api/browser/profile/create`
+- Profile listing, starting/stopping browser sessions
+- Chrome profile path resolution (different between macOS/Linux)
+- A bootstrap that patches `browser-use`'s `get_chrome_profile_path` at import time
+- Profile cleanup and lock-file management
+- Screenshots, CDP integration
+
+Pain points:
+- Profile path resolution is fragile (macOS vs Linux, `Default` subdirectory
+  inconsistency that caused browser-use to create profiles in the wrong location)
+- Browser sessions that don't close properly leave Chrome lock files, blocking the
+  next start
+- No profile inventory -- you can't see which profiles have which saved logins
+- The `browser-use` Python dependency pulls in heavy model deps even when you just
+  want profile management
+
+**Rust fix**: browser profiles are a first-class subsystem:
+
+```rust
+struct BrowserProfile {
+    name: String,
+    chrome_data_dir: PathBuf,
+    created_at: DateTime<Utc>,
+    last_used: Option<DateTime<Utc>>,
+    saved_domains: Vec<String>,  // domains with saved auth cookies
+    size_bytes: u64,
+}
+
+struct BrowserSession {
+    profile: String,
+    pid: Option<u32>,
+    cdp_port: u16,
+    started_at: DateTime<Utc>,
+    screenshots: Vec<PathBuf>,
+}
+```
+
+- Profile CRUD is native (no Python browser-use dependency for management)
+- Chrome is launched directly via CDP flags, not through a Python wrapper
+- Lock files are cleaned up on server start (reconciliation)
+- Profile inventory shows saved auth domains
+- Screenshots use CDP directly (`Page.captureScreenshot`)
+- The Anthropic model call is separate from the browser control -- you can use
+  profiles without burning tokens
+
+### L6: 114 registered sessions, 62 running, 67 with no status
+
+Half the registered sessions are just `.env` files with no running process. The
+dashboard shows all 114 with no visual distinction. A user sees 67 blank entries mixed
+in with 47 real workers.
+
+**Rust fix**: workers that are stopped are in a collapsed "Stopped" section by
+default. The main view shows only running + recently-active workers. The worker count
+in the header shows "6 active / 41 idle / 67 stopped" -- three numbers, not one.
 
 ## What does NOT change
 
