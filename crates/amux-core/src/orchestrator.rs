@@ -489,3 +489,243 @@ mod tests {
         assert_eq!(plan1.assignments.len(), 50);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Anti-livelock enforcement (RR-0048a/e, Invariants 47, 51)
+// ---------------------------------------------------------------------------
+
+/// Decomposition caps (Invariant 51). Depth 4 is rejected, an 11th child is
+/// rejected, and a run that discovers more than 50 items must report the
+/// overflow rather than silently keep appending (ethos rule 5: at 100x the
+/// volume, does this still discriminate?).
+pub const MAX_DECOMPOSITION_DEPTH: u32 = 3;
+pub const MAX_CHILDREN_PER_TASK: u32 = 10;
+pub const MAX_DISCOVERED_ITEMS_PER_RUN: u32 = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+pub enum DecompositionError {
+    #[error("decomposition depth {attempted} exceeds cap {max} — quarantine instead of digging deeper")]
+    DepthExceeded { attempted: u32, max: u32 },
+    #[error("child count {attempted} exceeds cap {max} for one task")]
+    TooManyChildren { attempted: u32, max: u32 },
+}
+
+/// Gate a proposed decomposition against the Invariant 51 caps.
+pub fn check_decomposition(depth: u32, children: u32) -> Result<(), DecompositionError> {
+    if depth > MAX_DECOMPOSITION_DEPTH {
+        return Err(DecompositionError::DepthExceeded {
+            attempted: depth,
+            max: MAX_DECOMPOSITION_DEPTH,
+        });
+    }
+    if children > MAX_CHILDREN_PER_TASK {
+        return Err(DecompositionError::TooManyChildren {
+            attempted: children,
+            max: MAX_CHILDREN_PER_TASK,
+        });
+    }
+    Ok(())
+}
+
+/// What the runtime must do about an assignment whose task has exhausted its
+/// execution limits (Invariant 47).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ExhaustionAction {
+    /// Limits spent, decomposition not yet tried twice: split the task.
+    Decompose { task: TaskId, depth: u32 },
+    /// Limits spent AND decomposition already failed twice: terminal
+    /// quarantine — retrying identically forever is the livelock this
+    /// invariant exists to kill.
+    Quarantine { task: TaskId, reason: String },
+}
+
+/// Filter planned assignments through ExecutionLimits. Returns the
+/// assignments that may proceed and the actions for those that may not.
+/// Wall-clock elapsed per task is derived from its first attempt timestamp.
+pub fn enforce_limits(
+    assignments: Vec<WorkAssignment>,
+    limits: &crate::limits::ExecutionLimits,
+    now: DateTime<Utc>,
+    decomposition_depth: &BTreeMap<TaskId, u32>,
+) -> (Vec<WorkAssignment>, Vec<ExhaustionAction>) {
+    let mut proceed = Vec::new();
+    let mut actions = Vec::new();
+    for asg in assignments {
+        let elapsed = asg
+            .prior_attempts
+            .first()
+            .map(|a| (now - a.at).num_seconds().max(0) as u64)
+            .unwrap_or(0);
+        match crate::limits::check(limits, &asg.prior_attempts, elapsed) {
+            crate::limits::LimitCheck::WithinLimits => proceed.push(asg),
+            crate::limits::LimitCheck::Exhausted { which } => {
+                let decompositions_tried = asg
+                    .prior_attempts
+                    .iter()
+                    .filter(|a| a.decomposition_attempted)
+                    .count();
+                if decompositions_tried >= 2 {
+                    actions.push(ExhaustionAction::Quarantine {
+                        task: asg.task.clone(),
+                        reason: format!(
+                            "limits exhausted ({which:?}) after {} attempts and {decompositions_tried} failed decompositions",
+                            asg.prior_attempts.len()
+                        ),
+                    });
+                } else {
+                    let depth = decomposition_depth.get(&asg.task).copied().unwrap_or(0);
+                    if depth >= MAX_DECOMPOSITION_DEPTH {
+                        // At max depth, exhaustion goes straight to
+                        // quarantine (RR-0048e) — there is no deeper to dig.
+                        actions.push(ExhaustionAction::Quarantine {
+                            task: asg.task.clone(),
+                            reason: format!(
+                                "limits exhausted ({which:?}) at max decomposition depth {depth}"
+                            ),
+                        });
+                    } else {
+                        actions.push(ExhaustionAction::Decompose {
+                            task: asg.task.clone(),
+                            depth: depth + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (proceed, actions)
+}
+
+#[cfg(test)]
+mod livelock_tests {
+    use super::*;
+    use crate::limits::{AttemptRecord, ExecutionLimits};
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap()
+    }
+
+    fn tid(n: u32) -> TaskId {
+        TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 20_000 + n as u128))
+    }
+
+    fn wid() -> WorkerId {
+        WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 1))
+    }
+
+    fn attempt(n: u32, decomposed: bool, tokens: u64) -> AttemptRecord {
+        AttemptRecord {
+            attempt: n,
+            failure_reason: format!("attempt {n} failed"),
+            rejected_evidence: vec![],
+            tokens_spent: tokens,
+            wall_clock_secs: 60,
+            decomposition_attempted: decomposed,
+            tree_status: None,
+            at: now() - chrono::Duration::hours(1),
+        }
+    }
+
+    fn asg(task: TaskId, attempts: Vec<AttemptRecord>) -> WorkAssignment {
+        WorkAssignment {
+            idempotency_key: "k".into(),
+            task: task.clone(),
+            worker: wid(),
+            attempt: attempts.len() as u32 + 1,
+            lease: Lease {
+                task,
+                worker: wid(),
+                acquired_at: now(),
+                expires_at: now() + chrono::Duration::minutes(10),
+                generation: 0,
+            },
+            prior_attempts: attempts,
+        }
+    }
+
+    #[test]
+    fn within_limits_proceeds() {
+        let limits = ExecutionLimits::default();
+        let (proceed, actions) =
+            enforce_limits(vec![asg(tid(1), vec![attempt(1, false, 1000)])], &limits, now(), &BTreeMap::new());
+        assert_eq!(proceed.len(), 1);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn exhaustion_triggers_decomposition_first() {
+        let limits = ExecutionLimits {
+            max_attempts: 2,
+            ..Default::default()
+        };
+        let attempts = vec![attempt(1, false, 1000), attempt(2, false, 1000)];
+        let (proceed, actions) =
+            enforce_limits(vec![asg(tid(1), attempts)], &limits, now(), &BTreeMap::new());
+        assert!(proceed.is_empty());
+        assert_eq!(
+            actions,
+            vec![ExhaustionAction::Decompose { task: tid(1), depth: 1 }]
+        );
+    }
+
+    #[test]
+    fn double_decomposition_failure_quarantines() {
+        let limits = ExecutionLimits {
+            max_attempts: 2,
+            ..Default::default()
+        };
+        let attempts = vec![attempt(1, true, 1000), attempt(2, true, 1000)];
+        let (_, actions) =
+            enforce_limits(vec![asg(tid(1), attempts)], &limits, now(), &BTreeMap::new());
+        assert!(
+            matches!(&actions[0], ExhaustionAction::Quarantine { task, reason }
+                if task == &tid(1) && reason.contains("2 failed decompositions")),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn max_depth_exhaustion_quarantines_without_decomposing() {
+        let limits = ExecutionLimits {
+            max_attempts: 1,
+            ..Default::default()
+        };
+        let mut depths = BTreeMap::new();
+        depths.insert(tid(1), MAX_DECOMPOSITION_DEPTH);
+        let (_, actions) =
+            enforce_limits(vec![asg(tid(1), vec![attempt(1, false, 100)])], &limits, now(), &depths);
+        assert!(
+            matches!(&actions[0], ExhaustionAction::Quarantine { reason, .. }
+                if reason.contains("max decomposition depth")),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn decomposition_caps_enforced() {
+        assert!(check_decomposition(3, 10).is_ok());
+        assert!(matches!(
+            check_decomposition(4, 1),
+            Err(DecompositionError::DepthExceeded { attempted: 4, max: 3 })
+        ));
+        assert!(matches!(
+            check_decomposition(1, 11),
+            Err(DecompositionError::TooManyChildren { attempted: 11, max: 10 })
+        ));
+    }
+
+    #[test]
+    fn token_exhaustion_also_routes_through_actions() {
+        let limits = ExecutionLimits {
+            max_tokens: 1500,
+            ..Default::default()
+        };
+        let attempts = vec![attempt(1, false, 1000), attempt(2, false, 1000)];
+        let (proceed, actions) =
+            enforce_limits(vec![asg(tid(1), attempts)], &limits, now(), &BTreeMap::new());
+        assert!(proceed.is_empty());
+        assert_eq!(actions.len(), 1);
+    }
+}

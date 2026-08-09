@@ -92,6 +92,15 @@ async fn async_main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3),
         heartbeat_every: 10,
+        breaker: amux_core::circuit::FleetCircuitBreaker {
+            // Spend trip disabled until the token ledger wires in (Phase 4)
+            // — 0 budget with 0 accounting would trip instantly on lies.
+            window_budget_tokens: u64::MAX,
+            window_secs: 3600,
+            min_progress_per_window: 0, // no-progress trip opt-in via config later
+            max_failures_per_window: 50,
+        },
+        fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
     });
     match runtime.reconcile_on_startup().await {
         Ok(report) => tracing::info!(

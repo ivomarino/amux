@@ -38,6 +38,12 @@ pub struct Runtime {
     pub tick_secs: u64,
     /// Heartbeat cadence in ticks (heartbeat every Nth tick).
     pub heartbeat_every: u64,
+    /// Fleet circuit breaker (RR-0048b, Invariant 48). The state lives here,
+    /// in memory: a restart resets to Normal, and the first post-restart
+    /// window re-trips if the condition persists — a breaker that survives
+    /// its own process is a breaker nobody can reset.
+    pub breaker: amux_core::circuit::FleetCircuitBreaker,
+    pub fleet_state: std::sync::Mutex<amux_core::circuit::FleetState>,
 }
 
 impl Runtime {
@@ -152,16 +158,50 @@ impl Runtime {
         }
     }
 
-    /// One tick: load state, plan, execute the plan.
+    /// One tick: load state, evaluate the circuit breaker, plan, execute.
     pub async fn tick_once(&self, heartbeat: bool) -> anyhow::Result<()> {
         let now = Utc::now();
         let (workers, leases, quarantined_total) = self.load_state()?;
+
+        // Circuit breaker (RR-0048b): evaluate the rolling window BEFORE
+        // planning. While open, reconciliation looks for runnable work and
+        // auto-closes when it finds the fleet can actually move again.
+        let window = self.window_stats(now)?;
+        // Evaluate under the lock WITHOUT awaiting (the guard is not Send);
+        // publish the change after the guard drops.
+        let (fleet_state, changed) = {
+            let mut fs = self.fleet_state.lock().unwrap();
+            let mut changed = None;
+            match &*fs {
+                amux_core::circuit::FleetState::Normal => {
+                    if let Some(tripped) = self.breaker.trip(&window, now) {
+                        tracing::warn!(state = ?tripped, "fleet circuit OPENED");
+                        *fs = tripped.clone();
+                        changed = Some(tripped);
+                    }
+                }
+                _ => {
+                    // Open/reconciling: a healthy window is the auto-close
+                    // signal — the fleet demonstrably moves again.
+                    if self.breaker.evaluate(&window).is_none() {
+                        if let Some(closed) = fs.close() {
+                            tracing::info!("fleet circuit CLOSED (window healthy)");
+                            *fs = closed.clone();
+                            changed = Some(closed);
+                        }
+                    }
+                }
+            }
+            (fs.clone(), changed)
+        };
+        if let Some(state) = &changed {
+            self.publish_fleet_state(state).await.ok();
+        }
 
         // Tasks arrive with the board API (Phase 2). Empty until then.
         let tasks: Vec<amux_core::board::Task> = vec![];
         let hints = BTreeMap::new();
         let attempts = BTreeMap::new();
-        let fleet_state = amux_core::circuit::FleetState::Normal;
 
         let plan = plan_tick(&TickInputs {
             now,
@@ -207,6 +247,47 @@ impl Runtime {
                 })
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Rolling-window stats from the revisioned event journal — the same
+    /// events every other consumer sees, so the breaker and the dashboard
+    /// can never disagree about what happened (ethos rule 4).
+    fn window_stats(&self, now: DateTime<Utc>) -> anyhow::Result<amux_core::circuit::WindowStats> {
+        let conn = self.store.read()?;
+        let cutoff = (now - chrono::Duration::seconds(self.breaker.window_secs as i64)).to_rfc3339();
+        let completed: u32 = conn.query_row(
+            r#"SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
+             AND entity_type = 'task' AND mutation LIKE '%"to":"done"%'"#,
+            params![cutoff], |r| r.get(0)).unwrap_or(0);
+        let failures: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
+             AND mutation LIKE '%interrupted%'",
+            params![cutoff], |r| r.get(0)).unwrap_or(0);
+        Ok(amux_core::circuit::WindowStats {
+            // Token accounting joins with the turn ledger (Phase 4); 0 keeps
+            // the spend trip disabled rather than fed invented numbers.
+            tokens_spent: 0,
+            tasks_completed: completed,
+            failures,
+            all_items_blocked: false,
+        })
+    }
+
+    async fn publish_fleet_state(&self, state: &amux_core::circuit::FleetState) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(state)?;
+        self.store
+            .write_async(move |_conn| {
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![PendingEvent {
+                        entity_type: EntityType::Other("fleet_state".into()),
+                        entity_id: payload.clone(),
+                        mutation: MutationKind::Updated,
+                    }],
+                })
+            })
+            .await?;
         Ok(())
     }
 
@@ -381,6 +462,22 @@ mod tests {
         }
     }
 
+    fn test_runtime(store: SharedStore, backends: Vec<Arc<dyn SessionBackend>>) -> Runtime {
+        Runtime {
+            store,
+            backends,
+            tick_secs: 3,
+            heartbeat_every: 1,
+            breaker: amux_core::circuit::FleetCircuitBreaker {
+                window_budget_tokens: 0, // 0 disables the spend trip in tests
+                window_secs: 3600,
+                min_progress_per_window: 0,
+                max_failures_per_window: 1000,
+            },
+            fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+        }
+    }
+
     fn store() -> SharedStore {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -416,15 +513,10 @@ mod tests {
     async fn reconcile_marks_vanished_sessions_interrupted() {
         let store = store();
         seed_live_session(&store, "ses_a", "wrk_a", "amux-wrk_a");
-        let rt = Runtime {
-            store: store.clone(),
-            backends: vec![Arc::new(FakeBackend {
-                hosted: vec![], // backend hosts nothing
-                fail_probe: false,
-            })],
-            tick_secs: 3,
-            heartbeat_every: 10,
-        };
+        let rt = test_runtime(store.clone(), vec![Arc::new(FakeBackend {
+            hosted: vec![], // backend hosts nothing
+            fail_probe: false,
+        })]);
         let report = rt.reconcile_on_startup().await.unwrap();
         assert_eq!(report.interrupted, vec!["wrk_a".to_string()]);
         // The session row is ended.
@@ -440,18 +532,13 @@ mod tests {
     #[tokio::test]
     async fn reconcile_reports_stale_backend_refs_without_killing() {
         let store = store();
-        let rt = Runtime {
-            store,
-            backends: vec![Arc::new(FakeBackend {
-                hosted: vec![BackendSession {
-                    backend_ref: "amux-wrk_ghost".into(),
-                    status: BackendStatus::Running,
-                }],
-                fail_probe: false,
-            })],
-            tick_secs: 3,
-            heartbeat_every: 10,
-        };
+        let rt = test_runtime(store, vec![Arc::new(FakeBackend {
+            hosted: vec![BackendSession {
+                backend_ref: "amux-wrk_ghost".into(),
+                status: BackendStatus::Running,
+            }],
+            fail_probe: false,
+        })]);
         let report = rt.reconcile_on_startup().await.unwrap();
         assert_eq!(report.stale_backend, vec!["amux-wrk_ghost".to_string()]);
     }
@@ -460,15 +547,10 @@ mod tests {
     async fn failed_probe_never_mass_ends_sessions() {
         let store = store();
         seed_live_session(&store, "ses_b", "wrk_b", "amux-wrk_b");
-        let rt = Runtime {
-            store: store.clone(),
-            backends: vec![Arc::new(FakeBackend {
-                hosted: vec![],
-                fail_probe: true, // probe down != sessions gone
-            })],
-            tick_secs: 3,
-            heartbeat_every: 10,
-        };
+        let rt = test_runtime(store.clone(), vec![Arc::new(FakeBackend {
+            hosted: vec![],
+            fail_probe: true, // probe down != sessions gone
+        })]);
         let report = rt.reconcile_on_startup().await.unwrap();
         assert!(report.interrupted.is_empty(), "flaky probe must not reap");
         assert_eq!(report.backend_probe_failures.len(), 1);
@@ -494,12 +576,7 @@ mod tests {
                 Ok(WriteOutcome { applied: true, events: vec![] })
             })
             .unwrap();
-        let rt = Runtime {
-            store: store.clone(),
-            backends: vec![],
-            tick_secs: 3,
-            heartbeat_every: 1,
-        };
+        let rt = test_runtime(store.clone(), vec![]);
         let mut rx = store.subscribe();
         rt.tick_once(true).await.unwrap();
         // Lease is gone (expired long ago).
