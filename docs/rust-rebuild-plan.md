@@ -182,7 +182,8 @@ The orchestrator uses this graph to determine what to assign, not a flat queue s
 ### Invariant 5: Typed command/event protocol (the D1 exit)
 
 The terminal is an adapter, not the control plane. The system speaks typed commands
-and events internally; tmux/herdr translate at the boundary.
+and events internally; the backend (herdr, tmux, or native PTY) translates at the
+boundary.
 
 ```rust
 enum WorkerCommand {
@@ -217,8 +218,11 @@ from the captured text. The consumer never knows which source produced the event
 just processes `WorkerEvent`s. As Claude Code's hook coverage grows, scrapers shrink
 to liveness checks.
 
-This is the actual D1 exit. tmux scraping becomes an adapter that emits
-`WorkerEvent::RateLimited` instead of the orchestrator matching regexes.
+This is the actual D1 exit. Backend scraping becomes a fallback adapter that emits
+`WorkerEvent::RateLimited` instead of the orchestrator matching regexes. Herdr's
+structured state reports handle most transitions directly; scraping remains only for
+provider-specific signals (rate-limit messages, context warnings) that neither herdr
+nor hooks expose.
 
 ### Invariant 6: Turn is a first-class concept
 
@@ -289,6 +293,7 @@ enum Provider {
 struct WorkerConfig {
     provider: Provider,
     model: Option<String>,
+    #[serde(default)]  // default: Herdr
     backend: BackendKind,
     // ...
 }
@@ -410,10 +415,16 @@ fn process_event(worker: &mut Worker, event: WorkerEvent) {
 }
 ```
 
-For hooks-capable providers (Claude Code), events come from hooks in real time. For
-hookless providers (Gemini, Codex, Ollama), the terminal adapter polls and translates
-to WorkerEvents -- but the adapter owns the translation, not the orchestrator. The
-consumer code is identical either way.
+Event sources, in priority order:
+1. **Provider hooks** (Claude Code): events in real time via Stop/UserPromptSubmit
+2. **Herdr structured state**: session existence, waiting/blocked/completed status
+   reported directly as WorkerEvents without scraping
+3. **Terminal adapter** (fallback): polls and translates rendered terminal output to
+   WorkerEvents for provider-specific signals herdr/hooks cannot expose
+
+The consumer code is identical regardless of source. For hookless providers (Gemini,
+Codex, Ollama) on herdr, the backend's structured state handles lifecycle transitions
+while the terminal adapter handles only provider-specific rate-limit patterns.
 
 **Per-provider event coverage** (what each provider can report today):
 
@@ -649,9 +660,10 @@ Elevated from lessons learned to architectural law:
    `amux issue AR-123 history` returns the full chain.
 
 3. **No backend/provider-specific behavior above its adapter boundary.** The
-   orchestrator, board, scheduler, and dashboard never know whether tmux or herdr is
-   running, or whether Claude or Ollama is the provider. If a feature requires
-   `if provider == "claude"` above the adapter, the adapter's interface is wrong.
+   orchestrator, board, scheduler, and dashboard never know whether herdr, tmux, or
+   native PTY is running, or whether Claude or Ollama is the provider. If a feature
+   requires `if backend == "herdr"` or `if provider == "claude"` above the adapter,
+   the adapter's interface is wrong.
 
 ### Invariant 16: Token budgets are a runtime primitive
 
@@ -830,28 +842,90 @@ against known limits. Distinct failure types get distinct recovery:
 
 ### Invariant 21: Backend and provider conformance suites
 
-Every backend implementation passes the same test suite unchanged. Every provider
-adapter passes the same test suite unchanged.
+Every backend implementation passes the exact same test suite without changing tests.
+Every provider adapter passes the exact same test suite without changing tests.
 
 ```rust
-// One suite, runs against Mock, Tmux, Herdr, NativePty:
+// One suite, runs against MockBackend, HerdrBackend, TmuxBackend,
+// and eventually NativePtyBackend:
 mod backend_conformance {
+    // Core lifecycle
     async fn test_spawn_and_capture(backend: &dyn SessionBackend);
     async fn test_send_text_roundtrip(backend: &dyn SessionBackend);
+    async fn test_multiline_input(backend: &dyn SessionBackend);
+    async fn test_large_input(backend: &dyn SessionBackend);
+    async fn test_unicode(backend: &dyn SessionBackend);
+    async fn test_read_output(backend: &dyn SessionBackend);
+
+    // State detection
+    async fn test_detect_active(backend: &dyn SessionBackend);
+    async fn test_detect_waiting(backend: &dyn SessionBackend);
+    async fn test_detect_completed(backend: &dyn SessionBackend);
+
+    // Lifecycle
     async fn test_interrupt(backend: &dyn SessionBackend);
     async fn test_terminate(backend: &dyn SessionBackend);
-    async fn test_crash_recovery(backend: &dyn SessionBackend);
+    async fn test_process_crash(backend: &dyn SessionBackend);
+    async fn test_backend_daemon_disappears(backend: &dyn SessionBackend);
+
+    // Reconciliation
     async fn test_restart_reconciliation(backend: &dyn SessionBackend);
-    async fn test_large_prompt(backend: &dyn SessionBackend);
-    async fn test_unicode(backend: &dyn SessionBackend);
-    async fn test_multiline(backend: &dyn SessionBackend);
+    async fn test_stale_session_reconciliation(backend: &dyn SessionBackend);
+
+    // Scale and concurrency
     async fn test_concurrent_workers(backend: &dyn SessionBackend);
-    async fn test_backend_disappears(backend: &dyn SessionBackend);
+    async fn test_40_worker_load(backend: &dyn SessionBackend);
+
+    // Reliability
+    async fn test_command_idempotency(backend: &dyn SessionBackend);
+    async fn test_no_duplicate_delivery_after_restart(backend: &dyn SessionBackend);
 }
 ```
 
 **The invariant: no test above the backend/provider layer knows which
 backend/provider is running.**
+
+### Invariant 33: Backend independence
+
+Switching a worker between herdr, tmux, and a future native PTY must not alter its
+worker identity, issue lifecycle, messages, context, turns, gates, verification
+behavior, scheduling behavior, or observable API semantics.
+
+```rust
+// Backend is configuration, not identity
+struct WorkerConfig {
+    // ...
+    backend: BackendKind,  // default: Herdr
+    // Changing this field and restarting the worker is a valid operation.
+    // Everything above the SessionBackend trait is unchanged.
+}
+
+enum BackendKind {
+    Herdr,      // default, agent-oriented lifecycle
+    Tmux,       // fallback, terminal multiplexer
+    NativePty,  // future, direct PTY ownership
+}
+```
+
+The layering:
+
+```
+Orchestrator
+    |
+WorkerCommand / WorkerEvent
+    |
+SessionBackend trait
+    |
++-- HerdrBackend   [default]
++-- TmuxBackend    [fallback]
++-- NativePtyBackend [future]
+```
+
+Rate limits, turns, compaction, messages, issue state, gates, verification,
+scheduling, and worker state are completely backend-independent. A worker can
+restart on a different backend while preserving all durable amux state. Backend
+choice does not require DB/schema changes and does not change worker identity or
+issue ownership.
 
 ### Invariant 22: Deterministic orchestrator simulation
 
@@ -1469,9 +1543,9 @@ trait ContextProvider: Send + Sync {
 
 ## Terminal backend evaluation
 
-The terminal backend is the dominant complexity center: ~90-100 tmux subprocess call
-sites, ~50 compiled regexes, 5 polling loops at 2s/3s/15s/60s/60s intervals, ~700
-lines for rate-limit detection alone.
+The terminal backend is the dominant complexity center in the Python system: ~90-100
+tmux subprocess call sites, ~50 compiled regexes, 5 polling loops at
+2s/3s/15s/60s/60s intervals, ~700 lines for rate-limit detection alone.
 
 ### What tmux costs today
 
@@ -1489,22 +1563,45 @@ lines for rate-limit detection alone.
 | Option | Description | Wins | Loses |
 |---|---|---|---|
 | **A: tmux improved** | tmux control-mode (`-CC`), persistent connection | Zero migration risk | 50 regexes stay, D1 stays |
-| **B: herdr primary** | Structured `agent prompt/read` | Send quality, alt-screen capture, cleaner lifecycle | Same scraping regexes |
+| **B: herdr primary** | Structured agent lifecycle operations | Send quality, alt-screen capture, cleaner lifecycle, reduced scraping | Same provider-specific scraping regexes |
 | **C: Native PTY** | Rust owns PTY via `portable-pty` | Zero subprocess overhead, streaming | Must solve persistence, lose manual attach |
 | **D: Structured protocol** | WorkerCommand/WorkerEvent, hooks as primary | IS the D1 exit | Depends on Claude Code hook coverage |
 
 ### Recommendation
 
-**herdr as primary backend + WorkerCommand/WorkerEvent as the internal protocol (B + D).**
+**herdr as primary/default backend + WorkerCommand/WorkerEvent as the internal
+protocol (B + D). tmux as fallback. Native PTY as future option.**
 
-The key insight: **terminal backend choice is independent of the protocol change.** The
-WorkerCommand/WorkerEvent protocol (D) is what eliminates the D1 scraping center,
-regardless of whether the backend is tmux or herdr. Herdr becomes the primary backend
-because it has structured lifecycle semantics (`agent prompt/read`) that map more
-cleanly to WorkerCommand/WorkerEvent than tmux's character-level `send-keys`. As Claude
-Code's hook coverage grows, the adapter shrinks and either backend becomes transparent.
-Tmux stays as a fallback backend behind the trait. Native PTY (Option C) is a future
-target once hooks cover enough that the scraper is liveness-only.
+Herdr is preferred because its agent-oriented interface is closer to amux's actual
+abstraction than terminal multiplexing. Compared to tmux, herdr reduces:
+
+- raw subprocess calls (structured agent operations vs. `tmux send-keys`)
+- `send-keys`-style input hacks (no autocomplete/ghost-text/paste-buffer fights)
+- terminal scraping (herdr can report session/process state structurally)
+- prompt/idle heuristics (herdr exposes waiting/blocked/completed state)
+- pane targeting/geometry issues (no detached-window drift)
+- timing-sensitive delivery logic (structured send vs. keystroke injection)
+
+The key insight remains: **terminal backend choice is independent of the protocol
+change.** WorkerCommand/WorkerEvent (D) is what eliminates the D1 scraping center.
+Herdr becomes the default because its structured lifecycle semantics map more cleanly
+to WorkerCommand/WorkerEvent than tmux's character-level I/O.
+
+Where herdr can report session existence, output, waiting/blocked state, completion,
+and lifecycle transitions, those translate directly into typed `WorkerEvent`s. Terminal
+text scraping remains only for provider-specific signals that neither herdr nor hooks
+expose (rate-limit messages, context-low warnings).
+
+The scraping goal is no longer "port all tmux scraping behavior to Rust." Instead:
+
+1. Structured herdr state is primary
+2. Provider hooks are primary where available (Claude Code Stop/UserPromptSubmit)
+3. Terminal output parsing is a fallback adapter
+4. Scraping progressively shrinks toward provider-specific signals and liveness only
+
+tmux stays as a fallback backend behind the `SessionBackend` trait -- useful for
+migration, debugging, and recovery. Native PTY (Option C) is a future target once
+hooks cover enough that the scraper is liveness-only.
 
 ---
 
@@ -1577,10 +1674,11 @@ amux/
           scheduler.rs           # user-facing durable schedules
           periodic.rs            # internal maintenance tasks
         backend/
-          mod.rs                 # SessionBackend trait
-          herdr.rs               # herdr agent backend (primary default)
+          mod.rs                 # SessionBackend trait + BackendKind dispatch
+          herdr.rs               # herdr agent backend (default)
           tmux.rs                # tmux subprocess (fallback)
-          adapter.rs             # terminal output -> WorkerEvent translator
+          native_pty.rs          # native PTY (future/optional)
+          adapter.rs             # terminal output -> WorkerEvent fallback translator
         provider/
           mod.rs                 # provider dispatch
           claude.rs              # Claude Code specifics (hooks, regexes, auth)
@@ -1612,6 +1710,36 @@ amux/
         main.rs                  # clap subcommand tree
 ```
 
+### SessionBackend trait
+
+The backend trait covers the semantic operations amux needs. Higher layers never call
+herdr or tmux directly.
+
+```rust
+#[async_trait]
+trait SessionBackend: Send + Sync {
+    async fn spawn(&self, spec: SessionSpec) -> Result<ProcessRef>;
+    async fn send(&self, session: &ProcessRef, input: BackendInput) -> Result<()>;
+    async fn read(&self, session: &ProcessRef) -> Result<BackendOutput>;
+    async fn interrupt(&self, session: &ProcessRef) -> Result<()>;
+    async fn terminate(&self, session: &ProcessRef) -> Result<()>;
+    async fn status(&self, session: &ProcessRef) -> Result<BackendStatus>;
+    async fn reconcile(&self) -> Result<Vec<BackendSession>>;
+}
+
+enum BackendStatus {
+    Running,
+    Waiting,
+    Completed { exit_code: i32 },
+    Crashed { signal: Option<i32> },
+    NotFound,
+}
+```
+
+`HerdrBackend` translates these to herdr's structured agent operations. `TmuxBackend`
+translates to `tmux new-session`, `send-keys`, `capture-pane`, etc. The orchestrator,
+board, scheduler, and dashboard never know which is running.
+
 ### Key dependencies
 
 | Concern | Crate | Notes |
@@ -1622,7 +1750,7 @@ amux/
 | JSON | `serde` + `serde_json` | derive-based |
 | SSE | `axum::response::sse` | built-in |
 | TLS | `rustls` + `rcgen` | self-signed cert |
-| Subprocess | `tokio::process` | tmux, git, node, browser-use |
+| Subprocess | `tokio::process` | herdr, tmux (fallback), git, node, browser-use |
 | Embed files | `rust-embed` | dashboard baked into binary |
 | CLI | `clap` | subcommand tree |
 | Regex | `regex` | compiled pattern sets for terminal scraping |
@@ -1699,12 +1827,14 @@ harness that will verify every subsequent phase.
 
 1. `amux-core/worker`: Worker struct, WorkerConfig, WorkerCapabilities
 2. `amux-core/orchestrator`: Orchestrator trait, WorkAssignment, Lease
-3. `amux-server/backend/herdr.rs`: SessionBackend impl for herdr (primary)
-4. `amux-server/backend/adapter.rs`: terminal output -> WorkerEvent translator (port
-   ANSI stripping, prompt detection, rate-limit regexes, per-provider patterns)
-5. `amux-server/api/workers.rs`: CRUD, start (202 async), stop, peek, send
-6. `amux-server/orchestrator`: runtime loop, startup reconciliation
-7. SSE: worker state stream
+3. `amux-server/backend/herdr.rs`: SessionBackend impl for herdr (default)
+4. `amux-server/backend/tmux.rs`: SessionBackend impl for tmux (fallback)
+5. `amux-server/backend/adapter.rs`: terminal output -> WorkerEvent fallback
+   translator (ANSI stripping, provider-specific rate-limit regexes). Used only
+   for signals herdr/hooks do not expose structurally.
+6. `amux-server/api/workers.rs`: CRUD, start (202 async), stop, peek, send
+7. `amux-server/orchestrator`: runtime loop, startup reconciliation
+8. SSE: worker state stream
 
 The orchestrator runs from day one, even if its initial behavior is simple (pick up
 next TODO, assign to idle worker). It grows in sophistication over phases.
@@ -1733,10 +1863,15 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Simulation: worker crash mid-issue -- lease reclaimed, issue re-assigned (Invariant 22)
 - proptest: no double-lease for arbitrary event sequences (Invariant 22)
 - proptest: verified implies done occurred previously (Invariant 22)
-- Backend conformance: herdr passes full suite (Invariant 21)
+- Backend conformance: HerdrBackend passes full suite (Invariant 21)
+- Backend conformance: TmuxBackend passes full suite (Invariant 21)
+- Backend conformance: MockBackend passes full suite (Invariant 21)
 - Provider conformance: Claude adapter passes full suite (Invariant 21)
-- Integration: create Claude worker, start, verify tmux session, send text, capture
+- Integration: create Claude worker on herdr (default), start, send text, capture
+- Integration: create Claude worker on tmux (fallback), start, send text, capture
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
+- Integration: switch worker from herdr to tmux, restart -- worker identity, issue
+  ownership, messages, context all preserved (Invariant 33)
 - Integration: SSE delivers worker state within 2s of WorkerEvent
 - Integration: worker status transitions (idle->active->rate_limited->idle) reflected
   in API response within 1s
@@ -1917,7 +2052,11 @@ The user flow acceptance tests built here become the regression suite:
 
 **Playwright golden scenarios (the acceptance criteria)**:
 
-Each scenario runs end-to-end in a real browser. Timing is measured and asserted.
+Each scenario runs end-to-end in a real browser using herdr as the default backend.
+Timing is measured and asserted. At least one complete scenario (the happy path)
+executes identically with `AMUX_BACKEND=herdr` and `AMUX_BACKEND=tmux`, producing
+the same board transitions, WorkerEvents, verification result, and final issue state
+(Invariant 33).
 
 1. **Happy path (per provider: Claude, Gemini, Codex, Ollama)**:
    - User opens dashboard, submits work text to a worker via the UI
@@ -1976,6 +2115,12 @@ Each scenario runs end-to-end in a real browser. Timing is measured and asserted
    - Assign different issues to each
    - All three complete independently
    - **Assert**: each provider's status updates are timely, no cross-provider confusion
+
+9. **Backend interchangeability (Invariant 33)**:
+   - Run the happy path with `AMUX_BACKEND=herdr` (default)
+   - Run the identical happy path with `AMUX_BACKEND=tmux`
+   - **Assert**: same board transitions, same WorkerEvents, same verification result,
+     same final issue state. The backend is invisible above the `SessionBackend` trait.
 
 ### Phase 6: Email, Calendar, CRM (est. 2 weeks)
 
@@ -2084,7 +2229,7 @@ Performance measurement:
 Pipeline stages:
 1. `cargo check` + `clippy` -- compile-time correctness
 2. `cargo test` -- all unit + integration + simulation + proptest tests
-3. Backend conformance suite -- MockBackend + TmuxBackend (Invariant 21)
+3. Backend conformance suite -- MockBackend + HerdrBackend + TmuxBackend (Invariant 21)
 4. Provider conformance suite -- MockProvider + all adapter tests (Invariant 21)
 5. Playwright suite -- all golden scenarios + all UI flows
 6. Performance benchmarks -- compared against baseline, regression = failure
@@ -2123,12 +2268,34 @@ SQLite schema is preserved, so the DB file is directly compatible. But:
 3. **Day 15: cut fallback.** If no rollback needed, stop Python server. Keep binary
    available for 30 days.
 
+#### Backend migration
+
+The Rust rebuild migrates toward herdr as the primary backend:
+
+- herdr is the default for new workers (`BackendKind::Herdr`)
+- Existing tmux-based workers continue on tmux during migration
+- Workers can be individually switched between herdr and tmux via config
+  (`backend: BackendKind::Tmux` override)
+- Backend choice does not require DB/schema changes
+- Backend choice does not change worker identity or issue ownership
+- A worker can restart on a different backend while preserving all durable
+  amux state (Invariant 33)
+
+tmux remains available as rollback/fallback throughout, not as a parallel
+control plane. There is one orchestrator, one WorkerCommand protocol, one
+WorkerEvent protocol, one worker state machine, and one reconciliation system.
+herdr and tmux only translate those primitives to/from their underlying
+process-host mechanisms.
+
 #### Rollback plan
 
 At any point during shadow or swap:
 1. Stop Rust server
 2. Start Python server on 8822
 3. DB is compatible in both directions (no destructive migrations)
+
+Backend rollback: switch any worker from herdr back to tmux by changing its
+`backend` config and restarting. No data migration, no identity change.
 
 #### Cloud deployment
 
@@ -2165,8 +2332,11 @@ tail (parallelizable, saves ~2 weeks). Phases 8-11 are polish, testing, and cuto
 2. **Feature velocity**: amux gains ~2-3 features/week in Python. During the rewrite,
    development must continue. Mitigation: Python stays the dev target until phase 11
    swap; the golden scenario harness catches drift.
-3. **Terminal scraping**: 50+ regexes must be ported and tested. Mitigation: extract
-   test corpus from Python, run as unit tests per provider.
+3. **Terminal scraping residue**: provider-specific rate-limit and state regexes must
+   still be ported for signals herdr/hooks cannot expose structurally. Mitigation:
+   herdr's structured state handles most transitions directly; scraping scope is
+   reduced to provider-specific patterns only. Extract test corpus from Python, run
+   as unit tests per provider.
 4. **SQLite under real concurrency**: Python's GIL accidentally serialized writes. Rust
    exposes latent races. Mitigation: single-writer task, WAL mode, explicit transaction
    boundaries designed in phase 0.
@@ -2215,17 +2385,24 @@ Delta sync (Invariant 14) compounds this: after the initial load, the client rec
 only changed items, not the full board. A single card status change pushes ~200 bytes
 instead of 6.2MB.
 
-### L2: Backend specificity consistency
+### L2: Process-host mechanics must not leak above the backend adapter
 
-Different terminal backends have different command protocols and resolution rules. For
-tmux, the `=` prefix works differently for session vs. pane operations. For herdr,
-agent addressing has its own semantics. This caused backend-specific outages where
-tests passed for one backend but failed silently for another.
+The original tmux outage: the `=` prefix for exact session matching works for
+session-level commands (`has-session`, `kill-session`) but silently fails for
+pane-level commands (`capture-pane`, `send-keys`). Every capture and send-keys
+across 62 sessions was silently failing, and the test suite only verified the
+commands that happened to work.
+
+The lesson is broader than "encapsulate tmux targeting." **Process-host-specific
+mechanics must be confined to a replaceable backend adapter. amux must not depend on
+terminal multiplexer behavior for correctness.** Each backend has its own addressing
+semantics -- tmux pane targets vs. herdr agent references vs. PTY file descriptors
+-- and all of them are implementation details behind `SessionBackend`.
 
 **Rust fix**: the `SessionBackend` trait encapsulates all backend-specific interaction.
-Target/agent resolution is derived once, tested once, used everywhere. No raw
-`subprocess::Command` construction outside the backend module. The test harness
-exercises every command the backend uses, not just the ones that motivated the fix.
+No raw `subprocess::Command` construction outside the backend module. The backend
+conformance suite (Invariant 21) exercises every operation against every backend
+implementation -- not just the ones that motivated the original fix.
 
 ```rust
 impl HerdrBackend {
@@ -2406,7 +2583,8 @@ in the header shows "6 active / 41 idle / 67 stopped" -- three numbers, not one.
 - Flat board -> dependency graph with typed relations
 - String-based scope -> three-tier Global/Group/Worker with deterministic inheritance
 - Terminal scraping as control plane -> WorkerCommand/WorkerEvent protocol with
-  terminal as adapter
+  herdr (default) / tmux (fallback) behind the SessionBackend trait
+- tmux as sole backend -> herdr primary, tmux fallback, native PTY future
 - `done` as final state -> `done` (worker claim) vs `verified` (harness conclusion)
 - 30 Python threads -> single tokio select! loop + spawned tasks
 - Port doc -> system invariant doc with behavioral acceptance tests
