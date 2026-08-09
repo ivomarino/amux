@@ -4327,7 +4327,7 @@ def tmux_target(session: str) -> str:
     (tmux >= 2.1). Same class as cross-session send-keys: a steer aimed at a
     prefix name would TYPE INTO the longer-named session.
     """
-    return "=" + tmux_name(session)
+    return "=" + tmux_name(session) + ":"
 
 
 _tmux_sessions_cache: tuple[float, set[str]] = (0.0, set())
@@ -21287,7 +21287,7 @@ def _attach_log_streaming():
             pass
         try:
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name), "-o",
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name) + ":", "-o",
                  _log_pipe_command(lp)],
                 capture_output=True, timeout=5,
             )
@@ -22396,7 +22396,7 @@ def _capture_log_tail_for_reload(name: str, reason: str) -> bool:
     if is_running(name):
         try:
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name)],
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name) + ":"],
                 capture_output=True, timeout=5,
             )
         except Exception:
@@ -22472,7 +22472,7 @@ def _stop_session_for_restart(name: str, provider: str) -> tuple[bool, str]:
         return stop_session(name)
     try:
         subprocess.run(
-            ["tmux", "pipe-pane", "-t", "=" + tmux_name(name)],
+            ["tmux", "pipe-pane", "-t", "=" + tmux_name(name) + ":"],
             capture_output=True, timeout=5,
         )
     except Exception:
@@ -24494,7 +24494,7 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
             except Exception:
                 pass
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name), "-o",
+                ["tmux", "pipe-pane", "-t", "=" + tmux_name(name) + ":", "-o",
                  _log_pipe_command(lp)],
                 capture_output=True, timeout=5,
             )
