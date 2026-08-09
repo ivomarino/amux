@@ -41,3 +41,4 @@ amux.db-*
 
 # Rust build artifacts
 /target
+/test-results
