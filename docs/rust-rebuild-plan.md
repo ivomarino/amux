@@ -2025,7 +2025,8 @@ struct DurableEvent {
     actor: Actor,
     kind: EventKind,
     entity_id: String,  // task, worker, schedule, etc.
-    payload: Value,
+    payload: EventPayload,
+    causality: Option<EventId>,  // the event that caused this one
 }
 
 enum EventKind {
@@ -2037,10 +2038,18 @@ enum EventKind {
     WorkerMentioned,
     CommandQueued,
     CommandDelivered,
+    CommandSent { text: String, delivery: DeliveryTiming },
     TurnStarted,
     TurnCompleted,
+    ModelRequest { model: ModelId, input_tokens: u64, prompt_hash: Hash },
+    ModelResponse { model: ModelId, output_tokens: u64, duration_ms: u64 },
+    ToolUsed { tool: String, args_hash: Hash, result_hash: Hash, duration_ms: u64 },
+    FileWritten { path: PathBuf, content_hash: Hash, diff_hash: Option<Hash> },
     RateLimitEntered,
     RateLimitCleared,
+    BudgetWarning { model: ModelId, utilization: f32 },
+    BudgetPaused { model: ModelId, spent: f64 },
+    BudgetRaised { model: ModelId, new_limit: BudgetLimit },
     VerificationStarted,
     VerificationFailed,
     TaskVerified,
@@ -2053,15 +2062,73 @@ enum EventKind {
     CircuitOpened,            // Invariant 48 -- fleet halt
     CircuitClosed,            // Invariant 48 -- fleet resumed
     AmendmentProposed,        // Invariant 45 -- agent wants to weaken a hashed clause
+    OrchestratorDecision { decision: String, inputs: Vec<EventId>, rationale: String },
     Extension(String),        // open variant -- plugins and future event kinds
                               // without recompiling amux-core
 }
 ```
 
-This is not event sourcing (current state is still the DB row). It is an append-only
-audit log. It enables: debugging ("why did AR-421 end up here?"), replay (offline
-sync), metrics (tokens per verified task, time-in-state), and the `why-blocked`
-query.
+#### Replay-capable event log
+
+The event log is verbose enough to replay exactly what happened. This is not
+event sourcing (current state is still the DB row), but the log must answer:
+"given the same starting state, what did each actor do, in what order, with
+what inputs, producing what outputs?"
+
+```rust
+enum EventPayload {
+    Inline(Value),             // small payloads stored directly
+    BlobRef {                  // large payloads (model I/O, file diffs)
+        hash: Hash,
+        size: u64,
+        store: BlobStore,      // local SQLite blob, S3, or filesystem
+    },
+}
+
+struct ReplaySegment {
+    worker_id: WorkerId,
+    task_id: Option<TaskId>,
+    events: Vec<DurableEvent>,   // causally ordered
+    start_state: StateSnapshot,  // worker + task state at segment start
+    end_state: StateSnapshot,    // expected state after replay
+}
+```
+
+**What gets captured per turn (the replay contract):**
+
+```
+1. CommandSent        — exact text delivered to the worker
+2. TurnStarted        — with turn_id and context token count
+3. ModelRequest*      — every model call: model, input tokens, prompt hash
+4. ModelResponse*     — every response: output tokens, duration, content hash
+5. ToolUsed*          — every tool call: name, args hash, result hash
+6. FileWritten*       — every file mutation: path, content hash, diff
+7. TurnCompleted      — outcome, tokens consumed, duration
+8. State transitions  — any board/task/gate changes caused by this turn
+```
+
+Items marked `*` repeat per occurrence within a turn. Content hashes let you
+verify replay fidelity without storing full model I/O inline (the blobs are
+in `BlobStore`, retrievable by hash).
+
+**Replay modes:**
+
+- **Audit replay**: read-only, verify that events reproduce the recorded
+  state transitions. No model calls. Answers "did the system behave correctly?"
+- **Debug replay**: step through a worker's turn history interactively.
+  Show what the orchestrator saw, what it decided, what the worker received.
+- **Fork replay**: replay up to event N, then diverge with a different
+  decision. Answers "what would have happened if we'd routed to worker B?"
+
+**Causality chain:** `DurableEvent.causality` links effect to cause. A
+`TaskStarted` points to the `OrchestratorDecision` that assigned it. A
+`GateSatisfied` points to the `ToolUsed` that produced the evidence. Walking
+the chain from any event reconstructs the full decision tree.
+
+**Blob lifecycle:** blobs older than the retention window (default: 30 days)
+are eligible for pruning. Event rows survive pruning — they retain hashes
+for verification but `BlobRef` resolution returns `BlobPruned`. Recent events
+(configurable) always retain blobs for active replay.
 
 ### Invariant 25: Priority and scheduling hints
 
@@ -2244,8 +2311,10 @@ let a worker reply to a steering message and the reply appears in the task activ
 Two separate concepts that share correlation IDs but serve different consumers:
 
 **Structured events** (`DurableEvent`, Invariant 24): machine-readable, typed,
-queryable. The orchestrator, dashboard, and API consume these. They drive state
-transitions, metrics, and the `why-blocked` query.
+queryable, and **replay-capable**. The orchestrator, dashboard, API, and replay
+engine consume these. They drive state transitions, metrics, the `why-blocked`
+query, and full session replay. Every event carries enough detail (typed payloads,
+content hashes, causality links) to reconstruct exactly what happened.
 
 **Logs/output**: human-readable, append-only, unstructured text. Worker terminal
 output, tool call results, error messages, debug traces. Humans read these when
@@ -2260,6 +2329,7 @@ Task AR-421 detail:
   Worker output     — raw terminal capture per turn
   Tool calls        — structured tool events
   Transitions       — board state machine history
+  Replay            — step-through or audit replay of the turn sequence
   Gate evaluations  — gate checks with evidence
   Verification      — criteria + evidence + result
   System events     — orchestrator decisions, lease changes
@@ -8024,6 +8094,32 @@ consistent with their dependencies.
     task shows both views, correlated by turn_id.
   Tests: dual views present and correlated
   Verify: Implementation, Integration tests
+  Status: TODO
+
+- [ ] RR-0111a — Replay-capable event log
+  Phase: 9
+  Depends on: RR-0009, RR-0108, RR-0111
+  Invariant: 24, 30
+  Requirement: DurableEvent captures enough detail to replay exactly what happened.
+    Per-turn capture contract: CommandSent (exact text), TurnStarted (context tokens),
+    ModelRequest/ModelResponse (model, tokens, content hashes), ToolUsed (name, args
+    hash, result hash, duration), FileWritten (path, content hash, diff hash),
+    TurnCompleted (outcome, tokens, duration), plus all state transitions caused.
+    EventPayload is either Inline(Value) for small payloads or BlobRef { hash, size,
+    store } for large ones (model I/O, file diffs). DurableEvent.causality links
+    effect to cause for full decision-tree reconstruction.
+    Three replay modes:
+    1. Audit replay: read-only, verify events reproduce recorded state transitions
+    2. Debug replay: step through worker turn history interactively
+    3. Fork replay: replay to event N, diverge with different decision
+    Blob retention: configurable window (default 30 days), event rows survive pruning
+    with hashes intact but BlobRef resolves to BlobPruned.
+    CLI: `amux replay worker <id> --from <event> --to <event>`,
+    `amux replay task <id> --mode audit|debug|fork`.
+    API: `GET /api/replay/<entity>/<id>?from=&to=&mode=`.
+  Tests: replay produces identical state transitions, causality chain traversal,
+    blob storage/retrieval, pruned blob handling, fork divergence
+  Verify: Implementation, Unit tests, Integration tests, CLI verification, API verification
   Status: TODO
 
 - [ ] RR-0112 — Performance baselines + measurement
