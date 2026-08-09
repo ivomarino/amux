@@ -740,6 +740,41 @@ impl Runtime {
                         .await
                 }
             };
+            // On successful message delivery, advance the MESSAGE's own
+            // delivery state too (Invariant 29: the message is the durable
+            // entity — its state must reflect what actually happened, not
+            // just the command queue's view). Flagged by the Phase 4 agent
+            // as the one gap it could not close from outside runtime.rs.
+            if delivery.is_ok() {
+                if let amux_core::protocol::WorkerCommand::DeliverMessage(msg_id) = &cmd.command {
+                    let mid = msg_id.to_string();
+                    let delivered = serde_json::json!({"state": "delivered", "at": now.to_rfc3339()});
+                    self.store
+                        .write_async(move |conn| {
+                            let n = conn.execute(
+                                "UPDATE _amux_messages SET delivery = ?2
+                                 WHERE id = ?1 AND delivery LIKE '%queued%'",
+                                params![mid, delivered.to_string()],
+                            )?;
+                            Ok(WriteOutcome {
+                                applied: n > 0,
+                                events: if n > 0 {
+                                    vec![PendingEvent {
+                                        entity_type: EntityType::Message,
+                                        entity_id: mid.clone(),
+                                        mutation: MutationKind::StatusChanged {
+                                            from: "queued".into(),
+                                            to: "delivered".into(),
+                                        },
+                                    }]
+                                } else {
+                                    vec![]
+                                },
+                            })
+                        })
+                        .await?;
+                }
+            }
             let t = match delivery {
                 Ok(()) => amux_core::protocol::CommandTransition::Deliver,
                 Err(e) => amux_core::protocol::CommandTransition::Fail {
