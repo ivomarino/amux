@@ -9,6 +9,9 @@ pub mod auth;
 pub mod board;
 pub mod criteria;
 pub mod browser;
+pub mod calendar;
+pub mod crm;
+pub mod email;
 pub mod files;
 pub mod health;
 pub mod memories;
@@ -58,6 +61,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
+        .nest("/api/email", email::routes())
+        .nest("/api/cal-events", calendar::routes())
+        .nest("/api/crm", crm::routes())
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
         .nest("/api/push", crate::push::routes())
@@ -69,6 +75,8 @@ pub fn router(state: AppState) -> Router {
     let app = Router::new()
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
+        // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
+        .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
