@@ -137,24 +137,6 @@ fn ping_payload() -> &'static str {
     })
 }
 
-#[cfg(test)]
-mod ping_tests {
-    #[test]
-    fn ping_carries_the_embedded_app_ver() {
-        let p = super::ping_payload();
-        // The version must be the one inside the EMBEDDED app.js — not a
-        // hardcoded copy that drifts on the next client bump.
-        let f = amux_dashboard::DashboardAssets::get("app.js").unwrap();
-        let s = String::from_utf8_lossy(&f.data).into_owned();
-        let ver = s
-            .split("const APP_VER = '")
-            .nth(1)
-            .and_then(|r| r.split('\'').next())
-            .expect("APP_VER present in embedded app.js");
-        assert_eq!(p, &format!("{{\"type\":\"ping\",\"v\":\"{ver}\"}}"));
-    }
-}
-
 /// Push the legacy full-list events. Returns false when the client is gone.
 async fn push_legacy(
     store: &crate::db::SharedStore,
@@ -264,4 +246,22 @@ where
             rx.recv().await.map(|ev| (Ok(ev), rx))
         },
     ))
+}
+
+#[cfg(test)]
+mod ping_tests {
+    #[test]
+    fn ping_carries_the_embedded_app_ver() {
+        let p = super::ping_payload();
+        // The version must be the one inside the EMBEDDED app.js — not a
+        // hardcoded copy that drifts on the next client bump.
+        let f = amux_dashboard::DashboardAssets::get("app.js").unwrap();
+        let s = String::from_utf8_lossy(&f.data).into_owned();
+        let ver = s
+            .split("const APP_VER = '")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("APP_VER present in embedded app.js");
+        assert_eq!(p, &format!("{{\"type\":\"ping\",\"v\":\"{ver}\"}}"));
+    }
 }

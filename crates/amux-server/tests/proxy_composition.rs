@@ -1,5 +1,5 @@
-//! FULL-composition routing tests for the python-proxy passthroughs
-//! (AMUX-2594 + the /api/fs swallow).
+//! FULL-composition routing tests for the python-proxy boundary
+//! (AMUX-2594 swallow + AMUX-2597 registry).
 //!
 //! Why these exist at the integration level and not only as unit tests: the
 //! nested routers' unit tests build `Router::new().nest(...)` WITHOUT the
@@ -8,18 +8,21 @@
 //! fallback-based proxy passed its unit test while the live server answered
 //! index.html (200 text/html) for /api/groups, /api/browser/state and every
 //! other unrouted API path. That 200-HTML swallow is what broke the SPA's
-//! group picker ("adding a group didn't work": app.js fetches /api/groups,
-//! r.json() threw on HTML, the .catch silently emptied the dropdown) and
-//! what earlier misled an auth probe into reporting an unauthenticated 200
-//! on /api/fs. These tests pin the property that failed: proxied namespaces
-//! must never be answered by the static shell.
+//! group picker ("adding a group didn't work") and what earlier misled an
+//! auth probe into reporting an unauthenticated 200 on /api/fs.
 //!
-//! The Python base URL points at a dead port on purpose: the assertion is
-//! about ROUTING (request reaches the proxy handler, which then answers an
-//! honest 502 naming the unreachable Python), deterministic on any machine —
-//! a live-Python assertion here would pass on the dev box and rot in CI.
+//! Post-AMUX-2597 this file also pins the BOUNDARY itself:
+//! - every family py_proxy::PROXIED_FAMILIES declares actually routes to
+//!   the proxy (honest 502 against a dead python — deterministic anywhere);
+//! - the families that went NATIVE (/api/fs, /api/groups, /api/tags,
+//!   /api/ls) answer WITHOUT the `x-amux-answered-by: python-proxy` stamp,
+//!   so a regression back to proxying (or forward to the SPA shell) fails
+//!   loudly;
+//! - the registry cannot drift from mod.rs: every /api route literal mod.rs
+//!   mounts must be claimed by NATIVE_FAMILIES or PROXIED_FAMILIES (a view
+//!   must share the predicate of the mechanism it describes — ethos rule 1).
 
-use amux_server::api::{router, AppState};
+use amux_server::api::{router, py_proxy, AppState};
 use amux_server::db::Store;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -38,7 +41,7 @@ fn app() -> (axum::Router, tempfile::TempDir) {
     (router(state), dir)
 }
 
-async fn get(app: &axum::Router, path: &str) -> (StatusCode, String, String) {
+async fn get(app: &axum::Router, path: &str) -> (StatusCode, String, String, bool) {
     let res = app
         .clone()
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -51,36 +54,53 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, String, String) {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let proxied = res.headers().get("x-amux-answered-by").is_some();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    (status, ct, String::from_utf8_lossy(&bytes).into_owned())
+    (status, ct, String::from_utf8_lossy(&bytes).into_owned(), proxied)
 }
 
-/// One test fn on purpose: it mutates process env (AMUX_PY_URL), and tests
-/// within a binary share the process.
+/// One test fn on purpose: it mutates process env (AMUX_PY_URL, AMUX_HOME),
+/// and tests within a binary share the process.
 #[tokio::test]
-async fn proxied_namespaces_route_to_python_never_to_the_spa_shell() {
+async fn boundary_routes_proxied_to_python_native_stays_native() {
     // Dead port: bind-then-drop reserves an address nothing serves.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead = format!("http://{}", l.local_addr().unwrap());
     drop(l);
     std::env::set_var("AMUX_PY_URL", &dead);
+    // Hermetic fleet home: /api/groups must not read the developer's real
+    // ~/.amux in a test.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    std::fs::write(
+        home.path().join("sessions/w1.env"),
+        "CC_TAGS=\"alpha, beta\"\n",
+    )
+    .unwrap();
+    std::env::set_var("AMUX_HOME", home.path());
 
     let (app, _dir) = app();
 
-    // Every proxied namespace, including the AMUX-2594 group-picker path and
-    // sub-paths that have no explicit Rust route.
+    // -- PROXIED families (from the registry) reach the proxy: honest 502
+    //    naming the unreachable python, never the static shell.
     for path in [
-        "/api/groups",
-        "/api/groups/mygroup/config",
-        "/api/tags",
-        "/api/tags/mytag",
-        "/api/fs",
-        "/api/fs/list?path=/tmp",
+        // browser driver verbs (Module mount inside api::browser)
         "/api/browser/state?session=x",
         "/api/browser/pw-profiles",
         "/api/browser/screenshot",
+        // session verbs (SessionVerbs mount, rust-worker guard first)
+        "/api/sessions/some-fleet-lane/peek",
+        "/api/sessions/some-fleet-lane",
+        // file viewer + media pipeline (Namespace mount)
+        "/api/file?path=/tmp/x.txt",
+        "/api/file/raw?path=/tmp/x.mp4",
+        "/api/file/prepare?path=/tmp/x.mkv",
+        "/api/file/transcode?path=/tmp/x.avi",
+        "/api/library?path=/tmp",
+        // dictation engine config (Module mount inside api::dictation)
+        "/api/dictation/config",
     ] {
-        let (status, ct, body) = get(&app, path).await;
+        let (status, ct, body, _) = get(&app, path).await;
         assert!(
             !ct.starts_with("text/html"),
             "{path} answered by the static shell: {ct}"
@@ -93,9 +113,81 @@ async fn proxied_namespaces_route_to_python_never_to_the_spa_shell() {
         );
     }
 
+    // -- NATIVE families answer themselves: no proxy stamp, no 502, no
+    //    static shell. /api/fs, /api/groups, /api/tags, /api/ls were
+    //    proxied before AMUX-2597; a reappearing stamp means the boundary
+    //    regressed.
+    let (status, _, body, proxied) = get(&app, "/api/groups").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/groups must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["groups"], serde_json::json!([
+        {"name": "alpha", "workers": 1}, {"name": "beta", "workers": 1}
+    ]));
+
+    let (status, _, body, proxied) = get(&app, "/api/tags").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/tags must be NATIVE");
+
+    let (status, _, body, proxied) = get(&app, "/api/groups/alpha/config").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"name": "alpha", "department": "", "goal": "", "kpis": [], "human_cost": 0})
+    );
+
+    let dirq = home.path().to_str().unwrap().replace('/', "%2F");
+    for path in [
+        format!("/api/fs/list?path={dirq}"),
+        format!("/api/ls?path={dirq}"),
+        format!("/api/fs/search?path={dirq}&q=zzz-not-there"),
+    ] {
+        let (status, _, body, proxied) = get(&app, &path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(!proxied, "{path} must be NATIVE");
+    }
+
+    // Unknown paths in native namespaces: python's generic JSON 404 shape.
+    for path in ["/api/fs", "/api/fs/definitely-not", "/api/tags/mytag", "/api/groups/x/y"] {
+        let (status, ct, body, proxied) = get(&app, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert!(ct.starts_with("application/json"), "{path}: {ct}");
+        assert!(!proxied, "{path}");
+        let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert_eq!(v["error"], "not found", "{path}: {body}");
+    }
+
+    // -- /api/identity: native config-introspection (the SPA's boot call
+    //    404'd on this origin before AMUX-2597). AMUX_HOME is the hermetic
+    //    tempdir (no server.env), so no key is visible; oauth may be true
+    //    on a dev box with a real ~/.claude.json — assert shape + the
+    //    hermetic facts only.
+    let (status, _, body, proxied) = get(&app, "/api/identity").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/identity must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["email"], "");
+    assert_eq!(v["is_cloud"], false);
+    assert_eq!(v["managed_upstream"], false, "no server.env in the hermetic home");
+    assert_eq!(v["key_valid"], Value::Null);
+    for k in ["has_api_key", "has_oauth", "key_error"] {
+        assert!(v.get(k).is_some(), "identity payload missing {k}: {body}");
+    }
+
+    // -- The registry endpoint itself.
+    let (status, _, body, proxied) = get(&app, "/api/debug/boundary").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert!(v["proxied"].as_array().unwrap().len() >= 4, "{body}");
+    assert!(v["native"].as_array().unwrap().len() > 20, "{body}");
+    assert_eq!(v["doc"], "docs/rust-migration/server-boundary.md");
+
     // Unrouted dictation paths answer the module's NATIVE Python-shape 404
     // (never the static shell's generic one, never a proxy attempt).
-    let (status, ct, body) = get(&app, "/api/dictation/bogus").await;
+    let (status, ct, body, _) = get(&app, "/api/dictation/bogus").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(ct.starts_with("application/json"), "{ct}");
     let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
@@ -103,16 +195,71 @@ async fn proxied_namespaces_route_to_python_never_to_the_spa_shell() {
 
     // Unknown API paths outside every nest: static's JSON 404 (Python's
     // generic shape), NOT the SPA shell.
-    let (status, ct, body) = get(&app, "/api/definitely-not-a-route").await;
+    let (status, ct, body, _) = get(&app, "/api/definitely-not-a-route").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(ct.starts_with("application/json"), "{ct}");
     let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
     assert_eq!(v["error"], "not found", "{body}");
 
     // Non-API unknown paths still serve the SPA shell (client routing).
-    let (status, ct, _body) = get(&app, "/some/client/route").await;
+    let (status, ct, _body, _) = get(&app, "/some/client/route").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.starts_with("text/html"), "{ct}");
 
     std::env::remove_var("AMUX_PY_URL");
+    std::env::remove_var("AMUX_HOME");
+}
+
+/// The registry must share the predicate of the mechanism it describes:
+/// every /api route literal mounted in mod.rs maps to a family claimed by
+/// NATIVE_FAMILIES or PROXIED_FAMILIES. Add a mount without a registry row
+/// and this fails; retire a family without pruning the registry and the
+/// stale row is at least visible in the diff of this list.
+#[test]
+fn every_mounted_api_family_is_claimed_by_the_registry() {
+    let src = include_str!("../src/api/mod.rs");
+    let mut mounted: std::collections::BTreeSet<String> = Default::default();
+    for line in src.lines() {
+        let t = line.trim();
+        if !(t.starts_with(".nest(") || t.starts_with(".route(") || t.starts_with(".merge(")) {
+            continue;
+        }
+        if let Some(start) = t.find("\"/api/") {
+            let rest = &t[start + 1..];
+            let path = &rest[..rest.find('"').unwrap_or(rest.len())];
+            // Family root: first two segments ("/api/xxx").
+            let family: String =
+                path.split('/').take(3).collect::<Vec<_>>().join("/");
+            mounted.insert(family);
+        }
+    }
+    assert!(
+        mounted.len() > 20,
+        "source parse broke — found only {mounted:?}"
+    );
+    let native: std::collections::BTreeSet<&str> =
+        py_proxy::NATIVE_FAMILIES.iter().map(|(f, _)| *f).collect();
+    // Proxied families that appear as literals in mod.rs do so only through
+    // family_routes(); mod.rs itself should carry no proxy path literals.
+    for fam in &mounted {
+        let claimed = native.contains(fam.as_str())
+            || native.iter().any(|n| fam.starts_with(*n) && fam[n.len()..].starts_with('.'))
+            || py_proxy::PROXIED_FAMILIES.iter().any(|p| p.family.contains(fam.as_str()));
+        assert!(
+            claimed,
+            "mod.rs mounts {fam} but the boundary registry (py_proxy.rs \
+             NATIVE_FAMILIES / PROXIED_FAMILIES) does not claim it — add the row"
+        );
+    }
+    // And the inverse spot check: no native family claims a proxied prefix.
+    for p in py_proxy::PROXIED_FAMILIES {
+        for (n, _) in py_proxy::NATIVE_FAMILIES {
+            assert!(
+                !p.family.starts_with(*n) || p.family.contains("sessions") || p.family.contains("browser")
+                    || p.family.contains("dictat"),
+                "family {n} is claimed native AND proxied ({})",
+                p.family
+            );
+        }
+    }
 }
