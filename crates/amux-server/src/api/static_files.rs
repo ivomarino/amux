@@ -84,7 +84,16 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
         jstr(&std::env::var("AMUX_USER_EMAIL").unwrap_or_default()),
         jstr(&std::env::var("AMUX_USER_ID").unwrap_or_default()),
         jstr(&ui_token),
-        jstr("sonnet"),
+        // The REAL configured default, not a hardcoded guess — the settings
+        // sweep caught the select showing sonnet after a PATCH (finding #2).
+        jstr(&crate::api::settings::get_default_model(
+            &std::env::var("AMUX_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(".amux")
+                }),
+        )),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Update watcher (serve-time layer, never touching the extracted SPA):
