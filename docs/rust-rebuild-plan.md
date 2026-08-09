@@ -460,6 +460,10 @@ enum WaitingFor {
     Provider { kind: WaitReason },
     ExternalCondition { description: String, check: VerifierKind },
     Capability { needed: Vec<String>, available_workers: Vec<WorkerId> },
+    TreeConflict {      // dirty tree or merge conflict under Shared isolation
+        holder: WorkerId,
+        path: PathBuf,
+    },
 }
 
 // Every non-terminal task resolves to exactly one of these:
@@ -477,7 +481,12 @@ fn disposition(task: &Task, board: &Board) -> TaskDisposition {
 }
 
 // The orchestrator runs this check on every tick:
-fn stall_check(worker: &Worker, board: &Board) -> Vec<StallViolation> {
+fn stall_check(worker: &Worker, board: &Board, fleet: &FleetState) -> Vec<StallViolation> {
+    // Invariant 48: circuit breaker deliberately produces idle workers with
+    // runnable tasks. Stall check is suspended during fleet emergency.
+    if matches!(fleet, FleetState::CircuitOpen { .. } | FleetState::Reconciling) {
+        return vec![];
+    }
     if worker.state != WorkerState::Idle { return vec![]; }
     board.tasks_for_worker(worker.id)
         .filter(|i| matches!(disposition(i, board), TaskDisposition::Runnable))
@@ -878,7 +887,7 @@ These are separate concepts that must never bleed into each other.
 
 ```
 todo -> claimed -> in_progress -> review -> done -> verified
-                                         -> blocked
+                                         -> quarantined
                                          -> discarded
 ```
 
@@ -1147,11 +1156,12 @@ behavior, scheduling behavior, or observable API semantics.
 // All of WorkerConfig is mutable configuration, not identity (Invariant 43).
 struct WorkerConfig {
     cwd: PathBuf,
-    provider: Provider,
+    provider: ProviderId,
     model: Option<ModelId>,
     backend: BackendKind,  // default: Herdr
     environment: ScopedEnv,
     permissions: Permissions,
+    isolation: IsolationPolicy,  // default: Shared
     // Changing any field is valid. Some changes require session restart.
     // Everything above the SessionBackend/AgentProtocol traits is unchanged.
 }
@@ -1159,7 +1169,29 @@ struct WorkerConfig {
 // BackendId is a string, not a closed enum (see Invariant 8).
 // Built-in backends: "herdr" (default), "tmux" (fallback), "native-pty" (future).
 // New backends register via the BackendRegistry trait without recompiling amux-core.
+
+enum IsolationPolicy {
+    Shared,                         // default -- workers share a single checkout
+    Worktree { base: PathBuf },     // git worktree per worker
+    Container { image: String },    // container per worker (future)
+}
 ```
+
+Scoped like everything else (Org/Global/Group/Worker via Invariant 2).
+
+**Shared isolation caveat (Invariant 28 interaction):** under `IsolationPolicy::Shared`,
+`cargo test` exit codes are evidence about the shared tree, not about any individual
+worker's change. Acceptance criteria that need per-worker attribution of test results
+(e.g., "this worker's change did not break the build") must declare
+`IsolationPolicy::Worktree`. Under `Shared`, a dirty tree or merge conflict is
+`WaitingFor::TreeConflict { holder, path }` -- a structured wait reason, not
+`StallReason::ProcessDown`.
+
+**Invariant 49 interaction:** under `Shared`, `AttemptRecord.failure_reason` may
+reflect another worker's breakage. The failure-feeds-forward context becomes
+actively misleading if the tree state is not attributed. When `isolation == Shared`,
+the attempt record must include the tree's `git status` at failure time so the next
+attempt can distinguish "my code broke" from "the tree was dirty when I started."
 
 The layering:
 
@@ -1661,7 +1693,7 @@ unreliable); `ignored_fields` carried in the response body but never read.
 ```rust
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]  // unknown fields are errors, not silent drops
-struct IssuePatch {
+struct TaskPatch {
     status: Option<Status>,
     desc: Option<String>,
     // ...
@@ -2579,7 +2611,7 @@ Not just "PATCH /api/board worked."
 Complex components define legal states and transitions:
 
 ```typescript
-type IssueModalState =
+type TaskModalState =
     | "closed"
     | "viewing"
     | "editing"
@@ -2621,7 +2653,7 @@ Every E2E step automatically captures:
 {
     "interaction_id": "int_92871",
     "test_id": "board_move_with_gate",
-    "component": "IssueCard",
+    "component": "TaskCard",
     "action": "press_enter",
     "target": "task-title-input",
     "entity": "AR-421",
@@ -2723,8 +2755,8 @@ server restart mid-modal, worker disappears while menu open
 ```
 Component                   Actions    Covered
 -----------------------------------------------
-IssueCard                   12/12      100%
-IssueMenu                    8/8       100%
+TaskCard                   12/12      100%
+TaskMenu                    8/8       100%
 WorkerCard                  14/14      100%
 WorkerSettings              21/21      100%
 GateModal                    9/9       100%
@@ -2853,10 +2885,10 @@ it is reversible by amending the policy table and reopening the affected items.
 creates a structured checklist entry, carries a `RetrySchedule` with a
 machine-checkable condition, and continues all unrelated runnable items. When
 `max_age` expires without resolution, the blocker becomes `Quarantined` (see
-Invariant 47). If the checklist reaches a state where EVERY remaining item is
-blocked, that is a distinct terminal failure -- the orchestrator writes a diagnostic
-report covering every blocker's evidence, attempted resolutions, and remaining
-independent work, then enters a low-power reconciliation loop (Invariant 48).
+Invariant 47). If the checklist reaches a state where EVERY remaining item is blocked, the
+circuit opens with `CircuitOpenReason::AllItemsBlocked` (Invariant 48 owns this
+event and the subsequent reconciliation loop -- see Invariant 48 for the full
+protocol).
 
 A single blocked integration must never halt the entire rebuild.
 
@@ -2877,10 +2909,10 @@ behavior.
 | Enum variant ordering (no natural order) | Alphabetical | Deterministic, diffable | Yes |
 | Missing foreign key (implicit relationship in Python) | Add FK with `ON DELETE SET NULL` | Preserves referential integrity without cascade risk | Yes |
 | Ambiguous NULL semantics (Python uses empty string and NULL interchangeably) | Normalize to `Option<T>` with NULL | Explicit, queryable | Yes |
-| Event kind classification (Python log line doesn't map cleanly to EventKind) | `EventKind::Legacy { raw }` | Preserves original; reclassify later | Yes |
+| Event kind classification (Python log line doesn't map cleanly to EventKind) | `EventKind::Extension(raw)` | Preserves original; reclassify later | Yes |
 | Provider-specific behavior (Python has provider-specific codepath) | Abstract behind trait; if unclear, Claude-first | Most-tested provider | Yes |
 | Config key conflict (Python has conflicting keys at different scopes) | Worker scope wins (most specific) | Matches existing resolver behavior | Yes |
-| Test flakiness (test passes 90% of the time) | Mark `#[flaky]`, quarantine after 3 consecutive failures | Doesn't block progress; doesn't hide real failures | Yes |
+| Test flakiness (test passes 90% of the time) | Mark `#[flaky]`, quarantine after 3 consecutive failures; quarantine creates a task linked to the test's `INV-xxx` tag; linked invariant cannot reach `VERIFIED` while test is quarantined | Doesn't block progress; doesn't hide real failures | Yes |
 | API response shape ambiguity (Python returns inconsistent shapes) | Union type with discriminator field | Backwards compatible; clients handle both | Yes |
 | Scope of a feature (unclear if global or group-scoped) | Group-scoped | Narrower default; widening is safe, narrowing breaks | Yes |
 
@@ -3024,7 +3056,7 @@ toast -> authoritative state).
 **Network/result-state discovery.** The same action can produce multiple legitimate
 result states. For mutation actions, explore applicable outcomes via deterministic
 fault injection: success, validation failure, 401/403, 404, 409 conflict/gate, 429,
-500, timeout, offline, server restart. Thus `IssueCard -> Move -> Review` may have
+500, timeout, offline, server restart. Thus `TaskCard -> Move -> Review` may have
 edges to: success (Review column), 409 (Gate modal), offline (queued), 500 (error
 toast + original state). All are separate UX paths requiring coverage.
 
@@ -3189,6 +3221,31 @@ enum CircuitOpenReason {
 }
 ```
 
+**Interaction with Invariant 10 (no-stall guarantee):** `FleetState::CircuitOpen`
+and `FleetState::Reconciling` **suspend `stall_check`**. The circuit breaker
+deliberately produces idle workers with runnable tasks -- that is its job. Without
+this suspension, the correct emergency behavior (halt assignments) trips the
+cardinal acceptance criterion (idle worker + runnable tasks = system failure),
+and the agent must resolve the contradiction by either ignoring the circuit
+breaker or ignoring the stall check. Neither is correct.
+
+```rust
+fn stall_check(worker: &Worker, board: &Board, fleet: &FleetState) -> Vec<StallViolation> {
+    if matches!(fleet, FleetState::CircuitOpen { .. } | FleetState::Reconciling) {
+        return vec![];  // stall check suspended during fleet emergency
+    }
+    // ... normal stall detection (Invariant 10)
+}
+```
+
+**Interaction with Invariant 45 (autonomous execution):** Inv 45's "every
+remaining item blocked -> terminal failure report" and Inv 48's
+`CircuitOpenReason::AllItemsBlocked` describe the same event. The owner is
+Invariant 48 (this section). When all items are blocked, the circuit opens
+with `AllItemsBlocked`, which triggers the diagnostic report and reconciliation
+loop described below. Invariant 45's agent loop enters the reconciliation
+state rather than independently producing its own terminal failure report.
+
 When the circuit opens:
 1. The orchestrator halts new assignments.
 2. Writes a diagnostic report: every in-progress task, every blocker, every
@@ -3253,8 +3310,25 @@ struct Criterion {
 
 Rules:
 1. A task cannot leave `todo` without at least one `Criterion`.
-2. `AcceptanceCriteria.authored_by` must differ from the task's executor
-   `WorkerId`. Self-authored criteria are structurally rejected.
+2. `AcceptanceCriteria.authored_by` must differ from the task's executor.
+   Self-authored criteria are structurally rejected. `authored_by` is
+   `CriteriaAuthor`, not `WorkerId`:
+
+   ```rust
+   enum CriteriaAuthor {
+       Worker(WorkerId),     // a different worker wrote these
+       Document,             // pre-authored by this plan document
+   }
+   ```
+
+   **Bootstrap rule**: RR checklist items' acceptance criteria are
+   pre-authored by this document (`authored_by: CriteriaAuthor::Document`),
+   which satisfies the separation requirement by construction. The criteria
+   are the `Requirement` and `Tests` fields of each RR item. Invariant 50's
+   `CriteriaReviewer` role applies only to tasks the agent creates at
+   runtime -- decompositions (Invariant 47), discovered items (Invariant 46),
+   and auto-captured prompts.
+
 3. Post-start criteria edits are a distinct audited transition
    (`EventKind::CriteriaAmended`) that resets verification status to
    `needs_reverification`. The executor sees the amendment on their next
@@ -3264,6 +3338,11 @@ Rules:
    before the executor starts, not after they finish. Under-specified =
    no `VerifierKind`, or verifier is `Manual` when a `Deterministic`
    check exists, or criterion is not falsifiable ("works correctly").
+5. **Reviewer round cap**: the `CriteriaReviewer` may reject criteria at
+   most 3 times per task. On the third rejection, the criteria are accepted
+   with a `PolicyDecisionMade` event recording the reviewer's objections
+   and a `review_rounds_exhausted: true` flag. This prevents an unbounded
+   reject loop (Invariant 47 limits the executor; this limits the reviewer).
 
 ### Invariant 51: Decomposition depth cap
 
@@ -3273,7 +3352,7 @@ unbounded work generator. Cap it:
 
 ```rust
 const MAX_DECOMPOSITION_DEPTH: u32 = 3;
-const MAX_CHILDREN_PER_ISSUE: u32 = 10;
+const MAX_CHILDREN_PER_TASK: u32 = 10;
 const MAX_DISCOVERED_ITEMS_PER_RUN: u32 = 50;
 ```
 
@@ -3323,7 +3402,8 @@ enum ActionClass {
     SendEmail,
     ExternalApiWrite { service: String },
     DeleteData { scope: Scope },
-    SpendMoney { currency: String },
+    // SpendMoney removed -- token spend is a continuous metered resource governed
+    // by FleetCircuitBreaker.window_budget (Invariant 48), not a discrete action.
     CreateWorker,
     ModifySchedule,
     DatabaseMigration,
@@ -3343,10 +3423,46 @@ The `DeploymentProfile` selects the default policy. Per-action overrides are
 loaded from `~/.amux/capability-policy.toml`. This is also the mechanism that
 distinguishes personal/cloud/concierge deployments -- one construct, two jobs.
 
-Irreversible actions (`SendEmail`, `GitPush`, `DeleteData`, `SpendMoney`) get
-`DryRunFirst` by default: the agent executes the action in dry-run mode,
-records the evidence (what would happen), and then executes for real. No
-approval gate, but a mandatory evidence trail.
+**Enforcement chokepoint**: every `ActionClass` invocation routes through
+`CapabilityPolicy::check(action, context) -> CapabilityVerdict` before
+execution. This is a single function, not per-call-site checks. Any action
+site that bypasses `policy.check()` is a CI failure -- the `#[must_use]`
+return type and a lint pass that greps for unguarded action invocations
+enforce this structurally. Unrouted action sites fail CI the way untested
+`data-testid`s do (Invariant 44).
+
+```rust
+enum CapabilityVerdict {
+    Proceed,
+    DryRunFirst { dry_run_fn: DryRunFn },
+    RateLimited { retry_after: Duration },
+    Denied { reason: String },
+}
+```
+
+**`DryRunFirst` definitions per action class:**
+
+| ActionClass | DryRun behavior |
+|---|---|
+| `GitPush` | `git push --dry-run` -- records refs that would update |
+| `SendEmail` | Render message to `DurableEvent`, no SMTP delivery |
+| `ExternalApiWrite` | Log request body + endpoint, no HTTP call |
+| `DeleteData` | List affected rows/keys, no deletion |
+| `SpendMoney` | N/A -- see below |
+| `DatabaseMigration` | Run against in-memory DB clone, diff schema |
+
+**`SpendMoney` unification with Invariant 48:** `SpendMoney` as an `ActionClass`
+and `window_budget` in `FleetCircuitBreaker` are two spend controls -- an
+Invariant 36 violation. Resolution: `SpendMoney` is removed from `ActionClass`.
+Token spend is governed solely by `FleetCircuitBreaker.window_budget` (Invariant
+48), which is the fleet-level mechanism. `ActionClass` governs discrete
+side-effecting actions; token spend is a continuous metered resource, not a
+discrete action.
+
+Irreversible actions (`SendEmail`, `GitPush`, `DeleteData`) get `DryRunFirst`
+by default: the agent executes the dry-run variant, records the evidence as a
+`DurableEvent`, and then executes for real. No approval gate, but a mandatory
+evidence trail.
 
 ### Invariant 53: Terminology is opt-in and backward-compatible
 
@@ -3394,8 +3510,12 @@ the same value. A pref (`api_field_style`: `"modern"` | `"legacy"` |
 - `"modern"`: `{"worker": "wrk-1", ...}` (no `session` field)
 - `"legacy"`: `{"session": "wrk-1", ...}` (no `worker` field)
 
-Request bodies accept either field name. If both are present,
-`worker` wins and `session` is ignored with a warning in the response.
+Request bodies accept either field name. Conflict resolution (Invariant 37
+compliance -- silently dropping a field is forbidden):
+- Both present and **equal**: accept (either field satisfies the request).
+- Both present and **different**: return 400 with both values in the error
+  body. Never silently pick a winner -- that is the exact dropped-field
+  behavior Invariant 37 exists to forbid.
 
 **CLI commands**: `amux session` and `amux worker` are both valid.
 `amux issue` and `amux task` are both valid. Tab completion shows both.
@@ -3413,6 +3533,13 @@ classes use the new names only; the pref only affects rendered text.
 `legacy_kind` field when `api_field_style != "modern"`:
 `{"kind": "TaskCreated", "legacy_kind": "IssueCreated", ...}`.
 Consumers filtering on the old string still match.
+
+`legacy_kind` is generated from a single exhaustive mapping table
+(`LEGACY_EVENT_NAMES: &[(EventKind, &str)]`), not from per-variant ad-hoc
+strings. CI checks that every `EventKind` variant (except `Extension(_)`)
+has exactly one entry in this table. An `EventKind` variant with no legacy
+name is a CI failure, not a silent omission -- consumers would miss the
+event entirely.
 
 **Migration**: the Python -> Rust migration reads old field/table
 names and writes new ones. No consumer-side migration is required
@@ -3584,7 +3711,7 @@ struct WorkerCapabilities {
     browser: bool,
     filesystem: FsScope,
     integrations: HashSet<Integration>,
-    provider: Provider,
+    provider: ProviderId,   // open string, not closed enum (Invariant 8)
 }
 
 struct WorkRequirements {
@@ -3726,7 +3853,7 @@ amux/
           mod.rs                 # Orchestrator trait, WorkAssignment, Lease
           matching.rs            # capability matching
         verification.rs          # Verification, Criterion, Evidence
-        provider.rs              # Provider enum (Claude/Gemini/Codex/Ollama)
+        provider.rs              # ProviderId(String), ProviderConfig, ProviderRegistry
 
     amux-server/                 # the binary -- HTTP, DB, runtime
       src/
@@ -3927,32 +4054,7 @@ With 30+ jobs + HTTP + SSE + workers, SQLite needs explicit design:
 **Goal**: binary that starts, serves the dashboard, manages the DB, AND the test
 harness that will verify every subsequent phase.
 
-1. Scaffold workspace, crate structure
-2. `amux-core`: Scope, Worker, Task, BoardTransition, WorkerCommand/Event,
-   Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
-   system's vocabulary. Every entity type carries a `version: u64` field.
-3. `amux-server/db`: all tables as SQL migrations (count from schema discovery), WAL mode, single-writer task
-4. `amux-server/config`: four-tier config loading (org/global/group/worker), `server.env`
-5. `amux-server/api`: axum router, static file embedding, `/health`, auth,
-   `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
-6. TLS setup with self-signed cert
-7. **Golden scenario test harness** (Playwright-based): end-to-end scenario tests
-   that will run against every phase. Start with:
-   - Server starts, dashboard loads, health returns 200
-   - Auth rejects bad token, accepts good token
-8. **UI interaction coverage infrastructure** (Invariant 44):
-   - `data-testid` on every interactive element from day one
-   - Interaction contract registry (machine-readable component capabilities)
-   - DOM inventory crawler: discovers all `data-testid` elements across
-     reachable UI states, diffs against registry, fails on uncovered controls
-   - Fault injection hooks (`#[cfg(test)]` only)
-9. **UX discovery harness** (Invariant 46):
-   - Automated UX interaction graph crawler (BFS, semantic state hashing)
-   - Interactive control detection (buttons, links, inputs, roles, draggable, etc.)
-   - Seed state fixtures (empty, populated, migrated, per-worker-state, per-task-state)
-   - Crawler self-test (fixture pages with intentionally hidden/nested controls)
-   - Generated artifacts: `interaction-graph.json`, `interaction-coverage.json`
-10. **OpenCode provider spike** (week 1, before any other provider work):
+1. **OpenCode provider spike** (week 1 -- gates everything else):
    - Connect to each of the four providers (Claude Code, Gemini CLI, Codex CLI,
      Ollama) via OpenCode's structured agent protocol.
    - For each provider, verify: session start, prompt delivery, event streaming
@@ -3976,6 +4078,34 @@ harness that will verify every subsequent phase.
      check" to "scrapers demoted for providers with OpenCode coverage, primary for
      providers without."
    - This spike determines the architecture's viability by week 1, not week 24.
+   - **Gate**: the coverage matrix must be committed as `docs/provider-coverage.csv`
+     (RR-0028e) before Phase 1 begins. The written-branch decision is a checklist
+     item with its own RR ID so the agent cannot skip it.
+2. Scaffold workspace, crate structure
+3. `amux-core`: Scope, Worker, Task, BoardTransition, WorkerCommand/Event,
+   ProviderId, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
+   system's vocabulary. Every entity type carries a `version: u64` field.
+4. `amux-server/db`: all tables as SQL migrations (count from schema discovery), WAL mode, single-writer task
+5. `amux-server/config`: four-tier config loading (org/global/group/worker), `server.env`
+6. `amux-server/api`: axum router, static file embedding, `/health`, auth,
+   `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
+7. TLS setup with self-signed cert
+8. **Golden scenario test harness** (Playwright-based): end-to-end scenario tests
+   that will run against every phase. Start with:
+   - Server starts, dashboard loads, health returns 200
+   - Auth rejects bad token, accepts good token
+9. **UI interaction coverage infrastructure** (Invariant 44):
+   - `data-testid` on every interactive element from day one
+   - Interaction contract registry (machine-readable component capabilities)
+   - DOM inventory crawler: discovers all `data-testid` elements across
+     reachable UI states, diffs against registry, fails on uncovered controls
+   - Fault injection hooks (`#[cfg(test)]` only)
+10. **UX discovery harness** (Invariant 46):
+   - Automated UX interaction graph crawler (BFS, semantic state hashing)
+   - Interactive control detection (buttons, links, inputs, roles, draggable, etc.)
+   - Seed state fixtures (empty, populated, migrated, per-worker-state, per-task-state)
+   - Crawler self-test (fixture pages with intentionally hidden/nested controls)
+   - Generated artifacts: `interaction-graph.json`, `interaction-coverage.json`
 
 **Test plan**:
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
@@ -3996,6 +4126,16 @@ harness that will verify every subsequent phase.
 - Unit: response field aliasing -- api_field_style=both emits both session+worker,
   modern omits session, legacy omits worker (Invariant 53)
 - Unit: request body accepts `session` as alias for `worker` field (Invariant 53)
+- Unit: request body with both `worker` and `session` present and equal -> accepted (Invariant 53 + 37)
+- Unit: request body with both `worker` and `session` present and different -> 400 (Invariant 53 + 37)
+- Unit: `legacy_kind` mapping table covers every `EventKind` variant except `Extension` (Invariant 53)
+- Unit: `stall_check` returns empty during `FleetState::CircuitOpen` (Invariant 10 + 48)
+- Unit: `stall_check` returns empty during `FleetState::Reconciling` (Invariant 10 + 48)
+- Unit: `CriteriaAuthor::Document` satisfies authorship separation for RR items (Invariant 50)
+- Unit: `CriteriaReviewer` review rounds capped at 3 with `PolicyDecisionMade` (Invariant 50)
+- Unit: `DocCodeDivergence::WeakeningProposed` is a CI failure, not a resolution (Invariant 45)
+- Unit: `CapabilityPolicy::check` is called before every `ActionClass` invocation (Invariant 52)
+- Unit: `IsolationPolicy::Shared` produces `WaitingFor::TreeConflict` on dirty tree (Invariant 10 + 33)
 - Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
 - Unit: backpressure -- bounded channels reject/drop correctly at capacity (Invariant 26)
 - Unit: `ContextFragment` priority ordering is deterministic (Invariant 16)
@@ -4835,23 +4975,64 @@ cutover, that is a bug -- the information should have been expressed in code.
 
 Invariant 45 says reopen stale `VERIFIED` markers if tests fail. This extends
 to the document itself: if the implementation diverges from a stated invariant,
-the agent must either fix the code OR amend the document with a recorded
-rationale. Silent disagreement between doc and code is the failure mode this
-rule exists to prevent.
+the agent must either fix the code OR propose an amendment. Silent disagreement
+between doc and code is the failure mode this rule exists to prevent.
+
+#### Normative clause protection
+
+The invariant list and each invariant's **normative clauses** (MUST/MUST NOT
+statements, enum definitions with exhaustive match requirements, struct field
+constraints, state machine transitions, and acceptance criteria) are
+content-hashed at Phase 0 and committed as `docs/invariant-hashes.json`. Any
+change to a hashed clause is classified as either a **clarification** or a
+**weakening**:
+
+- **Clarification** (agent may apply): adds specificity, narrows ambiguity,
+  fixes an inconsistency, corrects a stale cross-reference. The hash updates
+  in the same commit. CI verifies the new hash matches the new content.
+- **Weakening** (agent may NOT apply): removes a required condition, converts
+  MUST to SHOULD, widens a terminal state, raises a limit, removes a test
+  obligation, deletes an invariant or normative clause.
+
+A weakening is a `PolicyDecision { reversible: false }` and **fails CI rather
+than resolving the `Disagreement`**. The agent records the proposed amendment
+in `docs/proposed-amendments.md` with the invariant ID, the current clause,
+the proposed replacement, and a rationale. It then continues with other
+runnable work. Only a human can accept a weakening by updating the hash file.
 
 ```rust
 enum DocCodeDivergence {
     CodeMatchesDoc,
-    DocAmended { invariant: InvariantId, rationale: String, event: EventId },
+    DocClarified {
+        invariant: InvariantId,
+        clause: String,
+        rationale: String,
+        old_hash: String,
+        new_hash: String,
+    },
     CodeFixed { invariant: InvariantId, commit: String },
-    Disagreement { invariant: InvariantId },  // this state is a CI failure
+    WeakeningProposed {       // agent cannot resolve this -- human review required
+        invariant: InvariantId,
+        proposal_file: PathBuf,  // docs/proposed-amendments.md
+    },
+    Disagreement { invariant: InvariantId },  // CI failure
 }
 ```
 
 CI check: for every `INV-xxx` tag in code, the corresponding invariant section
 in this document must not contradict the implementation. For every invariant in
 this document, at least one `INV-xxx` tag must exist in code. Any
-`Disagreement` is a blocking CI failure.
+`Disagreement` is a blocking CI failure. Any `WeakeningProposed` is also a
+blocking CI failure (it is not a resolution, it is a request).
+
+#### `#[flaky]` quarantine and invariant linkage
+
+A test quarantined after 3 consecutive failures (see policy defaults table) is
+a silently weakened invariant at the test level. Quarantine MUST create a task
+linked to the test's `INV-xxx` tag. The linked invariant cannot reach
+`VERIFIED` status while any of its tests are quarantined. This prevents
+quarantine from becoming a mechanism that quietly removes verification
+obligations.
 
 ### Known inconsistencies (fixed)
 
@@ -6050,7 +6231,7 @@ consistent with their dependencies.
   Phase: 0
   Depends on: RR-0001
   Invariant: 8, 20
-  Requirement: Provider enum (ClaudeCode, Gemini, Codex, Ollama). ProviderUsage with
+  Requirement: ProviderId(String) -- open, not a closed enum (Invariant 8). ProviderUsage with
     multiple UsageWindows (PerMinute/PerHour/Rolling/Daily/Weekly/Monthly/BillingPeriod/
     SubscriptionAllowance). All fields Optional. UsageConfidence enum. ProviderCapabilities
     struct. UsageProvenance enum (Api/ProviderCli/StructuredRuntime/HttpHeaders/
@@ -6383,35 +6564,84 @@ consistent with their dependencies.
 - [ ] RR-0028g — Core types: CapabilityPolicy, DeploymentProfile, ActionClass
   Phase: 0
   Depends on: RR-0001
-  Invariant: 52
+  Invariant: 52, 36
   Requirement: Capability policy types. DeploymentProfile enum (Personal, Cloud,
-    Concierge). ActionClass enum. CapabilityConstraint enum (Allowed, RateLimited,
-    DryRunFirst, SandboxOnly, RequiresEvidence, Denied). Policy loaded from
-    capability-policy.toml at startup.
-  Tests: policy loading, constraint evaluation, dry-run evidence recording
+    Concierge). ActionClass enum (SpendMoney removed -- token spend governed by
+    FleetCircuitBreaker.window_budget per Inv 48, not a discrete action).
+    CapabilityConstraint enum (Allowed, RateLimited, DryRunFirst, SandboxOnly,
+    RequiresEvidence, Denied). CapabilityVerdict enum (Proceed, DryRunFirst,
+    RateLimited, Denied). Policy loaded from capability-policy.toml at startup.
+    Single enforcement chokepoint: CapabilityPolicy::check(action, context) called
+    before every ActionClass invocation. Unrouted action sites fail CI.
+    DryRunFirst defined per action class: GitPush -> --dry-run, SendEmail ->
+    render to DurableEvent, ExternalApiWrite -> log without HTTP, DeleteData ->
+    list affected rows, DatabaseMigration -> in-memory DB clone.
+  Tests: policy loading, constraint evaluation, dry-run evidence recording,
+    unrouted action site detection, every ActionClass has a DryRunFirst definition
   Verify: Implementation, Unit tests
   Status: TODO
 
 - [ ] RR-0028h — Core types: FleetCircuitBreaker, FleetState, PolicyDecision
   Phase: 0
   Depends on: RR-0001
-  Invariant: 48, 45
+  Invariant: 48, 45, 10
   Requirement: Fleet-level circuit breaker types. FleetState enum (Normal,
-    CircuitOpen, Reconciling). CircuitOpenReason enum. PolicyDecision struct
-    (decision, chosen, rationale, reversible). Policy defaults table as a
-    loadable config.
-  Tests: circuit breaker state transitions, policy decision recording
+    CircuitOpen, Reconciling). CircuitOpenReason enum (including AllItemsBlocked --
+    the single owner of the "every item blocked" terminal event, shared with Inv 45).
+    PolicyDecision struct (decision, chosen, rationale, reversible). Policy defaults
+    table as a loadable config. stall_check accepts FleetState and returns empty
+    during CircuitOpen/Reconciling (Inv 10+48 interaction).
+  Tests: circuit breaker state transitions, policy decision recording,
+    stall_check suspended during CircuitOpen, stall_check suspended during Reconciling
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0028i — Core types: AcceptanceCriteria, Criterion, CriterionId
+- [ ] RR-0028i — Core types: AcceptanceCriteria, Criterion, CriterionId, CriteriaAuthor
   Phase: 0
   Depends on: RR-0001
   Invariant: 50
   Requirement: Acceptance criteria types. AcceptanceCriteria (criteria vec,
-    authored_by WorkerId, version). Criterion (id, description, VerifierKind,
-    required flag). Structural enforcement: authored_by != executor WorkerId.
-  Tests: authorship separation enforced, criteria amendment versioning
+    authored_by CriteriaAuthor, version). CriteriaAuthor enum (Worker(WorkerId),
+    Document). Criterion (id, description, VerifierKind, required flag).
+    Structural enforcement: CriteriaAuthor::Worker(id) != executor WorkerId.
+    CriteriaAuthor::Document pre-authors RR checklist items (bootstrap rule).
+    CriteriaReviewer round cap: max 3 rejections per task, then
+    PolicyDecisionMade with review_rounds_exhausted flag.
+  Tests: authorship separation enforced, Document author satisfies separation,
+    reviewer round cap produces PolicyDecisionMade, criteria amendment versioning
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028j — Invariant hash infrastructure (normative clause protection)
+  Phase: 0
+  Depends on: RR-0001
+  Invariant: 45
+  Requirement: Generate docs/invariant-hashes.json at Phase 0 containing
+    content hashes of every invariant's normative clauses. CI check:
+    DocCodeDivergence classification (CodeMatchesDoc, DocClarified,
+    WeakeningProposed, Disagreement). WeakeningProposed and Disagreement
+    are CI failures. Agent may apply DocClarified (hash updates in same
+    commit). Agent may NOT apply weakenings -- records proposed amendment
+    in docs/proposed-amendments.md. Flaky test quarantine creates task
+    linked to INV-xxx; linked invariant cannot reach VERIFIED while
+    quarantined.
+  Tests: hash generation covers all invariants, clarification updates hash,
+    weakening detected and blocked, quarantine-invariant linkage enforced
+  Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028k — Core types: IsolationPolicy, WaitingFor::TreeConflict
+  Phase: 0
+  Depends on: RR-0001, RR-0003
+  Invariant: 33, 10, 49
+  Requirement: IsolationPolicy enum (Shared, Worktree, Container). Scoped
+    via Invariant 2. WaitingFor::TreeConflict { holder: WorkerId, path }.
+    Under Shared, cargo test exit code is tree-level not worker-level
+    evidence. AttemptRecord under Shared includes git status at failure
+    time. Acceptance criteria needing per-worker attribution must declare
+    Worktree.
+  Tests: TreeConflict is a structured wait not a stall, Shared isolation
+    records tree status in AttemptRecord
   Verify: Implementation, Unit tests
   Status: TODO
 
@@ -6699,7 +6929,7 @@ consistent with their dependencies.
   Depends on: RR-0048a
   Invariant: 51
   Requirement: decomposition_depth tracked. MAX_DECOMPOSITION_DEPTH=3,
-    MAX_CHILDREN_PER_ISSUE=10, MAX_DISCOVERED_ITEMS_PER_RUN=50. At max depth,
+    MAX_CHILDREN_PER_TASK=10, MAX_DISCOVERED_ITEMS_PER_RUN=50. At max depth,
     exhaustion -> Quarantined. Discovered items link to VERIFIED-gated parent.
   Tests: depth 4 rejected, child count capped, discovered items linked to parent,
     per-run cap reported
@@ -7296,7 +7526,11 @@ consistent with their dependencies.
   Tests: legacy route returns same response as canonical route + Deprecated header,
     api_field_style=legacy omits new fields, api_field_style=modern omits old fields,
     api_field_style=both includes both, CLI alias resolution, dashboard pref toggle,
-    SSE legacy_kind present when configured, request body accepts either field name
+    SSE legacy_kind present when configured, legacy_kind mapping table exhaustive
+    (CI: every EventKind variant except Extension has an entry),
+    request body accepts either field name,
+    request body with both fields equal -> accepted,
+    request body with both fields different -> 400 (Invariant 37 compliance)
   Verify: Implementation, Browser verification, CLI verification, Integration tests
   Status: TODO
 
@@ -7895,7 +8129,7 @@ consistent with their dependencies.
       `DateTime<Utc>` with correct conversion
     - Python `actor`/`session` fields -> Rust `Actor` enum + `WorkerId`
     - Event types/kinds mapped to `EventKind` enum variants
-    - Events that cannot be cleanly typed preserved as `EventKind::Legacy { raw: String }`
+    - Events that cannot be cleanly typed preserved as `EventKind::Extension(String)`
     - Correlation IDs generated for migrated events where inferable from context
     - Append-only integrity: no migrated event is modified or dropped
   Data verification: event count matches, timestamps are correct (verify
