@@ -7,6 +7,7 @@
 pub mod aliases;
 pub mod auth;
 pub mod board;
+pub mod criteria;
 pub mod browser;
 pub mod files;
 pub mod health;
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/schedules", schedules::routes())
         .nest("/api/verify", verify::routes())
         .nest("/api/prefs", prefs::routes())
+        .nest("/api/criteria", criteria::routes())
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
         .nest("/api/push", crate::push::routes())

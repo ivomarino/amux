@@ -935,6 +935,45 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // RR-0048d (Invariant 50): leaving todo requires authored
+                    // acceptance criteria — enforcement opt-in during
+                    // coexistence (AMUX_RS_REQUIRE_CRITERIA=1); force bypasses
+                    // WITH its audit line like every other gate.
+                    if task.status == TaskStatus::Todo
+                        && target != TaskStatus::Todo
+                        && !target.is_terminal()
+                        && !force
+                    {
+                        match crate::api::criteria::todo_exit_permitted(conn, &next.id) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(msg)) => {
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "acceptance criteria required",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "item": next.id,
+                                            "detail": msg,
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            Err(e) => {
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        json!({ "error": e.to_string() }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                        }
+                    }
                     let eff_gate = bs::effective_gate(&next, target);
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);

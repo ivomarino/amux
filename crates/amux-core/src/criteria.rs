@@ -43,15 +43,10 @@ pub enum CriteriaAuthor {
 pub struct Criterion {
     pub id: CriterionId,
     pub description: String,
-    /// Names the `VerifierKind` that proves this criterion (e.g.
-    /// `command`, `http_check`, `file_exists`, `playwright_assertion`,
-    /// `model_judgment`).
-    // NOTE: becomes crate::verification::VerifierKind once integration
-    // lands (RR-0015 defines it, including payload shapes like
-    // Command { cmd, expected_exit }); stored as a String for now so this
-    // module carries no compile-time dependency on the sibling's exact
-    // variant payloads while both are being written.
-    pub verifier: String,
+    /// The typed verifier that proves this criterion (RR-0015). Typed, not
+    /// a name string: a criterion whose verifier cannot execute is a
+    /// criterion that cannot fail, and that is theatre (ethos rule 7).
+    pub verifier: crate::verification::VerifierKind,
     /// Optional criteria may fail without blocking verification; required
     /// ones cannot.
     pub required: bool,
@@ -175,7 +170,10 @@ mod tests {
         Criterion {
             id: CriterionId::from_ulid(ulid.parse().unwrap()),
             description: "GET /api/search returns PagedResponse with truncated computed".into(),
-            verifier: "command".into(),
+            verifier: crate::verification::VerifierKind::Command {
+                cmd: "true".into(),
+                expected_exit: 0,
+            },
             required: true,
         }
     }
