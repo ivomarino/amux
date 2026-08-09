@@ -310,6 +310,70 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         }
     }
 
+    // self_report from the SHARED persisted store (prefs key
+    // 'session_reports', amux-server.py:3943) — the same bytes Python
+    // hydrates at boot, not its memory. state/ts/source -> Python's
+    // {state, age_s, source} card shape (py:20411).
+    {
+        let raw: Option<String> = conn
+            .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| r.get(0))
+            .ok();
+        if let Some(map) = raw.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+            let now = chrono::Utc::now().timestamp();
+            for v in out.iter_mut() {
+                if let Some(name) = v["name"].as_str() {
+                    if let Some(rep) = map.get(name) {
+                        let ts = rep["ts"].as_i64().unwrap_or(0);
+                        v["self_report"] = json!({
+                            "state": rep["state"].as_str().unwrap_or(""),
+                            "age_s": (now - ts).max(0),
+                            "source": rep["source"].as_str().unwrap_or(""),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // branch: bounded parallel git lookups, deduped by directory (many
+    // sessions share a checkout — one git call per DISTINCT dir).
+    {
+        let dirs: std::collections::BTreeSet<String> = out
+            .iter()
+            .filter_map(|v| v["dir"].as_str())
+            .filter(|d| !d.is_empty())
+            .map(String::from)
+            .collect();
+        let mut branches: std::collections::BTreeMap<String, String> = Default::default();
+        let dir_list: Vec<String> = dirs.into_iter().collect();
+        for chunk in dir_list.chunks(12) {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|d| {
+                    let d = d.clone();
+                    std::thread::spawn(move || {
+                        let out = std::process::Command::new("git")
+                            .args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
+                            .output()
+                            .ok()?;
+                        out.status.success().then(|| {
+                            (d, String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        })
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Ok(Some((d, b))) = h.join() {
+                    branches.insert(d, b);
+                }
+            }
+        }
+        for v in out.iter_mut() {
+            let b = v["dir"].as_str().and_then(|d| branches.get(d)).cloned().unwrap_or_default();
+            v["branch"] = json!(b);
+        }
+    }
+
     // Previews for RUNNING sessions: bounded parallel tmux capture, 15-line
     // ANSI tail like Python's card preview. Bounded (12 at a time) so 49
     // running sessions cannot serialize the request.
