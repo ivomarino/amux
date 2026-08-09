@@ -85,14 +85,42 @@ fn state_tag(state: &WorkerState) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Map WorkerState to the dashboard status string the JS expects.
+/// The dashboard reads `s.status` and renders status badges from it.
+fn dashboard_status(state: &WorkerState) -> &'static str {
+    match state {
+        WorkerState::Stopped => "stopped",
+        WorkerState::Starting => "starting",
+        WorkerState::Active { .. } => "active",
+        WorkerState::Idle { .. } => "idle",
+        WorkerState::Waiting { .. } => "waiting",
+        WorkerState::RateLimited { .. } => "rate_limited",
+        WorkerState::Error { .. } => "error",
+    }
+}
+
 /// The canonical API body for a worker. Field aliasing (RR-0018a) is applied
 /// by callers via `alias_fields`.
+///
+/// Includes dashboard-facing fields (`status`, `running`, `rate_limited_until`,
+/// `name`) so the JS `_renderSessionCard` renders status badges on every card
+/// and shows terminal preview on expand. Fields that require backend adapters
+/// (Phase 1) return null until then: `preview_lines`, `preview`, `tokens`,
+/// `last_activity`, `task_name`.
 fn worker_body(row: &WorkerRow) -> Value {
+    let status = dashboard_status(&row.state);
+    let running = !matches!(row.state, WorkerState::Stopped);
+    let rate_limited_until = match &row.state {
+        WorkerState::RateLimited { reset_at } => reset_at.map(|t| t.to_rfc3339()),
+        _ => None,
+    };
     json!({
         "id": row.id,
+        "name": row.display_name,
         "display_name": row.display_name,
         "name_aliases": row.name_aliases,
         "cwd": row.cwd,
+        "dir": row.cwd,
         "provider": row.provider,
         "model": row.model,
         "backend": row.backend,
@@ -100,17 +128,44 @@ fn worker_body(row: &WorkerRow) -> Value {
         "permissions": row.permissions,
         "group": row.group_id,
         "state": serde_json::to_value(&row.state).unwrap_or_else(|_| json!({"state": "stopped"})),
+        "status": status,
+        "running": running,
+        "rate_limited_until": rate_limited_until,
         "version": row.version,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        // Phase 1 (backend adapters): preview_lines, preview, tokens,
+        // last_activity, task_name, credit_limited, session_created
+        "preview_lines": Value::Null,
+        "preview": Value::Null,
+        "tokens": Value::Null,
+        "last_activity": row.updated_at,
+        "task_name": Value::Null,
     })
 }
 
+/// Event with no snapshot (session rows and other entities replay does not
+/// yet reconstruct). Worker mutations must use [`ev_worker`] instead so the
+/// journal stays replayable for them (RR-0111a).
 fn ev(entity_type: EntityType, id: &str, mutation: MutationKind) -> PendingEvent {
     PendingEvent {
         entity_type,
         entity_id: id.to_string(),
         mutation,
+        payload: None,
+    }
+}
+
+/// Worker event carrying the post-mutation snapshot (RR-0111a). Every worker
+/// event site has the row it just wrote in hand inside the write closure, so
+/// the snapshot is one serialization — the journal can then replay worker
+/// state without consulting the live table.
+fn ev_worker(row: &WorkerRow, mutation: MutationKind) -> PendingEvent {
+    PendingEvent {
+        entity_type: EntityType::Worker,
+        entity_id: row.id.clone(),
+        mutation,
+        payload: Some(row.snapshot()),
     }
 }
 
@@ -280,7 +335,7 @@ pub async fn create_worker(
             queries::insert_worker(conn, &row_for_write)?;
             Ok(WriteOutcome {
                 applied: true,
-                events: vec![ev(EntityType::Worker, &row_for_write.id, MutationKind::Created)],
+                events: vec![ev_worker(&row_for_write, MutationKind::Created)],
             })
         })
         .await;
@@ -482,19 +537,28 @@ pub async fn patch_worker(
                 );
             }
 
+            // The post-mutation row, built BEFORE the events so each worker
+            // event can journal it as its payload (RR-0111a): config from
+            // new_cfg, version bumped exactly as update_worker_config wrote
+            // it, state as apply_config decided.
+            let mut new_row = row.clone();
+            new_row.set_config(&new_cfg);
+            new_row.version = row.version + 1;
+            new_row.state = updated.state.clone();
+            new_row.updated_at = now_s.clone();
+
             let mut events = Vec::new();
             if updated.state != row.state {
                 queries::update_worker_state(conn, &row.id, &updated.state, &now_s)?;
-                events.push(ev(
-                    EntityType::Worker,
-                    &row.id,
+                events.push(ev_worker(
+                    &new_row,
                     MutationKind::StatusChanged {
                         from: state_tag(&row.state),
                         to: state_tag(&updated.state),
                     },
                 ));
             } else {
-                events.push(ev(EntityType::Worker, &row.id, MutationKind::Updated));
+                events.push(ev_worker(&new_row, MutationKind::Updated));
             }
 
             // Session replacement bookkeeping (Invariant 43). The actual
@@ -524,11 +588,6 @@ pub async fn patch_worker(
                 }
             }
 
-            let mut new_row = row.clone();
-            new_row.set_config(&new_cfg);
-            new_row.version = row.version + 1;
-            new_row.state = updated.state.clone();
-            new_row.updated_at = now_s;
             finish(
                 &slot_w,
                 PatchOutcome::Applied { body: worker_body(&new_row), change },
@@ -617,10 +676,14 @@ pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>
                 },
             )?;
             queries::update_worker_state(conn, &row.id, &WorkerState::Starting, &now_s)?;
+            // Post-mutation snapshot for the journal (RR-0111a): the row as
+            // update_worker_state just left it.
+            let mut after = row.clone();
+            after.state = WorkerState::Starting;
+            after.updated_at = now_s.clone();
             let events = vec![
-                ev(
-                    EntityType::Worker,
-                    &row.id,
+                ev_worker(
+                    &after,
                     MutationKind::StatusChanged { from: "stopped".into(), to: "starting".into() },
                 ),
                 ev(EntityType::Session, ses_id.as_str(), MutationKind::Created),
@@ -672,9 +735,11 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
             }
             if !matches!(row.state, WorkerState::Stopped) {
                 queries::update_worker_state(conn, &row.id, &WorkerState::Stopped, &now_s)?;
-                events.push(ev(
-                    EntityType::Worker,
-                    &row.id,
+                let mut after = row.clone();
+                after.state = WorkerState::Stopped;
+                after.updated_at = now_s.clone();
+                events.push(ev_worker(
+                    &after,
                     MutationKind::StatusChanged {
                         from: state_tag(&row.state),
                         to: "stopped".into(),
@@ -723,12 +788,19 @@ pub async fn delete_worker(State(state): State<AppState>, Path(key): Path<String
                 // already gone, report absence rather than a fresh change.
                 return finish(&slot_w, StepOutcome::NotFound, no_write());
             }
+            // Deletion is SOFT: the row survives with `deleted_at` set, and
+            // the Deleted event journals a snapshot of that surviving row —
+            // replay then knows both that it was deleted and what it was
+            // (RR-0111a).
+            let mut after = row.clone();
+            after.deleted_at = Some(now_s.clone());
+            after.updated_at = now_s;
             finish(
                 &slot_w,
                 StepOutcome::Applied { body: json!({ "deleted": true, "id": row.id }) },
                 WriteOutcome {
                     applied: true,
-                    events: vec![ev(EntityType::Worker, &row.id, MutationKind::Deleted)],
+                    events: vec![ev_worker(&after, MutationKind::Deleted)],
                 },
             )
         })
