@@ -440,8 +440,12 @@ async fn golden_failure_and_retry() {
     match &calls[0] {
         RecordedCall::SendPrompt { worker, prompt } => {
             assert_eq!(worker, &wid);
-            assert!(prompt.text.contains("execute_task"), "{}", prompt.text);
+            // The pump delivers the WORK (feed-forward assignment brief),
+            // not a serialized command (live-golden finding: the model
+            // needs the task, not its id).
             assert!(prompt.text.contains(tid.as_str()), "{}", prompt.text);
+            assert!(prompt.text.contains("harden the flaky retry path"), "{}", prompt.text);
+            assert!(prompt.text.contains("board card"), "{}", prompt.text);
         }
         other => panic!("expected SendPrompt, got {other:?}"),
     }
@@ -851,7 +855,7 @@ async fn golden_no_stall() {
     for call in rig.protocol.calls() {
         if let RecordedCall::SendPrompt { prompt, .. } = call {
             prompts += 1;
-            assert!(prompt.text.contains("execute_task"), "{}", prompt.text);
+            assert!(prompt.text.contains("board card"), "{}", prompt.text);
             let named = tid_to_sem
                 .keys()
                 .find(|t| prompt.text.contains(t.as_str()))
