@@ -69337,7 +69337,22 @@ class CCHandler(BaseHTTPRequestHandler):
                     (bid,),
                 ).fetchone()
                 if not row:
-                    return self._json({"error": "item not found"}, 404)
+                    # SAY WHICH ABSENCE (AC-312). "item not found" reads as a
+                    # broken board / permissions / transient 000 from the
+                    # recipient's seat — amux-cloud burned probes establishing
+                    # AC-311 was simply deleted after its assignment notice went
+                    # out. The ghost row (soft delete) is the discriminator.
+                    _ghost = db.execute("SELECT deleted FROM issues WHERE id = ?", (bid,)).fetchone()
+                    return self._json({
+                        "error": "item not found",
+                        "gone": True,
+                        "why": (("this card was deleted"
+                                 if _ghost and _ghost["deleted"] else
+                                 "no card with this id has ever existed here")
+                                + " — if an assignment notification told you to claim it, "
+                                  "the card was removed after the notice was sent; nothing "
+                                  "is broken and there is nothing to do (AC-312)"),
+                    }, 404)
                 if dict(row)["owner_type"] != "agent":
                     return self._json({"error": "item is not an agent task"}, 409)
                 if dict(row)["status"] not in ("todo", "backlog"):
@@ -70399,9 +70414,32 @@ class CCHandler(BaseHTTPRequestHandler):
 
                 if method == "DELETE":
                     now = int(time.time())
-                    _del_row = db.execute("SELECT title FROM issues WHERE id = ?", (bid,)).fetchone()
+                    _del_row = db.execute(
+                        "SELECT title, session, owner_type, COALESCE(notified,0) AS notified "
+                        "FROM issues WHERE id = ?", (bid,)).fetchone()
                     db.execute("UPDATE issues SET deleted = ? WHERE id = ?", (now, bid))
                     db.commit()
+                    # RETRACT a delivered assignment (AC-312). The dispatcher
+                    # revalidates before sending, but a delete landing in the
+                    # recheck->send_text window still ships a notice for a card
+                    # that is gone — irreducible from the sender's side, so the
+                    # DELETE closes the loop instead: one line to the lane that
+                    # was told to claim it. Only when the notice actually went
+                    # out (notified=1) to an agent lane that is running; silence
+                    # otherwise.
+                    try:
+                        if (_del_row and _del_row["notified"]
+                                and (_del_row["owner_type"] or "") == "agent"
+                                and (_del_row["session"] or "").strip()
+                                and is_running(_del_row["session"].strip())):
+                            send_text(_del_row["session"].strip(),
+                                      f"[amux] Disregard the earlier assignment for {bid} "
+                                      f"(\"{(_del_row['title'] or '')[:80]}\") — the card was "
+                                      f"deleted. Nothing to claim; nothing is broken.")
+                            slog(f"[notify] {bid} deleted after assignment notice — "
+                                 f"retraction sent to {_del_row['session']}")
+                    except Exception:
+                        pass
                     _stamp_evicted_dependents([(bid, (_del_row["title"] if _del_row else ""))])
                     _board_changed()
                     _gcal_sync_bg(bid, deleted=True)
