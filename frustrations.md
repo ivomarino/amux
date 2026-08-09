@@ -1819,3 +1819,29 @@ FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited her
   a checkout where other lanes commit. The trap is invisible on a single-session repo, which
   is precisely why it needs writing down here: every fix in this repo is supposed to be
   checked against a pre-fix specimen, so the wrong recipe is reached for constantly.
+
+
+## staged-guard BLOCKED a commit on an edit record with no content behind it
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-26
+SYMPTOM: `git commit -- CLAUDE.md frustrations.md` refused with "COMMIT BLOCKED - staged
+  files were edited by OTHER amux sessions sharing this checkout: CLAUDE.md (edited by
+  session 'amux-cloud' 0m ago)". Checked before overriding: `git diff HEAD -- CLAUDE.md` is
+  ONE hunk, 14 insertions / 0 deletions, entirely my own text, and `git log -- CLAUDE.md`
+  shows no amux-cloud commit at all. There was no foreign content to sweep. The guard gates
+  on a recent-edit RECORD, not on whether the staged patch actually contains another
+  session's hunks.
+COST: ~8 min verifying the block was spurious, and a commit that had to be forced past a
+  correct-looking refusal. Worse than AF-24 (same subsystem, warns only) because this one
+  BLOCKS. The compounding cost is that overriding is now normalised on a guard whose whole
+  value is that its refusals mean something.
+FIX: gate on diff CONTENT rather than edit recency - does the staged patch contain hunks the
+  other session wrote? And note the ethos rule 3 shape in the escape: the only documented
+  way past is `AMUX_ALLOW_FOREIGN=1`, described as "if this cross-session commit is
+  intentional", so clearing a FALSE positive requires setting a flag whose name asserts
+  something untrue. If a record-based block is kept, give the honest case an honest name
+  (AMUX_VERIFIED_SOLO=1). Probably one root with AF-24.
