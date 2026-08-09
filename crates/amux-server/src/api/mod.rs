@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", axum::routing::get(sse::events))
         .nest("/api/board", board::routes())
         .nest("/api/workers", workers::routes())
+        .nest("/api/schedules", schedules::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

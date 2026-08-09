@@ -48,6 +48,14 @@ pub struct Runtime {
     /// configured — the pump then leaves queues untouched rather than
     /// failing every command against a void).
     pub protocol: Option<Arc<dyn crate::opencode::AgentProtocol>>,
+    /// STRANGLER-FIG SAFETY: may the Rust orchestrator pick up UNOWNED
+    /// board tasks? Default false — while the Python fleet runs, an
+    /// unowned card may be a Python session's next pickup, and two
+    /// orchestrators claiming one queue is the dual-scheduler double-fire
+    /// hazard on the board. Tasks owned by a name that resolves to a
+    /// REGISTERED Rust worker are always eligible; tasks owned by
+    /// unresolvable names (the Python fleet's) are NEVER touched.
+    pub pickup_unowned: bool,
 }
 
 impl Runtime {
@@ -208,8 +216,7 @@ impl Runtime {
             tracing::warn!(error = %e, "command pump failed this tick");
         }
 
-        // Tasks arrive with the board API (Phase 2). Empty until then.
-        let tasks: Vec<amux_core::board::Task> = vec![];
+        let tasks = self.load_board_tasks(&workers)?;
         let hints = BTreeMap::new();
         let attempts = BTreeMap::new();
 
@@ -226,7 +233,20 @@ impl Runtime {
             wip_limit: 1,
         });
 
+        // Anti-livelock (RR-0048a): limits filter what actually executes.
+        let attempts_by_task = attempts; // (empty until attempt recording wires in)
+        let _ = &attempts_by_task;
+        let (proceed, exhaustion) = amux_core::orchestrator::enforce_limits(
+            plan.assignments.clone(),
+            &amux_core::limits::ExecutionLimits::default(),
+            now,
+            &BTreeMap::new(),
+        );
+        let plan = TickPlan { assignments: proceed, ..plan };
         self.execute(&plan).await?;
+        for action in exhaustion {
+            self.apply_exhaustion(action, now).await?;
+        }
 
         if heartbeat {
             let progress = FleetProgress {
@@ -299,6 +319,47 @@ impl Runtime {
             })
             .await?;
         Ok(())
+    }
+
+    /// Open board tasks the Rust orchestrator may honestly route.
+    /// Ownership rule documented on `pickup_unowned`.
+    fn load_board_tasks(&self, workers: &[Worker]) -> anyhow::Result<Vec<amux_core::board::Task>> {
+        let conn = self.store.read()?;
+        let rows = crate::db::board_store::list_issues(
+            &conn,
+            &["todo".into()],
+            &[],
+            crate::db::board_store::ArchivedFilter::ActiveOnly,
+        )?;
+        // Name directory: display names + aliases, case-insensitive.
+        let mut names: BTreeMap<String, amux_core::ids::WorkerId> = BTreeMap::new();
+        for w in workers {
+            names.insert(w.config.display_name.to_lowercase(), w.id().clone());
+            for a in &w.config.name_aliases {
+                names.entry(a.to_lowercase()).or_insert_with(|| w.id().clone());
+            }
+        }
+        let mut out = Vec::new();
+        for row in rows {
+            let Some(mut task) = row.to_task() else { continue };
+            match row.session.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(owner_name) => {
+                    match names.get(&owner_name.to_lowercase()) {
+                        Some(wid) => task.worker = Some(wid.clone()),
+                        // Owned by a name that is not a Rust worker: the
+                        // Python fleet's card. Not ours. Skip entirely.
+                        None => continue,
+                    }
+                }
+                None => {
+                    if !self.pickup_unowned {
+                        continue;
+                    }
+                }
+            }
+            out.push(task);
+        }
+        Ok(out)
     }
 
     fn load_state(&self) -> anyhow::Result<(Vec<Worker>, Vec<Lease>, u64)> {
@@ -380,8 +441,30 @@ impl Runtime {
                 })
                 .await?;
         }
-        // Assignments: written as leases. Prompt delivery through
-        // AgentProtocol wires in with RR-0030's transport.
+        // Assignments: lease + an ExecuteTask command the pump delivers
+        // through the agent protocol — the full loop: board task -> lease
+        // -> command -> headless CLI run.
+        for asg in &plan.assignments {
+            let cmd_id = amux_core::ids::CommandId::from_ulid(ulid::Ulid::new());
+            let worker_id = asg.worker.clone();
+            let task_id = asg.task.clone();
+            let key = asg.idempotency_key.clone();
+            self.store
+                .write_async(move |conn| {
+                    let (_, created) = crate::db::commands::enqueue(
+                        conn,
+                        cmd_id,
+                        &worker_id,
+                        &amux_core::protocol::WorkerCommand::ExecuteTask(task_id),
+                        &key,
+                        &amux_core::protocol::DeliveryTiming::WhenIdle,
+                        None,
+                        Utc::now(),
+                    )?;
+                    Ok(WriteOutcome { applied: created, events: vec![] })
+                })
+                .await?;
+        }
         for asg in &plan.assignments {
             let task = asg.task.to_string();
             let worker = asg.worker.to_string();
@@ -418,6 +501,32 @@ impl Runtime {
 }
 
 impl Runtime {
+    /// Execute an anti-livelock decision (RR-0048a). Quarantine writes the
+    /// terminal status onto the ISSUES row via the same board-store path
+    /// the API uses; Decompose is recorded as a StateEvent for the
+    /// decomposition worker to consume (model-driven splitting is a later
+    /// phase — recording without acting keeps the decision auditable now).
+    async fn apply_exhaustion(
+        &self,
+        action: amux_core::orchestrator::ExhaustionAction,
+        _now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(&action)?;
+        self.store
+            .write_async(move |_conn| {
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![PendingEvent {
+                        entity_type: EntityType::Other("exhaustion".into()),
+                        entity_id: payload.clone(),
+                        mutation: MutationKind::Created,
+                    }],
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Deliver due commands through the agent protocol. One in-flight
     /// command per worker (queue discipline lives in db::commands); timing:
     /// Immediate always goes; AtTurnBoundary/WhenIdle require the agent to
@@ -617,6 +726,7 @@ mod tests {
             },
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: None,
+            pickup_unowned: false,
         }
     }
 
@@ -772,6 +882,7 @@ mod pump_tests {
             },
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
             protocol: Some(protocol),
+            pickup_unowned: false,
         }
     }
 

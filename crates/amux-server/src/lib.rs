@@ -106,6 +106,7 @@ async fn async_main() {
         protocol: Some(Arc::new(
             opencode::structured::StructuredCliProtocol::new(),
         )),
+        pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
     });
     match runtime.reconcile_on_startup().await {
         Ok(report) => tracing::info!(
