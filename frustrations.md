@@ -1733,3 +1733,65 @@ NOTE: distinct from the already-fixed "co-edit notice asks the reader to resolve
   something that has since become false — worse, because an out-of-date question costs a
   moment while a false statement sends you hunting a defect that does not exist. The emitter
   is right to be conservative; over-warning about a sweep beats under-warning. Only re-check it.
+
+
+## SessionStart freshness hook named files upstream never touched
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-22
+SYMPTOM: Hook printed `checkout is 1 commit(s) behind origin/main - including: CLAUDE.md
+  amux amux-server.py`. The single incoming commit (eaa1e91) touches ONLY amux-server.py.
+  Cause: the hot-file list used `git diff --name-only HEAD..$base` - TWO dots, which in
+  `git diff` compares the two ENDPOINTS instead of diffing from the merge-base, so on a
+  shared checkout with 120 unpushed commits it reports OUR OWN files as upstream changes.
+  The same sentence disagreed with itself: `behind` uses rev-list, where two-dot IS correct,
+  so the count said 1 while the file list implied a broad conflict.
+COST: ~10 min reconciling two files that had zero incoming changes. The compounding cost is
+  worse than the minutes: the error grows with the number of unpushed local commits, so the
+  warning is least trustworthy exactly when the checkout is busiest - which is the situation
+  it exists for. An instrument that cries wolf in proportion to the real risk gets ignored.
+FIX: 13c7014 - three dots. Positive control in a scratch clone with upstream touching only
+  amux-server.py: two-dot -> [CLAUDE.md amux amux-server.py] (reproduces the symptom),
+  three-dot -> [amux-server.py]. Line 43's rev-list two-dot deliberately left alone.
+
+## Shared-checkout guard blocked a commit aimed at a scratch repo, naming the shared one as fact
+AREA: cli
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-23
+SYMPTOM: A compound command that `cd`s into a throwaway git repo under the scratchpad and
+  runs `git commit -qam` there was blocked by ~/.amux/hooks/git-shared-guard.py, whose
+  message asserts "'/Users/ethan/Dev/amux' is a SHARED checkout" - a repo the command never
+  touched. The guard matches on command TEXT against the session's cwd and cannot see an
+  in-command `cd`.
+COST: one wasted round-trip. Small, but the next session that writes a scratch-repo test
+  hits it identically, and the refusal reads as a true positive because it states the shared
+  path as fact rather than as the assumption it is.
+FIX: keep the guard strict - it should stay strict - but have the refusal say it matched on
+  the session's cwd, and that a command targeting a different repo should use
+  `git -C <path>` with explicit paths. That makes the false positive self-diagnosing instead
+  of looking like a real one.
+
+## Staged-guard attributed a session's OWN edit, seconds old, to session '(unknown)'
+AREA: attribution
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-24
+SYMPTOM: Committing .claude/session-freshness.sh, which I had edited ~30s earlier and which
+  no other session had touched, printed: "WARNING - .claude/session-freshness.sh was also
+  edited by session '(unknown)' 0m ago. This commit stages 13 insertions / 1 deletions there
+  - if that is MORE than you wrote, their work is in it." The 13/1 was exactly my own edit.
+COST: minutes reconciling a co-edit that did not exist. NOT root-caused - I did not
+  determine whether the edit record was missing, unattributed at write time, or attributed
+  but not matched against the committing session.
+FIX: unknown pending diagnosis. The thing worth protecting is the signal: this guard is
+  load-bearing (it is what catches another session's work riding along in your commit, which
+  has happened twice here), and a warning that fires on your own edits is how a real one gets
+  waved through. Whatever the cause, the guard should be able to say "this was you".
