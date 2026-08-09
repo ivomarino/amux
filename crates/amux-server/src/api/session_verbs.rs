@@ -3611,6 +3611,26 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions/{name}", any(session_root_handler))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
+        // CANONICAL SPELLING, same dispatcher. `/api/sessions/*` is exempt from
+        // the alias layer (aliases.rs: the bare list has a dedicated shape
+        // handler and the verbs used to proxy to Python), so nothing was
+        // rewriting `/api/workers/<n>/<verb>` onto these — the canonical name
+        // for the verbs simply did not exist, and only the legacy one answered.
+        //
+        // That is not cosmetic: the INSTALLED `amux send` posts to
+        // /api/workers/<n>/send. Against Python it worked; after the cutover it
+        // got 405 and the CLI fell back to RAW TMUX KEYSTROKES — unstamped,
+        // unaudited, delivery unverified. So every session's `amux send` lost
+        // the origin stamp that AMUX-1768 exists to provide and that CLAUDE.md
+        // instructs every session to rely on ("provenance comes from the server
+        // stamp, not the text"). Two long inter-session messages were confirmed
+        // LOST through that fallback the same afternoon.
+        //
+        // Fixed server-side rather than in the CLI deliberately: a CLI fix only
+        // reaches machines that reinstall, while the route fixes every already
+        // installed copy at once (ethos rule 1 — capability has to actually
+        // reach everyone, not just exist).
+        .route("/api/workers/{name}/{*verb}", any(session_verb_handler))
         // Long prompts ride /send bodies; axum's 2MB default is Python's cap
         // too (none), so disable rather than invent one.
         .layer(axum::extract::DefaultBodyLimit::disable())
