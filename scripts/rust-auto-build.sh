@@ -29,8 +29,10 @@ last=$(cat "$STAMP" 2>/dev/null || echo "")
   WORK=$(mktemp -d /tmp/amux-rs-build.XXXXXX)
   trap 'git -C "$REPO" worktree remove --force "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
   git -C "$REPO" worktree add --detach "$WORK" "$(git -C "$REPO" rev-parse HEAD)" >/dev/null
-  if (cd "$WORK" && cargo build --release -p amux-server 2>&1 | tail -3); then
-    install -m 0755 "$WORK/target/release/amux-server" "$INSTALL"
+  # Shared target dir: incremental rebuilds (~15s) instead of cold ones
+  # (~3min) — the worktree isolates SOURCE, the cache is content-keyed.
+  if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server 2>&1 | tail -3); then
+    install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL"
     echo "$head" > "$STAMP"
     echo "== installed; running server will self-adopt within 5s"
   else
