@@ -844,11 +844,13 @@ pub fn disposition(task: &Task, board: &[Task], effective_gates: &[Gate]) -> Tas
         TaskStatus::Todo => {
             if let Some(dep) = first_unmet_dependency(task, board) {
                 TaskDisposition::Waiting(WaitingFor::Dependency { on: dep })
-            } else if let Some(worker) = &task.worker {
-                TaskDisposition::Assigned {
-                    worker: worker.clone(),
-                }
             } else {
+                // An OWNER on a todo card is a routing constraint (queued
+                // for that worker), not an execution claim — the lease is
+                // the claim (Invariant 19: task state != execution state).
+                // Treating owned-todo as Assigned made every tagged queue
+                // card invisible to the orchestrator, which is exactly the
+                // Python board's L3 shape: 380 todos nobody was told to run.
                 TaskDisposition::Runnable
             }
         }

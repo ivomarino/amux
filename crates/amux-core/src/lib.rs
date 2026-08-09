@@ -35,6 +35,7 @@ pub mod isolation;
 pub mod limits;
 pub mod memory;
 pub mod message;
+pub mod orchestrator;
 pub mod protocol;
 pub mod provider;
 pub mod revision;

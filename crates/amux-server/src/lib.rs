@@ -4,8 +4,10 @@
 //! land phase by phase; each `pub mod` line appears when its RR item starts.
 
 pub mod api;
+pub mod backend;
 pub mod config;
 pub mod db;
+pub mod opencode;
 pub mod orchestrator;
 pub mod tls;
 
