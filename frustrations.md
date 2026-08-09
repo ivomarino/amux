@@ -897,3 +897,33 @@ COST: Anyone following the error's advice sets an env var that changes nothing.
 FIX: The Rust port implements AMUX_SEARCH_RG for real rather than inheriting the
   false claim (crates/amux-server/src/api/fs.rs). Python side still carries the
   dead promise — fix or delete the text there.
+
+---
+## Rust SSE "ping" goes out as an SSE COMMENT — EventSource clients can never see it
+AREA: sse
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2601 (found during a read-only verification run with board writes barred — needs filing)
+SYMPTOM: Wire capture of GET /api/events on the Rust server (build 51f43c50d66e88b9)
+  shows the keep-alive as `: {"type":"ping","v":"0.9.529"}` — a comment frame, not a
+  `data:` event. sse.rs's own comment says "The keep-alive IS the ping contract: 10s
+  cadence, real data event", but axum 0.8.9's KeepAlive::text(t) is literally
+  `self.event(Event::default().comment(t))` (axum src/response/sse.rs:552). The SPA
+  consumes pings via EventSource.onmessage (app.js:21378), which fires only on data
+  events, so `msg.type === 'ping'` (app.js:21462) is unreachable against the Rust
+  server: the version self-reload-on-deploy path is dead, and pings never feed
+  `_lastDataTime`, so an idle fleet (>18s without real events) trips the client's
+  zombie detector and forces reconnect loops. The `v` value itself is correct
+  (matches served app.js APP_VER).
+COST: A 12s data-line probe reported 0 pings and initially read as "no pings sent";
+  discriminating comment-vs-data took a raw curl capture. In prod: deploy adoption
+  by open windows silently does not happen on the Rust server, and quiet fleets
+  reconnect every ~18s. Secondary: axum keep-alives fire only after `interval` of
+  SILENCE (unlike Python's unconditional 10s ping), so even after the data-event
+  fix, a busy stream can starve version-adoption pings.
+FIX: crates/amux-server/src/api/sse.rs — replace `.text(ping_payload())` with
+  `.event(Event::default().data(ping_payload()))` (KeepAlive::event exists in axum
+  0.8.9); consider an unconditional 10s ping task for Python parity. Regression
+  test: read the raw stream and assert the ping arrives as a `data:` frame.

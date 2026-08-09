@@ -107,9 +107,19 @@ pub async fn events(
         // on deploy, the next ping carries the new version, every open
         // window follows. Ethan 2026-08-09: clients restart like the Python
         // server's, not behind a banner.
+        // .event(data), NOT .text(): KeepAlive::text() is literally
+        // Event::default().comment(t), and an SSE COMMENT never reaches
+        // EventSource.onmessage — so the ping parsed right on the wire and
+        // was invisible to the client: self-reload unreachable, _lastDataTime
+        // starved, and the SPA's 18s zombie detector reconnect-looped on any
+        // quiet fleet (browser re-verify, 2026-08-09: 2 comment-pings, 0
+        // data-pings in 32s of raw wire). Axum keep-alives fire only after
+        // `interval` of SILENCE, unlike Python's unconditional 10s ping —
+        // acceptable, because flowing data events feed _lastDataTime
+        // themselves; the ping covers exactly the quiet gaps.
         KeepAlive::new()
             .interval(Duration::from_secs(10))
-            .text(ping_payload()),
+            .event(Event::default().data(ping_payload())),
     )
 }
 
