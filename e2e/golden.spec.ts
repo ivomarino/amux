@@ -107,7 +107,10 @@ function transport(page: Page): Promise<'sse' | 'polling' | 'none'> {
 }
 
 async function serverTitles(request: APIRequestContext, token: string): Promise<string[]> {
-  const res = await request.get('/api/board?archived=all&done_limit=0', {
+  // Bare `archived` (absent) = NO filter, the Python grammar: the whole
+  // board including archived rows. (`archived=all` was a Rust-only spelling;
+  // Python reads any non-truthy value as "non-archived only".)
+  const res = await request.get('/api/board?done_limit=0', {
     headers: authHeaders(token),
   });
   expect(res.status()).toBe(200);

@@ -758,3 +758,80 @@ COST: ~10 min re-probing the live endpoint; one step from encoding a never-match
 FIX: loadUsage() should accept both "session" and "worker" (the Rust mapper now does);
   better, both consumers should assert the discriminator against a recorded live
   fixture so endpoint drift fails a test instead of silently unlabeling a bar.
+
+---
+## Journal `entity_type` stored serde's object form — every tag filter matched nothing
+AREA: journal
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2593
+SYMPTOM: `_amux_state_events.entity_type` held the adjacently-tagged serde object
+  (`{"kind":"task"}`) instead of the bare tag (`task`), so every
+  `entity_type = '<tag>'` SQL filter silently matched zero rows: redistribute dedupe,
+  `/api/metrics/fleet` `last()`, and the circuit breaker's `window_stats` (its
+  `completed` was permanently 0 — a breaker that can never see success). Classic
+  ethos-7 silent probe: the queries ran, returned empty, and empty looked like
+  "no events yet". Found only because RR-0111a's replay verifier needed the tag
+  as a join key and its round-trip test could actually fail.
+COST: The circuit breaker judged fleet health on a numerator of zero for as long
+  as the journal existed; fleet metrics under-reported; nothing errored. Two
+  sessions (this one and amux-rust) then fixed the SAME mismatch in opposite
+  directions concurrently — writer-to-bare vs readers-to-object — which is the
+  drift the single-codebase rule exists to prevent; resolved toward bare tags
+  with both-format-tolerant readers since existing DBs hold old rows.
+FIX: Writer stores bare tags; `parse_entity_type` (db/mod.rs) + `entity_tag`
+  (db/replay.rs) + IN-clauses at the two query sites accept both forms. The
+  durable lesson: when a column is written by serde serialization, pin its
+  STORED form with a test that queries it back by literal value — serialization
+  defaults are an implementation detail until SQL depends on them.
+
+---
+## Rust origin answered unknown /api/* with the SPA shell (200 text/html) — nested proxy fallbacks silently shadowed
+AREA: instruments
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (updict/browser parity lane)
+CARD: AMUX-2594
+SYMPTOM: On 8824, GET /api/groups, /api/browser/state, /api/fs?path=/tmp and every
+  other unrouted API path returned 200 text/html — the static catch-all
+  (`/{*path}`) serving index.html. Two distinct downstream failures: (1) the SPA
+  group picker silently emptied ("adding a group didn't work": r.json() threw on
+  HTML, .catch swallowed it), and (2) an auth probe reported "/api/fs returns 200
+  with NO token", reading the shell as an unauthenticated file listing. Worse: a
+  nested router `.fallback(py_proxy)` compiled, passed its unit tests, and was
+  STILL shadowed in the full composition, because unit tests nest the router
+  without the competing static catch-all.
+COST: One wrong security conclusion shipped upstream (phantom unauthenticated fs
+  endpoint); the SPA groups feature broken on the Rust origin; a browser-verb
+  proxy that looked done on unit-test evidence and was inert live.
+FIX: static_files.rs returns Python's JSON 404 for unknown /api/*; proxied
+  namespaces use EXPLICIT `/` + `/{*rest}` routes (py_proxy::passthrough_routes),
+  never nested `.fallback()`; tests/proxy_composition.rs pins the property at the
+  FULL-router level with a dead python port. Durable lesson: a nested fallback is
+  not a route — test routing properties on the composed app, not the nest.
+
+---
+## Rust and Python servers each minted their own auth token — same claimed file, different names
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (updict/browser parity lane)
+CARD: AMUX-2594
+SYMPTOM: auth.rs's docstring said the token file is "shared with the Python
+  server", but Rust read `~/.amux/auth-token` (dash) while Python owns
+  `~/.amux/auth_token` (underscore). The Rust server minted its own token on
+  first boot, so every client holding the real token (the SPA served by Python,
+  curl recipes, probes) got 401 from 8824 — which presented as a confusing
+  "auth asymmetry" between origins and burned probe time on the wrong theory
+  (that the UI-guard sha was an accepted token form; it never was — Python's
+  localhost bypass was producing the 200s).
+COST: Cross-origin 401s for every valid-token caller; a probe narrative built
+  on two wrong mechanisms before the filename diff was spotted.
+FIX: config.rs reads Python's `auth_token`; AMUX_AUTH_TOKEN env parity
+  ("none" disables); require_bearer is a port of Python's _check_auth
+  (localhost bypass, public paths, `_token=` only, JSON 401). The stale
+  `auth-token` file is left on disk but nothing reads it.
