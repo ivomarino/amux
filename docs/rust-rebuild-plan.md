@@ -4563,33 +4563,64 @@ journal                         other SQLite tables
 Do not assume the documented table count remains current. Discover the actual schema:
 `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;`
 
-**Migration manifest** -- one row per source entity:
+**Migration manifest** -- one row per source entity, with EXPLICIT schema translation:
 
 ```
-source table/entity      source row count
-destination table/entity destination row count
-migration method         transformations applied
-validation method        status (Migrated/Transformed/Deprecated)
+source table/entity      -> destination table/entity
+source column (type)     -> destination column (type)   [transformation if any]
+source row count         -> destination row count
+migration method            validation method
+status: Migrated / Intentionally Transformed / Intentionally Deprecated
 ```
+
+Every table requires a column-level mapping. Not just "table A -> table B" but every
+column in A mapped to its destination in B with the type conversion documented.
+Examples of translations that must be explicit:
+
+- `sessions.name` (TEXT) -> `workers.display_name` (TEXT) [table + column rename]
+- `sessions.name` -> `workers.name_aliases` (TEXT[]) [old name becomes alias]
+- `board.status` (TEXT "todo"/"doing"/"done"/"verified") -> `issues.status` (BoardStatus enum)
+- `board.type` (TEXT) -> `issues.issue_type` (IssueType enum)
+- `board.owner_type` (TEXT) -> `issues.owner_type` (OwnerType enum)
+- `board.created` (REAL epoch) -> `issues.created_at` (DateTime<Utc>)
+- `board.desc` (TEXT) -> `issues.desc` (TEXT) + `issues.desc_preview` (TEXT, computed)
+- `board.log` (TEXT) -> `durable_events` entries (parsed where structured, legacy otherwise)
+- `interaction_log.ts` (INTEGER, MILLISECONDS) -> `events.timestamp` (DateTime<Utc>)
+  [known incident: two sessions treated ms as seconds; the migration must divide by 1000]
+- `prefs.value` (TEXT, JSON string) -> typed pref values with validation
+- `memories.scope` (TEXT) -> `memories.scope` (MemoryScope enum)
+- `schedules.session` (TEXT, session name) -> `schedules.worker_id` (WorkerId)
+- `messages.sender` (TEXT) -> `messages.sender_id` (WorkerId, via migration mapping)
+
+The manifest is committed as machine-readable JSON/TOML, not only prose. A CI check
+validates that every source column appears in the manifest and every destination column
+has a documented source.
 
 For every source row/entity, it must be one of:
 - **Migrated** -- exists in Rust with equivalent semantics
-- **Intentionally transformed** -- exists with documented changes
+- **Intentionally transformed** -- exists with documented changes (transformation
+  logic explicit, including renames, type conversions, computed fields, splits, merges)
 - **Intentionally deprecated** -- removed with explicit reason, approval if semantic
   data would be lost, and preservation/export path where appropriate
 
-Nothing may silently disappear.
+Nothing may silently disappear. A column that exists in the source but not the
+destination is a bug in the manifest, not an implicit deprecation.
 
 **Every major subsystem must be tested two ways:**
 
 1. **Existing-data path**: use data migrated from Python and prove it works in Rust.
    Open a migrated issue, search migrated messages, run a migrated schedule, start a
    migrated worker, view migrated logs, resolve migrated scoped config, access migrated
-   browser profile metadata.
+   browser profile metadata, view migrated email threads, check migrated calendar events
+   in iCal feed, browse migrated CRM contacts, verify migrated group scope resolution,
+   confirm migrated token ledger totals, exercise migrated memories with scope isolation.
 
 2. **Net-new path**: create new data through the Rust system and prove the complete
-   lifecycle works. Create worker, rename worker, change cwd, change model, create
-   group, create issue, create gate, create schedule, send message, perform search.
+   lifecycle works. Create worker, rename worker, change cwd, change model, change
+   provider, create group, create issue, create gate with dependency, create schedule,
+   send message with @mention, upload file, compose email, create calendar event, create
+   CRM contact, create browser profile, create memory, perform universal search, go
+   offline and reconnect, verify token usage recorded.
 
 A subsystem is not verified if only migration works or only fresh creation works.
 
@@ -4852,9 +4883,12 @@ The rebuild is complete ONLY when all of the following are true:
 [ ] Zero VERIFYING items
 [ ] Zero unexplained BLOCKED items
 [ ] Full current Python data migration complete
-[ ] Migration manifest reconciles (every source entity accounted for)
-[ ] Net-new data tested for every subsystem
-[ ] Existing migrated data tested for every subsystem
+[ ] Migration manifest reconciles (every source entity accounted for, every column mapped)
+[ ] Migration manifest committed as machine-readable JSON/TOML (not only prose)
+[ ] Schema translation documented for every table (column-level type conversions explicit)
+[ ] Net-new data tested for every subsystem (workers, board, messages, groups, schedules,
+    memories, email, calendar, CRM, browser profiles, files, token ledger, search, offline)
+[ ] Existing migrated data tested for every subsystem (same list -- both paths required)
 [ ] API acceptance suite green
 [ ] CLI acceptance suite green
 [ ] Playwright deep-interaction suite green
@@ -6852,51 +6886,127 @@ consistent with their dependencies.
   Phase: 11
   Depends on: RR-0019
   Invariant: 36
-  Requirement: Discover actual Python schema (`sqlite_master`). Run both servers'
-    migration code against same DB, diff schemas. Any mismatch blocks go-live.
-    Record actual table count (do not assume 47/51).
-  Data verification: schema diff clean
+  Requirement: Discover actual Python schema (`sqlite_master`). Record every table
+    name, column name, column type, indexes, triggers. Do NOT assume the documented
+    table count (47/51) remains current. Run both servers' migration code against the
+    same DB, diff schemas. Any mismatch blocks go-live.
+  Data verification: schema diff clean, actual table inventory recorded
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0118 — Migration manifest: all tables
+- [ ] RR-0118 — Migration manifest: all tables with explicit translations
   Phase: 11
   Depends on: RR-0117
   Invariant: 36
-  Requirement: One manifest row per source table/entity. Source row count, destination
-    row count, migration method, transformations, validation method, status. Every
-    source row is Migrated/Transformed/Deprecated. Nothing silently disappears.
-    Deprecated data has explicit reason and preservation path.
+  Requirement: One manifest row per source table/entity. Each row documents:
+    - Source table name -> destination table name
+    - Source column names/types -> destination column names/types (explicit mapping)
+    - Transformation logic (renames, type conversions, computed fields, splits, merges)
+    - Row count before/after
+    - Validation method (row count match, spot-check, hash, full compare)
+    - Status: Migrated / Intentionally Transformed / Intentionally Deprecated
+    Every source row must be accounted for. Nothing silently disappears. Deprecated
+    data has explicit reason and preservation/export path. The manifest is committed
+    to the repository as machine-readable JSON/TOML, not just prose.
+    Translation examples that must be documented:
+    - `sessions` table -> `workers` table (rename + column mapping)
+    - Python `status` string values -> Rust `WorkerState` enum variants
+    - Python `item_type` strings -> Rust `IssueType` enum variants
+    - Python `owner_type` strings -> Rust `OwnerType` enum variants
+    - Python epoch timestamps -> Rust `DateTime<Utc>`
+    - Python JSON-string columns -> Rust typed structs
+    - Python `desc` field -> Rust `desc` + `desc_preview` (computed)
+    - Any column rename, type change, or semantic change
   Data verification: manifest reconciles (source total = migrated + transformed + deprecated)
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0119 — Worker config migration (.env -> WorkerConfig)
+- [ ] RR-0119 — Migration: workers + sessions (DB records)
   Phase: 11
-  Depends on: RR-0003, RR-0118
-  Invariant: 43
-  Requirement: Python `.env` files -> validated WorkerConfig structs. Any validation
-    failure produces a report, not a silent skip. All worker identities preserved.
-  Data verification: all workers migrated with correct config
+  Depends on: RR-0003, RR-0004, RR-0118
+  Invariant: 1, 43
+  Requirement: Migrate all worker/session records from Python DB. Translation:
+    - Python `sessions` table -> Rust `workers` table
+    - Python session name -> Rust `display_name`
+    - Generate stable `WorkerId` (wrk_...) for each migrated worker
+    - Map Python status strings to `WorkerState` enum
+    - Preserve session history (all past sessions for each worker)
+    - Preserve group membership
+    - Map backend type strings to `BackendKind` enum
+    Worker identities must be stable: same worker has same WorkerId forever after
+    migration. Old session names become `name_aliases` for @mention resolution.
+  Data verification: all workers migrated, WorkerIds stable, aliases resolve
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0120 — Migration: board issues + relationships
+- [ ] RR-0119a — Migration: worker config (.env -> WorkerConfig)
   Phase: 11
-  Depends on: RR-0049, RR-0118
+  Depends on: RR-0119
+  Invariant: 43
+  Requirement: Python per-worker `.env` files -> validated `WorkerConfig` structs.
+    Translation:
+    - env var names -> WorkerConfig fields (cwd, provider, model, backend, permissions)
+    - Provider-specific env vars -> `Provider` enum + provider config
+    - MCP config references -> preserved
+    Any validation failure produces a detailed report, not a silent skip. Config
+    values that cannot be cleanly translated get a warning with the original value
+    preserved in a `legacy_config` field for manual resolution.
+  Data verification: all worker configs migrated, no silent skips
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0120 — Migration: board issues + columns + relationships
+  Phase: 11
+  Depends on: RR-0005, RR-0049, RR-0118
   Invariant: 3, 4
-  Requirement: All board issues, columns, relationships, gates migrated. Issue
-    IDs preserved. Dependency graph intact. Gate history preserved.
-  Data verification: row counts match, spot-check content
+  Requirement: Migrate all board issues, columns, issue relationships. Translation:
+    - Issue IDs preserved (AR-NNN format)
+    - Python `status` strings -> Rust `BoardStatus` enum variants
+    - Python `type` strings -> Rust `IssueType` enum variants
+    - Python `owner_type` strings -> Rust `OwnerType` enum variants
+    - Python `depends_on` JSON array -> Rust `IssueRelation` records
+    - Python `gate` JSON array -> Rust `Gate` entities
+    - Python `log` text -> Rust structured `DurableEvent` entries where parseable,
+      preserved as legacy log text otherwise
+    - Python `desc` -> Rust `desc` + computed `desc_preview` (first line, 200 chars)
+    - Python epoch `created`/`updated` -> Rust `DateTime<Utc>`
+    - `pinned`, `archived`, `pos`, `rev`, `tags` -> direct mapping
+    - Column definitions per group preserved
+    Dependency graph integrity verified (no dangling references, no orphaned
+    relationships). Gate history preserved.
+  Data verification: issue count matches, all fields spot-checked, dependency graph
+    intact, gate evaluations preserved
   Verify: Implementation, Data verification, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0121 — Migration: messages + history
+- [ ] RR-0121 — Migration: messages + delivery state
   Phase: 11
   Depends on: RR-0010, RR-0118
   Invariant: 29
-  Requirement: All messages, threads, delivery state migrated. History preserved.
-  Data verification: message counts match, thread integrity
+  Requirement: Migrate all messages including threads and delivery state. Translation:
+    - Python message records -> Rust `Message` entities
+    - Thread parent references preserved
+    - Delivery state strings -> `DeliveryState` enum (Queued/Delivered/Acknowledged/ActedOn)
+    - Sender/recipient references -> WorkerId (using migration mapping from RR-0119)
+    - Python epoch timestamps -> `DateTime<Utc>`
+    - Inline @mentions -> `MentionRef` records
+    - Message body text preserved verbatim (no content transformation)
+  Data verification: message count matches, thread integrity verified, delivery
+    states correct, @mention references resolve
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0121a — Migration: groups + group config
+  Phase: 11
+  Depends on: RR-0016, RR-0118
+  Invariant: 12
+  Requirement: Migrate all groups with their scoped configuration. Translation:
+    - Python group records -> Rust `Group` entities with `GroupId`
+    - Group-scoped columns, gates, environment -> Rust typed config
+    - Worker-to-group membership -> `Worker.group: Option<GroupId>`
+    - Group-scoped prefs -> three-tier scope resolution
+  Data verification: group count matches, worker membership preserved, scoped config
+    resolves correctly
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
@@ -6904,17 +7014,69 @@ consistent with their dependencies.
   Phase: 11
   Depends on: RR-0058, RR-0118
   Invariant: —
-  Requirement: All schedules and run history migrated. Source field preserved.
-  Data verification: schedule counts match, run history intact
+  Requirement: Migrate all durable schedules and run history. Translation:
+    - Python schedule records -> Rust `DurableSchedule` entities
+    - `schedule_expr` string -> parsed and re-validated cron expression
+    - `session` field -> `WorkerId` (via migration mapping)
+    - Run history preserved with `source` field (manual/cron) intact
+    - `enabled` flag preserved
+    - Epoch timestamps -> `DateTime<Utc>`
+    Any schedule expression that fails re-validation produces a warning, not a
+    silent skip; the schedule is migrated as disabled with the error noted.
+  Data verification: schedule count matches, run history count matches, source
+    discrimination preserved, cron expressions re-validate
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
 - [ ] RR-0123 — Migration: memories
   Phase: 11
-  Depends on: RR-0071, RR-0118
+  Depends on: RR-0014, RR-0071, RR-0118
   Invariant: 42
-  Requirement: All memory entries migrated with scope, version, provenance.
-  Data verification: memory counts match, scope isolation preserved
+  Requirement: Migrate all memory entries. Translation:
+    - Python memory records -> Rust `MemoryEntry` entities
+    - Scope resolution (global/group/worker) preserved
+    - Version numbers preserved or re-initialized at 1
+    - `memory_type` string -> `MemoryType` enum
+    - Provenance tracking: migrated entries marked `provenance: MigratedFromPython`
+    - Soft-deleted entries preserved (not discarded during migration)
+  Data verification: memory count matches (including soft-deleted), scope isolation
+    preserved, MEMORY.md regenerates correctly from migrated entries
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0123a — Migration: logs + structured events + interaction history
+  Phase: 11
+  Depends on: RR-0009, RR-0118
+  Invariant: 24, 30
+  Requirement: Migrate all log and event data. Translation:
+    - Python `interaction_log` table -> Rust `DurableEvent` entries where structured
+      data is parseable, `LegacyLogEntry` otherwise
+    - Python log timestamps (MILLISECONDS, not seconds -- known incident) ->
+      `DateTime<Utc>` with correct conversion
+    - Python `actor`/`session` fields -> Rust `Actor` enum + `WorkerId`
+    - Event types/kinds mapped to `EventKind` enum variants
+    - Events that cannot be cleanly typed preserved as `EventKind::Legacy { raw: String }`
+    - Correlation IDs generated for migrated events where inferable from context
+    - Append-only integrity: no migrated event is modified or dropped
+  Data verification: event count matches, timestamps are correct (verify
+    millisecond-to-datetime conversion), actor references resolve, no data loss
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0123b — Migration: token/cost ledger
+  Phase: 11
+  Depends on: RR-0007, RR-0118
+  Invariant: 20
+  Requirement: Migrate all token usage and cost records. Translation:
+    - Python token ledger records -> Rust `ProviderUsage` / usage tracking tables
+    - Provider name strings -> `Provider` enum
+    - Model name strings -> `ModelId`
+    - Token counts preserved
+    - Cost values preserved with currency
+    - Per-worker, per-issue, per-turn usage attribution maintained
+    - Epoch timestamps -> `DateTime<Utc>`
+  Data verification: total token counts match before/after, per-worker totals match,
+    cost sums match
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
@@ -6922,27 +7084,82 @@ consistent with their dependencies.
   Phase: 11
   Depends on: RR-0020, RR-0118
   Invariant: 2
-  Requirement: All prefs and settings migrated.
-  Data verification: pref counts match, values correct
-  Verify: Implementation, Data verification
-  Status: TODO
-
-- [ ] RR-0125 — Migration: email, calendar, CRM data
-  Phase: 11
-  Depends on: RR-0088, RR-0089, RR-0090, RR-0118
-  Invariant: —
-  Requirement: Email metadata, calendar events, CRM contacts all migrated.
-  Data verification: row counts match per table
+  Requirement: Migrate all prefs and settings. Translation:
+    - Python pref key strings -> Rust typed pref enum/struct
+    - Pref values: JSON strings -> Rust typed values with validation
+    - Scope (global/worker/group) preserved
+    - Unknown pref keys preserved in a `legacy_prefs` table for manual review
+    Any pref value that fails type validation migrates with the original string
+    value preserved and a migration warning.
+  Data verification: pref count matches, values correct, scope resolution works
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0126 — Migration: browser profiles, files, interaction history
+- [ ] RR-0125 — Migration: email metadata
   Phase: 11
-  Depends on: RR-0092, RR-0093, RR-0118
+  Depends on: RR-0088, RR-0118
   Invariant: —
-  Requirement: Browser profile metadata, files/file metadata, interaction/event
-    history, token/cost ledger migrated.
-  Data verification: row counts match, spot-check content
+  Requirement: Migrate all email metadata. Translation:
+    - Python email event/metadata records -> Rust email tables
+    - RFC822 message IDs preserved
+    - Thread references (In-Reply-To, References) preserved
+    - Account associations preserved
+    - Send audit log preserved with session attribution -> WorkerId
+    - Epoch timestamps -> `DateTime<Utc>`
+  Data verification: email record count matches, thread references intact, audit
+    log attributions resolve to valid WorkerIds
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0125a — Migration: calendar events
+  Phase: 11
+  Depends on: RR-0089, RR-0118
+  Invariant: —
+  Requirement: Migrate all calendar events. Translation:
+    - Python cal_events table -> Rust calendar events
+    - All-day vs timed events preserved
+    - Timezone handling verified (UTC storage)
+    - iCal feed regenerates correctly from migrated events
+    - S3 upload key preserved (not regenerated -- would break Google Calendar
+      subscriptions)
+  Data verification: event count matches, iCal feed content matches pre-migration feed
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0125b — Migration: CRM contacts + interactions
+  Phase: 11
+  Depends on: RR-0090, RR-0118
+  Invariant: —
+  Requirement: Migrate all CRM contacts, tags, and interaction records. Translation:
+    - Python CRM contact records -> Rust `CrmContact` entities
+    - Tags preserved
+    - Interaction history preserved with timestamps
+  Data verification: contact count matches, tags intact, interaction history present
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0126 — Migration: browser profiles + metadata
+  Phase: 11
+  Depends on: RR-0092, RR-0118
+  Invariant: —
+  Requirement: Migrate browser profile metadata. Translation:
+    - Python browser profile records -> Rust `BrowserProfile` entities
+    - Chrome data directory paths preserved (platform-specific resolution)
+    - Saved auth domain inventory preserved
+    - Profile lock state NOT migrated (fresh reconciliation on first Rust startup)
+  Data verification: profile count matches, paths resolve, auth domains listed
+  Verify: Implementation, Data verification, Integration tests
+  Status: TODO
+
+- [ ] RR-0126a — Migration: files + file metadata
+  Phase: 11
+  Depends on: RR-0093, RR-0118
+  Invariant: —
+  Requirement: Migrate all file metadata and references. Translation:
+    - Python file records -> Rust file metadata tables
+    - File paths preserved and verified accessible
+    - Upload metadata preserved
+  Data verification: file count matches, referenced files exist on disk
   Verify: Implementation, Data verification
   Status: TODO
 
@@ -6950,72 +7167,202 @@ consistent with their dependencies.
   Phase: 11
   Depends on: RR-0095, RR-0118
   Invariant: —
-  Requirement: All remaining Python tables migrated or explicitly deprecated.
-    Integration configuration, MCP configuration, alerts, journal entries.
-  Data verification: no table left unaccounted in manifest
+  Requirement: Migrate all remaining Python tables. Translation:
+    - Integration configuration records -> Rust typed config
+    - MCP server configuration -> preserved (used by workers)
+    - Alert records -> Rust alert table
+    - Journal entries -> Rust journal or `DurableEvent` as appropriate
+    Every table from the schema discovery (RR-0117) must appear in the manifest.
+    No table left unaccounted.
+  Data verification: no table unaccounted in manifest, row counts match per table
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0128 — Migration existing-data acceptance: board subsystem
+- [ ] RR-0128 — Acceptance: migrated board data
   Phase: 11
   Depends on: RR-0120
   Invariant: 3, 7
-  Requirement: Open a migrated issue in Rust server. View transitions. Check gates.
-    Edit. Search. Verify behavior identical to Python.
-  Browser verification: migrated board data works in UI
+  Requirement: Exercise migrated board data through the Rust server:
+    - Open a migrated issue in the dashboard -> renders correctly
+    - View issue transitions/history -> all historical transitions visible
+    - Check gate status -> gates derived correctly from migrated type
+    - Edit issue (title, desc, status) -> mutation works, revision increments
+    - Search for migrated issue by content -> appears in results
+    - View dependency graph -> migrated relationships intact
+    - Archive/restore a migrated issue -> round-trip preserves fields
+    - Verify `desc_preview` computed correctly from migrated `desc`
+  Browser verification: migrated board data works fully in UI
+  Verify: Integration tests, Browser verification, API verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0129 — Acceptance: migrated workers
+  Phase: 11
+  Depends on: RR-0119, RR-0119a
+  Invariant: 1, 43
+  Requirement: Exercise migrated workers through the Rust server:
+    - List migrated workers -> all appear with correct display_name
+    - Worker detail -> config loaded from migrated WorkerConfig
+    - Start a migrated worker on Herdr -> session starts with WorkerId-based ref
+    - Send prompt to migrated worker -> delivers via AgentProtocol
+    - Receive events from migrated worker -> status updates in dashboard
+    - Verify migrated group membership -> scope resolution correct
+    - Verify old session name resolves as alias (@old-name -> correct worker)
+    - Rename migrated worker -> alias created, identity preserved
+    - Change migrated worker's model -> correct ConfigApplyMode triggered
+  Browser verification: migrated workers render and function in dashboard
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0129 — Migration existing-data acceptance: worker subsystem
-  Phase: 11
-  Depends on: RR-0119
-  Invariant: 1, 43
-  Requirement: Start a migrated worker on Rust server. Verify config loaded correctly.
-    Verify worker identity preserved. Send prompt. Receive events.
-  Verify: Integration tests, Migration (existing)
-  Status: TODO
-
-- [ ] RR-0130 — Migration existing-data acceptance: messages
+- [ ] RR-0130 — Acceptance: migrated messages
   Phase: 11
   Depends on: RR-0121
   Invariant: 29
-  Requirement: Search migrated messages. View thread. Verify delivery states.
-  Browser verification: migrated messages visible in UI
+  Requirement: Exercise migrated messages through the Rust server:
+    - Search migrated messages by content -> appear in search results
+    - View message thread -> thread integrity preserved
+    - View delivery states -> states migrated correctly
+    - View @mentions in messages -> resolve to correct workers (via WorkerId)
+    - Send new reply to migrated thread -> threads correctly
+    - Message visible in issue detail -> correlated view works
+  Browser verification: migrated messages visible and functional in UI
+  Verify: Integration tests, Browser verification, API verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0130a — Acceptance: migrated groups
+  Phase: 11
+  Depends on: RR-0121a
+  Invariant: 12
+  Requirement: Exercise migrated groups through the Rust server:
+    - List groups -> all migrated groups appear
+    - Group detail -> scoped config resolves correctly
+    - Workers in migrated group -> see group-level gates, columns, env
+    - Create issue in migrated group -> group scope applied
+    - Verify group-scoped gates -> gate derivation correct
+  Browser verification: migrated groups render and scope correctly
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131 — Migration existing-data acceptance: schedules
+- [ ] RR-0131 — Acceptance: migrated schedules
   Phase: 11
   Depends on: RR-0122
   Invariant: —
-  Requirement: View migrated schedules. Edit one. Run-now. Verify run history.
-  Browser verification: migrated schedules in dashboard
+  Requirement: Exercise migrated schedules through the Rust server:
+    - View migrated schedules in dashboard -> render correctly
+    - View run history -> historical runs visible with correct source (manual/cron)
+    - Edit a migrated schedule -> mutation works
+    - Run-now a migrated schedule -> fires, new run recorded with source=manual
+    - Verify cron expression re-validation -> all migrated expressions parseable
+    - Verify worker references -> schedule targets correct WorkerId
+  Browser verification: migrated schedules in dashboard with run history
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0132 — Migration existing-data acceptance: scoped config
+- [ ] RR-0131a — Acceptance: migrated logs + events
+  Phase: 11
+  Depends on: RR-0123a
+  Invariant: 24, 30
+  Requirement: Exercise migrated log/event data through the Rust server:
+    - View issue history -> migrated events appear with correct timestamps
+    - Search events -> migrated events in search results
+    - `amux why issue <migrated-id>` -> provenance chain includes migrated events
+    - Verify timestamp correctness (millisecond-epoch conversion validated)
+    - Verify actor references -> resolve to valid workers
+    - Verify structured vs legacy events -> both render appropriately
+  Browser verification: migrated events visible in issue detail and search
+  CLI verification: `amux why` returns migrated event data
+  Verify: Integration tests, Browser verification, CLI verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0131b — Acceptance: migrated memories
+  Phase: 11
+  Depends on: RR-0123
+  Invariant: 42
+  Requirement: Exercise migrated memories through the Rust server:
+    - List memories for a scope -> migrated entries appear
+    - Read a migrated memory -> content preserved
+    - Edit a migrated memory -> version increments, content updates
+    - Verify scope isolation -> worker memory not visible at group scope
+    - MEMORY.md regenerated from migrated entries -> valid markdown
+    - Search for memory content -> appears in universal search
+  API verification: memory CRUD on migrated entries
+  Verify: Integration tests, API verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0131c — Acceptance: migrated email/calendar/CRM
+  Phase: 11
+  Depends on: RR-0125, RR-0125a, RR-0125b
+  Invariant: —
+  Requirement: Exercise migrated integration data through the Rust server:
+    - Email inbox -> migrated email metadata renders
+    - Email search -> migrated emails appear in results
+    - Calendar -> migrated events render, iCal feed correct
+    - CRM -> migrated contacts render with tags and interaction history
+    - Reply to migrated email thread -> threading correct (In-Reply-To preserved)
+  Browser verification: email, calendar, CRM dashboards show migrated data
+  Verify: Integration tests, Browser verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0131d — Acceptance: migrated browser profiles + token ledger
+  Phase: 11
+  Depends on: RR-0123b, RR-0126
+  Invariant: —
+  Requirement: Exercise migrated ancillary data through the Rust server:
+    - Browser profiles -> inventory shows migrated profiles with auth domains
+    - Start a migrated profile -> Chrome launches with correct data dir
+    - Token ledger -> migrated usage data visible in provider quota dashboard
+    - Per-worker token totals match pre-migration values
+    - Cost summaries match pre-migration values
+  Browser verification: profiles and token data render correctly
+  Verify: Integration tests, Browser verification, Migration (existing)
+  Status: TODO
+
+- [ ] RR-0132 — Acceptance: migrated scoped config
   Phase: 11
   Depends on: RR-0124
   Invariant: 2
-  Requirement: Resolve migrated scoped config via `amux config show --effective`.
-    Verify inheritance chain correct.
-  CLI verification: effective config output
+  Requirement: Resolve migrated scoped config through all interfaces:
+    - `amux config show --effective --worker=X` -> correct inheritance chain
+    - Verify global -> group -> worker override precedence
+    - Verify migrated pref values loaded correctly
+    - Unknown/legacy pref keys accessible for manual review
+  CLI verification: effective config output matches expected
   Verify: Integration tests, CLI verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0133 — Migration net-new acceptance: full lifecycle
+- [ ] RR-0133 — Acceptance: net-new full lifecycle (all subsystems)
   Phase: 11
   Depends on: RR-0078, RR-0118
   Invariant: 7, 45
-  Requirement: Create new worker, new group, new issue, new gate, new schedule,
-    send message, rename worker, change cwd, change model, upload file, perform
-    search. Full lifecycle through Rust system with fresh data.
-  Verify: Integration tests, Browser verification, CLI verification, Migration (net-new)
+  Requirement: Create entirely new data through the Rust system and prove the
+    complete lifecycle works for every subsystem:
+    - Create new worker (Herdr) -> start -> send prompt -> receive events
+    - Rename worker -> alias created, identity preserved
+    - Change worker cwd -> session replaced, context preserved
+    - Change worker model -> correct apply mode
+    - Change worker provider -> session restart, state preserved
+    - Create new group -> add worker -> verify scoped config
+    - Create new issue -> assign -> work -> complete -> verify
+    - Create gate -> trigger on transition -> gate modal -> satisfy -> proceed
+    - Create dependency (parent + children) -> children complete -> parent runnable
+    - Create schedule -> run-now -> verify run recorded with source
+    - Send message -> delivery at turn boundary -> acknowledge
+    - @mention worker in issue -> mention delivered
+    - Create memory -> read -> edit -> verify version
+    - Upload file -> download -> verify content
+    - Compose email -> send -> verify in sent
+    - Create calendar event -> verify in iCal feed
+    - Create CRM contact -> add tag -> add interaction
+    - Create browser profile -> start -> screenshot -> stop
+    - Perform universal search -> results span all new entities
+    - Go offline -> create board card -> reconnect -> replay -> verify
+    - Token usage recorded for new work -> visible in ledger
+  Verify: Integration tests, Browser verification, CLI verification, API verification,
+    Offline behavior, Migration (net-new)
   Status: TODO
 
 - [ ] RR-0134 — Shadow mode: Rust on 8823 alongside Python on 8822
   Phase: 11
-  Depends on: RR-0118 through RR-0133
+  Depends on: RR-0117 through RR-0133 (all migration + acceptance items incl. sub-IDs)
   Invariant: —
   Requirement: Both servers read same DB (WAL concurrent readers). Automated
     traffic replay compares responses. Run for 1 week.
@@ -7056,7 +7403,7 @@ consistent with their dependencies.
 
 - [ ] RR-0138 — Migration rehearsal
   Phase: 11
-  Depends on: RR-0118 through RR-0133
+  Depends on: RR-0117 through RR-0133 (all migration + acceptance items incl. sub-IDs)
   Invariant: 45
   Requirement: Clone production data -> run migration end-to-end -> validate
     manifest -> start Rust on migrated copy -> browser/CLI/API verification ->
