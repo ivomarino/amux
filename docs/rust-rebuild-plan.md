@@ -1061,6 +1061,45 @@ enum VerifierKind {
 
 Verifiers run in cost order. If the free checks fail, expensive ones never run.
 
+### Design rule: self-documenting by construction
+
+The system is its own documentation. No separate design doc, wiki, or README should
+be required to understand what the system does, how it works, or why a decision was
+made. This is enforced structurally, not by discipline:
+
+1. **Types ARE the spec.** `WorkerCommand`, `WorkerEvent`, `BoardTransition`,
+   `GateEvaluator`, `StallReason`, `ProviderState` -- reading the enum variants tells
+   you exactly what the system can do. No prose description of "supported commands"
+   that drifts from the code.
+
+2. **API contract IS the documentation.** `JsonSchema` derives generate the OpenAPI
+   spec from the same structs that handle requests. The spec cannot disagree with the
+   implementation because it IS the implementation. `/api/spec.json` is always current.
+
+3. **Error messages ARE the user guide.** Gate rejections return the exact gate
+   criteria, the missing evidence, and the CLI command to satisfy them (Invariant 18).
+   A 409 body teaches you what to do next. `why-blocked` returns the full chain.
+   No separate "troubleshooting" doc.
+
+4. **Event history IS the audit trail.** `DurableEvent` (Invariant 24) means every
+   state transition is queryable: `amux issue AR-123 history` shows who did what,
+   when, and why. No separate audit log to maintain.
+
+5. **Test names ARE the requirements.** Each Playwright golden scenario and each
+   proptest property IS a requirement. If the test passes, the requirement is met. If
+   the test is missing, the requirement is unspecified.
+
+6. **Config structure IS the admin guide.** Three-tier scope (Invariant 2) with
+   `effective_config` means there is one way to configure anything, and
+   `amux config show --effective --worker=X` shows exactly what is in effect and where
+   each value came from (global, group, or worker override).
+
+7. **The dependency graph IS the project plan.** `IssueRelation` (Invariant 4) means
+   the board itself shows what blocks what. No separate Gantt chart or project tracker.
+
+The bar: a new contributor should be able to understand the system by reading types,
+running tests, and querying the API -- without opening a single markdown file.
+
 ---
 
 ## The Orchestrator (updated mental model)
