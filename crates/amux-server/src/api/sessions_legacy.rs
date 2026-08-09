@@ -95,14 +95,31 @@ impl FleetSignals {
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
         let mut running = BTreeSet::new();
-        if let Ok(o) = std::process::Command::new("tmux")
+        // The Ok() only means the SPAWN worked — tmux exiting non-zero (no
+        // server, wrong socket) still lands here with empty stdout, and an
+        // empty fleet is indistinguishable from a dead probe (ethos rule 4;
+        // live incident 2026-08-09: launchd build served running=0 for 116
+        // cards while 62 tmux sessions ran, with nothing in the log).
+        let tmux_out = std::process::Command::new("tmux")
             .args([
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{session_activity}\t#{session_created}",
             ])
-            .output()
-        {
+            .output();
+        match &tmux_out {
+            Ok(o) if !o.status.success() => tracing::warn!(
+                status = %o.status,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "tmux list-sessions failed — fleet will read as not-running"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "tmux spawn failed — fleet will read as not-running"
+            ),
+            _ => {}
+        }
+        if let Ok(o) = tmux_out {
             for l in String::from_utf8_lossy(&o.stdout).lines() {
                 let mut it = l.split('\t');
                 let (Some(n), a, c) = (it.next(), it.next(), it.next()) else {
