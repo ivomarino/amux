@@ -618,7 +618,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-08
 SESSION: amux
-CARD: AMUX-2554
+CARD: AMUX-2443
 SYMPTOM: I staged amux-server.py and committed; the commit also carried
   tests/test_board_full_cache_generation.py — amux-frustrations' AF-12 test, sitting
   in the SHARED index. The staged-guard warned about the co-edited server file but
