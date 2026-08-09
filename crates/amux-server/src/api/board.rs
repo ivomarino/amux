@@ -159,7 +159,7 @@ fn detail_body(row: &IssueRow) -> Value {
 /// desc truncated to its first line (max 200 chars) with `desc_truncated`
 /// set when it was cut; `log` never ships in a list — `log_n` (line count)
 /// stands in. `slim` additionally drops desc and adds `desc_len`.
-fn list_body(row: &IssueRow, slim: bool) -> Value {
+pub fn list_body(row: &IssueRow, slim: bool) -> Value {
     let mut v = detail_body(row);
     let obj = v.as_object_mut().expect("detail_body is an object");
     obj.remove("log");

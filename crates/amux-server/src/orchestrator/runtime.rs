@@ -748,6 +748,65 @@ impl Runtime {
                         ))),
                     }
                 }
+                amux_core::protocol::WorkerCommand::ExecuteTask(task_id) => {
+                    // The MODEL needs the WORK, not a task id (the live
+                    // golden bridged this with a CLAUDE.md briefing — the
+                    // real fix). Build the feed-forward prompt from the
+                    // board row + attempt history (Invariant 49).
+                    let prompt_text = {
+                        let conn = self.store.read()?;
+                        let row = {
+                            // internal id -> semantic row: scan open issues
+                            // re-minting ids (the interop shim is one-way).
+                            let rows = crate::db::board_store::list_issues(
+                                &conn,
+                                &[],
+                                &[],
+                                crate::db::board_store::ArchivedFilter::ActiveOnly,
+                            )
+                            .unwrap_or_default();
+                            rows.into_iter().find(|r| {
+                                crate::db::board_store::internal_id(&r.id) == *task_id
+                            })
+                        };
+                        match row {
+                            Some(r) => {
+                                let asg = amux_core::orchestrator::WorkAssignment {
+                                    task: task_id.clone(),
+                                    worker: worker.clone(),
+                                    attempt: cmd.attempts + 1,
+                                    lease: amux_core::orchestrator::Lease {
+                                        task: task_id.clone(),
+                                        worker: worker.clone(),
+                                        acquired_at: now,
+                                        expires_at: now,
+                                        generation: 0,
+                                    },
+                                    idempotency_key: cmd.idempotency_key.clone(),
+                                    prior_attempts: vec![],
+                                };
+                                format!(
+                                    "{}
+(board card {} — move it through the board as you work)",
+                                    amux_core::orchestrator::assignment_prompt(
+                                        &r.title, &r.desc, &asg
+                                    ),
+                                    r.id
+                                )
+                            }
+                            None => serde_json::to_string(&cmd.command).unwrap_or_default(),
+                        }
+                    };
+                    protocol
+                        .send_prompt(
+                            &worker,
+                            crate::opencode::Prompt {
+                                text: prompt_text,
+                                idempotency_key: cmd.idempotency_key.clone(),
+                            },
+                        )
+                        .await
+                }
                 other => {
                     protocol
                         .send_prompt(

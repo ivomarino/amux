@@ -1086,10 +1086,16 @@ mod tests {
         assert_eq!(canonical["total"], json!(1));
         assert_eq!(canonical["truncated"], json!(false)); // PagedResponse shape
 
+        // Bare /api/sessions now serves the PYTHON SHAPE (bare array from
+        // the dedicated handler, no Deprecated header) — the SPA's
+        // fetchSessions throws on anything else (browser-golden finding #3).
         let (st, headers, legacy) = send(&app, "GET", "/api/sessions", None).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(headers.get("deprecated").unwrap(), "true");
-        assert_eq!(legacy, canonical); // same handler, same body
+        assert!(headers.get("deprecated").is_none());
+        let arr = legacy.as_array().expect("bare array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], json!("w"));
+        assert!(arr[0]["status"].is_string());
 
         let (st, headers, detail) = send(&app, "GET", "/api/sessions/w", None).await;
         assert_eq!(st, StatusCode::OK);

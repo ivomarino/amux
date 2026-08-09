@@ -34,22 +34,34 @@ fn python_status(state_json: &str) -> &'static str {
     }
 }
 
+/// The legacy array as a JSON string, shared by the GET handler and the
+/// SSE `sessions` pushes (one serializer, two transports).
+pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<String> {
+    let conn = store.read()?;
+    let arr = build_array(&conn)?;
+    Ok(serde_json::to_string(&arr)?)
+}
+
 pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
     let conn = match state.store.read() {
         Ok(c) => c,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     };
-    let mut stmt = match conn.prepare(
+    match build_array(&conn) {
+        Ok(arr) => Json(serde_json::Value::Array(arr)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
                 (SELECT COUNT(*) FROM _amux_sessions s
                  WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live
          FROM _amux_workers w
          WHERE json_extract(w.state, '$.deleted_at') IS NULL
          ORDER BY w.display_name",
-    ) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    )?;
     let rows = stmt.query_map([], |r| {
         let name: String = r.get(0)?;
         let state_json: String = r.get(1)?;
@@ -73,14 +85,8 @@ pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
             "tags": [],
             "steering_queue": [],
         }))
-    });
-    let mut out = Vec::new();
-    if let Ok(rows) = rows {
-        for row in rows.flatten() {
-            out.push(row);
-        }
-    }
-    Json(serde_json::Value::Array(out)).into_response()
+    })?;
+    rows.collect()
 }
 
 #[cfg(test)]

@@ -75,6 +75,13 @@ pub fn alias_layer(router: Router) -> Router {
 /// like `/api/sessionsfoo`, which must NOT rewrite).
 fn rewrite_legacy_uri(uri: &Uri) -> Option<Uri> {
     let path = uri.path();
+    // The bare legacy LIST path has a dedicated Python-SHAPE handler
+    // (api::sessions_legacy) — rewriting it to /api/workers would serve the
+    // modern envelope to the SPA, whose fetchSessions throws on a non-array
+    // (browser-golden finding #3). Sub-paths still rewrite.
+    if path == "/api/sessions" {
+        return None;
+    }
     for (legacy, canonical) in ROUTE_ALIASES {
         let rest = if path == *legacy {
             Some("")
@@ -309,7 +316,8 @@ mod tests {
     #[test]
     fn rewrite_maps_prefix_subpath_and_query_but_not_near_misses() {
         let u = |s: &str| s.parse::<Uri>().unwrap();
-        assert_eq!(rewrite_legacy_uri(&u("/api/sessions")).unwrap().path(), "/api/workers");
+        // Bare /api/sessions is exempt: it has a dedicated shape handler.
+        assert!(rewrite_legacy_uri(&u("/api/sessions")).is_none());
         let r = rewrite_legacy_uri(&u("/api/sessions/abc/peek?lines=600")).unwrap();
         assert_eq!(r.path(), "/api/workers/abc/peek");
         assert_eq!(r.query(), Some("lines=600"));
@@ -353,10 +361,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_route_resolves_to_same_handler_with_deprecated_header() {
         let app = demo_app();
-        let (st, dep, body) = fetch(&app, "/api/sessions").await;
-        assert_eq!(st, StatusCode::OK);
-        assert_eq!(dep.as_deref(), Some("true"));
-        assert_eq!(body, "list");
+        // Bare /api/sessions is EXEMPT (dedicated shape handler wins) — the
+        // demo app has no such route, so it 404s instead of rewriting.
+        let (st, _dep, _body) = fetch(&app, "/api/sessions").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
 
         // Path params survive the rewrite.
         let (st, dep, body) = fetch(&app, "/api/sessions/abc").await;

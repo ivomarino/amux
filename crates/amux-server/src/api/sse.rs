@@ -1,10 +1,16 @@
-//! `/api/events` — SSE with revisioned StateEvents (RR-0023, Invariant 35).
+//! `/api/events` — SSE (RR-0023/RR-0042, Invariants 35/26).
 //!
-//! Every event carries the global revision, so a client can detect a gap
-//! (missed events while backgrounded) and recover via `/api/sync?since_rev=`
-//! instead of trusting an incomplete picture. A real `{"type":"ping"}` every
-//! 10s lets clients detect zombie connections (carried over from the Python
-//! SSE contract — clients declare staleness at 18s of silence).
+//! Speaks BOTH dialects on one stream:
+//! - Modern: revisioned StateEvents (`{"type":"state",...}`) + gap
+//!   detection (`lagged`) + `hello` carrying the current rev.
+//! - Legacy: the Python dashboard's own event vocabulary —
+//!   `{"type":"board","payload":[...]}` and `{"type":"sessions",
+//!   "payload":[...]}` full-list pushes, coalesced. Without these the SPA
+//!   CONNECTS (so its polling fallback disarms) and then understands
+//!   nothing — strictly worse than no SSE at all, which is exactly what
+//!   the browser-golden run demonstrated. The 10s `{"type":"ping"}`
+//!   keep-alive serves both dialects (the SPA's 18s staleness detector
+//!   feeds on it).
 
 use super::AppState;
 use axum::extract::State;
@@ -19,8 +25,11 @@ pub async fn events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.store.subscribe();
     let current = state.store.current_rev().map(|r| r.0).unwrap_or(0);
+    let store = state.store.clone();
 
     let stream = async_stream(current, move |yielder: tokio::sync::mpsc::Sender<Event>| async move {
+        // Initial full pushes so a fresh client renders without a poll.
+        push_legacy(&store, &yielder, true, true).await;
         loop {
             match rx.recv().await {
                 Ok(ev) => {
@@ -35,11 +44,40 @@ pub async fn events(
                     {
                         break; // client went away
                     }
+                    // Legacy dialect: coalesce this event plus everything
+                    // already queued (a burst of N writes = one list push).
+                    let mut board_dirty = matches!(
+                        ev.entity_type,
+                        amux_core::revision::EntityType::Task
+                    );
+                    let mut sessions_dirty = matches!(
+                        ev.entity_type,
+                        amux_core::revision::EntityType::Worker
+                            | amux_core::revision::EntityType::Session
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    while let Ok(more) = rx.try_recv() {
+                        board_dirty |= matches!(
+                            more.entity_type,
+                            amux_core::revision::EntityType::Task
+                        );
+                        sessions_dirty |= matches!(
+                            more.entity_type,
+                            amux_core::revision::EntityType::Worker
+                                | amux_core::revision::EntityType::Session
+                        );
+                    }
+                    if (board_dirty || sessions_dirty)
+                        && !push_legacy(&store, &yielder, board_dirty, sessions_dirty).await
+                    {
+                        break;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                     // Backpressure (Invariant 26): a slow client that missed
                     // events is TOLD so, with the count — it must delta-sync,
-                    // not assume continuity.
+                    // not assume continuity. Legacy clients get fresh full
+                    // lists, which IS their recovery.
                     let payload = serde_json::json!({
                         "type": "lagged",
                         "missed": missed,
@@ -49,6 +87,9 @@ pub async fn events(
                         .await
                         .is_err()
                     {
+                        break;
+                    }
+                    if !push_legacy(&store, &yielder, true, true).await {
                         break;
                     }
                 }
@@ -63,6 +104,69 @@ pub async fn events(
             .interval(Duration::from_secs(10))
             .text("{\"type\":\"ping\"}"),
     )
+}
+
+/// Push the legacy full-list events. Returns false when the client is gone.
+async fn push_legacy(
+    store: &crate::db::SharedStore,
+    yielder: &tokio::sync::mpsc::Sender<Event>,
+    board: bool,
+    sessions: bool,
+) -> bool {
+    if board {
+        let payload = {
+            let s = store.clone();
+            tokio::task::spawn_blocking(move || legacy_board_json(&s))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(json) = payload {
+            let ev = format!("{{\"type\":\"board\",\"payload\":{json}}}");
+            if yielder.send(Event::default().data(ev)).await.is_err() {
+                return false;
+            }
+        }
+    }
+    if sessions {
+        let payload = {
+            let s = store.clone();
+            tokio::task::spawn_blocking(move || legacy_sessions_json(&s))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(json) = payload {
+            let ev = format!("{{\"type\":\"sessions\",\"payload\":{json}}}");
+            if yielder.send(Event::default().data(ev)).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn legacy_board_json(store: &crate::db::SharedStore) -> Option<String> {
+    let conn = store.read().ok()?;
+    let rows = crate::db::board_store::list_issues(
+        &conn,
+        &[],
+        &[],
+        crate::db::board_store::ArchivedFilter::ActiveOnly,
+    )
+    .ok()?;
+    let (kept, _, _) = crate::db::board_store::cap_terminal(rows, 100);
+    let items: Vec<serde_json::Value> = kept
+        .iter()
+        // The API's own list serializer — the SSE view and the GET view can
+        // never disagree (a view must share its mechanism's predicate).
+        .map(|r| crate::api::board::list_body(r, false))
+        .collect();
+    serde_json::to_string(&items).ok()
+}
+
+fn legacy_sessions_json(store: &crate::db::SharedStore) -> Option<String> {
+    crate::api::sessions_legacy::legacy_sessions_array(store).ok()
 }
 
 /// Bridge an async producer into an SSE stream, prefixed with a `hello`
