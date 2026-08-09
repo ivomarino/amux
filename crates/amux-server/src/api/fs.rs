@@ -79,7 +79,7 @@ pub fn routes() -> Router<AppState> {
 // Shared JSON plumbing
 // ---------------------------------------------------------------------------
 
-fn j(status: u16, v: Value) -> Response {
+pub(crate) fn j(status: u16, v: Value) -> Response {
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Json(v),
@@ -89,7 +89,7 @@ fn j(status: u16, v: Value) -> Response {
 
 /// Python's generic fallthrough 404 (`{"error": "not found"}`), which is
 /// what wrong-method and unknown /api/fs/* requests get.
-async fn not_found() -> Response {
+pub(crate) async fn not_found() -> Response {
     j(404, json!({"error": "not found"}))
 }
 
@@ -102,7 +102,7 @@ async fn not_found() -> Response {
 /// the regex crate has no look-ahead (clippy::invalid_regex caught the naive
 /// port), so the same rule is applied by hand: a `\` NOT followed by a valid
 /// JSON escape is doubled.
-fn parse_body(bytes: &[u8]) -> Result<Value, String> {
+pub(crate) fn parse_body(bytes: &[u8]) -> Result<Value, String> {
     if bytes.is_empty() {
         return Ok(json!({}));
     }
@@ -141,14 +141,14 @@ fn parse_body(bytes: &[u8]) -> Result<Value, String> {
 }
 
 /// str-typed body field with Python `.get(k) or ""` semantics.
-fn body_str(body: &Value, key: &str) -> String {
+pub(crate) fn body_str(body: &Value, key: &str) -> String {
     body.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
 /// Python `urllib.parse.parse_qs` equivalent: repeated keys kept, `+` is a
 /// space, percent-decoding is utf-8 lossy. Hand-rolled because axum's Query
 /// collapses repeated keys (search's `glob` is repeatable).
-fn parse_qs(query: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_qs(query: &str) -> Vec<(String, String)> {
     fn dec(s: &str) -> String {
         let s = s.replace('+', " ");
         let bytes = s.as_bytes();
@@ -177,7 +177,7 @@ fn parse_qs(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn qs_get<'a>(qs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(crate) fn qs_get<'a>(qs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     qs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
@@ -192,7 +192,7 @@ fn home_dir() -> PathBuf {
 /// `Path(s).expanduser()`. `~user` forms are left untouched (Python would
 /// consult passwd; such a path stays relative here and fails the same
 /// `is_absolute` checks downstream).
-fn expanduser(s: &str) -> PathBuf {
+pub(crate) fn expanduser(s: &str) -> PathBuf {
     if s == "~" {
         home_dir()
     } else if let Some(rest) = s.strip_prefix("~/") {
@@ -206,7 +206,7 @@ fn expanduser(s: &str) -> PathBuf {
 /// interior `.` collapse, `..` is KEPT, trailing slash dropped. Rust's
 /// `Components` applies the same normalization, so rebuilding from it
 /// matches Python's string form.
-fn pystr(p: &Path) -> String {
+pub(crate) fn pystr(p: &Path) -> String {
     let mut out = String::new();
     for c in p.components() {
         match c {
@@ -414,7 +414,7 @@ pub fn is_dangerous_write(p: &Path) -> bool {
     DANGEROUS_WRITE_DIR_MARKERS.iter().any(|m| hay.contains(m))
 }
 
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
