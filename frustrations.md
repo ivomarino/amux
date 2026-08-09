@@ -861,3 +861,39 @@ FIX: board.rs PATCH now ports Python's archived semantics byte-for-byte
   the card id. Strays archived by hand via the Python API. Lesson repeated:
   a cleanup that cannot report failure is a generator of exactly the debris
   it exists to remove.
+
+---
+## Group-config PATCH: COALESCE arms are dead code — explicit JSON null 500s on both origins
+AREA: board
+SEVERITY: wrong-conclusion
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2597
+SYMPTOM: /api/groups/<n>/config PATCH looks like it preserves absent keys via
+  COALESCE upsert arms, but SQL NULL trips the column's NOT NULL before conflict
+  resolution ever runs — so an explicit JSON null 500s on BOTH servers and the
+  COALESCE arms can never fire. Also PATCH resets absent keys (send the full
+  object). Found while porting to Rust; verified against Python's exact schema+
+  SQL; an earlier "null preserves" reading was a killed hypothesis, recorded.
+COST: A client sending a partial config update silently wipes the other keys; a
+  null 500s with no useful message. Ported faithfully to Rust (bug-compatible)
+  so the fix must land on both or the boundary drifts.
+FIX: Decide the intended semantics (partial-merge vs full-replace), implement on
+  both servers, and add a null-body regression test each side.
+
+---
+## /api/fs/search error text promises AMUX_SEARCH_RG that Python never reads
+AREA: files
+SEVERITY: annoy
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2597
+SYMPTOM: Python's search error text tells the user to set AMUX_SEARCH_RG
+  (amux-server.py:21056) but no code reads it — a documented knob that does not
+  exist (ethos rule 6 shape: the claim without the implementation).
+COST: Anyone following the error's advice sets an env var that changes nothing.
+FIX: The Rust port implements AMUX_SEARCH_RG for real rather than inheriting the
+  false claim (crates/amux-server/src/api/fs.rs). Python side still carries the
+  dead promise — fix or delete the text there.
