@@ -17,7 +17,7 @@ Rewrite of `amux-server.py` (77k-line Python single-file server) in Rust. Not a 
 - **3 terminal backends**: herdr (primary process host), tmux, iTerm2
 - **Structured agent protocol**: OpenCode (structured commands, events, lifecycle)
 - **4 LLM providers**: Claude Code (OAuth + API key), Gemini, Codex, Ollama
-- **Full SPA dashboard** with SSE real-time updates, PWA/offline, dark/light themes
+- **Full SPA dashboard** with revisioned SSE, delta sync, PWA/offline, dark/light themes
 
 ## Why Rust
 
@@ -416,8 +416,10 @@ fn process_event(worker: &mut Worker, event: WorkerEvent) {
         WorkerEvent::Exited(_) => worker.state = WorkerState::Stopped,
         _ => {}
     }
-    // SSE emitted immediately -- dashboard sees the change within 1 event cycle
-    emit_sse(Event::WorkerStateChanged { id: worker.id, state: worker.state });
+    // DB write increments global rev; SSE carries the revisioned StateEvent
+    // Dashboard applies only if rev > local rev (Invariant 35)
+    db.persist_worker_state(worker)?;
+    emit_state_event(worker.id, EntityType::Worker, Mutation::StateChanged);
 }
 ```
 
@@ -558,53 +560,29 @@ interface QueuedOperation {
   method: string;          // POST, PATCH, DELETE
   path: string;            // /api/board/AR-7
   body?: any;              // JSON payload
+  baseRev: number;         // entity version at time of queue (for conflict detection)
   queuedAt: number;        // timestamp
   retries: number;         // retry count
   lastError?: string;      // last sync error
   optimisticState?: any;   // local state applied before server confirmed
 }
-
-interface CachedState {
-  workers: Worker[];       // last-known worker list
-  board: BoardItem[];      // last-known board state (desc-truncated)
-  workerDetails: Map<string, WorkerDetail>;  // peek/history per worker
-  lastSync: number;        // when server state was last confirmed
-  serverRev: number;       // server's state revision (for delta sync)
-}
 ```
+
+IndexedDB also persists the `EntityStore` from Invariant 35 (the normalized
+client-side cache). This is the offline rendering source. `lastRev` in the
+store drives delta sync on reconnect: `GET /api/sync?since_rev={lastRev}`.
 
 #### Server-side support
 
-```rust
-// Every mutating endpoint accepts an idempotency key
-#[derive(Deserialize)]
-struct MutationRequest<T> {
-    #[serde(flatten)]
-    payload: T,
-    #[serde(default)]
-    idempotency_key: Option<Uuid>,
-}
+All server-side sync, conflict detection, and delta reconciliation is defined
+in Invariant 35 (server-authoritative revisioned state). The offline layer
+uses those primitives:
 
-// Idempotency table: stores results of completed mutations for 24h
-// A replayed operation with the same key returns the cached result
-// without re-executing
-
-// Delta sync: client sends its last-known revision, server returns
-// only what changed since then
-#[derive(Serialize)]
-struct SyncResponse {
-    rev: u64,
-    workers: Option<Vec<Worker>>,        // None = unchanged
-    board_changes: Vec<BoardDelta>,      // additions, updates, deletions since rev
-    pending_commands: Vec<PendingCmd>,    // commands queued for this client
-}
-
-enum BoardDelta {
-    Upsert(BoardItem),
-    Delete { id: IssueId },
-    StatusChange { id: IssueId, from: Status, to: Status },
-}
-```
+- **Optimistic writes** include `base_rev` (entity version); conflicts return
+  409 with current server state (Invariant 35)
+- **Delta sync** on reconnect uses `GET /api/sync?since_rev=N` (Invariant 35)
+- **Idempotency keys** on queued operations prevent duplicate application
+  (Invariant 9)
 
 #### Conflict resolution
 
@@ -615,7 +593,7 @@ Conflicts are surfaced, never swallowed:
 | Board card moved by someone else while offline | Toast with both states, user picks |
 | Board card deleted while offline edit queued | Toast: "card was deleted", discard edit |
 | Worker command sent while worker stopped | Toast: "worker stopped", offer restart |
-| Stale optimistic state (server rev moved) | Silent merge if non-conflicting, toast if conflicting |
+| Entity version conflict (409) | Show server state, user picks or merges |
 
 #### Service worker caching
 
@@ -640,15 +618,12 @@ for all workers. The Rust version:
 - Configurable: user picks which workers to cache for offline
 - Storage budget: IndexedDB size limit awareness (show usage, prune old data)
 
-**Test plan**:
+**Test plan** (offline-specific; real-time convergence tests are in Invariant 35):
 - Playwright: go offline, create board card, send worker command, go online, verify
-  both applied
+  both applied with correct base_rev
 - Playwright: go offline, queue 5 commands, go online, verify all 5 replay in order
-- Playwright: offline queue + conflict (another user moved the card) shows toast
+- Playwright: offline queue + entity version conflict (409) shows toast with both states
 - Playwright: dashboard renders all tabs from service worker cache while offline
-- Playwright: delta sync -- make 3 board changes on server, client reconnects,
-  receives only the 3 deltas (not full board reload)
-- Playwright: idempotency -- replay same operation twice, verify no duplicate
 - Playwright: close tab while offline with queued operations, reopen, verify queue
   survives in IndexedDB and replays on reconnect
 - Playwright: service worker update -- deploy new version, verify client picks up
@@ -1001,7 +976,7 @@ enum CommandState {
 |---|---|---|---|---|---|
 | **Command queue** (per worker) | DB-backed, survives restart | FIFO within priority | Reject 429 at capacity | 3 attempts, backoff | Dead-letter after max attempts, alert |
 | **Event channel** (per worker) | In-memory, lossy | Causal (per worker) | Drop oldest, gap marker | No retry (events are facts) | N/A |
-| **SSE channel** (per subscriber) | In-memory, lossy | Sequence-numbered | Drop oldest + reconnect hint | Client reconnects from last seq | N/A |
+| **SSE channel** (per subscriber) | In-memory, lossy | Global rev ordered (Invariant 35) | Drop oldest + reconnect hint | Client detects rev gap, delta syncs | N/A |
 | **DB write queue** | In-memory, bounded | Serialized (single writer) | Backpressure -> 503 | Retry on SQLITE_BUSY (3x) | Fail request |
 | **Message queue** (Invariant 29) | DB-backed, durable | FIFO per thread | No bound (durable) | Deliver at next turn boundary | Never (messages are durable) |
 
@@ -1091,6 +1066,223 @@ struct QueueHealth {
 A delivery rate below 90% or an oldest command older than 60s triggers a dashboard
 warning. The orchestrator uses queue depth as an input to work assignment: a worker
 with a deep queue is not a good candidate for new work.
+
+### Invariant 35: Server-authoritative revisioned state
+
+**The backend database is authoritative. The UI may optimistically predict future
+state, but every displayed entity must eventually converge to an explicitly
+revisioned backend state. Missing, duplicate, reordered, or stale realtime events
+must never produce persistent UI divergence.**
+
+SSE is notification, not the source of truth. The UI never infers "latest" from
+whichever SSE message it happened to receive last.
+
+#### Global revision
+
+Every mutating DB transaction increments a monotonic global revision. The revision
+is the single source of ordering for all state changes across all entity types.
+
+```rust
+struct StateRevision {
+    rev: u64,                  // monotonically increasing, never reset
+    entity_type: EntityType,   // Worker, Issue, Message, Group, Gate, Session, ...
+    entity_id: EntityId,
+    mutation: Mutation,        // what changed
+    at: DateTime<Utc>,
+}
+
+// DB: single row table, updated in the same transaction as the mutation
+// CREATE TABLE global_rev (id INTEGER PRIMARY KEY CHECK(id = 1), rev INTEGER NOT NULL);
+// Every mutating transaction: UPDATE global_rev SET rev = rev + 1 RETURNING rev;
+```
+
+#### Entity versions
+
+Each entity carries its own version in addition to the global revision. Global
+`rev` answers "what is the latest system state?" Entity `version` answers "is
+this exact entity stale?"
+
+```rust
+struct Issue {
+    id: IssueId,
+    version: u64,              // incremented on every mutation to THIS issue
+    // ...
+}
+
+struct Worker {
+    id: WorkerId,
+    version: u64,
+    // ...
+}
+```
+
+Concurrency checks use entity version. Global revision drives sync ordering.
+
+#### Event publishing
+
+Every DB mutation publishes a revisioned event:
+
+```
+DB mutation
+   ↓
+commit transaction (atomically increments global rev)
+   ↓
+publish event { rev, entity_type, entity_id, mutation }
+   ↓
+UI applies only if rev > local rev
+```
+
+```rust
+struct StateEvent {
+    rev: u64,
+    entity_type: EntityType,
+    entity_id: EntityId,
+    mutation: Mutation,
+}
+```
+
+SSE carries `StateEvent`s. The client applies them in revision order:
+
+```typescript
+function onStateEvent(event: StateEvent) {
+    if (event.rev <= state.lastRev) return;           // stale, ignore
+
+    if (event.rev !== state.lastRev + 1) {
+        reconcileFrom(state.lastRev);                 // gap detected, delta sync
+        return;
+    }
+
+    applyMutation(event);
+    state.lastRev = event.rev;
+}
+```
+
+#### Delta sync endpoint
+
+On initial load, reconnect, tab wake, browser `online`, or detected revision gap:
+
+```
+GET /api/sync?since_rev=104
+```
+
+```rust
+#[derive(Serialize)]
+struct SyncResponse {
+    rev: u64,                              // current global revision
+    changes: Vec<StateEvent>,             // all mutations since since_rev
+    full_sync_required: bool,             // true if since_rev is too old (pruned)
+}
+```
+
+The server retains a bounded changelog (configurable, default 10,000 revisions).
+If `since_rev` is older than the oldest retained revision, `full_sync_required`
+is true and the client does a full state load instead of a delta.
+
+This handles: dropped SSE connections, laptop sleep, flaky Wi-Fi, browser
+throttling, server restart, SSE backpressure drops.
+
+#### Optimistic writes with conflict detection
+
+Mutating API calls include the base revision for conflict detection:
+
+```rust
+#[derive(Deserialize)]
+struct MutationRequest<T> {
+    #[serde(flatten)]
+    payload: T,
+    base_rev: u64,                        // client's last known entity version
+    idempotency_key: Option<Uuid>,
+}
+```
+
+The backend either commits and returns the new revision:
+
+```json
+{ "rev": 108, "version": 18, "entity": { ... } }
+```
+
+Or rejects as stale:
+
+```
+409 Conflict
+{ "server_rev": 107, "server_version": 17, "current": { ... } }
+```
+
+The client reconciles on conflict. Offline/slow clients cannot silently overwrite
+newer state.
+
+#### Normalized client-side state store
+
+One canonical local entity cache. Every screen reads from the same entities:
+
+```typescript
+interface EntityStore {
+    workers: Map<WorkerId, Worker>;
+    issues: Map<IssueId, Issue>;
+    groups: Map<GroupId, Group>;
+    messages: Map<MessageId, Message>;
+    gates: Map<GateId, Gate>;
+    sessions: Map<SessionId, Session>;
+    lastRev: number;
+}
+```
+
+The board does not maintain one copy of an issue while the issue-detail modal has
+another. Views are projections over the store, not independent state. A mutation
+from any source (SSE event, API response, optimistic write) updates the store
+once; every view re-renders from the same data.
+
+#### Connection state indicator
+
+The UI shows connection state, subtle but always visible:
+
+```
+LIVE · rev 18291
+SYNCING…
+OFFLINE · last synced 2m ago
+STALE · reconnecting
+```
+
+Transitions:
+
+| From | To | Trigger |
+|---|---|---|
+| LIVE | STALE | SSE silence > 18s (existing ping timeout) |
+| LIVE | OFFLINE | browser `offline` event |
+| STALE | SYNCING | reconnect attempt starts |
+| OFFLINE | SYNCING | browser `online` event |
+| SYNCING | LIVE | delta sync completes, SSE reconnected |
+| SYNCING | STALE | delta sync fails, retrying |
+
+#### Reconciliation triggers
+
+Delta sync fires on all of these (not just SSE reconnect):
+
+1. Initial page load
+2. SSE reconnect after drop
+3. Tab wake (`visibilitychange` visible)
+4. Browser `online` event
+5. `pageshow` / `focus` events
+6. Revision gap detected in SSE stream
+7. Periodic heartbeat (every 60s while LIVE, as a safety net)
+8. After any 409 Conflict response
+
+#### E2E test plan
+
+The ugly cases, tested explicitly:
+
+- Drop every 5th SSE event -> UI converges to correct state
+- Deliver events out of order -> UI stays correct (revision ordering)
+- Duplicate events -> no duplicate effects (idempotent apply)
+- Kill/restart server -> UI reconnects and catches up via delta sync
+- Sleep browser for 10 minutes -> wakes and delta-syncs to current
+- Two tabs mutate same issue -> both converge to same state
+- Offline mutation conflicts with newer backend state -> explicit 409, toast
+- 1,000 rapid board mutations -> UI finishes at exactly backend rev/state
+- SSE backpressure drops 50 events -> gap detection triggers reconcile
+- Server changelog pruned (since_rev too old) -> full sync, not partial
+- Entity version conflict (two clients edit same issue) -> loser gets 409
+- Optimistic write applied then server rejects -> rollback visible to user
 
 ### Invariant 22: Deterministic orchestrator simulation
 
@@ -1846,8 +2038,9 @@ amux/
           metrics.rs             # /api/metrics, /api/debug/*
           search.rs              # /api/search -- FTS5 across all entities
           messages.rs            # /api/messages/* -- durable message CRUD, threads
+          sync.rs                # /api/sync -- delta sync, global rev (Invariant 35)
           auth.rs                # bearer token, share tokens, org
-          sse.rs                 # /api/events
+          sse.rs                 # /api/events -- revisioned StateEvents (Invariant 35)
           health.rs              # /health
           static_files.rs        # embedded dashboard
         orchestrator/
@@ -2019,10 +2212,12 @@ harness that will verify every subsequent phase.
 
 1. Scaffold workspace, crate structure
 2. `amux-core`: Scope, Worker, Session, Issue, BoardTransition, WorkerCommand/Event,
-   Provider -- all types, no I/O. This is the system's vocabulary.
-3. `amux-server/db`: all 47 tables as SQL migrations, WAL mode, single-writer task
+   Provider, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
+   system's vocabulary. Every entity type carries a `version: u64` field.
+3. `amux-server/db`: all 49 tables as SQL migrations, WAL mode, single-writer task
 4. `amux-server/config`: three-tier config loading (global/group/worker), `server.env`
-5. `amux-server/api`: axum router, static file embedding, `/health`, auth
+5. `amux-server/api`: axum router, static file embedding, `/health`, auth,
+   `/api/sync?since_rev=N` (Invariant 35), SSE with revisioned StateEvents
 6. TLS setup with self-signed cert
 7. **Golden scenario test harness** (Playwright-based): end-to-end scenario tests
    that will run against every phase. Start with:
@@ -2033,7 +2228,7 @@ harness that will verify every subsequent phase.
 - Unit: scope resolver merges global < group < worker correctly, worker wins conflicts
 - Unit: scope resolver with group gates overriding global gates
 - Unit: scope resolver with worker env overriding group env
-- Unit: all 47 tables created in in-memory DB
+- Unit: all 49 tables created in in-memory DB
 - Unit: `BoardTransition` state machine rejects invalid transitions
 - Unit: API request/response types match OpenAPI spec (generated from JsonSchema derives)
 - Unit: `DurableEvent` append succeeds for every `EventKind` variant (Invariant 24)
@@ -2388,6 +2583,19 @@ the same board transitions, WorkerEvents, verification result, and final issue s
    - **Assert**: same board transitions, same WorkerEvents, same verification result,
      same final issue state. The backend is invisible above the `SessionBackend` trait.
 
+10. **Real-time convergence (Invariant 35)**:
+    - Open two browser tabs
+    - Tab 1: create 10 board cards rapidly
+    - Intercept SSE: drop every 3rd event to Tab 2
+    - Tab 2 detects rev gap, delta syncs
+    - Both tabs show identical state
+    - Kill server, restart
+    - Both tabs reconnect, delta sync from their last rev
+    - Mutate same issue from both tabs simultaneously
+    - Loser gets 409, reconciles
+    - **Assert**: both tabs converge to identical, revision-consistent state.
+      No stale, duplicate, or missing entities at any point after convergence.
+
 ### Phase 6: Email, Calendar, CRM (est. 2 weeks)
 
 **Goal**: integration subsystems, each scoped.
@@ -2442,7 +2650,14 @@ the same board transitions, WorkerEvents, verification result, and final issue s
 - Integration: service worker caches shell URLs
 - Integration: `amux board add "test"` creates card, prints ID
 - Integration: `amux send <worker> "hello"` delivers
-- Playwright: all dashboard tabs render, SSE updates live, PWA offline works
+- Playwright: all dashboard tabs render, PWA offline works
+- Playwright: SSE delivers revisioned StateEvents, client applies in rev order (Invariant 35)
+- Playwright: rev gap triggers delta sync (drop SSE events, verify convergence) (Invariant 35)
+- Playwright: two tabs mutate same issue -> both converge (Invariant 35)
+- Playwright: kill server, restart -> client reconnects and delta-syncs (Invariant 35)
+- Playwright: 1,000 rapid board mutations -> UI finishes at exact backend rev (Invariant 35)
+- Playwright: connection indicator shows LIVE/STALE/OFFLINE/SYNCING (Invariant 35)
+- Playwright: optimistic write rejected (409) -> rollback visible to user (Invariant 35)
 
 ### Phase 9: Observability + performance (est. 2 weeks)
 
