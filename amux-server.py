@@ -28471,6 +28471,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .overlay { top: env(safe-area-inset-top, 0px); }
   }
   @media (max-width: 600px) {
+    /* Peek header title first (AMUX-2241, Ethan's iOS screenshot: the name
+       ellipsized to "mixpeek-…" while WORKING + RATE-LIMITED-UNTIL badges and
+       the model chip kept full width). The NAME is what identifies the peek —
+       it gets a guaranteed floor and grows; badges/model wrap to a second
+       line when the row is tight. Desktop keeps the one-line layout (this
+       block is phone-only), and the badges remain fully visible — wrapped,
+       never clipped. */
+    #peek-title-row { flex-wrap: wrap; row-gap: 2px; }
+    #peek-title { flex: 1 1 auto; min-width: 55%; }
     .file-overlay-header { flex-wrap: nowrap; gap: 6px; align-items: center; position: relative; }
     /* Full title (no more 32vw cutoff) — actions move into the ⋮ menu. */
     .file-overlay-header h2 { font-size: 0.9rem; flex: 1 1 auto; min-width: 0; max-width: none; margin-right: 4px; }
@@ -34192,7 +34201,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Peek overlay -->
 <div id="peek-overlay" class="overlay">
   <div class="overlay-header" style="flex-direction:column;gap:4px;padding-bottom:6px;">
-    <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+    <div id="peek-title-row" style="display:flex;align-items:center;gap:8px;min-width:0;">
       <h2 id="peek-title" style="margin:0;font-size:0.92rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">peek</h2>
       <span id="peek-session-status"></span>
       <span id="peek-model-badge" style="font-size:0.75rem;padding:2px 8px;border-radius:9999px;background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);white-space:nowrap;"></span>
@@ -41570,7 +41579,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.525';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.526';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -63435,7 +63444,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.525';
+const CACHE = 'amux-v0.9.526';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell
