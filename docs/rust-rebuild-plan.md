@@ -77,7 +77,7 @@ struct Worker {
 struct Session {
     id: SessionId,
     worker_id: WorkerId,
-    backend: BackendKind,
+    backend: BackendId,           // open string, not closed enum (Invariant 8)
     process: Option<ProcessRef>,
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
@@ -1158,7 +1158,7 @@ struct WorkerConfig {
     cwd: PathBuf,
     provider: ProviderId,
     model: Option<ModelId>,
-    backend: BackendKind,  // default: Herdr
+    backend: BackendId,    // default: "herdr" -- open string (Invariant 8)
     environment: ScopedEnv,
     permissions: Permissions,
     isolation: IsolationPolicy,  // default: Shared
@@ -1964,6 +1964,7 @@ enum EventKind {
     TaskQuarantined,         // Invariant 47 -- terminal failure
     CircuitOpened,            // Invariant 48 -- fleet halt
     CircuitClosed,            // Invariant 48 -- fleet resumed
+    AmendmentProposed,        // Invariant 45 -- agent wants to weaken a hashed clause
     Extension(String),        // open variant -- plugins and future event kinds
                               // without recompiling amux-core
 }
@@ -2810,10 +2811,10 @@ made. This is enforced structurally, not by discipline:
    proptest property IS a requirement. If the test passes, the requirement is met. If
    the test is missing, the requirement is unspecified.
 
-6. **Config structure IS the admin guide.** Three-tier scope (Invariant 2) with
+6. **Config structure IS the admin guide.** Four-tier scope (Invariant 2) with
    `effective_config` means there is one way to configure anything, and
    `amux config show --effective --worker=X` shows exactly what is in effect and where
-   each value came from (global, group, or worker override).
+   each value came from (org, global, group, or worker override).
 
 7. **The dependency graph IS the project plan.** `TaskRelation` (Invariant 4) means
    the board itself shows what blocks what. No separate Gantt chart or project tracker.
@@ -2865,6 +2866,13 @@ enum BlockerKind {
         chosen: String,
         rationale: String,
         reversible: bool,
+    },
+    AmendmentProposed {     // agent wants to weaken a hashed invariant clause
+        invariant: InvariantId,
+        proposal: String,
+        // Never self-resolving. Agent records in docs/proposed-amendments.md
+        // and moves to other runnable work. If no independent work remains,
+        // circuit opens with AllItemsBlocked (Invariant 48).
     },
 }
 
@@ -3187,14 +3195,14 @@ struct AttemptRecord {
 }
 ```
 
-`Quarantined` is terminal, counted in `FleetProgress`, and reported in the
+`Quarantined` is terminal, counted in `FleetProgress` (L4), and reported in the
 diagnostic output. It is never silently retried. The quarantine count is a
 fleet-level health signal: rising quarantine count = systemic problem, not
 bad luck on individual tasks.
 
 ### Invariant 48: Global spend and progress circuit breakers
 
-`FleetProgress` (Invariant 16) reports. This invariant makes it ACT.
+`FleetProgress` (defined in L4 below) reports. This invariant makes it ACT.
 
 ```rust
 struct FleetCircuitBreaker {
@@ -3357,7 +3365,7 @@ const MAX_DISCOVERED_ITEMS_PER_RUN: u32 = 50;
 ```
 
 Rules:
-1. **Depth limit**: an task created by decomposition carries
+1. **Depth limit**: a task created by decomposition carries
    `decomposition_depth: u32`. Children inherit `parent_depth + 1`. At
    `MAX_DECOMPOSITION_DEPTH`, exhaustion leads directly to `Quarantined`,
    not further decomposition.
@@ -3368,7 +3376,10 @@ Rules:
    (Invariant 46) or any automated discovery process must link to a parent
    task that is `VERIFIED`-gated. The parent cannot verify until all
    discovered children verify. This prevents discovered items from
-   floating free with no completion gate.
+   floating free with no completion gate. For top-level crawls (e.g., the
+   Phase 8 full-dashboard UX crawl), the parent is the RR item that
+   triggered the crawl (e.g., RR-0101). That RR item cannot reach `VERIFIED`
+   until all discovered children verify -- this is correct and intentional.
 4. **Per-run cap**: a single discovery run (UX crawl, schema scan, etc.)
    creates at most `MAX_DISCOVERED_ITEMS_PER_RUN` items. If more are found,
    the run completes with a report of what was capped, and a follow-up
@@ -4081,6 +4092,10 @@ harness that will verify every subsequent phase.
    - **Gate**: the coverage matrix must be committed as `docs/provider-coverage.csv`
      (RR-0028e) before Phase 1 begins. The written-branch decision is a checklist
      item with its own RR ID so the agent cannot skip it.
+   - **Re-estimate trigger**: if the written branch fires (OpenCode < 3/4 coverage),
+     Phases 1 and 4 must be re-estimated before proceeding (RR-0028l), since
+     promoting `TerminalAdapter` to a peer of `OpenCodeAdapter` changes scope in
+     both phases. The 3-week Phase 0 estimate does not absorb this re-planning.
 2. Scaffold workspace, crate structure
 3. `amux-core`: Scope, Worker, Task, BoardTransition, WorkerCommand/Event,
    ProviderId, StateRevision, EntityType, Mutation -- all types, no I/O. This is the
@@ -4798,10 +4813,10 @@ deleted, not a permanent abstraction.
 
 The Rust rebuild migrates toward herdr as the primary backend:
 
-- herdr is the default for new workers (`BackendKind::Herdr`)
+- herdr is the default for new workers (`backend: "herdr"`)
 - Existing tmux-based workers continue on tmux during migration
 - Workers can be individually switched between herdr and tmux via config
-  (`backend: BackendKind::Tmux` override)
+  (`backend: "tmux"` override)
 - Backend choice does not require DB/schema changes
 - Backend choice does not change worker identity or task ownership
 - A worker can restart on a different backend while preserving all durable
@@ -4983,39 +4998,44 @@ between doc and code is the failure mode this rule exists to prevent.
 The invariant list and each invariant's **normative clauses** (MUST/MUST NOT
 statements, enum definitions with exhaustive match requirements, struct field
 constraints, state machine transitions, and acceptance criteria) are
-content-hashed at Phase 0 and committed as `docs/invariant-hashes.json`. Any
+content-hashed at Phase 0 and committed as `docs/invariant-hashes.toml`. Any
 change to a hashed clause is classified as either a **clarification** or a
 **weakening**:
 
-- **Clarification** (agent may apply): adds specificity, narrows ambiguity,
-  fixes an inconsistency, corrects a stale cross-reference. The hash updates
-  in the same commit. CI verifies the new hash matches the new content.
-- **Weakening** (agent may NOT apply): removes a required condition, converts
-  MUST to SHOULD, widens a terminal state, raises a limit, removes a test
-  obligation, deletes an invariant or normative clause.
+- **Clarification** (allowed, `DocClarified`): adds specificity, resolves
+  ambiguity, fixes a stale cross-reference, corrects an internal
+  inconsistency. **Does not change any normative clause** -- the hashed
+  content is unchanged, or the change is strictly additive (new specificity
+  within an existing requirement). The hash updates in the same commit. CI
+  verifies the new hash matches the new content.
+- **Weakening** (forbidden, `WeakeningProposed`): removes a required
+  condition, converts MUST to SHOULD, widens a terminal state, raises a limit
+  constant, removes a test obligation, deletes an invariant or normative
+  clause, or adds an exemption.
 
-A weakening is a `PolicyDecision { reversible: false }` and **fails CI rather
-than resolving the `Disagreement`**. The agent records the proposed amendment
-in `docs/proposed-amendments.md` with the invariant ID, the current clause,
-the proposed replacement, and a rationale. It then continues with other
-runnable work. Only a human can accept a weakening by updating the hash file.
+**Mechanism**: any diff to a hashed clause in `docs/invariant-hashes.toml`
+classifies as `WeakeningProposed`. The agent writes to
+`docs/proposed-amendments.md` (invariant ID, current clause, proposed
+replacement, rationale) and **fails CI rather than resolving the
+`Disagreement`**. The agent then continues with other runnable work -- this
+is not a stall, since only a human can accept. Without the hash file, "does
+this amendment weaken the invariant" is a judgment call made by the party who
+benefits from the answer.
 
 ```rust
 enum DocCodeDivergence {
     CodeMatchesDoc,
     DocClarified {
         invariant: InvariantId,
-        clause: String,
         rationale: String,
-        old_hash: String,
-        new_hash: String,
+        event: EventId,
     },
     CodeFixed { invariant: InvariantId, commit: String },
-    WeakeningProposed {       // agent cannot resolve this -- human review required
+    WeakeningProposed {       // CI FAILURE -- agent cannot resolve
         invariant: InvariantId,
-        proposal_file: PathBuf,  // docs/proposed-amendments.md
+        proposal: String,     // written to docs/proposed-amendments.md
     },
-    Disagreement { invariant: InvariantId },  // CI failure
+    Disagreement { invariant: InvariantId },  // CI FAILURE
 }
 ```
 
@@ -6191,11 +6211,12 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0004 — Core types: Session, BackendKind, ProcessRef
+- [ ] RR-0004 — Core types: Session, BackendId, ProcessRef
   Phase: 0
   Depends on: RR-0001, RR-0003
-  Invariant: 1, 33
-  Requirement: Session struct with SessionId, WorkerId, BackendKind (Herdr/Tmux),
+  Invariant: 1, 33, 8
+  Requirement: Session struct with SessionId, WorkerId, BackendId (open string,
+    not closed enum -- Invariant 8; built-in values: "herdr", "tmux"),
     ProcessRef, started_at/ended_at/exit_reason. Backend refs derive from WorkerId:
     `format!("amux-{}", worker.id)`.
   Tests: backend ref derives from WorkerId not display_name, session lifecycle states
@@ -6389,7 +6410,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Data verification
   Status: TODO
 
-- [ ] RR-0020 — Three-tier config loading (server.env, global/group/worker)
+- [ ] RR-0020 — Four-tier config loading (server.env, org/global/group/worker)
   Phase: 0
   Depends on: RR-0002, RR-0019
   Invariant: 2
@@ -6616,7 +6637,7 @@ consistent with their dependencies.
   Phase: 0
   Depends on: RR-0001
   Invariant: 45
-  Requirement: Generate docs/invariant-hashes.json at Phase 0 containing
+  Requirement: Generate docs/invariant-hashes.toml at Phase 0 containing
     content hashes of every invariant's normative clauses. CI check:
     DocCodeDivergence classification (CodeMatchesDoc, DocClarified,
     WeakeningProposed, Disagreement). WeakeningProposed and Disagreement
@@ -6643,6 +6664,22 @@ consistent with their dependencies.
   Tests: TreeConflict is a structured wait not a stall, Shared isolation
     records tree status in AttemptRecord
   Verify: Implementation, Unit tests
+  Status: TODO
+
+- [ ] RR-0028l — Phase 1+4 re-estimate if OpenCode spike triggers written branch
+  Phase: 0
+  Depends on: RR-0028e
+  Invariant: 45
+  Requirement: If the OpenCode spike (RR-0028e) coverage matrix shows < 3/4
+    providers with core lifecycle coverage and the written branch fires
+    (TerminalAdapter promoted to peer of OpenCodeAdapter), Phases 1 and 4 must
+    be re-estimated before Phase 1 begins. The re-estimate accounts for dual
+    adapter paths in the orchestrator (Phase 1) and provider coverage matrix
+    rewrite (Phase 4). Record the re-estimate as an amendment to the phase
+    timeline table.
+  Tests: written-branch decision recorded in docs/provider-coverage.csv,
+    phase re-estimates committed if triggered
+  Verify: Implementation
   Status: TODO
 
 ---
@@ -8006,7 +8043,7 @@ consistent with their dependencies.
     - Map Python status strings to `WorkerState` enum
     - Preserve session history (all past sessions for each worker)
     - Preserve group membership
-    - Map backend type strings to `BackendKind` enum
+    - Map backend type strings to `BackendId` values
     Worker identities must be stable: same worker has same WorkerId forever after
     migration. Old session names become `name_aliases` for @mention resolution.
   Data verification: all workers migrated, WorkerIds stable, aliases resolve
