@@ -45,7 +45,19 @@ if git remote get-url origin >/dev/null 2>&1; then
       # Name the files that actually matter here, not just a number: "110
       # commits behind" reads as bookkeeping, "amux-server.py changed upstream"
       # reads as "your edit is going to conflict".
-      hot="$(git diff --name-only "HEAD..$base" 2>/dev/null \
+      #
+      # THREE dots, and the distinction is the whole point of this line. In
+      # `git diff`, two dots compare the two ENDPOINTS — so on a shared checkout
+      # carrying unpushed work it reports OUR OWN files as upstream changes.
+      # Measured 2026-08-09: 1 commit behind touching only amux-server.py, and
+      # the two-dot form named `CLAUDE.md amux amux-server.py`, sending the
+      # session to reconcile two files upstream had never touched. Three dots
+      # diff from the merge-base, i.e. exactly "what $base added that I lack".
+      # Note line 43 is correct as-is: two-dot rev-list already means that.
+      # The bug was that one sentence mixed both conventions, so its count and
+      # its file list disagreed — and it degraded precisely as the checkout got
+      # busier, which is when the warning matters most.
+      hot="$(git diff --name-only "HEAD...$base" 2>/dev/null \
              | grep -E '^(amux-server\.py|amux|CLAUDE\.md)$' | tr '\n' ' ')"
       out+="  - checkout is ${behind} commit(s) behind ${base}"
       [ -n "$hot" ] && out+=" — including: ${hot}"
