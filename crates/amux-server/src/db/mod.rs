@@ -14,6 +14,7 @@
 //!   every mutation so SSE/delta-sync can publish revisioned StateEvents
 //!   (Invariant 35).
 
+pub mod commands;
 pub mod migrate;
 pub mod queries;
 
