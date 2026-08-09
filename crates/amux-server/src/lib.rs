@@ -34,6 +34,11 @@ pub fn run() {
 }
 
 async fn async_main() {
+    // rustls refuses to guess when both ring and aws-lc-rs are in the
+    // dependency graph (reqwest pulls one, axum-server the other). Pin ring
+    // explicitly or the first TLS handshake panics the accept loop.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

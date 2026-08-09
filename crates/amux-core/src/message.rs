@@ -180,9 +180,10 @@ mod tests {
     }
 
     fn t(secs: u32) -> DateTime<Utc> {
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, secs)
-            .unwrap()
+        // Seconds offset from a fixed epoch — callers pass values >= 60, so
+        // this must be arithmetic, not a clock-field constructor.
+        chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            + chrono::Duration::seconds(secs as i64)
     }
 
     fn human() -> Actor {

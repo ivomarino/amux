@@ -24,6 +24,7 @@
 //! - `criteria`      RR-0028i (Invariant 50)
 //! - `isolation`     RR-0028k (Invariants 33, 10, 49)
 
+pub mod board;
 pub mod capability;
 pub mod circuit;
 pub mod criteria;
@@ -42,8 +43,6 @@ pub mod search;
 pub mod session;
 pub mod stall;
 pub mod turn;
+pub mod verification;
 pub mod worker;
 
-// Blocked on board.rs landing:
-// pub mod board;
-// pub mod verification;  // depends on board::GateCriterion

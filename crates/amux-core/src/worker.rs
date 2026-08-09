@@ -387,12 +387,15 @@ mod tests {
         assert_eq!(crate::session::backend_ref(w1.id()), ref_before);
     }
 
+    /// A boxed config mutation for table-driven classification tests.
+    type ConfigEdit = Box<dyn Fn(&mut WorkerConfig)>;
+
     // ---- RR-0018: classification, one class per field ------------------
 
     #[test]
     fn immediate_class_fields_classify_immediate() {
         let old = base_config();
-        let cases: Vec<Box<dyn Fn(&mut WorkerConfig)>> = vec![
+        let cases: Vec<ConfigEdit> = vec![
             Box::new(|c| c.display_name = "renamed".into()),
             Box::new(|c| c.name_aliases = vec!["backend".into()]),
             Box::new(|c| c.group = Some(GroupId::from_ulid(fixed_ulid("GGGG")))),
@@ -451,7 +454,7 @@ mod tests {
     #[test]
     fn process_level_fields_classify_session_restart() {
         let old = base_config();
-        let cases: Vec<Box<dyn Fn(&mut WorkerConfig)>> = vec![
+        let cases: Vec<ConfigEdit> = vec![
             Box::new(|c| c.cwd = "/somewhere/else".into()),
             Box::new(|c| c.provider = ProviderId("codex".into())),
             Box::new(|c| c.backend = BackendId::tmux()),
