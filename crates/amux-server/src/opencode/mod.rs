@@ -9,7 +9,9 @@
 //! drive it deterministically. The OpenCode transport implementation lands
 //! against the RR-0028e spike's coverage matrix.
 
+pub mod events;
 pub mod mock;
+pub mod structured;
 
 use amux_core::ids::{MessageId, TurnId, WorkerId};
 use amux_core::protocol::{ProgressReport, RateLimit, WorkerEvent};
