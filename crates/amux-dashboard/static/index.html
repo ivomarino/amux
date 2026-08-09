@@ -2010,15 +2010,18 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <!-- Steering queue panel -->
   <div id="peek-steering-panel" class="peek-tasks-panel">
     <div style="flex-shrink:0;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px;background:rgba(255,255,255,0.02);">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <div onclick="var b=document.getElementById('peek-instructions-body');var c=document.getElementById('peek-instructions-caret');var v=b.style.display==='none';b.style.display=v?'':'none';c.textContent=v?'▾':'▸';" style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;-webkit-user-select:none;">
+        <span id="peek-instructions-caret" style="font-size:0.7rem;color:var(--dim);display:inline-block;width:10px;">&#x25B8;</span>
         <span style="font-size:0.8rem;font-weight:600;">Standing instructions</span>
-        <span style="font-size:0.68rem;color:var(--dim);flex:1;">Re-sent automatically whenever this worker (re)starts — survives compaction.</span>
+        <span style="font-size:0.68rem;color:var(--dim);flex:1;">Re-sent on (re)start — survives compaction.</span>
       </div>
-      <textarea id="peek-instructions" rows="3" placeholder="e.g. Act autonomously — don't ask the user for permission or direction. Execute best practices for your mandate; pick the lowest-risk option. Record progress as evidence on your board items. Escalate only to the orchestrator if blocked outside your scope." style="width:100%;font-size:0.78rem;resize:vertical;box-sizing:border-box;"></textarea>
-      <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;align-items:center;">
-        <span id="peek-instructions-status" style="flex:1;font-size:0.7rem;color:var(--dim);"></span>
-        <button class="btn" style="font-size:0.75rem;padding:4px 12px;" onclick="savePeekInstructions(false)">Save</button>
-        <button class="btn primary" style="font-size:0.75rem;padding:4px 12px;" onclick="savePeekInstructions(true)" title="Save and send to the worker now">Save &amp; apply now</button>
+      <div id="peek-instructions-body" style="display:none;margin-top:8px;">
+        <textarea id="peek-instructions" rows="3" placeholder="e.g. Act autonomously — don't ask the user for permission or direction. Execute best practices for your mandate; pick the lowest-risk option. Record progress as evidence on your board items. Escalate only to the orchestrator if blocked outside your scope." style="width:100%;font-size:0.78rem;resize:vertical;box-sizing:border-box;"></textarea>
+        <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;align-items:center;">
+          <span id="peek-instructions-status" style="flex:1;font-size:0.7rem;color:var(--dim);"></span>
+          <button class="btn" style="font-size:0.75rem;padding:4px 12px;" onclick="event.stopPropagation();savePeekInstructions(false)">Save</button>
+          <button class="btn primary" style="font-size:0.75rem;padding:4px 12px;" onclick="event.stopPropagation();savePeekInstructions(true)" title="Save and send to the worker now">Save &amp; apply now</button>
+        </div>
       </div>
     </div>
     <div class="peek-tasks-add" style="gap:10px;">
