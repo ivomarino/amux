@@ -71,7 +71,9 @@ pub(crate) fn amux_home() -> PathBuf {
 /// first (Python's boot loader only overrides `os.environ` with non-empty
 /// values), then process env, then None. File-first is what makes a PATCH
 /// visible to the next GET without mutating process env.
-fn effective_env(home: &Path, key: &str) -> Option<String> {
+/// `pub(crate)`: the alert-config endpoints (api/alerts.rs) read the same
+/// keys the same way — one resolver, not two spellings of it.
+pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
     let file_env = crate::config::parse_env_file(&home.join("server.env"));
     if let Some(v) = file_env.get(key) {
         if !v.is_empty() {
@@ -82,8 +84,10 @@ fn effective_env(home: &Path, key: &str) -> Option<String> {
 }
 
 /// Python's server.env line-replace: rewrite the first `KEY=`/`KEY =` line,
-/// else append. Non-atomic plain write, matching Python.
-fn set_server_env_key(home: &Path, key: &str, val: &str) -> std::io::Result<()> {
+/// else append. Non-atomic plain write, matching Python (`_env_set`).
+/// `pub(crate)`: shared with the alert-config PATCH (api/alerts.rs), which
+/// is Python's `_env_set` on the same file.
+pub(crate) fn set_server_env_key(home: &Path, key: &str, val: &str) -> std::io::Result<()> {
     let file = home.join("server.env");
     let mut lines: Vec<String> = std::fs::read_to_string(&file)
         .map(|s| s.lines().map(String::from).collect())

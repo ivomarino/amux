@@ -4,6 +4,10 @@
 //! in the OpenAPI spec (RR checklist) and — for legacy-compat paths — in the
 //! alias registry (RR-0018a).
 
+pub mod alerts;
+pub mod branding;
+pub mod stats;
+pub mod usage;
 pub mod aliases;
 pub mod auth;
 pub mod board;
@@ -68,6 +72,15 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
+        .nest("/api/usage", usage::routes())
+        .nest("/api/alert", alerts::routes())
+        .route("/api/stats/daily", axum::routing::get(stats::daily))
+        .route("/api/branding", axum::routing::get(branding::get_branding)
+            .post(branding::post_branding).delete(branding::delete_branding))
+        // base64 icons: the handler's own 5MB check must answer (Python's
+        // 400), not axum's 2MB default 413.
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+        .route("/api/branding/asset/{fname}", axum::routing::get(branding::serve_asset))
         .nest("/api/email", email::routes())
         .nest("/api/cal-events", calendar::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
@@ -97,6 +110,9 @@ pub fn router(state: AppState) -> Router {
         .route("/health", axum::routing::get(health::health))
         // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
         .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
+        // Dynamic manifest: PWA name/color follow the branding prefs (the
+        // static file is the fallback inside the handler).
+        .route("/manifest.json", axum::routing::get(branding::manifest))
         // Public: Google's OAuth redirect carries no bearer token. Python
         // admits it via the localhost auth bypass; require_bearer has no
         // such bypass, so the callback must sit outside it (single-use
