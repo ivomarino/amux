@@ -315,6 +315,32 @@ fn ephemeral_port() -> anyhow::Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+/// base64(sha256(DER SubjectPublicKeyInfo)) of amux's own TLS cert — the exact
+/// form Chrome's `--ignore-certificate-errors-spki-list` expects.
+///
+/// Read from `~/.amux/tls/cert.pem` at LAUNCH time rather than baked in as a
+/// constant: tls.rs regenerates that material when it expires or is deleted, and
+/// a hardcoded pin would then silently stop matching — the browser would go back
+/// to failing on amux's own URL with nothing pointing at why. Deriving it from
+/// the same file the server presents means the pin cannot drift from the cert.
+///
+/// Returns None if the cert is unreadable or malformed, in which case the flag is
+/// simply not passed: no pin is strictly worse for reaching amux, but inventing
+/// or guessing a pin would be worse still, and a blanket cert bypass is never the
+/// fallback (see the call site's note about the auth profile).
+fn amux_cert_spki_b64(home: &Path) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    // Derived from the KEY via rcgen — which already generated this material in
+    // tls.rs and hands back the DER SubjectPublicKeyInfo directly. That avoids
+    // both a new x509 dependency and hand-slicing ASN.1 out of the certificate,
+    // which is the step this kind of helper usually gets subtly wrong.
+    let key_pem = std::fs::read_to_string(home.join("tls").join("key.pem")).ok()?;
+    let key_pair = rcgen::KeyPair::from_pem(&key_pem).ok()?;
+    let digest = sha2::Sha256::digest(key_pair.public_key_der());
+    Some(base64::engine::general_purpose::STANDARD.encode(digest))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StartedBrowser {
     pub profile: String,
@@ -356,6 +382,22 @@ pub async fn start(home: &Path, profile: &str, url: &str) -> anyhow::Result<Star
         .arg(format!("--user-data-dir={}", target.user_data_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check");
+    // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
+    // one site this browser most needs to reach — amux itself — lands on
+    // chrome-error://chromewebdata/ and every subsequent verb runs against the
+    // error page. Dogfooding: the browser primitive could not browse the product
+    // that ships it.
+    //
+    // Deliberately SPKI-PINNED to amux's own key rather than the blanket
+    // --ignore-certificate-errors. This profile (~/.amux/playwright-auth/profile)
+    // holds real logged-in sessions for third-party sites; globally disabling
+    // certificate validation there would expose those cookies to any MITM on the
+    // network. The pin excuses exactly one public key and leaves validation fully
+    // intact for everything else — including, importantly, still rejecting a
+    // DIFFERENT bad cert on localhost.
+    if let Some(spki) = amux_cert_spki_b64(home) {
+        cmd.arg(format!("--ignore-certificate-errors-spki-list={spki}"));
+    }
     if let Some(pd) = &target.profile_directory {
         cmd.arg(format!("--profile-directory={pd}"));
     }
@@ -1594,5 +1636,57 @@ mod tests {
         NATIVE_TARGETS.lock().unwrap().remove("live-smoke");
         let report = stop(home.path()).await;
         assert!(report.stopped);
+    }
+}
+
+#[cfg(test)]
+mod spki_pin_tests {
+    use super::*;
+
+    /// The pin must equal what OpenSSL computes for the same cert, because that
+    /// is the value Chrome compares against. Generating a real keypair here and
+    /// checking only "returns Some" would pass for any digest of any bytes — so
+    /// this recomputes the expected answer by the independent path (public key
+    /// DER -> sha256 -> base64) and, crucially, also asserts the helper does NOT
+    /// simply hash the file contents, which is the plausible wrong implementation.
+    #[test]
+    fn spki_pin_matches_openssl_definition_and_is_not_a_file_hash() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let dir = std::env::temp_dir().join(format!("amux-spki-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "amux");
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(tls.join("cert.pem"), cert.pem()).unwrap();
+        std::fs::write(tls.join("key.pem"), key_pair.serialize_pem()).unwrap();
+
+        let got = amux_cert_spki_b64(&dir).expect("pin computed");
+
+        // Independent recomputation of Chrome's documented input:
+        // base64(sha256(DER SubjectPublicKeyInfo)).
+        let want = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(key_pair.public_key_der()));
+        assert_eq!(got, want, "pin must be base64(sha256(SPKI DER))");
+
+        // Counter-case: a digest of the PEM FILE would also be Some(...) and
+        // would look correct in every "did it return a value" check, while
+        // matching nothing Chrome ever computes.
+        let file_hash = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(std::fs::read(tls.join("cert.pem")).unwrap()));
+        assert_ne!(got, file_hash, "pin must not be a hash of the cert file");
+
+        // Missing material must degrade to None (no flag), never to a guess.
+        std::fs::remove_file(tls.join("key.pem")).unwrap();
+        assert!(amux_cert_spki_b64(&dir).is_none(), "absent key -> no pin");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
