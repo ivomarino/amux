@@ -19350,14 +19350,30 @@ def _staged_guard_check(session: str, work_dir: str, rel_paths: list) -> dict:
             continue
         if ap in mine:
             if hit or _is_dirty:
+                # `peer` distinguishes the two reasons this fires, which the owner
+                # field alone cannot (AF-24): a real co-editor, versus YOUR OWN file
+                # that merely has unstaged changes. The renderer said "also edited by
+                # session '(unknown)'" for the second case — a phantom co-editor on a
+                # solo edit, which is how a real co-edit warning stops being read.
                 shared.append({"path": rel, "owner": hit[0] if hit else "(unknown)",
+                               "peer": bool(hit),
                                "age_secs": int(max(0, now - hit[1])) if hit else 0,
                                "has_unstaged_changes": _is_dirty})
             continue
         if hit:
+            # WHY, recorded on the verdict (AF-26). A block that says only "edited by
+            # X" cannot be told apart from a block that is wrong, and on 2026-08-09 a
+            # commit whose staged diff verifiably contained zero foreign hunks was
+            # refused with no way to see what the guard had actually compared. The
+            # classification is edit-RECORD based within a window — it never inspects
+            # the staged patch — so say that where the reader is, rather than leaving
+            # them to infer it from source.
             foreign.append({"path": rel, "owner": hit[0],
                             "age_secs": int(max(0, now - hit[1])),
-                            "has_unstaged_changes": _is_dirty})
+                            "has_unstaged_changes": _is_dirty,
+                            "why": ("no edit of yours on this path in the last %dm; "
+                                    "basis is edit records, not the staged diff"
+                                    % int(window / 60))})
     return {"ok": True, "foreign": foreign, "shared": shared,
             "cotenants": cotenants, "window_secs": int(window)}
 
@@ -22996,7 +23012,17 @@ def main():
         # only in the pre-commit hook: the hook was fixed the same night to read
         # `git show ":$FILE"` instead of the worktree, but a reader whose hook is
         # older gets no protection at all from a hint that omits it.
-        w("amux staged-guard: %s — %s was also edited by session '%s' %dm ago.%s\\n"
+        # AF-24: '(unknown)' is the NO-PEER placeholder from _staged_guard_check's
+        # shared branch, not a session name. Rendering it as "also edited by session
+        # '(unknown)'" asserts a co-editor who does not exist — the real fact is that
+        # YOU edited it and it has uncommitted changes. This fired on every commit of
+        # a file only one session had touched, and a warning that cries co-edit on
+        # your own solo work is how the genuine ones stop being read.
+        _who = ("was also edited by session '%s' %dm ago" % (f.get("owner"), mins)
+                if f.get("peer")
+                else "is yours and has uncommitted changes right now — no other "
+                     "session edited it")
+        w("amux staged-guard: %s — %s %s.%s\\n"
           "  Reconcile the count above against what you believe you wrote — that is the "
           "check that caught this class twice.\\n"
           "  Keep only your hunks:  git diff %s > /tmp/mine.patch  (trim to yours)  &&  "
@@ -23005,7 +23031,7 @@ def main():
           "stale offsets (four unbuildable commits, 2026-08-08).\\n"
           "  Then verify the STAGED blob, not the worktree:  git show \\":%s\\" | "
           "python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'\\n"
-          % (_level, f.get("path"), f.get("owner"), mins, _n, f.get("path"), f.get("path")))
+          % (_level, f.get("path"), _who, _n, f.get("path"), f.get("path")))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0
@@ -23013,12 +23039,33 @@ def main():
       "OTHER amux sessions sharing this checkout:\\n\\n")
     for f in foreign:
         mins = int((f.get("age_secs") or 0) / 60)
-        w("  %s   (edited by session '%s' %dm ago)\\n"
-          % (f.get("path"), f.get("owner"), mins))
+        _w = f.get("why")
+        w("  %s   (edited by session '%s' %dm ago)%s\\n"
+          % (f.get("path"), f.get("owner"), mins,
+             ("\\n      %s" % _w) if _w else ""))
     w("\\nUnstage them:   git restore --staged "
       + " ".join(f.get("path", "") for f in foreign) + "\\n")
-    w("If this cross-session commit is intentional: "
-      "AMUX_ALLOW_FOREIGN=1 git commit ...\\n\\n")
+    # AF-26. Two separate defects fixed here, both about an honest exit.
+    #
+    # 1. This verdict is derived from edit RECORDS in a time window; it never reads
+    #    the staged patch. So it can fire when the staged diff verifiably contains
+    #    none of the peer's work — measured 2026-08-09 on a single 14-line hunk that
+    #    was entirely the committer's. Tell the reader how to CHECK that, instead of
+    #    leaving "am I about to sweep someone?" unanswerable at the moment they must
+    #    answer it.
+    # 2. The only documented escape was AMUX_ALLOW_FOREIGN=1, described as "if this
+    #    cross-session commit is intentional". Clearing a FALSE positive therefore
+    #    required asserting the commit was cross-session when it was not — ethos rule
+    #    3, a constraint with no truthful path forward in a legitimate state. The
+    #    honest case now has an honest name. Both are logged identically; the
+    #    difference is that the operator can state which one is true.
+    w("\\nVERIFY BEFORE OVERRIDING — this verdict comes from edit records in a time\\n"
+      "window, NOT from the staged diff, so check whether their work is actually in it:\\n")
+    for f in foreign:
+        w("  git diff --cached -- %s        # is any of this theirs?\\n" % f.get("path", ""))
+    w("\\nThen take the exit that is TRUE:\\n"
+      "  AMUX_ALLOW_FOREIGN=1 git commit ...   # yes, their work is in it, and I mean to ship it\\n"
+      "  AMUX_VERIFIED_SOLO=1 git commit ...   # I checked the staged diff: none of it is theirs\\n\\n")
     return 1
 
 
