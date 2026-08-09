@@ -835,3 +835,29 @@ FIX: config.rs reads Python's `auth_token`; AMUX_AUTH_TOKEN env parity
   ("none" disables); require_bearer is a port of Python's _check_auth
   (localhost bypass, public paths, `_token=` only, JSON 401). The stale
   `auth-token` file is left on disk but nothing reads it.
+
+---
+## Board card archive via PATCH 500s on the Rust origin — and the harness's fire-and-forget cleanup hid it for three runs
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (rust parity-gaps lane)
+CARD: AMUX-2586
+SYMPTOM: `PATCH /api/board/<id> {"archived":1}` — the exact write the SPA's
+  card-archive and the parity harness's cleanup use — returned 500 on the Rust
+  origin (the field was absent from PATCH_WRITABLE; Python has accepted it
+  since AMUX-2492). The harness's cleanup `.catch(() => {})`ed the response,
+  so each run left an unarchived PARITY- card on the LIVE shared board with
+  no error anywhere: PH-2/PH-3/PH-5 accumulated across days and read as
+  stray unowned todos to every board consumer.
+COST: 3 stray cards polluting the live board's Unowned view across multiple
+  days; the silent-cleanup shape meant nobody knew which side had failed
+  (python vs rust) until the response was actually read.
+FIX: board.rs PATCH now ports Python's archived semantics byte-for-byte
+  (truthy set 1/true/yes/on, cross-lane guard requiring authorized_by,
+  un-archive never gated; test patch_archived_round_trip_with_cross_lane_guard);
+  the harness cleanup checks the PATCH status and prints CLEANUP FAILED with
+  the card id. Strays archived by hand via the Python API. Lesson repeated:
+  a cleanup that cannot report failure is a generator of exactly the debris
+  it exists to remove.
