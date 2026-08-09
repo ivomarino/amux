@@ -44,6 +44,10 @@ pub struct Runtime {
     /// its own process is a breaker nobody can reset.
     pub breaker: amux_core::circuit::FleetCircuitBreaker,
     pub fleet_state: std::sync::Mutex<amux_core::circuit::FleetState>,
+    /// Agent protocol for command delivery (None until a transport is
+    /// configured — the pump then leaves queues untouched rather than
+    /// failing every command against a void).
+    pub protocol: Option<Arc<dyn crate::opencode::AgentProtocol>>,
 }
 
 impl Runtime {
@@ -196,6 +200,12 @@ impl Runtime {
         };
         if let Some(state) = &changed {
             self.publish_fleet_state(state).await.ok();
+        }
+
+        // Command delivery pump (Invariant 34): drain each worker's queue
+        // head through the agent protocol, honoring DeliveryTiming.
+        if let Err(e) = self.pump_commands(now).await {
+            tracing::warn!(error = %e, "command pump failed this tick");
         }
 
         // Tasks arrive with the board API (Phase 2). Empty until then.
@@ -407,6 +417,137 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// Deliver due commands through the agent protocol. One in-flight
+    /// command per worker (queue discipline lives in db::commands); timing:
+    /// Immediate always goes; AtTurnBoundary/WhenIdle require the agent to
+    /// be at a boundary (Idle or WaitingForInput). Failures transition
+    /// through the core state machine — retry budget 3 (Invariant 34).
+    async fn pump_commands(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
+        let Some(protocol) = &self.protocol else {
+            return Ok(());
+        };
+        let worker_ids: Vec<String> = {
+            let conn = self.store.read()?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT worker_id FROM _amux_commands
+                 WHERE state LIKE '%queued%' OR state LIKE '%dispatched%' OR state LIKE '%delivered%'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for wid_str in worker_ids {
+            let Ok(worker) = amux_core::ids::WorkerId::parse(&wid_str) else {
+                continue;
+            };
+            let head = {
+                let conn = self.store.read()?;
+                crate::db::commands::next_deliverable(&conn, &worker)?
+            };
+            let Some(cmd) = head else { continue };
+
+            // Timing gate.
+            let due = match cmd.timing {
+                amux_core::protocol::DeliveryTiming::Immediate => true,
+                amux_core::protocol::DeliveryTiming::AtTurnBoundary
+                | amux_core::protocol::DeliveryTiming::WhenIdle => matches!(
+                    protocol.state(&worker).await,
+                    Ok(crate::opencode::AgentState::Idle)
+                        | Ok(crate::opencode::AgentState::WaitingForInput)
+                ),
+            };
+            if !due {
+                continue;
+            }
+
+            // Precondition gate (freshness at delivery, Invariant 38): a
+            // command whose precondition no longer holds FAILS visibly
+            // instead of firing against stale state.
+            if let Some(pre) = &cmd.precondition {
+                let holds = {
+                    let conn = self.store.read()?;
+                    let lookup = |entity: &str| -> Option<(u64, String)> {
+                        conn.query_row(
+                            "SELECT version, json_extract(state,'$.state') FROM _amux_workers WHERE id = ?1",
+                            params![entity],
+                            |r| Ok((r.get::<_, u64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+                        )
+                        .ok()
+                    };
+                    pre.evaluate(&lookup)
+                };
+                if !holds {
+                    let id = cmd.id.clone();
+                    self.store
+                        .write_async(move |conn| {
+                            crate::db::commands::transition(
+                                conn,
+                                &id,
+                                amux_core::protocol::CommandTransition::Fail {
+                                    reason: "precondition no longer holds at delivery".into(),
+                                },
+                                3,
+                            )?;
+                            Ok(WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .await?;
+                    continue;
+                }
+            }
+
+            // Dispatch.
+            let id = cmd.id.clone();
+            self.store
+                .write_async({
+                    let id = id.clone();
+                    move |conn| {
+                        crate::db::commands::transition(
+                            conn,
+                            &id,
+                            amux_core::protocol::CommandTransition::Dispatch,
+                            3,
+                        )?;
+                        Ok(WriteOutcome { applied: true, events: vec![] })
+                    }
+                })
+                .await?;
+            let delivery = match &cmd.command {
+                amux_core::protocol::WorkerCommand::DeliverMessage(msg_id) => {
+                    // Body resolution joins with the message store (Phase 4);
+                    // the id itself is the durable reference.
+                    protocol
+                        .deliver_message(&worker, msg_id.clone(), String::new())
+                        .await
+                }
+                other => {
+                    protocol
+                        .send_prompt(
+                            &worker,
+                            crate::opencode::Prompt {
+                                text: serde_json::to_string(other).unwrap_or_default(),
+                                idempotency_key: cmd.idempotency_key.clone(),
+                            },
+                        )
+                        .await
+                }
+            };
+            let t = match delivery {
+                Ok(()) => amux_core::protocol::CommandTransition::Deliver,
+                Err(e) => amux_core::protocol::CommandTransition::Fail {
+                    reason: format!("delivery failed at {now}: {e}"),
+                },
+            };
+            self.store
+                .write_async(move |conn| {
+                    crate::db::commands::transition(conn, &id, t, 3)?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ReconcileReport {
     /// Workers whose DB session was live but whose backend process is gone.
@@ -475,6 +616,7 @@ mod tests {
                 max_failures_per_window: 1000,
             },
             fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+            protocol: None,
         }
     }
 
@@ -593,5 +735,111 @@ mod tests {
         }
         assert!(kinds.iter().any(|k| k.contains("lease")), "{kinds:?}");
         assert!(kinds.iter().any(|k| k.contains("fleet_progress")), "{kinds:?}");
+    }
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use super::*;
+    use crate::opencode::mock::{MockProtocol, RecordedCall};
+    use crate::opencode::AgentState;
+    use amux_core::ids::{CommandId, WorkerId};
+    use amux_core::protocol::{CommandState, DeliveryTiming, WorkerCommand};
+
+    fn store() -> SharedStore {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let s = Arc::new(crate::db::Store::open(&path).unwrap());
+        std::mem::forget(dir);
+        s
+    }
+
+    fn wid() -> WorkerId {
+        WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 77))
+    }
+
+    fn runtime_with(store: SharedStore, protocol: Arc<MockProtocol>) -> Runtime {
+        Runtime {
+            store,
+            backends: vec![],
+            tick_secs: 3,
+            heartbeat_every: 1000,
+            breaker: amux_core::circuit::FleetCircuitBreaker {
+                window_budget_tokens: u64::MAX,
+                window_secs: 3600,
+                min_progress_per_window: 0,
+                max_failures_per_window: 1000,
+            },
+            fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+            protocol: Some(protocol),
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_delivers_when_idle_and_holds_mid_turn() {
+        let store = store();
+        let protocol = Arc::new(MockProtocol::new());
+        // Worker mid-turn: an AtTurnBoundary command must WAIT.
+        protocol.register(wid(), AgentState::Working { turn: None, progress: None });
+        let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 501));
+        {
+            let id = cmd_id.clone();
+            store
+                .write(move |conn| {
+                    crate::db::commands::enqueue(
+                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k1",
+                        &DeliveryTiming::AtTurnBoundary, None, Utc::now(),
+                    )?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        let rt = runtime_with(store.clone(), protocol.clone());
+        rt.pump_commands(Utc::now()).await.unwrap();
+        assert!(protocol.calls().is_empty(), "mid-turn: nothing delivered");
+        {
+            let conn = store.read().unwrap();
+            let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+            assert_eq!(cmd.state, CommandState::Queued, "still queued");
+        }
+
+        // Turn ends -> delivery goes through and the state advances.
+        protocol.set_state(&wid(), AgentState::Idle, None);
+        rt.pump_commands(Utc::now()).await.unwrap();
+        let calls = protocol.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(matches!(&calls[0], RecordedCall::SendPrompt { worker, .. } if worker == &wid()));
+        let conn = store.read().unwrap();
+        let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+        assert_eq!(cmd.state, CommandState::Delivered);
+    }
+
+    #[tokio::test]
+    async fn pump_fails_command_against_dead_worker() {
+        let store = store();
+        // Protocol knows NOTHING about this worker (no session).
+        let protocol = Arc::new(MockProtocol::new());
+        let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 502));
+        {
+            let id = cmd_id.clone();
+            store
+                .write(move |conn| {
+                    crate::db::commands::enqueue(
+                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k2",
+                        &DeliveryTiming::Immediate, None, Utc::now(),
+                    )?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        let rt = runtime_with(store.clone(), protocol);
+        rt.pump_commands(Utc::now()).await.unwrap();
+        let conn = store.read().unwrap();
+        let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+        assert!(
+            matches!(&cmd.state, CommandState::Failed { reason } if reason.contains("delivery failed")),
+            "{:?}", cmd.state
+        );
+        assert_eq!(cmd.attempts, 1, "failure recorded for the retry budget");
     }
 }

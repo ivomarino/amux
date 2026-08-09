@@ -10,6 +10,7 @@ pub mod db;
 pub mod opencode;
 pub mod orchestrator;
 pub mod provider;
+pub mod runtime_jobs;
 pub mod tls;
 
 use std::sync::Arc;
@@ -102,6 +103,9 @@ async fn async_main() {
             max_failures_per_window: 50,
         },
         fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
+        protocol: Some(Arc::new(
+            opencode::structured::StructuredCliProtocol::new(),
+        )),
     });
     match runtime.reconcile_on_startup().await {
         Ok(report) => tracing::info!(
