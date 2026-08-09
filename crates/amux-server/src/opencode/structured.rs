@@ -82,11 +82,17 @@ impl CliProvider {
                 "stream-json".into(),
                 "--verbose".into(),
             ],
+            // --approval-mode auto_edit: a HEADLESS gemini turn has no human
+            // to approve a write tool, so the default mode hangs FOREVER on
+            // any task that edits a file (verified live, RR-0085: default
+            // hung >90s on a one-line write; auto_edit finished in ~10s).
             CliProvider::GeminiCli => vec![
                 "-p".into(),
                 prompt.into(),
                 "--output-format".into(),
                 "stream-json".into(),
+                "--approval-mode".into(),
+                "auto_edit".into(),
             ],
             // --skip-git-repo-check: codex refuses to run outside a git repo
             // otherwise. The orchestrator chose the cwd deliberately, and a
