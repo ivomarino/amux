@@ -22946,7 +22946,21 @@ import json, os, ssl, subprocess, sys, urllib.request
 
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
-    if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
+    # AMUX_VERIFIED_SOLO is the HONEST half of the same exit (AF-26). Both skip the
+    # check; they differ in what the operator asserts, and that difference is the point —
+    # ALLOW_FOREIGN says "their work is in it and I mean to ship it", VERIFIED_SOLO says
+    # "I read the staged diff and none of it is theirs". Clearing a FALSE positive
+    # previously required claiming the first, which is ethos rule 3: a constraint with no
+    # truthful path forward in a legitimate state.
+    #
+    # Wired in the same edit as the text advertising it. The first cut of this fix
+    # shipped the message WITHOUT this line — an escape existing only in its own
+    # instructions, which is exactly AMUX-2140 (every notice told sessions to run
+    # `amux board claim`, which did not exist, fell through to help, and exited 0).
+    # Caught by grepping for what the message promises. The push guard above still has
+    # ALLOW_FOREIGN as its only exit and has the same problem; left alone here because
+    # its assertion differs ("these commits are not mine" vs "this diff is not theirs").
+    if not sess or os.environ.get("AMUX_ALLOW_FOREIGN") or os.environ.get("AMUX_VERIFIED_SOLO"):
         return 0
     try:
         staged = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"],
