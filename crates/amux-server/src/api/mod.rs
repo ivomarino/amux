@@ -21,6 +21,7 @@ pub mod gmail_auth;
 pub mod health;
 pub mod history;
 pub mod journal;
+pub mod map;
 pub mod memories;
 pub mod metrics;
 pub mod messages;
@@ -30,6 +31,7 @@ pub mod py_proxy;
 pub mod schedules;
 pub mod sessions_legacy;
 pub mod settings;
+pub mod skills;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -90,14 +92,40 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{name}/{*verb}", axum::routing::any(py_proxy::proxy_session_verb))
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
+        // /api/fs/* is the SPA's Files contract (multipart upload + dir
+        // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
+        // paths) — a different contract from /api/files above, so it
+        // proxies to the Python owner rather than aliasing (py_proxy.rs).
+        .nest("/api/fs", py_proxy::passthrough_routes())
+        // Chunked upload: /api/upload/start, /api/upload/:id/chunk/:n,
+        // /api/upload/:id/finish. Python owns the chunked protocol and the
+        // uploads directory; the SPA's peek drag-and-drop hits these.
+        .nest("/api/upload", py_proxy::passthrough_routes())
+        .nest("/api/uploads", py_proxy::passthrough_routes())
+        // Groups/tags (AMUX-2594): the SPA's group picker reads /api/groups
+        // ({"groups":[{name,workers,...}]}); Python owns the fleet and its
+        // own groups->tags aliasing (amux-server.py:65345, config paths
+        // exempt), so BOTH spellings proxy wholesale pre-cutover.
+        .nest("/api/groups", py_proxy::passthrough_routes())
+        .nest("/api/tags", py_proxy::passthrough_routes())
         .nest("/api/journal", journal::routes())
+        // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
+        .nest("/api/skills", skills::routes())
+        .nest("/api/slash-commands", skills::slash_routes())
+        .nest("/api/map", map::routes())
         .nest("/api/history", history::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         .nest("/api/dictation", dictation::routes())
         // Python serves transcription at the TOP-LEVEL /api/dictate (the
-        // dictation module owns it; here it is an honest 501).
-        .route("/api/dictate", axum::routing::post(dictation::dictate))
+        // dictation module owns it; it proxies to the Python engine). Body
+        // limit off: audio runs to 25MB raw / ~33MB base64, and Python's own
+        // 413 must answer, not axum's 2MB default.
+        .route(
+            "/api/dictate",
+            axum::routing::post(dictation::dictate)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .nest("/api/torrents", torrents::routes())
         .nest("/api/org", org::routes())
         // Absolute-path routes (merged, not nested): the gmail callback
