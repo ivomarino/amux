@@ -1013,6 +1013,7 @@ async fn golden_multi_provider_fleet() {
                         provider: *cli,
                         cwd: ws.path().to_path_buf(),
                         binary: binary.clone(),
+                        model: None, // structured::WorkerConfig grew `model` mid-flight (other lane); None = CLI default
                     },
                 );
                 routes.insert(wid.clone(), structured.clone());

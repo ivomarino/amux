@@ -90,6 +90,23 @@ impl ProviderRegistry {
         self.adapters.get(id).cloned()
     }
 
+    /// Resolve a provider id as it appears on WORKER ROWS. Exact match
+    /// first; the one legacy spelling — `"claude"`, the `_amux_workers`
+    /// schema default (migration 0003) and the create-endpoint default
+    /// (api/workers.rs) — resolves to the canonical `"claude-code"`.
+    /// Without this alias every default-created worker fails provider
+    /// lookup while `GET /api/workers` happily shows `"provider":"claude"`
+    /// (two components disagreeing about the same fact; ethos rule 4).
+    pub fn resolve(&self, id: &str) -> Option<Arc<dyn ProviderAdapter>> {
+        if let Some(a) = self.adapters.get(&ProviderId::new(id)) {
+            return Some(a.clone());
+        }
+        match id {
+            "claude" => self.adapters.get(&ProviderId::new("claude-code")).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn ids(&self) -> Vec<ProviderId> {
         self.adapters.keys().cloned().collect()
     }
@@ -238,6 +255,17 @@ mod tests {
         assert_eq!(reg.len(), 5);
         let got = reg.get(&ProviderId::new("a-provider-from-2031")).unwrap();
         assert_eq!(got.id().as_str(), "a-provider-from-2031");
+    }
+
+    #[test]
+    fn resolve_accepts_the_worker_row_default_spelling() {
+        let reg = default_registry();
+        // The exact ids all resolve...
+        assert_eq!(reg.resolve("claude-code").unwrap().id().as_str(), "claude-code");
+        assert_eq!(reg.resolve("gemini").unwrap().id().as_str(), "gemini");
+        // ...and the schema-default legacy spelling lands on claude-code.
+        assert_eq!(reg.resolve("claude").unwrap().id().as_str(), "claude-code");
+        assert!(reg.resolve("not-a-provider").is_none());
     }
 
     #[test]

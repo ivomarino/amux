@@ -655,8 +655,15 @@ const PATCH_WRITABLE: [&str; 17] = [
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
-const PATCH_CONTROL: [&str; 6] =
-    ["expect_rev", "gate_ack", "gate_checked", "force", "reason", "authorized_by"];
+const PATCH_CONTROL: [&str; 7] = [
+    "expect_rev",
+    "gate_ack",
+    "gate_checked",
+    "force",
+    "reason",
+    "authorized_by",
+    "override_doing",
+];
 
 enum PatchOut {
     NotFound,
@@ -773,11 +780,22 @@ pub async fn patch_item(
         );
     };
     let (actor, actor_name) = actor_from_headers(&headers);
-    let force_actor = if actor_name == "api-anonymous" {
-        "anonymous".to_string()
-    } else {
-        actor_name.clone()
-    };
+    // ATTRIBUTION IS REQUIRED FOR FORCE (ts-gke 2026-08-03; Python parity
+    // amux-server.py ~70111). Fires on `force` ITSELF, never `eff_gate &&
+    // force`: the incident specimen was a watch card whose todo->discarded
+    // had NO gate, so a gate-conditioned check cannot fail on the case that
+    // motivated it.
+    if map.get("force").and_then(Value::as_bool).unwrap_or(false) && actor_name == "api-anonymous" {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "force requires attribution",
+                "why": "force bypasses the checks; the judgment then rests with whoever forced it, so the ledger must name them. An unattributed force is an audit row that records only that something happened.",
+                "how": "send X-Amux-Session: <your session> (the `amux board` CLI does this for you). Or satisfy the gate honestly — if it does not fit the work, the TYPE is wrong; fix the type, not the truth.",
+            }),
+        );
+    }
+    let force_actor = actor_name.clone();
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
     // archive guard only fires for a NAMED caller (AMUX-2492).
     let caller_lane = if actor_name == "api-anonymous" {
@@ -1099,6 +1117,59 @@ pub async fn patch_item(
                     };
                     let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
                     let reason = body_str(&map, "reason").unwrap_or_default();
+                    // ONE-DOING-PER-SESSION (AMUX-1707 parity). Python's WIP
+                    // filters verbatim: archived cards and dormant types
+                    // (tripwire/watch) do not hold WIP — both were real
+                    // incidents. The escape names the attributed CLI command
+                    // (AMUX-2325: an escape publishable only in HTTP terms
+                    // routes agents off the audited path).
+                    let override_doing = map
+                        .get("override_doing")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if target == TaskStatus::Doing
+                        && task.status != TaskStatus::Doing
+                        && !force
+                        && !override_doing
+                    {
+                        if let Some(sess) = next.session.as_deref().filter(|s| !s.is_empty()) {
+                            let holding: Vec<String> = conn
+                                .prepare(
+                                    "SELECT id FROM issues WHERE session = ?1 \
+                                     AND status = 'doing' AND id != ?2 \
+                                     AND deleted IS NULL AND COALESCE(archived,0) = 0 \
+                                     AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+                                     ORDER BY id",
+                                )
+                                .and_then(|mut st| {
+                                    st.query_map(rusqlite::params![sess, next.id], |r| {
+                                        r.get::<_, String>(0)
+                                    })
+                                    .map(|rows| rows.filter_map(Result::ok).collect())
+                                })
+                                .unwrap_or_default();
+                            if !holding.is_empty() {
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "already holding doing",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "session": sess,
+                                            "holding": holding,
+                                            "cli": format!(
+                                                "amux board doing {} --override-doing",
+                                                next.id
+                                            ),
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                        }
+                    }
                     // RR-0048d (Invariant 50): leaving todo requires authored
                     // acceptance criteria — enforcement opt-in during
                     // coexistence (AMUX_RS_REQUIRE_CRITERIA=1); force bypasses

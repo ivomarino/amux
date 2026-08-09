@@ -11,12 +11,14 @@
 //! renames must not orphan processes).
 
 pub mod adapter;
+pub mod bootstrap;
 pub mod herdr;
 pub mod tmux;
 
 use amux_core::ids::WorkerId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// What a backend needs to start a session process. Everything resolved
 /// upstream (scope, provider CLI invocation) — the backend runs a command in
@@ -84,6 +86,24 @@ pub fn backend_ref(worker: &WorkerId) -> String {
     format!("amux-{worker}")
 }
 
+/// The backend set for this server, from configuration. tmux is always
+/// present (it needs no server of its own); herdr joins when
+/// `AMUX_HERDR_SESSION` names the herdr session hosting amux workspaces —
+/// constructing a HerdrBackend against a missing herdr server would make
+/// every probe a failure report, so absence of the variable means absence
+/// of the backend. `BackendId::default()` is herdr, so a deployment that
+/// wants the default worker backend to actually work sets this variable.
+pub fn backends_from_env(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Vec<Arc<dyn SessionBackend>> {
+    let mut backends: Vec<Arc<dyn SessionBackend>> = vec![Arc::new(tmux::TmuxBackend::new())];
+    if let Some(session) = env.get("AMUX_HERDR_SESSION").map(|s| s.trim()).filter(|s| !s.is_empty())
+    {
+        backends.push(Arc::new(herdr::HerdrBackend::new(session.to_string())));
+    }
+    backends
+}
+
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     /// Human-readable backend name ("herdr", "tmux") — matches
@@ -100,4 +120,27 @@ pub trait SessionBackend: Send + Sync {
     /// Capture recent visible output. This is a LIVENESS/diagnostic view,
     /// not the control plane (D1): structured state comes from OpenCode.
     async fn capture(&self, proc: &ProcessRef, lines: u32) -> Result<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn herdr_backend_joins_only_when_a_session_is_named() {
+        let none: BTreeMap<String, String> = BTreeMap::new();
+        let names: Vec<&str> = backends_from_env(&none).iter().map(|b| b.name()).collect();
+        assert_eq!(names, vec!["tmux"], "unconfigured herdr must stay absent");
+
+        let mut env = BTreeMap::new();
+        env.insert("AMUX_HERDR_SESSION".to_string(), "amux".to_string());
+        let names: Vec<&str> = backends_from_env(&env).iter().map(|b| b.name()).collect();
+        assert_eq!(names, vec!["tmux", "herdr"]);
+
+        // Whitespace-only is absence, not a session named "  ".
+        env.insert("AMUX_HERDR_SESSION".to_string(), "   ".to_string());
+        let names: Vec<&str> = backends_from_env(&env).iter().map(|b| b.name()).collect();
+        assert_eq!(names, vec!["tmux"]);
+    }
 }

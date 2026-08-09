@@ -166,18 +166,25 @@ pub fn record_snapshot(
 /// scan is exact, where a reverse map would be a second spelling of the id
 /// scheme that could drift from the first.
 pub fn task_by_internal_id(conn: &Connection, id: &TaskId) -> rusqlite::Result<Option<Task>> {
+    Ok(issue_by_internal_id(conn, id)?.and_then(|row| row.to_task()))
+}
+
+/// The RAW issue row behind a planner TaskId — for callers that must write
+/// board columns (log, rev) rather than reason over the core Task. Same
+/// scan-and-re-mint as [`task_by_internal_id`], one implementation.
+pub fn issue_by_internal_id(
+    conn: &Connection,
+    id: &TaskId,
+) -> rusqlite::Result<Option<crate::db::board_store::IssueRow>> {
     let rows = crate::db::board_store::list_issues(
         conn,
         &[],
         &[],
         crate::db::board_store::ArchivedFilter::All,
     )?;
-    for row in rows {
-        if crate::db::board_store::internal_id(&row.id) == *id {
-            return Ok(row.to_task());
-        }
-    }
-    Ok(None)
+    Ok(rows
+        .into_iter()
+        .find(|row| crate::db::board_store::internal_id(&row.id) == *id))
 }
 
 #[cfg(test)]

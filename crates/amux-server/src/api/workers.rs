@@ -1149,6 +1149,12 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sessions_route_serves_workers_with_deprecated_header() {
+        // Keep this test's verdict machine-independent: without suppression
+        // the legacy route merges the REAL fleet (env + tmux read at call
+        // time) and the assertion below depends on how many live sessions
+        // this box runs. See SUPPRESS_FLEET_FOR_TEST for the named deviation.
+        crate::api::sessions_legacy::SUPPRESS_FLEET_FOR_TEST
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (app, _dir) = app();
         let id = create(&app, "w").await;
 

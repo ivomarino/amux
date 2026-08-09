@@ -69,11 +69,31 @@ impl CliProvider {
         }
     }
 
+    /// The structured CLI for a provider id as stored on worker rows.
+    /// `"claude"` is the workers-table default spelling (migration 0003);
+    /// the provider registry's canonical id is `"claude-code"` — both map
+    /// here so a worker created through either era of the API resolves.
+    /// `None` (e.g. `"ollama"`, spike: not an agent CLI) means this
+    /// protocol cannot drive the provider; such a worker stays
+    /// terminal-hosted only and the pump never sees a live session for it.
+    pub fn from_provider_id(id: &str) -> Option<Self> {
+        match id {
+            "claude" | "claude-code" => Some(CliProvider::ClaudeCode),
+            "gemini" => Some(CliProvider::GeminiCli),
+            "codex" => Some(CliProvider::CodexCli),
+            _ => None,
+        }
+    }
+
     /// Argv for one headless prompt run. Flags verified against the
     /// installed binaries on 2026-08-09 (claude 2.1.226, gemini 0.53.1,
     /// codex 0.141.0) — see events.rs for the captured output they produce.
-    fn args(&self, prompt: &str) -> Vec<String> {
-        match self {
+    ///
+    /// `model` is the worker's configured model (tier alias or full id);
+    /// all three CLIs take `--model`. None = the CLI's own default — never
+    /// invent one here (the model choice is the user's, ethos rule 8).
+    fn args(&self, prompt: &str, model: Option<&str>) -> Vec<String> {
+        let mut argv: Vec<String> = match self {
             // --verbose is required for stream-json with --print.
             CliProvider::ClaudeCode => vec![
                 "--print".into(),
@@ -103,7 +123,12 @@ impl CliProvider {
                 "--skip-git-repo-check".into(),
                 prompt.into(),
             ],
+        };
+        if let Some(m) = model {
+            argv.push("--model".into());
+            argv.push(m.into());
         }
+        argv
     }
 
     /// Extra env for headless runs. Gemini refuses untrusted directories
@@ -135,9 +160,16 @@ pub struct WorkerConfig {
     /// Override the binary path (tests point this at a fixture-replaying
     /// script; production leaves it `None` and resolves via PATH).
     pub binary: Option<PathBuf>,
+    /// The worker's configured model (`_amux_workers.model`), passed as
+    /// `--model` on every run. None = the CLI's own default.
+    pub model: Option<String>,
 }
 
 struct WorkerShared {
+    /// Who this session belongs to — carried so lifecycle logging names the
+    /// worker (a turn that completes invisibly is a diagnosis that cannot
+    /// be made; ethos rule 4).
+    worker: WorkerId,
     config: WorkerConfig,
     events: broadcast::Sender<WorkerEvent>,
     state: Mutex<AgentState>,
@@ -177,8 +209,9 @@ impl StructuredCliProtocol {
     pub fn register(&self, worker: WorkerId, config: WorkerConfig) {
         let (tx, _) = broadcast::channel(256);
         self.workers.lock().unwrap().insert(
-            worker,
+            worker.clone(),
             Arc::new(WorkerShared {
+                worker,
                 config,
                 events: tx,
                 state: Mutex::new(AgentState::Idle),
@@ -186,6 +219,14 @@ impl StructuredCliProtocol {
                 child: Mutex::new(None),
             }),
         );
+    }
+
+    /// Whether a worker has a live protocol session. Callers that adopt
+    /// existing workers (backend::bootstrap) MUST check this before
+    /// register(): re-registering replaces the WorkerShared, which would
+    /// silently orphan a running turn's state.
+    pub fn is_registered(&self, worker: &WorkerId) -> bool {
+        self.workers.lock().unwrap().contains_key(worker)
     }
 
     fn shared(&self, worker: &WorkerId) -> Result<Arc<WorkerShared>> {
@@ -222,7 +263,7 @@ impl StructuredCliProtocol {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(cfg.provider.binary()));
             let mut cmd = Command::new(&program);
-            cmd.args(cfg.provider.args(text))
+            cmd.args(cfg.provider.args(text, cfg.model.as_deref()))
                 .current_dir(&cfg.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -311,8 +352,18 @@ async fn read_stream(
                     turn: Some(turn.clone()),
                     progress: Some(p.clone()),
                 }),
-                WorkerEvent::TurnCompleted(_) => {
+                WorkerEvent::TurnCompleted(r) => {
                     turn_completed = true;
+                    // The one place a headless turn's outcome is visible
+                    // server-side today (nothing durable subscribes to the
+                    // broadcast yet) — log it, or the turn completes
+                    // invisibly (ethos rule 4).
+                    tracing::info!(
+                        worker = %shared.worker,
+                        turn = %r.turn_id,
+                        outcome = %r.outcome,
+                        "structured turn completed"
+                    );
                     shared.set_state(AgentState::Idle);
                 }
                 _ => {}
@@ -361,6 +412,7 @@ async fn read_stream(
                     shared.config.provider.binary()
                 )
             };
+            tracing::warn!(worker = %shared.worker, reason = %reason, "structured turn failed");
             shared.emit(WorkerEvent::Failed(Failure {
                 reason,
                 retryable: true,
@@ -581,6 +633,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_flag_rides_into_argv_only_when_configured() {
+        for provider in [
+            CliProvider::ClaudeCode,
+            CliProvider::GeminiCli,
+            CliProvider::CodexCli,
+        ] {
+            let with = provider.args("hi", Some("haiku"));
+            assert!(
+                with.windows(2).any(|w| w == ["--model", "haiku"]),
+                "{provider:?}: missing --model haiku in {with:?}"
+            );
+            let without = provider.args("hi", None);
+            assert!(
+                !without.iter().any(|a| a == "--model"),
+                "{provider:?}: invented a model in {without:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_id_mapping_covers_worker_row_spellings() {
+        // "claude" is the workers-table DEFAULT (migration 0003); a mapping
+        // that only knows "claude-code" strands every default-created worker.
+        assert_eq!(
+            CliProvider::from_provider_id("claude"),
+            Some(CliProvider::ClaudeCode)
+        );
+        assert_eq!(
+            CliProvider::from_provider_id("claude-code"),
+            Some(CliProvider::ClaudeCode)
+        );
+        assert_eq!(
+            CliProvider::from_provider_id("gemini"),
+            Some(CliProvider::GeminiCli)
+        );
+        assert_eq!(
+            CliProvider::from_provider_id("codex"),
+            Some(CliProvider::CodexCli)
+        );
+        // Not an agent CLI (spike): the honest answer is None, not a guess.
+        assert_eq!(CliProvider::from_provider_id("ollama"), None);
+    }
+
     #[tokio::test]
     async fn codex_shaped_stream_full_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,6 +699,7 @@ mod tests {
                 provider: CliProvider::CodexCli,
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
+                model: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -642,6 +739,7 @@ mod tests {
                 provider: CliProvider::GeminiCli,
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
+                model: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -683,6 +781,7 @@ mod tests {
                 provider: CliProvider::ClaudeCode,
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
+                model: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -722,6 +821,7 @@ mod tests {
                 provider: CliProvider::CodexCli,
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
+                model: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -760,6 +860,7 @@ mod tests {
                 provider: CliProvider::CodexCli,
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
+                model: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -788,6 +889,7 @@ mod tests {
                 provider: CliProvider::ClaudeCode,
                 cwd: dir.path().to_path_buf(),
                 binary: None,
+                model: None,
             },
         );
         assert!(matches!(
@@ -837,6 +939,7 @@ mod tests {
                 provider: CliProvider::CodexCli,
                 cwd: dir.path().to_path_buf(),
                 binary: None,
+                model: None,
             },
         );
         proto.cancel(&w).await.unwrap();
@@ -869,6 +972,7 @@ mod tests {
                 provider: CliProvider::ClaudeCode,
                 cwd: dir.path().to_path_buf(),
                 binary: None,
+                model: None,
             },
         );
         let mut rx = proto.events(&w);

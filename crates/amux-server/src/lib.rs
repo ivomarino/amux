@@ -122,15 +122,20 @@ async fn async_main() {
     let rustls_cfg =
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config));
 
+    // Terminal backends (RR-0031/0032): tmux always; herdr joins when
+    // AMUX_HERDR_SESSION names the herdr session hosting amux workspaces
+    // (backend::backends_from_env — constructing it against a missing herdr
+    // server would make every probe a failure report).
+    let backends = backend::backends_from_env(&cfg.env);
+    // ONE protocol instance shared by the runtime pump, the scan demotion
+    // check, and the bootstrap registrar — two instances would disagree
+    // about which workers have live sessions (ethos rule 4).
+    let protocol = Arc::new(opencode::structured::StructuredCliProtocol::new());
+
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
-        backends: vec![
-            Arc::new(backend::tmux::TmuxBackend::new()),
-            // Herdr backend joins the reconcile set when a herdr session is
-            // configured (AMUX_HERDR_SESSION); constructing it against a
-            // missing server would make every probe a failure report.
-        ],
+        backends: backends.clone(),
         tick_secs: cfg
             .env
             .get("AMUX_RS_TICK_SECS")
@@ -146,9 +151,7 @@ async fn async_main() {
             max_failures_per_window: 50,
         },
         fleet_state: std::sync::Mutex::new(amux_core::circuit::FleetState::Normal),
-        protocol: Some(Arc::new(
-            opencode::structured::StructuredCliProtocol::new(),
-        )),
+        protocol: Some(protocol.clone() as Arc<dyn opencode::AgentProtocol>),
         pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
         // RR-0044b: staggered un-park interval after a provider rate-limit
         // reset (thundering-herd prevention).
@@ -182,6 +185,24 @@ async fn async_main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
     tokio::spawn(scan.run(scan_secs));
+
+    // Session bootstrap (backend::bootstrap): the spawn/registration glue
+    // that turns the API's durable Starting/ended records into real backend
+    // processes and structured-protocol sessions. Without it a started
+    // worker never gets a terminal and the pump sees NoSession forever —
+    // see the module docs for the incident.
+    let boot = Arc::new(backend::bootstrap::Bootstrap {
+        store: store.clone(),
+        backends,
+        registry: Arc::new(provider::default_registry()),
+        registrar: protocol,
+    });
+    let boot_secs = cfg
+        .env
+        .get("AMUX_RS_BOOTSTRAP_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    tokio::spawn(boot.run(boot_secs));
 
     // Self-adoption (parity with the Python server's own-mtime watch): when
     // the INSTALLED binary changes underneath us — the builder agent just

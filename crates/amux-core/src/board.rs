@@ -1022,6 +1022,164 @@ pub fn would_cycle(
     detect_cycle(&edges)
 }
 
+// ---------------------------------------------------------------------------
+// Prompt capture: the ledger duty (ethos rules 2 and 5)
+// ---------------------------------------------------------------------------
+
+/// Control words that steer the task ALREADY in flight rather than starting
+/// a new one. A card for "continue" is noise that buries the cards that mean
+/// something. Mirrors the Python board's `_AUTOTASK_SKIP` set.
+const CAPTURE_SKIP: [&str; 26] = [
+    "continue", "go", "yes", "y", "no", "n", "ok", "okay", "yep", "yeah", "sure",
+    "stop", "wait", "retry", "again", "next", "done", "thanks", "ty", "k",
+    "proceed", "resume", "keep going", "carry on", "do it", "sounds good",
+];
+
+/// Conversational lead-ins stripped so the derived title is the ACTION
+/// ("Please can you fix X" -> "Fix X"). Checked case-insensitively,
+/// repeatedly, longest-first at each step.
+const CAPTURE_FILLER: [&str; 19] = [
+    "i would like you to ", "i want you to ", "i need you to ", "could you please ",
+    "can you please ", "would you please ", "i want to ", "i need to ", "we need to ",
+    "we should ", "could you ", "can you ", "would you ", "will you ", "let's ",
+    "lets ", "please ", "kindly ", "pls ",
+];
+
+/// Derive a board-card title from a prompt's own first clause — COMPUTED,
+/// never a model call (ethos rule 2: the Python system paid a full
+/// `claude -p` boot, ~12-15k input tokens, for a 3-word label, and the
+/// throttle that cost forced is why most commands never reached the board).
+/// Mirrors Python `_autotask_title` + the `_AUTOTASK_SKIP` guards.
+///
+/// Returns `None` when the text is NOT a task: a control word steering the
+/// current work, a too-short fragment, a bare slash command (drives the
+/// harness, not the work), or an explicit `[no-board]` opt-out. `None`
+/// means "do not mint a ledger card", not "untitled".
+pub fn title_from_prompt(text: &str) -> Option<String> {
+    let mut t = text.trim();
+    // Explicit opt-out marker, checked BEFORE stamp-stripping so the marker
+    // itself is never mistaken for a timestamp prefix.
+    let lower_all = t.to_lowercase();
+    if lower_all.starts_with("[no-board]") || lower_all.starts_with("[no_board]") {
+        return None;
+    }
+    // Drop leading "[03:47 PM] " / "[amux-origin: ...]" style stamps.
+    while t.starts_with('[') {
+        match t.find(']') {
+            Some(i) => t = t[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bare = collapsed
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_lowercase();
+    if collapsed.chars().count() < 12 || CAPTURE_SKIP.contains(&bare.as_str()) {
+        return None;
+    }
+    // A bare slash command drives the harness, not the work.
+    if collapsed.starts_with('/') && !collapsed.contains(' ') {
+        return None;
+    }
+
+    // First sentence/clause: cut after ". " / "! " / "? " or at "; ".
+    let mut head: &str = &collapsed;
+    let chars: Vec<(usize, char)> = collapsed.char_indices().collect();
+    for w in chars.windows(2) {
+        let ((i, c), (_, next)) = (w[0], w[1]);
+        if matches!(c, '.' | '!' | '?' | ';') && next == ' ' {
+            head = &collapsed[..i + c.len_utf8()];
+            break;
+        }
+    }
+    let mut head = head.trim_matches([' ', '-', '–', '—', ':', ',']).to_string();
+
+    // Strip conversational filler, repeatedly (they stack: "ok please ...").
+    loop {
+        let lower = head.to_lowercase();
+        let Some(f) = CAPTURE_FILLER.iter().find(|f| lower.starts_with(*f)) else {
+            break;
+        };
+        head = head[f.len()..]
+            .trim_start_matches([' ', '-', '–', '—', ':', ','])
+            .to_string();
+    }
+    head = head
+        .trim_end_matches(['.', '!', '?', ',', ';', ' '])
+        .to_string();
+
+    // Sentence-case a lowercase opener.
+    let mut out: String = head;
+    if let Some(first) = out.chars().next() {
+        if first.is_lowercase() {
+            let upper: String = first.to_uppercase().collect();
+            out = format!("{upper}{}", &out[first.len_utf8()..]);
+        }
+    }
+    // Cap at 64 chars, cut on a word boundary (247 of 379 live Python titles
+    // ran past 60 and ended mid-thought before this rule).
+    if out.chars().count() > 64 {
+        let cut: String = out.chars().take(63).collect();
+        let cut = match cut.rfind(' ') {
+            Some(i) => cut[..i].trim_end_matches([' ', '-', '–', '—', ':', ',']).to_string(),
+            None => cut,
+        };
+        out = format!("{cut}…");
+    }
+    if out.is_empty() {
+        // The clause dissolved (all filler): fall back to the raw text.
+        out = collapsed.chars().take(60).collect();
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn control_words_and_short_fragments_mint_no_card() {
+        for s in ["continue", "yes", "ok", "keep going", "do it", "  go  ", "Retry."] {
+            assert_eq!(title_from_prompt(s), None, "{s:?} is steering, not a task");
+        }
+        assert_eq!(title_from_prompt("fix it"), None, "too short to be a brief");
+        assert_eq!(title_from_prompt("/compact"), None, "bare slash = harness");
+        assert_eq!(
+            title_from_prompt("[no-board] what's the status of the deploy?"),
+            None,
+            "explicit opt-out"
+        );
+    }
+
+    #[test]
+    fn first_clause_becomes_the_title_with_stamps_and_filler_stripped() {
+        assert_eq!(
+            title_from_prompt("[03:47 PM] please fix the flaky auth test. It fails on CI only."),
+            Some("Fix the flaky auth test".into())
+        );
+        assert_eq!(
+            title_from_prompt("can you please update the deploy docs; the old runbook is stale"),
+            Some("Update the deploy docs".into())
+        );
+        // A slash SKILL with a real brief still files a card.
+        assert_eq!(
+            title_from_prompt("/deploy the gateway change to staging"),
+            Some("/deploy the gateway change to staging".into())
+        );
+    }
+
+    #[test]
+    fn long_briefs_cut_on_a_word_boundary_at_64() {
+        let long = "Audit every mechanism that keeps workers adherent to their assigned board \
+                    cards and write the per-mechanism verdicts into the final report";
+        let t = title_from_prompt(long).unwrap();
+        assert!(t.chars().count() <= 64, "{} chars: {t}", t.chars().count());
+        assert!(t.ends_with('…'), "{t}");
+        assert!(!t.trim_end_matches('…').ends_with(' '), "{t}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

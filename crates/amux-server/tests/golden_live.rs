@@ -357,6 +357,7 @@ async fn golden_live_happy_path_claude() {
             provider: CliProvider::ClaudeCode,
             cwd: ws_path.clone(),
             binary: None, // real `claude` resolved via PATH
+            model: None, // structured::WorkerConfig grew `model` mid-flight (other lane); None = CLI default
         },
     );
 

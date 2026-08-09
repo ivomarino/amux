@@ -543,19 +543,24 @@ async fn force_bypasses_the_gate_and_leaves_the_audit_line() {
         "force audit line missing from log: {log}"
     );
 
-    // A headerless force is still audited, attributed to `anonymous`.
+    // A headerless force is REFUSED (Python parity: "force requires
+    // attribution", amux-server.py ~70111). The refusal fires on `force`
+    // itself, not on `eff_gate && force` — the ts-gke incident specimen was
+    // an UNGATED transition, which a gate-conditioned check waves through.
     let card2 = create(&app, json!({ "title": "h2", "status": "doing" })).await;
     let id2 = card2["id"].as_str().unwrap().to_string();
-    let (st, _, _) = send(
+    let (st, _, v) = send(
         &app,
         "PATCH",
         &format!("/api/board/{id2}"),
         Some(json!({ "status": "done", "force": true })),
     )
     .await;
-    assert_eq!(st, StatusCode::OK);
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], json!("force requires attribution"));
+    // And the card did not move.
     let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id2}"), None).await;
-    assert!(detail["log"].as_str().unwrap().contains("force by anonymous: doing->done"));
+    assert_eq!(detail["status"], json!("doing"));
 }
 
 // ---- archive / restore (RR-0055) -----------------------------------------
@@ -605,11 +610,14 @@ async fn archive_restore_round_trip_preserves_every_field() {
     assert_eq!(v2["rev"].as_i64().unwrap(), rev_after_archive);
 
     // A status PATCH on an archived card is refused (restore it first).
-    let (st, _, v3) = send(
+    // Attributed force: this cell tests archived-immutability, not the
+    // force-attribution refusal (which would 400 first and mask it).
+    let (st, _, v3) = send_with(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
         Some(json!({ "status": "done", "force": true })),
+        &[("X-Amux-Session", "orch")],
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -961,4 +969,64 @@ async fn board_routes_sit_behind_auth_when_token_configured() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+}
+
+// ---- one-doing-per-session (AMUX-1707 parity) ----------------------------
+
+#[tokio::test]
+async fn second_doing_for_same_session_is_refused_with_named_escape() {
+    let (app, _dir) = app();
+    let first = create(
+        &app,
+        json!({ "title": "in flight", "status": "doing", "session": "lane-a" }),
+    )
+    .await;
+    let second = create(
+        &app,
+        json!({ "title": "queued", "status": "todo", "session": "lane-a" }),
+    )
+    .await;
+    let id2 = second["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id2}"),
+        Some(json!({ "status": "doing" })),
+        &[("X-Amux-Session", "lane-a")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], json!("already holding doing"));
+    assert_eq!(v["holding"][0], first["id"]);
+    // The escape must name the attributed CLI command (AMUX-2325).
+    assert!(v["cli"].as_str().unwrap().contains("--override-doing"));
+
+    // The named escape works, and a different session is never capped.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id2}"),
+        Some(json!({ "status": "doing", "override_doing": true, "gate_ack": true })),
+        &[("X-Amux-Session", "lane-a")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Dormant types hold no WIP: a watch card in doing must not block.
+    let third = create(
+        &app,
+        json!({ "title": "third", "status": "todo", "session": "lane-b" }),
+    )
+    .await;
+    let id3 = third["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id3}"),
+        Some(json!({ "status": "doing", "gate_ack": true })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
 }

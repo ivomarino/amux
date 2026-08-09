@@ -199,6 +199,17 @@ pub fn apply_event(
                             to: "confirmed".into(),
                         },
                     ));
+                    // Drift feedback (2026-08-09 adherence audit): the board
+                    // is the ledger, so a turn spent ON a board task must be
+                    // VISIBLE on that task. If the worker's whole turn passed
+                    // without a single board write, note it on the card — the
+                    // turn ledger alone is a store the reviewer never opens
+                    // (ethos rule 4: a tag nobody reads is the same failure
+                    // as no tag). Without this, "worker finished, card
+                    // untouched" was observable nowhere.
+                    if let WorkerCommand::ExecuteTask(task_id) = &cmd.command {
+                        note_untouched_card(conn, wid, task_id, res, now, &mut events)?;
+                    }
                 }
                 // Dispatched-but-unacked: see module docs — not ours to confirm.
             }
@@ -343,6 +354,72 @@ pub fn apply_event(
     // `applied` mirrors the events: every real write above pushes one, so an
     // event that changed nothing does not bump the revision (Invariant 37).
     Ok(WriteOutcome { applied: !events.is_empty(), events })
+}
+
+/// If an ExecuteTask turn completed WITHOUT the worker writing its board
+/// card, append a board-visible note to the card (log + rev bump + Task
+/// event) so the drift is on the ledger everyone already reads.
+///
+/// "Untouched" is judged from the card's own `updated` stamp vs the turn's
+/// `started_at`: strictly older means no board write landed during the turn.
+/// A missing turn row (missed TurnStarted) makes the question unanswerable —
+/// skip honestly rather than guess (Invariant 20). A vanished card is warned
+/// about, never re-minted.
+fn note_untouched_card(
+    conn: &Connection,
+    wid: &str,
+    task_id: &TaskId,
+    res: &amux_core::protocol::TurnResult,
+    now: DateTime<Utc>,
+    events: &mut Vec<PendingEvent>,
+) -> rusqlite::Result<()> {
+    let started: Option<String> = conn
+        .query_row(
+            "SELECT started_at FROM _amux_turns WHERE id = ?1",
+            params![res.turn_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(started) = started.and_then(|s| s.parse::<DateTime<Utc>>().ok()) else {
+        return Ok(()); // no turn start on record: "untouched" is unanswerable
+    };
+    let Some(row) = crate::orchestrator::context::issue_by_internal_id(conn, task_id)? else {
+        tracing::warn!(worker = wid, task = %task_id,
+            "ExecuteTask turn completed but its board card no longer resolves");
+        return Ok(());
+    };
+    if row.status.trim().eq_ignore_ascii_case("quarantined") {
+        return Ok(()); // orchestrator-terminal: nothing left for the worker to move
+    }
+    if row.updated >= started.timestamp() {
+        return Ok(()); // the worker moved the board this turn — no nag
+    }
+    let who = queries::get_worker(conn, wid)?
+        .map(|w| w.display_name)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| wid.to_string());
+    let mut next = row;
+    let stamp = chrono::Local::now().format("%H:%M").to_string();
+    next.log = Some(crate::db::board_store::append_log(
+        next.log.as_deref(),
+        &stamp,
+        &format!(
+            "runtime: {who} completed a turn (outcome: {}) with no board update — \
+             the card did not move; update its status or release it",
+            res.outcome
+        ),
+    ));
+    next.rev += 1;
+    next.version += 1;
+    next.updated = now.timestamp();
+    crate::db::board_store::save_patched(conn, &next)?;
+    events.push(PendingEvent {
+        entity_type: EntityType::Task,
+        entity_id: next.id.clone(),
+        mutation: MutationKind::Updated,
+        payload: Some(next.snapshot()),
+    });
+    Ok(())
 }
 
 /// Process one event through the single-writer store.
@@ -748,6 +825,128 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ExitReason>(&reason).unwrap(),
             ExitReason::Completed
+        );
+    }
+
+    /// Seed a board card whose last write is far in the past (long before
+    /// any turn this test starts). Returns the semantic id.
+    fn seed_issue(store: &SharedStore, session: &str) -> String {
+        let session = session.to_string();
+        let out: Arc<std::sync::Mutex<String>> = Arc::default();
+        let out_w = out.clone();
+        store
+            .write(move |conn| {
+                let row = crate::db::board_store::create_issue(
+                    conn,
+                    &crate::db::board_store::NewIssue {
+                        title: "drift specimen".into(),
+                        desc: String::new(),
+                        status: "doing".into(),
+                        session: Some(session.clone()),
+                        item_type: "code".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                    },
+                    1_700_000_000, // 2023: well before "now"
+                )?;
+                *out_w.lock().unwrap() = row.id;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let sem = out.lock().unwrap().clone();
+        sem
+    }
+
+    fn issue_col(store: &SharedStore, sem: &str, col: &str) -> String {
+        let conn = store.read().unwrap();
+        conn.query_row(
+            &format!("SELECT COALESCE(CAST({col} AS TEXT), '') FROM issues WHERE id = ?1"),
+            params![sem],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// M4 (drift feedback, 2026-08-09 adherence audit): an ExecuteTask turn
+    /// that completes WITHOUT the worker touching its card must leave a
+    /// board-visible note — otherwise "worker finished, card untouched" is
+    /// observable nowhere a reviewer looks (the board), only in `_amux_turns`
+    /// (a store the reader never opens is the same failure as no tag, ethos
+    /// rule 4). Pre-fix, TurnCompleted confirmed the command and wrote
+    /// nothing to the board: this test then finds an empty card log and
+    /// fails.
+    #[test]
+    fn execute_task_turn_with_untouched_card_writes_a_board_note() {
+        let store = store();
+        seed(&store);
+        let sem = seed_issue(&store, "w");
+        let task = crate::db::board_store::internal_id(&sem);
+        let cmd_id = enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task));
+
+        apply(&store, WorkerEvent::TurnStarted { turn_id: trn(20) });
+        apply(
+            &store,
+            WorkerEvent::TurnCompleted(TurnResult {
+                turn_id: trn(20),
+                outcome: "completed".into(),
+            }),
+        );
+
+        let conn = store.read().unwrap();
+        let cmd = commands::by_id(&conn, &cmd_id).unwrap().unwrap();
+        assert_eq!(cmd.state, CommandState::Confirmed, "confirmation still happens");
+        drop(conn);
+        let log = issue_col(&store, &sem, "log");
+        assert!(
+            log.contains("no board update"),
+            "the card must carry the runtime's drift note: {log:?}"
+        );
+        let rev: String = issue_col(&store, &sem, "rev");
+        assert_ne!(rev, "0", "the note is a real write pollers can see");
+    }
+
+    /// The negative cell: a worker that DID move the board during its turn
+    /// gets no note — the check discriminates, it does not nag (ethos
+    /// rule 7: an instrument that fires on every turn discriminates
+    /// nothing).
+    #[test]
+    fn execute_task_turn_that_touched_the_card_writes_no_note() {
+        let store = store();
+        seed(&store);
+        let sem = seed_issue(&store, "w");
+        let task = crate::db::board_store::internal_id(&sem);
+        enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task));
+
+        apply(&store, WorkerEvent::TurnStarted { turn_id: trn(21) });
+        // The worker's own board write, mid-turn (updated >= turn start).
+        let sem_w = sem.clone();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE issues SET updated = ?1 WHERE id = ?2",
+                    params![Utc::now().timestamp() + 5, sem_w],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        apply(
+            &store,
+            WorkerEvent::TurnCompleted(TurnResult {
+                turn_id: trn(21),
+                outcome: "completed".into(),
+            }),
+        );
+        let log = issue_col(&store, &sem, "log");
+        assert!(
+            !log.contains("no board update"),
+            "a touched card gets no drift note: {log:?}"
         );
     }
 

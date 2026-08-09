@@ -427,7 +427,22 @@ fn blocked_names(home: &std::path::Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Test-only fleet suppression. The handler reads `amux_home()` + live tmux at
+/// CALL time, so a unit test on a temp DB still merges the machine's real
+/// fleet — `legacy_sessions_route_serves_workers…` failed with 117 rows on a
+/// box running 116 sessions, and broke every full-suite run (2026-08-09, two
+/// lanes hit it). Named deviation: the root fix is capturing home in AppState
+/// at startup instead of re-reading env per request (carded); until then this
+/// is the only race-free way to keep the unit test's verdict machine-independent.
+#[cfg(test)]
+pub(crate) static SUPPRESS_FLEET_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
+    #[cfg(test)]
+    if SUPPRESS_FLEET_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return vec![];
+    }
     let home = amux_home();
     let sessions_dir = home.join("sessions");
     let blocked = blocked_names(&home);

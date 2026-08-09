@@ -265,7 +265,31 @@ pub fn plan_tick(inputs: &TickInputs) -> TickPlan {
                 }
                 match disposition(t, inputs.tasks, inputs.gates) {
                     TaskDisposition::Terminal | TaskDisposition::Waiting(_) => {}
-                    TaskDisposition::Assigned { .. } => {}
+                    TaskDisposition::Assigned { .. } => {
+                        // The owner filter above means this card is assigned
+                        // to THIS worker, and the leased_tasks check above
+                        // means no live lease covers it: an in-flight
+                        // (`doing`) card whose owner sits idle with no claim
+                        // is the DRIFT case — the worker took the card and
+                        // stopped without moving it. It must be a stall,
+                        // because it can exit no other way: Assigned is not
+                        // Runnable (never re-assigned), and the empty arm
+                        // this replaces made it invisible to every tick
+                        // forever, contradicting stall.rs's cardinal rule
+                        // ("a worker idle while any of its tasks is
+                        // non-terminal is a SYSTEM FAILURE"). Deliberate
+                        // pauses stay excluded: a live lease is the grace
+                        // window, provider exhaustion is skipped above, and
+                        // needs_you/blocked/review/backlog/armed are Waiting
+                        // dispositions, not Assigned.
+                        plan.stalls.push(StallViolation {
+                            worker: w.id().clone(),
+                            task: t.id.clone(),
+                            status: format!("{:?}", t.status),
+                            idle_since: *since,
+                            reason: StallReason::WorkerIdle,
+                        });
+                    }
                     TaskDisposition::Runnable => {
                         // Runnable + owner idle + not assigned this tick:
                         // only possible when the owner had no capacity —
@@ -439,6 +463,45 @@ mod tests {
         let plan = plan_tick(&inputs(&tasks, &workers, &leases, &FleetState::Normal, &h, &a));
         assert!(plan.assignments.is_empty());
         assert!(plan.reclaim.is_empty());
+    }
+
+    /// The drift case (2026-08-09 adherence audit): a worker takes a card
+    /// into `doing`, its turn ends, the worker goes idle and never touches
+    /// the board again. Pre-fix the stall arm skipped `Assigned`
+    /// dispositions entirely, so this state was invisible to every tick
+    /// forever — no stall, no reassignment (Assigned is not Runnable),
+    /// nothing board-visible. That contradicts stall.rs's own cardinal
+    /// rule: a worker idle while any of its tasks is non-terminal is a
+    /// SYSTEM FAILURE.
+    #[test]
+    fn idle_owner_with_unleased_doing_card_is_a_stall() {
+        let tasks = vec![task(1, TaskStatus::Doing, Some(1))];
+        let workers = vec![worker(1, WorkerState::Idle { since: now() })];
+        let (h, a) = (BTreeMap::new(), BTreeMap::new());
+        let plan = plan_tick(&inputs(&tasks, &workers, &[], &FleetState::Normal, &h, &a));
+        assert!(plan.assignments.is_empty(), "a doing card is never re-assigned");
+        assert_eq!(plan.stalls.len(), 1, "idle owner + unleased doing card = stall");
+        assert_eq!(plan.stalls[0].reason, StallReason::WorkerIdle);
+        assert_eq!(plan.stalls[0].task, tid(1));
+        assert_eq!(plan.stalls[0].worker, wid(1));
+
+        // A LIVE lease is the grace window (the assignment may still be
+        // mid-flight through the command pump): leased means not stalled.
+        let leases = vec![Lease {
+            task: tid(1),
+            worker: wid(1),
+            acquired_at: now(),
+            expires_at: now() + chrono::Duration::hours(1),
+            generation: 0,
+        }];
+        let plan = plan_tick(&inputs(&tasks, &workers, &leases, &FleetState::Normal, &h, &a));
+        assert!(plan.stalls.is_empty(), "leased doing card is not a stall: {:?}", plan.stalls);
+
+        // A worker mid-turn (Active) is not idle: no stall — the pause is
+        // the work happening.
+        let workers = vec![worker(1, WorkerState::Active { turn: None })];
+        let plan = plan_tick(&inputs(&tasks, &workers, &[], &FleetState::Normal, &h, &a));
+        assert!(plan.stalls.is_empty(), "active owner is not a stall");
     }
 
     #[test]
