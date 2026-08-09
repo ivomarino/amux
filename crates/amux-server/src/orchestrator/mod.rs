@@ -6,6 +6,7 @@
 //! is how simulations end up testing a paraphrase of the system instead of
 //! the system (ethos rule 7).
 
+pub mod runtime;
 pub mod sim;
 
 use chrono::{DateTime, Utc};

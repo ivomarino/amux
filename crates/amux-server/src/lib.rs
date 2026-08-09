@@ -62,7 +62,7 @@ async fn async_main() {
     let auth_token = api::auth::load_or_create_token(&cfg.auth_token_path()).ok();
 
     let state = api::AppState {
-        store,
+        store: store.clone(),
         started: Instant::now(),
         build_hash: build_hash(),
         auth_token,
@@ -76,6 +76,33 @@ async fn async_main() {
     )
     .await
     .expect("rustls config");
+
+    // Orchestrator runtime: reconcile once, then tick (RR-0041).
+    let runtime = Arc::new(orchestrator::runtime::Runtime {
+        store: store.clone(),
+        backends: vec![
+            Arc::new(backend::tmux::TmuxBackend::new()),
+            // Herdr backend joins the reconcile set when a herdr session is
+            // configured (AMUX_HERDR_SESSION); constructing it against a
+            // missing server would make every probe a failure report.
+        ],
+        tick_secs: cfg
+            .env
+            .get("AMUX_RS_TICK_SECS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3),
+        heartbeat_every: 10,
+    });
+    match runtime.reconcile_on_startup().await {
+        Ok(report) => tracing::info!(
+            interrupted = report.interrupted.len(),
+            stale = report.stale_backend.len(),
+            probe_failures = report.backend_probe_failures.len(),
+            "startup reconciliation complete"
+        ),
+        Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
+    }
+    tokio::spawn(runtime.run());
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https)");
