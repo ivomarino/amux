@@ -6704,7 +6704,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: Included in crates/amux-core/src/worker.rs (ConfigApplyMode, ConfigChangeResult, classify_config_change). Commit ece692f.
 
-- [ ] RR-0018a — API route + field aliasing infrastructure (backward compat)
+- [ ] RR-0018a — API route + field aliasing infrastructure (backward compat) <!-- partial 2026-08-09: route-alias layer + Deprecated header + field aliasing + dual-field request bodies (crates/amux-server/src/api/aliases.rs, 9 tests; api/workers.rs conflicting_name_fields_are_400) / missing: api_field_style pref wiring (FieldStyle::default only), OpenAPI dual-path listing -->
   Phase: 0
   Depends on: RR-0001
   Invariant: 13, 53
@@ -6820,7 +6820,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: crates/amux-server/src/orchestrator/sim.rs (131 lines, 3 tests). FakeClock + SimRng (splitmix64, no rand dependency). Commit ece692f.
 
-- [ ] RR-0028 — Property test infrastructure (proptest)
+- [ ] RR-0028 — Property test infrastructure (proptest) <!-- partial 2026-08-09: crates/amux-core/tests/proptest_core.rs — 9 properties (command state machine, scope merge precedence, snapshot hash determinism, PagedResponse) / missing: BoardTransition/TaskDisposition/no-stall/acyclicity strategies -->
   Phase: 0
   Depends on: RR-0005, RR-0006, RR-0012
   Invariant: 22
@@ -7026,7 +7026,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: Written branch did NOT fire (3/4 coverage). No re-estimate needed. Decision recorded in docs/opencode-spike-results.md.
 
-- [ ] RR-0028m — Live capability parity audit
+- [ ] RR-0028m — Live capability parity audit <!-- partial 2026-08-09: e2e/parity-tasks.mjs + docs/rust-migration/ux-parity-report.md (11 task series vs live Python oracle) + /api/debug/boundary registry (api/py_proxy.rs) / missing: committed capability-audit.toml classifying all ~165 live routes -->
   Phase: 0
   Depends on: RR-0001
   Invariant: 45
@@ -7054,7 +7054,7 @@ consistent with their dependencies.
 
 ### Phase 1: Workers + Orchestrator
 
-- [ ] RR-0029 — Orchestrator trait: WorkAssignment, Lease, tick loop
+- [x] RR-0029 — Orchestrator trait: WorkAssignment, Lease, tick loop <!-- verified 2026-08-09: crates/amux-core/src/orchestrator.rs (WorkAssignment, Lease, plan; 982 lines) + orchestrator/runtime.rs tick_once + tick_reclaims_expired_lease_and_heartbeats test -->
   Phase: 1
   Depends on: RR-0005, RR-0012, RR-0027
   Invariant: 10, 22
@@ -7066,7 +7066,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0030 — AgentProtocol: OpenCode implementation
+- [x] RR-0030 — AgentProtocol: OpenCode implementation <!-- verified 2026-08-09: crates/amux-server/src/opencode/mod.rs trait AgentProtocol + structured.rs StructuredCliProtocol + mock.rs MockProtocol; exercised end-to-end by golden_scenarios/golden_live -->
   Phase: 1
   Depends on: RR-0006
   Invariant: 5
@@ -7077,7 +7077,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0031 — SessionBackend: HerdrBackend
+- [x] RR-0031 — SessionBackend: HerdrBackend <!-- verified 2026-08-09: crates/amux-server/src/backend/herdr.rs impl SessionBackend + tests/backend_conformance.rs herdr_backend_conformance + golden_live herdr lifecycle -->
   Phase: 1
   Depends on: RR-0004
   Invariant: 1, 21, 33
@@ -7088,7 +7088,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Backend conformance
   Status: TODO
 
-- [ ] RR-0032 — SessionBackend: TmuxBackend
+- [x] RR-0032 — SessionBackend: TmuxBackend <!-- verified 2026-08-09: crates/amux-server/src/backend/tmux.rs + tmux_backend_conformance + golden_live.rs golden_live_backend_lifecycle_tmux -->
   Phase: 1
   Depends on: RR-0004
   Invariant: 1, 21, 33
@@ -7098,7 +7098,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Backend conformance
   Status: TODO
 
-- [ ] RR-0033 — Terminal adapter: ANSI stripping + rate-limit regex
+- [x] RR-0033 — Terminal adapter: ANSI stripping + rate-limit regex <!-- verified 2026-08-09: crates/amux-server/src/backend/adapter.rs strip_ansi + CLAUDE_PATTERNS(16)/GEMINI(2)/CODEX(1)/OLLAMA(1) tables, 27 tests -->
   Phase: 1
   Depends on: RR-0006, RR-0007
   Invariant: 5
@@ -7109,7 +7109,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0034 — Worker API: CRUD + start/stop/peek/send + file upload
+- [x] RR-0034 — Worker API: CRUD + start/stop/peek/send + file upload <!-- verified 2026-08-09: crates/amux-server/src/api/workers.rs (9 tests: CRUD, 409 stale expect_version, start/stop lifecycle) + api/upload.rs start/chunk/finish protocol -->
   Phase: 1
   Depends on: RR-0003, RR-0021, RR-0029
   Invariant: 13, 43
@@ -7124,7 +7124,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, API verification
   Status: TODO
 
-- [ ] RR-0035 — Worker rename + alias resolution
+- [x] RR-0035 — Worker rename + alias resolution <!-- verified 2026-08-09: api/workers.rs create_get_rename_then_alias_resolves — rename preserves WorkerId, old name resolves as alias -->
   Phase: 1
   Depends on: RR-0003, RR-0034
   Invariant: 17, 43
@@ -7136,7 +7136,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0036 — Worker cwd change + session replacement
+- [x] RR-0036 — Worker cwd change + session replacement <!-- verified 2026-08-09: api/workers.rs cwd_change_with_live_session_replaces_it_atomically -->
   Phase: 1
   Depends on: RR-0003, RR-0031, RR-0034
   Invariant: 43
@@ -7150,7 +7150,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0037 — Worker model change (hot-switch vs restart)
+- [ ] RR-0037 — Worker model change (hot-switch vs restart) <!-- partial 2026-08-09: classify_config_change + PATCH wiring (workers.rs) / missing: real hot_model_switch — provider_caps() hardcodes all-false so every model change is SessionRestart; per-task model override absent -->
   Phase: 1
   Depends on: RR-0003, RR-0007, RR-0034
   Invariant: 20, 43
@@ -7162,7 +7162,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0038 — Worker provider change + session restart
+- [ ] RR-0038 — Worker provider change + session restart <!-- partial 2026-08-09: provider change classifies SessionRestart through the same atomic replace path proven for cwd / missing: provider-change-specific state-preservation test -->
   Phase: 1
   Depends on: RR-0003, RR-0031, RR-0034
   Invariant: 43
@@ -7173,7 +7173,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0039 — Worker backend change (Herdr <-> tmux)
+- [ ] RR-0039 — Worker backend change (Herdr <-> tmux) <!-- partial 2026-08-09: backend change classifies SessionRestart; both backends pass the same conformance suite / missing: dedicated herdr<->tmux switch test -->
   Phase: 1
   Depends on: RR-0031, RR-0032, RR-0034
   Invariant: 33, 43
@@ -7184,7 +7184,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0040 — Worker group/environment/permissions change
+- [ ] RR-0040 — Worker group/environment/permissions change <!-- partial 2026-08-09: Immediate classification in amux-core/src/worker.rs (tested) + PATCH wiring / missing: runtime scope re-resolution assertion (worker observes new group/env config) -->
   Phase: 1
   Depends on: RR-0003, RR-0016, RR-0034
   Invariant: 2, 43
@@ -7195,7 +7195,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0041 — Orchestrator runtime loop + startup reconciliation
+- [x] RR-0041 — Orchestrator runtime loop + startup reconciliation <!-- verified 2026-08-09: crates/amux-server/src/backend/bootstrap.rs startup reconciliation (698 lines, DB-vs-backend mismatch states) + runtime.rs continuous loop + lib.rs wiring -->
   Phase: 1
   Depends on: RR-0029, RR-0031, RR-0032
   Invariant: 10, 11
@@ -7206,7 +7206,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0042 — Worker SSE state stream
+- [x] RR-0042 — Worker SSE state stream <!-- verified 2026-08-09: crates/amux-server/src/api/sse.rs (RR-0042) + StatusChanged assertions in golden tests + e2e/golden.spec.ts SSE transport assertion -->
   Phase: 1
   Depends on: RR-0023, RR-0034
   Invariant: 35
@@ -7216,7 +7216,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0043 — ProviderAdapter trait + conformance suite
+- [x] RR-0043 — ProviderAdapter trait + conformance suite <!-- verified 2026-08-09: crates/amux-server/src/provider/mod.rs ProviderAdapter trait + conformance/conformance_static harness + ProviderCapabilities; claude.rs runs full conformance -->
   Phase: 1
   Depends on: RR-0007
   Invariant: 20, 21
@@ -7227,7 +7227,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Provider conformance
   Status: TODO
 
-- [ ] RR-0044 — Provider capacity routing
+- [x] RR-0044 — Provider capacity routing <!-- verified 2026-08-09: crates/amux-server/src/provider/routing.rs (13 tests) — capacity-aware routing, fallback chain, no silent failover when policy forbids -->
   Phase: 1
   Depends on: RR-0007, RR-0029, RR-0043
   Invariant: 20
@@ -7239,7 +7239,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0044a — Per-worker model budgets
+- [ ] RR-0044a — Per-worker model budgets <!-- open -->
   Phase: 4
   Depends on: RR-0003, RR-0043, RR-0044
   Invariant: 16, 24
@@ -7260,7 +7260,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0044b — Fleet-wide rate-limit/subscription coordination + auto-resume
+- [x] RR-0044b — Fleet-wide rate-limit/subscription coordination + auto-resume <!-- verified 2026-08-09: crates/amux-core/src/provider_fleet.rs (658 lines) + runtime.rs fleet park/redistribute + lib.rs resume_stagger_secs + golden_remaining.rs golden_rate_limit_recovery -->
   Phase: 4
   Depends on: RR-0043, RR-0044
   Invariant: 20, 22
@@ -7287,7 +7287,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Simulation
   Status: TODO
 
-- [ ] RR-0045 — @worker mention parsing + delivery
+- [ ] RR-0045 — @worker mention parsing + delivery <!-- partial 2026-08-09: amux-core/src/mention.rs parser + alias tests; MessageTarget group fan_out + DeliveryState machine (api/messages.rs) / missing: auto-parse of @mentions out of task text/prompt flow -->
   Phase: 1
   Depends on: RR-0003, RR-0010
   Invariant: 17, 29
@@ -7298,7 +7298,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0046 — Integration: create worker on Herdr, full lifecycle
+- [x] RR-0046 — Integration: create worker on Herdr, full lifecycle <!-- verified 2026-08-09: tests/golden_live.rs golden_live_happy_path_claude on herdr (live-gated: real claude + herdr binaries) -->
   Phase: 1
   Depends on: RR-0030, RR-0031, RR-0034
   Invariant: 5, 21
@@ -7308,7 +7308,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Backend conformance
   Status: TODO
 
-- [ ] RR-0047 — Integration: create worker on tmux, full lifecycle
+- [x] RR-0047 — Integration: create worker on tmux, full lifecycle <!-- verified 2026-08-09: tests/golden_live.rs golden_live_backend_lifecycle_tmux + golden_remaining.rs traced_live_backend_lifecycle -->
   Phase: 1
   Depends on: RR-0030, RR-0032, RR-0034
   Invariant: 5, 21, 33
@@ -7318,7 +7318,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Backend conformance
   Status: TODO
 
-- [ ] RR-0048 — Playwright: worker list, start, status updates
+- [ ] RR-0048 — Playwright: worker list, start, status updates <!-- partial 2026-08-09: e2e/control-plane.spec.ts worker-list-from-API test / missing: start-button response, status-badge-within-2s, group scope, stall-warning assertions -->
   Phase: 1
   Depends on: RR-0025, RR-0034, RR-0042
   Invariant: 44
@@ -7329,7 +7329,7 @@ consistent with their dependencies.
   Verify: Browser verification, Visual/rendering
   Status: TODO
 
-- [ ] RR-0048a — Anti-livelock: execution limits + auto-decomposition + quarantine
+- [x] RR-0048a — Anti-livelock: execution limits + auto-decomposition + quarantine <!-- verified 2026-08-09: amux-core/src/orchestrator.rs exhaustion_triggers_decomposition_first, double_decomposition_failure_quarantines + runtime.rs enforcement (RR-0048a cited) -->
   Phase: 1
   Depends on: RR-0029, RR-0028f
   Invariant: 47
@@ -7342,7 +7342,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Simulation
   Status: TODO
 
-- [ ] RR-0048b — Fleet circuit breakers
+- [x] RR-0048b — Fleet circuit breakers <!-- verified 2026-08-09: runtime.rs tick_once evaluates FleetCircuitBreaker before planning (open/close logged) + amux-core/src/circuit.rs (10 tests) -->
   Phase: 1
   Depends on: RR-0029, RR-0028h
   Invariant: 48
@@ -7355,7 +7355,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Simulation
   Status: TODO
 
-- [ ] RR-0048c — Failure feed-forward in WorkAssignment
+- [x] RR-0048c — Failure feed-forward in WorkAssignment <!-- verified 2026-08-09: amux-core/src/orchestrator.rs prior_attempts on WorkAssignment + prior_attempts_feed_forward test -->
   Phase: 1
   Depends on: RR-0029, RR-0028f
   Invariant: 49
@@ -7368,7 +7368,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0048d — Acceptance criteria authorship separation
+- [ ] RR-0048d — Acceptance criteria authorship separation <!-- partial 2026-08-09: criteria types (core, 7 tests) + api/criteria.rs + 0007_criteria.sql + todo-exit enforcement (board.rs:1173, opt-in) + ReviewRounds cap / missing: adversarial CriteriaReviewer worker flow; enforcement not on by default -->
   Phase: 1
   Depends on: RR-0029, RR-0028i
   Invariant: 50
@@ -7382,7 +7382,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0048e — Decomposition depth cap
+- [x] RR-0048e — Decomposition depth cap <!-- verified 2026-08-09: amux-core/src/orchestrator.rs MAX_DECOMPOSITION_DEPTH/MAX_CHILDREN_PER_TASK/MAX_DISCOVERED_ITEMS_PER_RUN + decomposition_caps_enforced, max_depth_exhaustion_quarantines_without_decomposing -->
   Phase: 1
   Depends on: RR-0048a
   Invariant: 51
@@ -7398,7 +7398,7 @@ consistent with their dependencies.
 
 ### Phase 2: Board + Dependency Graph
 
-- [ ] RR-0049 — Board API: all routes, 409 gate contract, force+audit
+- [x] RR-0049 — Board API: all routes, 409 gate contract, force+audit <!-- verified 2026-08-09: api/board.rs (409 gate contract with why_blocked body; force requires attribution and is audited into the card log) + tests/board_api.rs (1,032 lines) -->
   Phase: 2
   Depends on: RR-0005, RR-0011, RR-0021
   Invariant: 3, 13, 18
@@ -7409,7 +7409,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, API verification
   Status: TODO
 
-- [ ] RR-0050 — Board dependency graph resolution
+- [x] RR-0050 — Board dependency graph resolution <!-- verified 2026-08-09: amux-core/src/board.rs runnable() + cycle-detection tests + golden_scenarios.rs golden_dependency_chain end-to-end -->
   Phase: 2
   Depends on: RR-0005, RR-0049
   Invariant: 4
@@ -7421,7 +7421,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0051 — Scoped gates: global/group/worker gate resolution
+- [x] RR-0051 — Scoped gates: global/group/worker gate resolution <!-- verified 2026-08-09: db/board_store.rs scoped gate resolution + golden_remaining.rs golden_scoped_gates -->
   Phase: 2
   Depends on: RR-0011, RR-0016, RR-0049
   Invariant: 2, 18
@@ -7432,7 +7432,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0052 — Atomic claim + lease management
+- [ ] RR-0052 — Atomic claim + lease management <!-- partial 2026-08-09: lease create/expiry/reclaim in runtime (tick_reclaims_expired_lease) + no-double-lease asserts in golden tests / missing: two-connection concurrent-claim race test; board_store claim-by-WorkerId (comment at board_store.rs:444) -->
   Phase: 2
   Depends on: RR-0029, RR-0049
   Invariant: 3, 22
@@ -7443,7 +7443,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0053 — Board auto-capture: prompt -> task
+- [ ] RR-0053 — Board auto-capture: prompt -> task <!-- partial 2026-08-09: RUST workers covered — capture_prompt_card at orchestrator/runtime.rs:1262 mints a ledger card on prompt delivery when no open card exists (computed title via amux-core board.rs title_from_prompt, _autotask_title parity; tested). / missing: python-fleet sessions still rely on Python's capture until they migrate to rust workers at cutover -->
   Phase: 2
   Depends on: RR-0049
   Invariant: 3
@@ -7453,7 +7453,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0054 — Board full lifecycle: todo through verified
+- [x] RR-0054 — Board full lifecycle: todo through verified <!-- verified 2026-08-09: tests/board_api.rs lifecycle_todo_doing_review_done_verified_via_state_machine -->
   Phase: 2
   Depends on: RR-0049, RR-0051
   Invariant: 3, 7
@@ -7463,7 +7463,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0055 — Archive/Restore transitions
+- [x] RR-0055 — Archive/Restore transitions <!-- verified 2026-08-09: api/board.rs /{id}/archive + /{id}/restore + round-trip tests in board_api.rs; parity step D green -->
   Phase: 2
   Depends on: RR-0005, RR-0049
   Invariant: 3
@@ -7474,7 +7474,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0056 — why-blocked API + gate explainability
+- [ ] RR-0056 — why-blocked API + gate explainability <!-- partial 2026-08-09: why_blocked payload in every 409 body (board.rs:766,1266-1291) + core WhyBlocked with suggested command / missing: dedicated GET /api/board/:id/why-blocked route -->
   Phase: 2
   Depends on: RR-0011, RR-0049
   Invariant: 18
@@ -7484,7 +7484,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification, Browser verification
   Status: TODO
 
-- [ ] RR-0057 — Playwright: board rendering, drag-and-drop, gates
+- [ ] RR-0057 — Playwright: board rendering, drag-and-drop, gates <!-- partial 2026-08-09: board exercised in the real extracted dashboard e2e (create/converge/offline, desktop+mobile projects) / missing: drag-and-drop, gate-409-toast, touch-target assertions -->
   Phase: 2
   Depends on: RR-0025, RR-0049, RR-0051
   Invariant: 44
@@ -7499,7 +7499,7 @@ consistent with their dependencies.
 
 ### Phase 3: Scheduling
 
-- [ ] RR-0058 — DurableSchedule: CRUD + run history + audit trail
+- [x] RR-0058 — DurableSchedule: CRUD + run history + audit trail <!-- verified 2026-08-09: runtime_jobs/scheduler.rs (10 tests) over the LIVE schedules/schedule_runs tables, source discrimination cron-rs/manual + api/schedules.rs (9 tests) with attribution -->
   Phase: 3
   Depends on: RR-0019, RR-0021
   Invariant: 24
@@ -7510,7 +7510,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, API verification, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0059 — Cron expression parser
+- [x] RR-0059 — Cron expression parser <!-- verified 2026-08-09: scheduler.rs expression parser: daily at / every Nm / every weekday / weekly on / monthly on N / 5-field cron (scheduler.rs:95-100) + tests -->
   Phase: 3
   Depends on: RR-0058
   Invariant: —
@@ -7520,7 +7520,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0060 — Missed-run behavior + retry
+- [x] RR-0060 — Missed-run behavior + retry <!-- verified 2026-08-09: scheduler.rs RR-0060 section — MissedRunPolicy (skip vs catch-up with replay cap) + retry -->
   Phase: 3
   Depends on: RR-0058
   Invariant: —
@@ -7530,7 +7530,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0061 — Internal PeriodicTask system
+- [x] RR-0061 — Internal PeriodicTask system <!-- verified 2026-08-09: runtime_jobs/mod.rs PeriodicTask via tokio::time::interval, spawned per task, intentionally no conversion to DurableSchedule -->
   Phase: 3
   Depends on: RR-0001
   Invariant: —
@@ -7541,7 +7541,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0062 — Schedule API + Playwright
+- [ ] RR-0062 — Schedule API + Playwright <!-- partial 2026-08-09: schedule list/create/edit/run-now API + events (api/schedules.rs, 9 tests; runtime_jobs/scheduler.rs) + parity step E green / missing: dashboard schedule-management Playwright coverage -->
   Phase: 3
   Depends on: RR-0058, RR-0025
   Invariant: 13, 44
@@ -7556,7 +7556,7 @@ consistent with their dependencies.
 
 ### Phase 4: Control Plane
 
-- [ ] RR-0063 — Command queue: DB-backed per-worker queue
+- [ ] RR-0063 — Command queue: DB-backed per-worker queue <!-- partial 2026-08-09: DB-backed per-worker FIFO queue with idempotency-key dedup + restart survival (db/commands.rs + 0004_commands.sql) / missing: bounded-16 capacity with 429 rejection -->
   Phase: 4
   Depends on: RR-0006, RR-0019
   Invariant: 34
@@ -7567,7 +7567,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0064 — WorkerCommand dispatch via AgentProtocol
+- [x] RR-0064 — WorkerCommand dispatch via AgentProtocol <!-- verified 2026-08-09: runtime.rs dispatch via AgentProtocol with retry budget 3, DeadLettered terminal + command_dead_letter events; delivery preconditions revalidated -->
   Phase: 4
   Depends on: RR-0030, RR-0063
   Invariant: 5, 34
@@ -7578,7 +7578,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0065 — WorkerEvent processing + turn tracking
+- [x] RR-0065 — WorkerEvent processing + turn tracking <!-- verified 2026-08-09: orchestrator/events.rs (1,022 lines) WorkerEvent->consequence translation + 0006_turns_messages.sql turn tracking + gap contract (8 tests) -->
   Phase: 4
   Depends on: RR-0013, RR-0030
   Invariant: 5, 6
@@ -7589,7 +7589,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0066 — Message delivery at turn boundaries
+- [x] RR-0066 — Message delivery at turn boundaries <!-- verified 2026-08-09: api/messages.rs AtTurnBoundary queue-not-body delivery + fan_out to group members + turn-boundary pump test (messages.rs:698) -->
   Phase: 4
   Depends on: RR-0010, RR-0065
   Invariant: 29
@@ -7599,7 +7599,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0067 — Scan demotion + auto-responder
+- [ ] RR-0067 — Scan demotion + auto-responder <!-- partial 2026-08-09: orchestrator/scan.rs demotes structured-reporting workers from capture (structured_session_is_demoted_not_scanned) / missing: auto-responder for --dangerously-skip-permissions workers -->
   Phase: 4
   Depends on: RR-0041
   Invariant: —
@@ -7610,7 +7610,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0068 — Dead-letter handling + visibility
+- [x] RR-0068 — Dead-letter handling + visibility <!-- verified 2026-08-09: api/workers_deadletters.rs (306 lines) + route mounts + queue metrics in api/metrics.rs -->
   Phase: 4
   Depends on: RR-0064
   Invariant: 34
@@ -7621,7 +7621,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification, Browser verification
   Status: TODO
 
-- [ ] RR-0069 — Compaction subsystem
+- [ ] RR-0069 — Compaction subsystem <!-- partial 2026-08-09: compaction threshold table + monotonic actions (orchestrator/compaction.rs, 3 tests) + ContextLow wiring in events.rs / missing: compacted-fragment creation, 95% checkpoint + new session, hydration -->
   Phase: 4
   Depends on: RR-0013, RR-0014
   Invariant: 31
@@ -7633,7 +7633,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0070 — ContextSnapshot on every assignment
+- [x] RR-0070 — ContextSnapshot on every assignment <!-- verified 2026-08-09: orchestrator/context.rs ContextSnapshot on assignment, content-hash stable + 0005_memories_snapshots.sql (3 tests) -->
   Phase: 4
   Depends on: RR-0013, RR-0029
   Invariant: 27
@@ -7644,7 +7644,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0071 — Memory entity CRUD (runtime)
+- [ ] RR-0071 — Memory entity CRUD (runtime) <!-- partial 2026-08-09: memories CRUD + scope isolation + version conflict (api/memories.rs + db/memories.rs, 10 tests) / missing: MEMORY.md generation from the table -->
   Phase: 4
   Depends on: RR-0014, RR-0019
   Invariant: 42
@@ -7655,7 +7655,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification
   Status: TODO
 
-- [ ] RR-0072 — Rate-limit detection + recovery
+- [x] RR-0072 — Rate-limit detection + recovery <!-- verified 2026-08-09: adapter.rs structural+terminal rate-limit detection -> provider_fleet park/redistribute -> golden_rate_limit_recovery -->
   Phase: 4
   Depends on: RR-0033, RR-0043
   Invariant: 20
@@ -7666,7 +7666,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0073 — Integration degradation tracking
+- [x] RR-0073 — Integration degradation tracking <!-- verified 2026-08-09: integrations/mod.rs IntegrationState (Degraded/Unavailable with reason) + health_snapshot surfaced in /health (4 tests) -->
   Phase: 4
   Depends on: RR-0021
   Invariant: 23
@@ -7676,7 +7676,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification
   Status: TODO
 
-- [ ] RR-0074 — Incident regression tests (Phase 4 subset)
+- [x] RR-0074 — Incident regression tests (Phase 4 subset) <!-- verified 2026-08-09: tests/incident_regressions.rs — duplicate_draft_resurrects_sent_message, board_read_after_write_staleness, stale_steering_command_freshness (+ noop_write_bumps_nothing) -->
   Phase: 4
   Depends on: RR-0063, RR-0069, RR-0071
   Invariant: 41
@@ -7686,7 +7686,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0075 — Playwright: control plane dashboard elements
+- [ ] RR-0075 — Playwright: control plane dashboard elements <!-- partial 2026-08-09: sessions_legacy.rs python-shape dashboard feed + control-plane.spec.ts / missing: rate-limit badge, compaction indicator, dead-letter badge, queue-health e2e assertions -->
   Phase: 4
   Depends on: RR-0025, RR-0042, RR-0068, RR-0069
   Invariant: 44
@@ -7701,7 +7701,7 @@ consistent with their dependencies.
 
 ### Phase 5: Verification + Golden Scenarios
 
-- [ ] RR-0076 — Verification pipeline
+- [x] RR-0076 — Verification pipeline <!-- verified 2026-08-09: orchestrator/verify.rs cheapest-first executor with short-circuit (5 tests) + api/verify.rs endpoints + core verification.rs cost ordering (9 tests) -->
   Phase: 5
   Depends on: RR-0015, RR-0054
   Invariant: 7, 28
@@ -7712,7 +7712,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0077 — Task detail: correlated views
+- [ ] RR-0077 — Task detail: correlated views <!-- open -->
   Phase: 5
   Depends on: RR-0076
   Invariant: 30
@@ -7723,7 +7723,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification, Browser verification
   Status: TODO
 
-- [ ] RR-0078 — Golden scenario 1: Happy path (per provider)
+- [ ] RR-0078 — Golden scenario 1: Happy path (per provider) <!-- partial 2026-08-09: golden_live.rs golden_live_happy_path_claude (Claude on herdr, live-gated) / missing: Gemini/Codex/Ollama happy paths -->
   Phase: 5
   Depends on: RR-0046, RR-0076
   Invariant: 7, 10
@@ -7734,7 +7734,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0079 — Golden scenario 2: Failure + retry
+- [x] RR-0079 — Golden scenario 2: Failure + retry <!-- verified 2026-08-09: tests/golden_scenarios.rs golden_failure_and_retry -->
   Phase: 5
   Depends on: RR-0076, RR-0078
   Invariant: 7
@@ -7744,7 +7744,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0080 — Golden scenario 3: Rate limit recovery (per provider)
+- [x] RR-0080 — Golden scenario 3: Rate limit recovery (per provider) <!-- verified 2026-08-09: tests/golden_remaining.rs golden_rate_limit_recovery (park -> reset -> staggered resume, zero user interaction) -->
   Phase: 5
   Depends on: RR-0072, RR-0078
   Invariant: 20
@@ -7755,7 +7755,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0081 — Golden scenario 4: Dependency chain
+- [x] RR-0081 — Golden scenario 4: Dependency chain <!-- verified 2026-08-09: tests/golden_scenarios.rs golden_dependency_chain -->
   Phase: 5
   Depends on: RR-0050, RR-0078
   Invariant: 4
@@ -7765,7 +7765,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0082 — Golden scenario 5: Scoped gates
+- [x] RR-0082 — Golden scenario 5: Scoped gates <!-- verified 2026-08-09: tests/golden_remaining.rs golden_scoped_gates -->
   Phase: 5
   Depends on: RR-0051, RR-0078
   Invariant: 2, 18
@@ -7775,7 +7775,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0083 — Golden scenario 6: Offline mode
+- [x] RR-0083 — Golden scenario 6: Offline mode <!-- verified 2026-08-09: e2e/golden.spec.ts golden_offline_queue_and_replay against the real extracted dashboard, desktop+mobile -->
   Phase: 5
   Depends on: RR-0025, RR-0078
   Invariant: 14
@@ -7787,7 +7787,7 @@ consistent with their dependencies.
   Verify: Browser verification, Offline behavior
   Status: TODO
 
-- [ ] RR-0084 — Golden scenario 7: No-stall invariant
+- [x] RR-0084 — Golden scenario 7: No-stall invariant <!-- verified 2026-08-09: tests/golden_scenarios.rs golden_no_stall + assert_no_capacity_stall checkpoints -->
   Phase: 5
   Depends on: RR-0041, RR-0078
   Invariant: 10
@@ -7797,7 +7797,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0085 — Golden scenario 8: Multi-provider fleet
+- [x] RR-0085 — Golden scenario 8: Multi-provider fleet <!-- verified 2026-08-09: tests/golden_remaining.rs golden_multi_provider_fleet -->
   Phase: 5
   Depends on: RR-0043, RR-0078
   Invariant: 8
@@ -7807,7 +7807,7 @@ consistent with their dependencies.
   Verify: Browser verification, Integration tests
   Status: TODO
 
-- [ ] RR-0086 — Golden scenario 9: Backend interchangeability
+- [x] RR-0086 — Golden scenario 9: Backend interchangeability <!-- verified 2026-08-09: tests/golden_remaining.rs golden_backend_interchangeability + live lifecycle pair in golden_live.rs -->
   Phase: 5
   Depends on: RR-0046, RR-0047
   Invariant: 33
@@ -7818,7 +7818,7 @@ consistent with their dependencies.
   Verify: Integration tests, Backend conformance
   Status: TODO
 
-- [ ] RR-0087 — Golden scenario 10: Real-time convergence
+- [ ] RR-0087 — Golden scenario 10: Real-time convergence <!-- partial 2026-08-09: e2e/golden.spec.ts golden_realtime_convergence (two contexts, SSE transport asserted, burst convergence in DOM) / missing: event-drop injection, server-restart reconnect, 409-conflict reconcile phases -->
   Phase: 5
   Depends on: RR-0023, RR-0024
   Invariant: 35
@@ -7834,7 +7834,7 @@ consistent with their dependencies.
 
 ### Phase 6: Email, Calendar
 
-- [ ] RR-0088 — Email: Gmail OAuth2, send/reply/inbox/search
+- [x] RR-0088 — Email: Gmail OAuth2, send/reply/inbox/search <!-- verified 2026-08-09: integrations/email.rs (1,653 lines, 25 tests: OAuth refresh, In-Reply-To/References threading, inbox, search) + api/email.rs + api/gmail_auth.rs -->
   Phase: 6
   Depends on: RR-0021
   Invariant: 13, 23
@@ -7847,7 +7847,7 @@ consistent with their dependencies.
     Migration (net-new)
   Status: TODO
 
-- [ ] RR-0089 — Calendar: events CRUD, iCal RFC 5545, S3 upload
+- [ ] RR-0089 — Calendar: events CRUD, iCal RFC 5545, S3 upload <!-- partial 2026-08-09: events CRUD + RFC 5545 feed (integrations/calendar.rs, 11 tests; parity step F 78=78) / missing: S3 publisher — seam declared, aws-sdk-s3 TODO at calendar.rs:237 -->
   Phase: 6
   Depends on: RR-0021
   Invariant: 13
@@ -7861,7 +7861,7 @@ consistent with their dependencies.
     Migration (net-new)
   Status: TODO
 
-- [ ] RR-0091 — Playwright: email/calendar dashboard
+- [ ] RR-0091 — Playwright: email/calendar dashboard <!-- open -->
   Phase: 6
   Depends on: RR-0025, RR-0088, RR-0089
   Invariant: 44
@@ -7875,7 +7875,7 @@ consistent with their dependencies.
 
 ### Phase 7: Browser Profiles, Files, Misc
 
-- [ ] RR-0092 — Browser profiles: CRUD, CDP, screenshots, lock cleanup
+- [ ] RR-0092 — Browser profiles: CRUD, CDP, screenshots, lock cleanup <!-- partial 2026-08-09: profile CRUD/inventory/lock handling native (integrations/browser.rs, 6 tests; api/browser.rs) / missing: driver verbs (CDP navigate/screenshot) still proxied to Python (py_proxy PROXIED_FAMILIES) -->
   Phase: 7
   Depends on: RR-0021
   Invariant: 13
@@ -7890,7 +7890,7 @@ consistent with their dependencies.
     Migration (net-new), Persistence/restart
   Status: TODO
 
-- [ ] RR-0093 — Files: browse, upload, download
+- [x] RR-0093 — Files: browse, upload, download <!-- verified 2026-08-09: api/fs.rs (1,786 lines, 15 tests) + api/files.rs + api/upload.rs; Python contract pinned by tests/boundary_golden.rs recorded fixtures -->
   Phase: 7
   Depends on: RR-0021
   Invariant: 13
@@ -7899,7 +7899,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, API verification, Browser verification
   Status: TODO
 
-- [ ] RR-0094 — Push notifications: VAPID + RFC 8291
+- [x] RR-0094 — Push notifications: VAPID + RFC 8291 <!-- verified 2026-08-09: push/mod.rs VAPID (RFC 8292) + aes128gcm (RFC 8291), shared vapid_private.pem with Python (5 tests) -->
   Phase: 7
   Depends on: RR-0021
   Invariant: —
@@ -7909,7 +7909,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0095 — Graph, journal, proxy, torrent, alerts, metrics
+- [ ] RR-0095 — Graph, journal, proxy, torrent, alerts, metrics <!-- partial 2026-08-09: journal/torrents/alerts/metrics/map/stats/org/branding/skills/dictation all native (api/*.rs); boundary table documents every remaining Python family with exit condition / missing: session verbs, file/library media, browser driver, dictation engine still proxied -->
   Phase: 7
   Depends on: RR-0021
   Invariant: —
@@ -7919,7 +7919,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Migration (existing), Migration (net-new)
   Status: TODO
 
-- [ ] RR-0096 — Playwright: browser profiles, files dashboard
+- [ ] RR-0096 — Playwright: browser profiles, files dashboard <!-- open -->
   Phase: 7
   Depends on: RR-0025, RR-0092, RR-0093
   Invariant: 44
@@ -7933,7 +7933,7 @@ consistent with their dependencies.
 
 ### Phase 8: Dashboard + CLI
 
-- [ ] RR-0097 — Extract SPA into amux-dashboard/static/
+- [x] RR-0097 — Extract SPA into amux-dashboard/static/ <!-- verified 2026-08-09: SPA extracted to crates/amux-dashboard/static/ (app.js 27,905 lines + app.css + index.html) served via rust-embed with APP_VER stamping; e2e golden suite runs against it -->
   Phase: 8
   Depends on: RR-0025
   Invariant: —
@@ -7943,7 +7943,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0098 — CLI: clap subcommand tree
+- [ ] RR-0098 — CLI: clap subcommand tree <!-- partial 2026-08-09: amux-rs CLI (crates/amux-cli): board add/list/show/done(gate-aware)/doing/todo, workers list/start/stop, send (stdin convention), schedules list/run, health / missing: config show, why, search, worker create/rename/config -->
   Phase: 8
   Depends on: RR-0034, RR-0049, RR-0058
   Invariant: 13
@@ -7956,7 +7956,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, CLI verification
   Status: TODO
 
-- [ ] RR-0099 — Terminology aliases: session/worker, issue/task (backward-compat)
+- [ ] RR-0099 — Terminology aliases: session/worker, issue/task (backward-compat) <!-- partial 2026-08-09: route+field aliases with Deprecated header (api/aliases.rs) + python-shape /api/sessions (sessions_legacy.rs, tested) / missing: CLI worker/session verb aliasing, dashboard terminology pref, SSE legacy_kind -->
   Phase: 8
   Depends on: RR-0097, RR-0098
   Invariant: 1, 53
@@ -7980,7 +7980,7 @@ consistent with their dependencies.
   Verify: Implementation, Browser verification, CLI verification, Integration tests
   Status: TODO
 
-- [ ] RR-0100 — data-testid on every interactive element
+- [ ] RR-0100 — data-testid on every interactive element <!-- open -->
   Phase: 8
   Depends on: RR-0097
   Invariant: 44
@@ -7990,7 +7990,7 @@ consistent with their dependencies.
   Verify: Implementation, Browser verification
   Status: TODO
 
-- [ ] RR-0101 — Interaction contract registry + DOM inventory crawler
+- [ ] RR-0101 — Interaction contract registry + DOM inventory crawler <!-- open -->
   Phase: 8
   Depends on: RR-0100
   Invariant: 44
@@ -8002,7 +8002,7 @@ consistent with their dependencies.
   Verify: Implementation, Browser verification
   Status: TODO
 
-- [ ] RR-0102 — Service worker + offline PWA shell
+- [x] RR-0102 — Service worker + offline PWA shell <!-- verified 2026-08-09: crates/amux-dashboard/static/sw.js — CACHE name derived from APP_VER (drift-proof), shell precache; offline behavior proven by golden_offline_queue_and_replay -->
   Phase: 8
   Depends on: RR-0097
   Invariant: 14
@@ -8013,7 +8013,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Offline behavior
   Status: TODO
 
-- [ ] RR-0103 — Playwright: SSE revision convergence suite
+- [ ] RR-0103 — Playwright: SSE revision convergence suite <!-- partial 2026-08-09: SSE convergence + explicit transport assertions in e2e/golden.spec.ts / missing: rev-gap delta sync, restart reconnect, 1000-mutation run, connection indicator, optimistic-rollback phases -->
   Phase: 8
   Depends on: RR-0023, RR-0024, RR-0025
   Invariant: 35
@@ -8026,7 +8026,7 @@ consistent with their dependencies.
   Verify: Browser verification, Sync/reconciliation
   Status: TODO
 
-- [ ] RR-0104 — Playwright: deep nested interaction paths
+- [ ] RR-0104 — Playwright: deep nested interaction paths <!-- open -->
   Phase: 8
   Depends on: RR-0100, RR-0101
   Invariant: 44
@@ -8041,7 +8041,7 @@ consistent with their dependencies.
   Verify: Browser verification, Visual/rendering
   Status: TODO
 
-- [ ] RR-0105 — Playwright: fault injection suite
+- [ ] RR-0105 — Playwright: fault injection suite <!-- open -->
   Phase: 8
   Depends on: RR-0026, RR-0104
   Invariant: 44
@@ -8052,7 +8052,7 @@ consistent with their dependencies.
   Verify: Browser verification, Sync/reconciliation, Offline behavior
   Status: TODO
 
-- [ ] RR-0106 — Playwright: mobile/touch/geometry assertions
+- [ ] RR-0106 — Playwright: mobile/touch/geometry assertions <!-- partial 2026-08-09: mobile 375px Playwright project runs every spec + no-horizontal-overflow test (phase0.spec.ts) / missing: 44px touch-target, back/forward restore, sleep/wake delta-sync assertions -->
   Phase: 8
   Depends on: RR-0100
   Invariant: 44
@@ -8063,7 +8063,7 @@ consistent with their dependencies.
   Verify: Browser verification, Visual/rendering
   Status: TODO
 
-- [ ] RR-0107 — Playwright: model-based state machine testing
+- [ ] RR-0107 — Playwright: model-based state machine testing <!-- open -->
   Phase: 8
   Depends on: RR-0104
   Invariant: 44
@@ -8073,7 +8073,7 @@ consistent with their dependencies.
   Verify: Browser verification
   Status: TODO
 
-- [ ] RR-0107a — UX discovery: full application graph (desktop + mobile)
+- [ ] RR-0107a — UX discovery: full application graph (desktop + mobile) <!-- open -->
   Phase: 8
   Depends on: RR-0028a, RR-0028b, RR-0028c, RR-0097, RR-0100
   Invariant: 46
@@ -8087,7 +8087,7 @@ consistent with their dependencies.
   Verify: Implementation, Browser verification
   Status: TODO
 
-- [ ] RR-0107b — UX discovery: offline graph + reconnection paths
+- [ ] RR-0107b — UX discovery: offline graph + reconnection paths <!-- open -->
   Phase: 8
   Depends on: RR-0107a, RR-0102
   Invariant: 46
@@ -8099,7 +8099,7 @@ consistent with their dependencies.
   Verify: Browser verification, Offline behavior
   Status: TODO
 
-- [ ] RR-0107c — UX discovery: fault-state edges
+- [ ] RR-0107c — UX discovery: fault-state edges <!-- open -->
   Phase: 8
   Depends on: RR-0107a, RR-0026
   Invariant: 46
@@ -8110,7 +8110,7 @@ consistent with their dependencies.
   Verify: Browser verification, Sync/reconciliation
   Status: TODO
 
-- [ ] RR-0107d — UX discovery: deep nested path coverage
+- [ ] RR-0107d — UX discovery: deep nested path coverage <!-- open -->
   Phase: 8
   Depends on: RR-0107a
   Invariant: 46
@@ -8122,7 +8122,7 @@ consistent with their dependencies.
   Verify: Browser verification
   Status: TODO
 
-- [ ] RR-0107e — UX discovery: generated Playwright test suite
+- [ ] RR-0107e — UX discovery: generated Playwright test suite <!-- open -->
   Phase: 8
   Depends on: RR-0107a, RR-0107b, RR-0107c
   Invariant: 46
@@ -8135,7 +8135,7 @@ consistent with their dependencies.
   Verify: Implementation, Browser verification
   Status: TODO
 
-- [ ] RR-0107f — UX discovery: reconcile with RR checklist
+- [ ] RR-0107f — UX discovery: reconcile with RR checklist <!-- open -->
   Phase: 8
   Depends on: RR-0107a
   Invariant: 45, 46
@@ -8146,7 +8146,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0107g — UX graph baseline: committed contract
+- [ ] RR-0107g — UX graph baseline: committed contract <!-- open -->
   Phase: 8
   Depends on: RR-0107a
   Invariant: 46
@@ -8163,7 +8163,7 @@ consistent with their dependencies.
 
 ### Phase 9: Observability + Performance
 
-- [ ] RR-0108 — Correlation-ID tracing
+- [ ] RR-0108 — Correlation-ID tracing <!-- partial 2026-08-09: Correlation on every DurableEvent (amux-core/src/events.rs) + causality links in replay / missing: end-to-end correlation through task->command->turn->tool->outcome -->
   Phase: 9
   Depends on: RR-0009
   Invariant: 24, 30
@@ -8173,7 +8173,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0109 — Generalized `why` query system
+- [ ] RR-0109 — Generalized `why` query system <!-- open -->
   Phase: 9
   Depends on: RR-0108
   Invariant: 24
@@ -8185,7 +8185,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, CLI verification, API verification
   Status: TODO
 
-- [ ] RR-0110 — Universal search (FTS5)
+- [ ] RR-0110 — Universal search (FTS5) <!-- open -->
   Phase: 9
   Depends on: RR-0017, RR-0019
   Invariant: 32
@@ -8199,7 +8199,7 @@ consistent with their dependencies.
     Performance, Searchability
   Status: TODO
 
-- [ ] RR-0111 — Structured events + append-only logs
+- [ ] RR-0111 — Structured events + append-only logs <!-- partial 2026-08-09: append-only session_events journal + revisioned StateEvents / missing: correlated human/machine dual views per task -->
   Phase: 9
   Depends on: RR-0009, RR-0108
   Invariant: 30
@@ -8209,7 +8209,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0111a — Replay-capable event log
+- [ ] RR-0111a — Replay-capable event log <!-- partial 2026-08-09: audit-replay engine + verdict vs live tables (db/replay.rs, 583 lines; tests/replay_roundtrip.rs; 0008_event_payload.sql) / missing: debug/fork modes, BlobRef store, amux replay CLI + /api/replay -->
   Phase: 9
   Depends on: RR-0009, RR-0108, RR-0111
   Invariant: 24, 30
@@ -8235,7 +8235,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests, CLI verification, API verification
   Status: TODO
 
-- [ ] RR-0112 — Performance baselines + measurement
+- [ ] RR-0112 — Performance baselines + measurement <!-- partial 2026-08-09: scripts/perf-baseline.sh PASSED 2026-08-09 (dashboard 3ms, health 2ms, board 28ms @622KB, RSS 66MB) / missing: per-route p50/p95/p99, 40-worker load, 24h soak, FD-leak tracking -->
   Phase: 9
   Depends on: RR-0021
   Invariant: —
@@ -8248,7 +8248,7 @@ consistent with their dependencies.
   Verify: Implementation, Performance
   Status: TODO
 
-- [ ] RR-0113 — Playwright: search bar + provenance navigation
+- [ ] RR-0113 — Playwright: search bar + provenance navigation <!-- open -->
   Phase: 9
   Depends on: RR-0025, RR-0110
   Invariant: 32, 44
@@ -8262,7 +8262,7 @@ consistent with their dependencies.
 
 ### Phase 10: CI/CD Pipeline + Test Infrastructure
 
-- [ ] RR-0114 — CI tiered pipeline: PR Fast Gate
+- [ ] RR-0114 — CI tiered pipeline: PR Fast Gate <!-- partial 2026-08-09: .github/workflows/rust.yml check job (<25min): invariant hashes, cargo check, clippy -D warnings, workspace tests / missing: property/conformance/contract tier selection, targeted smoke for modified surfaces -->
   Phase: 10
   Depends on: RR-0028, RR-0027
   Invariant: 21, 44, 45
@@ -8276,7 +8276,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0115 — CI tiered pipeline: PR Full Gate
+- [ ] RR-0115 — CI tiered pipeline: PR Full Gate <!-- partial 2026-08-09: rust.yml e2e job: build + full Playwright golden suite (desktop+mobile) vs real server / missing: provider adapter matrix, tagged offline/sync suites, migrated-fixture stage -->
   Phase: 10
   Depends on: RR-0114
   Invariant: 21, 44
@@ -8290,7 +8290,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0116 — CI tiered pipeline: nightly deep gate
+- [ ] RR-0116 — CI tiered pipeline: nightly deep gate <!-- open -->
   Phase: 10
   Depends on: RR-0115
   Invariant: —
@@ -8304,7 +8304,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117a — CI tiered pipeline: release gate + periodic soak gate
+- [ ] RR-0117a — CI tiered pipeline: release gate + periodic soak gate <!-- open -->
   Phase: 10
   Depends on: RR-0115
   Invariant: 7, 45
@@ -8316,7 +8316,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117b — Regression detection thresholds
+- [ ] RR-0117b — Regression detection thresholds <!-- open -->
   Phase: 10
   Depends on: RR-0114, RR-0112
   Invariant: —
@@ -8327,7 +8327,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117c — Historical incident regression corpus
+- [ ] RR-0117c — Historical incident regression corpus <!-- partial 2026-08-09: 4 incident_regression tests in CI / missing: the 20+ corpus -->
   Phase: 10
   Depends on: RR-0074
   Invariant: 41
@@ -8339,7 +8339,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests
   Status: TODO
 
-- [ ] RR-0117d — Spec-to-test traceability infrastructure
+- [ ] RR-0117d — Spec-to-test traceability infrastructure <!-- open -->
   Phase: 10
   Depends on: RR-0114
   Invariant: 45
@@ -8358,7 +8358,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117e — Migrated-data regression fixture
+- [ ] RR-0117e — Migrated-data regression fixture <!-- open -->
   Phase: 10
   Depends on: RR-0118, RR-0128
   Invariant: 36
@@ -8372,7 +8372,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0117f — Test classification tags
+- [ ] RR-0117f — Test classification tags <!-- open -->
   Phase: 10
   Depends on: RR-0114
   Invariant: —
@@ -8386,7 +8386,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117g — Performance baseline establishment
+- [ ] RR-0117g — Performance baseline establishment <!-- open -->
   Phase: 10
   Depends on: RR-0112
   Invariant: —
@@ -8399,7 +8399,7 @@ consistent with their dependencies.
   Verify: Implementation, Performance
   Status: TODO
 
-- [ ] RR-0117h — Semantic invariant ID CI check
+- [ ] RR-0117h — Semantic invariant ID CI check <!-- open -->
   Phase: 10
   Depends on: RR-0114
   Invariant: 45
@@ -8412,7 +8412,7 @@ consistent with their dependencies.
   Verify: Implementation
   Status: TODO
 
-- [ ] RR-0117i — Doc-code reconciliation CI check
+- [ ] RR-0117i — Doc-code reconciliation CI check <!-- open -->
   Phase: 10
   Depends on: RR-0117h
   Invariant: 45
@@ -8428,7 +8428,7 @@ consistent with their dependencies.
 
 ### Phase 11: Migration + Go-Live
 
-- [ ] RR-0117 — Schema discovery + diff validation
+- [x] RR-0117 — Schema discovery + diff validation <!-- verified 2026-08-09: docs/rust-migration/schema-manifest.md — live sqlite_master dump (47 tables, 641,805 rows, drift notes) + migrations/0001_baseline.sql; rehearsal diffs table names + row counts on every run -->
   Phase: 11
   Depends on: RR-0019
   Invariant: 36
@@ -8440,7 +8440,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0118 — Migration manifest: all tables with explicit translations
+- [ ] RR-0118 — Migration manifest: all tables with explicit translations <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0117
   Invariant: 36
@@ -8467,7 +8467,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0119 — Migration: workers + sessions (DB records)
+- [ ] RR-0119 — Migration: workers + sessions (DB records) <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0003, RR-0004, RR-0118
   Invariant: 1, 43
@@ -8485,7 +8485,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0119a — Migration: worker config (.env -> WorkerConfig)
+- [ ] RR-0119a — Migration: worker config (.env -> WorkerConfig) <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0119
   Invariant: 43
@@ -8501,7 +8501,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0120 — Migration: board tasks + columns + relationships
+- [ ] RR-0120 — Migration: board tasks + columns + relationships <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0005, RR-0049, RR-0118
   Invariant: 3, 4
@@ -8525,7 +8525,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0121 — Migration: messages + delivery state
+- [ ] RR-0121 — Migration: messages + delivery state <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0010, RR-0118
   Invariant: 29
@@ -8542,7 +8542,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0121a — Migration: groups + group config
+- [ ] RR-0121a — Migration: groups + group config <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0016, RR-0118
   Invariant: 12
@@ -8556,7 +8556,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0122 — Migration: schedules + schedule runs
+- [ ] RR-0122 — Migration: schedules + schedule runs <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0058, RR-0118
   Invariant: —
@@ -8574,7 +8574,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0123 — Migration: memories
+- [ ] RR-0123 — Migration: memories <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0014, RR-0071, RR-0118
   Invariant: 42
@@ -8590,7 +8590,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0123a — Migration: logs + structured events + interaction history
+- [ ] RR-0123a — Migration: logs + structured events + interaction history <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0009, RR-0118
   Invariant: 24, 30
@@ -8609,7 +8609,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0123b — Migration: token/cost ledger
+- [ ] RR-0123b — Migration: token/cost ledger <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0007, RR-0118
   Invariant: 20
@@ -8626,7 +8626,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0124 — Migration: prefs/settings
+- [ ] RR-0124 — Migration: prefs/settings <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0020, RR-0118
   Invariant: 2
@@ -8641,7 +8641,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0125 — Migration: email metadata
+- [ ] RR-0125 — Migration: email metadata <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0088, RR-0118
   Invariant: —
@@ -8657,7 +8657,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0125a — Migration: calendar events
+- [ ] RR-0125a — Migration: calendar events <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0089, RR-0118
   Invariant: —
@@ -8672,7 +8672,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0126 — Migration: browser profiles + metadata
+- [ ] RR-0126 — Migration: browser profiles + metadata <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0092, RR-0118
   Invariant: —
@@ -8685,7 +8685,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification, Integration tests
   Status: TODO
 
-- [ ] RR-0126a — Migration: files + file metadata
+- [ ] RR-0126a — Migration: files + file metadata <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0093, RR-0118
   Invariant: —
@@ -8697,7 +8697,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0127 — Migration: integration config, MCP config, alerts, journal
+- [ ] RR-0127 — Migration: integration config, MCP config, alerts, journal <!-- superseded 2026-08-09: shared bilingual DB (strangler design) — Rust serves the live tables in place; additive-only migrations, rehearsal-proven (scripts/migration-rehearsal.sh); no data translation occurs -->
   Phase: 11
   Depends on: RR-0095, RR-0118
   Invariant: —
@@ -8712,7 +8712,7 @@ consistent with their dependencies.
   Verify: Implementation, Data verification
   Status: TODO
 
-- [ ] RR-0128 — Acceptance: migrated board data
+- [ ] RR-0128 — Acceptance: migrated board data <!-- partial 2026-08-09: live board data served/written by Rust (parity step D write-flow green incl. 409 gate) / missing: step B divergences (status counts; verified 141 vs 8) unresolved; history/gates/search acceptance -->
   Phase: 11
   Depends on: RR-0120
   Invariant: 3, 7
@@ -8729,7 +8729,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, API verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0129 — Acceptance: migrated workers
+- [ ] RR-0129 — Acceptance: migrated workers <!-- partial 2026-08-09: live sessions served python-shape (parity steps A/H; peek green) / missing: A diverges on previewLines shape; start/rename/config acceptance on live workers -->
   Phase: 11
   Depends on: RR-0119, RR-0119a
   Invariant: 1, 43
@@ -8747,7 +8747,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0130 — Acceptance: migrated messages
+- [ ] RR-0130 — Acceptance: migrated messages <!-- open -->
   Phase: 11
   Depends on: RR-0121
   Invariant: 29
@@ -8762,7 +8762,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, API verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0130a — Acceptance: migrated groups
+- [ ] RR-0130a — Acceptance: migrated groups <!-- partial 2026-08-09: groups parity green (parity step C, all 20 groups match) / missing: scoped gates/columns/env acceptance -->
   Phase: 11
   Depends on: RR-0121a
   Invariant: 12
@@ -8776,7 +8776,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131 — Acceptance: migrated schedules
+- [ ] RR-0131 — Acceptance: migrated schedules <!-- partial 2026-08-09: schedules parity green (parity step E, 111 schedules incl. run-history fields + rust-only computed_next_run) / missing: browser verification, run-now acceptance on live data -->
   Phase: 11
   Depends on: RR-0122
   Invariant: —
@@ -8791,7 +8791,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131a — Acceptance: migrated logs + events
+- [ ] RR-0131a — Acceptance: migrated logs + events <!-- open -->
   Phase: 11
   Depends on: RR-0123a
   Invariant: 24, 30
@@ -8807,7 +8807,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, CLI verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131b — Acceptance: migrated memories
+- [ ] RR-0131b — Acceptance: migrated memories <!-- open -->
   Phase: 11
   Depends on: RR-0123
   Invariant: 42
@@ -8822,7 +8822,7 @@ consistent with their dependencies.
   Verify: Integration tests, API verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131c — Acceptance: migrated email/calendar
+- [ ] RR-0131c — Acceptance: migrated email/calendar <!-- partial 2026-08-09: calendar parity green (parity step F, 78=78) / missing: email metadata acceptance + iCal feed content comparison -->
   Phase: 11
   Depends on: RR-0125, RR-0125a
   Invariant: —
@@ -8835,7 +8835,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0131d — Acceptance: migrated browser profiles + token ledger
+- [ ] RR-0131d — Acceptance: migrated browser profiles + token ledger <!-- open -->
   Phase: 11
   Depends on: RR-0123b, RR-0126
   Invariant: —
@@ -8849,7 +8849,7 @@ consistent with their dependencies.
   Verify: Integration tests, Browser verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0132 — Acceptance: migrated scoped config
+- [ ] RR-0132 — Acceptance: migrated scoped config <!-- partial 2026-08-09: prefs parity green (parity step G, 72=72) + settings.spec.ts round-trips 28 controls through the Rust store / missing: amux config show --effective CLI -->
   Phase: 11
   Depends on: RR-0124
   Invariant: 2
@@ -8862,7 +8862,7 @@ consistent with their dependencies.
   Verify: Integration tests, CLI verification, Migration (existing)
   Status: TODO
 
-- [ ] RR-0133 — Acceptance: net-new full lifecycle (all subsystems)
+- [ ] RR-0133 — Acceptance: net-new full lifecycle (all subsystems) <!-- partial 2026-08-09: subsystem lifecycles covered piecewise (golden scenarios, settings suite, board/worker/schedule/memory/message tests) / missing: the single net-new all-subsystem acceptance run -->
   Phase: 11
   Depends on: RR-0078, RR-0118
   Invariant: 7, 45
@@ -8892,7 +8892,7 @@ consistent with their dependencies.
     Offline behavior, Migration (net-new)
   Status: TODO
 
-- [ ] RR-0134 — Strangler-fig proxy: Rust on 8822, Python on 8823
+- [x] RR-0134 — Strangler-fig proxy: Rust on 8822, Python on 8823 <!-- verified 2026-08-09: api/py_proxy.rs table-driven strangler proxy (PROXIED_FAMILIES + NATIVE registry, x-amux-answered-by header, /api/debug/boundary) + tests/proxy_composition.rs + boundary_live_oracle.rs response comparison -->
   Phase: 1
   Depends on: RR-0029, RR-0019
   Invariant: —
@@ -8907,7 +8907,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0135 — Proxy removal: all routes native, Python stops
+- [ ] RR-0135 — Proxy removal: all routes native, Python stops <!-- open -->
   Phase: 11
   Depends on: RR-0134, all Phase 1-10 items
   Invariant: —
@@ -8918,7 +8918,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0136 — Rollback verification (per-route and full)
+- [ ] RR-0136 — Rollback verification (per-route and full) <!-- partial 2026-08-09: rollback proven by rehearsal step 5 (Python reads+writes the post-migration DB) + <1min port-swap runbook / missing: automated per-route rollback tests -->
   Phase: 11
   Depends on: RR-0135
   Invariant: —
@@ -8933,7 +8933,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0137 — Cloud deployment: Rust Docker image
+- [ ] RR-0137 — Cloud deployment: Rust Docker image <!-- open -->
   Phase: 11
   Depends on: RR-0135
   Invariant: —
@@ -8944,7 +8944,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0138 — Migration rehearsal
+- [x] RR-0138 — Migration rehearsal <!-- verified 2026-08-09: scripts/migration-rehearsal.sh — PASSED 2026-08-09 vs a copy of the live 640k-row DB: 7 migrations, no table lost, row counts unchanged, integrity ok, Python still reads+writes (cutover-runbook.md standing evidence) -->
   Phase: 11
   Depends on: RR-0117 through RR-0133 (all migration + acceptance items incl. sub-IDs)
   Invariant: 45
@@ -8956,7 +8956,7 @@ consistent with their dependencies.
   Verify: Data verification, Integration tests, Browser verification, Offline behavior
   Status: TODO
 
-- [ ] RR-0139 — Production cutover
+- [ ] RR-0139 — Production cutover <!-- open -->
   Phase: 11
   Depends on: RR-0135, RR-0138
   Invariant: 45
@@ -8966,7 +8966,7 @@ consistent with their dependencies.
   Verify: Data verification, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0140 — Post-cutover verification
+- [ ] RR-0140 — Post-cutover verification <!-- open -->
   Phase: 11
   Depends on: RR-0139
   Invariant: 7, 45
@@ -8981,7 +8981,7 @@ consistent with their dependencies.
 
 ### Cross-Cutting
 
-- [ ] RR-0141 — Herdr backend conformance: full E2E
+- [ ] RR-0141 — Herdr backend conformance: full E2E <!-- partial 2026-08-09: herdr conformance suite + traced live lifecycle (backend_conformance.rs, golden_live.rs, golden_remaining.rs) / missing: AMUX-restart-reconcile E2E, stale-process scenario, 10+/40-worker load -->
   Phase: 5 (after Phase 1 impl)
   Depends on: RR-0031, RR-0046
   Invariant: 21, 33
@@ -8993,7 +8993,7 @@ consistent with their dependencies.
   Verify: Backend conformance, Integration tests, Persistence/restart
   Status: TODO
 
-- [ ] RR-0142 — tmux backend conformance: same contract
+- [x] RR-0142 — tmux backend conformance: same contract <!-- verified 2026-08-09: tests/backend_conformance.rs — identical run_conformance suite passes on tmux (tmux_backend_conformance) + golden_backend_interchangeability -->
   Phase: 5 (after Phase 1 impl)
   Depends on: RR-0032, RR-0047
   Invariant: 21, 33
@@ -9002,7 +9002,7 @@ consistent with their dependencies.
   Verify: Backend conformance, Integration tests
   Status: TODO
 
-- [ ] RR-0143 — Provider conformance: Claude adapter
+- [x] RR-0143 — Provider conformance: Claude adapter <!-- verified 2026-08-09: provider/claude.rs full conformance incl. live usage probe (8 tests) + 16 Claude rate-limit patterns in adapter.rs (plan said 14; code carries 16) -->
   Phase: 1
   Depends on: RR-0043
   Invariant: 20, 21
@@ -9012,7 +9012,7 @@ consistent with their dependencies.
   Verify: Provider conformance, Unit tests
   Status: TODO
 
-- [ ] RR-0144 — Provider conformance: Gemini adapter
+- [ ] RR-0144 — Provider conformance: Gemini adapter <!-- partial 2026-08-09: GeminiAdapter + 2 rate-limit patterns (static_providers.rs, adapter.rs, tested) / missing: full conformance harness run (only Claude is wired to provider::conformance) -->
   Phase: 1
   Depends on: RR-0043
   Invariant: 20, 21
@@ -9021,7 +9021,7 @@ consistent with their dependencies.
   Verify: Provider conformance, Unit tests
   Status: TODO
 
-- [ ] RR-0145 — Provider conformance: Codex adapter
+- [ ] RR-0145 — Provider conformance: Codex adapter <!-- partial 2026-08-09: CodexAdapter + 1 usage-limit pattern (static_providers.rs, adapter.rs, tested) / missing: full conformance harness run -->
   Phase: 1
   Depends on: RR-0043
   Invariant: 20, 21
@@ -9030,7 +9030,7 @@ consistent with their dependencies.
   Verify: Provider conformance, Unit tests
   Status: TODO
 
-- [ ] RR-0146 — Provider conformance: Ollama adapter
+- [ ] RR-0146 — Provider conformance: Ollama adapter <!-- partial 2026-08-09: OllamaAdapter with honest UsageConfidence::Unknown + error pattern (static_providers.rs, adapter.rs, tested) / missing: full conformance harness run -->
   Phase: 1
   Depends on: RR-0043
   Invariant: 20, 21
@@ -9039,7 +9039,7 @@ consistent with their dependencies.
   Verify: Provider conformance, Unit tests
   Status: TODO
 
-- [ ] RR-0147 — Offline PWA: mutation classification + queue/replay
+- [ ] RR-0147 — Offline PWA: mutation classification + queue/replay <!-- partial 2026-08-09: offline queue + optimistic UI + replay in extracted SPA (app.js offlineQueue) proven by golden_offline e2e / missing: per-mutation offline classification registry -->
   Phase: 8
   Depends on: RR-0102
   Invariant: 14
@@ -9051,7 +9051,7 @@ consistent with their dependencies.
   Verify: Offline behavior, Browser verification
   Status: TODO
 
-- [ ] RR-0148 — Sync/reconciliation: convergence under faults
+- [ ] RR-0148 — Sync/reconciliation: convergence under faults <!-- partial 2026-08-09: two-tab convergence + coalesced-push dedupe (golden_realtime_convergence) / missing: drop/duplicate/out-of-order fault matrix, 1000-change run -->
   Phase: 8
   Depends on: RR-0023, RR-0024, RR-0103
   Invariant: 35
@@ -9062,7 +9062,7 @@ consistent with their dependencies.
   Verify: Sync/reconciliation, Browser verification
   Status: TODO
 
-- [ ] RR-0149 — Durable events: complete lifecycle coverage
+- [ ] RR-0149 — Durable events: complete lifecycle coverage <!-- partial 2026-08-09: DurableEvents journaled for board transitions, worker lifecycle, commands/dead-letters, schedule fires, verification (orchestrator/events.rs, board_store, runtime) / missing: completeness test across every lifecycle transition -->
   Phase: 4 (extends through all phases)
   Depends on: RR-0009
   Invariant: 24
@@ -9073,7 +9073,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests, Audit/event provenance
   Status: TODO
 
-- [ ] RR-0150 — Persistent-data restart tests: all subsystems
+- [ ] RR-0150 — Persistent-data restart tests: all subsystems <!-- open -->
   Phase: 9 (after all subsystems implemented)
   Depends on: RR-0041, RR-0054, RR-0058, RR-0071, RR-0092
   Invariant: 7
@@ -9083,7 +9083,7 @@ consistent with their dependencies.
   Verify: Persistence/restart, API verification, CLI verification, Browser verification
   Status: TODO
 
-- [ ] RR-0151 — Historical incident regression: full corpus
+- [ ] RR-0151 — Historical incident regression: full corpus <!-- open -->
   Phase: 10
   Depends on: RR-0074, RR-0117c
   Invariant: 41
@@ -9093,7 +9093,7 @@ consistent with their dependencies.
   Verify: Implementation, Unit tests, Integration tests
   Status: TODO
 
-- [ ] RR-0152 — 24h soak test
+- [ ] RR-0152 — 24h soak test <!-- open -->
   Phase: 10
   Depends on: RR-0112
   Invariant: —
@@ -9103,7 +9103,7 @@ consistent with their dependencies.
   Verify: Performance
   Status: TODO
 
-- [ ] RR-0153 — Final parity audit: Python vs Rust
+- [ ] RR-0153 — Final parity audit: Python vs Rust <!-- partial 2026-08-09: e2e/parity-tasks.mjs + docs/rust-migration/ux-parity-report.md (11 task series vs live Python oracle; 4 divergences named) / missing: the full 212-route Parity/Improved/Deprecated manifest -->
   Phase: 11
   Depends on: RR-0118
   Invariant: 45
@@ -9115,7 +9115,7 @@ consistent with their dependencies.
   Verify: Data verification
   Status: TODO
 
-- [ ] RR-0154 — Python shutdown criteria
+- [ ] RR-0154 — Python shutdown criteria <!-- open -->
   Phase: 11
   Depends on: RR-0140, RR-0153
   Invariant: 45
@@ -9129,7 +9129,7 @@ consistent with their dependencies.
 
 ### Release Gate
 
-- [ ] RR-0155 — Final release gate verification
+- [ ] RR-0155 — Final release gate verification <!-- open -->
   Phase: 11
   Depends on: RR-0001 through RR-0154
   Invariant: 7, 45
@@ -9145,3 +9145,36 @@ consistent with their dependencies.
 **The document is complete when implementation no longer requires interpretation of the
 intended end state. The implementation is complete when every requirement has independent
 evidence that it works.**
+
+---
+
+### Checklist reconciliation — 2026-08-09
+
+Reconciled against the code (crates/, e2e/, scripts/, .github/workflows/, docs/rust-migration/).
+Every `[x]` above carries a file citation; `partial` names what exists and what is missing.
+
+**Totals (203 items): 94 done · 51 partial · 42 open · 16 superseded.**
+(39 previously checked — all spot-checked sound, none flipped — plus 55 newly verified.)
+
+**(a) Genuinely open, needed before cutover** (AMUX-2598: 8824 exclusively rust + herdr + opencode; runbook docs/rust-migration/cutover-runbook.md):
+- RR-0053 — board auto-capture: rust-worker path DONE (runtime.rs:1262); the gap is only python-fleet sessions, which closes itself as sessions become rust workers at cutover
+- RR-0135 — proxy removal: retire the four remaining Python families (session verbs, file/library media, browser driver verbs, dictation engine)
+- RR-0130 / RR-0131a / RR-0131b / RR-0131d — live-data acceptance sweeps not yet run (messages, logs+events, memories, browser profiles + token ledger)
+- RR-0150 — persistent-data restart suite (create -> restart -> reconcile -> verify, all subsystems)
+- RR-0152 — 24h soak (runbook Phase B requires 48h monitored stability)
+- RR-0139 / RR-0140 — execute the cutover + post-cutover verification
+- RR-0154 / RR-0155 — Python shutdown criteria + final release gate
+
+**(b) Open, post-cutover / nice-to-have:**
+- RR-0044a per-worker model budgets · RR-0077 correlated task detail · RR-0091 email/calendar e2e · RR-0096 browser/files e2e
+- RR-0100/RR-0101 data-testid + interaction registry (extracted SPA has zero data-testid) · RR-0104/RR-0105/RR-0106(partial)/RR-0107 deep-interaction, fault-injection, mobile-geometry, model-based Playwright
+- RR-0107a–g UX discovery full-app graph (harness itself shipped in Phase 0)
+- RR-0109 `amux why` · RR-0110 universal FTS5 search (net-new; no /api/search exists in Python or the SPA today) · RR-0113 search-bar e2e
+- RR-0116/RR-0117a/RR-0117b nightly-deep, release/soak gates + regression thresholds · RR-0117c(partial, 4 of 20+)/RR-0151 incident corpus
+- RR-0117d–i traceability, migrated fixture, test tags, perf CI, INV-tag CI checks
+- RR-0137 Rust cloud Docker image (deploy-cloud.yml still ships Python only)
+
+**(c) Superseded by decision:**
+- RR-0118 through RR-0127 (16 items): the migrate-and-translate plan was replaced by the **shared bilingual DB** strangler design — Rust serves the live tables in place, migrations are additive-only, and `scripts/migration-rehearsal.sh` proves the file stays Python-compatible. No data-translation step exists or is needed.
+- CRM: deleted per owner directive (never received an RR item; parity step J confirms the tab stays hidden on both servers).
+- RR-0090 was assigned in the spec body but never became a checklist item; its scope (integration registry) shipped inside RR-0073/RR-0088/RR-0089 (integrations/mod.rs).
