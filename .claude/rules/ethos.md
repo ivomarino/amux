@@ -309,6 +309,38 @@ a positive is cheap to construct, construct one — run the highlighter on text 
 should match before trusting that it did not match; check that a control row appears
 before concluding the treatment row was filtered.
 
+**The failure is not carelessness, it is that a hand-written probe is a GUESS about
+where the answer lives, and a guess that misses is indistinguishable from an answer
+that is absent.** Two sessions logged NINE instances in one day (2026-08-08,
+amux-cloud + amux), and the value is in the count rather than any one of them, because
+each looked like a different mistake and every single one would have reported working
+code as broken or missing:
+
+- a positional slice matched the fix's own COMMENT, which quoted the string it removed
+- a grep for `:amux-server.py` against code that says `":${FILE}"`
+- BSD grep read the `$` in `${FILE}` as an anchor (`grep -F` finds it)
+- an `if True:` fixture built to "break" a file, which is valid Python — the following
+  indented lines just became its block, so the probe could not fail
+- a pattern missing backticks: `Do NOT reach for force` against
+  ``Do NOT reach for `"force":true` `` — on a security-adjacent check, where the false
+  negative reads as the vulnerability having returned
+- a slice window too small for the verbose comment that preceded the code, so the test
+  failed against the CORRECT fix
+- the first `<select>` matching a string, out of 28 on the page, three of which matched
+- an env value read straight out of a file with its quotes still attached, so `[ -d ]`
+  reported an existing directory as missing
+- a latency measured across a server restart, which makes any number meaningless
+
+The three that generalise past "be careful": **name the target before you search for
+it** (which of the 28 selects? which of the two branches?), **bound a positional window
+on the CODE, not on however much prose precedes it**, and **when you built the broken
+fixture yourself, verify it is actually broken** — "I broke it" is a claim, not a
+premise, and it fails silently because everything looks like it ran.
+
+The tell that beats all of them: a red test on code you just verified by hand, or a
+clean result you did not expect. Both mean the instrument is a candidate before the code
+is.
+
 The sharpest variant: the sanctioned instruction itself can be the theatre. Every
 assignment notification told sessions to run `amux board claim <id>`; the command did
 not exist, fell through to the help text, and exited 0 — so following the instruction
