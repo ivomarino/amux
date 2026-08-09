@@ -63,6 +63,32 @@ async fn async_main() {
         }
     };
 
+    // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
+    // Lets scripts/migration-rehearsal.sh exercise the EXACT production
+    // migration path against a DB copy without binding ports.
+    if cfg.env.get("AMUX_RS_MIGRATE_ONLY").map(|v| v == "1").unwrap_or(false) {
+        let conn = store.read().expect("read after migrate");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        let migrations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
+            .unwrap_or(-1);
+        println!(
+            "{}",
+            serde_json::json!({
+                "migrate_only": true,
+                "tables": tables,
+                "migrations_applied": migrations,
+            })
+        );
+        return;
+    }
+
     let auth_token = api::auth::load_or_create_token(&cfg.auth_token_path()).ok();
 
     // RR-0092: at boot no amux-launched Chrome exists, so Singleton* locks in
