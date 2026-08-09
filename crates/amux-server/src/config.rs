@@ -33,6 +33,18 @@ impl ServerConfig {
     /// and process env so tests can drive it hermetically.
     pub fn load(home: PathBuf, process_env: &BTreeMap<String, String>) -> Self {
         let mut env = parse_env_file(&home.join("server.env"));
+        // PYTHON-PARITY SETDEFAULT, for real: export server.env values into
+        // the PROCESS env when the process doesn't already set them. The doc
+        // above always claimed setdefault semantics, but values only reached
+        // the Config struct — every `std::env::var()` read site (the
+        // AMUX_RS_SCHEDULER gate, AMUX_HERDR_SESSION, the caps/knobs) saw
+        // nothing, so server.env flags silently didn't work (live incident
+        // 2026-08-09: scheduler stayed in shadow mode with the flag set).
+        for (k, v) in env.iter() {
+            if !process_env.contains_key(k) && std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
         // Process env wins over server.env (same rule as Python's setdefault).
         for (k, v) in process_env {
             env.insert(k.clone(), v.clone());
