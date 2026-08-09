@@ -163,6 +163,58 @@ pub fn dead_letters(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<Queue
     rows.collect()
 }
 
+/// Dead letters scoped to ONE worker (RR-0068:
+/// `GET /api/workers/:id/dead-letters`). `json_extract` on the state tag,
+/// not LIKE, so "delivered" can never substring-match its way in.
+pub fn dead_letters_for(
+    conn: &Connection,
+    worker: &WorkerId,
+    limit: u32,
+) -> rusqlite::Result<Vec<QueuedCommand>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM _amux_commands
+         WHERE worker_id = ?1 AND json_extract(state, '$.state') = 'dead_lettered'
+         ORDER BY queued_at DESC LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![worker.as_str(), limit], row_to_command)?;
+    rows.collect()
+}
+
+/// The worker's single in-flight command (Dispatched or Delivered), oldest
+/// first. This is what a `TurnCompleted` confirms and a `Failed` fails
+/// (Invariant 34 steps 5/6): queue discipline allows at most one, but the
+/// query tolerates more and returns the head rather than assuming.
+pub fn in_flight(conn: &Connection, worker: &WorkerId) -> rusqlite::Result<Option<QueuedCommand>> {
+    conn.query_row(
+        &format!(
+            "SELECT {COLS} FROM _amux_commands
+             WHERE worker_id = ?1
+               AND json_extract(state, '$.state') IN ('dispatched', 'delivered')
+             ORDER BY queued_at ASC, id ASC LIMIT 1"
+        ),
+        params![worker.as_str()],
+        row_to_command,
+    )
+    .optional()
+}
+
+/// Per-state row counts for one worker's queue — the queue-health summary
+/// (Invariant 34: queue depth is a health signal). Keys are the CommandState
+/// tags ("queued", "dispatched", ...); absent key = zero rows.
+pub fn state_counts(
+    conn: &Connection,
+    worker: &WorkerId,
+) -> rusqlite::Result<std::collections::BTreeMap<String, u32>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(state, '$.state'), COUNT(*) FROM _amux_commands
+         WHERE worker_id = ?1 GROUP BY 1",
+    )?;
+    let rows = stmt.query_map(params![worker.as_str()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+    })?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +303,46 @@ mod tests {
         assert_eq!(dead.len(), 1);
         assert!(matches!(&dead[0].state, CommandState::DeadLettered { reason } if reason.contains("boom 2")));
         assert!(next_deliverable(&c, &wid(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn worker_scoped_dead_letters_in_flight_and_counts() {
+        let c = conn();
+        // Worker 1: one dead letter, one delivered (in flight), one queued.
+        enqueue(&c, cid(1), &wid(1), &WorkerCommand::Continue, "a",
+                &DeliveryTiming::Immediate, None, t(0)).unwrap();
+        for _ in 0..3 {
+            transition(&c, &cid(1), CommandTransition::Dispatch, 3).unwrap();
+            transition(&c, &cid(1), CommandTransition::Fail { reason: "x".into() }, 3).unwrap();
+            transition(&c, &cid(1), CommandTransition::Retry, 3).unwrap();
+        }
+        enqueue(&c, cid(2), &wid(1), &WorkerCommand::Continue, "b",
+                &DeliveryTiming::Immediate, None, t(1)).unwrap();
+        transition(&c, &cid(2), CommandTransition::Dispatch, 3).unwrap();
+        transition(&c, &cid(2), CommandTransition::Deliver, 3).unwrap();
+        enqueue(&c, cid(3), &wid(1), &WorkerCommand::Continue, "c",
+                &DeliveryTiming::Immediate, None, t(2)).unwrap();
+        // Worker 2: its own dead letter, invisible to worker 1's listing.
+        enqueue(&c, cid(4), &wid(2), &WorkerCommand::Continue, "d",
+                &DeliveryTiming::Immediate, None, t(3)).unwrap();
+        for _ in 0..3 {
+            transition(&c, &cid(4), CommandTransition::Dispatch, 3).unwrap();
+            transition(&c, &cid(4), CommandTransition::Fail { reason: "y".into() }, 3).unwrap();
+            transition(&c, &cid(4), CommandTransition::Retry, 3).unwrap();
+        }
+
+        let dead = dead_letters_for(&c, &wid(1), 10).unwrap();
+        assert_eq!(dead.len(), 1, "only worker 1's dead letter");
+        assert_eq!(dead[0].id, cid(1));
+
+        let head = in_flight(&c, &wid(1)).unwrap().unwrap();
+        assert_eq!(head.id, cid(2), "delivered command is the in-flight head");
+        assert_eq!(head.state, CommandState::Delivered);
+
+        let counts = state_counts(&c, &wid(1)).unwrap();
+        assert_eq!(counts.get("dead_lettered"), Some(&1));
+        assert_eq!(counts.get("delivered"), Some(&1));
+        assert_eq!(counts.get("queued"), Some(&1));
+        assert_eq!(counts.get("confirmed"), None, "absent state = absent key");
     }
 }

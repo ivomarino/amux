@@ -16,6 +16,7 @@
 
 pub mod commands;
 pub mod board_store;
+pub mod memories;
 pub mod migrate;
 pub mod queries;
 

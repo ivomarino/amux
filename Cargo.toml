@@ -38,6 +38,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
 sha2 = "0.10"
 hex = "0.4"
+# Web Push (RR-0094): ES256 VAPID + RFC 8291 aes128gcm. `ecdh` and `pem` are
+# feature additions to the same crate: ecdh for the RFC 8291 key agreement,
+# pem so the Python server's PKCS#8 PEM VAPID key (~/.amux/vapid_private.pem)
+# loads unchanged and existing dashboard subscriptions keep verifying.
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
+base64 = "0.22"
 toml = "0.8"
 futures = "0.3"
 

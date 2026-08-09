@@ -16,7 +16,11 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordedCall {
     SendPrompt { worker: WorkerId, prompt: Prompt },
-    DeliverMessage { worker: WorkerId, msg: MessageId },
+    /// `body` is recorded so tests can assert the REAL message text reached
+    /// the agent — delivering the right MessageId with an empty body is
+    /// exactly the bug RR-0066 fixes, and a recorder blind to the body
+    /// could not fail on it (ethos rule 7).
+    DeliverMessage { worker: WorkerId, msg: MessageId, body: String },
     Cancel(WorkerId),
     Pause(WorkerId),
     Resume(WorkerId),
@@ -96,11 +100,12 @@ impl AgentProtocol for MockProtocol {
         Ok(())
     }
 
-    async fn deliver_message(&self, worker: &WorkerId, msg: MessageId, _body: String) -> Result<()> {
+    async fn deliver_message(&self, worker: &WorkerId, msg: MessageId, body: String) -> Result<()> {
         self.ensure(worker)?;
         self.record(RecordedCall::DeliverMessage {
             worker: worker.clone(),
             msg,
+            body,
         });
         Ok(())
     }

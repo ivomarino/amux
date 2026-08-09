@@ -7,9 +7,11 @@ pub mod api;
 pub mod backend;
 pub mod config;
 pub mod db;
+pub mod integrations;
 pub mod opencode;
 pub mod orchestrator;
 pub mod provider;
+pub mod push;
 pub mod runtime_jobs;
 pub mod tls;
 
@@ -62,6 +64,14 @@ async fn async_main() {
     };
 
     let auth_token = api::auth::load_or_create_token(&cfg.auth_token_path()).ok();
+
+    // RR-0092: at boot no amux-launched Chrome exists, so Singleton* locks in
+    // amux-owned profile dirs are stale by definition and would block the next
+    // launch (AMUX-2070). Only touches ~/.amux/playwright-auth — never the
+    // user's real Chrome dir. Logs WHAT was cleaned, not just that it ran.
+    for (dir, removed) in integrations::browser::reconcile_locks_at_startup(&cfg.amux_home) {
+        tracing::info!(dir = %dir.display(), locks = ?removed, "cleaned stale Chrome profile locks");
+    }
 
     let state = api::AppState {
         store: store.clone(),

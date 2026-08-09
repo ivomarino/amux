@@ -7,13 +7,19 @@
 pub mod aliases;
 pub mod auth;
 pub mod board;
+pub mod browser;
+pub mod files;
 pub mod health;
+pub mod memories;
+pub mod messages;
+pub mod prefs;
 pub mod schedules;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
 pub mod verify;
 pub mod workers;
+pub mod workers_deadletters;
 
 use crate::db::SharedStore;
 use axum::Router;
@@ -37,9 +43,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
         .nest("/api/board", board::routes())
-        .nest("/api/workers", workers::routes())
+        // Dead-letter routes merge into the workers nest (RR-0068): same
+        // /api/workers prefix, second nest at one path is an axum conflict.
+        .nest(
+            "/api/workers",
+            workers::routes().merge(workers_deadletters::routes()),
+        )
+        .nest("/api/memories", memories::routes())
+        .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())
         .nest("/api/verify", verify::routes())
+        .nest("/api/prefs", prefs::routes())
+        .nest("/api/browser", browser::routes())
+        .nest("/api/files", files::routes())
+        .nest("/api/push", crate::push::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

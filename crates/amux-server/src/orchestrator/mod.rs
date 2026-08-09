@@ -6,6 +6,9 @@
 //! is how simulations end up testing a paraphrase of the system instead of
 //! the system (ethos rule 7).
 
+pub mod compaction;
+pub mod context;
+pub mod events;
 pub mod runtime;
 pub mod sim;
 pub mod verify;

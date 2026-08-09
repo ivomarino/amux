@@ -441,6 +441,45 @@ impl Runtime {
                 })
                 .await?;
         }
+        // Immutable context snapshots (RR-0070, Invariant 27): record exactly
+        // what each assigned worker will receive, BEFORE the command that
+        // delivers it is enqueued. INSERT OR IGNORE on the assignment's
+        // idempotency key keeps this idempotent — a re-planned assignment
+        // re-records nothing and bumps no revision. A task the board no
+        // longer resolves is skipped as an honest no-op (the assignment
+        // itself will fail downstream and say so there).
+        for asg in &plan.assignments {
+            let worker_id = asg.worker.clone();
+            let task_id = asg.task.clone();
+            let key = asg.idempotency_key.clone();
+            self.store
+                .write_async(move |conn| {
+                    let Some(task) =
+                        crate::orchestrator::context::task_by_internal_id(conn, &task_id)?
+                    else {
+                        return Ok(WriteOutcome { applied: false, events: vec![] });
+                    };
+                    let snap = crate::orchestrator::context::assemble_context(
+                        conn, &worker_id, &task,
+                    )?;
+                    let recorded = crate::orchestrator::context::record_snapshot(
+                        conn, &key, &task_id, &worker_id, &snap,
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: recorded,
+                        events: if recorded {
+                            vec![PendingEvent {
+                                entity_type: EntityType::Other("context_snapshot".into()),
+                                entity_id: snap.content_hash.clone(),
+                                mutation: MutationKind::Created,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    })
+                })
+                .await?;
+        }
         // Assignments: lease + an ExecuteTask command the pump delivers
         // through the agent protocol — the full loop: board task -> lease
         // -> command -> headless CLI run.
@@ -532,7 +571,7 @@ impl Runtime {
     /// Immediate always goes; AtTurnBoundary/WhenIdle require the agent to
     /// be at a boundary (Idle or WaitingForInput). Failures transition
     /// through the core state machine — retry budget 3 (Invariant 34).
-    async fn pump_commands(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
+    pub(crate) async fn pump_commands(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
         let Some(protocol) = &self.protocol else {
             return Ok(());
         };
@@ -622,11 +661,29 @@ impl Runtime {
                 .await?;
             let delivery = match &cmd.command {
                 amux_core::protocol::WorkerCommand::DeliverMessage(msg_id) => {
-                    // Body resolution joins with the message store (Phase 4);
-                    // the id itself is the durable reference.
-                    protocol
-                        .deliver_message(&worker, msg_id.clone(), String::new())
-                        .await
+                    // RR-0066: the command carries only the REFERENCE
+                    // (Invariant 29); the durable body lives in
+                    // _amux_messages and is resolved here, at delivery. A
+                    // missing row is a delivery FAILURE, never an empty
+                    // message — silently delivering "" would be the Python
+                    // lost-steering-text bug wearing a Rust type.
+                    let body: rusqlite::Result<String> = {
+                        let conn = self.store.read()?;
+                        conn.query_row(
+                            "SELECT body FROM _amux_messages WHERE id = ?1",
+                            params![msg_id.as_str()],
+                            |r| r.get(0),
+                        )
+                    };
+                    match body {
+                        Ok(body) => {
+                            protocol.deliver_message(&worker, msg_id.clone(), body).await
+                        }
+                        Err(e) => Err(crate::opencode::ProtocolError::Transport(format!(
+                            "message body lookup failed for {}: {e}",
+                            msg_id.as_str()
+                        ))),
+                    }
                 }
                 other => {
                     protocol
@@ -648,8 +705,41 @@ impl Runtime {
             };
             self.store
                 .write_async(move |conn| {
-                    crate::db::commands::transition(conn, &id, t, 3)?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    let cmd = crate::db::commands::transition(conn, &id, t, 3)?;
+                    // Dead-letter handling (RR-0068, Invariant 34): a Fail
+                    // that spends the whole retry budget is retried into its
+                    // terminal state HERE, by the caller that observed it —
+                    // and the DurableEvent is emitted in the same
+                    // transaction, because a dead letter without a trace is
+                    // the Python system's silent-vanish mode with extra
+                    // steps. transition() returns the post-Fail state, so
+                    // this cannot fire on a command with budget left.
+                    let mut events = vec![];
+                    if matches!(&cmd.state, amux_core::protocol::CommandState::Failed { .. })
+                        && cmd.attempts >= 3
+                    {
+                        let dead = crate::db::commands::transition(
+                            conn,
+                            &id,
+                            amux_core::protocol::CommandTransition::Retry,
+                            3,
+                        )?;
+                        if let amux_core::protocol::CommandState::DeadLettered { reason } =
+                            &dead.state
+                        {
+                            tracing::warn!(command = id.as_str(), reason = %reason,
+                                "command dead-lettered after exhausting retries");
+                            events.push(PendingEvent {
+                                entity_type: EntityType::Other("command_dead_letter".into()),
+                                entity_id: id.as_str().to_string(),
+                                mutation: MutationKind::StatusChanged {
+                                    from: "failed".into(),
+                                    to: format!("dead_lettered: {reason}"),
+                                },
+                            });
+                        }
+                    }
+                    Ok(WriteOutcome { applied: true, events })
                 })
                 .await?;
         }
