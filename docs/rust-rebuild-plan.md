@@ -14,7 +14,7 @@ Rewrite of `amux-server.py` (77k-line Python single-file server) in Rust. Not a 
 - **47 SQLite tables**, single DB file
 - **212 API routes** (250+ method/path combos)
 - **~30 background jobs** (scheduler, snapshots, rate-limit watchdog, steering, token ledger, email sync, etc.)
-- **3 terminal backends**: tmux (primary), herdr, iTerm2
+- **3 terminal backends**: herdr (primary), tmux, iTerm2
 - **4 LLM providers**: Claude Code (OAuth + API key), Gemini, Codex, Ollama
 - **Full SPA dashboard** with SSE real-time updates, PWA/offline, dark/light themes
 
@@ -56,7 +56,7 @@ Worker (durable entity)
  ├── Session 1 (ran, hit context limit, ended)
  ├── Session 2 (ran, crashed via OOM, ended)
  └── Session 3 (currently running)
-       └── Backend: tmux pane "worker-name"
+       └── Backend: herdr agent "worker-name"
 ```
 
 ```rust
@@ -1061,6 +1061,186 @@ enum VerifierKind {
 
 Verifiers run in cost order. If the free checks fail, expensive ones never run.
 
+### Invariant 29: Message is a durable entity, not command plumbing
+
+Steering messages, `@worker` mentions, issue discussion, and offline commands are all
+the same thing: a **Message**. Making it an explicit durable entity gives you threads,
+unread state, delivery tracking, search, and audit history without building each one
+separately.
+
+```rust
+struct Message {
+    id: MessageId,
+    from: ActorRef,
+    to: Vec<ActorRef>,       // worker/group/user/orchestrator
+    issue_id: Option<IssueId>,
+    thread_id: ThreadId,
+    body: String,
+    created_at: DateTime<Utc>,
+    delivery: DeliveryState,
+}
+
+enum DeliveryState {
+    Queued,
+    Delivered { at: DateTime<Utc> },
+    Read { at: DateTime<Utc> },
+    Failed { reason: String },
+}
+```
+
+`WorkerCommand::Steer` becomes `WorkerCommand::DeliverMessage(MessageId)`. The
+orchestrator delivers messages at turn boundaries (Invariant 6). Offline messages
+queue in IndexedDB and sync on reconnect (Invariant 14). `@worker-3` in an issue
+description creates a Message addressed to worker-3 with the issue_id set. Threads
+let a worker reply to a steering message and the reply appears in the issue activity.
+
+### Invariant 30: Structured events for machines, append-only logs for humans
+
+Two separate concepts that share correlation IDs but serve different consumers:
+
+**Structured events** (`DurableEvent`, Invariant 24): machine-readable, typed,
+queryable. The orchestrator, dashboard, and API consume these. They drive state
+transitions, metrics, and the `why-blocked` query.
+
+**Logs/output**: human-readable, append-only, unstructured text. Worker terminal
+output, tool call results, error messages, debug traces. Humans read these when
+debugging.
+
+An issue detail exposes both, correlated by issue/worker/session/turn IDs:
+
+```
+Issue AR-421 detail:
+  Activity          — messages + transitions (human timeline)
+  Messages          — thread of steering/discussion
+  Worker output     — raw terminal capture per turn
+  Tool calls        — structured tool events
+  Transitions       — board state machine history
+  Gate evaluations  — gate checks with evidence
+  Verification      — criteria + evidence + result
+  System events     — orchestrator decisions, lease changes
+```
+
+Everything is cross-linked: clicking a gate evaluation shows the tool call that
+produced the evidence, the turn it ran in, the worker output surrounding it, and the
+message that triggered the work.
+
+### Invariant 31: Compaction is a first-class subsystem
+
+Context exhaustion is not an error. It is a lifecycle event with a defined protocol.
+Compaction creates a cheaper derived context layer without destroying source history.
+
+```rust
+struct Compaction {
+    id: CompactionId,
+    worker_id: WorkerId,
+    issue_id: Option<IssueId>,
+    source_turns: Vec<TurnId>,
+    summary: String,
+    retained_facts: Vec<Fact>,
+    retained_artifacts: Vec<ArtifactRef>,
+    supersedes: Vec<ContextFragmentId>,
+    token_before: u32,
+    token_after: u32,
+    created_at: DateTime<Utc>,
+}
+```
+
+Lifecycle triggers:
+
+```
+context 70%  -> prepare compaction (build summary in background)
+context 85%  -> compact (swap full history for compacted representation)
+context 95%  -> checkpoint + new session
+new session  -> hydrate: issue state + compacted history + unresolved work
+```
+
+**Source history is never replaced by compaction.** The original turns, messages,
+logs, and artifacts remain in the DB. Compaction produces a `ContextFragment` with
+`source: Compacted` that the context assembler (Invariant 16) uses instead of the
+originals, but a worker or human can always drill into the full source.
+
+Worker identity and issue assignment survive session replacement. The worker is
+durable (Invariant 1); the session is ephemeral. A new session hydrates from the
+compacted context and continues where the previous session left off.
+
+### Invariant 32: Universal search without embeddings
+
+A single search API spans every entity in the system. Basic search works completely
+offline without spending tokens.
+
+```
+GET /api/search?q=rate+limited+anthropic+AR-421
+```
+
+Searchable entities:
+
+```
+issues, messages, workers, groups, turns, logs, tool calls,
+verification evidence, gate evaluations, memories, files,
+browser history/artifacts, email, calendar, CRM, schedules, events
+```
+
+Each result carries provenance:
+
+```rust
+struct SearchHit {
+    entity_type: EntityType,
+    entity_id: EntityId,
+    scope: Scope,
+    issue_id: Option<IssueId>,
+    worker_id: Option<WorkerId>,
+    timestamp: DateTime<Utc>,
+    snippet: String,
+    score: f32,
+}
+```
+
+Search stack (no embeddings required for the first three tiers):
+
+```
+exact/filter lookup       — id, status, type, date range
+        ↓
+SQLite indexes            — indexed columns, foreign keys
+        ↓
+FTS5 lexical search       — full-text across all entities, offline
+        ↓
+optional semantic search  — embedding-based reranking (token cost, online only)
+```
+
+SQLite FTS5 is the baseline. `rate limited anthropic AR-421` works offline, instantly,
+without spending tokens. Semantic search is an optional layer on top for fuzzy/concept
+queries, with locally-generated and cached embeddings.
+
+### The history/context layer
+
+Invariants 29-32 are not four random features. They form one cohesive layer:
+
+```
+                  SEARCH (Inv 32)
+                    ▲
+                    │
+ ┌────────┬─────────┼───────────┬──────────┐
+ │        │         │           │          │
+Issues  Messages   Events      Logs      Artifacts
+(Inv 3) (Inv 29)  (Inv 30)   (Inv 30)
+ │        │         │           │          │
+ └────────┴─────────┼───────────┴──────────┘
+                    │
+               COMPACTION (Inv 31)
+                    │
+                    ▼
+             Worker Context (Inv 16/27)
+```
+
+Two governing principles:
+
+> **Everything produced by amux is durable, attributable, searchable, and selectively
+> compactable. Original source data is never replaced by compaction.**
+
+> **A user can navigate from any entity to any related entity without knowing where
+> it was stored.** Clicking a gate evaluation reaches the tool call, the turn, the
+> worker output, and the message that triggered the work.
+
 ### Design rule: self-documenting by construction
 
 The system is its own documentation. No separate design doc, wiki, or README should
@@ -1134,7 +1314,7 @@ USER / @MENTIONS / SCHEDULES
       +-------+--------+
       v                v
    PROVIDER          BACKEND
- Claude/Gemini/    tmux/herdr/
+ Claude/Gemini/    herdr/tmux/
  Codex/Ollama      native PTY
       |                |
       +-------+--------+
@@ -1174,8 +1354,8 @@ snapshot, and session startup) becomes explicit:
        │                 └──────┬───────┘
        │                        │ execution
        │                 ┌──────▼───────┐
-       │                 │Backend (tmux/│
-       │                 │herdr/native) │
+       │                 │Backend(herdr/│
+       │                 │tmux/native)  │
        │                 └──────────────┘
        v
 ┌──────────────┐
@@ -1309,20 +1489,22 @@ lines for rate-limit detection alone.
 | Option | Description | Wins | Loses |
 |---|---|---|---|
 | **A: tmux improved** | tmux control-mode (`-CC`), persistent connection | Zero migration risk | 50 regexes stay, D1 stays |
-| **B: herdr primary** | Structured `agent prompt/read` | Send quality, alt-screen capture | Same scraping regexes |
+| **B: herdr primary** | Structured `agent prompt/read` | Send quality, alt-screen capture, cleaner lifecycle | Same scraping regexes |
 | **C: Native PTY** | Rust owns PTY via `portable-pty` | Zero subprocess overhead, streaming | Must solve persistence, lose manual attach |
 | **D: Structured protocol** | WorkerCommand/WorkerEvent, hooks as primary | IS the D1 exit | Depends on Claude Code hook coverage |
 
 ### Recommendation
 
-**tmux as initial backend + WorkerCommand/WorkerEvent as the internal protocol (A + D).**
+**herdr as primary backend + WorkerCommand/WorkerEvent as the internal protocol (B + D).**
 
-The key insight: **tmux is not the problem -- the scraping is.** Changing which process
-hosts the PTY does not eliminate D1. The WorkerCommand/WorkerEvent protocol does, by
-making the terminal backend an adapter that translates PTY text into typed events. As
-Claude Code's hook coverage grows, the adapter shrinks. herdr stays as an optional
-backend behind the trait. Native PTY (Option C) is a future target once hooks cover
-enough that the scraper is liveness-only.
+The key insight: **terminal backend choice is independent of the protocol change.** The
+WorkerCommand/WorkerEvent protocol (D) is what eliminates the D1 scraping center,
+regardless of whether the backend is tmux or herdr. Herdr becomes the primary backend
+because it has structured lifecycle semantics (`agent prompt/read`) that map more
+cleanly to WorkerCommand/WorkerEvent than tmux's character-level `send-keys`. As Claude
+Code's hook coverage grows, the adapter shrinks and either backend becomes transparent.
+Tmux stays as a fallback backend behind the trait. Native PTY (Option C) is a future
+target once hooks cover enough that the scraper is liveness-only.
 
 ---
 
@@ -1378,6 +1560,8 @@ amux/
           settings.rs            # /api/prefs, /api/settings
           alerts.rs              # /api/alert/owner, push
           metrics.rs             # /api/metrics, /api/debug/*
+          search.rs              # /api/search -- FTS5 across all entities
+          messages.rs            # /api/messages/* -- durable message CRUD, threads
           auth.rs                # bearer token, share tokens, org
           sse.rs                 # /api/events
           health.rs              # /health
@@ -1387,14 +1571,15 @@ amux/
           reconcile.rs           # startup reconciliation
           pickup.rs              # runnable-issue selection
           context.rs             # context assembly pipeline
+          compaction.rs          # context compaction lifecycle (70/85/95% triggers)
         runtime/
           mod.rs                 # job scheduling (DurableSchedule vs PeriodicTask)
           scheduler.rs           # user-facing durable schedules
           periodic.rs            # internal maintenance tasks
         backend/
           mod.rs                 # SessionBackend trait
-          tmux.rs                # tmux subprocess (initial default)
-          herdr.rs               # herdr agent backend
+          herdr.rs               # herdr agent backend (primary default)
+          tmux.rs                # tmux subprocess (fallback)
           adapter.rs             # terminal output -> WorkerEvent translator
         provider/
           mod.rs                 # provider dispatch
@@ -1514,7 +1699,7 @@ harness that will verify every subsequent phase.
 
 1. `amux-core/worker`: Worker struct, WorkerConfig, WorkerCapabilities
 2. `amux-core/orchestrator`: Orchestrator trait, WorkAssignment, Lease
-3. `amux-server/backend/tmux.rs`: SessionBackend impl for tmux
+3. `amux-server/backend/herdr.rs`: SessionBackend impl for herdr (primary)
 4. `amux-server/backend/adapter.rs`: terminal output -> WorkerEvent translator (port
    ANSI stripping, prompt detection, rate-limit regexes, per-provider patterns)
 5. `amux-server/api/workers.rs`: CRUD, start (202 async), stop, peek, send
@@ -1539,13 +1724,16 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Unit: execution state transitions are independent of board state transitions (Invariant 19)
 - Unit: `@worker` mention parses from issue text, CLI, and dashboard input (Invariant 17)
 - Unit: mention delivery state machine: Queued->Delivered->Acknowledged->ActedOn (Invariant 17)
+- Unit: `Message` CRUD -- create, thread, delivery state tracking (Invariant 29)
+- Unit: `Message` addressed to group fans out to all group members (Invariant 29)
+- Unit: `WorkerCommand::Steer` wraps `DeliverMessage(MessageId)` (Invariant 29)
 - Simulation: 50 workers, 200 issues, fake clock -- orchestrator assigns optimally with
   no double-leases (Invariant 22)
 - Simulation: provider rate-limit + recovery -- fleet redistributes within 2 ticks (Invariant 20)
 - Simulation: worker crash mid-issue -- lease reclaimed, issue re-assigned (Invariant 22)
 - proptest: no double-lease for arbitrary event sequences (Invariant 22)
 - proptest: verified implies done occurred previously (Invariant 22)
-- Backend conformance: tmux passes full suite (Invariant 21)
+- Backend conformance: herdr passes full suite (Invariant 21)
 - Provider conformance: Claude adapter passes full suite (Invariant 21)
 - Integration: create Claude worker, start, verify tmux session, send text, capture
 - Integration: create Ollama worker (`ollama run` backend), start, verify running
@@ -1561,6 +1749,7 @@ next TODO, assign to idle worker). It grows in sophistication over phases.
 - Playwright: idle worker with non-terminal issue -> dashboard shows stall warning
 - Playwright: `@worker` mention in issue description triggers delivery (Invariant 17)
 - Playwright: token budget dashboard shows tokens-per-verified-issue metric (Invariant 16)
+- Playwright: message thread on issue detail -- send, reply, unread indicator (Invariant 29)
 
 ### Phase 2: Board + dependency graph (est. 3 weeks)
 
@@ -1650,13 +1839,17 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
 
 ### Phase 4: Control plane (steering, rate-limit, auto-responder) (est. 2 weeks)
 
-**Goal**: WorkerCommand delivery and WorkerEvent processing.
+**Goal**: WorkerCommand delivery, WorkerEvent processing, message delivery, and
+compaction subsystem.
 
 1. WorkerCommand -> terminal adapter (steering delivery with dedup, idempotency)
 2. Terminal adapter -> WorkerEvent (rate-limit detection per provider, crash detection)
 3. Scan demotion: hook-reported workers get demoted capture frequency
 4. Auto-responder for `--dangerously-skip-permissions` workers
 5. Turn tracking: TurnStarted/TurnCompleted events drive the orchestrator
+6. Message delivery: `Message` entities delivered at turn boundaries (Invariant 29)
+7. Compaction subsystem: context 70% -> prepare, 85% -> compact, 95% -> checkpoint +
+   new session, new session -> hydrate from compacted context (Invariant 31)
 
 **Test plan**:
 - Unit: steering dedup prevents double delivery
@@ -1675,8 +1868,18 @@ struct PeriodicTask { /* in-memory, interval, fire-and-forget */ }
 - Integration: rate-limit auto-wait fires on simulated terminal output
 - Integration: `IntegrationState` transitions reflected in `/health` endpoint (Invariant 23)
 - Integration: Gmail unavailable -> email operations queue, recover on reconnect (Invariant 23)
+- Integration: message delivered at turn boundary, not mid-turn (Invariant 29)
+- Integration: offline message queued, delivered on reconnect (Invariant 29)
+- Integration: compaction at 85% context -- compacted fragment created, source turns
+  preserved, token_after < token_before (Invariant 31)
+- Integration: context 95% triggers checkpoint + new session, new session hydrates
+  from compacted context (Invariant 31)
+- Integration: compaction never deletes source turns/messages/logs (Invariant 31)
+- Simulation: context exhaustion cycle: 10 turns -> compact -> 10 more turns -> new
+  session -> hydrate -> continue (Invariant 31)
 - Playwright: worker status updates live in dashboard, rate-limit shown within 2s
 - Playwright: provider quota dashboard shows fleet-level capacity (Invariant 20)
+- Playwright: compaction indicator on worker card when context > 70% (Invariant 31)
 
 ### Phase 5: Verification (est. 2 weeks)
 
@@ -1707,6 +1910,10 @@ The user flow acceptance tests built here become the regression suite:
 - Integration: verification fails, issue returns to doing with rejection reason
 - Integration: `DurableEvent::VerificationStarted` and `VerificationFailed`/`IssueVerified`
   emitted with full evidence chain (Invariant 24)
+- Integration: issue detail API returns all correlated views: activity, messages, worker
+  output, tool calls, transitions, gate evaluations, verification evidence (Invariant 30)
+- Integration: clicking a gate evaluation traces to the tool call, turn, and worker
+  output that produced the evidence (Invariant 30)
 
 **Playwright golden scenarios (the acceptance criteria)**:
 
@@ -1853,6 +2060,19 @@ Performance measurement:
 **Test plan**:
 - Integration: correlation IDs present in all log entries for a traced operation
 - Integration: dashboard "why is this stuck?" query returns full trace
+- Integration: `GET /api/search?q=...` returns hits across issues, messages, events,
+  logs, workers, schedules, email, CRM (Invariant 32)
+- Integration: search result provenance -- every `SearchHit` carries entity_type,
+  scope, issue_id, worker_id, timestamp (Invariant 32)
+- Integration: FTS5 search works completely offline (Invariant 32)
+- Integration: exact/filter lookup -> SQLite index -> FTS5 -> optional semantic
+  reranking stack (Invariant 32)
+- Integration: structured events vs logs -- same issue, both views present, correlated
+  by turn_id (Invariant 30)
+- Playwright: universal search bar -- type query, results span all entity types with
+  provenance chips (Invariant 32)
+- Playwright: search result click navigates to entity detail with context (Invariant 32)
+- Performance: FTS5 search over 10k entities returns < 50ms (Invariant 32)
 - Performance: all latency targets met under load (40 workers, 100 board items)
 - Performance: RSS stays flat over 24h soak test
 - Performance: no file descriptor leaks over 24h
@@ -1995,20 +2215,26 @@ Delta sync (Invariant 14) compounds this: after the initial load, the client rec
 only changed items, not the full board. A single card status change pushes ~200 bytes
 instead of 6.2MB.
 
-### L2: tmux target format inconsistency
+### L2: Backend specificity consistency
 
-The `=` prefix for exact session matching works for session-level commands
-(`has-session`, `kill-session`) but silently fails for pane-level commands
-(`capture-pane`, `send-keys`, `pipe-pane`) -- they need `=name:` with a trailing
-colon. This caused a fleet-wide outage: every capture and send-keys across 62 sessions
-was silently failing. The test only verified `has-session` and `kill-session`.
+Different terminal backends have different command protocols and resolution rules. For
+tmux, the `=` prefix works differently for session vs. pane operations. For herdr,
+agent addressing has its own semantics. This caused backend-specific outages where
+tests passed for one backend but failed silently for another.
 
-**Rust fix**: the `SessionBackend` trait encapsulates all tmux interaction. The target
-format is derived once, tested once, used everywhere. No raw `subprocess::Command`
-construction outside the backend module. The test harness exercises every tmux verb the
-backend uses, not just the ones that motivated the fix.
+**Rust fix**: the `SessionBackend` trait encapsulates all backend-specific interaction.
+Target/agent resolution is derived once, tested once, used everywhere. No raw
+`subprocess::Command` construction outside the backend module. The test harness
+exercises every command the backend uses, not just the ones that motivated the fix.
 
 ```rust
+impl HerdrBackend {
+    fn agent_ref(&self, worker: &str) -> String {
+        format!("amux-{}", worker)  // herdr agent reference
+    }
+    // Every herdr operation goes through this -- no raw agent name construction elsewhere
+}
+
 impl TmuxBackend {
     fn target(&self, worker: &str) -> String {
         format!("=amux-{}:", worker)  // exact + pane resolution
