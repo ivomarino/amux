@@ -24,6 +24,7 @@ pub mod groups;
 pub mod health;
 pub mod history;
 pub mod journal;
+pub mod layout_presets;
 pub mod map;
 pub mod memories;
 pub mod metrics;
@@ -32,6 +33,7 @@ pub mod org;
 pub mod prefs;
 pub mod py_proxy;
 pub mod schedules;
+pub mod session_verbs;
 pub mod sessions_legacy;
 pub mod settings;
 pub mod skills;
@@ -92,15 +94,20 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/cal-events", calendar::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
         .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
+        // Per-name session verbs — NATIVE (AMUX-2598): peek/send/config/
+        // start/stop/resize/duplicate/clone/steer/share/… answer from the
+        // fleet substrate (env files + tmux + shared DB), api/session_verbs.rs.
+        // Was PROXIED_FAMILIES' SessionVerbs row; the rust-worker 501 pointer
+        // guard moved into the module's dispatch.
+        .merge(session_verbs::routes())
         // Identity is config-introspection over server.env + ~/.claude.json
         // this server already reads — NATIVE, not a fleet capability
         // (AMUX-2597 addendum: the SPA's _initIdentity boot call 404'd here).
         .route("/api/identity", axum::routing::get(identity))
         // EVERY python-proxied mount below derives from py_proxy's
         // PROXIED_FAMILIES table (AMUX-2597: the rust/python boundary is a
-        // registry, not scattered mounts). Session verbs ride this merge;
-        // remaining Module rows carry their declared in-module hops.
-        // Enumerable at GET /api/debug/boundary; matrix:
+        // registry, not scattered mounts). Enumerable at
+        // GET /api/debug/boundary; matrix:
         // docs/rust-migration/server-boundary.md.
         .merge(py_proxy::family_routes())
         .nest("/api/browser", browser::routes())
@@ -131,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/groups", groups::routes())
         .nest("/api/tags", groups::tags_routes())
         .nest("/api/journal", journal::routes())
+        .nest("/api/layout-presets", layout_presets::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/slash-commands", skills::slash_routes())

@@ -22,9 +22,8 @@
 //! `/api/browser/{driver verbs}` (native, api/browser.rs — AMUX-2598: CDP
 //! websocket client against the server-machine Chrome; /agent = honest 501).
 //!
-//! Rust-managed workers (wrk_ ids) do NOT proxy — their verbs live under
-//! /api/workers; a legacy-path call against one gets a pointer, not a
-//! silent Python 404.
+//! Rust-managed workers (wrk_ ids) never proxied — that guard moved to
+//! api/session_verbs.rs with the session-verb cutover (same 501 pointer).
 //!
 //! Transport notes, load-bearing:
 //! - The Python server is `BaseHTTPRequestHandler`-based: it reads request
@@ -40,7 +39,7 @@
 //!   debugging session can tell which server actually answered (ethos rule 4).
 
 use super::AppState;
-use axum::extract::{Path, Request, State};
+use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -65,9 +64,6 @@ pub enum ProxyMount {
     /// Whole-namespace passthroughs at these prefixes, derived by
     /// [`family_routes`] — nothing else may mount a namespace proxy.
     Namespace(&'static [&'static str]),
-    /// The two per-name session-verb routes, derived by [`family_routes`]
-    /// (they carry the rust-worker guard, so they are not a plain nest).
-    SessionVerbs,
     /// The proxy hop is interleaved with NATIVE routes inside the named
     /// module's router (a namespace mount would shadow the native half).
     /// Declared here so the boundary stays enumerable; the module's router
@@ -89,15 +85,6 @@ pub struct ProxiedFamily {
 /// Everything that still proxies, in one place. Runtime view:
 /// `GET /api/debug/boundary`. Doc: docs/rust-migration/server-boundary.md.
 pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[
-    ProxiedFamily {
-        family: "/api/sessions/{name} + /api/sessions/{name}/{verb}",
-        why: "python-fleet session lifecycle: peek/send/start/stop/config/YOLO rewrite \
-              env files and restart live tmux/herdr sessions — the exact choreography \
-              cutover retires; reimplementing it per-verb would duplicate it",
-        exit: "AgentRuntime seam (#47/#48): rust owns session lifecycle end-to-end; \
-               verbs answer from the worker runtime instead of the python fleet",
-        mount: ProxyMount::SessionVerbs,
-    },
     ProxiedFamily {
         family: "/api/scope",
         why: "environment/capabilities per worker/group/global — reads CC_TAGS, \
@@ -121,7 +108,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
     ("/api/workers", "modern worker API (+dead-letters)"),
-    ("/api/sessions", "python-SHAPE session list (rust-derived); per-name verbs are the proxied family"),
+    ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
     ("/api/memories", "memories CRUD"),
     ("/api/messages", "inter-worker messages"),
@@ -148,6 +135,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/groups", "group list + per-group config (api/groups.rs)"),
     ("/api/tags", "legacy spelling of the group list (api/groups.rs)"),
     ("/api/journal", "journal"),
+    ("/api/layout-presets", "tab layout presets save/load/delete (api/layout_presets.rs)"),
     ("/api/skills", "skills list"),
     ("/api/slash-commands", "slash commands"),
     ("/api/map", "map + geocoding"),
@@ -175,11 +163,6 @@ pub fn family_routes() -> Router<AppState> {
                     r = r.nest(p, passthrough_routes());
                 }
             }
-            ProxyMount::SessionVerbs => {
-                r = r
-                    .route("/api/sessions/{name}", any(proxy_session_verb))
-                    .route("/api/sessions/{name}/{*verb}", any(proxy_session_verb));
-            }
             ProxyMount::Module(_) => {}
         }
     }
@@ -193,7 +176,6 @@ pub fn family_routes() -> Router<AppState> {
 pub async fn boundary() -> axum::Json<serde_json::Value> {
     let mount_str = |m: &ProxyMount| match m {
         ProxyMount::Namespace(p) => format!("namespace nest at {}", p.join(", ")),
-        ProxyMount::SessionVerbs => "session-verb routes (rust-worker guard, then forward)".into(),
         ProxyMount::Module(m) => format!("inside {m}::routes(), interleaved with native routes"),
     };
     axum::Json(json!({
@@ -352,43 +334,6 @@ pub fn passthrough_routes() -> Router<AppState> {
         .route("/{*rest}", any(forward_handler))
         .layer(axum::extract::DefaultBodyLimit::disable())
 }
-
-pub async fn proxy_session_verb(
-    State(state): State<AppState>,
-    Path(params): Path<Vec<(String, String)>>,
-    req: Request,
-) -> Response {
-    let name = params
-        .iter()
-        .find(|(k, _)| k == "name")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-
-    // Rust-managed worker? Its verbs are the modern API's.
-    let is_rust_worker = {
-        match state.store.read() {
-            Ok(conn) => crate::db::queries::get_worker(&conn, &name)
-                .ok()
-                .flatten()
-                .is_some(),
-            Err(_) => false,
-        }
-    };
-    if is_rust_worker {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": "rust-managed worker — use /api/workers",
-                "worker": name,
-                "hint": format!("/api/workers/{name}"),
-            })),
-        )
-            .into_response();
-    }
-
-    forward_to_python(req).await
-}
-
 // ---------------------------------------------------------------------------
 // Tests — a local fake "Python" listener; no live servers touched.
 // ---------------------------------------------------------------------------
