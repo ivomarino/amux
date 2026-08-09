@@ -14,12 +14,15 @@ pub mod crm;
 pub mod email;
 pub mod files;
 pub mod health;
+pub mod history;
+pub mod journal;
 pub mod memories;
 pub mod metrics;
 pub mod messages;
 pub mod prefs;
 pub mod schedules;
 pub mod sessions_legacy;
+pub mod settings;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -69,6 +72,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
         .nest("/api/browser", browser::routes())
         .nest("/api/files", files::routes())
+        .nest("/api/journal", journal::routes())
+        .nest("/api/history", history::routes())
+        .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
