@@ -106,7 +106,11 @@ fn python_fleet_sessions() -> Vec<serde_json::Value> {
         };
         let env = crate::config::parse_env_file(&path);
         let is_running = running.contains(&format!("amux-{name}"));
-        let archived = blocked.contains(&name);
+        // CC_ARCHIVED=1 is Python's session-archive marker (amux-server.py
+        // :20346) — blocked-sessions.txt is QUARANTINE, a different thing;
+        // conflating them reported 0 archived against a fleet with dozens.
+        let archived = env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false)
+            || blocked.contains(&name);
         out.push(json!({
             "archived": archived,
             "name": name,
