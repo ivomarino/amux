@@ -236,6 +236,9 @@ enum WorkerEvent {
     TurnCompleted(TurnResult),
     RateLimited(RateLimit),
     ContextLow(u8),
+    BudgetWarning { model: ModelId, utilization: f32 },
+    BudgetPaused { model: ModelId, spent: f64, limit: BudgetLimit },
+    BudgetRaised { model: ModelId, old_limit: BudgetLimit, new_limit: BudgetLimit },
     Failed(Failure),
     Exited(ExitStatus),
 }
@@ -538,6 +541,12 @@ fn process_event(worker: &mut Worker, event: WorkerEvent) {
             provider: rl.provider,
         },
         WorkerEvent::ContextLow(pct) => worker.context_pct = Some(pct),
+        WorkerEvent::BudgetPaused { model, .. } => {
+            worker.state = WorkerState::Waiting(WaitReason::BudgetExhausted { model });
+        }
+        WorkerEvent::BudgetRaised { .. } => {
+            worker.state = WorkerState::Idle { since: now() };
+        }
         WorkerEvent::Failed(_) => worker.state = WorkerState::Error,
         WorkerEvent::Exited(_) => worker.state = WorkerState::Stopped,
         _ => {}
@@ -782,7 +791,7 @@ Elevated from lessons learned to architectural law:
 ### Invariant 16: Token budgets are a runtime primitive
 
 Not just a context-assembler concern. Budgets govern context assembly, turn execution,
-and task-level cost tracking.
+task-level cost tracking, and **per-worker model spend limits**.
 
 ```rust
 struct TokenBudget {
@@ -807,6 +816,63 @@ Context assembly is deterministic priority order:
 Never dump entire task graphs, logs, memories, or prior transcripts. Summarize/cache
 once, reference by ID/hash, hydrate on demand. **Tokens consumed per verified task**
 is a core metric on the dashboard.
+
+#### Per-worker model budgets
+
+Every worker can have spend limits scoped by model. This is the local enforcement
+layer; for providers that support session-level budgets natively (Managed Agents
+`budget_reached` event), amux sets the provider-side budget AND tracks locally.
+For providers without native budget support (Ollama, Codex CLI), amux enforces
+via its own token accounting.
+
+```rust
+struct WorkerModelBudget {
+    model: ModelId,
+    window: BudgetWindow,
+    limit: BudgetLimit,
+    spent: f64,
+    state: BudgetState,
+}
+
+enum BudgetWindow {
+    Rolling { hours: u32 },   // e.g., 4h rolling
+    Daily,                    // resets at UTC midnight
+    Weekly,
+    Monthly,
+    Total,                    // lifetime, no reset
+}
+
+enum BudgetLimit {
+    Tokens(u64),
+    Cost { currency: String, amount: f64 },
+}
+
+enum BudgetState {
+    Active,
+    Warning { utilization: f32 },   // e.g., 80% threshold
+    Paused { reached_at: DateTime<Utc> },
+    Raised { old_limit: BudgetLimit, new_limit: BudgetLimit },
+}
+```
+
+Scoped via Invariant 2 (Org/Global/Group/Worker). A group-level budget applies
+to all workers in that group unless overridden per worker.
+
+**Provider integration:**
+
+- **Managed Agents** (Claude API): `start_session` passes `max_tokens` or
+  `max_cost`. On `budget_reached` event, worker pauses. User can raise the
+  budget via dashboard or CLI, which calls `update_session` to resume.
+- **Subscription providers** (Claude Code, Gemini CLI): amux tracks via
+  `SelfAccounting` (Invariant 24). Pause is local — amux stops sending
+  commands when the budget is hit.
+- **Local providers** (Ollama): tokens are effectively free but tracked.
+  Budget defaults to `None` (unlimited). Can be set to catch runaway loops.
+
+**Dashboard:** per-worker spend is visible in the worker detail panel and the
+fleet-wide cost view. Budget warnings surface as `WorkerEvent::BudgetWarning`.
+Budget exhaustion surfaces as `WorkerEvent::BudgetPaused` and blocks the
+worker's command queue until raised.
 
 ### Invariant 17: Structural @worker addressing
 
@@ -1016,12 +1082,15 @@ Codex has 63% remaining.
 trait ProviderAdapter: Send + Sync {
     async fn start_session(&self, spec: ProviderSessionSpec) -> Result<ProcessRef>;
     async fn usage(&self) -> Result<ProviderUsage>;
+    async fn set_budget(&self, budget: BudgetLimit) -> Result<()>;
+    async fn raise_budget(&self, new_limit: BudgetLimit) -> Result<()>;
     fn models(&self) -> &[ModelDescriptor];
     fn capabilities(&self) -> ProviderCapabilities;
 }
 
 struct ProviderCapabilities {
     usage_reporting: UsageReporting,
+    session_budgets: bool,             // provider supports native budget enforcement
     hot_model_switch: bool,
     context_window_reporting: bool,
     rate_limit_reset_reporting: bool,
@@ -1033,10 +1102,24 @@ enum UsageReporting {
     Partial,                       // headers or rate-limit only
     None,                          // no usage data (Ollama)
 }
+
+struct ProviderSessionSpec {
+    worker_id: WorkerId,
+    model: Option<ModelId>,
+    budget: Option<BudgetLimit>,   // passed to provider if session_budgets=true
+    environment: ScopedEnv,
+    cwd: PathBuf,
+}
 ```
 
 Prevents amux from expecting the same observability from Ollama, Claude Code
 OAuth, an Anthropic API key, Gemini, and Codex.
+
+When `session_budgets` is true (Managed Agents), `start_session` passes the
+budget to the provider. The provider emits `budget_reached` which the adapter
+translates to `WorkerEvent::BudgetPaused`. When `session_budgets` is false,
+amux enforces locally via `SelfAccounting` — the adapter's `set_budget` /
+`raise_budget` are no-ops and amux pauses the worker's command queue directly.
 
 #### Fleet-level quota state
 
@@ -1162,6 +1245,7 @@ struct WorkerConfig {
     environment: ScopedEnv,
     permissions: Permissions,
     isolation: IsolationPolicy,  // default: Shared
+    model_budgets: Vec<WorkerModelBudget>,  // per-model spend limits (Invariant 16)
     // Changing any field is valid. Some changes require session restart.
     // Everything above the SessionBackend/AgentProtocol traits is unchanged.
 }
@@ -6618,7 +6702,7 @@ consistent with their dependencies.
   Status: IMPLEMENTED
   Evidence: INTERACTIVE_SELECTOR in crawler.ts covers all 16 element/role patterns. missingSemanticIds CI-failure list. Self-test fixture (self-test.html) validates detection. Commit ece692f.
 
-- [ ] RR-0028c — UX discovery: seed state fixtures
+- [x] RR-0028c — UX discovery: seed state fixtures
   Phase: 0
   Depends on: RR-0028a
   Invariant: 46
@@ -6630,7 +6714,8 @@ consistent with their dependencies.
     active/locked. Run discovery from each relevant seed.
   Tests: seed states create expected conditions, discovery reaches seed-specific controls
   Verify: Implementation, Unit tests
-  Status: TODO
+  Status: IMPLEMENTED
+  Evidence: 6 fixture HTML files + seed-states.spec.ts (245 lines, 14 tests). Fixtures: empty-installation, populated-installation, migrated-dataset, worker-states (7 WorkerState + high-context + unread), task-lifecycle (all 11 TaskStatus), offline-sync (mutation queue + conflict resolution), provider-backend-states (provider/herdr unavailable, schedule enable/disable, browser profile active/locked). Commit 98d71ea.
 
 - [x] RR-0028d — UX discovery: crawler self-test
   Phase: 0
@@ -6992,6 +7077,27 @@ consistent with their dependencies.
     provider when policy forbids failover.
   Tests: routing simulation with exhausted providers, policy enforcement
   Verify: Implementation, Unit tests, Integration tests
+  Status: TODO
+
+- [ ] RR-0044a — Per-worker model budgets
+  Phase: 4
+  Depends on: RR-0003, RR-0043, RR-0044
+  Invariant: 16, 24
+  Requirement: Every worker can have spend limits scoped by model via
+    `WorkerConfig.model_budgets`. Budget enforcement is two-tier:
+    1. **Native** (Managed Agents): `ProviderSessionSpec.budget` passed to
+       `start_session`. Provider emits `budget_reached` -> adapter translates
+       to `WorkerEvent::BudgetPaused`. `raise_budget` resumes the session.
+    2. **Local** (all other providers): amux's `SelfAccounting` token counting
+       enforces. Worker command queue pauses when budget hit.
+    Budgets scoped via Invariant 2 (Global/Group/Worker). Group-level budget
+    applies to all members unless overridden. Dashboard shows per-worker spend
+    by model with warning/paused states. CLI: `amux worker budget <worker>
+    --model <model> --limit <amount> --window <daily|weekly|rolling:4h>`.
+    `amux worker budget <worker> --raise <new-limit>` resumes a paused worker.
+  Tests: budget enforcement (native + local), pause/resume lifecycle,
+    group-level inheritance, dashboard spend visibility, CLI budget management
+  Verify: Implementation, Unit tests, Integration tests, Browser verification
   Status: TODO
 
 - [ ] RR-0045 — @worker mention parsing + delivery
