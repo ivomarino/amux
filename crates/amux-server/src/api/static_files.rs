@@ -1,43 +1,92 @@
-//! Embedded dashboard serving (RR-0021). Files come from amux-dashboard's
-//! `static/` at compile time — the binary is the whole deploy artifact.
+//! Embedded dashboard serving (RR-0021 + Phase 8 bootstrap injection).
+//!
+//! Files come from amux-dashboard's `static/` at compile time. index.html
+//! gets its AMUX-BOOTSTRAP block substituted at serve time — the same
+//! values the Python server injects (amux-server.py:65679), same trust
+//! model: the dashboard shell + auth token are served unauthenticated on
+//! the LAN, exactly as the Python server does today. Cloud deployments put
+//! a gateway in front of both. Parity, not a new decision.
 
+use super::AppState;
 use amux_dashboard::DashboardAssets;
+use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use sha2::Digest;
 
-pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(|| async { serve("index.html") }))
+        .route("/", axum::routing::get(index))
         .route("/{*path}", axum::routing::get(serve_path))
 }
 
-async fn serve_path(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    serve(path)
+async fn index(State(state): State<AppState>) -> Response {
+    serve_index(&state)
 }
 
-fn serve(path: &str) -> Response {
+async fn serve_path(State(state): State<AppState>, uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
     match DashboardAssets::get(path) {
         Some(content) => {
             let mime = mime_for(path);
-            (
-                [(header::CONTENT_TYPE, mime)],
-                content.data.into_owned(),
-            )
-                .into_response()
+            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
         }
         // SPA fallback: unknown paths get the shell so client routing works
         // offline-first; API 404s are handled by the API router before this.
-        None => match DashboardAssets::get("index.html") {
-            Some(index) => (
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                index.data.into_owned(),
-            )
-                .into_response(),
-            None => (StatusCode::NOT_FOUND, "not found").into_response(),
-        },
+        None => serve_index(&state),
     }
+}
+
+fn serve_index(state: &AppState) -> Response {
+    let Some(index) = DashboardAssets::get("index.html") else {
+        return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
+    };
+    let html = String::from_utf8_lossy(&index.data).into_owned();
+    let injected = inject_bootstrap(&html, state);
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        injected,
+    )
+        .into_response()
+}
+
+/// Replace the marked bootstrap block with live values. The UI token is
+/// derived exactly as the Python does (sha256("amux-ui-guard:"+AUTH)[..40],
+/// amux-server.py:801) so a dashboard served by either server produces
+/// headers the OTHER server also accepts during coexistence.
+fn inject_bootstrap(html: &str, state: &AppState) -> String {
+    const BEGIN: &str = "<!-- AMUX-BOOTSTRAP-BEGIN";
+    const END: &str = "<!-- AMUX-BOOTSTRAP-END -->";
+    let (Some(b), Some(e)) = (html.find(BEGIN), html.find(END)) else {
+        return html.to_string(); // no markers: serve untouched, never corrupt
+    };
+    let auth = state.auth_token.clone().unwrap_or_default();
+    let ui_token = if auth.is_empty() {
+        String::new()
+    } else {
+        let mut h = sha2::Sha256::new();
+        h.update(format!("amux-ui-guard:{auth}"));
+        hex::encode(h.finalize())[..40].to_string()
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let jstr = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    let block = format!(
+        "<!-- AMUX-BOOTSTRAP-BEGIN (injected at serve time) -->\n<script>\
+         window._AMUX_S3_ICAL_URL={};window._AMUX_AUTH_TOKEN={};window._AMUX_HOME={};\
+         window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
+         window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};</script>\n",
+        jstr(&std::env::var("AMUX_S3_ICAL_URL").unwrap_or_default()),
+        jstr(&auth),
+        jstr(&home),
+        jstr(&std::env::var("POSTHOG_KEY").unwrap_or_default()),
+        jstr(&std::env::var("POSTHOG_HOST").unwrap_or_else(|_| "https://us.i.posthog.com".into())),
+        jstr(&std::env::var("AMUX_USER_EMAIL").unwrap_or_default()),
+        jstr(&std::env::var("AMUX_USER_ID").unwrap_or_default()),
+        jstr(&ui_token),
+        jstr("sonnet"),
+    );
+    format!("{}{}{}", &html[..b], block, &html[e..])
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -51,5 +100,43 @@ fn mime_for(path: &str) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("webmanifest") => "application/manifest+json",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn state(token: Option<&str>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        std::mem::forget(dir);
+        AppState {
+            store,
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: token.map(String::from),
+        }
+    }
+
+    #[test]
+    fn bootstrap_injects_auth_and_derived_ui_token() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let out = inject_bootstrap(html, &state(Some("tok123")));
+        assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
+        // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
+        let mut h = sha2::Sha256::new();
+        h.update("amux-ui-guard:tok123");
+        let expect = &hex::encode(h.finalize())[..40];
+        assert!(out.contains(expect), "{out}");
+        assert!(!out.contains("old"), "placeholder block replaced");
+    }
+
+    #[test]
+    fn missing_markers_serve_untouched() {
+        let html = "<head>no markers</head>";
+        assert_eq!(inject_bootstrap(html, &state(None)), html);
     }
 }
