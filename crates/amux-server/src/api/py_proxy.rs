@@ -5,16 +5,22 @@
 //! be a clear separation between the two servers"). Every family that still
 //! proxies is declared ONCE in [`PROXIED_FAMILIES`] — path, why Python owns
 //! it, and the exit condition that retires the proxy — and the axum mounts
-//! derive from that table ([`family_routes`], called from mod.rs). The two
-//! module-internal proxy hops (browser driver verbs, dictation engine) are
-//! declared in the same table with their mount site named, so nothing
-//! proxies without a row here. Runtime view: `GET /api/debug/boundary`
+//! derive from that table ([`family_routes`], called from mod.rs). A
+//! module-internal proxy hop (`ProxyMount::Module`) must also be declared in
+//! the same table with its mount site named, so nothing proxies without a
+//! row here (no such row remains). Runtime view: `GET /api/debug/boundary`
 //! (ethos rule 4 — the separation must be enumerable where people look).
 //! Full ownership matrix: docs/rust-migration/server-boundary.md.
 //!
 //! What no longer rides this: `/api/fs` (native, api/fs.rs), `/api/groups` +
 //! `/api/tags` (native, api/groups.rs), `/api/upload` + `/api/uploads`
-//! (native, api/upload.rs).
+//! (native, api/upload.rs), `/api/file` (+ raw/vtt/prepare/transcode) +
+//! `/api/library` (native, api/file_viewer.rs — AMUX-2598: durable media
+//! jobs in `_amux_media_jobs` replaced python's in-process `_MEDIA_PREP_JOBS`),
+//! `POST /api/dictate` + `/api/dictation/config` (native, api/dictation.rs —
+//! AMUX-2598: the whisper worker + Gemini fallback run in THIS process),
+//! `/api/browser/{driver verbs}` (native, api/browser.rs — AMUX-2598: CDP
+//! websocket client against the server-machine Chrome; /agent = honest 501).
 //!
 //! Rust-managed workers (wrk_ ids) do NOT proxy — their verbs live under
 //! /api/workers; a legacy-path call against one gets a pointer, not a
@@ -93,32 +99,12 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[
         mount: ProxyMount::SessionVerbs,
     },
     ProxiedFamily {
-        family: "/api/file (+ /raw /prepare /transcode) + /api/library",
-        why: "the file VIEWER + media pipeline: range/keepalive streaming, ffmpeg \
-              transcode + prepare jobs whose state lives in python process memory \
-              (_MEDIA_PREP_JOBS), ebook→HTML conversion, image inline caps. The \
-              payload shape is entangled with those engines",
-        exit: "viewer payload + raw range streaming ported once media-prep job state \
-               is durable; then this row splits like /api/fs did",
-        mount: ProxyMount::Namespace(&["/api/file", "/api/library"]),
-    },
-    ProxiedFamily {
-        family: "/api/browser/{driver verbs}",
-        why: "the playwright/model-driven browser engine runs in the python process on \
-              the machine whose browser it drives; native verbs (start/status/stop/\
-              profiles) already answer in rust",
-        exit: "browser driver ported or extracted; the module's forward_handler \
-               routes are then deleted with this row",
-        mount: ProxyMount::Module("api::browser"),
-    },
-    ProxiedFamily {
-        family: "POST /api/dictate + /api/dictation/config",
-        why: "the transcription engines (whisper local, Gemini fallback) load in the \
-              python process; /config must describe the engine /api/dictate actually \
-              uses, so both proxy together",
-        exit: "transcription engine ported/extracted; dictation history/dict CRUD is \
-               already native",
-        mount: ProxyMount::Module("api::dictation"),
+        family: "/api/scope",
+        why: "environment/capabilities per worker/group/global — reads CC_TAGS, \
+              session list, and the scope_caps table python owns",
+        exit: "nativize: read scope_caps from sqlite + CC_TAGS env, write via the \
+               same table; retire when the capabilities UI works against rust",
+        mount: ProxyMount::Namespace(&["/api/scope"]),
     },
 ];
 
@@ -150,8 +136,10 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/branding", "white-label branding + assets"),
     ("/api/email", "email send/read (gmail api)"),
     ("/api/cal-events", "calendar events CRUD"),
-    ("/api/browser", "browser start/status/stop/profiles (driver verbs are the proxied family)"),
+    ("/api/browser", "full browser family: launch/profiles + CDP driver verbs (screenshot/state/action/inspect/navigate/search) against the server-machine Chrome; /agent answers 501 — the session's model drives the native verbs (api/browser.rs, AMUX-2598)"),
     ("/api/files", "modern files API (raw-body upload, rooted)"),
+    ("/api/file", "file VIEWER: payload + raw range streaming + vtt + prepare/transcode with durable media jobs (api/file_viewer.rs)"),
+    ("/api/library", "ebook library index — calibre metadata.db / opf scan (api/file_viewer.rs)"),
     ("/api/fs", "SPA Files surface — native port of the python contract (api/fs.rs)"),
     ("/api/ls", "SPA Files browser listing (api/fs.rs)"),
     ("/api/autocomplete", "dir autocomplete (api/fs.rs)"),
@@ -166,8 +154,8 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/history", "command history"),
     ("/api/settings", "settings"),
     ("/api/push", "web push"),
-    ("/api/dictation", "dictation history/dict CRUD (engine config is the proxied family)"),
-    ("/api/dictate", "transcription entry point — MOUNTED native, body proxies to the python engine (api/dictation.rs)"),
+    ("/api/dictation", "dictation history/dict CRUD + engine config (native whisper/gemini, api/dictation.rs)"),
+    ("/api/dictate", "transcription — native whisper worker + gemini fallback (api/dictation.rs)"),
     ("/api/torrents", "torrents"),
     ("/api/org", "org chart"),
     ("/api/gmail", "gmail oauth"),
@@ -352,8 +340,12 @@ pub async fn forward_handler(req: Request) -> Response {
 /// probe into reporting an unauthenticated 200 on /api/fs.
 ///
 /// Body limit disabled: the Python origin imposes no body caps on these
-/// families (e.g. PUT /api/file content), and axum's 2MB default would 413
-/// requests the Python origin accepts.
+/// families, and axum's 2MB default would 413 requests the Python origin
+/// accepts. (The /api/file + /api/library family — long this mount's main
+/// tenant — went native in AMUX-2598; the machinery serves whatever
+/// `Namespace` rows remain in the registry, and the tests below pin its
+/// transport semantics against a SYNTHETIC prefix so they survive rows
+/// coming and going.)
 pub fn passthrough_routes() -> Router<AppState> {
     Router::new()
         .route("/", any(forward_handler))
@@ -407,7 +399,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Test override for the Python base URL (same pattern as dictation's
-    /// ENV_KEY_OVERRIDE: process-env reads are not hermetic).
+    /// GEMINI_KEY_OVERRIDE: process-env reads are not hermetic).
     pub(crate) static PY_BASE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
     /// Serializes tests that set the override (async-aware).
     pub(crate) static PY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -476,16 +468,19 @@ pub(crate) mod tests {
     }
 
     /// Transport semantics of the namespace passthrough, exercised through
-    /// [`family_routes`] (the mount the live composition uses) against the
-    /// registry's /api/file family: verbatim path+query via OriginalUri,
-    /// byte-for-byte body, header survival, and the answered-by stamp.
+    /// [`passthrough_routes`] nested at a SYNTHETIC prefix (no live
+    /// `Namespace` row exists post-AMUX-2598, and pinning the machinery to a
+    /// registry row would break every time a family cuts over): verbatim
+    /// path+query via OriginalUri, byte-for-byte body, header survival, and
+    /// the answered-by stamp.
     #[tokio::test]
     async fn namespace_passthrough_forwards_verbatim_and_stamps_answered_by() {
         let _guard = PY_LOCK.lock().await;
         let (base, log) = fake_python(StatusCode::OK, r#"{"ok": true}"#).await;
         *PY_BASE_OVERRIDE.lock().unwrap() = Some(base);
 
-        let app: Router = family_routes().with_state(state());
+        let app: Router =
+            Router::new().nest("/api/py-ns-test", passthrough_routes()).with_state(state());
         // Multipart-shaped body with a boundary in the content-type: the
         // header must survive the hop byte-for-byte or Python cannot parse
         // the form at all.
@@ -495,7 +490,7 @@ pub(crate) mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("PUT")
-                    .uri("/api/file?x=1")
+                    .uri("/api/py-ns-test?x=1")
                     .header("content-type", "multipart/form-data; boundary=XX")
                     .header("x-amux-session", "updict-test")
                     .header("authorization", "Bearer tok-abc")
@@ -516,7 +511,7 @@ pub(crate) mod tests {
         assert_eq!(seen.method, "PUT");
         // OriginalUri: the nested router must NOT strip the prefix off the
         // forwarded path — Python routes on the full path.
-        assert_eq!(seen.path_and_query, "/api/file?x=1");
+        assert_eq!(seen.path_and_query, "/api/py-ns-test?x=1");
         assert_eq!(seen.body, body, "body forwarded byte-for-byte");
         let h = |k: &str| {
             seen.headers
@@ -539,12 +534,13 @@ pub(crate) mod tests {
         drop(l);
         *PY_BASE_OVERRIDE.lock().unwrap() = Some(dead);
 
-        let app: Router = family_routes().with_state(state());
+        let app: Router =
+            Router::new().nest("/api/py-ns-test", passthrough_routes()).with_state(state());
         use tower::ServiceExt;
         let res = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/api/file/raw?path=/tmp/x.mp4")
+                    .uri("/api/py-ns-test/raw?path=/tmp/x.mp4")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -554,7 +550,7 @@ pub(crate) mod tests {
         let out = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["error"], json!("python server unreachable for proxied path"));
-        assert_eq!(v["path"], json!("/api/file/raw?path=/tmp/x.mp4"));
+        assert_eq!(v["path"], json!("/api/py-ns-test/raw?path=/tmp/x.mp4"));
         *PY_BASE_OVERRIDE.lock().unwrap() = None;
     }
 }

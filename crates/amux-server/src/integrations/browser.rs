@@ -453,8 +453,8 @@ pub async fn stop(home: &Path) -> StopReport {
     }
 }
 
-/// CDP over plain HTTP: the tab list. (The WS endpoints are out of scope
-/// until the websocket dep decision — see api/browser.rs screenshot.)
+/// CDP over plain HTTP: the tab list. (Command traffic — screenshot, eval,
+/// input — is the WebSocket client below, [`CdpClient`].)
 pub async fn cdp_list(port: u16) -> anyhow::Result<serde_json::Value> {
     let r = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/json/list"))
@@ -501,6 +501,768 @@ fn serde_urlencoded_url(url: &str) -> String {
         }
     }
     out
+}
+
+// ---- CDP WebSocket client (AMUX-2598 cutover) -----------------------------
+//
+// The driver verbs (/navigate /screenshot /state /action /inspect /search)
+// used to proxy to the Python server's browser engine; they now speak the
+// DevTools protocol directly to the Chrome THIS process launched via
+// [`start`]: JSON-RPC over the page target's local ws:// endpoint. One
+// connection per API call — the protocol is stateless at our grain — and the
+// only cross-call state lives either in this process (the session→tab map)
+// or in the PAGE itself as an injected shim (console/network capture,
+// element index list), exactly like the Python implementation
+// (`_BROWSER_CAPTURE_JS` / `window.__amux`), so a dropped connection loses
+// nothing a re-run cannot rebuild.
+
+use futures::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+
+/// A WebSocket connection to one CDP target.
+pub struct CdpClient {
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    next_id: u64,
+}
+
+impl CdpClient {
+    /// HARD INVARIANT (owner directive, AMUX-2598): browser automation
+    /// executes on the SERVER machine, never in a dashboard-viewing client's
+    /// browser. This client therefore connects exclusively to LOOPBACK CDP
+    /// endpoints — the Chrome this process spawned advertises exactly those —
+    /// and refuses anything else, so no code path can quietly grow a remote
+    /// browser dependency.
+    pub async fn connect(ws_url: &str) -> anyhow::Result<Self> {
+        let host_ok = ws_url
+            .strip_prefix("ws://")
+            .and_then(|rest| rest.split('/').next())
+            .map(|hp| {
+                let host = hp.rsplit_once(':').map(|(h, _)| h).unwrap_or(hp);
+                matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+            })
+            .unwrap_or(false);
+        if !host_ok {
+            anyhow::bail!(
+                "refusing non-loopback CDP endpoint {ws_url}: browser automation runs only \
+                 against the server-machine Chrome this process launched"
+            );
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("CDP websocket connect {ws_url}: {e}"))?;
+        Ok(Self { ws, next_id: 0 })
+    }
+
+    /// One CDP command. Chrome interleaves EVENT messages on the same
+    /// socket; anything without our id is skipped, and the deadline caps the
+    /// whole exchange so a wedged page degrades to an error, not a hung
+    /// handler. A CDP-level error surfaces with its message — never as an
+    /// empty success.
+    pub async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let payload = json!({ "id": id, "method": method, "params": params }).to_string();
+        let fut = async {
+            use tokio_tungstenite::tungstenite::Message;
+            self.ws.send(Message::Text(payload)).await?;
+            loop {
+                let Some(frame) = self.ws.next().await else {
+                    anyhow::bail!("CDP websocket closed during {method}");
+                };
+                match frame? {
+                    Message::Text(t) => {
+                        let v: Value = serde_json::from_str(&t).map_err(|e| {
+                            anyhow::anyhow!("CDP sent non-JSON during {method}: {e}")
+                        })?;
+                        if v.get("id").and_then(Value::as_u64) == Some(id) {
+                            if let Some(err) = v.get("error") {
+                                anyhow::bail!(
+                                    "CDP {method}: {}",
+                                    err.get("message").and_then(Value::as_str).unwrap_or("error")
+                                );
+                            }
+                            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                        }
+                        // No id match: a protocol event — not ours, keep reading.
+                    }
+                    Message::Close(_) => anyhow::bail!("CDP websocket closed during {method}"),
+                    _ => {} // Ping/Pong/Binary: tungstenite answers pings itself.
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("CDP {method} timed out after {}s", timeout.as_secs()),
+        }
+    }
+
+    /// Runtime.evaluate with by-value results. A page exception is an ERROR
+    /// carrying the page's own description, never a silent null — an eval
+    /// that cannot fail reads as "the page had no answer" (ethos rule 7).
+    pub async fn eval(&mut self, expr: &str, timeout_s: u64) -> anyhow::Result<Value> {
+        let r = self
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
+                std::time::Duration::from_secs(timeout_s),
+            )
+            .await?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            let desc = ex
+                .pointer("/exception/description")
+                .and_then(Value::as_str)
+                .or_else(|| ex.get("text").and_then(Value::as_str))
+                .unwrap_or("page threw");
+            anyhow::bail!("eval: {desc}");
+        }
+        Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
+    }
+}
+
+// ---- driver session → tab resolution --------------------------------------
+
+/// Which CDP page tab each amux browser-session name operates on, inside the
+/// one Chrome this server launched. AC-293's resolution order (explicit →
+/// X-Amux-Session → "amux") happens in the API layer; this map is keyed by
+/// the RESOLVED name. Two sessions never silently share a tab: an unbound
+/// session binds only to a tab no OTHER session claims (the AC-293 incident
+/// was two lanes driving one browser and diagnosing each other's pages).
+pub static NATIVE_TARGETS: LazyLock<Mutex<std::collections::HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Why a driver verb cannot run. `NotRunning` is the caller's fixable state
+/// (the API answers 409 + a pointer at /start); `Cdp` is the browser
+/// misbehaving (502).
+#[derive(Debug)]
+pub enum DriverError {
+    NotRunning,
+    Cdp(anyhow::Error),
+}
+
+impl From<anyhow::Error> for DriverError {
+    fn from(e: anyhow::Error) -> Self {
+        DriverError::Cdp(e)
+    }
+}
+
+/// The resolved page a driver verb runs against.
+pub struct DriverPage {
+    pub cdp_port: u16,
+    pub target_id: String,
+    pub ws_url: String,
+    pub url: String,
+    pub title: String,
+}
+
+/// Resolve the page for a session: its bound tab if still alive, else the
+/// first live page tab no other session claims (bound as a side effect),
+/// else a fresh tab on `create_url` (default about:blank). The port comes
+/// from [`RUNNING`] only — verbs NEVER attach to a browser this process did
+/// not launch (a human's Chrome is not ours to drive).
+pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<DriverPage, DriverError> {
+    let port = {
+        let guard = RUNNING.lock().expect("browser registry poisoned");
+        match guard.as_ref() {
+            Some(r) => r.cdp_port,
+            None => return Err(DriverError::NotRunning),
+        }
+    };
+    let tabs_v = cdp_list(port).await.map_err(DriverError::Cdp)?;
+    let empty = vec![];
+    let tabs = tabs_v.as_array().unwrap_or(&empty);
+    let page_of = |t: &Value| -> Option<DriverPage> {
+        Some(DriverPage {
+            cdp_port: port,
+            target_id: t.get("id")?.as_str()?.to_string(),
+            ws_url: t.get("webSocketDebuggerUrl")?.as_str()?.to_string(),
+            url: t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+            title: t.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+        })
+    };
+    let tab_id = |t: &Value| t.get("id").and_then(Value::as_str).map(str::to_string);
+
+    let (bound, claimed_by_others): (Option<String>, std::collections::HashSet<String>) = {
+        let map = NATIVE_TARGETS.lock().expect("native targets poisoned");
+        (
+            map.get(session).cloned(),
+            map.iter().filter(|(k, _)| k.as_str() != session).map(|(_, v)| v.clone()).collect(),
+        )
+    };
+    if let Some(tid) = bound {
+        if let Some(p) = tabs
+            .iter()
+            .find(|t| tab_id(t).as_deref() == Some(tid.as_str()))
+            .and_then(page_of)
+        {
+            return Ok(p);
+        }
+        // The bound tab died (closed/crashed): fall through and rebind.
+    }
+    if let Some(p) = tabs
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .filter(|t| tab_id(t).is_some_and(|id| !claimed_by_others.contains(&id)))
+        .find_map(page_of)
+    {
+        NATIVE_TARGETS
+            .lock()
+            .expect("native targets poisoned")
+            .insert(session.to_string(), p.target_id.clone());
+        return Ok(p);
+    }
+    // Every page tab is claimed by another session (or none exist): open a
+    // fresh one rather than hijacking a peer's tab.
+    let t = cdp_new_tab(port, create_url.unwrap_or("about:blank")).await.map_err(DriverError::Cdp)?;
+    let p = page_of(&t).ok_or_else(|| {
+        DriverError::Cdp(anyhow::anyhow!("CDP /json/new returned no webSocketDebuggerUrl: {t}"))
+    })?;
+    NATIVE_TARGETS
+        .lock()
+        .expect("native targets poisoned")
+        .insert(session.to_string(), p.target_id.clone());
+    Ok(p)
+}
+
+/// Session bindings for GET /api/browser/sessions: (name, target, alive?).
+pub async fn session_bindings() -> Vec<(String, String, bool)> {
+    let port = {
+        let guard = RUNNING.lock().expect("browser registry poisoned");
+        guard.as_ref().map(|r| r.cdp_port)
+    };
+    let live: std::collections::HashSet<String> = match port {
+        Some(p) => match cdp_list(p).await {
+            Ok(v) => v
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        },
+        None => Default::default(),
+    };
+    let map = NATIVE_TARGETS.lock().expect("native targets poisoned").clone();
+    let mut out: Vec<(String, String, bool)> =
+        map.into_iter().map(|(name, tid)| (name, tid.clone(), live.contains(&tid))).collect();
+    out.sort();
+    out
+}
+
+// ---- observation caps (Python `_obs_cap`, D4: policy lives in env) --------
+
+pub fn obs_eval_cap() -> usize {
+    std::env::var("AMUX_OBS_EVAL_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8000)
+}
+
+pub fn obs_state_cap() -> usize {
+    std::env::var("AMUX_OBS_STATE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(24000)
+}
+
+/// Python `_obs_cap`: truncate AND say so — silent truncation reads as the
+/// page ending there. Char-boundary safe (a byte slice through a multibyte
+/// char panics where Python's slice would not).
+pub fn obs_cap(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(limit).collect();
+    format!(
+        "{cut}\n…[truncated at {limit} chars — page stays live; re-query narrower or reopen via the url pointer]"
+    )
+}
+
+// ---- driver JS blobs (ported from amux-server.py) -------------------------
+
+/// Python `_BROWSER_CAPTURE_JS` verbatim: idempotent page-side capture shim
+/// mirroring console.*, fetch, XHR and window errors into ring buffers on
+/// `window.__amux`. Injected after every native /navigate and on first
+/// /inspect, so capture state survives our stateless per-call connections.
+pub const CAPTURE_JS: &str = r#"
+(function(){
+  if (window.__amux && window.__amux.__installed) return 'already';
+  var CAP = 500;
+  var S = window.__amux = window.__amux || {};
+  S.console = S.console || []; S.net = S.net || []; S.errors = S.errors || [];
+  S.__installed = true;
+  var now = function(){ return Date.now(); };
+  function push(a, x){ a.push(x); if (a.length > CAP) a.shift(); }
+  function fmt(a){
+    try {
+      if (a instanceof Error) return a.stack || (a.name + ': ' + a.message);
+      if (typeof a === 'object' && a !== null) { try { return JSON.stringify(a); } catch(e){ return String(a); } }
+      return String(a);
+    } catch(e){ return '[unserializable]'; }
+  }
+  ['log','info','warn','error','debug'].forEach(function(level){
+    var orig = console[level]; if (!orig) return;
+    console[level] = function(){
+      try { push(S.console, { level: level, text: [].map.call(arguments, fmt).join(' '), ts: now() }); } catch(e){}
+      return orig.apply(console, arguments);
+    };
+  });
+  window.addEventListener('error', function(e){
+    push(S.errors, { text: (e.message || 'error') + (e.filename ? (' @ ' + e.filename + ':' + e.lineno + ':' + e.colno) : ''),
+                     stack: (e.error && e.error.stack) || '', ts: now() });
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    var r = e.reason; push(S.errors, { text: 'unhandledrejection: ' + ((r && r.message) || fmt(r)), stack: (r && r.stack) || '', ts: now() });
+  });
+  if (window.fetch) {
+    var of = window.fetch;
+    window.fetch = function(input, init){
+      var url = (typeof input === 'string') ? input : (input && input.url) || '';
+      var method = (init && init.method) || (input && input.method) || 'GET';
+      var t0 = now();
+      return of.apply(this, arguments).then(function(res){
+        push(S.net, { type:'fetch', method:method, url:url, status:res.status, ok:res.ok, ms: now()-t0, ts: t0 }); return res;
+      }, function(err){
+        push(S.net, { type:'fetch', method:method, url:url, status:0, ok:false, error:String(err), ms: now()-t0, ts: t0 }); throw err;
+      });
+    };
+  }
+  var OX = window.XMLHttpRequest;
+  if (OX) {
+    var NX = function(){
+      var xhr = new OX();
+      var rec = { type:'xhr', method:'GET', url:'', status:0, ok:false, ms:0, ts: now() };
+      var open = xhr.open;
+      xhr.open = function(m, u){ rec.method = m; rec.url = u; return open.apply(xhr, arguments); };
+      var send = xhr.send;
+      xhr.send = function(){ var t0 = now();
+        xhr.addEventListener('loadend', function(){ rec.status = xhr.status; rec.ok = (xhr.status >= 200 && xhr.status < 400); rec.ms = now()-t0; push(S.net, rec); });
+        return send.apply(xhr, arguments); };
+      return xhr;
+    };
+    NX.prototype = OX.prototype; window.XMLHttpRequest = NX;
+  }
+  return 'installed';
+})()
+"#;
+
+/// Python `_BROWSER_INSPECT_JS` verbatim (placeholders `__LIMIT__` /
+/// `__CLEAR__` substituted by [`inspect_js`]): read the capture buffers plus
+/// the Resource Timing back-fill, which lists requests that fired before the
+/// shim was installed.
+const INSPECT_JS: &str = r#"
+(function(){
+  var S = window.__amux || {};
+  var L = __LIMIT__;
+  function tail(a){ a = a || []; return a.slice(Math.max(0, a.length - L)); }
+  var res = [];
+  try {
+    res = performance.getEntriesByType('resource').slice(-L).map(function(e){
+      return { url:e.name, type:e.initiatorType, ms:Math.round(e.duration), size:e.transferSize||0, start:Math.round(e.startTime) };
+    });
+  } catch(e){}
+  var out = { url: location.href, title: document.title, installed: !!S.__installed,
+    console: tail(S.console), network: tail(S.net), errors: tail(S.errors), resources: res,
+    counts: { console:(S.console||[]).length, network:(S.net||[]).length, errors:(S.errors||[]).length, resources:res.length } };
+  if (__CLEAR__) { if (S.console) S.console.length = 0; if (S.net) S.net.length = 0; if (S.errors) S.errors.length = 0; }
+  return out;
+})()
+"#;
+
+pub fn inspect_js(limit: usize, clear: bool) -> String {
+    INSPECT_JS
+        .replace("__LIMIT__", &limit.to_string())
+        .replace("__CLEAR__", if clear { "true" } else { "false" })
+}
+
+/// Structured perception (the Python state surface's `elements`/`viewport`):
+/// enumerate visible interactive elements, keep the live element list on
+/// `window.__amux_els` so click-by-index addresses EXACTLY what /state
+/// showed, and return `{url,title,viewport,text,elements}`. `__TEXT_CAP__`
+/// slices one past the cap so [`obs_cap`] can append its truncation notice
+/// only when text was actually cut.
+const STATE_JS: &str = r#"
+(function(){
+  var SEL = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [onclick], [contenteditable="true"]';
+  var seen = [];
+  document.querySelectorAll(SEL).forEach(function(e){
+    var r = e.getBoundingClientRect();
+    if (!r.width && !r.height) return;
+    var st = getComputedStyle(e);
+    if (st.visibility === 'hidden' || st.display === 'none') return;
+    seen.push(e);
+  });
+  window.__amux_els = seen;
+  var els = seen.slice(0, __EL_LIMIT__).map(function(e, i){
+    var label = e.getAttribute('aria-label') || e.innerText || e.value || e.placeholder || e.name || e.id || '';
+    label = String(label).replace(/\s+/g, ' ').trim().slice(0, 80);
+    return { index: i, tag: (e.tagName || '').toLowerCase(), label: label };
+  });
+  return { url: location.href, title: document.title,
+           viewport: { w: window.innerWidth, h: window.innerHeight },
+           text: ((document.body && document.body.innerText) || '').slice(0, __TEXT_CAP__),
+           elements: els };
+})()
+"#;
+
+/// Elements shown per state call — matches Python `_bu_parse_elements`'s cap.
+pub const STATE_EL_LIMIT: usize = 120;
+
+pub fn state_js() -> String {
+    STATE_JS
+        .replace("__EL_LIMIT__", &STATE_EL_LIMIT.to_string())
+        .replace("__TEXT_CAP__", &(obs_state_cap() + 1).to_string())
+}
+
+/// Python `_bu_click_selector`'s resolve-then-click, verbatim in behavior:
+/// distinguishes no-match from hidden from clicked, because a click that
+/// silently hits nothing is indistinguishable from one that worked.
+fn selector_click_js(selector: &str) -> String {
+    format!(
+        "(function(){{var e=document.querySelector({sel});\
+         if(!e)return 'NOMATCH';\
+         e.scrollIntoView({{block:'center'}});\
+         var r=e.getBoundingClientRect();\
+         if(r.width===0&&r.height===0)return 'NOTVISIBLE';\
+         e.click();\
+         return 'OK|'+(e.tagName||'')+'|'+((e.textContent||'').trim().slice(0,60));}})()",
+        sel = json!(selector)
+    )
+}
+
+/// Click element N of the `window.__amux_els` list /state built — same
+/// discrimination ladder as the selector click, plus STALE (the list
+/// outlived a navigation) and NOELEMENT (index out of range / no list yet).
+fn index_click_js(index: usize) -> String {
+    format!(
+        "(function(){{var els=window.__amux_els||[];var e=els[{index}];\
+         if(!e)return 'NOELEMENT';\
+         if(!e.isConnected)return 'STALE';\
+         e.scrollIntoView({{block:'center'}});\
+         var r=e.getBoundingClientRect();\
+         if(!r.width&&!r.height)return 'NOTVISIBLE';\
+         e.click();\
+         return 'OK|'+(e.tagName||'')+'|'+((e.textContent||e.value||'').trim().slice(0,60));}})()"
+    )
+}
+
+// ---- driver verb mechanics -------------------------------------------------
+
+/// Python `_CDP_KEYS`: key name → (windowsVirtualKeyCode, char text). The
+/// API layer validates against this table so an unsupported key is a 400
+/// naming the supported set, not a CDP failure.
+pub const CDP_KEYS: &[(&str, i64, &str)] = &[
+    ("Enter", 13, "\r"),
+    ("Tab", 9, "\t"),
+    ("Escape", 27, ""),
+    ("Backspace", 8, ""),
+    ("ArrowDown", 40, ""),
+    ("ArrowUp", 38, ""),
+    ("ArrowLeft", 37, ""),
+    ("ArrowRight", 39, ""),
+    ("PageDown", 34, ""),
+    ("PageUp", 33, ""),
+];
+
+/// Python `_live_key`: rawKeyDown → optional char → keyUp.
+pub async fn dispatch_key(c: &mut CdpClient, key: &str) -> anyhow::Result<()> {
+    let (name, vk, text) = CDP_KEYS
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .map(|(k, v, t)| (*k, *v, *t))
+        .ok_or_else(|| anyhow::anyhow!("unsupported key {key:?}"))?;
+    let t = std::time::Duration::from_secs(10);
+    c.call(
+        "Input.dispatchKeyEvent",
+        json!({ "type": "rawKeyDown", "key": name, "code": name,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk }),
+        t,
+    )
+    .await?;
+    if !text.is_empty() {
+        c.call("Input.dispatchKeyEvent", json!({ "type": "char", "text": text, "key": name }), t)
+            .await?;
+    }
+    c.call(
+        "Input.dispatchKeyEvent",
+        json!({ "type": "keyUp", "key": name, "code": name,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk }),
+        t,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Coordinate click: move → press → release, like a pointer would.
+pub async fn click_xy(c: &mut CdpClient, x: f64, y: f64) -> anyhow::Result<()> {
+    let t = std::time::Duration::from_secs(10);
+    c.call(
+        "Input.dispatchMouseEvent",
+        json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none" }),
+        t,
+    )
+    .await?;
+    for ev in ["mousePressed", "mouseReleased"] {
+        c.call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": ev, "x": x, "y": y, "button": "left", "clickCount": 1 }),
+            t,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Interpret the OK|tag|text / NOMATCH / NOTVISIBLE / STALE / NOELEMENT
+/// protocol the click JS speaks. `Ok(json)` may still carry an `error` key —
+/// the API layer maps that to a 400, matching Python's selector-click.
+pub fn click_outcome(raw: &Value, what: &str, hint: &str) -> Value {
+    let out = raw.as_str().unwrap_or("");
+    if out == "NOMATCH" || out == "NOELEMENT" {
+        return json!({ "error": format!("no element matches {what}"), "hint": hint });
+    }
+    if out == "NOTVISIBLE" {
+        return json!({ "error": format!("element for {what} has zero size (hidden or not laid out)") });
+    }
+    if out == "STALE" {
+        return json!({ "error": format!("element list is stale for {what} — the page navigated; re-fetch GET /api/browser/state") });
+    }
+    if let Some(rest) = out.strip_prefix("OK|") {
+        let mut parts = rest.splitn(2, '|');
+        let tag = parts.next().unwrap_or("");
+        let txt = parts.next().unwrap_or("");
+        return json!({ "ok": true, "clicked": { "tag": tag, "text": txt } });
+    }
+    json!({ "error": "click produced no result — the page may have navigated mid-click", "raw": raw })
+}
+
+/// Click by CSS selector (Python `_bu_click_selector`).
+pub async fn click_selector(c: &mut CdpClient, selector: &str) -> anyhow::Result<Value> {
+    let raw = c.eval(&selector_click_js(selector), 20).await?;
+    let mut v = click_outcome(
+        &raw,
+        &format!("selector {selector:?}"),
+        "check the selector against GET /api/browser/state",
+    );
+    if let Some(o) = v.as_object_mut() {
+        o.insert("selector".into(), json!(selector));
+    }
+    Ok(v)
+}
+
+/// Click by /state element index. NOELEMENT (no list yet — e.g. the caller
+/// never fetched /state on this connection's page) re-enumerates once and
+/// retries, so index clicks work on the list /state WOULD show.
+pub async fn click_index(c: &mut CdpClient, index: usize) -> anyhow::Result<Value> {
+    let mut raw = c.eval(&index_click_js(index), 20).await?;
+    if raw.as_str() == Some("NOELEMENT") {
+        let _ = c.eval(&state_js(), 20).await?;
+        raw = c.eval(&index_click_js(index), 20).await?;
+    }
+    let mut v = click_outcome(
+        &raw,
+        &format!("element index {index}"),
+        "indexes come from GET /api/browser/state — re-fetch it",
+    );
+    if let Some(o) = v.as_object_mut() {
+        o.insert("index".into(), json!(index));
+    }
+    Ok(v)
+}
+
+/// Navigate the page and wait (bounded) for `document.readyState` to reach
+/// `complete`; a slow page degrades to "still loading", never a hang. Then
+/// re-inject the capture shim (parity with Python `_bu_open` re-injecting
+/// per navigation) and run the landing check.
+pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result<Value> {
+    c.call("Page.navigate", json!({ "url": url }), std::time::Duration::from_secs(20)).await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ready = String::new();
+    loop {
+        if let Ok(v) = c.eval("document.readyState", 5).await {
+            ready = v.as_str().unwrap_or("").to_string();
+            if ready == "complete" {
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let _ = c.eval(CAPTURE_JS, 10).await;
+    let landed = c
+        .eval("location.href", 10)
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let mut out = json!({ "ok": true, "url": landed, "ready_state": ready });
+    // Landing check (Python `_bu_landing_check`): an open that cannot fail
+    // sends the caller to debug the wrong layer — every later verb would run
+    // against an error page or about:blank, not their page.
+    if landed.starts_with("chrome-error://") {
+        out["nav_failed"] = json!(true);
+        out["landed"] = json!(landed);
+        out["why"] = json!(format!(
+            "Chromium refused to load {url}. For amux's own https://localhost this is the \
+             self-signed certificate — the browser has no exception for it."
+        ));
+        out["hint"] = json!("every subsequent verb runs against the error page, not your page");
+    } else if landed == "about:blank" && !url.is_empty() && url != "about:blank" {
+        out["nav_failed"] = json!(true);
+        out["landed"] = json!(landed);
+        out["why"] = json!(format!("navigation to {url} left the page on about:blank"));
+        out["hint"] = json!("every subsequent verb runs against a blank page, not your page");
+    }
+    Ok(out)
+}
+
+/// Page.captureScreenshot → PNG on disk, same output shape as Python's
+/// driver screenshot (`~/.amux/browser-screenshots/<backend>-<session>.png`,
+/// response carries `path`). Zero decoded bytes is an ERROR — a 0-byte file
+/// reading as success is the lie ethos rule 7 exists for.
+pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
+    let r = c
+        .call(
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+    let b64 = r
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Page.captureScreenshot returned no data"))?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| anyhow::anyhow!("screenshot base64 decode: {e}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("Page.captureScreenshot returned zero bytes");
+    }
+    let dir = home.join("browser-screenshots");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("native-{}.png", safe_file_component(session)));
+    std::fs::write(&file, &bytes)?;
+    Ok((file, bytes.len()))
+}
+
+/// Session names come from callers; a name is a FILE component here, so
+/// anything path-shaped is flattened (Python interpolates the raw name —
+/// deliberately not ported).
+pub fn safe_file_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    if cleaned.trim_matches(['.', '_']).is_empty() {
+        "amux".into()
+    } else {
+        cleaned
+    }
+}
+
+// ---- profile registry writes (Python `_bu_registry_register` etc.) --------
+
+fn registry_path(home: &Path) -> PathBuf {
+    home.join("playwright-auth").join("profiles.json")
+}
+
+pub fn registry_save(home: &Path, reg: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    let path = registry_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write-then-rename, like Python: a torn write must not eat the registry.
+    let tmp = path.with_file_name("profiles.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&Value::Object(reg.clone()))?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Ensure a profile is registered; add `host` to its domains, set `label`
+/// when given, bump `updated`. Returns the entry (Python
+/// `_bu_registry_register`).
+pub fn registry_register(home: &Path, name: &str, host: &str, label: &str) -> anyhow::Result<Value> {
+    let mut reg = registry_load(home);
+    let mut entry = match reg.get(name) {
+        Some(Value::Object(m)) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    entry.entry("domains").or_insert_with(|| json!([]));
+    entry.entry("label").or_insert_with(|| json!(""));
+    if !host.is_empty() {
+        if let Some(doms) = entry.get_mut("domains").and_then(Value::as_array_mut) {
+            if !doms.iter().any(|d| d.as_str() == Some(host)) {
+                doms.push(json!(host));
+            }
+        }
+    }
+    if !label.is_empty() {
+        entry.insert("label".into(), json!(label));
+    }
+    entry.insert("updated".into(), json!(chrono::Utc::now().timestamp()));
+    let entry_v = Value::Object(entry);
+    reg.insert(name.to_string(), entry_v.clone());
+    registry_save(home, &reg)?;
+    Ok(entry_v)
+}
+
+/// Python's GET /api/browser/pw-profiles listing: profile DIRS under
+/// `playwright-auth/profiles` plus `default` when the bare profile exists.
+pub fn pw_profiles(home: &Path) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(home.join("playwright-auth").join("profiles")) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().is_dir() && !name.starts_with('.') {
+                out.insert(name);
+            }
+        }
+    }
+    if home.join("playwright-auth").join("profile").is_dir() {
+        out.insert("default".into());
+    }
+    out.into_iter().collect()
+}
+
+/// DELETE /api/browser/profile/{name}. DELIBERATE deviation from Python:
+/// Python resolves an unknown name into the REAL Chrome user-data-dir and
+/// `rmtree`s it — deleting a human's actual Chrome profile directory. The
+/// native port refuses anything outside amux-owned dirs, the rule every
+/// other mutation in this module already follows (see module docs).
+pub fn delete_profile(home: &Path, name: &str) -> Result<Value, (u16, Value)> {
+    if name == "default" {
+        return Err((400, json!({ "error": "refusing to delete the default profile" })));
+    }
+    let dir = resolve_profile_dir(home, &chrome_user_data_dir(), name);
+    if !dir.is_dir() {
+        return Err((404, json!({ "error": "no such profile" })));
+    }
+    if !is_amux_owned(home, &dir) {
+        return Err((
+            400,
+            json!({
+                "error": format!(
+                    "profile {name:?} resolves into the real Chrome user-data-dir — refusing to \
+                     delete a human's browser profile (native-only guard; amux-owned profiles \
+                     live under playwright-auth/)"
+                ),
+                "path": dir.display().to_string(),
+            }),
+        ));
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return Err((500, json!({ "error": e.to_string() })));
+    }
+    let mut reg = registry_load(home);
+    if reg.remove(name).is_some() {
+        let _ = registry_save(home, &reg);
+    }
+    Ok(json!({ "ok": true, "deleted": name }))
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -628,6 +1390,165 @@ mod tests {
         assert!(!is_amux_owned(home.path(), Path::new("/tmp/elsewhere")));
     }
 
+    // ---- CDP client + driver mechanics (hermetic — fake WS, temp dirs) ----
+
+    /// The client's one job: match responses by id THROUGH interleaved
+    /// events, and surface CDP errors as errors. A fake Chrome answers every
+    /// call with an event first — a client that read frames positionally
+    /// would return the event as the result.
+    #[tokio::test]
+    async fn cdp_client_skips_events_matches_ids_and_surfaces_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            use tokio_tungstenite::tungstenite::Message;
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    let id = v["id"].as_u64().unwrap();
+                    let method = v["method"].as_str().unwrap_or("");
+                    // Interleaved EVENT before every response.
+                    ws.send(Message::Text(
+                        json!({ "method": "Page.frameNavigated", "params": {} }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    let resp = if method == "Deliberate.fail" {
+                        json!({ "id": id, "error": { "message": "boom" } })
+                    } else {
+                        json!({ "id": id, "result": { "echo": method } })
+                    };
+                    ws.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        let mut c = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let five = std::time::Duration::from_secs(5);
+        let r = c.call("Page.navigate", json!({}), five).await.unwrap();
+        assert_eq!(r["echo"], "Page.navigate");
+        let r = c.call("Runtime.evaluate", json!({}), five).await.unwrap();
+        assert_eq!(r["echo"], "Runtime.evaluate", "second call matches its own id");
+        let err = c.call("Deliberate.fail", json!({}), five).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    /// The server-machine invariant, hermetically: a CDP endpoint that is
+    /// not loopback is refused BEFORE any connection attempt — automation
+    /// can only ever reach the Chrome this server launched.
+    #[tokio::test]
+    async fn cdp_client_refuses_non_loopback_endpoints() {
+        for url in [
+            "ws://192.168.1.50:9222/devtools/page/X",
+            "ws://client.example.com:9222/devtools/page/X",
+            "wss://example.com/devtools/page/X",
+        ] {
+            let err = match CdpClient::connect(url).await {
+                Err(e) => e,
+                Ok(_) => panic!("{url}: non-loopback endpoint must be refused"),
+            };
+            assert!(err.to_string().contains("refusing non-loopback"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn obs_cap_truncates_and_says_so() {
+        assert_eq!(obs_cap("short", 100), "short");
+        let capped = obs_cap(&"x".repeat(50), 10);
+        assert!(capped.starts_with("xxxxxxxxxx\n…[truncated at 10 chars"), "{capped}");
+        // Multibyte safety: a byte-index slice would panic here.
+        let capped = obs_cap(&"é".repeat(50), 10);
+        assert!(capped.contains("truncated at 10"), "{capped}");
+    }
+
+    #[test]
+    fn click_outcome_discriminates() {
+        let ok = click_outcome(&json!("OK|A|More information..."), "selector \"a\"", "h");
+        assert_eq!(ok["ok"], json!(true));
+        assert_eq!(ok["clicked"]["tag"], "A");
+        for (raw, needle) in [
+            ("NOMATCH", "no element matches"),
+            ("NOELEMENT", "no element matches"),
+            ("NOTVISIBLE", "zero size"),
+            ("STALE", "stale"),
+        ] {
+            let v = click_outcome(&json!(raw), "x", "h");
+            assert!(
+                v["error"].as_str().unwrap().contains(needle),
+                "{raw}: {v}"
+            );
+        }
+        // Garbage (page navigated mid-click) is an error, not a silent ok.
+        assert!(click_outcome(&json!(null), "x", "h")["error"].is_string());
+    }
+
+    #[test]
+    fn js_blob_substitution() {
+        let js = inspect_js(300, true);
+        assert!(js.contains("var L = 300;"));
+        assert!(js.contains("if (true) {"));
+        assert!(!js.contains("__LIMIT__") && !js.contains("__CLEAR__"));
+        let js = state_js();
+        assert!(!js.contains("__EL_LIMIT__") && !js.contains("__TEXT_CAP__"));
+        assert!(js.contains("window.__amux_els"));
+        // Selector JSON-encodes through format!: quotes must survive.
+        let js = selector_click_js("a[href=\"x\"]");
+        assert!(js.contains("querySelector(\"a[href=\\\"x\\\"]\")"), "{js}");
+    }
+
+    #[test]
+    fn registry_register_appends_domains_and_survives_reload() {
+        let home = fake_home();
+        let e = registry_register(home.path(), "gh", "github.com", "GH").unwrap();
+        assert_eq!(e["domains"], json!(["github.com"]));
+        assert_eq!(e["label"], "GH");
+        // Second host appends; duplicate host does not; label sticks.
+        registry_register(home.path(), "gh", "gist.github.com", "").unwrap();
+        let e = registry_register(home.path(), "gh", "github.com", "").unwrap();
+        assert_eq!(e["domains"], json!(["github.com", "gist.github.com"]));
+        assert_eq!(e["label"], "GH");
+        assert!(e["updated"].as_i64().unwrap() > 0);
+        // And the listing path (registry_load) sees the same bytes.
+        let reg = registry_load(home.path());
+        assert_eq!(reg["gh"]["domains"], json!(["github.com", "gist.github.com"]));
+    }
+
+    #[test]
+    fn pw_profiles_lists_dirs_plus_default() {
+        let home = fake_home();
+        std::fs::create_dir_all(home.path().join("playwright-auth/profiles/github")).unwrap();
+        std::fs::create_dir_all(home.path().join("playwright-auth/profiles/.hidden")).unwrap();
+        std::fs::create_dir_all(home.path().join("playwright-auth/profile")).unwrap();
+        assert_eq!(pw_profiles(home.path()), vec!["default".to_string(), "github".to_string()]);
+    }
+
+    #[test]
+    fn delete_profile_guards() {
+        let home = fake_home();
+        let dir = home.path().join("playwright-auth/profiles/x");
+        std::fs::create_dir_all(&dir).unwrap();
+        registry_register(home.path(), "x", "x.com", "").unwrap();
+
+        assert_eq!(delete_profile(home.path(), "default").unwrap_err().0, 400);
+        assert_eq!(
+            delete_profile(home.path(), "amux-native-test-nonexistent-9f3a").unwrap_err().0,
+            404
+        );
+        let ok = delete_profile(home.path(), "x").unwrap();
+        assert_eq!(ok["deleted"], "x");
+        assert!(!dir.exists());
+        assert!(registry_load(home.path()).get("x").is_none(), "registry entry pruned");
+    }
+
+    #[test]
+    fn safe_file_component_flattens_path_shapes() {
+        assert_eq!(safe_file_component("amux"), "amux");
+        assert_eq!(safe_file_component("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(safe_file_component(""), "amux");
+        assert_eq!(safe_file_component(".."), "amux");
+    }
+
     /// Live-Chrome smoke test: launches a real Chrome on a THROWAWAY temp
     /// user-data-dir (never a saved profile), checks CDP answers, stops it.
     /// #[ignore]d: `cargo test -- --ignored` runs it only where a human asked.
@@ -644,6 +1565,33 @@ mod tests {
         assert!(info.cdp_port > 0);
         let tabs = cdp_list(info.cdp_port).await.expect("cdp /json/list");
         assert!(tabs.is_array());
+
+        // Server-machine pin (owner directive): the page a driver verb
+        // resolves is served by the LOOPBACK CDP port of the child THIS
+        // process spawned — same port, same registry pid — and a round-trip
+        // eval proves the automation executed there.
+        let page = resolve_page("live-smoke", None).await.map_err(|e| match e {
+            DriverError::NotRunning => anyhow::anyhow!("not running"),
+            DriverError::Cdp(e) => e,
+        }).expect("resolve_page");
+        assert_eq!(page.cdp_port, info.cdp_port, "verb port IS the spawned child's port");
+        assert!(
+            page.ws_url.starts_with(&format!("ws://127.0.0.1:{}/", info.cdp_port))
+                || page.ws_url.starts_with(&format!("ws://localhost:{}/", info.cdp_port)),
+            "loopback CDP only: {}",
+            page.ws_url
+        );
+        {
+            let guard = RUNNING.lock().expect("browser registry poisoned");
+            let child_pid = guard.as_ref().and_then(|r| r.child.id());
+            assert_eq!(child_pid, info.pid, "acting Chrome is the registry's spawned child");
+            assert!(child_pid.is_some());
+        }
+        let mut c = CdpClient::connect(&page.ws_url).await.expect("cdp ws connect");
+        let v = c.eval("1+1", 10).await.expect("eval");
+        assert_eq!(v, json!(2));
+
+        NATIVE_TARGETS.lock().unwrap().remove("live-smoke");
         let report = stop(home.path()).await;
         assert!(report.stopped);
     }

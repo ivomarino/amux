@@ -16,6 +16,7 @@ pub mod browser;
 pub mod calendar;
 pub mod dictation;
 pub mod email;
+pub mod file_viewer;
 pub mod files;
 pub mod fs;
 pub mod gmail_auth;
@@ -97,12 +98,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/identity", axum::routing::get(identity))
         // EVERY python-proxied mount below derives from py_proxy's
         // PROXIED_FAMILIES table (AMUX-2597: the rust/python boundary is a
-        // registry, not scattered mounts). Session verbs, /api/file*,
-        // /api/library ride this merge; browser/dictation carry their
-        // declared in-module hops. Enumerable at GET /api/debug/boundary;
-        // matrix: docs/rust-migration/server-boundary.md.
+        // registry, not scattered mounts). Session verbs ride this merge;
+        // remaining Module rows carry their declared in-module hops.
+        // Enumerable at GET /api/debug/boundary; matrix:
+        // docs/rust-migration/server-boundary.md.
         .merge(py_proxy::family_routes())
         .nest("/api/browser", browser::routes())
+        // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
+        // streaming + vtt + ffmpeg prepare/transcode with durable job state
+        // (api/file_viewer.rs; was PROXIED_FAMILIES' /api/file namespace row).
+        .nest("/api/file", file_viewer::routes())
+        // Ebook library index (calibre metadata.db / opf scan) — top-level
+        // path in python, so top-level here.
+        .route("/api/library", axum::routing::any(file_viewer::library))
         .nest("/api/files", files::routes())
         // /api/fs/* is the SPA's Files contract (multipart upload + dir
         // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
@@ -131,10 +139,11 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         .nest("/api/dictation", dictation::routes())
-        // Python serves transcription at the TOP-LEVEL /api/dictate (the
-        // dictation module owns it; it proxies to the Python engine). Body
-        // limit off: audio runs to 25MB raw / ~33MB base64, and Python's own
-        // 413 must answer, not axum's 2MB default.
+        // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
+        // the dictation module owns it and answers NATIVELY (AMUX-2598:
+        // whisper worker + gemini fallback in this process). Body limit off:
+        // audio runs to 25MB raw / ~33MB base64, and the handler's own 413
+        // must answer, not axum's 2MB default.
         .route(
             "/api/dictate",
             axum::routing::post(dictation::dictate)

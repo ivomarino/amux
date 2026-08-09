@@ -39,6 +39,10 @@ tempfile = "3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
 sha2 = "0.10"
+# sha1 is NOT for security here: /api/file/prepare's media-cache key must be
+# byte-identical to python's hashlib.sha1 derivation (amux-server.py:68158) so
+# already-prepared copies in ~/.amux/media-cache survive the cutover.
+sha1 = "0.10"
 hex = "0.4"
 # Web Push (RR-0094): ES256 VAPID + RFC 8291 aes128gcm. `ecdh` and `pem` are
 # feature additions to the same crate: ecdh for the RFC 8291 key agreement,
@@ -50,6 +54,11 @@ aes-gcm = "0.10"
 base64 = "0.22"
 toml = "0.8"
 futures = "0.3"
+# CDP WebSocket client (browser driver cutover, AMUX-2598): Chrome's DevTools
+# protocol speaks JSON-RPC over a LOCAL ws:// endpoint — no TLS features
+# needed, and screenshot payloads (multi-MB base64 text frames) ride
+# tungstenite's default 64MB message cap.
+tokio-tungstenite = "0.24"
 
 [workspace.package]
 version = "0.1.0"

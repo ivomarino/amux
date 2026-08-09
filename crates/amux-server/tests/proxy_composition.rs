@@ -84,21 +84,9 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
     // -- PROXIED families (from the registry) reach the proxy: honest 502
     //    naming the unreachable python, never the static shell.
     for path in [
-        // browser driver verbs (Module mount inside api::browser)
-        "/api/browser/state?session=x",
-        "/api/browser/pw-profiles",
-        "/api/browser/screenshot",
         // session verbs (SessionVerbs mount, rust-worker guard first)
         "/api/sessions/some-fleet-lane/peek",
         "/api/sessions/some-fleet-lane",
-        // file viewer + media pipeline (Namespace mount)
-        "/api/file?path=/tmp/x.txt",
-        "/api/file/raw?path=/tmp/x.mp4",
-        "/api/file/prepare?path=/tmp/x.mkv",
-        "/api/file/transcode?path=/tmp/x.avi",
-        "/api/library?path=/tmp",
-        // dictation engine config (Module mount inside api::dictation)
-        "/api/dictation/config",
     ] {
         let (status, ct, body, _) = get(&app, path).await;
         assert!(
@@ -149,6 +137,47 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
         assert!(!proxied, "{path} must be NATIVE");
     }
 
+    // -- File viewer family + /api/library: NATIVE post-AMUX-2598 (was the
+    //    registry's last Namespace row). A reappearing proxy stamp — or the
+    //    502 these paths answered pre-cutover — means the boundary regressed.
+    std::fs::write(home.path().join("viewer.txt"), "hello viewer\n").unwrap();
+    let filep = format!("{dirq}%2Fviewer.txt");
+    let (status, _, body, proxied) = get(&app, &format!("/api/file?path={filep}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/file must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["content"], "hello viewer\n", "{body}");
+
+    // Raw streaming honors Range natively (the semantics browsers scrub with).
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/file/raw?path={filep}"))
+                .header("range", "bytes=0-4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(res.headers().get("x-amux-answered-by").is_none(), "/api/file/raw must be NATIVE");
+    assert_eq!(res.headers()["content-range"], "bytes 0-4/13");
+    let raw_body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&raw_body[..], b"hello");
+
+    let (status, _, body, proxied) = get(&app, &format!("/api/library?path={dirq}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/library must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert_eq!(v["is_library"], false, "hermetic home holds no ebooks: {body}");
+
+    // Unknown /api/file subpaths: the module's python-shape 404, no proxy.
+    let (status, ct, body, proxied) = get(&app, "/api/file/definitely-not").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied);
+
     // Unknown paths in native namespaces: python's generic JSON 404 shape.
     for path in ["/api/fs", "/api/fs/definitely-not", "/api/tags/mytag", "/api/groups/x/y"] {
         let (status, ct, body, proxied) = get(&app, path).await;
@@ -176,14 +205,65 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
         assert!(v.get(k).is_some(), "identity payload missing {k}: {body}");
     }
 
+    // -- Browser driver verbs — NATIVE post-AMUX-2598 (were the Module-mount
+    //    proxy row inside api::browser). With no amux-launched Chrome in this
+    //    test process they answer an honest 409 POINTING AT /start — never
+    //    the python proxy's 502, never the SPA shell. The old world answered
+    //    502 here (see the removed loop entries in this file's history), so
+    //    a 502 reappearing IS the regression signal.
+    for path in ["/api/browser/state?session=x", "/api/browser/screenshot"] {
+        let (status, ct, body, proxied) = get(&app, path).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+        assert!(ct.starts_with("application/json"), "{path}: {ct}");
+        assert!(!proxied, "{path} must be NATIVE");
+        let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("/api/browser/start"),
+            "{path}: the 409 must name the fix: {body}"
+        );
+    }
+    let (status, _, body, proxied) = get(&app, "/api/browser/pw-profiles").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!proxied, "/api/browser/pw-profiles must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert!(v["profiles"].is_array(), "{body}");
+
+    // Unknown browser routes answer the ported route catalog natively (the
+    // "guessed /status for /state" incident), not the shell, not a proxy.
+    let (status, ct, body, proxied) = get(&app, "/api/browser/definitely-not").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied);
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().starts_with("browser route not found"),
+        "{body}"
+    );
+    assert!(v["routes"].is_array() && v["actions"].is_array(), "{body}");
+
     // -- The registry endpoint itself.
     let (status, _, body, proxied) = get(&app, "/api/debug/boundary").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!proxied);
     let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
-    assert!(v["proxied"].as_array().unwrap().len() >= 4, "{body}");
+    // No minimum on `proxied`: AMUX-2598 is retiring rows one by one (file
+    // viewer + library went native here), and the registry legitimately
+    // shrinks toward empty — the shape is the contract, not the count.
+    assert!(v["proxied"].is_array(), "{body}");
     assert!(v["native"].as_array().unwrap().len() > 20, "{body}");
     assert_eq!(v["doc"], "docs/rust-migration/server-boundary.md");
+
+    // Dictation engine config — NATIVE (AMUX-2598; was the last dictation
+    // proxy row). Values are environment-dependent (whisper weights / key
+    // presence on the host), so pin the Python field SHAPE, not the values.
+    let (status, ct, body, proxied) = get(&app, "/api/dictation/config").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(ct.starts_with("application/json"), "{ct}");
+    assert!(!proxied, "/api/dictation/config must be NATIVE");
+    let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    for k in ["configured", "source", "model", "local", "local_model", "engine"] {
+        assert!(v.get(k).is_some(), "config payload missing {k}: {body}");
+    }
 
     // Unrouted dictation paths answer the module's NATIVE Python-shape 404
     // (never the static shell's generic one, never a proxy attempt).
@@ -255,8 +335,7 @@ fn every_mounted_api_family_is_claimed_by_the_registry() {
     for p in py_proxy::PROXIED_FAMILIES {
         for (n, _) in py_proxy::NATIVE_FAMILIES {
             assert!(
-                !p.family.starts_with(*n) || p.family.contains("sessions") || p.family.contains("browser")
-                    || p.family.contains("dictat"),
+                !p.family.starts_with(*n) || p.family.contains("sessions") || p.family.contains("browser"),
                 "family {n} is claimed native AND proxied ({})",
                 p.family
             );

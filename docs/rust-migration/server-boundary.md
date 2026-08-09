@@ -24,12 +24,12 @@ Rules:
 | `/api/sessions/{name}`, `/api/sessions/{name}/{verb}` | PYTHON-OWNED (proxied) | fleet lifecycle: peek/send/start/stop/config/YOLO rewrite env files + restart live sessions. Exit: AgentRuntime seam (#47/#48). Rust-managed `wrk_` names get a 501 pointer, never a silent proxy |
 | `/api/fs/*` | RUST-NATIVE (this change) | SPA Files surface: mkdir/open/upload/rename/read/search/list/delete. Ported guards: `_is_path_allowed` py:93-121, `_is_dangerous_write` py:670-698. Pure filesystem, no DB |
 | `/api/ls`, `/api/autocomplete/dir` | RUST-NATIVE (this change) | SPA Files browser listing + dir autocomplete (api/fs.rs). Pure filesystem |
-| `/api/file` (+`/raw` `/prepare` `/transcode`), `/api/library` | PYTHON-OWNED (proxied) | file VIEWER + media pipeline: range/keepalive streaming, ffmpeg prepare/transcode with in-process job state (`_MEDIA_PREP_JOBS`), ebook→HTML, image inline caps. Exit: port viewer + raw streaming once media job state is durable |
+| `/api/file` (+`/raw` `/vtt` `/prepare` `/transcode`), `/api/library` | RUST-NATIVE (AMUX-2598) | file VIEWER + media pipeline (`api/file_viewer.rs`): viewer payload (image inline-vs-stream cap `AMUX_IMG_INLINE_MAX`, pdf/video/audio cards, binary sniff, text/csv char truncation), PUT write-back, SRT→VTT, raw **Range** streaming (206/Content-Range/ETag-304; keep-alive is hyper's default — the semantic python hand-rolled in `_media_keepalive`), ffmpeg prepare/transcode with **durable job state** in shared-DB `_amux_media_jobs` (migration 0009; python's in-process `_MEDIA_PREP_JOBS` orphaned jobs on restart — a stale-heartbeat 'running' row or a 'done' row with a pruned file now restarts honestly). Cache key = python's exact sha1 derivation, so ~/.amux/media-cache survives cutover. ffmpeg/ffprobe found by ABSOLUTE path first (launchd has no shell PATH). **Deviation:** ebook→HTML (EPUB/FB2/CBZ/MOBI/AZW render) answers an honest **501** naming the missing capability (python-stdlib zip/XML/PalmDOC decoding has no rust port); non-renderable/oversize ebooks get python's download card. `/api/library` is fully native (calibre metadata.db read-only+immutable, opf sidecar scan via regex-grade extraction) |
 | `/api/groups`, `/api/tags` | RUST-NATIVE (this change) | group list derived from CC_TAGS env files (trimmed split, blocked sessions excluded, tag-isolation scoping); per-group config in shared-DB `group_config` (schema py:10346). Both spellings, matching python's alias (py:65345) |
 | `/api/upload`, `/api/uploads` | RUST-NATIVE | chunked upload protocol + serving `~/.amux/uploads` (api/upload.rs) |
 | `/api/identity` | RUST-NATIVE | cloud user + auth-config introspection (X-Amux-User-Email, server.env key/proxy presence, ~/.claude.json oauth) — py:73349. `key_valid`/`key_error` answer null/"" (python's pre-validation state): this server runs no key validator and does not invent one |
-| `/api/browser` | SPLIT | start/status/stop/profiles native; driver verbs (screenshot/action/state/agent/…) proxied — the playwright/model engine runs in the python process. Mount: inside `api::browser::routes()` |
-| `/api/dictate`, `/api/dictation/config` | PYTHON-OWNED (proxied) | whisper/Gemini engines load in the python process; `/config` must describe the engine `/api/dictate` uses. Mount: inside `api::dictation::routes()`. History/dict CRUD (`/api/dictation/*`) is native |
+| `/api/browser` | RUST-NATIVE (AMUX-2598) | Full family: launch/status/stop/profiles + driver verbs (navigate/screenshot(+`/screenshot/file` serving the bytes)/state/action/inspect/search/sessions/pw-profiles/save-profile/DELETE profile) over a native CDP **websocket** client (`integrations/browser.rs`) against the Chrome the server spawned. **Invariant (owner directive): browser automation always executes on the server machine; the dashboard is a remote viewer** — the CDP client refuses non-loopback endpoints, and screenshots are served through the API for remote clients (Python returns only a server filesystem `path`; its dashboard bridges via `/api/file/raw` — the native response carries both `path` and `serve`). `/agent` (Python's server-side model loop) answers an honest **501**: the session's own model drives the native verbs instead (ethos D1/D3). Deviation: `DELETE /profile/{name}` refuses dirs outside `playwright-auth/` (Python would rmtree inside the real Chrome user-data-dir) |
+| `/api/dictate`, `/api/dictation/*` | RUST-NATIVE (AMUX-2598) | full dictation family, engine included: warm openai-whisper worker subprocess (same inline worker script as python, `~/.cache/whisper/<AMUX_WHISPER_MODEL>.pt` presence-detected, interpreter found by ABSOLUTE path — launchd has no shell PATH), Gemini `generateContent` fallback + AI-edit (`AMUX_DICTATION_MODEL`, BYO pref `dictation_gemini_key` beats `GOOGLE_API_KEY`), and the deterministic session-name recovery pass with a difflib-exact `SequenceMatcher.ratio` port. `/config` GET is byte-compatible with python's `json.dumps` output. No engine present = python's honest 503 naming what to install |
 | everything else mounted in `api/mod.rs` (memories, messages, schedules, prefs, email, cal-events, branding, skills, map, journal, history, settings, push, torrents, org, gmail, metrics, usage, alerts, stats, debug, health, calendar.ics) | RUST-NATIVE | see `NATIVE_FAMILIES` notes per family |
 
 ## Contract subtleties worth knowing (all fixture- or live-verified 2026-08-09)
@@ -60,6 +60,16 @@ Rules:
 - The worker page's Files-tab search is `/api/fs/search` with the worker's CC_DIR as
   `path` — one engine for both surfaces (AMUX-2420). The workers-LIST search box is
   client-side; it consumes no endpoint.
+- **/api/file/raw Range parsing is python's, not the RFC's**: `bytes=(\d*)-(\d*)`
+  anchored at start, absent groups default to 0/EOF — so a suffix range
+  (`bytes=-500`) or an unparsable Range answers 206 over the whole file, exactly as
+  python does. One unavoidable divergence: start-past-end produces
+  `Content-Length: 0` natively where python emits a negative Content-Length (hyper
+  cannot express that); only malformed clients ever see it.
+- **A 'done' media-prep job whose cached file was pruned restarts instead of
+  answering ready** — durable rows outlive the files they point at, which python's
+  in-memory dict never had to consider. Same for 'running' rows whose heartbeat
+  (`updated_at`, ticked on every ffmpeg progress line) goes >60s stale.
 
 ## Verification
 
@@ -70,6 +80,15 @@ Rules:
   against :8822 and the native router; 2026-08-09 run: **29 paths agreed, 0 diffs**
   (fs list/read/search, ls, autocomplete, groups both spellings, all 14 live group
   configs, 3 scoped callers), `/health build` bracket held.
+- File-viewer live oracle: `tests/file_viewer_live_oracle.rs` (`--ignored`,
+  GET-only) diffs /api/file (9 payload kinds + 5 error shapes), /api/file/raw
+  (full + bounded range on a text fixture, 3 range shapes on a real media file
+  under ~/Dev with exact 206 header comparison), /api/file/vtt and /api/library
+  (opf fixture, empty dir, 2 error shapes); 2026-08-09 run: **24 request pairs
+  agreed, 0 diffs**, `/health build` bracket held. prepare/transcode are
+  excluded on purpose (they spawn ffmpeg work on the live server — not
+  read-only); their behavior is pinned by hermetic lavfi-fixture tests in
+  `api/file_viewer.rs` instead.
 - Composition: `tests/proxy_composition.rs` pins proxied families to the proxy
   (honest 502 on dead python), native families to no-proxy-stamp, and the registry
   to the mounts.
