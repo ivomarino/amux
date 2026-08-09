@@ -612,3 +612,21 @@ def test_limbo_message_reports_the_TRUE_total_not_the_sampled_cap(rig):
         f"reported a capped count instead of the real population: {msg[:120]}")
     assert "+22 more" in msg, f"the +N more figure is still derived from the sample: {msg[:200]}"
     assert "+12 more" not in msg, "still reporting LIMIT 20 minus 8"
+
+
+def test_engagement_never_prefix_matches_a_sibling_lane(rig):
+    """AC-316 defect 2 — the tmux -t bug's twin. startswith(want) made ANY
+    amux-* lane's message count as engagement by reviewer `amux`: amux-cloud's
+    own message citing their card read as "amux has already responded", the
+    ball was handed to an author whose reviewer had said nothing, and the
+    holder nudge then offered a reviewer-only exit (defect 1's reachability).
+    Decorated origins must still match; sibling lanes must never."""
+    mod, _ = rig
+    _msg(mod, "amux-cloud", "about AC-999 details", 1_700_000_000_050)
+    assert mod._reviewer_msg_engagement("AC-999", "amux") == 0, (
+        "a sibling lane's message counted as the short-named reviewer's "
+        "engagement — the prefix match is back")
+    _msg(mod, "amux (queued while generating)", "AC-999 ack", 1_700_000_000_060)
+    assert mod._reviewer_msg_engagement("AC-999", "amux") == 1_700_000_000_060, (
+        "a decorated origin of the RIGHT lane stopped matching — the boundary "
+        "cut over-tightened")

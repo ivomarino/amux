@@ -12972,14 +12972,23 @@ def _card_citing_note(bid: str, session: str) -> str:
         wd = _session_work_dir((session or "").strip()) if session else ""
         if not wd or not bid:
             return ""
-        out = subprocess.run(
+        _r = subprocess.run(
             ["git", "-C", wd, "log", "--grep", bid,
              "--format=%(trailers:key=Amux-Session,valueonly)"],
-            capture_output=True, text=True, timeout=8).stdout
+            capture_output=True, text=True, timeout=8)
+        if _r.returncode != 0:
+            return ""          # could-not-run stays SILENT; only ran-and-empty speaks
+        out = _r.stdout
         from collections import Counter
         c = Counter(s.strip() for s in out.splitlines() if s.strip())
         if not c:
-            return ""
+            # RAN AND FOUND NOTHING is a statement; COULD NOT RUN is silence
+            # (amux-cloud's residual on AMUX-2578): the lookup runs in the
+            # acker's working dir, so an empty note had three indistinguishable
+            # causes and read as "nobody committed against this" from the
+            # wrong repo. Naming the repo makes absence trustworthy.
+            return (f"no commits cite {bid} in {os.path.basename(wd) or wd} "
+                    f"(advisory only; an uncited fix is invisible — AC-302)")
         parts = ", ".join(f"{k} ({n})" for k, n in c.most_common())
         return (f"commits citing {bid} carry Amux-Session: {parts} "
                 f"(advisory only — docs commits look identical to fixes, and "
@@ -13050,7 +13059,20 @@ def _reviewer_msg_engagement(card_id: str, reviewer: str) -> int:
             "SELECT origin, text, ts FROM cmd_history WHERE text LIKE ? "
             "ORDER BY ts DESC LIMIT 500", (f"%{card_id}%",)).fetchall()
         for r in rows:
-            if not _norm_actor(r["origin"] or "").startswith(want):
+            # EXACT lane, never a prefix (AC-316 defect 2 — the tmux -t bug's
+            # twin, third prefix-match defect this week): startswith(want) made
+            # every message from ANY amux-* lane count as engagement by the
+            # reviewer `amux`, so amux-cloud's own message citing their card
+            # read as "amux has already responded" and handed the ball to an
+            # author whose reviewer had said nothing.
+            #
+            # The boundary must be cut BEFORE normalizing: _norm_actor flattens
+            # both lane separators AND decorations to '-', so post-norm the two
+            # are indistinguishable ("amux (queued...)" and "amux-cloud" both
+            # begin "amux-"). Observed decorations are bracketed/parenthesized
+            # suffixes — strip those, then demand EXACT equality.
+            _n = _norm_actor(re.sub(r"[\[(].*$", "", r["origin"] or ""))
+            if _n != want:
                 continue
             if pat.search(r["text"] or ""):
                 return int(r["ts"] or 0)
@@ -13746,9 +13768,24 @@ def _advance_open_card(session_name: str) -> bool:
             f"{(row['title'] or '')[:110]}\n\n"
             + (f"\n{_ball_with_author}.\n" if _ball_with_author else "")
             + f"Keep driving it. Do exactly one of:\n"
-            f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
-            f"     Satisfy those honestly and move it, then continue to the next card.\n"
-            f"{_retype_txt}"
+            + (
+                # THE AUTHOR CANNOT PASS A REVIEWER-ONLY GATE (AC-316 defect 1,
+                # the AC-298 blind spot in this second nudge): telling the
+                # holder of a review card to "satisfy the done gate and move
+                # it" offers an exit only the named reviewer can take, while
+                # the closing line forbids the force that is the sole way to
+                # obey. Same predicate as the reviewer edge above, not
+                # re-derived.
+                f"  1. Address the reviewer's feedback on the card, then ask {_rev} to "
+                f"re-ack — '{row['status']}'->'{gate_next}' is {_rev}'s sign-off, not yours; "
+                f"do NOT force it. If their feedback is already addressed, say so on the "
+                f"card and ping them.\n"
+                if (_rev and _reviewer_acts_next(row["status"]) and _rev != session_name)
+                else
+                f"  1. Advance it. The gate for '{gate_next}' is:\n{gate_txt}\n"
+                f"     Satisfy those honestly and move it, then continue to the next card.\n"
+              )
+            + f"{_retype_txt}"
             f"  2. If it is genuinely finished, close it out to {_term} with the evidence.\n"
             f"  3. If it is BLOCKED, say what on — and if the blocker is another card, "
             f"go work that dependency instead of waiting.\n"
@@ -41785,7 +41822,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.526';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.527';   // bump together with the sw.js CACHE version
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
@@ -59210,12 +59247,43 @@ async function pullFromRemote(btn) {
 
   // Auto-launch on first visit after short delay — but not when arriving on a
   // deeplink (#peek=…): the visitor came for a specific session, not a tour.
-  setTimeout(function() {
+  // A POPULATED WORKSPACE IS NOT A FIRST VISIT (AC-295). The only gate here was a
+  // per-BROWSER localStorage flag, so any fresh browser on an established install
+  // got the setup wizard over the top of it. This tour is explicitly "a setup
+  // wizard, not a slideshow" by its own comment — it un-hides tabs and opens the
+  // REAL create flow to bootstrap empty ones — so running it over a workspace that
+  // already has workers offers to set up what is already set up.
+  //
+  // Filed from the cloud prospect demos, where a customer opening the link we send
+  // lands on a 10-step setup wizard for a workspace we provisioned for them. Then
+  // hit the identical modal on the LOCAL dashboard over 47 workers, which is what
+  // showed the trigger is "fresh browser", not "fresh workspace".
+  //
+  // DEFERRED RATHER THAN GUESSED: at a fixed 1500ms `sessions` may simply not have
+  // arrived yet, and treating not-yet-loaded as empty would reintroduce the bug for
+  // anyone on a slow first paint — the same not-loaded-vs-genuinely-absent confusion
+  // that AC-275 fixed in the SSE watchdog. So wait for the first payload (bounded),
+  // and only then decide.
+  var _wtTries = 0;
+  // DECLARATION, not a named function EXPRESSION. `(function _wtMaybeStart(){...});`
+  // parses fine and binds the name ONLY inside its own body, so the setTimeout below
+  // would throw ReferenceError at runtime while `node --check` stayed green — the
+  // exact deleted-function shape ethos rule 7 was written for. Caught by re-reading
+  // the edit, not by any check we run.
+  function _wtMaybeStart() {
     try { if (localStorage.getItem(WT_KEY)) return; } catch(e) {}
     if (location.hash && location.hash.indexOf('=') !== -1) return;
     if (/[?&]view=/.test(location.search)) return;   // rig deeplink, not a first visit
+    // Still waiting on the first payload — retry, up to ~8s, then give up rather
+    // than show a setup wizard we cannot justify.
+    if (typeof _initialLoad !== 'undefined' && _initialLoad) {
+      if (++_wtTries > 26) return;
+      return void setTimeout(_wtMaybeStart, 250);
+    }
+    if (typeof sessions !== 'undefined' && sessions && sessions.length > 0) return;
     _wtShow();
-  }, 1500);
+  }
+  setTimeout(_wtMaybeStart, 1500);
 
   // Reposition on resize/scroll
   // Null-guarded: the capture-phase scroll listener fires for EVERY element's
@@ -63650,7 +63718,7 @@ PWA_MANIFEST = json.dumps({
 
 # Robust service worker: cache-first with localStorage fallback for multi-day offline
 SERVICE_WORKER = r"""
-const CACHE = 'amux-v0.9.526';
+const CACHE = 'amux-v0.9.527';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell

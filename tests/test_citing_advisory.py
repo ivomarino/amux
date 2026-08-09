@@ -59,12 +59,18 @@ def test_counts_by_session_most_common_first(srv, repo):
         "that this text claims no authority")
 
 
-def test_uncited_card_is_silent_not_wrong(srv, repo):
-    """The AC-292 shape: no commit cites the id -> empty string, no note —
-    a fabricated 'nobody worked on this' claim would be an enforcement-flavored
-    lie in the direction AC-302 rejected."""
+def test_uncited_card_says_so_with_the_repo_named(srv, repo):
+    """Revised per amux-cloud's residual on AMUX-2578: absence had three
+    indistinguishable causes because the lookup runs in the ACKER's workdir —
+    silence from the wrong repo read as "nobody committed against this". Now:
+    RAN-and-found-nothing is a statement naming the repo it searched;
+    could-not-run stays silent (next test). The wording still disclaims
+    authority — an uncited fix is invisible, so this cannot be read as proof
+    of no work."""
     srv._session_work_dir = lambda s: repo
-    assert srv._card_citing_note("XX-404", "any") == ""
+    note = srv._card_citing_note("XX-404", "any")
+    assert "no commits cite XX-404" in note, note
+    assert "advisory only" in note
 
 
 def test_errors_yield_absence_never_breakage(srv):
