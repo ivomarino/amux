@@ -12959,6 +12959,35 @@ _ADVANCE_NEXT = {"doing": "review", "review": "done", "done": "verified"}
 _REVIEWER_SIGNOFF_TARGETS = ("done", "verified")
 
 
+def _card_citing_note(bid: str, session: str) -> str:
+    """Advisory for the review->done seat (AC-302 / AMUX-2578): name the
+    sessions whose commits cite this card id, with counts. DECIDES NOTHING —
+    AC-302 tested every enforcing discriminator against its own three
+    specimens and killed each (a docs commit is indistinguishable from an
+    implementation commit; an uncited fix produces no signal at all). A
+    would-be self-acker who sees their own name can decline, which is what
+    amux-cloud did twice by hand; a legitimate reviewer proceeds. Absent on
+    any error — an advisory must never be the reason a transition fails."""
+    try:
+        wd = _session_work_dir((session or "").strip()) if session else ""
+        if not wd or not bid:
+            return ""
+        out = subprocess.run(
+            ["git", "-C", wd, "log", "--grep", bid,
+             "--format=%(trailers:key=Amux-Session,valueonly)"],
+            capture_output=True, text=True, timeout=8).stdout
+        from collections import Counter
+        c = Counter(s.strip() for s in out.splitlines() if s.strip())
+        if not c:
+            return ""
+        parts = ", ".join(f"{k} ({n})" for k, n in c.most_common())
+        return (f"commits citing {bid} carry Amux-Session: {parts} "
+                f"(advisory only — docs commits look identical to fixes, and "
+                f"uncited fixes are invisible; AC-302)")
+    except Exception:
+        return ""
+
+
 def _advance_target(status: str) -> str:
     """The status a card in `status` moves to next, or "" if it is terminal."""
     return _ADVANCE_NEXT.get((status or "").strip().lower(), "")
@@ -69704,12 +69733,14 @@ class CCHandler(BaseHTTPRequestHandler):
                                     else (f"'{new_status}' needs an INDEPENDENT session — anyone but "
                                           f"the author lane '{_author}'; the attempt came from "
                                           f"{_acker or '(no X-Amux-Session)'}")
+                                _cite = _card_citing_note(bid, gate_item.get("session") or "")
                                 return self._json({
                                     "error": "sign-off identity check failed for this transition",
                                     "blocked": True, "reviewer": _rev,
                                     "acker": _acker or "(no X-Amux-Session)",
                                     "transition": f"{prior['status'] if prior else '?'}->{new_status}",
                                     "how": _need + ", or pass force=true (logged) if the human overrides.",
+                                    **({"citing": _cite} if _cite else {}),
                                 }, 409)
                         # The contract advertises force as "logged" in two places and
                         # NOTHING logged it — the one escape hatch from the gate system
@@ -70410,6 +70441,15 @@ class CCHandler(BaseHTTPRequestHandler):
                     if _verify_cleared and isinstance(updated_item, dict):
                         updated_item = dict(updated_item)
                         updated_item["verify_gate_cleared"] = _verify_cleared
+                    # AC-302 advisory rides the review->done SUCCESS too: the
+                    # honest self-ack decline happens BEFORE a block exists,
+                    # which is the entire design (surface, never enforce).
+                    if (new_status == "done" and prior and prior["status"] == "review"
+                            and isinstance(updated_item, dict)):
+                        _cite2 = _card_citing_note(bid, updated_item.get("session") or "")
+                        if _cite2:
+                            updated_item = dict(updated_item)
+                            updated_item["citing"] = _cite2
                     return self._json(updated_item)
 
                 if method == "DELETE":
