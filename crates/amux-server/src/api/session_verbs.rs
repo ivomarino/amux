@@ -5506,6 +5506,44 @@ fn fleet_roster(me: &str) -> String {
     out
 }
 
+
+/// Rewrite EVERY live worker's composed memory, so the fleet roster in each one
+/// reflects the fleet as it is now.
+///
+/// THE ROSTER IS FLEET-WIDE DATA WRITTEN PER-WORKER, and that asymmetry is the
+/// bug this closes. `write_claude_memory` was reachable from exactly one place —
+/// a PATCH to a worker's OWN memory — so worker A getting a description left
+/// workers B..Z holding a roster that predates it. Measured 2026-08-10: all 48
+/// live workers had a description and 0 of 224 MEMORY.md files carried a roster
+/// at all. Capability that reaches nobody is the ethos-1 failure, and a roster
+/// nobody has is indistinguishable from no roster.
+///
+/// Called when a worker's IDENTITY changes (description, groups, name) — rare,
+/// and O(fleet) small file writes when it happens. Deliberately not on a timer:
+/// nothing about the roster decays on its own, so a periodic rewrite would be
+/// churn with no signal behind it.
+pub(crate) fn refresh_fleet_rosters() -> usize {
+    let Ok(entries) = std::fs::read_dir(sessions_dir()) else { return 0 };
+    let mut n = 0usize;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+        if parse_env(name).get("CC_ARCHIVED") == Some("1") {
+            continue;
+        }
+        let wd = session_work_dir(name);
+        if wd.is_empty() {
+            continue; // no project dir means no MEMORY.md to compose into
+        }
+        write_claude_memory(name, &wd);
+        n += 1;
+    }
+    n
+}
+
 fn write_claude_memory(name: &str, work_dir: &str) {
     let pname = project_name(work_dir);
     let session_file = mem_file(name);
@@ -9441,7 +9479,16 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
-        return j200(json!({"ok": true, "message": "description updated"}));
+        // A description is AUTO-DISCOVERY DATA, not a private label: every other
+        // worker's roster names this one. Refresh the fleet so the change is
+        // visible where peers actually read it, rather than only in this
+        // worker's env file where nobody looks.
+        let refreshed = refresh_fleet_rosters();
+        return j200(json!({
+            "ok": true,
+            "message": "description updated",
+            "rosters_refreshed": refreshed,
+        }));
     }
 
     // Toggle pin (py:76673).
