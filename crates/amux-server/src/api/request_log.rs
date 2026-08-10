@@ -1300,9 +1300,10 @@ async fn stats(
     };
     let mut fams: std::collections::BTreeMap<String, FamAcc> = Default::default();
     let mut scanned = 0i64;
+    let mut oldest_ts: Option<f64> = None;
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
-            "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip \
+            "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts \
              FROM _amux_request_log WHERE ts >= ?1 LIMIT ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
@@ -1315,6 +1316,8 @@ async fn stats(
             let worker: Option<String> = r.get(4)?;
             let amux_session: Option<String> = r.get(5)?;
             let client_ip: Option<String> = r.get(6)?;
+            let ts: f64 = r.get(7)?;
+            oldest_ts = Some(oldest_ts.map_or(ts, |prev: f64| prev.min(ts)));
             let f = fams.entry(family).or_insert_with(|| FamAcc {
                 latencies: Vec::new(),
                 error_count: 0,
@@ -1436,10 +1439,15 @@ async fn stats(
     outliers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     outliers.truncate(OUTLIER_CAP);
 
+    let now = unix_now();
+    let actual_window_h = oldest_ts.map(|ots| (now - ots) / 3600.0);
     Json(json!({
         "since_h": since_h,
+        "actual_window_h": actual_window_h.map(round2),
+        "oldest_row_ts": oldest_ts,
+        "oldest_row_local": oldest_ts.map(local_when),
         "window_start": cutoff, "window_start_local": local_when(cutoff),
-        "generated_at": unix_now(),
+        "generated_at": now,
         "percentile_method": "nearest-rank: value at 1-based rank ceil(q*n) of the window's \
                               sorted per-family latencies (always an observed latency, \
                               never interpolated)",
