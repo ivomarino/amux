@@ -6662,7 +6662,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.551';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.553';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17549,7 +17549,12 @@ async function fetchBoard() {
       fetch(API + '/api/board/session-gates'),
     ]);
     const statusData = await rs.json();
-    try { const sgData = await rsg.json(); if (sgData && typeof sgData === 'object') sessionGates = sgData; } catch(e) {}
+    // r.ok FIRST: a 404 body {"error":"not found"} IS an object, so the typeof
+    // guard below happily assigned it and sessionGates became {error:"not found"} —
+    // not merely empty, POISONED with a bogus scope key, while this endpoint 404'd
+    // 27 times/day after the cutover with nothing shown. Same class as the git-fetch
+    // guard: an HTTP error that parses into plausible data (AF-29/AF-30).
+    try { if (rsg.ok) { const sgData = await rsg.json(); if (sgData && typeof sgData === 'object') sessionGates = sgData; } } catch(e) {}
     consecutiveFailures = 0;
     if (!online) setOnline(true);
     const sj = JSON.stringify(statusData);
@@ -20181,6 +20186,7 @@ function editSessionGate(worker, statusId) {
     });
     try {
       const rsg = await fetch(API + '/api/board/session-gates');
+      if (!rsg.ok) throw new Error('HTTP ' + rsg.status);
       const data = await rsg.json();
       if (data && typeof data === 'object') sessionGates = data;
     } catch(e) {}
