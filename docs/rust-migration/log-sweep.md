@@ -48,6 +48,21 @@ fallback when a finding needs row-level inspection.
    missing route is a finding. Deep-dive fallback:
    `GET /api/logs?since=$SINCE&min_status=400&limit=2000` (raw rows).
 
+   **Known-benign 404s — do not file these.** Some 404s are the product working
+   as designed, and re-investigating them every day is a slow tax on this sweep:
+
+   - `/api/stripe/status` (~3/day, dashboard UA). CLOUD-ONLY feature detection,
+     not dead code. `_loadCloudPlan()` and `loadBillingSection()` in app.js both
+     fetch it and hide their section on `!r.ok`, which is exactly what a
+     self-hosted install should do — the comment above the first call says so.
+     A 404 here means "self-hosted", not "broken".
+
+   Add to this list rather than re-deriving it. AF-32 was filed on this endpoint
+   after checking only that it 404s on both origins — a true fact that supported
+   the wrong conclusion, because the discriminator is not "does any origin serve
+   it" but "does the CLIENT handle the 404 deliberately". Check the call site
+   before filing a 404 whose caller is our own dashboard.
+
 2. **Latency: one call.** `GET /api/logs/stats?since_h=24`
    Per family: count, p50_ms / p95_ms / max_ms (nearest-rank percentiles over
    the window's sorted latencies; the method is named in `percentile_method`),
