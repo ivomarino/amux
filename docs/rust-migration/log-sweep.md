@@ -109,6 +109,13 @@ fallback when a finding needs row-level inspection.
    group by `ip`. Finding = any non-loopback IP with a burst (>20/day), or a
    loopback caller failing auth repeatedly (a broken token on a lane).
 
+   **403 is not only an auth code here.** amux uses it for POLICY refusals too, so
+   a 403 is usually a guard working. All three in the 2026-08-10 window were:
+   `cannot delete pinned session — unpin first`, the same for archive, and a
+   cross-lane `session 'X' may not report for 'Y'` refusing a deliberate probe.
+   Read `error_body` before counting a 403 as an auth failure — the spike shape
+   (one IP, many, fast) is the signal, not the status on its own.
+
 5. **Worker traffic with no board trace.** Collect distinct `worker` values from
    `GET /api/logs?since=$SINCE&limit=2000`, keeping only rows whose `method` is
    POST/PATCH/PUT/DELETE; cross-check
