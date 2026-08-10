@@ -1883,6 +1883,86 @@ EOF
   exec "$server"
 }
 
+
+# ---------------------------------------------------------------------------
+# amux iac — the instance as declarative YAML (AMUX-2679)
+#
+# NOT `amux config`: that is already an alias for `amux defaults`
+# (show|edit|reset), and shadowing a working user-facing verb to save four
+# characters is how a CLI acquires a surprise.
+#
+# The SERVER speaks JSON like every other amux contract; YAML lives here,
+# where the human is. python3 + pyyaml do the conversion, so no endpoint has
+# to be different from all the others just to be configurable.
+# ---------------------------------------------------------------------------
+cmd_config() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    export)
+      curl -sk "${AMUX_API:-https://localhost:8822}/api/config/export" \
+      | python3 -c '
+import sys, json, yaml
+d = json.load(sys.stdin)
+d.pop("note", None)
+sys.stdout.write(yaml.safe_dump(d, sort_keys=False, allow_unicode=True, default_flow_style=False))
+'
+      ;;
+    apply)
+      local f="${1:-}"
+      [[ -n "$f" && -r "$f" ]] || die "usage: amux iac apply <file.yaml>   (reads a file; use - for stdin)"
+      local body
+      body=$(python3 -c '
+import sys, json, yaml
+raw = sys.stdin.read() if sys.argv[1] == "-" else open(sys.argv[1]).read()
+doc = yaml.safe_load(raw) or {}
+if not isinstance(doc, dict):
+    sys.stderr.write("config must be a YAML mapping (got %s)\n" % type(doc).__name__); sys.exit(2)
+print(json.dumps(doc))
+' "$f") || die "could not parse $f as YAML"
+      curl -sk -X PUT -H 'Content-Type: application/json' -d "$body" \
+        "${AMUX_API:-https://localhost:8822}/api/config/apply" \
+      | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception:
+    sys.stderr.write("apply failed: server sent no JSON\n"); sys.exit(1)
+if d.get("error"):
+    sys.stderr.write("apply refused: %s\n" % d["error"]); sys.exit(1)
+print(d.get("summary", "applied"))
+for c in d.get("changed", []): print("  changed   %s" % c)
+for u in d.get("unchanged", []): print("  unchanged %s" % u)
+errs = d.get("errors") or []
+for e in errs: sys.stderr.write("  ERROR %s: %s\n" % (e.get("item"), e.get("error")))
+sys.exit(1 if errs else 0)
+'
+      ;;
+    skin)
+      # What a given worker actually renders with, after the layer merge.
+      local w="${1:-}"
+      curl -sk "${AMUX_API:-https://localhost:8822}/api/skin?worker=${w}" \
+      | python3 -c '
+import sys, json, yaml
+d = json.load(sys.stdin)
+print("# layers applied: %s" % ", ".join(d.get("layers") or ["(none)"]))
+sys.stdout.write(yaml.safe_dump(d.get("skin") or {}, sort_keys=False, allow_unicode=True))
+'
+      ;;
+    *)
+      cat <<'USAGE'
+amux iac — the instance as declarative YAML
+
+  amux iac export             dump skins, columns and worker declarations
+  amux iac apply <file.yaml>  apply it (idempotent; says what changed)
+  amux iac skin [worker]      the RESOLVED skin, and which layers made it
+
+Apply DECLARES workers; it does not start them. `amux workers start <name>`
+is the separate verb, so a mistyped apply cannot spawn a fleet.
+USAGE
+      ;;
+  esac
+}
+
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -2153,6 +2233,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     board|b)          shift; cmd_board "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
+    iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;

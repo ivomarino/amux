@@ -247,6 +247,32 @@ pub async fn apply(
             let gate = c.get("gate").and_then(|g| g.as_array()).map(|_| c["gate"].to_string());
             let id2 = id.to_string();
             let tag = format!("column:{id}");
+            // COMPARE FIRST. Writing unconditionally made a re-apply report
+            // "2 changed" when nothing had, which destroys the one property
+            // this endpoint promises — a config tool that claims to have
+            // changed things it did not is one you cannot trust to tell you
+            // when it DID.
+            let current: Option<(Option<String>, Option<i64>, Option<String>)> = state
+                .store
+                .read()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT label, position, gate FROM statuses WHERE id=?1",
+                        rusqlite::params![id2],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .ok()
+                });
+            if let Some((cur_label, cur_pos, cur_gate)) = &current {
+                let label_ok = label.is_none() || label.as_deref() == cur_label.as_deref();
+                let pos_ok = position.is_none() || position == *cur_pos;
+                let gate_ok = gate.is_none() || gate.as_deref() == cur_gate.as_deref();
+                if label_ok && pos_ok && gate_ok {
+                    unchanged.push(tag);
+                    continue;
+                }
+            }
             let res = state
                 .store
                 .write_async(move |conn| {
