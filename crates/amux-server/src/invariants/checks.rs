@@ -14,7 +14,7 @@
 
 use super::InvariantResult;
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // 1. Route contract: every path a CLIENT calls must be mounted.
@@ -222,6 +222,55 @@ fn match_route_full(mounted: &[(&str, &[&str])], method: &str, path: &str) -> Ro
 /// Values are never emitted — only key names and an agree/differ verdict — so
 /// this is safe to expose on a health endpoint. server.env is the one place
 /// credential VALUES live.
+/// NO TWO LANES MAY SHARE A CLAUDE CONVERSATION (AMUX-1730 / AMUX-2819).
+///
+/// Two sessions pointed at one `cc_conversation_id` both RESUME it, so a message
+/// steered to one surfaces in the other, and work done by one is attributed to
+/// the other. It is not theoretical: on 2026-08-10 a fleet scan found two such
+/// pairs among 101 lanes —
+///     f035d084…  mixpeek-general + mixpeek-frustrations   (BOTH RUNNING)
+///     a2f88163…  ts-gke + ts-troubleshooting
+/// and the only reason anyone noticed is that a pane title rendered the wrong
+/// worker's name. Nothing else reported it.
+///
+/// The WRITE path is already guarded — `conversation_owned_by_other` gates the
+/// single writer of `cc_conversation_id` and both adoption sites — so this
+/// check is not redundant with it: the guard prevents NEW cross-links and is
+/// blind to the ones already on disk, which is the whole reason these two
+/// survived. A guard that cannot see existing damage needs a detector beside
+/// it, not a stronger version of itself.
+///
+/// Pure over (session, conversation) pairs so the real specimen is the test
+/// corpus rather than a fixture.
+pub fn conversations_are_not_shared(pairs: &[(String, String)]) -> Vec<InvariantResult> {
+    const ID: &str = "conversation.one_lane_each";
+    let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (session, conv) in pairs {
+        if conv.trim().is_empty() {
+            continue; // a lane with no conversation yet cannot collide
+        }
+        by.entry(conv.as_str()).or_default().push(session.as_str());
+    }
+    let mut out = Vec::new();
+    for (conv, mut lanes) in by {
+        lanes.sort();
+        let short: String = conv.chars().take(8).collect();
+        if lanes.len() == 1 {
+            out.push(InvariantResult::pass(ID).entity(&short));
+        } else {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    format!("conversation {short} is held by exactly 1 lane"),
+                    format!("held by {}: {}", lanes.len(), lanes.join(", ")),
+                )
+                .entity(&short),
+            );
+        }
+    }
+    out
+}
+
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
     const ID: &str = "config.env_reaches_process";
     let mut out = Vec::new();
@@ -410,6 +459,44 @@ pub struct LaneTruth {
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    /// CORPUS IS THE LIVE FLEET on 2026-08-10, not a fixture: two shared
+    /// conversations among 101 lanes, one of them held by two RUNNING lanes.
+    #[test]
+    fn two_lanes_on_one_conversation_is_a_failure_naming_both() {
+        let pairs: Vec<(String, String)> = vec![
+            ("mixpeek-general".into(), "f035d084-b362-404f-8cd3-d5ae76d17c28".into()),
+            ("mixpeek-frustrations".into(), "f035d084-b362-404f-8cd3-d5ae76d17c28".into()),
+            ("ts-gke".into(), "a2f88163-1111-2222-3333-444444444444".into()),
+            ("ts-troubleshooting".into(), "a2f88163-1111-2222-3333-444444444444".into()),
+            ("amux".into(), "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2".into()),
+        ];
+        let rs = conversations_are_not_shared(&pairs);
+        let fails: Vec<&InvariantResult> = rs.iter().filter(|r| r.status != Status::Pass).collect();
+        assert_eq!(fails.len(), 2, "both shared conversations must fail: {rs:?}");
+        // BOTH lane names must appear in the observed value. "conversation
+        // f035d084 is shared" without them sends the reader to the meta files to
+        // work out who — which is the hand-search that found this originally.
+        let obs: String = fails.iter().map(|f| f.observed.clone()).collect::<Vec<_>>().join(" ");
+        for lane in ["mixpeek-general", "mixpeek-frustrations", "ts-gke", "ts-troubleshooting"] {
+            assert!(obs.contains(lane), "{lane} missing from the failure: {obs}");
+        }
+        // The healthy lane passes — a check that fails for everyone is not a check.
+        assert_eq!(rs.iter().filter(|r| r.status == Status::Pass).count(), 1);
+    }
+
+    /// A lane with no conversation yet cannot collide, and must not be reported
+    /// as sharing the empty string with every other new lane — which is what a
+    /// naive group-by does, turning a fresh fleet into one giant failure.
+    #[test]
+    fn lanes_without_a_conversation_are_not_a_collision() {
+        let pairs: Vec<(String, String)> = vec![
+            ("a".into(), "".into()),
+            ("b".into(), "".into()),
+            ("c".into(), "   ".into()),
+        ];
+        assert!(conversations_are_not_shared(&pairs).is_empty());
+    }
 
     fn mounted() -> Vec<(&'static str, &'static [&'static str])> {
         vec![

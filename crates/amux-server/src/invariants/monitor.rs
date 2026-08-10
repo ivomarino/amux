@@ -34,6 +34,33 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let callers = extract_caller_paths();
     out.extend(checks::route_callers_have_routes(&mounted, &callers));
 
+    // -- 1b. no two lanes share a Claude conversation (AMUX-1730 / AMUX-2819).
+    //
+    // Reads the session meta files, which are the same store the resume path
+    // reads `cc_conversation_id` from — so this cannot disagree with the thing
+    // it describes.
+    {
+        let sessions_dir = crate::config::ServerConfig::from_process_env()
+            .amux_home
+            .join("sessions");
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&sessions_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let Some(fname) = p.file_name().and_then(|f| f.to_str()) else { continue };
+                let Some(name) = fname.strip_suffix(".meta.json") else { continue };
+                let Ok(text) = std::fs::read_to_string(&p) else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+                if let Some(c) = v.get("cc_conversation_id").and_then(|c| c.as_str()) {
+                    if !c.trim().is_empty() {
+                        pairs.push((name.to_string(), c.trim().to_string()));
+                    }
+                }
+            }
+        }
+        out.extend(checks::conversations_are_not_shared(&pairs));
+    }
+
     // -- 2. config provenance: did server.env reach the process?
     //
     // Reads the FILE and compares against the live process env. Deliberately
