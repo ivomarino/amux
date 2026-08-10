@@ -699,6 +699,36 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             .map(|l| l.lines().filter(|x| !x.trim().is_empty()).count())
             .unwrap_or(0);
         obj.insert("log_n".into(), json!(log_n));
+
+        // SHIP THE DERIVED FACTS, NOT THE RAW FIELDS (AMUX-2840).
+        //
+        // The comment above records that an earlier slimming attempt "silently
+        // blanked both in the dashboard", because the SPA reads `desc` and
+        // `log` straight off the LIST payload. It does — but not for their
+        // content. It needs exactly two things from them in a list:
+        //   app.js:19488  the first line of desc, as the card preview
+        //   app.js:18866  whether desc+log contain "New task:", for the folded badge
+        // Both are tiny derivations over fields that together are 81% of a
+        // 4.7MB response. Computing them here costs bytes in the low hundreds
+        // and lets the client stop carrying 3.5MB of prose it never renders.
+        //
+        // Full-text SEARCH is the third consumer and is deliberately NOT served
+        // here: /api/search already indexes these cards and returns ranked hits
+        // with snippets, so shipping every desc to re-implement it client-side
+        // is duplicated work in the expensive direction.
+        let head: String = row
+            .desc
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        obj.insert("desc_head".into(), json!(head));
+        let folded_n = row.desc.matches("New task:").count()
+            + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
+        obj.insert("folded_n".into(), json!(folded_n));
     }
     if stale {
         obj.insert("stale".into(), json!(true));
@@ -2602,5 +2632,70 @@ pub async fn delete_item(
             body["global_rev"] = json!(reply.rev.0);
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod slim_tests {
+    use super::*;
+    use crate::db::board_store::IssueRow;
+
+    /// SLIM MUST CARRY WHAT THE LIST ACTUALLY RENDERS (AMUX-2840).
+    ///
+    /// This is pinned because the same slimming was tried before and reverted:
+    /// `list_body`'s own doc says an earlier first-line-desc + `log_n` version
+    /// "silently blanked both in the dashboard". It blanked them because it
+    /// removed the fields without replacing what the SPA derives FROM them.
+    /// A payload diet that drops a rendered value is a regression wearing a
+    /// performance win, and it fails silently — the card just looks empty.
+    #[test]
+    fn slim_drops_the_prose_but_keeps_the_two_things_the_list_renders() {
+        let row = IssueRow {
+            id: "T-1".into(),
+            title: "a card".into(),
+            desc: "First line is the preview.\nNew task: folded one\nNew task: folded two".into(),
+            log: Some("`10:00` did a thing\n`10:01` New task: folded three".into()),
+            item_type: "code".into(),
+            ..Default::default()
+        };
+
+        let full = list_body(&row, false, false);
+        assert!(full["desc"].is_string(), "the plain list still serves full desc");
+        assert!(full["log"].is_string(), "and full log");
+
+        let slim = list_body(&row, true, false);
+        // The diet itself.
+        assert!(slim["desc"].is_null(), "slim must not ship the prose");
+        assert!(slim["log"].is_null());
+        // ...and the two derivations that make it safe to drop them.
+        assert_eq!(
+            slim["desc_head"], "First line is the preview.",
+            "app.js:19488 renders the first line as the card preview"
+        );
+        assert_eq!(
+            slim["folded_n"], 3,
+            "app.js:18866 counts 'New task:' across desc AND log for the folded badge"
+        );
+        assert_eq!(slim["desc_len"], row.desc.chars().count());
+    }
+
+    /// The preview must be bounded and must not panic on multi-byte text — it
+    /// is built with `chars().take()`, not a byte slice, and an empty desc is
+    /// ordinary rather than an error.
+    #[test]
+    fn the_preview_is_bounded_and_multibyte_safe() {
+        let long = IssueRow { desc: "é".repeat(400), ..Default::default() };
+        let v = list_body(&long, true, false);
+        assert_eq!(v["desc_head"].as_str().unwrap().chars().count(), 120);
+
+        let empty = IssueRow { desc: String::new(), ..Default::default() };
+        let v = list_body(&empty, true, false);
+        assert_eq!(v["desc_head"], "");
+        assert_eq!(v["folded_n"], 0);
+
+        // Leading blank lines are skipped: the preview is the first line with
+        // CONTENT, not the first line.
+        let padded = IssueRow { desc: "\n\n  \nreal content here".into(), ..Default::default() };
+        assert_eq!(list_body(&padded, true, false)["desc_head"], "real content here");
     }
 }
