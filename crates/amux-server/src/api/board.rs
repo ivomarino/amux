@@ -1149,9 +1149,17 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
 
 /// Keys PATCH writes. Everything else lands in `ignored_fields` (reported,
 /// never silently dropped — AC-263).
-const PATCH_WRITABLE: [&str; 17] = [
+const PATCH_WRITABLE: [&str; 18] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
+    // `amux board <status> --trigger` sends source_ref AND last_verified_at
+    // together, but only the first was writable, so the stamp was silently
+    // dropped into ignored_fields (reported by mixpeek-frustrations on MF-534).
+    // That defeats the guard the flag exists for: the staleness view keys on
+    // this field, so a parked card without it sleeps forever with a perfectly
+    // good trigger and nothing ever re-checks it — "parking without it buys
+    // silence with no expiry", which is the flag's own promise inverted.
+    "last_verified_at",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -1401,6 +1409,20 @@ pub async fn patch_item(
                     }
                 }
             };
+            // Nullable epoch seconds. An explicit null CLEARS (re-arming a
+            // trigger for re-verification); absent leaves it alone.
+            if let Some(v) = map.get("last_verified_at") {
+                let next_v = match v {
+                    Value::Null => None,
+                    Value::Number(n) => n.as_i64(),
+                    Value::String(s) => s.trim().parse::<i64>().ok(),
+                    _ => next.last_verified_at,
+                };
+                if next_v != next.last_verified_at {
+                    next.last_verified_at = next_v;
+                    changed.push("last_verified_at".into());
+                }
+            }
             if let Some(d) = desc_effective {
                 if d != next.desc {
                     next.desc = d;

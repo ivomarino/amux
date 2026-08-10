@@ -1213,6 +1213,17 @@ if ok:
     # misread, then routed around a working command with a raw PATCH.
     label = (_argv[2] if len(_argv) > 2 else "") or d.get("status") or d.get("title") or "ok"
     print(d.get("id", "?"), "\u2192", label)
+    # A 200 does not mean the server applied everything you sent. Reported by
+    # mixpeek-frustrations: `board backlog --trigger` stored source_ref but
+    # silently dropped last_verified_at, so the card parked with a good trigger
+    # and NOTHING to expire it — the exact guard --trigger exists to arm. The
+    # success line and the silent skip were indistinguishable.
+    ign = [f for f in (d.get("ignored_fields") or []) if f]
+    if ign:
+        sys.stderr.write(
+            "warning: the server IGNORED %s on this write — the transition "
+            "happened, those field(s) did not.\n" % ", ".join(ign))
+        sys.exit(6)
     sys.exit(0)
 sys.stderr.write(json.dumps(d) + "\n")
 e = err.lower()
