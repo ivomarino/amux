@@ -6766,7 +6766,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.565';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.566';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23644,8 +23644,17 @@ async function loadUsage() {
     if (!d.available) { el.innerHTML = '<span style="color:var(--dim);">' + esc(d.reason || 'Usage unavailable') + '</span>'; return; }
     const limits = (d.limits || []).filter(l => typeof l.percent === 'number');
     if (!limits.length) { el.innerHTML = '<span style="color:var(--dim);">No usage limits reported</span>'; return; }
+    // Anthropic renamed this limit's kind from 'worker' to 'session'. Accept
+    // BOTH: a client that hard-codes today's spelling breaks on the next
+    // rename, and an older server still sends the old one. Two call sites key
+    // on this — the label AND the sort order below, whose comment already said
+    // "session first" while its predicate had stopped matching, so the 5-hour
+    // row silently lost its place as well as its name.
+    const isSession = l => l.kind === 'session' || l.kind === 'worker';
     const label = l => {
-      if (l.kind === 'worker') return '5-hour worker';
+      // "session", not "worker": in amux a worker is a lane, and this limit is
+      // the account's 5-hour window, not any one lane's.
+      if (isSession(l)) return '5-hour session';
       const m = l.scope && l.scope.model && l.scope.model.display_name;
       if (m) return m + ' · weekly';
       if (l.group === 'weekly' || l.kind.indexOf('weekly') === 0) return 'Weekly (all models)';
@@ -23660,7 +23669,7 @@ async function loadUsage() {
       return 'resets ' + (dys >= 1 ? 'in ' + dys + 'd' : (h >= 1 ? 'in ' + h + 'h' : 'in <1h'));
     };
     // session first, then weekly-all, then per-model scoped
-    const order = l => l.kind === 'worker' ? 0 : (l.scope && l.scope.model ? 2 : 1);
+    const order = l => isSession(l) ? 0 : (l.scope && l.scope.model ? 2 : 1);
     limits.sort((a, b) => order(a) - order(b));
     el.innerHTML = limits.map(l => {
       const used = Math.max(0, Math.min(100, Math.round(l.percent)));
