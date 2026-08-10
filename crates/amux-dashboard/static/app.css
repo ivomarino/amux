@@ -550,23 +550,38 @@
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
   }
-  /* The PEEK terminal specifically renders fixed-width terminal output, so it must
-     NOT be re-wrapped. `.overlay-body` is a shared class whose pre-wrap/break-word is
-     right for prose overlays and wrong here: the CLI has already laid its output out
-     in columns at the pane width (220), and re-wrapping at the viewport destroys the
-     alignment that makes a table a table or a diff readable — the exact complaint,
-     with two-thirds of a 2000px view left empty while a diff block wrapped into a
-     ~710px column. `overflow-x:hidden` then made it unrecoverable: there was no way
-     to scroll right to the rest of the line.
-     Scoped to #peek-body rather than changing .overlay-body, because the other
-     overlays that share the class DO want wrapping.
-     touch-action/overscroll mirror #peek-task-label, which already does horizontal
-     panning in this SPA — on a phone a 220-col table is unreadable wrapped anyway,
-     so panning beats re-flowing it into noise. */
-  #peek-body {
-    white-space: pre; word-break: normal; overflow-wrap: normal;
-    overflow-x: auto; touch-action: pan-x pan-y; overscroll-behavior-x: contain;
-  }
+  /* DO NOT give #peek-body `white-space: pre`. It was added once (5c7cd9f) and
+     reverted here on Ethan's "make sure peek mode wraps"; the note is what stops
+     it being re-added a third time, because the reasoning for it reads as sound.
+
+     Peek does not need a global `pre`, because wrapping is already decided PER
+     BLOCK by the render pipeline, and only the pipeline can tell prose from a
+     table:
+       - wrapBoxBlocks() wraps each contiguous run of box-drawing lines in
+         `.peek-box` (white-space:pre; overflow-x:auto; max-width:100%) — so
+         tables, framed boxes and diffs keep monospace alignment and get their
+         OWN horizontal scroller.
+       - _fitRules() replaces full-pane `──── name ──` rules with a width-fitted
+         `.peek-rule`, so a 220-col rule never forces a scroller at all.
+     Everything left over is prose, and prose is what `.overlay-body`'s
+     pre-wrap/break-word is for. A `pre` on the container defeats both: the body
+     itself becomes 4196px wide, `.peek-box { max-width:100% }` resolves against
+     that instead of the viewport, and the targeted scroller stops being targeted.
+
+     The evidence that motivated the `pre` was misread, so re-check the pane
+     before trusting it again. The complaint was "a diff wrapped into a ~710px
+     column with two thirds of a 2000px view empty". That is not wrapping — it is
+     AR-110: a browser peek resizes the worker's tmux window to the VIEWER's width
+     and tmux pins window-size manual, so one narrow peek leaves the pane narrow
+     for every later viewer. The session that filed it was sitting at 94 cols;
+     94ch x 7.49px/char = 704px, i.e. the "~710px column" measured the pane, not
+     the CSS. Widening the box cannot fill a view with content that was never
+     emitted that wide, and `pre` traded away prose wrapping for nothing.
+
+     Measured cost of the `pre` build, #peek-body scrollWidth vs clientWidth on a
+     220-col lane: 4196 vs 1416 at 1440px desktop (2780px unreachable without
+     panning) and 4196 vs 366 at 390px phone — ~9% of each line visible on the
+     platform amux optimises for first. */
   .peek-copy-btn {
     position: absolute; top: 6px; right: 6px; z-index: 10;
     height: 28px; border-radius: 6px; padding: 0 8px;

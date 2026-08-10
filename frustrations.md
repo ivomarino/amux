@@ -1188,3 +1188,84 @@ have playwright.config.ts record the server build hash (GET /health .build) into
 run report so a mid-session flip names "the binary moved" instead of reading as
 flaky tests; separately, someone with git access should bisect the 401->200 auth
 behavior on current crates/amux-server HEAD.
+
+## Peek showed 9% of each line — a `white-space: pre` on #peek-body killed wrapping
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
+CARD: none (agent has no session identity to attribute a card; parent should file — see report)
+SYMPTOM: peek stopped wrapping. Measured on #peek-body against a 220-col lane:
+scrollWidth 4196px vs clientWidth 1416px at 1440px desktop (2780px of every line
+unreachable without horizontal panning), and 4196 vs 366 at 390px phone — about 9%
+of each line visible on the platform amux optimises for first. Long lines were cut
+at the right edge mid-sentence with no wrap and no visible affordance to scroll.
+COST: peek unusable for prose on a phone for the ~1h the build was live; and a
+misdiagnosis shipped with it — the complaint that motivated the change ("a diff
+wrapped into a ~710px column with two thirds of a 2000px view empty") was read as a
+CSS wrapping bug when it was the pane width. The filing session's own lane was at 94
+columns; 94ch x 7.49px = 704px, i.e. the "~710px column" was measuring the tmux pane,
+not the stylesheet. The CSS change could not have fixed it and cost prose wrapping.
+FIX: fixed — removed the #peek-body override so .overlay-body's pre-wrap/break-word
+applies again (python's behaviour, byte-identical). Peek never needed a global `pre`:
+wrapBoxBlocks() already gives each box-drawing run its own `.peek-box`
+(white-space:pre; overflow-x:auto) so tables/diffs keep alignment in their own
+scroller, and _fitRules() replaces full-pane rules with a fitted element. The
+container `pre` defeated both. A comment at the site records the measurement so the
+override is not re-added a third time.
+
+## Opening peek permanently narrows the worker's tmux pane — observing changes the observed
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
+CARD: AR-110
+SYMPTOM: peek POSTs /resize to fit the pane to the viewer, and tmux pins
+`window-size manual`, so the width persists after the viewer leaves. Verified live:
+amux-test-claude was 220x50, one peek at a 390px viewport left it at 50x50 and it
+stayed there. Across the fleet at scan time: mixpeek-autopilot 50 cols, amux 102,
+amux-frustrations 94, amux-rust 94 — all real lanes emitting at a fraction of their
+spawn width (220) for every later reader, because someone once peeked from a phone.
+The floor is Math.max(50, ...) client-side and .clamp(50, 300) server-side, so 50 is
+reachable and sticky.
+COST: one wrong root-cause and a shipped CSS change that had to be reverted (see the
+entry above) — the narrow pane presents exactly as "the renderer is wasting the
+viewport", and nothing in peek shows the pane's column count, so the reader cannot
+tell a narrow pane from a narrow render. Ongoing: any lane left narrow emits
+hard-wrapped output to every future viewer and to its own transcript.
+FIX: AR-110. Two parts worth separating — (1) do not let a transient viewer set a
+persistent property of someone else's worker (restore on peek close, or scope the
+resize to the read rather than the session); (2) surface the pane geometry in peek,
+so "why is this 50 columns wide" is answerable from the instrument instead of from
+`tmux list-sessions`.
+
+## The subagent switcher is wired end-to-end and reaches 0 of 50 sessions
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
+CARD: none (agent has no session identity to attribute a card; parent should file — see report)
+SYMPTOM: #peek-agent-nav (the ⌂/▲/▼ strip), agentNav(), the clickable .peek-agent-row
+rows and the rust `agent-nav` verb are all present and byte-identical to the python
+original — nothing was lost in the SPA extraction. The strip is gated on a VISIBLE
+panel row (`⏺ main`/`◯ main`/`● main`/`○ main`) in the last 8 non-empty pane lines.
+Running that predicate verbatim over every running session: 0 of 50 match, so the
+strip is display:none everywhere, always. 46 of 50 DO show Claude's `← 2 agents`
+status hint, but pressing ← (verified on an idle test session) opens the background
+CONVERSATION manager — "Your conversation moved to the background · 4 awaiting input
+· 0 working · 0 completed" with conversation rows — not a subagent panel with a
+`main` row. Probe validated both ways first: a synthetic panel returns true, prose
+returns false, so the zero is a real absence and not a broken matcher.
+COST: a feature that looks complete in code review, in three layers plus a backend
+verb, and that no user has ever been able to reach. Ethos rule 1 in its exact shape:
+capability that exists but is received by nobody by default.
+FIX: needs a live specimen of the current Claude Code agents panel to re-derive the
+gate against — the `⏺ main` shape it looks for is either gone or only reachable from
+a state nothing in the fleet enters. Do NOT widen the gate to the `← N agents` hint
+without that: the existing comment warns that with rows hidden the nav keys open the
+background-shells manager, and that is exactly what pressing ← did here. Separately,
+what all 46 lanes actually have is background CONVERSATIONS, and amux exposes no
+switcher for those at all — that is the reachable version of the same affordance.
