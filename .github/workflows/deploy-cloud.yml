@@ -16,16 +16,34 @@ name: Deploy to cloud.amux.io
 # back. Whether to take a customer's sessions down is a human's call, not a
 # push's (ethos rule 8).
 
+# NO `push:` TRIGGER. This is manual-dispatch only, and that is deliberate.
+#
+# AMUX-2809 gated the hop-scheme flip so a push could no longer break every
+# workspace. That fixed the damage but not the shape: a push still ran a real
+# deploy that nobody chose. It reinstalls gateway.py from the repo, rebuilds and
+# republishes ghcr.io/mixpeek/amux:latest, and pulls on the host — with the
+# `paths:` list covering crates/**, Cargo.toml, Cargo.lock, cloud/** and this
+# file, so most commits in the repo qualified. Editing a file was indistinguishable
+# from asking to deploy.
+#
+# It cost something concrete on 2026-08-10: a hand-deployed gateway fix that god
+# mode depended on would have been silently reverted by the next unrelated push
+# under cloud/**, and the only reason it was not is that two sessions agreed to
+# stop pushing that path by hand.
+#
+# The comment directly above already contains the argument — "Whether to take a
+# customer's sessions down is a human's call, not a push's (ethos rule 8)" — and
+# it applied to the whole workflow, not only to the recreate. A prod deploy that
+# an uninvolved lane can arm by editing an unrelated file is the same defect one
+# layer up.
+#
+# The cost of manual-only is that ghcr :latest goes stale until someone
+# dispatches. That is the intended trade: a stale image is visible and harmless,
+# an unchosen deploy is neither. Ethan's call, 2026-08-10.
+#
+#   gh workflow run deploy-cloud.yml                    # image + gateway, no recreate
+#   gh workflow run deploy-cloud.yml -f recreate=yes    # ALSO stops every session
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'cloud/**'
-      - '.dockerignore'
-      - '.github/workflows/deploy-cloud.yml'
   workflow_dispatch:
     inputs:
       recreate:
