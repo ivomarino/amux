@@ -133,10 +133,28 @@ echo "Security scan passed."
 # until 2026-08-09; the client is real static files now and the server is Rust.
 
 if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
-  echo "Checking Rust (cargo check --workspace)..."
-  # Same gate CI runs first; incremental, so warm-cache runs are seconds.
-  cargo check --workspace --quiet
-  echo "cargo check passed."
+  echo "Checking Rust (cargo check --workspace --all-targets)..."
+  # --all-targets IS THE POINT, not a flourish (AMUX-2807).
+  #
+  # Plain `cargo check --workspace` does not compile test targets, so a break
+  # that lives in `#[cfg(test)]` code sails through this gate and lands on
+  # whoever runs tests next — which on a shared checkout is every other lane.
+  # That happened TWICE on 2026-08-10 alone: a non-exhaustive match on
+  # `DetectorKind::CiFailure`, and `title_needs_self_description` called from
+  # orchestrator/runtime.rs before it existed in amux-core. Both passed this
+  # hook. Both left `cargo test` red for the whole fleet, one of them for ~30
+  # minutes, while `cargo check` reported green the entire time.
+  #
+  # Note what this does and does not buy: it compiles tests, it does not RUN
+  # them. That is deliberate — running the suite is ~40s and this is every
+  # commit on a machine hosting ~50 lanes. Compile errors are the class that
+  # blocks OTHER PEOPLE; a failing assertion blocks only its author.
+  #
+  # Measured on this machine, warm cache: 3.75s -> 13.75s. Ten seconds a commit
+  # against four fleet-wide blockages in one afternoon. If that trade ever stops
+  # being worth it, drop the flag — but drop it knowing what it was buying.
+  cargo check --workspace --all-targets --quiet
+  echo "cargo check passed (including test targets)."
 fi
 
 JS_STAGED=$(echo "$STAGED" | grep -E '^crates/amux-dashboard/static/.*\.(js|mjs)$' || true)
