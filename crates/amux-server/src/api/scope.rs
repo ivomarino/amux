@@ -37,16 +37,9 @@
 //! capped at 4000 chars — into the shared DB, where the existing audit
 //! consumers already look.
 //!
-//! ONE named deviation: Python pushes a WORKER-level memory write straight
-//! into Claude's project MEMORY.md (`_write_claude_memory`, py:22130) so the
-//! edit survives the next capture-then-compose cycle. That composer (layer
-//! merge + overflow fold + propagate-once archive handover) is the
-//! memory-compose machinery `api/session_verbs.rs` already names as its gap,
-//! and half-porting it is how the GCA-78 archive clobber happened — so the
-//! native write updates the STORE file (the source of truth) and leaves the
-//! push to the composer that owns it. While the Python server runs (the
-//! migration soak) its next compose picks the edit up; the gap closes with
-//! the memory-compose port, not here.
+//! Memory compose: `write_claude_memory` in `api/session_verbs.rs` now
+//! propagates worker memory writes into Claude's project MEMORY.md after
+//! updating the store file.
 
 use super::AppState;
 use axum::extract::{Query, Request, State};

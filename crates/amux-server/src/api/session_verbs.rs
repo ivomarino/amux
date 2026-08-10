@@ -4937,6 +4937,46 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
         .collect()
 }
 
+const MEM_MARKER: &str = "<!-- amux:session-memory -->";
+const MEM_TOPIC_FILE: &str = "amux-api.md";
+
+fn write_claude_memory(name: &str, work_dir: &str) {
+    let pname = project_name(work_dir);
+    let session_file = mem_file(name);
+    let global_file = memory_dir().join("_global.md");
+
+    let global_content = std::fs::read_to_string(&global_file).unwrap_or_default();
+    let session_content = std::fs::read_to_string(&session_file).unwrap_or_default();
+
+    let mut parts = Vec::new();
+    if !global_content.trim().is_empty() {
+        parts.push(format!(
+            "- [amux inter-session API]({MEM_TOPIC_FILE}) — \
+             sessions/peek/send, board, notes, CRM, browser, Drive. Read it when you \
+             need the call shapes; it is also in ~/.claude/CLAUDE.md."
+        ));
+    }
+    parts.push(MEM_MARKER.to_string());
+    if !session_content.trim().is_empty() {
+        parts.push(session_content.trim().to_string());
+    }
+    let composed = parts.join("\n\n") + "\n";
+
+    let claude_mem_dir = claude_home().join("projects").join(&pname).join("memory");
+    let claude_mem_file = claude_mem_dir.join("MEMORY.md");
+
+    if std::fs::create_dir_all(&claude_mem_dir).is_err() {
+        return;
+    }
+    if !global_content.trim().is_empty() {
+        let _ = std::fs::write(
+            claude_mem_dir.join(MEM_TOPIC_FILE),
+            global_content.trim().to_owned() + "\n",
+        );
+    }
+    let _ = std::fs::write(&claude_mem_file, &composed);
+}
+
 fn memory_shared_with(name: &str) -> Vec<String> {
     let wd = session_work_dir(name);
     if wd.is_empty() {
@@ -5712,10 +5752,15 @@ async fn dispatch(
     // OLD name after its env file already moved; admit it so the convergent
     // cascade can finish the remainder (owner addendum, AMUX-2598).
     if !env_path(&name).exists() {
-        let rename_resume = method == Method::PATCH
-            && action == "config"
+        // Covers BOTH spellings, or the alias would diverge from the canonical
+        // path on exactly the retry this exception exists for: a partially
+        // completed rename addresses the OLD name after its env file already
+        // moved. An alias that 404s where the original resumes is not an alias.
+        let rename_resume = ((method == Method::PATCH && action == "config")
+            || (method == Method::POST && action == "rename"))
             && body
                 .get("rename")
+                .or_else(|| body.get("name"))
                 .and_then(|v| v.as_str())
                 .map(|r| {
                     let target = sanitize_session_name(r);
@@ -6514,8 +6559,10 @@ async fn post_dispatch(
             if std::fs::write(&mf, content).is_err() {
                 return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write memory file"}));
             }
-            // _write_claude_memory (symlink into ~/.claude/projects) is not
-            // ported — Python owns the memory composition during coexistence.
+            let wd = session_work_dir(name);
+            if !wd.is_empty() {
+                write_claude_memory(name, &wd);
+            }
             j200(json!({"ok": true}))
         }
         "git" => {
@@ -6786,6 +6833,32 @@ async fn post_dispatch(
             j200(json!({"ok": true}))
         }
         "delete" => delete_post(state, name, headers).await,
+        // CONVENTIONAL SPELLINGS, routed to the SAME handlers (AMUX-2669/2665).
+        //
+        // Both of these 404'd/405'd while a non-obvious spelling worked:
+        //   rename lived only at PATCH /api/sessions/<n>/config {"rename":...}
+        //   delete lived only at POST  /api/sessions/<n>/delete
+        // The SPA happened to use the working one, so nothing looked broken —
+        // but a script, a runbook, the CLI, or a peer session reaching for the
+        // obvious verb got a dead end. That is exactly the shape that cost two
+        // lost inter-session messages tonight: POST /api/workers/<n>/send 405'd
+        // while /api/sessions/<n>/send answered, and `amux send` degraded to
+        // raw tmux without anyone noticing.
+        //
+        // Aliases, not reimplementations — they call the identical functions,
+        // so the two spellings cannot drift into different behaviour.
+        "rename" => {
+            let to = body_str(body, "name");
+            let to = if to.is_empty() { body_str(body, "rename") } else { to };
+            if to.is_empty() {
+                return jresp(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "name is required",
+                           "hint": "POST {\"name\": \"<new>\"} (alias of PATCH /config {\"rename\":...})"}),
+                );
+            }
+            rename_session(state, name, &to).await
+        }
         _ => not_found(),
     }
 }
