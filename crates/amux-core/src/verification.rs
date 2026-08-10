@@ -356,7 +356,7 @@ mod tests {
     }
     fn http() -> VerifierKind {
         VerifierKind::HttpCheck {
-            url: "https://localhost:8822/health".into(),
+            url: "https://localhost:8824/health".into(),
             expected_status: 200,
         }
     }
