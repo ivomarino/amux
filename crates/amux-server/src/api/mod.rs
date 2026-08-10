@@ -220,6 +220,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/log-search", axum::routing::get(log_search::search))
         .route(
+            "/api/memory/global",
+            axum::routing::get(global_memory_get).post(global_memory_post),
+        )
+        .route(
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
         )
@@ -360,4 +364,42 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
         "key_valid": serde_json::Value::Null,
         "key_error": "",
     }))
+}
+
+// ---- /api/memory/global ----
+
+fn global_memory_path() -> std::path::PathBuf {
+    let home = std::env::var("AMUX_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+        });
+    home.join("memory").join("_global.md")
+}
+
+async fn global_memory_get() -> axum::Json<serde_json::Value> {
+    let content = std::fs::read_to_string(global_memory_path()).unwrap_or_default();
+    axum::Json(serde_json::json!({"content": content}))
+}
+
+async fn global_memory_post(
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let path = global_memory_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, content) {
+        Ok(_) => axum::Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
