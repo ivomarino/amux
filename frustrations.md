@@ -2465,3 +2465,173 @@ FIX: Partly fixed: the new autofix `disk` detector puts `tmutil listlocalsnapsho
   to know APFS semantics. Still open: nothing warns that the TM destination has been absent
   for long enough to accumulate a full day of local snapshots, which is the actual upstream
   condition and is invisible until it interacts with a disk-full event.
+
+## Fixing a hook's `${AMUX_URL:-...}` DEFAULT cannot fix anything, because the variable is never unset
+AREA: hooks
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2770
+SYMPTOM: The retired port (8822) was being called ~6,000 times an hour and would not drain.
+  Three separate callers had each been "fixed" by correcting a default:
+  `${AMUX_URL:-https://localhost:8824}` in the three ~/.claude/settings.json report hooks,
+  `os.environ.get("AMUX_URL", "https://localhost:8824")` in the tracked pre-commit
+  staged-guard, and the same line twice in ~/.amux/hooks/git-shared-guard.py. Every one of
+  those is dead code on this machine: a `:-` default and a `.get()` fallback only fire when
+  the variable is UNSET, and all 55 live `claude` processes carry
+  `AMUX_URL=https://localhost:8822` in their process env — which is the entire reason the
+  legacy bind exists in the first place. Each fix read as correct in the file, shipped, and
+  moved the number by zero.
+COST: Three rounds of fixes across two sessions that could not have worked, and the
+  retirement decision stalled on a counter nobody could move. The tell was available the
+  whole time and nobody ran it: `ps -E` on any session shows the variable set.
+FIX: The server now publishes `~/.amux/endpoint.json` (canonical_url + legacy_port) at boot,
+  and each hook swaps ONLY a localhost URL sitting on the port the server itself calls
+  retired. Not a hardcoded 8822 -> 8824 rewrite: the two are reversed in the cloud image, so
+  a baked-in swap would break that deployment. A deliberate dev port or a remote amux is
+  left alone (all three cases have assertions). The general lesson is bigger than the port:
+  **a default is not a fix for an inherited value.** Before "fixing" a fallback, check
+  whether the variable is ever actually unset in the population you are trying to fix.
+
+## The retired-port tally could not tell two callers apart, so no fix could be shown to work
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2769
+SYMPTOM: `GET /api/debug/legacy-port` grouped callers by (ip, user-agent) and kept one
+  `last_path`. On this machine `curl/8.7.1` is BOTH the Claude Code report hooks and every
+  agent's own `curl $AMUX_URL/...`, and `Python-urllib` is BOTH the git pre-commit guard and
+  the PreToolUse Bash guard — so four callers rendered as two rows and "did my fix work?"
+  was unanswerable from the instrument the whole retirement rests on. Worse, the single
+  loudest row (an iPhone user-agent, ~3,200 req/h, blamed on the owner's phone) was actually
+  a leftover iOS SIMULATOR parked on the old port: every legacy client IP was 127.0.0.1, and
+  a real phone cannot reach the Mac's loopback. The instrument had the discriminator (`ip`)
+  and nobody read it.
+COST: A fix was scoped, and a manual step was nearly written into the owner's report, for a
+  device that was not the caller. Also ~40 minutes of measuring deltas that could not
+  separate the caller that had just been fixed from the one that had not.
+FIX: Per-client path histogram (capped, with the drop count reported) in the snapshot, with
+  a mutation test proving the collapsed-into-one-bucket version goes red. The broader rule:
+  when a tally exists to drive a drain, group it by whatever distinguishes the things you
+  will fix ONE AT A TIME — a row you cannot decompose is a row you cannot watch fall.
+
+## Nothing could update an amux git hook outside the amux checkout
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2769
+SYMPTOM: `amux-staged-guard` is installed in nine checkouts on this machine, but
+  `scripts/install-hooks.sh` resolved its source as `$(git rev-parse --show-toplevel)/scripts/
+  git-hooks/`, which exists only inside amux. After the Python generator that used to write
+  the hook per work_dir was deleted, the other eight checkouts were frozen on whatever the
+  generator last wrote — all eight still addressing the retired port, with no supported way
+  to update them. `grep -L 'GUARD_VERSION'` showed 8 of 9 stale and the installer could
+  reach exactly one.
+COST: Eight checkouts silently running a months-old guard, discovered only because they
+  turned up in a port-drain inventory. Nobody would have found them from the amux repo.
+FIX: `install-hooks.sh <repo>` and `install-hooks.sh --all` (bounded scan that PRINTS its
+  bounds). Foreign mode installs the guard only and NEVER writes another repo's pre-commit —
+  those carry that repo's own checks — reporting the exact shim lines instead when the chain
+  is broken. GUARD_VERSION now bumps on any change to the file, since that number is what
+  the staleness inventory greps; leaving it fixed made stale copies read as current.
+
+## `cargo test` cannot pass under the target-dir convention the repo itself mandates
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2799
+SYMPTOM: `db::migrate::guard_tests::it_actually_refuses_a_pending_migration_against_the_live_db`
+  fails with "precondition: the test binary should live under a cargo target dir, got
+  /Users/ethan/.amux/rust-build-target/debug/deps/amux_server-...". The predicate is
+  `s.contains("/target/debug/") || s.contains("/target/release/")` — but per-agent target
+  dirs are BANNED (they filled the disk on 2026-08-09) and both the task instructions and
+  scripts/rust-auto-build.sh use `CARGO_TARGET_DIR=$HOME/.amux/rust-build-target`, whose
+  path contains `/rust-build-target/debug/`, not `/target/debug/`. So the sanctioned way to
+  run the suite is the one way this test cannot pass. Verified at the unmodified base commit
+  86d3353, so it is not caused by any working-tree change.
+COST: A red suite that every lane must learn to ignore, which is the state in which a REAL
+  regression gets waved through. It also cost a false green in the other direction: the
+  background run was invoked as `cargo test > log; echo $?; tail -25`, so the reported exit
+  code was `tail`'s (0) while the log said FAILED — a full suite was nearly reported green.
+FIX: Not applied — migrate.rs has another lane's uncommitted work in it and this is not my
+  file to tangle with. One line: accept a path under the configured target dir, e.g. also
+  match `std::env::var("CARGO_TARGET_DIR")` as a prefix, or match `/debug/deps/` generally.
+  The second half generalises past this bug: **when you redirect a command's output to a
+  log, `$?` is the exit code of the LAST command in the pipeline, not the one you care
+  about.** Capture it immediately after the command, or the "did it pass?" check reports on
+  `tail`.
+
+## SUPERSEDES "Two alerts tests pass alone and fail together": the lock was never the problem — the machine's server.env is
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux (subagent, AMUX-2675)
+CARD: AMUX-2675
+SYMPTOM: Supersedes the 2026-08-10 entry above that diagnosed this as `test_env::set_home`
+  racing "whichever sibling is mid-assertion" and proposed a shared `static ENV_LOCK`. That
+  lock ALREADY EXISTS (`test_env::LOCK`) and every failing test already took it, so the
+  proposed fix was a no-op against the real cause and would have read as "fixed" while the
+  flake continued. The dead hypothesis is worth as much as the live one here.
+  The real path: `ServerConfig::load` exports `~/.amux/server.env` into the PROCESS env, and
+  `effective_env` (settings.rs:76) falls back to the process env whenever a key is absent from
+  the TEMP home's file. So the machine's own values are visible inside a temp home no matter
+  what the lock does. `LEAKY_KEYS` cleared exactly ONE key, `AMUX_OWNER_PHONE`, while the same
+  file also sets `AMUX_URGENT_PUSH` and `AMUX_URGENT_SMS` — read through the identical
+  fallback at alerts.rs:254 to decide whether the push channel is attempted at all.
+  That is why the observed failures were all "push missing": `owner_alert_60s_dedupe_and_ledger_visibility`
+  (0 pushes, expected 1), `owner_alert_reports_channel_failures_per_contract` (channels.push
+  Null, expected the vapid error), `config_defaults_patch_and_provider_detection`.
+COST: 24 measured runs at HEAD in a detached worktree to establish the rate: 4 failures in 24
+  (16.7%). It is the named blocker behind ~20 cards stuck at `done` instead of `verified`,
+  because CI cannot go green. Two prior sessions also mis-identified WHICH test flakes —
+  AMUX-2675 names `owner_alert_full_send_shape_channels_and_ledger` as "the actual one"; it
+  did not fail once in 24 runs, while three tests it does not name did. Chasing the named
+  test would have found nothing.
+FIX: Derive the cleared set from the LEAK SOURCE rather than a hand list — `set_home` now
+  clears every key present in the real `~/.amux/server.env` (names only; values never read),
+  over a 3-key floor, cached in a OnceLock. 39 keys covered instead of 1, and the 40th key
+  someone adds is covered without anyone remembering. A hand list and the thing it models are
+  maintained by different people in different files, which is why it recurred twice.
+  Test `a_temp_home_clears_every_key_the_machine_could_leak` asserts the coverage relation and
+  fails against the pre-fix constant (verified by rebuilding the pre-fix specimen).
+  NOTE this is invisible on CI, which has no server.env — nothing leaks there and the tests are
+  green, so CI cannot ever catch a regression of this class. That is the residual risk.
+
+## Another lane's `git add` swept my uncommitted AC-322 fix into their commit, under their message
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux (subagent, AC-322)
+CARD: AC-322
+SYMPTOM: Fourth instance of the cluster already recorded above (the migration sweep, the
+  "swept my UNCOMMITTED work and pushed half of it" entry, and the "consumes PEERS' staged
+  files silently" entry). Logging it only because the COUNT is the argument: this is now
+  four independent sessions hitting the identical shape, which is what turns it from
+  bad luck into a design fact about a shared checkout.
+  My board.rs `actor_from_headers` fix and both AC-322 regression tests
+  (`force_accepts_x_amux_worker_attribution_like_every_other_module`,
+  `cross_lane_archive_guard_sees_x_amux_worker_callers`) were uncommitted in the working
+  tree. They are now in f36d407, "fix(build+ui): title_needs_self_description, clear-done
+  honesty, and the legacy-port shell injection", which mentions neither AC-322 nor the
+  attribution header. I never ran `git commit`; I was explicitly instructed not to.
+COST: No work lost this time, but the audit trail is now wrong in a way nobody can see from
+  the log: a security-adjacent change (the cross-lane ARCHIVE guard had been open to every
+  bash-CLI caller) is recorded under a commit message about a build break and a UI fix.
+  Anyone bisecting for when the archive guard started working will not find it by message.
+  The reviewer-of-record for that hunk is also wrong.
+FIX: Same as the three entries above — this is not fixable by being careful, because the
+  sweeping session cannot see whose hunks it is staging. `git add <specific paths>` is the
+  mitigation everyone already knows and it failed four times; the durable fix is a
+  pre-commit guard that refuses to stage hunks in files another session has open, or
+  per-session worktrees so `git add -A` is scoped by construction. Until then, treat
+  "my change is uncommitted" as "my change may ship under someone else's message at a
+  time I do not choose" (CLAUDE.md already says this; the entry is the evidence).

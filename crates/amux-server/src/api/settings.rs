@@ -517,7 +517,63 @@ pub(crate) mod test_env {
     /// A temp home must mean a clean slate. Cleared here rather than in each
     /// test because the guard already holds LOCK, so this is the one place the
     /// mutation is race-free. Restored on drop.
-    const LEAKY_KEYS: &[&str] = &["AMUX_OWNER_PHONE"];
+    ///
+    /// THE FLOOR, not the list (AMUX-2675). This used to BE the list — a single
+    /// hand-maintained key — and the next two leaks were already sitting in the
+    /// same file on the same machine: `AMUX_URGENT_PUSH` and `AMUX_URGENT_SMS`
+    /// are read through the identical `effective_env` fallback at alerts.rs:254,
+    /// so a machine with `AMUX_URGENT_PUSH=0` silently disabled the push channel
+    /// inside temp-home tests. That is what the residual flake actually was:
+    /// `owner_alert_60s_dedupe_and_ledger_visibility` (0 pushes, expected 1) and
+    /// `owner_alert_reports_channel_failures_per_contract` (channels.push
+    /// absent, expected the vapid error) — NOT the single test AMUX-2675 named.
+    ///
+    /// Enumerated from the LEAK SOURCE instead: see [`leaky_keys`]. Widening a
+    /// hand list one key at a time is how this recurs, because the list and the
+    /// thing it models are maintained in different places by different people.
+    const LEAKY_KEYS_FLOOR: &[&str] = &["AMUX_OWNER_PHONE", "AMUX_URGENT_PUSH", "AMUX_URGENT_SMS"];
+
+    /// EVERY key the real machine can leak, derived from the file that leaks
+    /// them rather than from a list someone must remember to update.
+    ///
+    /// The leak path is exactly one: `ServerConfig::load` exports
+    /// `$HOME/.amux/server.env` into the process env, and `effective_env` falls
+    /// back to the process env whenever a key is absent from the TEMP home's
+    /// file. So the set of keys that can leak IS the set of keys in that file —
+    /// 39 of them on this machine, of which the old list covered one. Reading
+    /// the file makes the fix cover the 40th key nobody has added yet.
+    ///
+    /// Only the NAMES are read; values are never touched, logged, or compared
+    /// (that file holds credentials — docs/credentials.md). Cached because
+    /// `set_home` is called by ~30 tests and the answer cannot change during a
+    /// run. Absent file (CI) yields just the floor, which is correct: with no
+    /// server.env there is nothing to leak, which is why CI never saw this.
+    fn leaky_keys() -> &'static [String] {
+        static KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let mut keys: Vec<String> = LEAKY_KEYS_FLOOR.iter().map(|s| s.to_string()).collect();
+            // The REAL home, never AMUX_HOME — AMUX_HOME may already point at a
+            // previous test's temp dir, and the machine's file is what leaks.
+            if let Some(home) = std::env::var_os("HOME") {
+                let f = std::path::Path::new(&home).join(".amux").join("server.env");
+                if let Ok(text) = std::fs::read_to_string(f) {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((k, _)) = line.split_once('=') {
+                            let k = k.trim();
+                            if !k.is_empty() && !keys.iter().any(|e| e == k) {
+                                keys.push(k.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            keys
+        })
+    }
 
     pub struct HomeGuard {
         prev: Option<String>,
@@ -527,12 +583,13 @@ pub(crate) mod test_env {
 
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_leaky: Vec<(&'static str, Option<String>)> = LEAKY_KEYS
+        let prev_leaky: Vec<(&'static str, Option<String>)> = leaky_keys()
             .iter()
             .map(|k| {
-                let was = std::env::var(*k).ok();
+                let k: &'static str = k.as_str();
+                let was = std::env::var(k).ok();
                 std::env::remove_var(k);
-                (*k, was)
+                (k, was)
             })
             .collect();
         let prev = std::env::var("AMUX_HOME").ok();
@@ -557,6 +614,67 @@ pub(crate) mod test_env {
                 }
             }
         }
+    }
+
+    /// The invariant, stated against the LEAK SOURCE (AMUX-2675).
+    ///
+    /// Deliberately not written as "poison the process env, then call
+    /// set_home": that would have to mutate process-global state OUTSIDE the
+    /// lock in order to set up, which is the very race this file is about — the
+    /// test would have been a new flake aimed at an old one. This asserts the
+    /// coverage relation instead, which is what actually failed: every key the
+    /// machine's server.env can export must be cleared by a temp home.
+    ///
+    /// On this machine it fails against the pre-fix `LEAKY_KEYS` at
+    /// `AMUX_URGENT_PUSH`. On CI there is no server.env, the loop body never
+    /// runs, and the floor assertions still hold — which is honest, because
+    /// with no server.env there is nothing to leak and CI never saw the flake.
+    #[test]
+    fn a_temp_home_clears_every_key_the_machine_could_leak() {
+        let keys = leaky_keys();
+        for k in LEAKY_KEYS_FLOOR {
+            assert!(
+                keys.iter().any(|x| x == k),
+                "{k} must always be cleared, even with no server.env present"
+            );
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let file = std::path::Path::new(&home).join(".amux").join("server.env");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return; // no server.env (CI): nothing can leak
+        };
+        let mut checked = 0usize;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, _)) = line.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            if k.is_empty() {
+                continue;
+            }
+            checked += 1;
+            // NAME only — never the value; that file holds credentials.
+            assert!(
+                keys.iter().any(|x| x == k),
+                "{k} is in the machine's server.env, so ServerConfig::load exports it into the \
+                 process env and effective_env falls back to it inside a TEMP home — but set_home \
+                 does not clear it. That is the AMUX-2675 flake, one key at a time."
+            );
+        }
+        // The loop must have had something to check, or this passes vacuously
+        // — an empty-match filter and a correct one look identical from a green
+        // result alone (ethos rule 7).
+        assert!(
+            checked > 0,
+            "server.env exists at {} but parsed 0 keys — the parser, not the coverage, is wrong",
+            file.display()
+        );
     }
 }
 
