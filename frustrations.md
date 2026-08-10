@@ -1269,3 +1269,151 @@ without that: the existing comment warns that with rows hidden the nav keys open
 background-shells manager, and that is exactly what pressing ← did here. Separately,
 what all 46 lanes actually have is background CONVERSATIONS, and amux exposes no
 switcher for those at all — that is the reachable version of the same affordance.
+
+## Every session log on the fleet stopped growing while tmux reported piping ON
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2628)
+CARD: AMUX-2628
+SYMPTOM: `~/.amux/logs/*.log` frozen at 19:30 for 50 sessions, still frozen at
+21:02. Every individual signal read healthy: `#{pane_pipe}`=1, the writer process
+alive, its fd 1 on the same inode as the file on disk, the file present and
+non-empty. The pipe writer was `python3 -c "... for line in sys.stdin.buffer: ..."`,
+whose `readline()` blocks until a LINE FEED — and a full-screen Claude TUI redraws
+in place with CARRIAGE RETURNS (measured on the real amux-frustrations.log: 106,081
+CR bytes against 2,506 LF, 42:1). So megabytes accumulated inside the reader and
+nothing was ever written. Two independent second defects rode along: `pipe-pane -o`
+TOGGLES an already-piped pane OFF (tmux 3.6a: arm -> 1, arm again with -o -> 0), so
+starting an already-piped session silently disabled its logging and 20 of 50 fleet
+sessions were sitting unpiped; and `capture_log_tail_for_reload` detached the pipe
+and never re-armed it, so any provider/model/effort swap ended logging permanently.
+COST: 90+ minutes of fleet-wide terminal history lost outright for the lanes that
+were parked, and 9.3 MB recovered from the stuck reader buffers only because the
+re-arm made the old writers hit EOF and flush. Two sessions' logs (amux-rust,
+amux-frustrations) were each holding ~3 MB of unwritten output. Nothing anywhere
+reported the outage — this was noticed by a human reading a log, an hour in.
+FIX: fixed. Writer rewritten to chunked `read1` + `select`, treating CR as a
+terminator (`python3 -u` does NOT help — it unbuffers stdout, the block is on the
+READ side); `-o` dropped from both arm sites; reload capture re-arms. The reason
+nobody saw it is now its own fix: `GET /api/debug/logs` correlates pipe state, log
+mtime, pane activity and writer liveness per session and computes the verdict
+("stale: piping on but no write in Ns while the pane was active"), with `log_verdict`
+extracted as a pure function and unit-tested against this incident's own numbers so
+the alarm is demonstrably able to fire.
+
+## A hand-written `ps | grep` probe matched its own command line and invented 3 phantom failures
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2628)
+SYMPTOM: verifying the fleet re-arm, `ps -eo pid,command | grep 'sh -c python3' |
+grep -c 'for line in sys.stdin.buffer'` reported 3 sessions still on the OLD writer.
+There were zero. The bash tool's own process carries the search string in its argv,
+so the probe matched itself three times, and the follow-up that tried to name the 3
+sessions printed 60 lines of shell fragments as if they were session names — which
+is the only reason it was caught. Re-run as a child-of-tmux-server filter: 52 new
+writers, 0 old.
+CARD: AMUX-2628
+COST: ~10 minutes and one nearly-reported false conclusion ("3 sessions did not get
+the fix") in the final report. The ethos file already names this exact trap ("a probe
+that matches itself in a ps listing"), which is the point: the rule was written down
+and it still did not fire at the moment of use, because the answer looked plausible.
+FIX: the durable version is not "remember to exclude your own pid" — it is that
+fleet-wide process questions should be asked of the server, not of `ps` by hand.
+`/api/debug/logs` now answers "which sessions have a live writer" as structured data
+(`writer_pid`, `writer_age_s`) computed in one place, so the next session does not
+hand-roll the grep at all.
+
+## A hot model switch that HAD landed was reported as failed, because the pane sat on an unanswered confirmation dialog
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2617)
+SYMPTOM: the new hot-model-switch path (`/model <id>` delivered to the live agent
+instead of a restart) reported `mode:"restart"`, `hot_error:"no acknowledgement in
+the pane within 5s"` — twice — on switches that had ACTUALLY WORKED. Claude Code
+guards a mid-conversation model change behind a selector ("Switch model? … 1. Yes,
+switch to Haiku 4.5 / 2. No, go back") that appears in no `--help` output and never
+on a fresh pane, so it only exists once a session has a real conversation. amux typed
+the command, the dialog opened, nobody answered it, and the verifier timed out on an
+ack that could not render yet. The restart it fell back to then answered the dialog
+with a stray keystroke and RESUMED — which is the only reason the ack showed up at
+all, replayed into the new pane.
+CARD: AMUX-2617
+COST: ~40 minutes, and the natural next move from the symptom alone is to widen the
+timeout, which would never have helped. The variant cost it a second time: the fix
+anchored on the dialog's TITLE, so `/effort` (titled "Change effort level?", same
+body) kept falling back while `/model` worked, and the two failures looked nothing
+alike.
+FIX: fixed in the same change. Two parts, and the second is the durable one:
+(1) `config_switch_confirm_key` answers the dialog, anchored on the BODY line both
+variants share and picking the option by its "Yes" TEXT rather than by position, so
+a reordering cannot turn a confirm into a cancel; (2) the fallback now logs the pane
+tail plus `echo_seen`/`ack_seen` before restarting. A fallback that leaves no trace
+is indistinguishable from a switch that never happened — the pane tail is what named
+the dialog within one run, both times, and it is what makes the next unexplained
+timeout decidable from the log alone.
+
+## The API answered 200 {"ok":true,"message":"sent"} for a message the model never received
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2629)
+CARD: AMUX-2629
+SYMPTOM: `POST /api/sessions/amux-rust/send` at 20:55:25 answered `200 {"ok":true,
+"message":"sent"}` in 1050ms. The text was typed into the pane and the Enter did not
+register, so it sat in Claude Code's composer for 10m50s — the conversation JSONL
+receives it at 21:06:15, only because a human pressed a bare Enter. Nine steering
+messages were queued behind it. Every instrument agreed with the lie: `session_events`
+holds one `message.sent` row at 20:55:26 and nothing after it, `steering_history` had
+already dequeued the previous delivery as delivered, and the pane looked idle. The one
+artifact that discriminates is Claude Code's own `queue-operation: enqueue` record —
+it writes one for every mid-turn Enter it ACCEPTS (10 of them in that same transcript)
+and there is none at 20:55. Nothing amux stores could have told anyone that.
+COST: an hour of a lane sitting idle with the owner's instruction on screen and nine
+commands queued behind it; then the owner's time to notice and press Enter himself.
+Worse than the hour: the diagnosis was IMPOSSIBLE from amux's own data — every
+recorded fact was consistent with successful delivery, so the natural conclusion from
+the ledger alone ("it was delivered, the lane ignored it") is wrong and blames the
+model.
+FIX: fixed on AMUX-2629 (`verify_submitted` + `send_outcome` in api/session_verbs.rs).
+"sent" is now read back from Claude Code's artifacts — the composer contents and the
+conversation JSONL — never inferred from the `send-keys` exit code, and the response
+carries `submitted` / `submission` / `retried` so the four outcomes a single `ok` bit
+used to cover are distinguishable. THE UNDERLYING DEFECT IS NOT FIXED AND CANNOT BE
+FIXED HERE: keystroke delivery into a TUI is best-effort by construction. Twenty
+attempts across four pane states failed to reproduce the dropped Enter, which is the
+point — it is intermittent, so it can only be detected and retried, not timed away.
+The real fix is protocol delivery, where submission is an ACK (opencode::structured).
+
+## Ghost-rescue can only rescue the messages that happen to carry a timestamp prefix
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2629)
+CARD: AMUX-2629
+SYMPTOM: the ported `[ghost-rescue]` sweep decides a stuck message is amux's — and so
+safe to submit — only when the composer text starts with the dashboard's `[H:MM AM]`
+stamp (py:9160, the only sound discriminator: anything else risks submitting a
+half-written human thought). A read-only scan of the live fleet found 13 lanes holding
+composer text with no matching user message in their transcript — `backend` "continue
+with the queue", `ethan-dev` "push it", `mvs-infra` "Run the MVS prod health loop per
+the runbook", and ten more — and ZERO of the 13 carry the stamp. The dashboard applies
+the prefix inconsistently (`cmd_history` for amux-rust alone has both prefixed and
+unprefixed human sends in the same hour), and agent-to-agent and nudge messages never
+carry it.
+COST: not yet counted in minutes, but it is 13 messages the fleet is currently sitting
+on, and a fallback that covers 0% of the live population reads as protection that is
+not there. Deliberately not widened: guessing "this looks like amux" would eventually
+submit a person's unfinished sentence, which is worse than the stall.
+FIX: two honest options, both upstream of the sweep. (1) Make the stamp universal — if
+every amux-originated message carried a machine-readable origin marker, the guard would
+be exact instead of a heuristic. (2) Better: deliver over the structured protocol, where
+there is no composer to get stuck in and nothing to sweep for; the sweep's exit condition
+is written into its module docs for that reason.

@@ -75,7 +75,11 @@ fn not_found(key: &str) -> Response {
 /// spelling ("claude" -> "claude-code"). A provider the registry does not
 /// know keeps the conservative all-false default — over-restarting is the
 /// honest fallback for capabilities nobody measured.
-fn provider_caps(provider: &str) -> ProviderCapabilities {
+/// `pub(crate)` because session_verbs' hot model switch (AMUX-2617) asks the
+/// same question of the same registry: duplicating the accessor would give the
+/// fleet path its own OnceLock and its own idea of the capability matrix, and
+/// two components disagreeing about one fact is the shape of ethos rule 4.
+pub(crate) fn provider_caps(provider: &str) -> ProviderCapabilities {
     static REGISTRY: std::sync::OnceLock<crate::provider::ProviderRegistry> =
         std::sync::OnceLock::new();
     REGISTRY

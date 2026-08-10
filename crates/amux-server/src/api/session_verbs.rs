@@ -322,7 +322,7 @@ async fn tmux_sessions_set() -> std::collections::BTreeSet<String> {
 }
 
 /// tmux capture-pane -e; lines<=0 → visible screen only (py:4406).
-async fn tmux_capture(name: &str, lines: i64) -> String {
+pub(crate) async fn tmux_capture(name: &str, lines: i64) -> String {
     if session_backend(name) == "herdr" {
         return herdr_capture(name, lines.max(1)).await;
     }
@@ -354,7 +354,7 @@ async fn tmux_alt_screen(name: &str) -> bool {
     }
 }
 
-async fn send_key(name: &str, key: &str) {
+pub(crate) async fn send_key(name: &str, key: &str) {
     let pt = pt(name);
     let _ = tmux(&["send-keys", "-t", &pt, key]).await;
 }
@@ -737,7 +737,7 @@ fn at_shell_prompt(clean_output: &str) -> bool {
 }
 
 /// py:18479 _detect_claude_status → 'active' | 'waiting' | 'idle' | ''.
-fn detect_claude_status(raw_output: &str) -> String {
+pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if raw_output.is_empty() {
         return String::new();
     }
@@ -1677,7 +1677,7 @@ fn now_i64() -> i64 {
 
 /// py:7593 _emit_event — append-only, idempotent on `idem`, never fails the
 /// caller.
-async fn emit_event(state: &AppState, session: &str, etype: &str, data: Option<Value>, idem: Option<String>, source: &str) {
+pub(crate) async fn emit_event(state: &AppState, session: &str, etype: &str, data: Option<Value>, idem: Option<String>, source: &str) {
     let session = session.to_string();
     let etype = etype.to_string();
     let source = source.to_string();
@@ -1894,14 +1894,442 @@ async fn is_running(name: &str) -> bool {
 // send_text (py:25432) — the delivery choreography. Ported: restart guard,
 // resume-picker guard, auto-wake, boot-in-flight wait, status-gated Escape
 // discipline (the 1.3s double-Escape rule), C-u clear, paste-buffer for >400
-// chars, @/slash picker handling, steering enqueue for waiting selectors.
-// NOT ported: _verify_submitted's JSONL evidence gate (gap named in the
-// module doc) — "sent" here means the keys landed and Enter was pressed.
+// chars, @/slash picker handling, steering enqueue for waiting selectors,
+// and — AMUX-2629 — the SUBMISSION EVIDENCE GATE (`verify_submitted`).
+//
+// KEYSTROKE DELIVERY IS BEST-EFFORT AND ALWAYS WILL BE. `tmux send-keys`
+// succeeding proves the bytes reached the pty, nothing more: whether Claude
+// Code's TUI turned them into a submitted message is a fact only Claude Code
+// holds. That is why "sent" may never be inferred from the send-keys exit
+// code — it must be READ BACK from an artifact the TUI writes.
+//
+// The durable fix is not here. It is protocol delivery, where submission is
+// an ACK rather than an inference (opencode::structured, AgentProtocol). As
+// of 2026-08-09 that path cannot carry ANY interactive lane — see
+// `lane_has_protocol_path` — so this choreography is still the only one, and
+// this gate is what keeps it honest until the protocol takes over.
 // ---------------------------------------------------------------------------
 
 fn at_picker_text(text: &str) -> bool {
-    // Python's _AT_PICKER_RE: text that opens Claude's autocomplete picker.
-    text.contains('@') || text.trim_start().starts_with('/')
+    // py:25538 _AT_PICKER_RE = r'(?:^|\s)@\S' — an @ that STARTS a token, plus
+    // a leading slash. NOT `contains('@')`: that also matches emails
+    // (mhoward@lucihub.com) and backticked `@backend` mentions, which
+    // force-queued any such message while the session generated even in Send
+    // mode (py's 2026-07-17 fix, dropped in the rust port and restored here).
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?:^|\s)@\S").expect("at-picker regex"));
+    re.is_match(text) || text.trim_start().starts_with('/')
+}
+
+/// Unsubmitted text sitting in Claude Code's input box, or None when no input
+/// prompt is visible (py:25349 `_pending_input`).
+///
+/// The box hard-wraps long text, so the ❯ line alone is NOT the whole pending
+/// message — collect its continuation lines down to the box's bottom border /
+/// status bar. Returned space-stripped, matching `verify_submitted`'s
+/// space-insensitive comparison. (Checking only the ❯ line is how a wrapped
+/// message's tail escaped verification and got dequeued as 'sent' while still
+/// sitting in the box — the "random" ghost, 2026-07-10.)
+pub(crate) fn pending_input(clean: &str) -> Option<String> {
+    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let idx = lines.iter().rposition(|l| {
+        matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}'))
+    })?;
+    let mut buf: Vec<String> =
+        vec![lines[idx].trim().trim_start_matches(['\u{276f}', '\u{203a}', ' ', '\u{a0}', '\t']).to_string()];
+    for l in &lines[idx + 1..] {
+        let s = l.trim();
+        if matches!(s.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
+            break;
+        }
+        buf.push(s.to_string());
+    }
+    Some(buf.iter().flat_map(|b| b.split_whitespace()).collect::<String>())
+}
+
+/// Durable submission evidence (py:25373 `_jsonl_user_msg_since`): true if
+/// `text` already landed in the session's conversation JSONL as a user message
+/// stamped AFTER `since`.
+///
+/// The pane can lie mid-repaint (resize rewrap; the ~1s gap before the spinner
+/// paints after a submit); the JSONL append happens AT submission and cannot.
+/// The `since` gate uses the message's OWN timestamp, not file mtime, so an
+/// older identical text — a second "continue" minutes later — cannot count as
+/// this send.
+pub(crate) fn jsonl_user_msg_since(name: &str, text: &str, since: f64) -> bool {
+    let needle = text.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let Some(p) = session_jsonl_path(name) else { return false };
+    // 256KiB tail, same budget as python's f.seek(size - 262144).
+    jsonl_records_have(&iter_jsonl_tail(&p, 262_144), needle, since)
+}
+
+/// The evidence scan itself, over already-parsed records — pure so it can be
+/// tested against a planted transcript rather than a mock of the file reader.
+pub(crate) fn jsonl_records_have(recs: &[Value], needle: &str, since: f64) -> bool {
+    if needle.trim().is_empty() {
+        return false;
+    }
+    let needle = needle.trim();
+    for rec in recs.iter().rev() {
+        let msg = &rec["message"];
+        let role = msg["role"].as_str().or_else(|| rec["type"].as_str()).unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+        let hit = match &msg["content"] {
+            Value::String(s) => s.contains(needle),
+            Value::Array(items) => items
+                .iter()
+                .any(|c| c["text"].as_str().map(|t| t.contains(needle)).unwrap_or(false)),
+            _ => false,
+        };
+        if !hit {
+            continue;
+        }
+        let Some(ts) = rec["timestamp"].as_str().and_then(parse_iso8601) else { continue };
+        if ts >= since - 2.0 {
+            // small slack for clock/rounding, as python
+            return true;
+        }
+    }
+    false
+}
+
+/// What ONE pane frame says about our message. Pure: everything the verifier
+/// decides from a frame is decided here, so the decision can be tested against
+/// the real incident's frames instead of against a paraphrase of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameRead {
+    /// Claude Code has not drawn its composer at all. NOT "submitted" (AC-271).
+    NoUi,
+    /// The composer is drawn and does not hold our text.
+    Cleared,
+    /// Our text is still sitting in the composer, and the lane is generating —
+    /// that is queued input, which submits at the turn boundary.
+    StillThereGenerating,
+    /// Our text is still sitting in the composer with the lane idle. Nothing is
+    /// going to submit it.
+    StillThereIdle,
+}
+
+pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
+    let clean = strip_ansi(raw);
+    let pend = pending_input(&clean);
+    let has_prompt = clean
+        .lines()
+        .any(|l| matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}')));
+    if pend.is_none() && !has_prompt {
+        return FrameRead::NoUi;
+    }
+    let still_there = pend.as_deref().map(|p| p.contains(tail_sq)).unwrap_or(false);
+    if !still_there {
+        return FrameRead::Cleared;
+    }
+    if detect_claude_status(raw) == "active" {
+        FrameRead::StillThereGenerating
+    } else {
+        FrameRead::StillThereIdle
+    }
+}
+
+/// The (ok, message) a send reports for a given verdict. Pure, so the contract
+/// "a message we could not confirm is NEVER reported as sent" is asserted
+/// directly instead of inferred from a live pane.
+pub(crate) fn send_outcome(sub: Submission, generating: bool, retried: bool) -> (bool, String) {
+    match sub {
+        Submission::Confirmed if generating && retried => {
+            (true, "sent (queued while generating, submitted on retry)".into())
+        }
+        Submission::Confirmed if generating => (true, "sent (queued while generating)".into()),
+        // A retry SUCCEEDED, which is not the same as a clean send: the first
+        // Enter was dropped. Callers and the request log see the difference, so
+        // "the keystroke path is failing on this lane" is countable instead of
+        // being smoothed into a success.
+        Submission::Confirmed if retried => (true, "sent (Enter was dropped; submitted on retry)".into()),
+        Submission::Confirmed => (true, "sent".into()),
+        Submission::Stuck if generating => (
+            false,
+            "not submitted — text is sitting in the input box (mid-turn Enter was not accepted)".into(),
+        ),
+        Submission::Stuck => (
+            false,
+            "not submitted — text is sitting in the input box (autocomplete popup ate the Enter?)".into(),
+        ),
+        // Honest third state (ethos rule 3): the composer could not be read, so
+        // we assert neither success nor failure. `ok` stays true so a caller
+        // does not double-send; the message says exactly what is not known and
+        // send_post turns it into submitted=null / submission="unverified".
+        Submission::Unverified => (
+            true,
+            "sent (keys delivered; submission could not be verified — no input box was drawn)".into(),
+        ),
+    }
+}
+
+/// RFC3339 / ISO-8601 (`...Z` or `+00:00`) → unix seconds. Kept local: the
+/// only consumer is the submission gate, and a wrong parse there must fail
+/// CLOSED (None → no evidence) rather than manufacture a timestamp.
+fn parse_iso8601(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut y = date.splitn(3, '-');
+    let (yy, mm, dd): (i64, i64, i64) =
+        (y.next()?.parse().ok()?, y.next()?.parse().ok()?, y.next()?.parse().ok()?);
+    // Trailing zone: Z, +HH:MM or -HH:MM.
+    let (time, off_s) = if let Some(t) = rest.strip_suffix('Z') {
+        (t, 0i64)
+    } else if let Some(i) = rest.rfind(['+', '-']) {
+        let (t, z) = rest.split_at(i);
+        let sign = if z.starts_with('-') { -1 } else { 1 };
+        let z = &z[1..];
+        let (zh, zm) = z.split_once(':').unwrap_or((z, "0"));
+        (t, sign * (zh.parse::<i64>().ok()? * 3600 + zm.parse::<i64>().ok()? * 60))
+    } else {
+        (rest, 0)
+    };
+    let mut tp = time.splitn(3, ':');
+    let hh: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let sec: f64 = tp.next().unwrap_or("0").parse().ok()?;
+    // days from civil (Howard Hinnant's algorithm) — no chrono in this crate.
+    let yy2 = if mm <= 2 { yy - 1 } else { yy };
+    let era = if yy2 >= 0 { yy2 } else { yy2 - 399 } / 400;
+    let yoe = yy2 - era * 400;
+    let doy = (153 * (if mm > 2 { mm - 3 } else { mm + 9 }) + 2) / 5 + dd - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + hh * 3600 + mi * 60 - off_s) as f64 + sec)
+}
+
+/// What the evidence says about a just-sent message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Submission {
+    /// Positively observed as submitted (composer released it, or the JSONL
+    /// has it stamped after this send began).
+    Confirmed,
+    /// Our text is STILL sitting in the input box with no evidence of
+    /// submission — this is the AMUX-2629 failure, and callers must NOT
+    /// report success.
+    Stuck,
+    /// Could not tell (no UI drawn yet, capture failed, pane torn). Biased to
+    /// "do not double-send" — the caller reports the uncertainty rather than
+    /// claiming either outcome.
+    Unverified,
+}
+
+/// Confirm a just-sent message actually SUBMITTED (py:25421 `_verify_submitted`).
+///
+/// `send-keys` succeeding only means the keystrokes reached the pane. An
+/// autocomplete picker (opened by an @mention) can swallow the Enter, and — the
+/// AMUX-2629 specimen — a mid-turn Enter can simply not register, leaving the
+/// message unsent in the input box while the API reports "sent" and the
+/// steering queue dequeues it. That is the "steering queue clears without
+/// delivering" bug.
+///
+/// Returns `Confirmed` once the input prompt no longer holds our text. If it
+/// still does AND the session is idle, a picker likely ate the Enter → press
+/// Escape+Enter to submit (`retry_keys`), spaced ≥1.3s from any earlier Escape
+/// because two Escapes inside ~1s read as a double-press and EAT the pending
+/// message. Biased to `Unverified` rather than `Stuck` when uncertain, so we
+/// never double-send.
+async fn verify_submitted(
+    name: &str,
+    text: &str,
+    esc_at: Option<std::time::Instant>,
+    sent_at: f64,
+    retry_keys: bool,
+) -> (Submission, bool) {
+    let mut retried = false;
+    let tail: String = text.trim().chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+    if tail.is_empty() {
+        return (Submission::Confirmed, retried);
+    }
+    // Compare space-insensitively: the input box hard-wraps long messages at
+    // the pane width, splitting the tail across visual lines at arbitrary
+    // points.
+    let tail_sq: String = tail.split_whitespace().collect();
+    let mut esc_at = esc_at;
+    let mut cleared_once = false;
+    let mut stuck_looks = 0;
+    let mut no_ui_looks = 0;
+    for _ in 0..5 {
+        sleep_ms(300).await;
+        let raw = tmux_capture(name, 25).await;
+        match read_frame(&raw, &tail_sq) {
+            // NO INPUT BOX AT ALL IS "NOT READY", NOT "SUBMITTED" (AC-271). A
+            // successful submit leaves the composer rendered and EMPTY — the ❯
+            // line is still there. So the absence of any ❯/› means Claude Code
+            // has not drawn its UI yet, which on a cold session is normal for
+            // several seconds; two "clear looks" 0.3s apart inside that window
+            // would report success while the text renders into the box
+            // AFTERWARDS and sits there. Measured 2026-08-06 (amux-cloud): a
+            // schedule fired into a container that was still waking, send
+            // reported "sent", _run_schedule recorded ok, and the worker never
+            // ran — 9 workers across 3 customer envs.
+            FrameRead::NoUi => {
+                no_ui_looks += 1;
+                if no_ui_looks <= 12 {
+                    // ~4s more; a cold Claude Code needs it
+                    sleep_ms(300).await;
+                    continue;
+                }
+                // UI never appeared — do NOT claim this submitted. An "ok" that
+                // means "typed into nothing" is what let 9 dead triggers read as
+                // successful runs.
+                return (Submission::Unverified, retried);
+            }
+            FrameRead::Cleared => {
+                // Looks submitted — but right after a Claude restart the typed
+                // text can render into the box AFTER our first look (keystrokes
+                // buffered through boot), so one clear look is not proof.
+                // Require two.
+                if cleared_once {
+                    return (Submission::Confirmed, retried);
+                }
+                cleared_once = true;
+                continue;
+            }
+            // Text still in the box while Claude is generating: it is queued
+            // input that submits at the turn end — don't touch it (Escape would
+            // interrupt).
+            FrameRead::StillThereGenerating => return (Submission::Confirmed, retried),
+            FrameRead::StillThereIdle => {}
+        }
+        cleared_once = false;
+        // ONE stuck look is not proof either: for ~1s after a successful submit
+        // the pane still shows the echoed text and no spinner yet (worse during
+        // a resize repaint), which reads exactly like "stuck + idle". Acting on
+        // that single torn look sent Escape — INTERRUPTING the just-started turn,
+        // which restores the message into the input box — then Enter, RESUBMITTING
+        // it (ts-gke duplicate, 2026-07-13, copies 1.65s apart).
+        stuck_looks += 1;
+        if stuck_looks < 2 {
+            continue;
+        }
+        // Durable evidence beats the pane: the conversation JSONL gets the user
+        // message appended at submission. If it is there stamped after this send
+        // began, it submitted and the pane read is a repaint lie.
+        if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
+            return (Submission::Confirmed, retried);
+        }
+        if !retry_keys {
+            return (Submission::Stuck, retried);
+        }
+        // Idle with our text genuinely stuck → press Escape (closes a picker
+        // WITHOUT selecting an entry; a bare Enter would pick one and rewrite an
+        // @path) then Enter. Any two Escapes within ~1s read as a double-press
+        // and EAT the pending message (v2.1.205), so space each retry's Escape
+        // ≥1.3s from the previous one, including the one send_text itself sent.
+        if let Some(at) = esc_at {
+            let elapsed = at.elapsed();
+            if elapsed < Duration::from_millis(1300) {
+                tokio::time::sleep(Duration::from_millis(1300) - elapsed).await;
+            }
+        }
+        send_key(name, "Escape").await;
+        esc_at = Some(std::time::Instant::now());
+        sleep_ms(60).await;
+        send_key(name, "Enter").await;
+        // A retry is EVIDENCE THE SEND PATH FAILED, not a routine step, so it
+        // is logged at WARN and reported back to the caller (`retried` in the
+        // send response). A silent retry would hide exactly the signal that
+        // says "the keystroke path is dropping Enters on this lane".
+        retried = true;
+        tracing::warn!(
+            session = %name,
+            "send: Enter did not submit — retried Escape+Enter (keystroke delivery failure)"
+        );
+        stuck_looks = 0;
+    }
+    let raw = tmux_capture(name, 25).await;
+    if !matches!(read_frame(&raw, &tail_sq), FrameRead::StillThereIdle) {
+        return (Submission::Confirmed, retried);
+    }
+    // Last resort before reporting a failure (which makes callers re-send):
+    // trust the durable JSONL record over a possibly-torn final frame.
+    if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
+        (Submission::Confirmed, retried)
+    } else {
+        (Submission::Stuck, retried)
+    }
+}
+
+/// Per-session send lock (py:25432's `_get_send_lock`). Two choreographies
+/// typing into one pane interleave into garbage, and — the reason this landed
+/// with AMUX-2629 — the ghost-rescue sweep must never fire an Enter into a pane
+/// a send is mid-way through typing: that Enter would submit a half-typed
+/// message. Separate from `session_op_lock` on purpose: a send must not queue
+/// behind a 60s start choreography.
+pub(crate) fn session_send_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::Mutex::new(None);
+    let mut g = LOCKS.lock().unwrap();
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Does this lane have a STRUCTURED PROTOCOL path, where delivery is an ACK
+/// instead of a keystroke we hope lands?
+///
+/// Today the honest answer is `false` for every interactive lane, and the
+/// reason is structural rather than a missing wire-up:
+/// `opencode::structured::StructuredCliProtocol` runs `claude --print` — one
+/// prompt, one child process, no stdin session — so its own
+/// `deliver_message` returns `Rejected` for exactly the mid-turn case that
+/// dropped Ethan's message on 2026-08-09. It hosts orchestrator WORKERS, not
+/// the `~/.amux/sessions/*.env` fleet the send verb addresses, and on this
+/// machine at the time of writing `_amux_sessions` held 0 live rows.
+///
+/// It is a function, not a constant, so the day an interactive lane IS
+/// protocol-hosted, the send path and the ghost-rescue sweep both switch on
+/// one edit here rather than needing to be found.
+pub(crate) fn lane_has_protocol_path(state: &AppState, name: &str) -> bool {
+    // A lane is protocol-driven when a live `_amux_sessions` row names its
+    // backend ref. `amux-<name>` is the L2 ref shape for tmux-hosted lanes.
+    let want = tmux_name(name);
+    state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM _amux_sessions WHERE backend_ref = ?1 AND ended_at IS NULL",
+                rusqlite::params![want],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+/// Lanes whose ONLY delivery channel is keystrokes: registered, not archived,
+/// tmux-hosted, and with no structured-protocol session. This is the set the
+/// ghost-rescue sweep may act on — and the set that shrinks to nothing when
+/// interactive lanes become protocol-driven, which is that job's exit.
+pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(sessions_dir()) else { return vec![] };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("env"))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    names.sort();
+    names.retain(|n| {
+        let cfg = parse_env(n);
+        cfg.get("CC_ARCHIVED") != Some("1")
+            && iterm2_id(&cfg).is_empty()
+            && backend_of_cfg(&cfg) == "tmux"
+            && !lane_has_protocol_path(state, n)
+    });
+    names
 }
 
 async fn send_after_ready(state: AppState, name: String, text: String, timeout_s: u64) {
@@ -2034,6 +2462,16 @@ async fn send_text_inner(
         return (true, "queued (steering) until turn end — @/slash needs the picker closed".into());
     }
     let mut esc_at: Option<std::time::Instant> = None;
+    // Exclusive use of the pane for the whole type+Enter+verify choreography.
+    // Without it a second send (or the ghost-rescue sweep) can fire an Enter
+    // between our `send-keys -l` and our own Enter, submitting a half-typed
+    // message. Taken here, AFTER every early return above, so a refusal never
+    // holds the lock.
+    let send_lock = session_send_lock(name);
+    let _send_guard = send_lock.lock().await;
+    // `sent_at` bounds the JSONL evidence window: an OLDER identical message
+    // (a second "continue" minutes later) must not count as this send.
+    let sent_at = now_f64();
     if !generating {
         // Fresh re-check right before the Escape (py:25597): "esc to
         // interrupt" in the pane is the reliable generating signal.
@@ -2087,10 +2525,39 @@ async fn send_text_inner(
         sleep_ms(60).await;
     }
     send_key(name, "Enter").await;
-    if generating {
-        return (true, "sent (queued while generating)".into());
+    // ------------------------------------------------------------------
+    // THE EVIDENCE GATE (AMUX-2629). Everything above proves only that bytes
+    // reached the pty. "sent" is a claim about Claude Code's state, so it is
+    // read back from Claude Code's own artifacts — the composer contents and
+    // the conversation JSONL — never inferred from the send-keys exit code.
+    //
+    // The mid-turn branch is NOT exempt, and that exemption is what shipped
+    // the incident: Python returned "sent (queued while generating)" without
+    // looking, Rust inherited it, and on 2026-08-09 a mid-turn Enter simply
+    // did not register — the message sat in amux-rust's composer for 10m50s
+    // (typed 20:55:25, entered the transcript 21:06:15 only when a human
+    // pressed Enter) while the API had answered 200 {"ok":true}.
+    //
+    // Mid-turn we retry with a BARE Enter and never an Escape: Escape mid-turn
+    // is an INTERRUPT that kills the running response (py:25597's warning, and
+    // this session's own "[Request interrupted by user]" records). Idle, the
+    // Escape+Enter pair is correct because a picker may be holding the Enter.
+    // ------------------------------------------------------------------
+    let (first, retried) = verify_submitted(name, &text, esc_at, sent_at, !generating).await;
+    if first == Submission::Stuck && generating {
+        // One bare-Enter retry, then re-read the evidence. No sleep-tuning: the
+        // retry is gated on the OBSERVED composer contents, not on a guess
+        // about how long Claude Code needs. Bare Enter and never Escape —
+        // Escape mid-turn is an interrupt.
+        tracing::warn!(
+            session = %name,
+            "send: mid-turn Enter was not accepted — retrying with a bare Enter (keystroke delivery failure)"
+        );
+        send_key(name, "Enter").await;
+        let (second, _) = verify_submitted(name, &text, None, sent_at, false).await;
+        return send_outcome(second, generating, true);
     }
-    (true, "sent".into())
+    send_outcome(first, generating, retried)
 }
 
 /// py:25815 send_keys — allowed control keys only.
@@ -2143,20 +2610,152 @@ fn tmux_rows() -> String {
     std::env::var("AMUX_TMUX_ROWS").ok().filter(|v| v.parse::<u32>().is_ok()).unwrap_or_else(|| "50".into())
 }
 
-/// py:21478 _log_pipe_command — pipe-pane through the secret redactor.
+/// The `pipe-pane` writer program (py:21478 `_log_pipe_command` was
+/// redaction-only; AMUX-2628 rewrote it).
+///
+/// **Why this is not `for line in sys.stdin.buffer`.** That is what shipped,
+/// and it froze every log on the fleet for over an hour with `pane_pipe=1`
+/// and the writer process alive — the failure looks exactly like "piping is
+/// fine, the session just went quiet". `readline()` blocks until a **line
+/// feed**, and a full-screen TUI redraws in place with CARRIAGE RETURNS and
+/// cursor-positioning escapes: measured on a real `amux-frustrations.log`,
+/// 106,081 CR bytes against 2,506 LF bytes, a 42:1 ratio. So the reader sat
+/// on a partial "line" accumulating megabytes in its internal buffer (the two
+/// actively-working lanes' writers were carrying ~3MB of RSS above the idle
+/// baseline) and wrote nothing. Reproduced on a throwaway pane: 221 bytes on
+/// disk after 4,000 CR-terminated frames, then 175,118 bytes the instant one
+/// LF arrived.
+///
+/// Note that `python3 -u` does NOT fix this — `-u` unbuffers stdout, and the
+/// block is on the READ side. The fix has to be chunked reads plus treating
+/// CR as a terminator, which is what this program does.
+///
+/// It also strips ANSI at write time, because the raw capture was 54.6%
+/// escape bytes and unreadable as a log. Cursor MOVEMENT becomes whitespace
+/// rather than being deleted (`G`/`H`/`C` alone account for 530k sequences in
+/// that one file); deleting it jams the reflowed words together
+/// ("whoseoutcomeisartifacts"). Set `AMUX_LOG_RAW=1` to keep the byte stream
+/// verbatim. Real-capture measurement: 11,291,687 -> 4,663,903 bytes (58.7%).
+///
+/// The knobs are INTERPOLATED, not read from the environment by the program:
+/// `pipe-pane` children are forked by the **tmux server**, so they inherit
+/// tmux's environment and would never see `~/.amux/server.env`.
 fn log_pipe_command(log_path: &Path) -> String {
-    let redactor = concat!(
-        "import re,sys\n",
-        "pat=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\\s\\r\\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+')\n",
-        "def repl(m):\n",
-        "    if m.group(1): return m.group(1)+b'_REDACTED'\n",
-        "    if m.group(2): return m.group(2)+b'REDACTED'\n",
-        "    return b'SECRET_REDACTED'\n",
-        "for line in sys.stdin.buffer:\n",
-        "    sys.stdout.buffer.write(pat.sub(repl, line))\n",
-        "    sys.stdout.buffer.flush()\n",
-    );
-    format!("python3 -c {} >> {}", sh_quote(redactor), sh_quote(&log_path.to_string_lossy()))
+    const PROG: &str = r#"import os,re,select,sys,time
+LOG=sys.argv[1]; MAXB=int(sys.argv[2]); RAW=sys.argv[3]=='1'; FLUSH=int(sys.argv[4])/1000.0
+SEC=re.compile(rb'((?:mxp|usr|ret)_sk)_[A-Za-z0-9_-]+|((?:AMUX_MIXPEEK_OPS_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_MAPS_API_KEY|GOOGLE_API_KEY|CLOUDFLARE_API_TOKEN|ELEVENLABS_API_KEY|POSTHOG_KEY|POSTHOG_PERSONAL_API_KEY)=)[^\s\r\n]+|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|sk[_-][A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{30,}|(?:phx|phc)_[A-Za-z0-9]+')
+def repl(m):
+    if m.group(1): return m.group(1)+b'_REDACTED'
+    if m.group(2): return m.group(2)+b'REDACTED'
+    return b'SECRET_REDACTED'
+CSI=re.compile(rb'\x1b\[[0-9;?]*([a-zA-Z])')
+def csi(m):
+    f=m.group(1)
+    if f in b'GCHfd': return b' '
+    if f in b'ABEF': return b'\n'
+    return b''
+OTHER=re.compile(rb'\x1b\]8;[^\x1b]*\x1b\\|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][A-Z0-9]|\x1b[\x20-\x2f]*[\x40-\x7e]')
+CTL=re.compile(rb'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+PAD=re.compile(rb'(?<=\S)[ \t]{2,}')
+fh=open(LOG,'ab',0)
+def rot():
+    global fh
+    if MAXB<=0: return
+    try: n=os.fstat(fh.fileno()).st_size
+    except OSError: return
+    if n<MAXB: return
+    try:
+        fh.close(); os.replace(LOG,LOG+'.1')
+    except OSError: pass
+    fh=open(LOG,'ab',0)
+    fh.write(b'=== amux log rotated '+time.strftime('%Y-%m-%dT%H:%M:%S').encode()+b' ('+str(n).encode()+b' bytes rolled to .1) ===\n')
+prev=None
+def emit(seg,redraw):
+    global prev
+    s=SEC.sub(repl,seg)
+    if RAW:
+        try: fh.write(s+b'\n')
+        except OSError: return
+        rot(); return
+    s=PAD.sub(b' ',CTL.sub(b'',OTHER.sub(b'',CSI.sub(csi,s))))
+    parts=s.split(b'\n')
+    for i,p in enumerate(parts):
+        p=p.rstrip()
+        if not p.strip(): continue
+        if (redraw or i<len(parts)-1) and p==prev: continue
+        prev=p
+        try: fh.write(p+b'\n')
+        except OSError: return
+        rot()
+if RAW:
+    while True:
+        c=os.read(0,65536)
+        if not c: break
+        try: fh.write(SEC.sub(repl,c))
+        except OSError: break
+        rot()
+    sys.exit(0)
+buf=b''; last_rx=time.monotonic(); held=None; HARD=1<<20
+while True:
+    r,_,_=select.select([0],[],[],0.25)
+    eof=False
+    if r:
+        c=os.read(0,65536)
+        if c: buf+=c; last_rx=time.monotonic()
+        else: eof=True
+    while buf:
+        j=buf.find(b'\n'); k=buf.find(b'\r')
+        if j<0 and k<0: break
+        if k>=0 and (j<0 or k<j):
+            if k==len(buf)-1 and not eof: break
+            if buf[k+1:k+2]==b'\n': emit(buf[:k],False); buf=buf[k+2:]
+            else: emit(buf[:k],True); buf=buf[k+1:]
+        else: emit(buf[:j],False); buf=buf[j+1:]
+        held=None
+    now=time.monotonic()
+    held=(held or now) if buf else None
+    if buf:
+        if len(buf)>HARD or eof or now-last_rx>=FLUSH:
+            emit(buf,True); buf=b''; held=None
+        elif now-held>=FLUSH*4:
+            i=max(buf.rfind(b' '),buf.rfind(b'\t'))
+            if i>=0: emit(buf[:i+1],True); buf=buf[i+1:]; held=now
+    if eof: break
+if buf: emit(buf,True)
+"#;
+    format!(
+        "python3 -c {} {} {} {} {}",
+        sh_quote(PROG),
+        sh_quote(&log_path.to_string_lossy()),
+        log_rotate_bytes(),
+        if log_raw_capture() { 1 } else { 0 },
+        log_flush_ms(),
+    )
+}
+
+/// Size cap for a single session log before it rolls to `<name>.log.1`.
+/// `AMUX_LOG_MAX_MB=0` disables rotation. Default 32MB: the incident's own
+/// specimen was an 11MB file with no rotation at all, and two generations at
+/// 32MB is a bounded 64MB per session.
+fn log_rotate_bytes() -> u64 {
+    std::env::var("AMUX_LOG_MAX_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(32) * 1024 * 1024
+}
+
+/// `AMUX_LOG_RAW=1` keeps the verbatim byte stream (colour, cursor escapes)
+/// instead of readable text. Secrets are still redacted in both modes.
+fn log_raw_capture() -> bool {
+    matches!(std::env::var("AMUX_LOG_RAW").unwrap_or_default().trim(), "1" | "true" | "yes")
+}
+
+/// How long the pane must be QUIET before an unterminated trailing fragment
+/// is written out. Deliberately a quiet-detector rather than a periodic
+/// timer: a periodic flush cuts live spinner frames in half mid-word.
+fn log_flush_ms() -> u64 {
+    std::env::var("AMUX_LOG_FLUSH_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 100)
+        .unwrap_or(2000)
 }
 
 async fn poll_shell_prompt(name: &str, timeout_ms: u64) -> bool {
@@ -2646,7 +3245,16 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     }
     let ptq = pt(name);
     let pipe_cmd = log_pipe_command(&lp);
-    let _ = tmux(&["pipe-pane", "-t", &ptq, "-o", &pipe_cmd]).await;
+    // NO `-o` here. tmux's `-o` means "only open a pipe if none exists", and
+    // its implementation closes the existing pipe and then declines to open a
+    // replacement — i.e. on an ALREADY-PIPED pane it is a toggle OFF. Starting
+    // a session whose pane was still piped therefore DISABLED its logging,
+    // silently and with a success exit code. Measured on tmux 3.6a: arm ->
+    // pane_pipe=1, arm again with -o -> pane_pipe=0, again -> 1. Half the live
+    // fleet (29 of 60 panes) was sitting unpiped from exactly this. Plain
+    // `pipe-pane` is what we want and is idempotent: tmux closes any existing
+    // pipe before running the new command, so re-arming is always safe.
+    let _ = tmux(&["pipe-pane", "-t", &ptq, &pipe_cmd]).await;
     meta.remove("start_error");
     meta.insert("last_started".into(), json!(now_i64()));
     let count = meta.get("start_count").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -3069,17 +3677,22 @@ fn save_session_log(name: &str, content: &str) {
     let _ = std::fs::create_dir_all(logs_dir());
     let lp = log_path(name);
     let data = content.as_bytes();
-    let existing = lp.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    if existing + data.len() > MAX_LOG_BYTES {
-        let mut combined = std::fs::read(&lp).unwrap_or_default();
-        combined.extend_from_slice(data);
-        let start = combined.len().saturating_sub(MAX_LOG_BYTES);
-        let _ = std::fs::write(&lp, &combined[start..]);
-    } else {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&lp) {
-            let _ = f.write_all(data);
-        }
+    // APPEND-ONLY. This used to read the whole file, concatenate, and rewrite
+    // the last MAX_LOG_BYTES whenever the cap was crossed — two defects at
+    // once. First, the pipe-pane writer holds an O_APPEND fd on this same
+    // file, so a read-modify-write races it and silently drops whatever the
+    // writer appended between the read and the write. Second, it made size
+    // discipline a policy owned by TWO components that disagreed: this one
+    // trimmed to 10MB, the writer rolls at AMUX_LOG_MAX_MB. Five logs on the
+    // live fleet sat at exactly 10,485,760 bytes from this path.
+    //
+    // Rotation now has exactly one owner — the writer, which holds the fd. A
+    // session with no writer can drift over the cap until its next start arms
+    // one; that is bounded and comprehensible, which two racing trimmers were
+    // not.
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&lp) {
+        let _ = f.write_all(data);
     }
 }
 
@@ -3110,10 +3723,15 @@ async fn capture_log_tail_for_reload(name: &str, reason: &str) -> bool {
     let existing = load_session_log(name, MAX_LOG_BYTES as u64);
     chunks.extend_from_slice(existing.as_bytes());
     let mut captured = String::new();
+    let mut was_piped = false;
     if is_running(name).await {
-        let stq = st(name);
-        let _ = tmux(&["pipe-pane", "-t", &stq]).await;
         let ptq = pt(name);
+        // Detaching the pipe is deliberate: the whole-file rewrite below would
+        // otherwise race the writer's appends. But it has to be put BACK —
+        // this used to detach and return, so any provider/model/effort/yolo
+        // swap left the session permanently unlogged with nothing reporting it.
+        was_piped = pane_is_piped(name).await;
+        let _ = tmux(&["pipe-pane", "-t", &ptq]).await;
         if let Some(o) = run_cmd("tmux", &["capture-pane", "-t", &ptq, "-p", "-S", "-"], Duration::from_secs(30)).await {
             captured = String::from_utf8_lossy(&o.stdout).into_owned();
         }
@@ -3132,10 +3750,266 @@ async fn capture_log_tail_for_reload(name: &str, reason: &str) -> bool {
         chunks.extend_from_slice(cap_text.as_bytes());
     }
     if chunks.is_empty() {
+        if was_piped {
+            rearm_log_pipe(name).await;
+        }
         return false;
     }
     let start = chunks.len().saturating_sub(MAX_LOG_BYTES);
-    std::fs::write(&lp, &chunks[start..]).is_ok()
+    let ok = std::fs::write(&lp, &chunks[start..]).is_ok();
+    if was_piped {
+        rearm_log_pipe(name).await;
+    }
+    ok
+}
+
+/// Is this pane currently piped? `#{pane_pipe}` is tmux's own answer, and it
+/// is the field the stale-log verdict in `/api/debug/logs` keys off.
+async fn pane_is_piped(name: &str) -> bool {
+    let ptq = pt(name);
+    match tmux(&["list-panes", "-t", &ptq, "-F", "#{pane_pipe}"]).await {
+        Some(o) => String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "1"),
+        None => false,
+    }
+}
+
+/// Re-attach the log pipe. Same construction as `start_session` and, like it,
+/// without `-o` — see the comment there for why `-o` silently disables the
+/// pipe it is supposed to guard.
+async fn rearm_log_pipe(name: &str) {
+    let _ = std::fs::create_dir_all(logs_dir());
+    let lp = log_path(name);
+    let ptq = pt(name);
+    let pipe_cmd = log_pipe_command(&lp);
+    let _ = tmux(&["pipe-pane", "-t", &ptq, &pipe_cmd]).await;
+}
+
+/// Previous generation produced by the writer's rotation.
+fn rotated_log_path(name: &str) -> PathBuf {
+    logs_dir().join(format!("{name}.log.1"))
+}
+
+/// GET /api/debug/logs — per-session logging health.
+///
+/// This endpoint exists because of the AMUX-2628 failure MODE, not merely the
+/// bug: every log on the fleet stopped growing and NOTHING said so for over an
+/// hour. Each individual signal looked healthy — `pane_pipe` was 1, the writer
+/// process was alive holding the right inode, the file existed — and the only
+/// way to see the fault was to correlate three facts that no single view put
+/// side by side. So this reports the correlation, and computes the VERDICT
+/// rather than leaving it to whoever is reading (ethos rule 4: the instrument
+/// has to be able to express the discriminator).
+///
+/// The discriminating verdict is `stale`: piping is on and the pane has been
+/// active more recently than the log was written. That is the exact shape of
+/// this incident and it is what a sweep can key on tomorrow.
+pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
+    let qs = parse_qs(q.as_deref().unwrap_or(""));
+    let stale_s: u64 = qs_first(&qs, "stale_s", "120").parse().unwrap_or(120);
+    let now = now_i64();
+
+    // One tmux call for the whole fleet: name, pipe state, and when the
+    // session last produced activity. Correlating per session would be 3N
+    // spawns and would also sample the three fields at different instants.
+    let mut panes: BTreeMap<String, (bool, i64)> = BTreeMap::new();
+    let mut unmanaged = 0usize;
+    if let Some(o) = tmux(&[
+        "list-panes",
+        "-a",
+        "-F",
+        // window_activity, NOT session_activity. Measured on tmux 3.6a: a
+        // pane writing output moves #{window_activity} and leaves
+        // #{session_activity} untouched (it tracks session-level use). Keying
+        // the stale verdict on session_activity made every busy pane look
+        // dormant — the verdict would have answered, plausibly, and wrongly.
+        "#{session_name}\t#{pane_pipe}\t#{window_activity}",
+    ])
+    .await
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut it = line.split('\t');
+            let (Some(sess), Some(pipe), Some(act)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Some(name) = sess.strip_prefix("amux-") else { continue };
+            // Only sessions amux MANAGES. A tmux session with no `<name>.env`
+            // was not created by the session verbs, so amux never armed a pipe
+            // for it and "unpiped" is not a fault. Counting them made
+            // `healthy` permanently false on this machine (12 leftover
+            // zz-*/smprobe-* panes), and a verdict that can never be green is
+            // one nobody reads — the same defect as a threshold below the
+            // baseline. The skipped count is reported rather than dropped, so
+            // the exemption cannot hide a real session that lost its env file.
+            if !env_path(name).exists() {
+                unmanaged += 1;
+                continue;
+            }
+            let e = panes.entry(name.to_string()).or_insert((false, 0));
+            e.0 |= pipe.trim() == "1";
+            e.1 = e.1.max(act.trim().parse::<i64>().unwrap_or(0));
+        }
+    }
+
+    // Writer liveness, one `ps` for the fleet. "pipe on but the writer died"
+    // and "pipe on, writer alive, nothing arriving" are different bugs and
+    // were indistinguishable during the incident.
+    let mut writers: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // -ww: without it macOS ps truncates the command line, and the writer's
+    // argv is ~3.3KB of embedded program with the log path at the very END —
+    // i.e. exactly the part that gets cut, so every writer would read as absent.
+    if let Some(o) = run_cmd("ps", &["-axww", "-o", "pid=,lstart=,command="], OP_TIMEOUT).await {
+        let dir = logs_dir().to_string_lossy().into_owned();
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let Some(idx) = line.find(&dir) else { continue };
+            // The writer's own signature, not "python3": the CHILD process is
+            // spelled `.../MacOS/Python -c ...` on macOS, so a python3 test
+            // silently matched nothing and reported every writer dead.
+            if !line.contains("sys.argv") {
+                continue;
+            }
+            let tail = &line[idx + dir.len()..];
+            let file = tail.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            let Some(base) = file.strip_suffix(".log") else { continue };
+            let mut head = line.split_whitespace();
+            let Some(Ok(pid)) = head.next().map(str::parse::<i64>) else { continue };
+            // lstart is a fixed 5-field ctime string ("Sun Aug  9 21:34:13
+            // 2026"). How long the WRITER has existed is what separates "this
+            // pipe is broken now" from "this pipe was just re-armed and the
+            // pane has not spoken since" — without it the surface stays red
+            // after a correct fix, which is how a verdict stops being read.
+            let stamp: Vec<&str> = head.clone().take(5).collect();
+            let started = if stamp.len() == 5 {
+                {
+                    use chrono::TimeZone as _;
+                    chrono::NaiveDateTime::parse_from_str(&stamp.join(" "), "%a %b %e %H:%M:%S %Y")
+                        .ok()
+                        .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+                        .map(|d: chrono::DateTime<chrono::Local>| d.timestamp())
+                        .unwrap_or(0)
+                }
+            } else {
+                0
+            };
+            writers.entry(base.to_string()).or_insert((pid, started));
+        }
+    }
+
+    let mut names: Vec<String> = panes.keys().cloned().collect();
+    if let Ok(rd) = std::fs::read_dir(logs_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("log") {
+                if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
+                    if panes.contains_key(s) {
+                        continue;
+                    }
+                    if env_path(s).exists() {
+                        names.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+
+    let mut rows = Vec::new();
+    let (mut ok, mut stale, mut unpiped, mut idle, mut recovering) = (0, 0, 0, 0, 0);
+    for name in &names {
+        let (piped, activity) = panes.get(name).copied().unwrap_or((false, 0));
+        let running = panes.contains_key(name);
+        let lp = log_path(name);
+        let md = lp.metadata().ok();
+        let size = md.as_ref().map(|m| m.len());
+        let log_age = md
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| now - d.as_secs() as i64);
+        let act_age = if activity > 0 { Some(now - activity) } else { None };
+
+        let (verdict, detail) = if !running {
+            ("not-running", "no tmux pane for this session".to_string())
+        } else if !piped {
+            unpiped += 1;
+            ("unpiped", "pane is running but pipe-pane is OFF — nothing is being logged".to_string())
+        } else {
+            match (log_age, act_age) {
+                (Some(la), Some(aa)) if la > stale_s as i64 && aa < la => {
+                    // Was a writer even present when that output happened? If
+                    // the writer is YOUNGER than the gap, the missing output
+                    // predates it and the pipe is merely waiting for the pane
+                    // to speak again — a different, non-actionable state.
+                    let writer_age = writers.get(name).map(|(_, st)| now - st).unwrap_or(0);
+                    if writer_age > 0 && writer_age < aa {
+                        recovering += 1;
+                        (
+                            "recovering",
+                            format!(
+                                "pipe re-armed {writer_age}s ago; the {la}s-old log predates it \
+                                 and the pane has not written since"
+                            ),
+                        )
+                    } else {
+                        stale += 1;
+                        (
+                            "stale",
+                            format!(
+                                "piping on but no write in {la}s while the pane was active {aa}s ago"
+                            ),
+                        )
+                    }
+                }
+                (None, _) => {
+                    stale += 1;
+                    ("stale", "piping on but no log file exists".to_string())
+                }
+                (Some(la), _) => {
+                    if la > stale_s as i64 {
+                        idle += 1;
+                        ("idle", format!("no write in {la}s, but the pane is idle too"))
+                    } else {
+                        ok += 1;
+                        ("ok", format!("last write {la}s ago"))
+                    }
+                }
+            }
+        };
+        rows.push(json!({
+            "name": name,
+            "running": running,
+            "pipe": piped,
+            "writer_pid": writers.get(name).map(|(p, _)| *p),
+            "writer_age_s": writers.get(name).map(|(_, st)| now - st),
+            "log_bytes": size,
+            "log_age_s": log_age,
+            "pane_activity_age_s": act_age,
+            "rotated_bytes": rotated_log_path(name).metadata().map(|m| m.len()).ok(),
+            "verdict": verdict,
+            "detail": detail,
+        }));
+    }
+
+    j200(json!({
+        "checked_at": now,
+        "stale_s": stale_s,
+        // Panes named amux-* that amux does not manage (no session env file).
+        // Named, not silently dropped.
+        "unmanaged_panes_skipped": unmanaged,
+        "config": {
+            "raw_capture": log_raw_capture(),
+            "rotate_max_bytes": log_rotate_bytes(),
+            "flush_ms": log_flush_ms(),
+        },
+        "counts": {
+            "total": rows.len(), "ok": ok, "stale": stale,
+            "unpiped": unpiped, "idle": idle, "recovering": recovering,
+            "not_running": rows.len() - ok - stale - unpiped - idle - recovering,
+        },
+        // The whole point of the endpoint: a sweep reads this one boolean.
+        "healthy": stale == 0 && unpiped == 0,
+        "sessions": rows,
+    }))
 }
 
 fn mark_pending_log_reload(name: &str, reason: &str) {
@@ -4426,7 +5300,18 @@ fn log_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        return j200(json!({"exists": true, "size": md.len(), "mtime": mtime, "path": lp.to_string_lossy()}));
+        // Rotation is only honest if the reader is TOLD an older generation
+        // exists — otherwise `size` reads as "everything this session ever
+        // produced" and a roll looks like the log was cleared.
+        let rp = rotated_log_path(name);
+        let rotated = rp.metadata().map(|m| m.len()).ok();
+        return j200(json!({
+            "exists": true, "size": md.len(), "mtime": mtime, "path": lp.to_string_lossy(),
+            "rotated": rotated.is_some(),
+            "rotated_size": rotated.unwrap_or(0),
+            "rotated_path": rotated.map(|_| rp.to_string_lossy().into_owned()),
+            "rotate_max_bytes": log_rotate_bytes(),
+        }));
     }
     if !subid.is_empty() {
         return not_found();
@@ -4454,12 +5339,23 @@ fn log_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
         let text = collapse_blank_runs(&strip_ansi(&String::from_utf8_lossy(&data)));
         data = text.into_bytes();
     }
+    // Two INDEPENDENT ways this body is not the whole log, and a caller that
+    // sees only `x-log-remaining` cannot tell them apart: the tail_kb slice
+    // (bytes dropped from this file) and rotation (a whole prior generation
+    // sitting in <name>.log.1). Report both, and a single boolean the caller
+    // can branch on without arithmetic.
+    let rotated_bytes = rotated_log_path(name).metadata().map(|m| m.len()).unwrap_or(0);
     (
         StatusCode::OK,
         [
             ("content-type", "text/plain; charset=utf-8".to_string()),
             ("content-disposition", format!("attachment; filename=\"{name}.log\"")),
             ("x-log-remaining", remaining.to_string()),
+            ("x-log-rotated-bytes", rotated_bytes.to_string()),
+            (
+                "x-log-truncated",
+                if remaining > 0 || rotated_bytes > 0 { "1".to_string() } else { "0".to_string() },
+            ),
         ],
         data,
     )
@@ -5211,6 +6107,38 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     if ok && msg.contains("at a selector") {
         resp["held_at_selector"] = json!(true);
     }
+    // WHAT "sent" MEANS, stated in the payload (AMUX-2629). Before this, a
+    // caller had one bit — `ok` — covering four different outcomes, and the
+    // one that mattered ("the keys landed but Claude Code never took the
+    // message") was indistinguishable from success. It is now explicit:
+    //   submitted=true   — read back from the composer / the conversation JSONL
+    //   submitted=false  — the text is STILL in the input box; NOT delivered
+    //   submitted=null   — queued/deferred, or the composer could not be read;
+    //                      `submission` names which
+    // `ok` keeps its old meaning (did the request do its job) so existing
+    // callers do not silently change behaviour; `submitted` is the new,
+    // narrower claim. Never widen `ok` to mean "submitted" — a deferred
+    // message is a legitimate success that has not been submitted yet.
+    resp["submitted"] = if msg.starts_with("queued") || msg.contains("could not be verified") {
+        Value::Null
+    } else {
+        json!(ok)
+    };
+    resp["submission"] = json!(if msg.starts_with("queued") {
+        "deferred"
+    } else if msg.contains("could not be verified") {
+        "unverified"
+    } else if ok {
+        "confirmed"
+    } else {
+        "not_submitted"
+    });
+    // A retry means the FIRST Enter was dropped. Reported even on success:
+    // smoothing it into a plain "sent" is how a degrading delivery path stays
+    // invisible until it drops a message for ten minutes (AMUX-2629).
+    if msg.contains("on retry") {
+        resp["retried"] = json!(true);
+    }
     // Python additionally reports recipient_gated from its in-memory
     // credit-gate state (_session_auto_actions) — process state this origin
     // does not hold; named gap.
@@ -5839,18 +6767,55 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
 // dedupe_default_flags), which overrides the global default. It does change
 // the default for a bare `claude` a human starts by hand.
 
+// THE CONFIRMATION DIALOG, and how it was found. A mid-conversation model
+// switch is not silent — Claude Code asks:
+//
+//     Switch model?                      | Change effort level?
+//     Your next response will be slower and use more tokens
+//     This conversation is cached for the current model. Switching to Haiku
+//     4.5 means the full history gets re-read on your next message.
+//   ❯ 1. Yes, switch to Haiku 4.5           | 1. Yes, switch to high
+//     2. No, go back                        | 2. No, go back
+//
+// — one dialog per changed key, and the TITLES differ while the body does not.
+//
+// It is in no `--help` output and it does not appear on a fresh pane, so the
+// only way to find it was to run the shipped path against a session with a
+// real conversation. The first two live runs fell back to a restart on
+// switches that had ALREADY landed — the delivery was fine, the pane was
+// sitting on an unanswered dialog — and the fallback's own log line (the pane
+// tail, added for exactly this reason) is what showed it. Without that tail
+// the symptom is "hot switching does not work", and the natural next move is
+// to widen the timeout, which would never have helped.
+//
+// amux answers it. That is not amux deciding something that was the user's to
+// decide (D2 / ethos rule 8): the switch was requested explicitly through the
+// API by whoever operated the picker, and this dialog asks only whether they
+// meant the thing they just asked for. Leaving it unanswered would park the
+// session on a selector amux itself opened, and would make the feature useless
+// on precisely the sessions it exists for — the ones with a conversation worth
+// keeping.
+
 /// What Claude Code prints when a slash config command lands.
 const CC_MODEL_ACK: &str = "Set model to ";
 const CC_EFFORT_ACK: &str = "Set effort level to ";
 /// …and when it refuses the id ("Model 'x' not found").
 const CC_SLASH_REJECT: &str = "not found";
+/// The body every mid-conversation config-change confirmation shares — the
+/// model dialog and the effort dialog differ in TITLE but not in this line.
+const CC_CONFIG_CONFIRM_BODY: &str = "This conversation is cached for the current";
 /// How far below the echoed command the answer may sit. Claude renders it on
 /// the very next line (`  ⎿  Set model to …`); the slack absorbs a wrap.
 const SLASH_ACK_WINDOW: usize = 6;
 /// The slash command is handled locally by the CLI, so the ack renders in well
-/// under a second. Poll instead of sleeping a fixed budget so a loaded machine
-/// does not turn a working switch into a restart.
-const HOT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// under a second — but a mid-conversation switch interposes the confirmation
+/// dialog above, which amux has to see and answer first. Poll rather than
+/// sleeping a fixed budget so a loaded machine does not turn a working switch
+/// into a restart.
+const HOT_ACK_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long to watch for the confirmation dialog of a switch that was QUEUED
+/// on the steering queue rather than delivered immediately.
+const QUEUED_CONFIRM_WATCH: Duration = Duration::from_secs(300);
 
 /// How a model/effort change reaches a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5990,6 +6955,59 @@ fn slash_verdict(before: &str, after: &str, cmd: &str, ack: &str) -> Option<HotO
     None
 }
 
+/// The key that CONFIRMS a pending config-change dialog, if one is on screen.
+///
+/// Anchored on the dialog's BODY, not its title. The model dialog is titled
+/// "Switch model?" and the effort one "Change effort level?" — pinning the
+/// title made `/effort` fall back to a restart on its first live run while
+/// `/model` worked, with the two failures looking nothing alike. The body line
+/// is the invariant across the family, and it is also what identifies the
+/// dialog as "this config change re-reads the conversation, confirm?" rather
+/// than some other selector amux must not touch.
+///
+/// The choice is read from the OPTION TEXT ("Yes"), never hardcoded to `1`, so
+/// a reordering of the two options cannot silently turn a confirm into a
+/// cancel — the failure mode where amux reports a switch and presses "No".
+fn config_switch_confirm_key(pane: &str) -> Option<String> {
+    let clean = strip_ansi(pane);
+    if !clean.contains(CC_CONFIG_CONFIRM_BODY) {
+        return None;
+    }
+    let re = regex::Regex::new(r"(?i)(?:^|\s)(\d+)\.\s*yes\b").unwrap();
+    clean
+        .lines()
+        .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
+}
+
+/// Watch for the confirmation dialog of a switch that went onto the STEERING
+/// QUEUE instead of being delivered inline, and answer it once.
+///
+/// A queued `/model` lands at the next turn boundary, long after this request
+/// has returned — and the dialog then opens with nobody to answer it, parking
+/// the session on a selector amux itself asked for. Bounded, single-shot, and
+/// narrow: it only ever answers a "Switch model?" dialog. If the window
+/// expires the dialog is still on screen and the session reads as `waiting` on
+/// the dashboard — stalled and SEEN, never stalled and silent.
+fn spawn_switch_confirm_watcher(name: &str) {
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + QUEUED_CONFIRM_WATCH;
+        while std::time::Instant::now() < deadline {
+            sleep_ms(2000).await;
+            let pane = tmux_capture(&name, 40).await;
+            if let Some(key) = config_switch_confirm_key(&pane) {
+                send_key(&name, &key).await;
+                tracing::info!(session = %name, key, "hot config: confirmed a queued config change");
+                return;
+            }
+        }
+        tracing::warn!(
+            session = %name,
+            "hot config: a queued config change never showed its confirmation inside the watch window"
+        );
+    });
+}
+
 /// Deliver one slash config command to a live session and report what the
 /// agent did about it.
 ///
@@ -6002,6 +7020,7 @@ fn slash_verdict(before: &str, after: &str, cmd: &str, ack: &str) -> Option<HotO
 async fn deliver_hot_config(state: &AppState, name: &str, cmd: &str, ack: &str) -> HotOutcome {
     let before = tmux_capture(name, 40).await;
     let (sent, msg) = send_text(state, name, cmd, true).await;
+    tracing::info!(session = name, cmd, sent, result = %msg, "hot config: delivered");
     if !sent {
         return HotOutcome::Failed(msg);
     }
@@ -6011,16 +7030,44 @@ async fn deliver_hot_config(state: &AppState, name: &str, cmd: &str, ack: &str) 
     // means delivery is deferred, so there is nothing to confirm yet — and
     // claiming a verdict we cannot see is what rule 4 forbids.
     if msg != "sent" {
+        spawn_switch_confirm_watcher(name);
         return HotOutcome::Queued;
     }
     let deadline = std::time::Instant::now() + HOT_ACK_TIMEOUT;
+    let mut last = String::new();
+    let mut confirmed = false;
     while std::time::Instant::now() < deadline {
         sleep_ms(250).await;
-        let after = tmux_capture(name, 40).await;
-        if let Some(v) = slash_verdict(&before, &after, cmd, ack) {
+        last = tmux_capture(name, 40).await;
+        if let Some(v) = slash_verdict(&before, &last, cmd, ack) {
             return v;
         }
+        // The switch is waiting on its confirmation dialog: answer it once and
+        // keep polling for the ack that follows.
+        if !confirmed {
+            if let Some(key) = config_switch_confirm_key(&last) {
+                send_key(name, &key).await;
+                confirmed = true;
+                tracing::info!(session = name, cmd, key, "hot config: confirmed the config-change dialog");
+            }
+        }
     }
+    // A fallback that leaves no trace is indistinguishable from a switch that
+    // never happened (ethos rule 4) — and the first live run of this path fell
+    // back on a switch that HAD landed, which was only diagnosable because the
+    // restart's --resume replayed the ack into the new pane. Log what the pane
+    // actually said, so the next timeout is decidable from the log alone.
+    let clean = strip_ansi(&last);
+    let tail: String = clean.lines().rev().take(12).collect::<Vec<_>>().join(" | ");
+    tracing::warn!(
+        session = name,
+        cmd,
+        ack,
+        echo_seen = clean.contains(cmd),
+        ack_seen = clean.contains(ack),
+        pane_tail = %tail,
+        "hot config: no acknowledgement, falling back to a restart"
+    );
     HotOutcome::Failed(format!(
         "no acknowledgement in the pane within {}s",
         HOT_ACK_TIMEOUT.as_secs()
@@ -6640,6 +7687,130 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// Feed `input` to the real generated pipe command and return the log.
+    /// Runs the SHIPPED string through `sh -c`, exactly as tmux's `pipe-pane`
+    /// does — not a paraphrase of what the program is believed to do.
+    fn run_pipe_writer(input: &[u8], log: &Path) -> Vec<u8> {
+        use std::io::Write as _;
+        let cmd = log_pipe_command(log);
+        let mut ch = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn writer");
+        ch.stdin.take().unwrap().write_all(input).unwrap();
+        let out = ch.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "writer exited {:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read(log).unwrap_or_default()
+    }
+
+    /// AMUX-2628. The incident specimen, not a convenient one: a full-screen
+    /// TUI redraw stream is CARRIAGE-RETURN terminated and contains no line
+    /// feed at all (measured 106,081 CR against 2,506 LF in the real
+    /// `amux-frustrations.log`). The shipped writer was
+    /// `for line in sys.stdin.buffer`, which blocks in `readline()` until an
+    /// LF, so it wrote NOTHING while tmux reported `pane_pipe=1` and the
+    /// writer process sat alive holding the file — logging looked healthy and
+    /// the whole fleet's logs were frozen.
+    ///
+    /// This test fails against that writer (0 bytes) and passes against this
+    /// one, which is the only thing that makes it worth having.
+    #[test]
+    fn cr_only_tui_redraws_reach_the_log_without_any_linefeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("s.log");
+        let mut input = Vec::new();
+        for i in 0..200 {
+            input.extend_from_slice(format!("\r\x1b[2K\x1b[36m* Photosynthesizing ({i}s)\x1b[0m").as_bytes());
+        }
+        assert!(!input.contains(&b'\n'), "the specimen must contain NO linefeed");
+
+        let got = run_pipe_writer(&input, &log);
+        let text = String::from_utf8_lossy(&got);
+        assert!(!got.is_empty(), "CR-terminated output never reached the log");
+        assert!(text.contains("Photosynthesizing (0s)"), "first frame missing: {text:.200}");
+        assert!(text.contains("Photosynthesizing (199s)"), "last frame missing");
+        assert!(!got.contains(&0x1b), "ANSI escapes must be stripped by default");
+    }
+
+    /// Redaction is the writer's original job and must survive the rewrite,
+    /// including for a secret that arrives with only CR terminators.
+    #[test]
+    fn secrets_are_redacted_in_cr_terminated_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("s.log");
+        let got = run_pipe_writer(
+            b"tok sk-ant-abc123DEADBEEFxyz\rANTHROPIC_API_KEY=hunter2hunter2\rghp_abcdefghijklmnopqrstuvwxyz01\r",
+            &log,
+        );
+        let text = String::from_utf8_lossy(&got);
+        assert!(!text.contains("hunter2"), "api key leaked: {text}");
+        assert!(!text.contains("DEADBEEF"), "anthropic key leaked: {text}");
+        assert!(!text.contains("abcdefghijklmnopqrstuvwxyz01"), "github token leaked: {text}");
+        assert!(text.contains("REDACTED"), "expected a redaction marker: {text}");
+    }
+
+    /// Cursor MOVEMENT becomes whitespace rather than being deleted. Deleting
+    /// it is what turned reflowed prose into "whoseoutcomeisartifacts" — the
+    /// log was technically ANSI-free and still not readable.
+    #[test]
+    fn cursor_movement_does_not_jam_words_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("s.log");
+        let got = run_pipe_writer(b"alpha\x1b[20Gbeta\x1b[5Cgamma\r", &log);
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("alpha beta gamma"), "movement not mapped to space: {text:?}");
+    }
+
+    /// Rotation must actually roll, and must leave a marker saying so — a log
+    /// that silently restarts at zero reads as "the session did nothing".
+    #[test]
+    fn the_log_rotates_at_the_configured_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("s.log");
+        // 1MB cap via the same env knob the server bakes into the command.
+        std::env::set_var("AMUX_LOG_MAX_MB", "1");
+        let mut input = Vec::new();
+        for i in 0..40_000 {
+            input.extend_from_slice(format!("line {i:06} padding-padding-padding\r").as_bytes());
+        }
+        let got = run_pipe_writer(&input, &log);
+        std::env::remove_var("AMUX_LOG_MAX_MB");
+        let rolled = dir.path().join("s.log.1");
+        assert!(rolled.exists(), "no rotated generation was produced");
+        assert!(
+            String::from_utf8_lossy(&got).contains("amux log rotated"),
+            "rotation left no marker in the live log"
+        );
+        assert!(got.len() < 2 * 1024 * 1024, "live log did not shrink after rotation");
+    }
+
+    /// `-o` is the flag that silently DISABLES an existing pipe (tmux closes
+    /// the old pipe and then declines to open a replacement). Re-arming a
+    /// running session is routine, so this must never come back.
+    #[test]
+    fn the_pipe_is_armed_without_the_toggle_flag() {
+        let src = include_str!("session_verbs.rs");
+        for line in src.lines() {
+            let l = line.trim();
+            if l.starts_with("//") || !l.contains("\"pipe-pane\"") {
+                continue;
+            }
+            assert!(
+                !l.contains("\"-o\""),
+                "pipe-pane armed with -o, which toggles an already-piped pane OFF: {l}"
+            );
+        }
+    }
 
     fn state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -7561,5 +8732,259 @@ mod hot_model_switch_tests {
             mode_after_delivery(&fold_hot_outcomes(&[out])),
             SwapMode::Restart
         );
+    }
+}
+
+#[cfg(test)]
+mod hot_switch_dialog_tests {
+    //! The confirmation dialog, pinned against the REAL text captured from
+    //! Claude Code v2.1.226 on 2026-08-09 (server log, AMUX-2617 probe). Both
+    //! variants are here because the first implementation anchored on the
+    //! model dialog's TITLE and silently could not answer the effort one.
+    use super::*;
+
+    const MODEL_DIALOG: &str = "\
+   Switch model?
+
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Haiku 4.5 means the full history gets re-read on your next message.
+
+ ❯ 1. Yes, switch to Haiku 4.5
+   2. No, go back
+";
+
+    const EFFORT_DIALOG: &str = "\
+   Change effort level?
+
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current effort level. Switching to high means the full history gets re-read on your next message.
+
+ ❯ 1. Yes, switch to high
+   2. No, go back
+";
+
+    #[test]
+    fn both_config_dialogs_are_answered() {
+        assert_eq!(config_switch_confirm_key(MODEL_DIALOG).as_deref(), Some("1"));
+        assert_eq!(
+            config_switch_confirm_key(EFFORT_DIALOG).as_deref(),
+            Some("1"),
+            "the effort dialog's title differs from the model one; anchoring on the title \
+             made this return None and turned every effort change into a restart"
+        );
+    }
+
+    /// The confirm must be chosen by TEXT, so reordering the options cannot
+    /// make amux press "No" while reporting a switch.
+    #[test]
+    fn the_yes_option_is_found_by_text_not_by_position() {
+        let reordered = MODEL_DIALOG
+            .replace("1. Yes, switch to Haiku 4.5", "1. No, go back")
+            .replace("2. No, go back", "2. Yes, switch to Haiku 4.5");
+        assert_eq!(config_switch_confirm_key(&reordered).as_deref(), Some("2"));
+    }
+
+    /// Narrow by construction: an ordinary pane, and any OTHER selector, must
+    /// never be answered. amux presses a key here only because it is the one
+    /// that asked for the change.
+    #[test]
+    fn no_other_selector_is_ever_answered() {
+        assert_eq!(config_switch_confirm_key("❯ just a prompt\n"), None);
+        // A real AskUserQuestion-style selector: numbered, has a "Yes", but
+        // carries none of the config-confirmation body.
+        let unrelated = " Delete the branch?\n ❯ 1. Yes, delete it\n   2. Cancel\n";
+        assert_eq!(
+            config_switch_confirm_key(unrelated),
+            None,
+            "answering an unrelated selector would be amux deciding for the user"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AMUX-2629 — the submission evidence gate.
+//
+// Every fixture here is rebuilt from the INCIDENT, not from a convenient shape
+// (ethos rule 7): amux-rust, 2026-08-09. The owner's message was typed into a
+// mid-turn composer at 20:55:25, `POST /api/sessions/amux-rust/send` answered
+// 200 {"ok":true} in 1050ms, and the text entered the conversation transcript
+// at 21:06:15 — 10m50s later, when a human pressed a bare Enter. Claude Code
+// writes a `queue-operation: enqueue` record for every mid-turn Enter it
+// ACCEPTS (10 of them in that same transcript); there is none at 20:55, which
+// is what discriminates "the Enter was not accepted" from "it was queued and
+// waiting". The pre-fix code could not tell those apart and reported both as
+// "sent (queued while generating)".
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod submission_gate_tests {
+    use super::*;
+
+    /// The real stuck message (142 chars — under the 400-char paste threshold,
+    /// so it took the `send-keys -l` path).
+    const GHOST: &str = "[06:55 PM] there are 9 queued commands here in this worker but ur idle - figure out why this is and make sure its fixed at the root moving fwd";
+
+    fn tail_sq(text: &str) -> String {
+        text.trim().chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// Idle composer holding `text` — the frame the pane actually showed for
+    /// ten minutes.
+    fn frame_stuck_idle(text: &str) -> String {
+        format!(
+            "\u{2500}\u{2500}\u{2500}\u{2500} amux-rust \u{2500}\u{2500}\n\
+             \u{276f} {text}\n\
+             \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents\n"
+        )
+    }
+    /// Same text still in the box, but the lane is generating: this IS queued
+    /// input and must be left alone.
+    fn frame_stuck_active(text: &str) -> String {
+        format!(
+            "\u{2731} Galloping\u{2026} (12s \u{b7} \u{2193} 84 tokens)\n\
+             \u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \u{276f} {text}\n\
+             \u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \u{23f5}\u{23f5} bypass permissions on \u{b7} esc to interrupt\n"
+        )
+    }
+    /// A successful submit: composer drawn and empty.
+    fn frame_cleared() -> String {
+        "\u{2500}\u{2500}\u{2500}\u{2500} amux-rust \u{2500}\u{2500}\n\u{276f} \n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{23f5}\u{23f5} bypass permissions on\n".into()
+    }
+    /// A cold Claude Code that has not painted its composer yet.
+    fn frame_no_ui() -> String {
+        "Loading\u{2026}\n\n".into()
+    }
+
+    #[test]
+    fn the_incident_frame_reads_as_stuck_and_the_send_reports_failure() {
+        let t = tail_sq(GHOST);
+        assert_eq!(read_frame(&frame_stuck_idle(GHOST), &t), FrameRead::StillThereIdle);
+        // ...and that verdict must make the SEND report failure, not success.
+        let (ok, msg) = send_outcome(Submission::Stuck, false, false);
+        assert!(!ok, "a message still sitting in the box must not report ok");
+        assert!(msg.starts_with("not submitted"), "{msg}");
+        // The mid-turn spelling, which is the branch the incident took.
+        let (ok, msg) = send_outcome(Submission::Stuck, true, true);
+        assert!(!ok, "mid-turn: a message the retry could not submit must not report ok");
+        assert!(msg.contains("mid-turn Enter was not accepted"), "{msg}");
+    }
+
+    #[test]
+    fn a_frame_that_is_not_the_incident_still_discriminates() {
+        // The probe that would pass against ANY implementation is the danger;
+        // these are the controls that make the test above mean something.
+        let t = tail_sq(GHOST);
+        assert_eq!(read_frame(&frame_cleared(), &t), FrameRead::Cleared);
+        assert_eq!(read_frame(&frame_no_ui(), &t), FrameRead::NoUi);
+        assert_eq!(read_frame(&frame_stuck_active(GHOST), &t), FrameRead::StillThereGenerating);
+        // A DIFFERENT message in the box is not our message.
+        assert_eq!(read_frame(&frame_stuck_idle("[06:50 PM] something else"), &t), FrameRead::Cleared);
+    }
+
+    #[test]
+    fn no_ui_is_never_reported_as_submitted() {
+        // AC-271: an empty pane is "not ready", not "delivered". `ok` stays
+        // true so nobody double-sends, but `submitted` must not be claimed —
+        // the message says so and send_post maps it to submission=unverified.
+        let (ok, msg) = send_outcome(Submission::Unverified, false, false);
+        assert!(ok);
+        assert!(msg.contains("could not be verified"), "{msg}");
+        assert!(!msg.contains("not submitted"), "unverified must not read as a failure: {msg}");
+    }
+
+    #[test]
+    fn wrapped_text_is_matched_across_the_hard_wrap() {
+        // The box wraps at the pane width, splitting the tail across visual
+        // lines at arbitrary points. Checking only the ❯ line is how a wrapped
+        // message's tail escaped verification and got dequeued as "sent" (the
+        // "random" ghost, 2026-07-10).
+        let wrapped = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} [06:55 PM] there are 9 queued commands here in this worker but ur idle - figure\n  out why this is and make sure its fixed at the root moving fwd\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{23f5}\u{23f5} bypass permissions on\n";
+        assert_eq!(read_frame(wrapped, &tail_sq(GHOST)), FrameRead::StillThereIdle);
+    }
+
+    #[test]
+    fn absent_from_the_evidence_source_is_not_evidence() {
+        // "send reports failure when the message never appears in the evidence
+        // source": the transcript tail has OTHER user messages and an OLDER
+        // copy of ours, but nothing stamped after this send began.
+        let sent_at = 1_786_323_326.0; // 2026-08-09 20:55:26 -0400, the real send
+        let recs = vec![
+            json!({"type":"user","message":{"role":"user","content":"unrelated"},"timestamp":"2026-08-10T00:54:28.000Z"}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":GHOST}]},"timestamp":"2026-08-10T00:56:00.000Z"}),
+            // An OLDER identical user message must not count as this send.
+            json!({"type":"user","message":{"role":"user","content":GHOST},"timestamp":"2026-08-10T00:40:00.000Z"}),
+        ];
+        assert!(!jsonl_records_have(&recs, GHOST, sent_at), "absent-after-since must read as no evidence");
+        // The positive control: the same text stamped AFTER the send is proof.
+        // Without this the negative above could pass on a scanner that never
+        // matches anything.
+        let mut with_it = recs.clone();
+        with_it.push(json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":GHOST}]},"timestamp":"2026-08-10T01:06:15.000Z"}));
+        assert!(jsonl_records_have(&with_it, GHOST, sent_at), "post-send user message IS evidence");
+    }
+
+    #[test]
+    fn iso8601_parses_to_the_real_incident_timestamps() {
+        // The evidence window is only as good as this parse; a wrong epoch
+        // makes the `since` gate match everything or nothing (the
+        // milliseconds-vs-seconds trap, ethos rule 7).
+        let t = parse_iso8601("2026-08-10T01:06:15.000Z").unwrap();
+        assert!((t - 1_786_323_975.0).abs() < 1.0, "got {t}");
+        let z = parse_iso8601("2026-08-09T21:06:15.000-04:00").unwrap();
+        assert!((z - t).abs() < 1.0, "offset form must equal the Z form: {z} vs {t}");
+        assert!(parse_iso8601("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn at_picker_regex_matches_a_mention_not_an_email() {
+        // py:25538 _AT_PICKER_RE. `contains('@')` force-queued any message with
+        // an email in it (2026-07-17); the rust port had reintroduced that.
+        assert!(at_picker_text("[04:27 PM] fix @/Users/ethan/.amux/uploads/x.png"));
+        assert!(at_picker_text("@session please look"));
+        assert!(at_picker_text("/compact"));
+        assert!(!at_picker_text("email mhoward@lucihub.com about it"));
+        assert!(!at_picker_text("nothing special here"));
+        assert!(!at_picker_text(GHOST), "the incident's own text opens no picker");
+    }
+
+    #[test]
+    fn pending_input_reads_the_composer_not_the_transcript() {
+        // The ❯ scan must take the LAST prompt line; earlier ❯ lines in the
+        // scrollback are previous turns.
+        let frame = format!(
+            "\u{276f} an older prompt from the scrollback\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} {GHOST}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{23f5}\u{23f5} bypass permissions on\n"
+        );
+        let p = pending_input(&frame).unwrap();
+        assert!(p.starts_with("[06:55PM]there"), "{p}");
+        assert!(!p.contains("scrollback"), "must not fold in an earlier prompt: {p}");
+    }
+}
+
+#[cfg(test)]
+mod send_retry_reporting_tests {
+    use super::*;
+
+    #[test]
+    fn a_retry_is_never_smoothed_into_a_clean_send() {
+        // The first Enter being dropped and then working on retry is a
+        // DEGRADED delivery, not a success. If this ever reads identically to
+        // a clean send, the signal that the keystroke path is failing is gone
+        // and the next ten-minute stall is invisible again.
+        let (ok, clean) = send_outcome(Submission::Confirmed, false, false);
+        assert!(ok);
+        let (ok, retried) = send_outcome(Submission::Confirmed, false, true);
+        assert!(ok);
+        assert_ne!(clean, retried, "a retried send must not report as a clean send");
+        assert!(retried.contains("on retry"), "{retried}");
+        // send_post keys `retried` off exactly that substring.
+        assert!(!clean.contains("on retry"));
+        let (_, mid) = send_outcome(Submission::Confirmed, true, true);
+        assert!(mid.contains("on retry"), "{mid}");
     }
 }
