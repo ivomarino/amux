@@ -15,9 +15,12 @@
 //! home-relative on both origins).
 //!
 //! The live-fleet-dependent groups cases (groups_dashboard, scoped variants)
-//! are exercised by tests/boundary_live_oracle.rs (#[ignore], needs the live
-//! python server); here the fleet-independent parts are pinned: the contract
-//! strings, the config-miss default shape, and the 404 shapes.
+//! were exercised by tests/boundary_live_oracle.rs, deleted with the Python
+//! server (2026-08-09): once 8822 was answered by Rust, that oracle diffed
+//! Rust against itself — a check that could not fail (ethos rule 7). These
+//! RECORDED goldens are the surviving contract memory; here the
+//! fleet-independent parts are pinned: the contract strings, the config-miss
+//! default shape, and the 404 shapes.
 
 use amux_server::api::{router, AppState};
 use amux_server::db::Store;

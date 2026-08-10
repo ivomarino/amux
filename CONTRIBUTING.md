@@ -6,7 +6,7 @@ Thanks for your interest in amux! The product is a Rust workspace (`crates/`) se
 
 **All new work lands in the Rust server** (`crates/amux-server`, port 8824). If a family of endpoints exists, it answers natively there; the ownership map is [docs/rust-migration/server-boundary.md](docs/rust-migration/server-boundary.md), cross-checked by tests and served live at `GET /api/debug/boundary`.
 
-> **Legacy:** `amux-server.py` at the repo root is the deprecated Python predecessor, kept runnable on port 8822 only for the migration soak ([cutover runbook](docs/rust-migration/cutover-runbook.md)). Do not add features to it, and do not delete it before the runbook's gates pass. Its old contributing rules (single file, `APP_VER`/`CACHE` bumps, `ast.parse` checks) apply only to soak-critical fixes made there.
+> **Legacy:** the Python predecessor (`amux-server.py`) has been removed — git history has it, and the Rust server answers the legacy 8822 port as well as 8824. Only `cloud/` still runs the last-built Python image, pending its own Rust migration; do not build anything new on it.
 
 ## Local development
 
@@ -28,7 +28,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI treats warnings as errors. Integration tests marked `#[ignore]` (the live oracles) need a live server and are run manually.
+CI treats warnings as errors. Integration tests marked `#[ignore]` (the live-model goldens in `golden_live.rs`/`golden_remaining.rs`) spend real agent tokens and are run manually.
 
 ## Project layout
 
@@ -40,8 +40,8 @@ CI treats warnings as errors. Integration tests marked `#[ignore]` (the live ora
 | `crates/amux-core` | Shared domain types |
 | `install.sh` / `uninstall.sh` | One-command setup / teardown |
 | `docs/` | Guides, reference, and the rust-migration docs |
-| `amux-server.py`, `amux`, `amux-remote` | **Legacy** Python server + bash CLIs (soak only) |
-| `cloud/` | Cloud gateway + VM provisioning (the hosted tunnel/SSO tier) |
+| `amux`, `amux-remote` | **Legacy** bash CLIs (HTTP clients of the server; pending `amux-rs` verb parity) |
+| `cloud/` | Cloud gateway + VM provisioning (the hosted tunnel/SSO tier) — still runs the last Python image, pending Rust migration |
 | `site/` | The marketing site (deployed separately) |
 | `ios/`, `android/`, `desktop/` | Native wrappers |
 

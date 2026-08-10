@@ -803,8 +803,17 @@
        line when the row is tight. Desktop keeps the one-line layout (this
        block is phone-only), and the badges remain fully visible — wrapped,
        never clipped. */
-    #peek-title-row { flex-wrap: wrap; row-gap: 2px; }
-    #peek-title { flex: 1 1 auto; min-width: 55%; }
+    /* REVERSED 2026-08-09 on Ethan's call: keep it to ONE row on phones too.
+       The trade above was deliberate and is now decided the other way — a
+       guaranteed 55% floor on the name is what FORCED the model chip onto a
+       second line, costing a whole row of a 2436px-tall phone viewport for one
+       chip. Name truncates with its existing ellipsis instead; the badges are
+       short, fixed-width and the ones you scan for state, so they keep their
+       space and the name yields. Do not restore the 55% floor without asking —
+       the wrap it causes is the reported defect, not a side effect. */
+    #peek-title-row { flex-wrap: nowrap; gap: 6px; }
+    #peek-title { flex: 1 1 auto; min-width: 0; }
+    #peek-session-status, #peek-model-badge { flex-shrink: 0; }
     .file-overlay-header { flex-wrap: nowrap; gap: 6px; align-items: center; position: relative; }
     /* Full title (no more 32vw cutoff) — actions move into the ⋮ menu. */
     .file-overlay-header h2 { font-size: 0.9rem; flex: 1 1 auto; min-width: 0; max-width: none; margin-right: 4px; }

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# UTILITY, not the old Python server: rust-migration invariant-hash tooling, called by .github/workflows/rust.yml.
 """Invariant hash infrastructure (RR-0028j, Invariant 45).
 
 Extracts every `### Invariant N:` section from docs/rust-rebuild-plan.md,

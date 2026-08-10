@@ -124,14 +124,9 @@ Local-first. Auth is a bearer token minted at `~/.amux/auth_token` (localhost ca
 
 ## LEGACY: the Python server
 
-> **`amux-server.py` is the deprecated Python predecessor of the Rust server. Do not build on it.**
->
-> - It still runs on **port 8822** during the migration soak, side by side with the Rust server, against the same `~/.amux` data (the DB is bilingual by construction).
-> - It is **scheduled for removal**. The retirement gates — shadow-scheduler agreement, perf baseline, migration rehearsal, browser suite, and the step-by-step switch — live in [docs/rust-migration/cutover-runbook.md](docs/rust-migration/cutover-runbook.md). Until those gates pass, the file stays runnable (`python3 amux-server.py`) and must not be deleted.
-> - The legacy bash CLI (`amux`) and `amux-remote` talk to 8822; the Rust CLI is `amux-rs`.
-> - Historical install channels (Homebrew `mixpeek/amux/amux`, `pipx install amux`) ship the Python server and will be repointed at the Rust build as part of the cutover.
->
-> If a doc or guide tells you to edit `amux-server.py`, verify a matching Rust surface first: [docs/rust-migration/server-boundary.md](docs/rust-migration/server-boundary.md) is the map from every `/api` family to the crate module that owns it.
+> The Python predecessor (`amux-server.py`) was **removed at this commit** — git history has it, and [docs/rust-migration/](docs/rust-migration/) records how the Rust server replaced it (the Rust binary now answers both 8824 and the legacy 8822).
+> `cloud/` still runs the last-built Python image pending its own Rust migration; do not build anything new on it.
+> Historical install channels that shipped Python (`pipx install amux`, Homebrew) are retired — install with `./install.sh`.
 
 ---
 

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # amux — phone-friendly Claude Code worker manager built on tmux
 # Usage: amux [command] [args...]
+#
+# LEGACY CLIENT, pending amux-rs verb parity: this bash CLI is an HTTP client
+# of the Rust server (which answers both 8822 and 8824) — it is NOT part of the
+# removed Python server, and the fleet's muscle memory (amux send/board/alert)
+# runs through it. Keep it working until crates/amux-cli covers every verb.
 
 set -euo pipefail
 
@@ -97,9 +102,9 @@ load_defaults() {
   [[ -f "$CC_DEFAULTS" ]] && source "$CC_DEFAULTS"
   # Load ~/.amux/server.env so CLI-spawned sessions see the same AMUX_* knobs
   # the server process uses (e.g. AMUX_CLAUDE_CMD). Parsed manually rather than
-  # `source`d so values are never shell-expanded — mirrors the Python loader at
-  # the top of amux-server.py, which treats entries as literal key=value pairs
-  # and is safe for values containing $, backticks, etc.
+  # `source`d so values are never shell-expanded — mirrors the server's env
+  # loader (crates/amux-server/src/config.rs), which treats entries as literal
+  # key=value pairs and is safe for values containing $, backticks, etc.
   local _se="$CC_HOME/server.env"
   if [[ -f "$_se" ]]; then
     local _k _v
@@ -262,8 +267,9 @@ _run_py_safe() {
 }
 
 # Tokenize a stored flag string and re-quote each token shell-safely.
-# Mirror of _shell_quote_flags() in amux-server.py — see that function for
-# full rationale. Required because zsh glob-expands unquoted '[1m]' in
+# Mirror of the server's shell_quote_flags (crates/amux-server/src/api/
+# session_verbs.rs) — see that function for full rationale. Required
+# because zsh glob-expands unquoted '[1m]' in
 # model IDs like 'claude-opus-4-6[1m]', failing with 'no matches found'
 # before claude is even invoked.
 #
@@ -776,8 +782,9 @@ PYEOF
     [[ $rc -eq 0 ]] && return 0
     [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
   fi
-  # Retry: the server re-execs on amux-server.py saves; a 1-2s wait often
-  # recovers. Three tries over ~4s before falling back to raw tmux.
+  # Retry: the server restarts when the builder installs a new binary (it
+  # self-adopts and relaunches); a 1-2s wait often recovers. Three tries over
+  # ~4s before falling back to raw tmux.
   local _retry
   for _retry in 1 2; do
     sleep 2
@@ -1806,16 +1813,17 @@ EOF
         ;;
     esac
   done
-  # Resolve cc-server.py relative to the real location of this script
-  local script_dir
-  script_dir="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
-  local server="$script_dir/amux-server.py"
-  # Fall back to old name during migration
-  [[ -f "$server" ]] || server="$script_dir/cc-server.py"
-  [[ -f "$server" ]] || die "amux-server.py not found at $script_dir"
-  command -v python3 &>/dev/null || die "python3 is required for amux serve"
-  # Pass all args through: amux-server.py parses the positional port and any --bind flag.
-  exec python3 "$server" "$@"
+  # The server is the Rust binary (the Python amux-server.py was removed
+  # 2026-08-09; git history has it). It takes NO argv — port comes from
+  # AMUX_RS_PORT — so map the old positional-port spelling onto the env var.
+  local server="$HOME/.local/bin/amux-server-rs"
+  [[ -x "$server" ]] || server="$(command -v amux-server-rs 2>/dev/null || true)"
+  [[ -n "$server" && -x "$server" ]] || die "amux-server-rs not found — run ./install.sh from the amux checkout"
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    export AMUX_RS_PORT="$1"; shift
+  fi
+  [[ $# -gt 0 ]] && die "amux serve takes only an optional port now (extra args: $*)"
+  exec "$server"
 }
 
 cmd_help() {
@@ -1984,7 +1992,8 @@ ${BOLD}amux tunnel${RESET} — expose a local port at a public HTTPS URL
 
 Any localhost port works: ${BOLD}amux tunnel start 3000${RESET} publishes your dev server.
 Requires an active amux cloud subscription; set AMUX_TUNNEL_TOKEN in
-~/.amux/server.env, then \`touch amux-server.py\` to reload.
+~/.amux/server.env, then restart the server to reload:
+\`launchctl kickstart -k gui/\$(id -u)/com.amux.server-rs\`.
 EOF
 }
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pre-commit hook: security scan + Python/JS syntax + E2E smoke tests
+# Pre-commit hook: security scan + Rust/client-JS syntax
 set -e
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -8,7 +8,8 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 # NO staged-guard CALL HERE ON PURPOSE — the server injects it (2026-08-06).
 #
 # `.git/hooks/amux-staged-guard` is a GENERATED artifact:
-# `_install_amux_precommit_guard()` in amux-server.py writes it from
+# `_install_amux_precommit_guard()` in the amux server (Python-era; see git
+# history of amux-server.py) writes it from
 # `_AMUX_GUARD_BODY` for every work_dir, and inserts its own shim line into
 # whatever pre-commit exists. It is deliberately untracked — the server's own
 # comment says so ("goes in .git/hooks/ where it is untracked and harmless"),
@@ -124,42 +125,22 @@ fi
 
 echo "Security scan passed."
 
-# ── 2. Python + JS syntax (only when amux-server.py is staged) ──────────────
+# ── 2. Rust + client JS syntax (only when the workspace / dashboard is staged) ─
+# The Python predecessor's ast.parse + inline-<script> extraction lived here
+# until 2026-08-09; the client is real static files now and the server is Rust.
 
-FILE="amux-server.py"
-
-if echo "$STAGED" | grep -q "^${FILE}$"; then
-  echo "Checking Python syntax..."
-  python3 -c "import ast; ast.parse(open('$ROOT/$FILE').read())"
-
-  echo "Checking JS syntax..."
-  python3 -c "
-import re, subprocess, sys, tempfile, os
-with open('$ROOT/$FILE') as f:
-    content = f.read()
-blocks = re.findall(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
-if not blocks:
-    print('WARNING: no <script> block found'); sys.exit(0)
-# This was re.search, which matches the FIRST block only: 2,379 of 1,296,891
-# bytes, 0.2% of the client. The board/gate/session client is block 4 of 6 at
-# 1.07MB and had NEVER been parsed here, while the step printed 'Syntax checks
-# passed' on every commit that touched it (AMUX-2331). A green check that
-# cannot see the code it claims to check is worse than no check.
-fail = 0
-for i, b in enumerate(blocks):
-    fd, path = tempfile.mkstemp(suffix='.js')
-    os.write(fd, b.encode())
-    os.close(fd)
-    r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
-    os.unlink(path)
-    if r.returncode != 0:
-        print('JS syntax error in <script> block %d of %d (%d bytes):' % (i + 1, len(blocks), len(b)))
-        print(r.stderr)
-        fail = 1
-if fail:
-    sys.exit(1)
-print('  %d script block(s) parsed, %d bytes' % (len(blocks), sum(len(b) for b in blocks)))
-"
-  echo "Syntax checks passed."
+if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
+  echo "Checking Rust (cargo check --workspace)..."
+  # Same gate CI runs first; incremental, so warm-cache runs are seconds.
+  cargo check --workspace --quiet
+  echo "cargo check passed."
 fi
 
+JS_STAGED=$(echo "$STAGED" | grep -E '^crates/amux-dashboard/static/.*\.(js|mjs)$' || true)
+if [ -n "$JS_STAGED" ]; then
+  echo "Checking client JS syntax..."
+  for f in $JS_STAGED; do
+    node --check "$ROOT/$f"
+  done
+  echo "JS syntax checks passed."
+fi

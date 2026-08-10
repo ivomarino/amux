@@ -1,3 +1,5 @@
+> **HISTORICAL (python era):** this audit predates the Python server's removal (2026-08-09) — `deploy-cloud.yml`, `cloud-image.yml`, `release.yml` and the python steps of `checks.yml` it discusses no longer exist.
+
 # CI/CD audit — 2026-08-06
 
 Measured over the last 100 workflow runs. The headline: **the failures are not

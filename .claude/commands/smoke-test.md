@@ -1,5 +1,5 @@
 ---
-description: Use after making changes to amux-server.py to verify the dashboard and APIs are working correctly
+description: Use after making changes to the amux server or dashboard to verify the dashboard and APIs are working correctly
 allowed-tools: Bash, Read
 argument-hint: [quick|full]
 context: fork
@@ -31,8 +31,9 @@ curl -sk https://localhost:8822/api/board | python3 -c "import json,sys; d=json.
 # 5. SSE endpoint connects (grab first event within 15s)
 timeout 15 curl -sk -N https://localhost:8822/api/events 2>/dev/null | head -5
 
-# 6. Python syntax valid
-python3 -c "import ast; ast.parse(open('amux-server.py').read())" && echo "syntax ok"
+# 6. Workspace compiles + client JS parses
+cargo check --workspace --quiet && echo "cargo check ok"
+node --check crates/amux-dashboard/static/app.js && echo "client JS ok"
 ```
 
 ## Full

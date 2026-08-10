@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# UTILITY, not the old Python server: audits frustrations.md CARD: pointers against the live board over HTTP (server-agnostic).
 """Audit frustrations.md's CARD: pointers against the live board (AF-28).
 
 The protocol rests on this field. `.claude/rules/frustrations.md` requires every entry to

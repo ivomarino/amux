@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# HISTORICAL (python->rust migration tooling): the rehearsal this automated has
+# happened — the Python server was removed 2026-08-09 and the Rust server now
+# answers both ports. Kept as migration history alongside docs/rust-migration/;
+# do not run it against the live system.
 # Migration rehearsal (Phase 11, RR checklist §Migration rehearsal).
 #
 # Proves, against a COPY of the live database, that:

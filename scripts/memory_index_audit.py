@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# UTILITY, not the old Python server: audits Claude Code per-project memory dirs (no amux server dependency).
 """Audit Claude Code per-project memory dirs: is every memory reachable, and is the state diagnosable?
 
 Written by gtm-videos for amux (board GV-644 / AMUX-2446). Backstop for a class of bug where a

@@ -21,7 +21,7 @@ Most of this composes with primitives amux already has: worker logs + `?plain=1`
 5. **Health tab** — uptime, version/commit, worker counts, error rate, watchdog restarts, disk/mem/CPU, provider reachability, cron/scheduler status, cert expiry.
 6. **`amux doctor`** (CLI + in-dashboard) — runs a checklist (tmux present, disk space, ports free, DB integrity, providers reachable, Gmail token valid, cert healthy) and returns pass/fail with fix hints. Deflects a large share of tickets.
 7. **Structured error panel** — capture exceptions/tracebacks with dedupe, counts, and last-seen; a "recent incidents" list instead of grepping raw logs.
-8. **Staleness badge** — warn when this deployment's `amux-server.py` is behind the latest release.
+8. **Staleness badge** — warn when this deployment's server build is behind the latest release.
 
 ## C. Opt-in remote monitoring  *(medium)*
 
@@ -32,7 +32,7 @@ Most of this composes with primitives amux already has: worker logs + `?plain=1`
 
 ## D. Safe remote updates & backup  *(medium–high)*
 
-13. **Update channel** — "Check for updates" then "Apply update": pulls a signed new `amux-server.py`, snapshots first, restarts (the mtime auto-restart already handles this), runs a post-update health check, and auto-rolls-back on failure. Stable/beta channels.
+13. **Update channel** — "Check for updates" then "Apply update": pulls a signed new server binary, snapshots first, restarts (the builder's self-adoption already handles this), runs a post-update health check, and auto-rolls-back on failure. Stable/beta channels.
 14. **Pre-update DB snapshot + one-click restore** of `~/.amux/amux.db` (board, workers, notes, CRM). Local snapshots on every update; cloud deployments already replicate via Litestream→R2.
 15. **Apply support patch** — we propose a config/hotfix; the customer sees a diff and approves; audit-logged. No silent changes.
 

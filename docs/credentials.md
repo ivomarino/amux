@@ -18,8 +18,8 @@ never reveals the other 34.
   board card, not a prompt.
 - **Name + purpose** → this file, committed, so the next session can answer "do we
   already have X?" without reading a secrets file or asking a human.
-- **Adding one:** put the value in `server.env`, add the row here, then
-  `touch amux-server.py` to reload.
+- **Adding one:** put the value in `server.env`, add the row here, then restart the
+  server to reload: `launchctl kickstart -k gui/$(id -u)/com.amux.server-rs`.
 
 Read the names you have with:
 

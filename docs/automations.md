@@ -134,7 +134,7 @@ A robot clicking around with saved logins can do real damage. Non-negotiable:
 
 ## 9. Local vs cloud (single-codebase rule)
 
-Per `CLAUDE.md`, `amux-server.py` is identical local and cloud — no `IS_CLOUD` branches. Automations respect this via **runtime capability detection**, not build flags:
+Per `CLAUDE.md`, the server code is identical local and cloud — no `IS_CLOUD` branches. Automations respect this via **runtime capability detection**, not build flags:
 
 - **Browser-tier robots** work everywhere (local *and* cloud containers) — Playwright runs headless.
 - **Desktop-tier robots** (real mouse/keyboard) need macOS Accessibility + Screen Recording perms and a physical desktop; they take over the machine while running and have **no cloud story** (containers have no desktop).

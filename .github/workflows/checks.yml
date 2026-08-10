@@ -1,7 +1,11 @@
 name: checks
-# Contribution gate: syntax + the full test suite on every push and PR.
-# Collaborators push straight to main (no local hook guaranteed) — this is the
-# net that catches what a missing pre-commit hook lets through.
+# Contribution gate. The Python-era steps (ast.parse of amux-server.py, inline
+# <script> extraction, check_client_refs, pytest) were removed with the Python
+# server on 2026-08-09 — the Rust build/lint/test gates live in rust.yml.
+# What remains is the repo-wide SECRET SCAN, which is language-agnostic and
+# must run on every push: collaborators push straight to main (no local hook
+# guaranteed), and AC-239 was four credentials committed in a PUBLIC repo that
+# only a CI-side scan would have caught.
 on:
   push:
     branches: [main]
@@ -13,43 +17,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - uses: actions/setup-node@v4
-        with: { node-version: '22' }
-      - name: Python syntax (amux-server.py parses)
-        run: python3 -c "import ast; ast.parse(open('amux-server.py').read())"
-      - name: JS syntax (ALL inline dashboard script blocks parse)
-        run: |
-          python3 - <<'PY'
-          import re, subprocess, sys, tempfile, os
-          content = open('amux-server.py').read()
-          # findall, NOT search: search parsed the FIRST block only — 2,379 of
-          # 1,296,891 bytes — so the 1.07MB dashboard block was never parsed by
-          # CI while this step printed green (AMUX-2331; the local pre-commit
-          # hook was fixed months before this CI copy was).
-          blocks = re.findall(r'<script>\s*\n(.*?)</script>', content, re.DOTALL)
-          if not blocks:
-              print('FAIL: no <script> block found — extraction broke'); sys.exit(1)
-          fail = 0
-          for i, b in enumerate(blocks):
-              fd, path = tempfile.mkstemp(suffix='.js')
-              os.write(fd, b.encode()); os.close(fd)
-              r = subprocess.run(['node', '--check', path], capture_output=True, text=True)
-              os.unlink(path)
-              if r.returncode != 0:
-                  print('JS syntax error in block %d of %d:' % (i + 1, len(blocks)))
-                  print(r.stderr); fail = 1
-          if fail: sys.exit(1)
-          print('%d blocks parsed, %d bytes' % (len(blocks), sum(len(b) for b in blocks)))
-          PY
-      - name: Client refs resolve (deleted-function class)
-        run: python3 tests/check_client_refs.py
       - name: Secret scan (the pre-commit hook, in CI)
-        # The hook only runs where it is installed. AC-239: four credentials
-        # sat committed in a PUBLIC repo since 2026-03-11 because the local
-        # hook was the ONLY gate and it did not match them. CI has no such
-        # excuse — same patterns, every push, no install step to forget.
         run: |
           set -euo pipefail
           PATTERNS=(
@@ -72,12 +40,9 @@ jobs:
           fail=0
           for p in "${PATTERNS[@]}"; do
             if out=$(grep -REn -e "$p" --include='*.py' --include='*.sh' --include='*.yml' \
-                      --include='*.yaml' --include='*.json' --include='*.ts' --include='*.js' . 2>/dev/null); then
+                      --include='*.yaml' --include='*.json' --include='*.ts' --include='*.js' \
+                      --include='*.rs' --include='*.toml' . 2>/dev/null); then
               echo "SECRET PATTERN MATCHED: $p"; echo "$out" | head -3 | cut -c1-120; fail=1
             fi
           done
           [ "$fail" -eq 0 ] && echo "secret scan clean" || exit 1
-      - name: Tests
-        run: |
-          pip install -q pytest psutil
-          python3 -m pytest tests/ -q

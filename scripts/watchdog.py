@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# ⚠ SUPERVISES THE RETIRED PYTHON SERVER (com.amux.server / amux-server.py, both
+# removed 2026-08-09). Kept only because the LOADED launchd agent
+# com.amux.watchdog still runs this file; deleting it would leave that agent
+# respawning a missing script. It cannot resurrect Python: its restart path is
+# `launchctl kickstart com.amux.server`, which no longer exists. TODO: either
+# retarget to com.amux.server-rs + /health on 8824, or bootout com.amux.watchdog
+# and delete this file. Do not extend it.
 """
 amux server watchdog — monitors health, auto-restarts, and spawns Claude to
 diagnose + fix persistent failures.

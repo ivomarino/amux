@@ -110,9 +110,23 @@ somebody can pick up.
 
 ## Structure
 
-- `amux-server.py` — the server + dashboard (single file)
+amux is a **Rust workspace**. The Python predecessor (`amux-server.py`) was removed
+2026-08-09 — git history has it; do not resurrect it or add anything that depends on it.
+
+- `crates/amux-server` — the server (axum): API in `src/api/`, SQLite layer in
+  `src/db/`, SQL migrations in `migrations/`, orchestration in `src/runtime_jobs/`
+- `crates/amux-dashboard` — the SPA, served from `static/` (`index.html`, `app.js`,
+  `app.css`, `sw.js`)
+- `crates/amux-core` / `crates/amux-cli` — shared types; the Rust CLI (`amux-rs`)
+- `amux` — the legacy **bash** CLI the fleet still runs (`amux send/board/alert`);
+  it is an HTTP client of the server, not part of it
+- `e2e/` — Playwright suites; `crates/amux-server/tests/` — integration tests
+  (`boundary_golden.rs` + `tests/fixtures/` are recorded Python-contract goldens —
+  the contract memory; they compare against recordings, not a live server)
+- `install.sh` — one-command install (build + `~/.local/bin` + launchd agents)
 - `mcp.json` — centralized MCP server config (shared by local and cloud)
-- `cloud/` — GCP VM provisioning (Terraform + setup script)
+- `cloud/` — GCP provisioning for cloud.amux.io. **DEPRECATED-pending-rust-migration:**
+  it still runs the last-built Python image; keep it deployable, build nothing new on it.
 
 ## Claude Code hook entries: matchers are REGEXES, and tool events require one
 
@@ -141,10 +155,10 @@ its env was missing", which testing the endpoint and the settings entry cannot.
 
 - **Staleness announces itself; nothing auto-pulls.** The `SessionStart` hook
   (`.claude/session-freshness.sh`) fetches and reports two things a session cannot see
-  on its own: how far this checkout is behind `origin/main` (naming `amux-server.py` /
+  on its own: how far this checkout is behind `origin/main` (naming `crates/` /
   `amux` / `CLAUDE.md` when they are in the diff, because those are the conflicts you
-  are about to hit), and whether the INSTALLED CLI and the RUNNING server still match
-  this checkout. It is silent when everything is current.
+  are about to hit), and whether the INSTALLED CLI still matches this checkout. It is
+  silent when everything is current.
 
   **Do not "improve" it into a scheduled pull.** This is a shared checkout, and the
   Deploy section below records a peer's `git pull --rebase` replaying another session's
@@ -156,27 +170,28 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   behind (a fix was written that upstream already had), and the installed CLI was a
   Jul-31 copy whose missing verb printed help and exited 0, silently swallowing three
   status requests.
-- **Commit after every completed task.** When you finish a piece of work (bug fix, feature, refactor), immediately `git add amux-server.py && git commit` with a concise message. Don't batch multiple tasks into one commit.
-- The server auto-restarts on file save (watches its own mtime) — but **it watches the
-  file it is RUNNING, which is `~/.local/bin/amux-server.py`, not your repo checkout.**
-  Editing `~/amux/amux-server.py` alone changes nothing that is live: `ps` the process
-  and you will see it running out of `~/.local/bin`. To see a change on
-  `https://localhost:8822`, install it, then confirm it actually took:
+- **Commit after every completed task.** When you finish a piece of work (bug fix, feature, refactor), immediately `git add` the files you changed and `git commit` with a concise message. Don't batch multiple tasks into one commit. Committing is also what DEPLOYS locally (next bullet).
+- **Editing the working tree changes nothing that is live — COMMITTED source is what
+  ships.** `com.amux.server-rs-builder` (`scripts/rust-auto-build.sh`, every 60s)
+  rebuilds when the last commit touching `crates/`/`Cargo.*` moves, installs
+  `~/.local/bin/amux-server-rs`, and the running server self-adopts (exits for launchd
+  to relaunch). The same binary answers **both ports**: 8824 (native) and the legacy
+  fleet port 8822 (`AMUX_URL`). To see a change live, commit it, then confirm it took:
   ```bash
-  # NOTE: ~/.local/bin/amux-server.py is a SYMLINK to this checkout, so there is
-  # nothing to copy — `cp` refuses with "are identical". The label is
-  # com.amux.serVER; `com.amux.serve` fails with "Could not find service", which
-  # looks like a restart you did not get. Both verified 2026-08-06.
-  launchctl kickstart -k gui/$(id -u)/com.amux.server
-  curl -sk https://localhost:8822/ | grep -c '<a line unique to your change>'
+  # wait for the builder cycle (or force it: bash scripts/rust-auto-build.sh)
+  curl -sk https://localhost:8824/health   # `build` hash must move, `server":"amux-rust"`
+  curl -sk https://localhost:8824/ | grep -c '<a line unique to your change>'
   ```
   Verify with a string your edit INTRODUCED, not one that already existed — grepping a
   common idiom returns a happy non-zero count against the old build and tells you
   nothing (this cost a wrong "it's live" call on AMUX-4).
-- Always verify Python syntax after edits: `python3 -c "import ast; ast.parse(open('amux-server.py').read())"`
-- **Bracket any timing/availability measurement with `/health`'s `build`.** The server
-  re-execs whenever ANYONE saves `amux-server.py` — and on this shared checkout that is
-  routinely not you, with your own tree clean and nothing in your session hinting the
+- Syntax/type gates after edits: `cargo check --workspace` (and `cargo clippy
+  --workspace --all-targets -- -D warnings` before pushing — CI denies warnings).
+  Tests: `cargo test -p amux-server`. Use a scratch `CARGO_TARGET_DIR` (e.g.
+  `/tmp/amux-target`) so parallel sessions don't thrash one lock.
+- **Bracket any timing/availability measurement with `/health`'s `build`.** The builder
+  swaps the running binary whenever ANYONE's commit lands — on this shared checkout that
+  is routinely not you, with your own tree clean and nothing in your session hinting the
   binary changed underneath you. A restart's symptoms (timeouts, HTTP 000, wild
   latencies) are indistinguishable from the thing you are measuring being slow, so the
   wrong conclusion arrives already corroborated by repeat runs. Read `build` before and
@@ -187,7 +202,7 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   B1=$(curl -sk $AMUX_URL/health | python3 -c 'import json,sys;print(json.load(sys.stdin)["build"])')
   [ "$B0" = "$B1" ] || echo "INVALID: build moved $B0 -> $B1 — you measured two different servers"
   ```
-  `build` is a content hash of the running file, so it discriminates a code change, not
+  `build` is a content hash of the running binary, so it discriminates a code change, not
   merely a bounce (`pid`/`uptime_s` catch the bounce). On 2026-08-08 this cost a session
   a published wrong conclusion: a filtered-board hang (AMUX-2562) was measured, blamed on
   a restart, and "disproved" by a re-measurement that had silently run against the FIXED
@@ -197,8 +212,8 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   reached for constantly, and on a shared checkout it is wrong the moment another lane
   commits between your commit and your check:
   ```bash
-  git show "$(git log -1 --format=%H --author-date-order --grep='<your subject>')^:amux-server.py"
-  git show 523df63^:amux-server.py     # or just: the parent of YOUR sha, read off git log
+  git show "$(git log -1 --format=%H --author-date-order --grep='<your subject>')^:<path/to/file>"
+  git show 523df63^:crates/amux-server/src/lib.rs   # or just: the parent of YOUR sha, read off git log
   ```
   On 2026-08-09 `HEAD~1` was another lane's commit landed seconds earlier, so the "pre-fix"
   specimen WAS the fix. The probe reported the new behaviour already present and concluded
@@ -206,17 +221,17 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   correctly-discriminating test into a worse one. This is the loud-wrong probe, not the
   silent one: it answers, and its answer looks exactly like the failure rule 7 warns about,
   so it corroborates itself. The tell is cheap — `git log -3` and check whose sha is where.
-- **Client JS changes need `APP_VER` and the sw.js `CACHE` bumped together**, or a
+- **Client JS changes need `APP_VER` (`crates/amux-dashboard/static/app.js`) and the
+  `CACHE` version (`crates/amux-dashboard/static/sw.js`) bumped together**, or a
   browser holding the cached script never receives the fix.
-- Always verify Python syntax after edits: `python3 -c "import ast; ast.parse(open('amux-server.py').read())"`
 
 ## Deploy
 
 ⚠ **BEFORE `git push origin main`: check what you are shipping that is not yours.** This is a
-SHARED checkout — other sessions commit here — and `.github/workflows/deploy-cloud.yml` triggers on
-`push: branches:[main], paths:['amux-server.py']` (as does `cloud-image.yml`). **So any push of
-main deploys EVERY unpushed commit touching that file, including other sessions' work that nobody
-reviewed at that moment.** Always run first:
+SHARED checkout — other sessions commit here — and CI (`rust.yml`) plus the site deploy
+(`pages.yml`) run against whatever a push carries. **Any push of main ships EVERY unpushed
+commit, including other sessions' work that nobody reviewed at that moment** — and locally the
+builder deploys every COMMIT the moment it lands, pushed or not. Always run first:
 
 ```bash
 git fetch origin                                # refresh — the recipe is wrong without this
@@ -251,22 +266,22 @@ a third party's push shipped a commit its author never pushed. You control neith
 ships nor *whether* it does.
 
 When the user says **"deploy"**, run the full pipeline:
-1. `git add` changed files (typically `amux-server.py`)
-2. `git commit` with a concise message
+1. `git add` changed files
+2. `git commit` with a concise message (the local builder adopts it within ~60s)
 3. Run the two checks above
 4. `git push origin main`
 
 ## Single-codebase rule (CRITICAL)
 
-**`amux-server.py` is identical for both local (OSS) and cloud deployments — no exceptions.**
+**The server code is identical for both local (OSS) and cloud deployments — no exceptions.**
 
-- Never add cloud-only or OSS-only code branches (no `if IS_CLOUD`, no `if os.environ.get('CLOUD')`).
+- Never add cloud-only or OSS-only code branches (no `if IS_CLOUD`, no `CLOUD` env build flags).
 - Features that differ between environments must be driven by headers/env vars injected by the gateway (e.g., `X-Amux-User-Email`) or by presence/absence of configuration, not by build-time flags.
-- `cloud/docker/amux-server.py` must never be committed — it is auto-generated during deploy. It is in `.gitignore`.
+- `cloud/docker/amux-server.py` must never be committed — it is a generated artifact of the deprecated Python cloud image (still what cloud.amux.io runs, pending its rust migration). It is in `.gitignore`.
 
 ## Server config — `~/.amux/server.env`
 
-Persistent env vars for the server. Loaded at startup via `os.environ.setdefault` so process-level env always wins. Survives `os.execv` auto-restarts.
+Persistent env vars for the server. Loaded at startup as setdefault (process-level env always wins) — see `crates/amux-server/src/config.rs`.
 
 **Credential VALUES live here and only here — never in this repo (it is PUBLIC), never in
 a board card, never in a prompt. [`docs/credentials.md`](docs/credentials.md) is the
@@ -285,7 +300,8 @@ AMUX_S3_KEY=amux/cal-<random-token>.ics
 AMUX_S3_REGION=us-east-2
 ```
 
-After creating/editing server.env, `touch amux-server.py` to trigger a reload.
+After creating/editing server.env, restart the server to pick it up:
+`launchctl kickstart -k gui/$(id -u)/com.amux.server-rs`.
 
 ## iCal / Google Calendar sync
 
@@ -301,7 +317,7 @@ S3 bucket config (on `ethan-personal`):
 - Bucket policy grants public `s3:GetObject` on `arn:aws:s3:::ethan-personal/amux/*.ics` (widened from the single `calendar.ics` key so cache-busting keys work). Bucket LISTING is denied (403), so a random key is not discoverable.
 - Current key: a **random token** (`amux/cal-<32hex>.ics`) that lives ONLY in `~/.amux/server.env` — **NEVER commit the actual key/URL to this repo: the repo is public, and a committed feed URL is how the old guessable key leaked.** Read it with `grep AMUX_S3_KEY ~/.amux/server.env`; the dashboard's Subscribe button shows the full URL.
 
-**Google caches ICS feeds by URL, hard.** There is no reliable way to force a refresh — Google refetches on its own cadence (hours). If you edit the feed's *content shape* and need Google to see it now, publish to a NEW random key and re-subscribe; the old URL keeps serving Google's stale cache. `AMUX_S3_KEY` is read at startup via `os.environ.setdefault`, and execv reloads inherit the env, so changing it needs a real restart: `launchctl kickstart -k gui/$(id -u)/com.amux.serve`.
+**Google caches ICS feeds by URL, hard.** There is no reliable way to force a refresh — Google refetches on its own cadence (hours). If you edit the feed's *content shape* and need Google to see it now, publish to a NEW random key and re-subscribe; the old URL keeps serving Google's stale cache. `AMUX_S3_KEY` is read at startup (setdefault), so changing it needs a real restart: `launchctl kickstart -k gui/$(id -u)/com.amux.server-rs`.
 
 The feed auto-uploads to S3 on every event write. The dashboard's calendar subscription button shows the S3 URL directly when configured.
 
@@ -321,4 +337,4 @@ node skills/chrome-cdp/scripts/cdp.mjs nav <target> <url>
 
 Requires Chrome remote debugging enabled (`chrome://inspect/#remote-debugging`) and Node.js 22+.
 
-Claude Code, the amux server, and Chrome all run on the same desktop machine. Use `https://localhost:8822` for amux dashboard URLs.
+Claude Code, the amux server, and Chrome all run on the same desktop machine. Use `https://localhost:8822` (or 8824 — same Rust server) for amux dashboard URLs.

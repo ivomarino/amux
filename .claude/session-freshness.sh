@@ -43,22 +43,23 @@ if git remote get-url origin >/dev/null 2>&1; then
     behind="$(git rev-list --count "HEAD..$base" 2>/dev/null || echo 0)"
     if [ "${behind:-0}" -gt 0 ]; then
       # Name the files that actually matter here, not just a number: "110
-      # commits behind" reads as bookkeeping, "amux-server.py changed upstream"
+      # commits behind" reads as bookkeeping, "crates/ changed upstream"
       # reads as "your edit is going to conflict".
       #
       # THREE dots, and the distinction is the whole point of this line. In
       # `git diff`, two dots compare the two ENDPOINTS — so on a shared checkout
       # carrying unpushed work it reports OUR OWN files as upstream changes.
-      # Measured 2026-08-09: 1 commit behind touching only amux-server.py, and
-      # the two-dot form named `CLAUDE.md amux amux-server.py`, sending the
-      # session to reconcile two files upstream had never touched. Three dots
+      # Measured 2026-08-09 (python era): 1 commit behind touching only the
+      # server file, and the two-dot form also named `CLAUDE.md amux`, sending
+      # the session to reconcile two files upstream had never touched. Three dots
       # diff from the merge-base, i.e. exactly "what $base added that I lack".
       # Note line 43 is correct as-is: two-dot rev-list already means that.
       # The bug was that one sentence mixed both conventions, so its count and
       # its file list disagreed — and it degraded precisely as the checkout got
       # busier, which is when the warning matters most.
       hot="$(git diff --name-only "HEAD...$base" 2>/dev/null \
-             | grep -E '^(amux-server\.py|amux|CLAUDE\.md)$' | tr '\n' ' ')"
+             | grep -E '^(crates/|Cargo\.(toml|lock)$|amux$|CLAUDE\.md$)' \
+             | head -6 | tr '\n' ' ')"
       out+="  - checkout is ${behind} commit(s) behind ${base}"
       [ -n "$hot" ] && out+=" — including: ${hot}"
       out+=$'\n'
@@ -79,15 +80,15 @@ if [ -n "$live_cli" ] && [ -f "$REPO/amux" ]; then
   fi
 fi
 
-# Compare against the server that is actually RUNNING, resolved from the
-# process itself rather than a hardcoded path — a hardcoded path matches on one
-# machine and silently checks nothing everywhere else (ethos rule 7).
-run_srv="$(ps -axo command= 2>/dev/null | grep -oE '[^ ]*/amux-server\.py' | head -1 || true)"
-if [ -n "$run_srv" ] && [ -f "$run_srv" ] && [ -f "$REPO/amux-server.py" ]; then
-  if ! diff -q "$REPO/amux-server.py" "$run_srv" >/dev/null 2>&1; then
-    out+="  - the RUNNING server is not this checkout: ${run_srv}"$'\n'
-    out+="    edits here are not live until installed + restarted"$'\n'
-    out+="    cp \"$REPO/amux-server.py\" \"$run_srv\" && launchctl kickstart -k gui/\$(id -u)/com.amux.serve"$'\n'
+# The RUNNING server's freshness is the builder's job, not this hook's:
+# com.amux.server-rs-builder rebuilds COMMITTED rust source every 60s and the
+# server self-adopts the new binary. A file diff cannot compare a binary to a
+# source tree, but /health's `build` hash names exactly which build answers —
+# so report only when the running server looks stale relative to the checkout.
+if command -v curl >/dev/null 2>&1; then
+  hs="$(timeout 5 curl -sk https://localhost:8824/health 2>/dev/null || true)"
+  if [ -n "$hs" ] && ! printf '%s' "$hs" | grep -q '"server":"amux-rust"'; then
+    out+="  - https://localhost:8824/health is answering but not as amux-rust — check com.amux.server-rs"$'\n'
   fi
 fi
 
