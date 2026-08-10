@@ -5882,6 +5882,25 @@ async fn dispatch(
     if method == Method::PATCH {
         return patch_dispatch(&state, &name, &action, &body).await;
     }
+    // DELETE on the RESOURCE — the conventional REST spelling (AMUX-2665).
+    //
+    // Deletion lived only at POST /api/sessions/<n>/delete. The SPA uses that
+    // (app.js:4315), so nothing looked broken — but anything reaching for the
+    // obvious verb got this function's 405 at the bottom. Third of three such
+    // gaps found tonight, and the first one cost real damage:
+    //   POST /api/workers/<n>/send    405 -> `amux send` fell back to raw tmux,
+    //                                        two inter-session messages lost
+    //   POST /api/sessions/<n>/rename 404 -> AMUX-2669, fixed
+    //   DELETE /api/sessions/<n>      405 -> this
+    //
+    // An ALIAS: it calls delete_post, the same function the POST spelling
+    // reaches, so the two cannot drift. Guarded on an EMPTY action so
+    // `DELETE /api/sessions/<n>/<something>` keeps 405-ing rather than
+    // silently deleting the whole worker — a DELETE that ignores its subpath
+    // is far worse than one that refuses.
+    if method == Method::DELETE && action.is_empty() {
+        return delete_post(&state, &name, &headers).await;
+    }
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
 }
 
