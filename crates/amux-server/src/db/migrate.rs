@@ -138,15 +138,48 @@ pub fn pending(conn: &Connection) -> Vec<&'static str> {
 /// True when this binary is a `cargo build` artifact run straight from a
 /// source checkout, rather than an installed one.
 ///
-/// The installed server lives at `~/.local/bin/amux-server-rs`; the auto-build
-/// compiles into `~/.amux/rust-build-target/release/` and then INSTALLS, so a
-/// running server is never the target artifact. Note that build dir contains
-/// the substring `target` — matching on `/target/release/` with the leading
-/// slash is what keeps `rust-build-target/release/` from tripping this, and
-/// there is a test pinning exactly that.
+/// # This matched the BANNED build dir and not the MANDATED one (AMUX-2799)
+///
+/// It used to test `s.contains("/target/debug/")`, and a previous version of
+/// this doc called the resulting exclusion deliberate: `rust-build-target`
+/// contains the substring `target` without a leading slash, so the shared build
+/// dir never tripped it. That reasoning was sound for the auto-builder, which
+/// compiles into `rust-build-target/release/` and then INSTALLS — it never runs
+/// the artifact.
+///
+/// It was exactly backwards for the hazard this guard exists for. CLAUDE.md
+/// tells every session to export `CARGO_TARGET_DIR=~/.amux/rust-build-target`,
+/// so an ordinary `cargo run -p amux-server` produces
+/// `~/.amux/rust-build-target/debug/amux-server` — which did NOT match, so the
+/// guard returned Ok and a working-tree build was free to apply an uncommitted
+/// migration to the live database. That is AMUX-2652 verbatim, the incident
+/// this guard was written for. Measured:
+///
+/// ```text
+///   false   ~/.amux/rust-build-target/debug/amux-server   <- MANDATED, unguarded
+///   true    ~/Dev/amux/target/debug/amux-server           <- BANNED, guarded
+///   false   ~/.local/bin/amux-server-rs                   <- installed, correct
+/// ```
+///
+/// Protection was on for the convention nobody is allowed to use and off for
+/// the one everybody must. Nothing reported it, because the test had been
+/// changed to inject a cargo-shaped fixture rather than read `current_exe()` —
+/// which fixed a red test by removing the only assertion that touched the real
+/// environmental input (ethos rule 7: a check that cannot fail).
+///
+/// # The rule now
+///
+/// A cargo artifact always sits under a `debug` or `release` PROFILE DIRECTORY,
+/// whatever `CARGO_TARGET_DIR` is set to; an installed server never does. Both
+/// real deployments are `bin/` paths with no such component —
+/// `~/.local/bin/amux-server-rs` locally and `/usr/local/bin/amux-server-rs` in
+/// the cloud image — so matching the component is precise in both directions
+/// and, unlike a substring of one hardcoded layout, does not need revisiting
+/// the next time the fleet moves its build directory.
 fn is_cargo_target_build(exe: &std::path::Path) -> bool {
-    let s = exe.to_string_lossy();
-    s.contains("/target/debug/") || s.contains("/target/release/")
+    exe.components().any(|c| {
+        matches!(c.as_os_str().to_str(), Some("debug") | Some("release"))
+    })
 }
 
 /// True when `db_path` is the fleet's real database, `$HOME/.amux/amux.db`.
@@ -368,30 +401,65 @@ mod guard_tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    // The near-miss that would silently disable the guard for the INSTALLED
-    // server's build dir: ~/.amux/rust-build-target/release/ contains the
-    // substring "target", so a naive contains("target/release") matches it.
-    // The leading slash is the whole defence, and this pins it.
+    /// SUPERSEDES `the_auto_build_target_dir_is_not_mistaken_for_a_cargo_run`,
+    /// which asserted the exact opposite and was WRONG (AMUX-2799).
+    ///
+    /// That test required `~/.amux/rust-build-target/release/` NOT to match, on
+    /// the stated grounds that "it INSTALLS, and blocking it would stop the real
+    /// server booting". The premise is false: `scripts/rust-auto-build.sh` runs
+    /// `install -m 0755 .../release/amux-server ~/.local/bin/amux-server-rs`, so
+    /// the artifact under the build dir is never the thing that boots. Nothing
+    /// executes it in place.
+    ///
+    /// What the assertion actually bought was a guard that was OFF for the build
+    /// dir CLAUDE.md mandates and ON for the per-session dirs it bans — so an
+    /// ordinary `cargo run -p amux-server` under the sanctioned environment
+    /// could apply an uncommitted migration to the live DB, which is AMUX-2652
+    /// verbatim. A test can pin a defect as firmly as it pins a fix.
     #[test]
-    fn the_auto_build_target_dir_is_not_mistaken_for_a_cargo_run() {
-        assert!(is_cargo_target_build(Path::new(
-            "/Users/x/Dev/amux/target/debug/amux-server"
-        )));
-        assert!(is_cargo_target_build(Path::new(
-            "/Users/x/Dev/amux/target/release/amux-server"
-        )));
+    fn any_profile_dir_reads_as_a_cargo_build_whatever_the_target_dir_is() {
+        // A per-session checkout dir (banned, but must still be caught).
+        assert!(is_cargo_target_build(Path::new("/Users/x/Dev/amux/target/debug/amux-server")));
+        assert!(is_cargo_target_build(Path::new("/Users/x/Dev/amux/target/release/amux-server")));
+        // THE MANDATED SHARED DIR — the case that was unguarded. A `cargo run`
+        // here is exactly the working-tree-against-live-DB hazard.
         assert!(
-            !is_cargo_target_build(Path::new(
-                "/Users/x/.amux/rust-build-target/release/amux-server"
-            )),
-            "the auto-build's own target dir must not read as a cargo run — \
-             it INSTALLS, and blocking it would stop the real server booting"
+            is_cargo_target_build(Path::new("/Users/x/.amux/rust-build-target/debug/amux-server")),
+            "the build dir every session is told to use must be guarded, not exempt"
         );
-        assert!(!is_cargo_target_build(Path::new(
-            "/Users/x/.local/bin/amux-server-rs"
+        assert!(is_cargo_target_build(Path::new(
+            "/Users/x/.amux/rust-build-target/release/amux-server"
         )));
-        // A container: binary on PATH, no target dir anywhere.
-        assert!(!is_cargo_target_build(Path::new("/usr/local/bin/amux-server")));
+        // Any OTHER target dir, because the next move must not need a code change.
+        assert!(is_cargo_target_build(Path::new("/tmp/whatever-42/debug/deps/amux_server-abc")));
+
+        // The two paths that actually boot a server, both of which must stay
+        // exempt or the fleet cannot start with a pending migration.
+        assert!(!is_cargo_target_build(Path::new("/Users/x/.local/bin/amux-server-rs")));
+        assert!(
+            !is_cargo_target_build(Path::new("/usr/local/bin/amux-server-rs")),
+            "the cloud image's path — CMD [\"amux-server-rs\"] off /usr/local/bin"
+        );
+    }
+
+    /// THE ASSERTION WHOSE REMOVAL HID THIS. The predicate's only real input is
+    /// `current_exe()`, and the previous fix for a red test here was to stop
+    /// consulting it and inject a hand-built path instead — which made the test
+    /// pass under every target dir by testing nothing about any of them.
+    ///
+    /// This is stable, not fragile: a test binary IS a cargo artifact by
+    /// construction, under any `CARGO_TARGET_DIR`, so the assertion holds
+    /// wherever it is built — while still failing the moment the predicate stops
+    /// recognising the real environment.
+    #[test]
+    fn this_very_test_binary_is_recognised_as_a_cargo_build() {
+        let exe = std::env::current_exe().expect("current_exe must be readable");
+        assert!(
+            is_cargo_target_build(&exe),
+            "a test binary must read as a cargo build, or the guard is off for whoever \
+             is running the suite from this target dir: {}",
+            exe.display()
+        );
     }
 
     #[test]
