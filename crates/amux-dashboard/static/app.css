@@ -311,6 +311,16 @@
   }
   .badges { display: flex; gap: 6px; margin-top: 6px; margin-left: 20px; flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .badges::-webkit-scrollbar { display: none; }
+  /* Group chip and model moved OFF the title row and onto this one, so the worker
+     name gets the full card width. `.card-name` is `flex:1; min-width:0` with
+     ellipsis, so anything sharing that row ate the name — `amux-rust` truncated
+     while a group chip and CLAUDE-OPUS-4-6 sat beside it.
+     Two fixes needed here, both because .badges is a nowrap flex strip and
+     .grp-chip was written for inline flow inside the title:
+       margin-left  — it carries its own 6px, which doubles this row's gap
+       flex-shrink  — without it the chip is squeezed instead of scrolling, which
+                      is the one thing this overflow-x strip exists to avoid */
+  .badges .grp-chip { margin-left: 0; flex-shrink: 0; }
   .badge {
     font-size: 0.7rem; padding: 2px 7px; border-radius: 4px;
     font-weight: 600; text-transform: uppercase; white-space: nowrap; flex-shrink: 0;
@@ -539,6 +549,23 @@
     -webkit-user-select: text; user-select: text;
     -webkit-touch-callout: default; cursor: text;
     touch-action: pan-y;
+  }
+  /* The PEEK terminal specifically renders fixed-width terminal output, so it must
+     NOT be re-wrapped. `.overlay-body` is a shared class whose pre-wrap/break-word is
+     right for prose overlays and wrong here: the CLI has already laid its output out
+     in columns at the pane width (220), and re-wrapping at the viewport destroys the
+     alignment that makes a table a table or a diff readable — the exact complaint,
+     with two-thirds of a 2000px view left empty while a diff block wrapped into a
+     ~710px column. `overflow-x:hidden` then made it unrecoverable: there was no way
+     to scroll right to the rest of the line.
+     Scoped to #peek-body rather than changing .overlay-body, because the other
+     overlays that share the class DO want wrapping.
+     touch-action/overscroll mirror #peek-task-label, which already does horizontal
+     panning in this SPA — on a phone a 220-col table is unreadable wrapped anyway,
+     so panning beats re-flowing it into noise. */
+  #peek-body {
+    white-space: pre; word-break: normal; overflow-wrap: normal;
+    overflow-x: auto; touch-action: pan-x pan-y; overscroll-behavior-x: contain;
   }
   .peek-copy-btn {
     position: absolute; top: 6px; right: 6px; z-index: 10;
