@@ -2955,6 +2955,14 @@ async function _fetchGitBranches(sess) {
   let newInfo = {};
   try {
     const r = await fetch(API + '/api/sessions-git');
+    // Check r.ok, not just that json() parsed. This endpoint 404'd for a whole day
+    // after the rust cutover (24 hits/day) and NOTHING showed it: the error body
+    // {"error":"not found"} parses fine, so newInfo became {error:"not found"},
+    // Object.entries yielded one pair whose .repo is undefined, the loop `continue`d,
+    // and the branch column just rendered empty. No throw, no console line, no
+    // user-visible failure — it was only found by grouping 404s in the request log.
+    // An HTTP error silently becoming empty data is the failure mode worth naming.
+    if (!r.ok) { console.error('bulk git fetch: HTTP ' + r.status); return; }
     newInfo = await r.json();
   } catch(e) { console.error('bulk git fetch:', e); return; }
   // Detect conflicts: two sessions on same branch in same repo
@@ -6654,7 +6662,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.549';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.551';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
