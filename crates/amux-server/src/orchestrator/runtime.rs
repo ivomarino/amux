@@ -1253,12 +1253,23 @@ impl Runtime {
     ///   card — the prompt is steering the work in flight (folding beyond
     ///   that is the Python system's job; a second heuristic here would
     ///   drift from it);
-    /// - the card lands in `todo`, attributed to the worker's display name,
+    /// - the card lands in `doing`, attributed to the worker's display name,
     ///   with the durable `capture: session prompt` log marker (the same
     ///   marker Python's dedupe and not-a-task guards key on), and
     ///   `notified=1` — the worker already RECEIVED this prompt as its live
     ///   command; the card is the ledger of it, not news (re-announcing a
     ///   stale capture was a real Python incident).
+    ///
+    ///   `doing`, NOT `todo` (AMUX-2613 E2E finding, 2026-08-09): an
+    ///   owned `todo` card is Runnable to the planner (deliberately — the
+    ///   L3 shape), so a `todo` ledger card was picked up on the next tick
+    ///   and its prompt REDELIVERED as an ExecuteTask assignment — every
+    ///   direct prompt ran twice (observed live: the claude transcript
+    ///   carried the same pomegranate prompt twice, once raw, once wrapped
+    ///   in "Task tsk_…"). `doing` + owner is `Assigned` — never
+    ///   re-dispatched — and if the turn ends with the card unmoved, that
+    ///   is the stall detector's designed drift cell, which is the honest
+    ///   ledger state for "prompt handled, card never closed".
     async fn capture_prompt_card(
         &self,
         worker: &amux_core::ids::WorkerId,
@@ -1301,7 +1312,10 @@ impl Runtime {
                     &crate::db::board_store::NewIssue {
                         title,
                         desc: format!("**Prompt:** {desc_body}"),
-                        status: "todo".into(),
+                        // In flight, not queued: see the doc comment — a
+                        // `todo` mint was re-dispatched by the planner,
+                        // double-running every direct prompt.
+                        status: "doing".into(),
                         session: Some(name),
                         item_type: "code".into(),
                         creator: "amux".into(),
@@ -2025,12 +2039,50 @@ mod adherence_tests {
             )
             .expect("delivery must have minted exactly one ledger card");
         assert_eq!(title, "Fix the flaky auth test");
-        assert_eq!(status, "todo");
+        assert_eq!(
+            status, "doing",
+            "in flight, not queued — a todo mint gets re-dispatched by the planner"
+        );
         assert_eq!(session, "alpha", "attributed to the receiving worker");
         assert_eq!(owner_type, "agent");
         assert!(log.contains("capture: session prompt"), "durable marker: {log}");
         assert_eq!(notified, 1, "the worker already received this prompt; not news");
         assert!(!sem.is_empty());
+    }
+
+    /// AMUX-2613 E2E regression: the ledger card minted from a delivered
+    /// prompt must NOT be picked up by the planner and redelivered as an
+    /// ExecuteTask — pre-fix (status "todo") the next tick assigned it and
+    /// the same prompt ran TWICE (observed in a live claude transcript:
+    /// once raw, once wrapped in "Task tsk_…").
+    #[tokio::test]
+    async fn captured_ledger_card_is_not_redispatched_by_the_planner() {
+        let store = store();
+        let w = seed_worker(&store, 5, "alpha");
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
+
+        let msg = MessageId::from_ulid(ulid::Ulid::new());
+        seed_message(&store, &msg, "please fix the flaky auth test. It only fails on CI.");
+        enqueue_deliver(&store, &w, &msg, "cap-k9");
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues"), 1, "ledger card minted");
+
+        // The tick that pre-fix re-dispatched the card as an ExecuteTask.
+        rt.tick_once(false).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+
+        let execute_cmds = count(
+            &store,
+            "SELECT COUNT(*) FROM _amux_commands WHERE command LIKE '%execute_task%'",
+        );
+        assert_eq!(execute_cmds, 0, "the ledger of a delivered prompt is not new work");
+        assert!(
+            matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { .. }]),
+            "exactly ONE delivery ever reaches the worker: {:?}",
+            protocol.calls()
+        );
     }
 
     /// M5 guards: steering words mint nothing, and an OPEN card means the

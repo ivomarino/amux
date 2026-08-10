@@ -35,6 +35,34 @@
 //! Idempotency (Invariant 9): a `send_prompt` whose `idempotency_key` was
 //! already seen for that worker returns `Ok` without re-spawning — restart
 //! reconciliation replays enqueues, and this is what makes the replay safe.
+//!
+//! CONVERSATION CONTINUITY (AMUX-2613 gap 2): successive turns share the
+//! provider's own conversation, not just a cwd. The reader captures the
+//! conversation ref from the stream's init-shaped line (claude `system/init
+//! session_id`, codex `thread.started thread_id`, gemini `init session_id`)
+//! and the next spawn passes it back (`--resume <id>` / `exec resume <id>`).
+//! All three verified LIVE on this machine 2026-08-09:
+//!
+//! - claude 2.1.226: `--print --resume <session_id>` continues the SAME
+//!   session id (no fork); memory confirmed (pomegranate probe).
+//! - gemini 0.54.4: `--resume <session_id>` works headless with `-p`;
+//!   memory confirmed. (The top-level help only mentions index/"latest";
+//!   the error text for a bad id names `--resume {uuid}` as supported.)
+//! - codex 0.141.0: `exec resume <thread_id> --json` re-attaches the thread
+//!   (same thread_id re-emitted). Memory could not be verified live — this
+//!   machine's codex quota is exhausted until 2026-08-27 — so codex
+//!   continuity rests on the CLI's documented resume contract.
+//!
+//! A DEAD resume target must not wedge the worker forever: a missing
+//! claude session exits 1 emitting only an error `result` (no init), and a
+//! missing gemini session exits 42 with no stream at all (both measured).
+//! So: refs are only ever (re)captured from init-shaped lines, and a run
+//! that was spawned WITH a resume ref, FAILED, and never emitted one is
+//! taken as "the target is gone" — the ref is dropped (memory + sink) so
+//! the next turn starts fresh instead of failing identically forever.
+//! Refs persist in `_amux_conversations` via [`ConversationSink`]
+//! (migration 0011), hydrated back at registration by backend::bootstrap,
+//! so continuity survives a server restart.
 
 use super::{events, AgentProtocol, AgentState, Prompt, ProtocolError, Result};
 use amux_core::ids::{MessageId, TurnId, WorkerId};
@@ -85,14 +113,65 @@ impl CliProvider {
         }
     }
 
+    /// Canonical family name for persistence: the provider registry's
+    /// canonical id, stable across the worker-row spellings that map here
+    /// ("claude" and "claude-code" are one family). `_amux_conversations`
+    /// stores this so hydration can refuse to replay a ref into a DIFFERENT
+    /// provider after a worker's provider changes.
+    pub fn family(&self) -> &'static str {
+        match self {
+            CliProvider::ClaudeCode => "claude-code",
+            CliProvider::GeminiCli => "gemini",
+            CliProvider::CodexCli => "codex",
+        }
+    }
+
+    /// The provider-native conversation id carried by one stream line, if
+    /// this line is the INIT-shaped one. Deliberately ONLY the init shapes:
+    /// claude's bad-resume failure emits an error `result` line that echoes
+    /// the DEAD session id (measured 2026-08-09), so matching any line with
+    /// a `session_id` would re-capture the very ref whose failure we need
+    /// to observe.
+    pub fn conversation_ref(&self, line: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let ty = v.get("type").and_then(serde_json::Value::as_str)?;
+        let key = match self {
+            CliProvider::ClaudeCode => {
+                let sub = v.get("subtype").and_then(serde_json::Value::as_str);
+                if ty != "system" || sub != Some("init") {
+                    return None;
+                }
+                "session_id"
+            }
+            CliProvider::GeminiCli => {
+                if ty != "init" {
+                    return None;
+                }
+                "session_id"
+            }
+            CliProvider::CodexCli => {
+                if ty != "thread.started" {
+                    return None;
+                }
+                "thread_id"
+            }
+        };
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
     /// Argv for one headless prompt run. Flags verified against the
-    /// installed binaries on 2026-08-09 (claude 2.1.226, gemini 0.53.1,
+    /// installed binaries on 2026-08-09 (claude 2.1.226, gemini 0.54.4,
     /// codex 0.141.0) — see events.rs for the captured output they produce.
     ///
     /// `model` is the worker's configured model (tier alias or full id);
     /// all three CLIs take `--model`. None = the CLI's own default — never
     /// invent one here (the model choice is the user's, ethos rule 8).
-    fn args(&self, prompt: &str, model: Option<&str>) -> Vec<String> {
+    ///
+    /// `resume` is the conversation ref a previous run reported (see the
+    /// module docs' continuity section); None = a fresh conversation.
+    fn args(&self, prompt: &str, model: Option<&str>, resume: Option<&str>) -> Vec<String> {
         let mut argv: Vec<String> = match self {
             // --verbose is required for stream-json with --print.
             CliProvider::ClaudeCode => vec![
@@ -117,13 +196,33 @@ impl CliProvider {
             // --skip-git-repo-check: codex refuses to run outside a git repo
             // otherwise. The orchestrator chose the cwd deliberately, and a
             // headless run cannot answer the interactive refusal.
-            CliProvider::CodexCli => vec![
-                "exec".into(),
-                "--json".into(),
-                "--skip-git-repo-check".into(),
-                prompt.into(),
-            ],
+            //
+            // Continuation is a SUBCOMMAND here (`exec resume <id> <prompt>`),
+            // not a flag, so the whole argv reshapes when resuming.
+            CliProvider::CodexCli => match resume {
+                Some(thread) => vec![
+                    "exec".into(),
+                    "resume".into(),
+                    "--json".into(),
+                    "--skip-git-repo-check".into(),
+                    thread.into(),
+                    prompt.into(),
+                ],
+                None => vec![
+                    "exec".into(),
+                    "--json".into(),
+                    "--skip-git-repo-check".into(),
+                    prompt.into(),
+                ],
+            },
         };
+        // claude + gemini share the flag spelling; codex handled above.
+        if !matches!(self, CliProvider::CodexCli) {
+            if let Some(r) = resume {
+                argv.push("--resume".into());
+                argv.push(r.into());
+            }
+        }
         if let Some(m) = model {
             argv.push("--model".into());
             argv.push(m.into());
@@ -151,6 +250,19 @@ impl CliProvider {
     }
 }
 
+/// Persistence seam for conversation refs (module docs' continuity
+/// section). The protocol captures refs from streams; WHERE they live
+/// durably (`_amux_conversations`, migration 0011) is the server's concern
+/// — a trait so tests record calls without a store. Both methods are
+/// fire-and-forget: continuity must never block or fail a turn.
+pub trait ConversationSink: Send + Sync {
+    /// The latest conversation ref a worker's stream reported.
+    fn save(&self, worker: &WorkerId, provider_family: &str, conversation_ref: &str);
+    /// A resume target proved dead (resumed run failed before init) — drop
+    /// the persisted ref so a restart does not hydrate it back.
+    fn forget(&self, worker: &WorkerId);
+}
+
 /// Per-worker spawn configuration, registered once per worker.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -163,6 +275,10 @@ pub struct WorkerConfig {
     /// The worker's configured model (`_amux_workers.model`), passed as
     /// `--model` on every run. None = the CLI's own default.
     pub model: Option<String>,
+    /// A persisted conversation ref to resume from (hydrated by
+    /// backend::bootstrap from `_amux_conversations`). None = start fresh;
+    /// the stream's own init line supersedes this the moment a run starts.
+    pub conversation: Option<String>,
 }
 
 struct WorkerShared {
@@ -179,6 +295,11 @@ struct WorkerShared {
     /// The live child, present while a turn is running. Held for `cancel`;
     /// the reader task takes it back at EOF to reap the exit status.
     child: Mutex<Option<Child>>,
+    /// The provider conversation the NEXT run resumes (continuity, module
+    /// docs). Seeded from config, updated from each run's init line.
+    conversation: Mutex<Option<String>>,
+    /// Durable home for `conversation` (None in tests without a store).
+    sink: Option<Arc<dyn ConversationSink>>,
 }
 
 impl WorkerShared {
@@ -196,6 +317,8 @@ impl WorkerShared {
 #[derive(Default)]
 pub struct StructuredCliProtocol {
     workers: Mutex<BTreeMap<WorkerId, Arc<WorkerShared>>>,
+    /// Shared by every worker registered on this protocol instance.
+    sink: Option<Arc<dyn ConversationSink>>,
 }
 
 impl StructuredCliProtocol {
@@ -203,11 +326,21 @@ impl StructuredCliProtocol {
         Self::default()
     }
 
+    /// A protocol whose captured conversation refs persist through `sink`
+    /// (production: the store-backed sink built in lib.rs).
+    pub fn with_conversation_sink(sink: Arc<dyn ConversationSink>) -> Self {
+        Self {
+            workers: Mutex::new(BTreeMap::new()),
+            sink: Some(sink),
+        }
+    }
+
     /// Register a worker. Without registration every call fails with
     /// `NoSession`, matching [`super::mock::MockProtocol`]'s contract for a
     /// worker whose process is gone.
     pub fn register(&self, worker: WorkerId, config: WorkerConfig) {
         let (tx, _) = broadcast::channel(256);
+        let conversation = config.conversation.clone();
         self.workers.lock().unwrap().insert(
             worker.clone(),
             Arc::new(WorkerShared {
@@ -217,6 +350,8 @@ impl StructuredCliProtocol {
                 state: Mutex::new(AgentState::Idle),
                 seen_keys: Mutex::new(HashSet::new()),
                 child: Mutex::new(None),
+                conversation: Mutex::new(conversation),
+                sink: self.sink.clone(),
             }),
         );
     }
@@ -245,7 +380,7 @@ impl StructuredCliProtocol {
         // Dedupe + busy-check + spawn under the per-worker key lock so two
         // concurrent sends with the same key cannot both spawn. Nothing in
         // this block awaits.
-        let (stdout, stderr, turn) = {
+        let (stdout, stderr, turn, resumed_from) = {
             let mut keys = shared.seen_keys.lock().unwrap();
             if keys.contains(&key) {
                 return Ok(()); // Invariant 9: redelivery must not double-run.
@@ -258,12 +393,16 @@ impl StructuredCliProtocol {
             }
 
             let cfg = &shared.config;
+            // Continuity: resume the conversation the last run reported
+            // (or the hydrated one). Cloned here, and passed to the reader
+            // so a failed resume can be attributed to exactly this ref.
+            let resumed_from = shared.conversation.lock().unwrap().clone();
             let program: PathBuf = cfg
                 .binary
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(cfg.provider.binary()));
             let mut cmd = Command::new(&program);
-            cmd.args(cfg.provider.args(text, cfg.model.as_deref()))
+            cmd.args(cfg.provider.args(text, cfg.model.as_deref(), resumed_from.as_deref()))
                 .current_dir(&cfg.cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -287,10 +426,10 @@ impl StructuredCliProtocol {
                 progress: None,
             });
             keys.insert(key);
-            (stdout, stderr, turn)
+            (stdout, stderr, turn, resumed_from)
         };
 
-        tokio::spawn(read_stream(shared, stdout, stderr, turn));
+        tokio::spawn(read_stream(shared, stdout, stderr, turn, resumed_from));
         Ok(())
     }
 }
@@ -313,19 +452,44 @@ async fn stderr_tail(stderr: Option<ChildStderr>) -> String {
 }
 
 /// Reader task: translate stdout lines into events, then reap the child and
-/// settle the worker's state.
+/// settle the worker's state. `resumed_from` is the conversation ref this
+/// run was spawned with (None = fresh) — see the module docs' continuity
+/// section for the dead-target rule it feeds.
 async fn read_stream(
     shared: Arc<WorkerShared>,
     stdout: ChildStdout,
     stderr: Option<ChildStderr>,
     turn: TurnId,
+    resumed_from: Option<String>,
 ) {
     let stderr_task = tokio::spawn(stderr_tail(stderr));
 
     let mut lines = BufReader::new(stdout).lines();
     let mut turn_started = false;
     let mut turn_completed = false;
+    let mut saw_conversation_ref = false;
     while let Ok(Some(line)) = lines.next_line().await {
+        // Continuity capture, BEFORE translation (an init line is also a
+        // Started event; the two concerns stay independent).
+        if let Some(cid) = shared.config.provider.conversation_ref(&line) {
+            saw_conversation_ref = true;
+            let changed = {
+                let mut cur = shared.conversation.lock().unwrap();
+                if cur.as_deref() != Some(cid.as_str()) {
+                    *cur = Some(cid.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                tracing::info!(worker = %shared.worker, conversation = %cid,
+                    "captured conversation ref for continuity");
+                if let Some(sink) = &shared.sink {
+                    sink.save(&shared.worker, shared.config.provider.family(), &cid);
+                }
+            }
+        }
         for ev in shared.config.provider.translate(&line, &turn) {
             match &ev {
                 WorkerEvent::Started => {}
@@ -413,6 +577,28 @@ async fn read_stream(
                 )
             };
             tracing::warn!(worker = %shared.worker, reason = %reason, "structured turn failed");
+            // Dead resume target (module docs): the run was told to resume,
+            // failed, and never emitted an init line — measured shape of a
+            // vanished claude session (exit 1, error result only) and a
+            // vanished gemini session (exit 42, empty stream). Drop the ref
+            // so the next turn starts fresh instead of failing identically
+            // forever. Guarded on the ref being UNCHANGED so a concurrent
+            // capture is never clobbered. An API failure mid-turn has
+            // already re-emitted init, so it never lands here.
+            if let Some(from) = &resumed_from {
+                if !saw_conversation_ref {
+                    let mut cur = shared.conversation.lock().unwrap();
+                    if cur.as_deref() == Some(from.as_str()) {
+                        *cur = None;
+                        tracing::warn!(worker = %shared.worker, conversation = %from,
+                            "resume target appears gone; dropping conversation ref \
+                             (next turn starts a fresh conversation)");
+                        if let Some(sink) = &shared.sink {
+                            sink.forget(&shared.worker);
+                        }
+                    }
+                }
+            }
             shared.emit(WorkerEvent::Failed(Failure {
                 reason,
                 retryable: true,
@@ -536,12 +722,19 @@ mod tests {
     }
 
     /// Write an executable script that logs each run (for idempotency
-    /// assertions) and replays a fixture stream on stdout.
+    /// assertions), records its argv (for continuity assertions — one
+    /// NUL-joined line per run in `<name>.argv`), and replays a fixture
+    /// stream on stdout.
     fn fixture_script(dir: &std::path::Path, name: &str, lines: &[&str], exit_code: i32) -> PathBuf {
         let path = dir.join(name);
         let runs = dir.join(format!("{name}.runs"));
+        let argv = dir.join(format!("{name}.argv"));
         let mut body = String::from("#!/bin/sh\n");
         body.push_str(&format!("printf x >> '{}'\n", runs.display()));
+        body.push_str(&format!(
+            "{{ printf '%s\\000' \"$@\"; printf '\\n'; }} >> '{}'\n",
+            argv.display()
+        ));
         body.push_str("cat <<'FIXTURE_EOF'\n");
         for line in lines {
             body.push_str(line);
@@ -563,6 +756,19 @@ mod tests {
         std::fs::read(dir.join(format!("{name}.runs")))
             .map(|b| b.len())
             .unwrap_or(0)
+    }
+
+    /// The argv of each recorded run, in order.
+    fn recorded_argvs(dir: &std::path::Path, name: &str) -> Vec<Vec<String>> {
+        let raw = std::fs::read_to_string(dir.join(format!("{name}.argv"))).unwrap_or_default();
+        raw.lines()
+            .map(|l| {
+                l.split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect()
     }
 
     async fn collect_until_terminal(
@@ -640,17 +846,71 @@ mod tests {
             CliProvider::GeminiCli,
             CliProvider::CodexCli,
         ] {
-            let with = provider.args("hi", Some("haiku"));
+            let with = provider.args("hi", Some("haiku"), None);
             assert!(
                 with.windows(2).any(|w| w == ["--model", "haiku"]),
                 "{provider:?}: missing --model haiku in {with:?}"
             );
-            let without = provider.args("hi", None);
+            let without = provider.args("hi", None, None);
             assert!(
                 !without.iter().any(|a| a == "--model"),
                 "{provider:?}: invented a model in {without:?}"
             );
         }
+    }
+
+    #[test]
+    fn resume_ref_rides_into_argv_in_each_providers_own_shape() {
+        // claude + gemini: a --resume flag (both verified live 2026-08-09).
+        for provider in [CliProvider::ClaudeCode, CliProvider::GeminiCli] {
+            let with = provider.args("hi", None, Some("abc-123"));
+            assert!(
+                with.windows(2).any(|w| w == ["--resume", "abc-123"]),
+                "{provider:?}: missing --resume in {with:?}"
+            );
+            let fresh = provider.args("hi", None, None);
+            assert!(
+                !fresh.iter().any(|a| a == "--resume"),
+                "{provider:?}: invented a resume target in {fresh:?}"
+            );
+        }
+        // codex: continuation is the `exec resume <id> <prompt>` subcommand
+        // (argv shape verified live against codex 0.141.0 — thread.started
+        // re-emitted the resumed thread id).
+        let with = CliProvider::CodexCli.args("hi", None, Some("thr-1"));
+        assert_eq!(
+            with,
+            vec!["exec", "resume", "--json", "--skip-git-repo-check", "thr-1", "hi"]
+        );
+        let fresh = CliProvider::CodexCli.args("hi", None, None);
+        assert_eq!(fresh, vec!["exec", "--json", "--skip-git-repo-check", "hi"]);
+    }
+
+    #[test]
+    fn conversation_refs_come_only_from_init_shaped_lines() {
+        // The three real init shapes carry their ids.
+        assert_eq!(
+            CliProvider::ClaudeCode.conversation_ref(events::tests::CLAUDE_INIT),
+            Some("b7e8023e-530b-47ac-8515-a4e181bb7d58".to_string())
+        );
+        assert_eq!(
+            CliProvider::CodexCli.conversation_ref(events::tests::CODEX_THREAD_STARTED),
+            Some("019fe715-0c25-72c3-878b-7728e09afc96".to_string())
+        );
+        assert_eq!(
+            CliProvider::GeminiCli.conversation_ref(events::tests::GEMINI_INIT),
+            Some("d1f03c4d-470b-4894-a540-3fd31e12be65".to_string())
+        );
+        // The bad-resume error result ALSO carries a session_id (the dead
+        // one — measured live); it must NOT be captured, or the dead ref
+        // would re-arm itself on every failure.
+        let bad_resume_result = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"00000000-0000-0000-0000-000000000000","errors":["No conversation found with session ID: 00000000-0000-0000-0000-000000000000"]}"#;
+        assert_eq!(CliProvider::ClaudeCode.conversation_ref(bad_resume_result), None);
+        // Cross-provider lines do not cross-match.
+        assert_eq!(
+            CliProvider::ClaudeCode.conversation_ref(events::tests::GEMINI_INIT),
+            None
+        );
     }
 
     #[test]
@@ -700,6 +960,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -740,6 +1001,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -782,6 +1044,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -822,6 +1085,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -861,6 +1125,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: Some(script),
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);
@@ -890,6 +1155,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: None,
                 model: None,
+                conversation: None,
             },
         );
         assert!(matches!(
@@ -940,9 +1206,267 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: None,
                 model: None,
+                conversation: None,
             },
         );
         proto.cancel(&w).await.unwrap();
+    }
+
+    // ---- conversation continuity (AMUX-2613 gap 2) ------------------------
+
+    #[derive(Default)]
+    struct RecordingSink {
+        saves: Mutex<Vec<(WorkerId, String, String)>>,
+        forgets: Mutex<Vec<WorkerId>>,
+    }
+
+    impl ConversationSink for RecordingSink {
+        fn save(&self, worker: &WorkerId, family: &str, cref: &str) {
+            self.saves
+                .lock()
+                .unwrap()
+                .push((worker.clone(), family.to_string(), cref.to_string()));
+        }
+        fn forget(&self, worker: &WorkerId) {
+            self.forgets.lock().unwrap().push(worker.clone());
+        }
+    }
+
+    /// Turn 2 must resume the conversation turn 1's stream reported —
+    /// pre-fix, every turn was a fresh fork+exec and this finds no
+    /// `--resume` in run 2's argv. Also pins the sink persistence call.
+    #[tokio::test]
+    async fn second_run_resumes_the_conversation_the_first_run_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "fake-claude",
+            &[
+                events::tests::CLAUDE_INIT, // session_id b7e8023e-…
+                events::tests::CLAUDE_TEXT,
+                events::tests::CLAUDE_RESULT,
+            ],
+            0,
+        );
+        let sink = Arc::new(RecordingSink::default());
+        let proto = StructuredCliProtocol::with_conversation_sink(sink.clone());
+        let w = worker_id("0000B");
+        proto.register(
+            w.clone(),
+            WorkerConfig {
+                provider: CliProvider::ClaudeCode,
+                cwd: dir.path().to_path_buf(),
+                binary: Some(script),
+                model: None,
+                conversation: None,
+            },
+        );
+        let mut rx = proto.events(&w);
+        proto.send_prompt(&w, prompt("t1")).await.unwrap();
+        collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
+        wait_for_state(&proto, &w, |s| *s == AgentState::Idle).await;
+
+        let mut rx2 = proto.events(&w);
+        proto.send_prompt(&w, prompt("t2")).await.unwrap();
+        collect_until_terminal(&mut rx2, Duration::from_secs(10)).await;
+        wait_for_state(&proto, &w, |s| *s == AgentState::Idle).await;
+
+        let argvs = recorded_argvs(dir.path(), "fake-claude");
+        assert_eq!(argvs.len(), 2, "{argvs:?}");
+        assert!(
+            !argvs[0].iter().any(|a| a == "--resume"),
+            "turn 1 must start fresh: {:?}",
+            argvs[0]
+        );
+        assert!(
+            argvs[1]
+                .windows(2)
+                .any(|p| p == ["--resume", "b7e8023e-530b-47ac-8515-a4e181bb7d58"]),
+            "turn 2 must resume turn 1's session: {:?}",
+            argvs[1]
+        );
+        // The ref was persisted once (unchanged on turn 2's re-observation),
+        // under the canonical family name.
+        let saves = sink.saves.lock().unwrap();
+        assert_eq!(saves.len(), 1, "{saves:?}");
+        assert_eq!(saves[0].1, "claude-code");
+        assert_eq!(saves[0].2, "b7e8023e-530b-47ac-8515-a4e181bb7d58");
+    }
+
+    /// A hydrated ref (config.conversation, from `_amux_conversations`)
+    /// rides into the FIRST run's argv — continuity across server restarts.
+    #[tokio::test]
+    async fn hydrated_conversation_rides_into_the_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "fake-claude",
+            &[events::tests::CLAUDE_INIT, events::tests::CLAUDE_RESULT],
+            0,
+        );
+        let proto = StructuredCliProtocol::new();
+        let w = worker_id("0000C");
+        proto.register(
+            w.clone(),
+            WorkerConfig {
+                provider: CliProvider::ClaudeCode,
+                cwd: dir.path().to_path_buf(),
+                binary: Some(script),
+                model: None,
+                conversation: Some("persisted-ref-1".into()),
+            },
+        );
+        let mut rx = proto.events(&w);
+        proto.send_prompt(&w, prompt("t1")).await.unwrap();
+        collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
+        let argvs = recorded_argvs(dir.path(), "fake-claude");
+        assert!(
+            argvs[0].windows(2).any(|p| p == ["--resume", "persisted-ref-1"]),
+            "{argvs:?}"
+        );
+    }
+
+    /// The dead-target rule: a resumed run that fails without emitting an
+    /// init line drops the ref (memory + sink) so the next turn starts
+    /// fresh — the measured shape of `claude --resume <vanished id>`
+    /// (exit 1, error result only). Without this, every subsequent turn
+    /// fails identically forever.
+    #[tokio::test]
+    async fn failed_resume_without_init_drops_the_dead_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        // The measured bad-resume stream: ONE error result line, exit 1.
+        let script = fixture_script(
+            dir.path(),
+            "fake-claude",
+            &[r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"dead-ref-9","errors":["No conversation found with session ID: dead-ref-9"]}"#],
+            1,
+        );
+        let sink = Arc::new(RecordingSink::default());
+        let proto = StructuredCliProtocol::with_conversation_sink(sink.clone());
+        let w = worker_id("0000D");
+        proto.register(
+            w.clone(),
+            WorkerConfig {
+                provider: CliProvider::ClaudeCode,
+                cwd: dir.path().to_path_buf(),
+                binary: Some(script),
+                model: None,
+                conversation: Some("dead-ref-9".into()),
+            },
+        );
+        let mut rx = proto.events(&w);
+        proto.send_prompt(&w, prompt("t1")).await.unwrap();
+        // The error result line closes the turn (collection stops there);
+        // the exit-1 consequences (Failed/Exited + the ref drop) land right
+        // after, observed via the settled state.
+        let evs = collect_until_terminal(&mut rx, Duration::from_secs(10)).await;
+        assert!(
+            evs.iter().any(|e| matches!(e, WorkerEvent::TurnCompleted(_))),
+            "{evs:?}"
+        );
+        let settled =
+            wait_for_state(&proto, &w, |s| matches!(s, AgentState::Exited { .. })).await;
+        assert!(matches!(settled, AgentState::Exited { code: Some(1) }), "{settled:?}");
+
+        let argvs = recorded_argvs(dir.path(), "fake-claude");
+        assert!(
+            argvs[0].windows(2).any(|p| p == ["--resume", "dead-ref-9"]),
+            "run 1 tried the dead ref: {argvs:?}"
+        );
+        assert_eq!(
+            *sink.forgets.lock().unwrap(),
+            vec![w.clone()],
+            "the dead ref must be forgotten durably"
+        );
+        assert!(sink.saves.lock().unwrap().is_empty(), "nothing re-captured the dead id");
+        // A fresh key runs again — WITHOUT the dead ref.
+        let mut rx2 = proto.events(&w);
+        proto.send_prompt(&w, prompt("t2")).await.unwrap();
+        collect_until_terminal(&mut rx2, Duration::from_secs(10)).await;
+        let argvs = recorded_argvs(dir.path(), "fake-claude");
+        assert_eq!(argvs.len(), 2, "{argvs:?}");
+        assert!(
+            !argvs[1].iter().any(|a| a == "--resume"),
+            "turn 2 must start fresh after the drop: {:?}",
+            argvs[1]
+        );
+    }
+
+    /// THE continuity acceptance (AMUX-2613): two real claude turns, and
+    /// turn 2 must remember turn 1's word — the difference between a
+    /// protocol and a fork+exec. #[ignore]d for CI (no claude auth there);
+    /// locally:
+    ///   cargo test -p amux-server pomegranate -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires installed+authenticated claude CLI; run with -- --ignored"]
+    async fn real_claude_conversation_remembers_pomegranate() {
+        let have_claude = std::process::Command::new("which")
+            .arg("claude")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !have_claude {
+            eprintln!("skipping: claude not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let proto = StructuredCliProtocol::new();
+        let w = worker_id("0000E");
+        proto.register(
+            w.clone(),
+            WorkerConfig {
+                provider: CliProvider::ClaudeCode,
+                cwd: dir.path().to_path_buf(),
+                binary: None,
+                model: Some("haiku".into()),
+                conversation: None,
+            },
+        );
+
+        let mut rx = proto.events(&w);
+        proto
+            .send_prompt(
+                &w,
+                Prompt {
+                    text: "Remember the word: pomegranate. Reply with just: OK".into(),
+                    idempotency_key: "pom-1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let t1 = collect_until_terminal(&mut rx, Duration::from_secs(120)).await;
+        assert!(
+            t1.iter().any(|e| matches!(e, WorkerEvent::TurnCompleted(_))),
+            "turn 1 did not complete: {t1:?}"
+        );
+        wait_for_state(&proto, &w, |s| *s == AgentState::Idle).await;
+
+        let mut rx2 = proto.events(&w);
+        proto
+            .send_prompt(
+                &w,
+                Prompt {
+                    text: "What word did I ask you to remember? Reply with just that word."
+                        .into(),
+                    idempotency_key: "pom-2".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let t2 = collect_until_terminal(&mut rx2, Duration::from_secs(120)).await;
+        let outcome = t2
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::TurnCompleted(r) => Some(r.outcome.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("turn 2 did not complete: {t2:?}"));
+        eprintln!("turn 2 outcome: {outcome}");
+        assert!(
+            outcome.to_lowercase().contains("pomegranate"),
+            "turn 2 forgot the word — continuity is broken: {outcome:?}"
+        );
     }
 
     /// Real end-to-end run against the installed claude CLI. #[ignore]d
@@ -973,6 +1497,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 binary: None,
                 model: None,
+                conversation: None,
             },
         );
         let mut rx = proto.events(&w);

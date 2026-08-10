@@ -31,6 +31,12 @@ pub struct SessionSpec {
     pub command: Vec<String>,
     pub cwd: String,
     pub env: std::collections::BTreeMap<String, String>,
+    /// The worker's display name, for backends that can show one (herdr
+    /// `workspace report-metadata` tokens — AMUX-2613 gap 5). DISPLAY ONLY:
+    /// never an identifier; the backend ref stays derived from `worker`
+    /// (Invariant 43 — renames must not orphan processes).
+    #[serde(default)]
+    pub human_label: Option<String>,
 }
 
 /// Opaque handle to a running (or once-running) process in some backend.
@@ -102,6 +108,39 @@ pub fn backends_from_env(
         backends.push(Arc::new(herdr::HerdrBackend::new(session.to_string())));
     }
     backends
+}
+
+/// The process-wide backend set, published once at boot (lib.rs) for API
+/// handlers that need a terminal read — worker peek (AMUX-2613 gap 4) was a
+/// 501 precisely because the API layer had no backend handle. A slot rather
+/// than an `AppState` field because AppState is constructed at 40+ sites
+/// (every test rig included) and a required field there would be churn with
+/// no information; `None` (never published — unit tests, migrate-only mode)
+/// stays distinguishable from "published but this backend absent" so peek
+/// can answer 503 vs "backend not configured" honestly.
+static PROCESS_BACKENDS: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<dyn SessionBackend>>>> =
+    std::sync::OnceLock::new();
+
+/// Publish (or, in tests, replace) the process backend set.
+pub fn set_process_backends(backends: Vec<Arc<dyn SessionBackend>>) {
+    let slot = PROCESS_BACKENDS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    *slot.write().unwrap() = backends;
+}
+
+/// Has `set_process_backends` ever run in this process?
+pub fn process_backends_published() -> bool {
+    PROCESS_BACKENDS.get().is_some()
+}
+
+/// The published backend with this name, if any.
+pub fn process_backend(name: &str) -> Option<Arc<dyn SessionBackend>> {
+    PROCESS_BACKENDS
+        .get()?
+        .read()
+        .unwrap()
+        .iter()
+        .find(|b| b.name() == name)
+        .cloned()
 }
 
 #[async_trait]

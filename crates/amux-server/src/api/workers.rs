@@ -66,14 +66,23 @@ fn not_found(key: &str) -> Response {
     )
 }
 
-/// Provider capabilities lookup. There is NO provider registry yet (RR-0007
-/// adapters land it), so this returns the core's conservative all-false
-/// default for every provider: a model change classifies as SessionRestart
-/// rather than falsely promising a hot switch the runtime cannot perform
-/// (better to over-restart than to claim `next_turn` and never apply).
-/// Replace with the real registry when provider adapters exist.
-fn provider_caps(_provider: &str) -> ProviderCapabilities {
-    ProviderCapabilities::default()
+/// Provider capabilities lookup, served from the REAL registry (AMUX-2613
+/// gap 3 — this used to hardcode the all-false default, so a claude worker's
+/// model change always classified as SessionRestart while the adapter's
+/// measured matrix said `hot_model_switch: true`; the capability existed and
+/// never reached the classifier, ethos rule 1). The registry is process-wide
+/// and immutable, built once: `resolve` handles the worker-row legacy
+/// spelling ("claude" -> "claude-code"). A provider the registry does not
+/// know keeps the conservative all-false default — over-restarting is the
+/// honest fallback for capabilities nobody measured.
+fn provider_caps(provider: &str) -> ProviderCapabilities {
+    static REGISTRY: std::sync::OnceLock<crate::provider::ProviderRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(crate::provider::default_registry)
+        .resolve(provider)
+        .map(|a| a.capabilities())
+        .unwrap_or_default()
 }
 
 /// The serde tag of a WorkerState ("stopped", "starting", ...) for
@@ -836,30 +845,117 @@ fn step_response(
 
 // ---- GET /api/workers/{id}/peek -----------------------------------------
 
-/// Peek needs a live terminal backend to read from; that lands with the
-/// backend adapters. Until then this is an honest 501 naming what delivers
-/// it — not a fake empty payload a caller would mistake for "no output"
-/// (the exact misread the Python peek's viewport bug taught us to fear).
-pub async fn peek_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+#[derive(Deserialize)]
+pub struct PeekParams {
+    /// Terminal lines to capture (herdr `pane read --lines`, tmux
+    /// `capture-pane` history depth). Clamped to 1..=2000.
+    #[serde(default)]
+    pub lines: Option<u32>,
+}
+
+/// GET /api/workers/{id}/peek?lines=N — recent terminal output of the
+/// worker's live session, read through the session's own backend (herdr
+/// pane read / tmux capture-pane). Was a 501 (AMUX-2613 gap 4: the API
+/// layer had no backend handle); now answers from
+/// `backend::process_backend`, with every non-answer NAMED rather than
+/// shaped like empty output — the Python peek's viewport bug taught us
+/// that "no output" and "could not look" must be distinguishable.
+///
+/// This is a DIAGNOSTIC view, not the control plane (D1): worker state
+/// comes from the structured protocol; peek is for the human who wants to
+/// see the terminal.
+pub async fn peek_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(p): Query<PeekParams>,
+) -> Response {
     let store = state.store.clone();
     let k = key.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        Ok(queries::get_worker(&conn, &k)?)
+        let Some(row) = queries::get_worker(&conn, &k)? else {
+            return Ok(None);
+        };
+        let live = queries::live_session_for(&conn, &row.id)?;
+        Ok(Some((row, live)))
     })
     .await;
-    match joined {
-        Ok(Ok(Some(row))) => err(
-            StatusCode::NOT_IMPLEMENTED,
+    let (row, live) = match joined {
+        Ok(Ok(Some(v))) => v,
+        Ok(Ok(None)) => return not_found(&key),
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    let Some(ses) = live else {
+        // No live session: there is no terminal to read. 409, not an empty
+        // 200 — absence of a session and absence of output are different
+        // facts.
+        return err(
+            StatusCode::CONFLICT,
             json!({
-                "error": "peek is not implemented yet",
-                "lands_with": "RR-0031/RR-0032 — terminal backend adapters (Phase 1)",
+                "error": "worker has no live session to peek",
                 "worker_id": row.id,
+                "state": state_tag(&row.state),
+            }),
+        );
+    };
+    let Some(backend) = crate::backend::process_backend(&ses.backend) else {
+        // Published-but-absent vs never-published both mean "this process
+        // cannot look", but the remedy differs — name which one it is.
+        let detail = if crate::backend::process_backends_published() {
+            format!(
+                "backend '{}' is not available on this server \
+                 (herdr requires AMUX_HERDR_SESSION)",
+                ses.backend
+            )
+        } else {
+            "terminal backends are not initialized in this process".to_string()
+        };
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": detail, "worker_id": row.id, "backend": ses.backend }),
+        );
+    };
+    let lines = p.lines.unwrap_or(200).clamp(1, 2000);
+    let proc = crate::backend::ProcessRef {
+        backend_ref: ses.backend_ref.clone(),
+        pid: ses.pid.map(|p| p as u32),
+    };
+    match backend.capture(&proc, lines).await {
+        Ok(output) => Json(json!({
+            "worker_id": row.id,
+            "session_id": ses.id,
+            "backend": ses.backend,
+            "backend_ref": ses.backend_ref,
+            "lines_requested": lines,
+            "output": output,
+            "captured_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .into_response(),
+        Err(crate::backend::BackendError::NotFound(what)) => err(
+            // The store says live, the backend says gone — surface the
+            // DISAGREEMENT (ethos rule 4), never an empty capture. With
+            // herdr this is also the shape of a finished process (its
+            // GAP-EXIT-CODE: exited panes are reaped, unobservably).
+            StatusCode::CONFLICT,
+            json!({
+                "error": "session is recorded live but its backend process was not found",
+                "worker_id": row.id,
+                "session_id": ses.id,
+                "backend": ses.backend,
+                "backend_ref": ses.backend_ref,
+                "backend_says": format!("not found: {what}"),
             }),
         ),
-        Ok(Ok(None)) => not_found(&key),
-        Ok(Err(e)) => internal(e),
-        Err(e) => internal(e),
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            json!({
+                "error": format!("terminal capture failed: {e}"),
+                "worker_id": row.id,
+                "backend": ses.backend,
+                "backend_ref": ses.backend_ref,
+            }),
+        ),
     }
 }
 
@@ -1236,15 +1332,263 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
     }
 
+    // ---- provider capabilities (AMUX-2613 gap 3) --------------------------
+
+    #[test]
+    fn provider_caps_serves_the_measured_matrix_not_all_false() {
+        // Pre-fix, provider_caps() returned ProviderCapabilities::default()
+        // (all false) for EVERY provider; this test then fails on the first
+        // assert. claude-code's measured caps (provider/claude.rs, cited to
+        // the RR-0028e spike) must reach the config classifier — and both
+        // worker-row spellings must land on them.
+        for spelling in ["claude", "claude-code"] {
+            let caps = provider_caps(spelling);
+            assert!(caps.hot_model_switch, "{spelling}: /model is a hot switch");
+            assert!(caps.structured_events, "{spelling}: stream-json exists");
+            assert!(caps.hooks, "{spelling}: lifecycle hooks exist");
+            assert!(caps.reports_usage, "{spelling}: OAuth usage endpoint");
+        }
+        // gemini/codex: structured events + hooks, no usage surface.
+        for spelling in ["gemini", "codex"] {
+            let caps = provider_caps(spelling);
+            assert!(caps.structured_events, "{spelling}");
+            assert!(!caps.reports_usage, "{spelling}");
+        }
+        // Unknown providers keep the conservative default (over-restart,
+        // never a promised capability nobody measured).
+        let unknown = provider_caps("some-future-provider");
+        assert!(!unknown.hot_model_switch && !unknown.structured_events);
+    }
+
     #[tokio::test]
-    async fn peek_is_honestly_unimplemented() {
+    async fn model_change_on_claude_is_next_turn_not_session_restart() {
+        // The observable consequence of gap 3: a claude worker's model
+        // change rides the hot-switch path — no session replacement.
         let (app, _dir) = app();
         let id = create(&app, "w").await;
-        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{id}/peek"), None).await;
-        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
-        assert!(body["lands_with"].as_str().unwrap().contains("RR-0031"));
-        // Unknown worker is still a 404, not a 501.
+        let (st, _, _) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let (st, _, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/workers/{id}"),
+            Some(json!({ "model": "haiku" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["change"]["mode"], json!("next_turn"), "{body}");
+        assert_eq!(body["change"]["session_replaced"], json!(false));
+    }
+
+    // ---- durable turn events reach the API (AMUX-2613 gap 1) --------------
+
+    /// During a (mock-protocol) turn, GET /api/workers/{id} shows the worker
+    /// ACTIVE with the turn id; after completion, idle — and the journal
+    /// carries both transitions with payloads (RR-0111a). Pre-fix, nothing
+    /// subscribed to protocol.events() in the server process, so a worker's
+    /// DB state sat at whatever the last poll wrote for the whole turn.
+    #[tokio::test]
+    async fn turn_events_flow_to_worker_state_and_journal() {
+        use crate::opencode::mock::MockProtocol;
+        use amux_core::ids::TurnId;
+        use amux_core::protocol::{TurnResult, WorkerEvent};
+
+        let (app, dir) = app();
+        let id = create(&app, "w").await;
+        let (st, _, started) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{started}");
+
+        // The same store the router serves, via the DB file.
+        let store = std::sync::Arc::new(
+            crate::db::Store::open(&dir.path().join("amux-test.db")).unwrap(),
+        );
+        let wid = WorkerId::parse(&id).unwrap();
+        let protocol = std::sync::Arc::new(MockProtocol::new());
+        protocol.register(wid.clone(), crate::opencode::AgentState::Idle);
+        let proc = crate::orchestrator::events::spawn_event_processor(
+            store.clone(),
+            protocol.clone(),
+            wid.clone(),
+        );
+
+        let turn = TurnId::from_ulid(ulid::Ulid::new());
+        protocol.emit(&wid, WorkerEvent::TurnStarted { turn_id: turn.clone() });
+        let mut active = Value::Null;
+        for _ in 0..200 {
+            let (_, _, body) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+            if body["status"] == json!("active") {
+                active = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(active["status"], json!("active"), "worker never went active: {active}");
+        assert_eq!(
+            active["state"]["turn"],
+            json!(turn.as_str()),
+            "the API must name WHICH turn: {active}"
+        );
+
+        protocol.emit(
+            &wid,
+            WorkerEvent::TurnCompleted(TurnResult { turn_id: turn.clone(), outcome: "done".into() }),
+        );
+        let mut settled = Value::Null;
+        for _ in 0..200 {
+            let (_, _, body) = send(&app, "GET", &format!("/api/workers/{id}"), None).await;
+            if body["status"] == json!("idle") {
+                settled = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(settled["status"], json!("idle"), "worker never settled idle: {settled}");
+        proc.abort();
+
+        // Journal proof (RR-0111a): both transitions landed as worker
+        // StatusChanged events WITH payload snapshots.
+        let conn = rusqlite::Connection::open(dir.path().join("amux-test.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT mutation, payload IS NOT NULL FROM _amux_state_events
+                 WHERE entity_type = 'worker' AND entity_id = ?1 ORDER BY rev",
+            )
+            .unwrap();
+        let rows: Vec<(String, bool)> = stmt
+            .query_map(rusqlite::params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let to_active = rows
+            .iter()
+            .find(|(m, _)| m.contains("\"to\":\"active\""))
+            .unwrap_or_else(|| panic!("no ->active journal row: {rows:?}"));
+        assert!(to_active.1, "->active journal row must carry a payload snapshot");
+        let to_idle = rows
+            .iter()
+            .find(|(m, _)| m.contains("\"to\":\"idle\""))
+            .unwrap_or_else(|| panic!("no ->idle journal row: {rows:?}"));
+        assert!(to_idle.1, "->idle journal row must carry a payload snapshot");
+    }
+
+    // ---- peek (AMUX-2613 gap 4) -------------------------------------------
+
+    /// One test fn on purpose: the scenarios share the process-wide backend
+    /// slot, and parallel tests mutating it would race each other.
+    #[tokio::test]
+    async fn peek_reads_the_live_terminal_and_names_every_non_answer() {
+        use crate::backend::{
+            AttachInfo, BackendError, BackendSession, BackendStatus, ProcessRef, SessionBackend,
+            SessionSpec,
+        };
+        use async_trait::async_trait;
+
+        struct ScriptedBackend {
+            name: &'static str,
+            frame: Result<String, fn() -> BackendError>,
+        }
+        #[async_trait]
+        impl SessionBackend for ScriptedBackend {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            async fn spawn(&self, _s: &SessionSpec) -> crate::backend::Result<ProcessRef> {
+                Err(BackendError::SpawnFailed("scripted".into()))
+            }
+            async fn terminate(&self, _p: &ProcessRef) -> crate::backend::Result<()> {
+                Ok(())
+            }
+            async fn status(&self, _p: &ProcessRef) -> crate::backend::Result<BackendStatus> {
+                Ok(BackendStatus::Running)
+            }
+            async fn attach_info(&self, _p: &ProcessRef) -> crate::backend::Result<AttachInfo> {
+                Ok(AttachInfo { command: "true".into() })
+            }
+            async fn reconcile(&self) -> crate::backend::Result<Vec<BackendSession>> {
+                Ok(vec![])
+            }
+            async fn capture(&self, _p: &ProcessRef, _l: u32) -> crate::backend::Result<String> {
+                match &self.frame {
+                    Ok(s) => Ok(s.clone()),
+                    Err(mk) => Err(mk()),
+                }
+            }
+        }
+
+        let (app, _dir) = app();
+
+        // Unknown worker: 404, before anything else.
         let (st, _, _) = send(&app, "GET", "/api/workers/ghost/peek", None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // No live session: 409 naming the fact — never an empty 200.
+        let id = create(&app, "w").await;
+        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{id}/peek"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("no live session"));
+
+        // Live tmux-backed session + a scripted backend: 200 with the frame
+        // and the full provenance shape.
+        let (st, _, created) = send(
+            &app,
+            "POST",
+            "/api/workers",
+            Some(json!({ "display_name": "t", "cwd": "/tmp/w", "backend": "tmux" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let tid = created["id"].as_str().unwrap().to_string();
+        let (st, _, started) = send(&app, "POST", &format!("/api/workers/{tid}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        crate::backend::set_process_backends(vec![std::sync::Arc::new(ScriptedBackend {
+            name: "tmux",
+            frame: Ok("❯ cargo test\nok. 42 passed".into()),
+        })]);
+        let (st, _, body) =
+            send(&app, "GET", &format!("/api/workers/{tid}/peek?lines=50"), None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["output"], json!("❯ cargo test\nok. 42 passed"));
+        assert_eq!(body["backend"], json!("tmux"));
+        assert_eq!(body["lines_requested"], json!(50));
+        assert_eq!(body["session_id"], started["session_id"]);
+        assert_eq!(
+            body["backend_ref"],
+            json!(format!("amux-{tid}")),
+            "ref derives from worker id (Invariant 43)"
+        );
+
+        // Backend configured out of this process (worker says herdr, only
+        // tmux published): 503 naming the missing backend.
+        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{id}/peek"), None).await;
+        // (id has no live session — start it on the default herdr backend.)
+        let _ = (st, body);
+        let (st, _, _) = send(&app, "POST", &format!("/api/workers/{id}/start"), None).await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{id}/peek"), None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("herdr"), "{body}");
+
+        // Store says live, backend says gone: 409 surfacing the
+        // disagreement (herdr's reaped-pane shape), not an empty capture.
+        crate::backend::set_process_backends(vec![std::sync::Arc::new(ScriptedBackend {
+            name: "tmux",
+            frame: Err(|| BackendError::NotFound("pane gone".into())),
+        })]);
+        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{tid}/peek"), None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("recorded live"),
+            "{body}"
+        );
+        assert!(body["backend_says"].as_str().unwrap().contains("pane gone"));
+
+        // Other capture failures: 502 carrying the reason.
+        crate::backend::set_process_backends(vec![std::sync::Arc::new(ScriptedBackend {
+            name: "tmux",
+            frame: Err(|| BackendError::CommandFailed("socket timeout".into())),
+        })]);
+        let (st, _, body) = send(&app, "GET", &format!("/api/workers/{tid}/peek"), None).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("socket timeout"));
     }
 }

@@ -164,6 +164,12 @@ impl Bootstrap {
     /// honestly: the worker stays terminal-hosted and the pump keeps seeing
     /// NoSession — never a fake registration that would accept prompts into
     /// a void.
+    ///
+    /// Registration HYDRATES the worker's persisted conversation ref
+    /// (`_amux_conversations`, migration 0011) so continuity survives a
+    /// server restart — without this, every restart silently amnesia'd the
+    /// fleet (AMUX-2613 gap 2). A ref stored under a DIFFERENT provider
+    /// family is left behind, never replayed into the wrong CLI.
     fn register_protocol(&self, report: &mut BootstrapReport, row: &queries::WorkerRow) {
         let Ok(worker) = WorkerId::parse(&row.id) else { return };
         if self.registrar.is_registered(&worker) {
@@ -172,6 +178,7 @@ impl Bootstrap {
         let Some(cli) = CliProvider::from_provider_id(&row.provider) else {
             return;
         };
+        let conversation = self.persisted_conversation(&row.id, cli);
         self.registrar.register_worker(
             worker,
             ProtocolWorkerConfig {
@@ -179,9 +186,25 @@ impl Bootstrap {
                 cwd: std::path::PathBuf::from(&row.cwd),
                 binary: None,
                 model: row.model.clone(),
+                conversation,
             },
         );
         report.registered.push(row.id.clone());
+    }
+
+    /// The worker's persisted conversation ref, if its provider family
+    /// still matches. Best-effort: a read failure hydrates nothing (a fresh
+    /// conversation is always a safe start), it never blocks registration.
+    fn persisted_conversation(&self, worker_id: &str, cli: CliProvider) -> Option<String> {
+        let conn = self.store.read().ok()?;
+        let (provider, cref): (String, String) = conn
+            .query_row(
+                "SELECT provider, conversation_ref FROM _amux_conversations WHERE worker_id = ?1",
+                params![worker_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        (CliProvider::from_provider_id(&provider) == Some(cli)).then_some(cref)
     }
 
     /// One pass over the store + backends. See module docs for the sweeps.
@@ -239,6 +262,9 @@ impl Bootstrap {
                 // Worker-scope env only for now; the four-tier scope
                 // assembly (amux-core scope) wires in with RR-0040.
                 env: row.environment.clone(),
+                // Display metadata for backends that can show it (herdr
+                // workspace tokens) — the backend ref stays id-derived.
+                human_label: Some(row.display_name.clone()).filter(|n| !n.trim().is_empty()),
             };
             match backend.spawn(&spec).await {
                 Ok(proc) => {
@@ -568,6 +594,9 @@ mod tests {
         );
         assert_eq!(spawns[0].cwd, "/tmp/bootstrap-test-cwd");
         assert_eq!(spawns[0].env.get("FOO").map(String::as_str), Some("bar"));
+        // Display name rides along for backend metadata (herdr workspace
+        // tokens, AMUX-2613 gap 5) — display-only, never the ref.
+        assert_eq!(spawns[0].human_label.as_deref(), Some(format!("w-{id}").as_str()));
 
         // pid recorded on the session row.
         let pid: Option<i64> = {
@@ -676,6 +705,66 @@ mod tests {
         // Idempotent: the second pass re-registers nothing.
         let again = boot.pass_once().await.unwrap();
         assert!(again.registered.is_empty(), "{again:?}");
+    }
+
+    fn seed_conversation(store: &SharedStore, worker: &WorkerId, provider: &str, cref: &str) {
+        let (w, p, c) = (worker.to_string(), provider.to_string(), cref.to_string());
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_conversations (worker_id, provider, conversation_ref, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![w, p, c, chrono::Utc::now().to_rfc3339()],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+    }
+
+    /// AMUX-2613 gap 2, restart half: adoption must hydrate the persisted
+    /// conversation ref into the protocol registration — and must NOT
+    /// replay a ref stored under a different provider family.
+    #[tokio::test]
+    async fn adoption_hydrates_the_persisted_conversation_ref() {
+        let (store, _dir) = store();
+        let (id, _) = seed(
+            &store,
+            WorkerState::Idle { since: chrono::Utc::now() },
+            "herdr",
+            "claude",
+            true,
+        );
+        // Stored under the canonical family (what the sink writes) while the
+        // row says "claude" — the family mapping must bridge the spellings.
+        seed_conversation(&store, &id, "claude-code", "conv-abc");
+        // A sibling whose stored family no longer matches its row provider.
+        let (mismatched, _) = seed(
+            &store,
+            WorkerState::Idle { since: chrono::Utc::now() },
+            "herdr",
+            "gemini",
+            true,
+        );
+        seed_conversation(&store, &mismatched, "codex", "wrong-family-ref");
+
+        let backend = Arc::new(FakeBackend::default());
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let boot = bootstrap(store.clone(), backend, registrar.clone());
+        boot.pass_once().await.unwrap();
+
+        let regs = registrar.registered.lock().unwrap();
+        let of = |w: &WorkerId| {
+            regs.iter()
+                .find(|(rw, _)| rw == w)
+                .map(|(_, c)| c.conversation.clone())
+                .expect("worker registered")
+        };
+        assert_eq!(of(&id).as_deref(), Some("conv-abc"));
+        assert_eq!(
+            of(&mismatched),
+            None,
+            "a ref from another provider family must not be replayed"
+        );
     }
 
     #[tokio::test]

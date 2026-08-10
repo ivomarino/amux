@@ -1071,3 +1071,49 @@ FIX: not a request to reverse the protocol - deletion is Ethan's call and he mad
   is where someone hitting it again would actually look. amux-cloud argued the general form of
   this before the deletions and was told, correctly, that the call was made; this entry is the
   evidence they asked for rather than a re-litigation.
+
+## A 405 on an unrouted path — the GET-only SPA catch-all makes "no such route" wear "wrong method"
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (AMUX-2610 build lane)
+CARD: AMUX-2610
+SYMPTOM: Any non-GET request to a path the rust router does not mount answers 405 (with
+  Allow: GET) from the SPA catch-all (`/{*path}` is registered GET-only in static_files.rs),
+  while a GET to the same unknown /api path answers 404. So POST /api/lookup logged a 405 —
+  a status that says "path exists, method wrong" about a path that does not exist at all.
+  Verified live on 8824 and reproduced against the router in tests.
+COST: fed directly into the incident that motivated AMUX-2610: a model diagnosing a 405 had
+  to grep mod.rs + module routers to discover whether the path was even routed — the
+  expensive token spend Ethan flagged. The status code alone cannot discriminate the three
+  honest cells (wrong method / unknown path / route landed after the rows).
+FIX: not changed at the router (the catch-all's GET-only shape is load-bearing for the SPA
+  shell); fixed at the instrument instead, same commit as this entry: /api/logs/analyze
+  computes a per-405-group verdict that names the cell explicitly, including "no route
+  exists at this path — the 405 is the GET-only SPA catch-all answering a non-GET", and
+  /api/debug/routes serves the ROUTE_TABLE so "is X routed" is a GET, not a grep.
+
+## Every direct prompt to a rust worker ran TWICE — the ledger card re-dispatched its own prompt
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (AMUX-2613 build lane)
+CARD: AMUX-2613
+SYMPTOM: The full-stack pomegranate E2E's claude transcript carried the same prompt twice:
+  once raw ("Remember the word: pomegranate…"), then again wrapped in an ExecuteTask
+  assignment ("Task tsk_…: Remember the word: pomegranate **Prompt:** …"). The pump
+  delivered the message, capture_prompt_card minted its no-silent-work ledger card as
+  `todo` — and an owned `todo` card is Runnable to the planner (deliberately: the L3
+  380-invisible-todos lesson), so the next tick assigned the card and redelivered the
+  same prompt as new work. Two turns, two token spends, two "OK"s, per prompt.
+COST: one failed E2E verdict (turn-count wait tripped early on the phantom turn) plus the
+  double token spend this would have silently charged EVERY direct prompt to every
+  rust-orchestrated worker; invisible unless you read a provider transcript, since each
+  delivery looks legitimate alone — the board showed one card and the queue two commands.
+FIX: same commit as this entry: the ledger card mints as `doing` (in flight, owner
+  attached), which disposition() reads as Assigned — never re-dispatched; an un-moved
+  card after the turn lands in the stall detector's designed drift cell. Regression:
+  captured_ledger_card_is_not_redispatched_by_the_planner (runtime.rs) fails on the
+  pre-fix mint.

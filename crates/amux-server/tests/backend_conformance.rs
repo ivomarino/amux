@@ -55,6 +55,7 @@ async fn run_conformance(backend: &dyn SessionBackend) {
         command: vec!["sleep".into(), "30".into()],
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         env: BTreeMap::from([("AMUX_CONFORMANCE".to_string(), "1".to_string())]),
+        human_label: None,
     };
 
     let proc = backend

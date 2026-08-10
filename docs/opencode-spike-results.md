@@ -96,6 +96,31 @@ and for Claude Code's interactive menu. The D1 exit (report endpoint replaces
 scrapers) is further along than the spike originally recorded: 2 of 3
 providers now have a structured rate-limit path.
 
+## Conversation Continuity (AMUX-2613, measured 2026-08-09)
+
+Headless continuation per provider, measured live on this machine
+(claude 2.1.226, gemini 0.54.4, codex 0.141.0). Implemented in
+`crates/amux-server/src/opencode/structured.rs`; refs persist in
+`_amux_conversations` (migration 0011) and hydrate at registration.
+
+| Provider | Conversation id source | Resume argv | Live verification |
+|---|---|---|---|
+| Claude Code | `system/init` `session_id` | `--print --resume <id>` | VERIFIED end-to-end: same session id continues (no fork); memory confirmed (pomegranate probe, haiku) |
+| Gemini CLI | `init` `session_id` | `-p --resume <id>` | VERIFIED end-to-end; memory confirmed. Top-level help documents only index/"latest", but UUID works and the bad-id error text names `--resume {uuid}` as supported |
+| Codex CLI | `thread.started` `thread_id` | `exec resume <id> <prompt>` (with `--json --skip-git-repo-check`) | PARTIAL: argv accepted, `thread.started` re-emits the SAME thread id, turn starts — then fails on this machine's exhausted quota (resets 2026-08-27). Memory continuity rests on the CLI's documented resume contract until then |
+| Ollama | n/a | n/a | Not an agent CLI (above); no session concept to resume |
+
+Dead-target shapes (why refs are captured ONLY from init-shaped lines):
+
+- claude `--resume <vanished id>`: exit 1, a single error `result` line that
+  ECHOES the dead session id, no init. Capturing session_id from arbitrary
+  lines would re-arm the dead ref on every failure.
+- gemini `--resume <vanished id>`: exit 42, empty stream, stderr explains.
+
+The protocol drops a ref whose resumed run failed without re-emitting init,
+so a vanished conversation degrades to one failed turn + a fresh start, not
+a permanently wedged worker.
+
 ## herdr Agent Detection
 
 herdr (v0.8.0) already has agent-detection profiles for claude, codex, and

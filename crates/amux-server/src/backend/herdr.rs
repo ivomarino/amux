@@ -270,6 +270,30 @@ impl SessionBackend for HerdrBackend {
             )));
         }
 
+        // Display metadata (AMUX-2613 gap 5 — herdr capability the backend
+        // under-used): the workspace LABEL is the machine ref
+        // (`amux-wrk_<ulid>`), opaque to a human attached to the session.
+        // `workspace report-metadata` tokens show alongside it in herdr's
+        // UI/`workspace get` (`tokens: {worker: <name>}` — verified live
+        // 2026-08-09; note the CLI wants the positional ID BEFORE flags).
+        // Display-only and best-effort: a metadata miss must never fail a
+        // spawn that succeeded.
+        if let Some(name) = spec.human_label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(ws_id) = v["result"]["root_pane"]["workspace_id"].as_str() {
+                let token = format!("worker={name}");
+                if let Err(e) = self
+                    .run_json(
+                        &["workspace", "report-metadata", ws_id, "--source", "amux", "--token", &token],
+                        OP_TIMEOUT,
+                    )
+                    .await
+                {
+                    tracing::debug!(backend_ref = %ref_, error = %e,
+                        "herdr workspace metadata report failed (display-only; ignored)");
+                }
+            }
+        }
+
         Ok(ProcessRef {
             backend_ref: ref_,
             pid,

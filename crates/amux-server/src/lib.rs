@@ -40,6 +40,64 @@ pub fn run() {
     rt.block_on(async_main());
 }
 
+/// Store-backed [`opencode::structured::ConversationSink`] (AMUX-2613
+/// gap 2): captured conversation refs land in `_amux_conversations`
+/// (migration 0011) so backend::bootstrap hydrates them back after a
+/// restart. Fire-and-forget by contract — a persistence hiccup must never
+/// stall a turn's reader task, so failures are logged, not propagated.
+/// `applied: false` on purpose: this is protocol plumbing state with no
+/// entity/SSE consumer, so it must not bump the global revision (Invariant
+/// 37 gates rev on entity-visible change; the write itself still commits).
+struct StoreConversationSink {
+    store: db::SharedStore,
+}
+
+impl opencode::structured::ConversationSink for StoreConversationSink {
+    fn save(&self, worker: &amux_core::ids::WorkerId, family: &str, conversation_ref: &str) {
+        let store = self.store.clone();
+        let (w, f, c) = (worker.to_string(), family.to_string(), conversation_ref.to_string());
+        tokio::spawn(async move {
+            let (ww, ff, cc) = (w.clone(), f, c);
+            let res = store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_conversations
+                             (worker_id, provider, conversation_ref, updated_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(worker_id) DO UPDATE SET
+                             provider = ?2, conversation_ref = ?3, updated_at = ?4",
+                        rusqlite::params![ww, ff, cc, chrono::Utc::now().to_rfc3339()],
+                    )?;
+                    Ok(db::WriteOutcome { applied: false, events: vec![] })
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(worker = %w, error = %e, "conversation ref persist failed");
+            }
+        });
+    }
+
+    fn forget(&self, worker: &amux_core::ids::WorkerId) {
+        let store = self.store.clone();
+        let w = worker.to_string();
+        tokio::spawn(async move {
+            let ww = w.clone();
+            let res = store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "DELETE FROM _amux_conversations WHERE worker_id = ?1",
+                        rusqlite::params![ww],
+                    )?;
+                    Ok(db::WriteOutcome { applied: false, events: vec![] })
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(worker = %w, error = %e, "conversation ref forget failed");
+            }
+        });
+    }
+}
+
 async fn async_main() {
     // rustls refuses to guess when both ring and aws-lc-rs are in the
     // dependency graph (reqwest pulls one, axum-server the other). Pin ring
@@ -151,10 +209,21 @@ async fn async_main() {
     // (backend::backends_from_env — constructing it against a missing herdr
     // server would make every probe a failure report).
     let backends = backend::backends_from_env(&cfg.env);
+    // Publish the backend set for API handlers (worker peek, AMUX-2613
+    // gap 4): AppState is constructed at 40+ sites, so the accessor is a
+    // process-wide slot rather than a new required field on every one.
+    backend::set_process_backends(backends.clone());
     // ONE protocol instance shared by the runtime pump, the scan demotion
     // check, and the bootstrap registrar — two instances would disagree
     // about which workers have live sessions (ethos rule 4).
-    let protocol = Arc::new(opencode::structured::StructuredCliProtocol::new());
+    //
+    // Conversation refs the protocol captures persist to
+    // `_amux_conversations` (AMUX-2613 gap 2) so bootstrap re-hydrates them
+    // after a restart — an in-memory-only ref is fiction (the D1 report-
+    // table lesson: this process re-execs on every deploy).
+    let protocol = Arc::new(opencode::structured::StructuredCliProtocol::with_conversation_sink(
+        Arc::new(StoreConversationSink { store: store.clone() }),
+    ));
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
     let runtime = Arc::new(orchestrator::runtime::Runtime {

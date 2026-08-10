@@ -76,6 +76,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0010_request_log",
         sql: include_str!("../../migrations/0010_request_log.sql"),
     },
+    Migration {
+        version: 11,
+        name: "0011_conversations",
+        sql: include_str!("../../migrations/0011_conversations.sql"),
+    },
 ];
 
 pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {

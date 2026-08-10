@@ -1014,6 +1014,7 @@ async fn golden_multi_provider_fleet() {
                         cwd: ws.path().to_path_buf(),
                         binary: binary.clone(),
                         model: None, // structured::WorkerConfig grew `model` mid-flight (other lane); None = CLI default
+            conversation: None, // and `conversation` with AMUX-2613; None = fresh
                     },
                 );
                 routes.insert(wid.clone(), structured.clone());
@@ -1423,6 +1424,7 @@ async fn traced_live_backend_lifecycle(
         command: vec!["claude".into(), "--dangerously-skip-permissions".into()],
         cwd: ws.path().to_string_lossy().into_owned(),
         env: BTreeMap::from([("AMUX_GOLDEN_LIVE".to_string(), "1".to_string())]),
+        human_label: None,
     };
     let proc = backend
         .spawn(&spec)

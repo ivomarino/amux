@@ -358,6 +358,7 @@ async fn golden_live_happy_path_claude() {
             cwd: ws_path.clone(),
             binary: None, // real `claude` resolved via PATH
             model: None, // structured::WorkerConfig grew `model` mid-flight (other lane); None = CLI default
+            conversation: None, // and `conversation` with AMUX-2613; None = fresh
         },
     );
 
@@ -717,6 +718,7 @@ async fn run_live_backend_lifecycle(backend: Arc<dyn SessionBackend>, label: &st
         command: vec!["claude".into(), "--dangerously-skip-permissions".into()],
         cwd: ws.path().to_string_lossy().into_owned(),
         env: BTreeMap::from([("AMUX_GOLDEN_LIVE".to_string(), "1".to_string())]),
+        human_label: None,
     };
     let proc = backend
         .spawn(&spec)
