@@ -6631,6 +6631,43 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             continue;
         }
         let pane = tmux_capture(name, 30).await;
+
+        // INPUT-REQUIRED IS A DISTINCT STATE, and the dashboard has always been
+        // able to show it (app.js:2405 renders `needs input`, and there is a
+        // filter for it) — no lane ever reached it. The fleet listing derives
+        // status from self-reports and tmux activity, neither of which can see a
+        // PICKER; only a pane capture can, and this sweep is the one place that
+        // already pays for one (AMUX-2834).
+        //
+        // A lane sitting on an AskUserQuestion is BLOCKED ON A HUMAN and is the
+        // opposite of idle: nothing will move it, no deadline will force it, and
+        // amux must not answer it (typing there rejects the pending tool — the
+        // 2026-07-15 kill). Reading as `idle` is exactly backwards, and it hid
+        // mvs-infra behind a menu for 400s+ earlier today.
+        //
+        // A rate-limit menu is EXCLUDED: it is also a selector, but amux owns it
+        // and answers it below, so flagging it would ask a human for something
+        // nobody needs to decide.
+        let selector_now = !is_rate_limit_menu(&pane) && detect_claude_status(&pane) == "waiting";
+        let selector_was = load_meta(name)["input_required_since"].as_i64().unwrap_or(0) > 0;
+        if selector_now != selector_was {
+            update_meta(
+                name,
+                &[("input_required_since", json!(if selector_now { now_i64() } else { 0 }))],
+            );
+            if selector_now {
+                emit_event(
+                    state,
+                    name,
+                    "session.input_required",
+                    Some(json!({"detected_by": "sweep"})),
+                    Some(format!("inputreq:{name}:{}", now_i64() / 3600)),
+                    "status",
+                )
+                .await;
+            }
+        }
+
         if !is_rate_limit_menu(&pane) {
             // Recovered on its own (or was never limited): clear a stale stamp
             // so the fleet view does not stay red after the fact.

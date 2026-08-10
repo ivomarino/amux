@@ -104,6 +104,42 @@ fn env_secs(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Derive the waiting_reason from a pane capture: "permission_prompt",
+/// "user_input", "rate_limit", or "" (not waiting / unknown).
+///
+/// Mirrors the logic in backend::adapter but runs against the preview
+/// pane content that build_array already has in hand. Does not spawn
+/// any subprocess.
+fn derive_waiting_reason(raw: &str) -> &'static str {
+    if raw.is_empty() {
+        return "";
+    }
+    let clean = strip_ansi(raw);
+    let low = clean.to_lowercase();
+
+    if crate::api::session_verbs::is_rate_limit_menu(raw) {
+        return "rate_limit";
+    }
+    if low.contains("do you want to proceed") {
+        return "permission_prompt";
+    }
+    if low.contains("approve") && !low.contains("bypass permissions on") {
+        let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+        for l in lines.iter().rev().take(5) {
+            if l.to_lowercase().contains("approve") && !l.to_lowercase().contains("esc to interrupt") {
+                return "permission_prompt";
+            }
+        }
+    }
+    if low.contains("enter to select") || low.contains("esc to cancel") {
+        return "user_input";
+    }
+    if clean.contains("Resume from summary") && clean.contains("Resume full session") {
+        return "user_input";
+    }
+    ""
+}
+
 /// The whole-fleet pane snapshot, shared by every reader inside the TTL.
 ///
 /// A process global rather than a field on `AppState`: `FleetSignals::load` is
@@ -113,6 +149,35 @@ fn env_secs(name: &str, default: f64) -> f64 {
 /// changes no verdict.
 #[allow(clippy::type_complexity)]
 fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, BTreeMap<String, String>)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
+}
+
+/// Response-level cache for `build_array`: the serialized JSON string + the
+/// epoch it was computed at. At 3,714 req/hr (~1/s) with each call spawning
+/// ~100 tmux subprocesses for previews + N git subprocesses + ~226 filesystem
+/// reads, a 2s TTL collapses the real work by ~2x while being invisible to a
+/// human polling the dashboard.
+fn build_array_cache() -> &'static std::sync::Mutex<(f64, String)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, String)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new((0.0, String::new())))
+}
+
+/// Git branch cache: dir -> (branch, epoch). Branches change on the scale of
+/// minutes; re-running `git rev-parse` per directory on every request is pure
+/// waste.
+fn git_branch_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, BTreeMap<String, String>)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
+}
+
+/// Preview capture cache: name -> raw pane text, with a TTL matching the
+/// status-pane cache. Previews are the dominant cost in build_array (~100
+/// tmux capture-pane subprocesses per call).
+fn preview_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, BTreeMap<String, String>)>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
@@ -716,20 +781,62 @@ fn amux_home() -> std::path::PathBuf {
 
 /// ~/.amux/sessions/<name>.meta.json (py:_load_meta) — last_send,
 /// last_started, task_summary live here.
+///
+/// Cached per build_array call via a process-global with a 2s TTL.
+/// load_meta is called TWICE per session in build_array (once in
+/// python_fleet_sessions, once in board linkage) — 226 filesystem reads
+/// per request collapsed to ~113.
 fn load_meta(name: &str) -> serde_json::Value {
+    fn meta_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, serde_json::Value>)> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, BTreeMap<String, serde_json::Value>)>> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
+    }
+    let now = chrono::Utc::now().timestamp() as f64;
+    if let Ok(c) = meta_cache().lock() {
+        if now - c.0 < 2.0 {
+            if let Some(v) = c.1.get(name) {
+                return v.clone();
+            }
+        }
+    }
     let p = amux_home().join("sessions").join(format!("{name}.meta.json"));
-    std::fs::read_to_string(p)
+    let val = std::fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(serde_json::Value::Null);
+    if let Ok(mut c) = meta_cache().lock() {
+        if now - c.0 >= 2.0 {
+            c.1.clear();
+            c.0 = now;
+        }
+        c.1.insert(name.to_string(), val.clone());
+    }
+    val
 }
 
 /// The legacy array as a JSON string, shared by the GET handler and the
 /// SSE `sessions` pushes (one serializer, two transports).
+///
+/// Cached with a short TTL: the real work (tmux subprocesses, filesystem
+/// reads, git calls) costs ~80-950ms and runs ~1/s from dashboard polling.
+/// A 2s-stale response is invisible to a human and halves the subprocess
+/// load.
 pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<String> {
+    let ttl = env_secs("AMUX_SESSIONS_CACHE_TTL_S", 2.0);
+    let now = chrono::Utc::now().timestamp() as f64;
+    if let Ok(c) = build_array_cache().lock() {
+        if now - c.0 < ttl && !c.1.is_empty() {
+            return Ok(c.1.clone());
+        }
+    }
     let conn = store.read()?;
     let arr = build_array(&conn)?;
-    Ok(serde_json::to_string(&arr)?)
+    let json = serde_json::to_string(&arr)?;
+    if let Ok(mut c) = build_array_cache().lock() {
+        *c = (now, json.clone());
+    }
+    Ok(json)
 }
 
 pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
@@ -990,7 +1097,19 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             let send = meta["last_send"].as_i64().unwrap_or(0);
             if send != 0 { send } else { meta["last_started"].as_i64().unwrap_or(0) }
         };
-        let status = signals.derive_status(&name, is_running);
+        let mut status = signals.derive_status(&name, is_running);
+        // A lane parked on a real picker is WAITING, never idle (AMUX-2834). The
+        // derivation above cannot see a picker — it reads self-reports and tmux
+        // activity, and a lane at a prompt is producing neither. The sweep in
+        // session_verbs stamps this after a pane capture; read it here rather
+        // than capturing again, which would be ~113 tmux calls per request.
+        // Only overrides a NON-active status: if the lane is genuinely
+        // generating, that is the more urgent truth and the picker reading is
+        // stale by definition.
+        if is_running && status != "active" && meta["input_required_since"].as_i64().unwrap_or(0) > 0
+        {
+            status = "waiting".to_string();
+        }
         out.push(json!({
             "archived": archived,
             // The lightning button's state derives from THIS field in the
@@ -1301,35 +1420,51 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 
     // branch: bounded parallel git lookups, deduped by directory (many
     // sessions share a checkout — one git call per DISTINCT dir).
+    // Cached with a 30s TTL: branches change on the scale of minutes.
     {
-        let dirs: std::collections::BTreeSet<String> = out
-            .iter()
-            .filter_map(|v| v["dir"].as_str())
-            .filter(|d| !d.is_empty())
-            .map(String::from)
-            .collect();
-        let mut branches: std::collections::BTreeMap<String, String> = Default::default();
-        let dir_list: Vec<String> = dirs.into_iter().collect();
-        for chunk in dir_list.chunks(12) {
-            let handles: Vec<_> = chunk
+        let git_ttl = env_secs("AMUX_GIT_BRANCH_CACHE_TTL_S", 30.0);
+        let mut branches: std::collections::BTreeMap<String, String> =
+            if let Ok(c) = git_branch_cache().lock() {
+                if signals.now - c.0 < git_ttl {
+                    c.1.clone()
+                } else {
+                    Default::default()
+                }
+            } else {
+                Default::default()
+            };
+        if branches.is_empty() {
+            let dirs: std::collections::BTreeSet<String> = out
                 .iter()
-                .map(|d| {
-                    let d = d.clone();
-                    std::thread::spawn(move || {
-                        let out = std::process::Command::new("git")
-                            .args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
-                            .output()
-                            .ok()?;
-                        out.status.success().then(|| {
-                            (d, String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter_map(|v| v["dir"].as_str())
+                .filter(|d| !d.is_empty())
+                .map(String::from)
+                .collect();
+            let dir_list: Vec<String> = dirs.into_iter().collect();
+            for chunk in dir_list.chunks(12) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|d| {
+                        let d = d.clone();
+                        std::thread::spawn(move || {
+                            let out = std::process::Command::new("git")
+                                .args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
+                                .output()
+                                .ok()?;
+                            out.status.success().then(|| {
+                                (d, String::from_utf8_lossy(&out.stdout).trim().to_string())
+                            })
                         })
                     })
-                })
-                .collect();
-            for h in handles {
-                if let Ok(Some((d, b))) = h.join() {
-                    branches.insert(d, b);
+                    .collect();
+                for h in handles {
+                    if let Ok(Some((d, b))) = h.join() {
+                        branches.insert(d, b);
+                    }
                 }
+            }
+            if let Ok(mut c) = git_branch_cache().lock() {
+                *c = (signals.now, branches.clone());
             }
         }
         for v in out.iter_mut() {
@@ -1342,66 +1477,87 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
     // lines like Python's batch, py:20137); STOPPED sessions get the saved
     // log tail (py:20218-20223). Both feed Python's preview pair: scalar +
     // the preview_lines ARRAY the SPA maps over (AMUX-2588).
+    //
+    // Cached with a TTL matching the status-pane cache: previews are the
+    // dominant cost (~100 tmux capture-pane subprocesses per uncached call).
     {
-        let names: Vec<(String, bool)> = out
-            .iter()
-            .filter_map(|v| {
-                let n = v["name"].as_str()?.to_string();
-                let running = v["running"].as_bool().unwrap_or(false);
-                Some((n, running))
-            })
-            .collect();
-        // Seed from the status probe's captures — same command, same 30 lines.
-        // Capturing them twice in one request would be two READS of a live
-        // pane 20ms apart, i.e. two different frames, and the card would then
-        // show a preview from a frame the status was not derived from.
-        let mut raws: std::collections::BTreeMap<String, String> = signals
-            .panes
-            .iter()
-            .filter(|(_, raw)| !raw.trim().is_empty())
-            .map(|(n, raw)| (n.clone(), raw.clone()))
-            .collect();
-        let names: Vec<(String, bool)> =
-            names.into_iter().filter(|(n, _)| !raws.contains_key(n)).collect();
-        for chunk in names.chunks(12) {
-            let handles: Vec<_> = chunk
+        let preview_ttl = env_secs("AMUX_PREVIEW_CACHE_TTL_S", 3.0);
+        let cached_previews: Option<BTreeMap<String, String>> =
+            if let Ok(c) = preview_cache().lock() {
+                if signals.now - c.0 < preview_ttl && !c.1.is_empty() {
+                    Some(c.1.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let raws = if let Some(cached) = cached_previews {
+            cached
+        } else {
+            let names: Vec<(String, bool)> = out
                 .iter()
-                .map(|(name, running)| {
-                    let n = name.clone();
-                    let running = *running;
-                    std::thread::spawn(move || {
-                        if running {
-                            // Via the L2 helper, not an inline format!: this was
-                            // the ONE tmux target in the crate spelled by hand.
-                            // It happened to be exact, but `tmux_target_audit`
-                            // cannot tell a correct hand-spelling from the
-                            // prefix-matching kind, and a rule with an
-                            // exception is a rule nobody can enforce.
-                            let pt = pane_target(&format!("amux-{n}"));
-                            let out = std::process::Command::new("tmux")
-                                .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
-                                .output()
-                                .ok()?;
-                            Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
-                        } else {
-                            let raw = stopped_session_raw(&n);
-                            (!raw.is_empty()).then_some((n, raw))
-                        }
-                    })
+                .filter_map(|v| {
+                    let n = v["name"].as_str()?.to_string();
+                    let running = v["running"].as_bool().unwrap_or(false);
+                    Some((n, running))
                 })
                 .collect();
-            for h in handles {
-                if let Ok(Some((n, p))) = h.join() {
-                    raws.insert(n, p);
+            // Seed from the status probe's captures — same command, same 30 lines.
+            let mut raws: std::collections::BTreeMap<String, String> = signals
+                .panes
+                .iter()
+                .filter(|(_, raw)| !raw.trim().is_empty())
+                .map(|(n, raw)| (n.clone(), raw.clone()))
+                .collect();
+            let names: Vec<(String, bool)> =
+                names.into_iter().filter(|(n, _)| !raws.contains_key(n)).collect();
+            for chunk in names.chunks(12) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|(name, running)| {
+                        let n = name.clone();
+                        let running = *running;
+                        std::thread::spawn(move || {
+                            if running {
+                                let pt = pane_target(&format!("amux-{n}"));
+                                let out = std::process::Command::new("tmux")
+                                    .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
+                                    .output()
+                                    .ok()?;
+                                Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+                            } else {
+                                let raw = stopped_session_raw(&n);
+                                (!raw.is_empty()).then_some((n, raw))
+                            }
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    if let Ok(Some((n, p))) = h.join() {
+                        raws.insert(n, p);
+                    }
                 }
             }
-        }
+            if let Ok(mut c) = preview_cache().lock() {
+                *c = (signals.now, raws.clone());
+            }
+            raws
+        };
         for v in out.iter_mut() {
             if let Some(name) = v["name"].as_str() {
                 if let Some(raw) = raws.get(name) {
                     let (preview, lines) = preview_of(raw);
                     v["preview"] = json!(preview);
                     v["preview_lines"] = json!(lines);
+                    let wr = derive_waiting_reason(raw);
+                    if !wr.is_empty() {
+                        v["waiting_reason"] = json!(wr);
+                        if v["status"].as_str() != Some("active") {
+                            v["status"] = json!("waiting");
+                        }
+                    }
                 }
             }
         }
