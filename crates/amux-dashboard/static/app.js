@@ -2778,7 +2778,29 @@ function esc(s) {
 // e.g. onclick="fn('${escJs(x)}')": HTML-escape (incl. ") then backslash-escape
 // \ and ' so it can't break out of the JS string.
 function escJs(s) {
-  return esc(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  // LINE TERMINATORS MUST BE ESCAPED. A raw newline inside a single-quoted JS
+  // string literal is a SyntaxError — "Unexpected end of input" — and inside an
+  // inline handler that means the whole attribute fails to compile and the
+  // click does NOTHING. Silently: no error at click time in most paths, no
+  // network request, no state change, nothing visibly broken to report.
+  //
+  // Found live on two real worker cards whose `task` text spans lines
+  // (amux-homepage, cold-outbound): their "Task label" menu item was dead,
+  // and the same would apply to any of the 47 escJs call sites carrying
+  // multi-line user text. Detected by compiling every inline onclick on the
+  // page with `new Function(...)` and reporting the ones that throw — testing
+  // that the handler is VALID, not merely that the element exists.
+  //
+  // U+2028/U+2029 are line terminators in JS but invisible in most editors,
+  // which is exactly why they are worth escaping here rather than trusting
+  // input to be clean.
+  return esc(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 // How many viewport px one style px maps to under the root CSS zoom — MEASURED
 // with a probe, not derived from getComputedStyle(zoom). Engines disagree on
@@ -6632,7 +6654,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.545';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.548';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17652,22 +17674,154 @@ function _beTagRenderChips(prefix) {
   tags.forEach(t => {
     const chip = document.createElement('span');
     chip.className = 'be-tag-chip';
-    chip.innerHTML = esc(t) + '<span class="be-tag-chip-remove" onclick="event.stopPropagation();_beTagRemove(' + JSON.stringify(prefix) + ',' + JSON.stringify(t) + ')">\u00d7</span>';
+    // Same quoting hazard as the suggestion chips: JSON.stringify's double
+    // quotes inside a double-quoted onclick attribute truncated the handler to
+    // `event.stopPropagation();_beTagRemove(`, so the \u00d7 was dead too. Bound as
+    // a real listener \u2014 no attribute, no quoting to get wrong.
+    chip.appendChild(document.createTextNode(t));
+    const x = document.createElement('span');
+    x.className = 'be-tag-chip-remove';
+    x.textContent = '\u00d7';
+    x.addEventListener('click', ev => { ev.stopPropagation(); _beTagRemove(prefix, t); });
+    chip.appendChild(x);
     wrap.insertBefore(chip, inp);
   });
   inp.placeholder = tags.length ? '' : 'Add group\u2026';
 }
 
+/// Tags that are IDENTIFIERS, not themes.
+///
+/// A namespace whose members are each used on ~1 card is a per-entity label
+/// (`hrsla:annette@madgicx.com`, `hrsla:john@d4solutions.ae`, ...), not a theme
+/// anyone would want suggested. That is what filled the picker with a dozen
+/// strangers' email addresses: the old code offered EVERY tag on the entire
+/// board, so one lane's per-customer SLA tracking became every other card's
+/// autocomplete.
+///
+/// The discriminator is deterministic and needs no model call (ethos rule 2):
+/// group by `family:` prefix, and if a family has several members averaging
+/// about one card each, it is an identifier namespace. A real theme (`perf`,
+/// `parity`, `backend`) is reused across many cards by construction — that is
+/// what makes it a theme.
+function _tagIdentifierFamilies(items) {
+  const fam = {};
+  for (const it of items) {
+    for (const t of (it.tags || [])) {
+      const i = t.indexOf(':');
+      if (i <= 0) continue;
+      const f = t.slice(0, i);
+      (fam[f] = fam[f] || { members: new Set(), uses: 0 });
+      fam[f].members.add(t);
+      fam[f].uses++;
+    }
+  }
+  const out = new Set();
+  for (const [f, v] of Object.entries(fam)) {
+    // >=4 distinct members averaging <1.5 cards each: an entity namespace.
+    if (v.members.size >= 4 && v.uses / v.members.size < 1.5) out.add(f);
+  }
+  return out;
+}
+
+/// Rank candidate tags for THIS card instead of dumping the board's tag set.
+///
+/// Signals, cheapest first, all local and free:
+///  * co-occurrence with tags already on the card — the actual "theme"
+///    signal: tags that travel together describe the same body of work;
+///  * tags used by the same worker (a lane's work is thematically coherent);
+///  * word overlap with the card's own title;
+///  * overall frequency, as a weak prior so one-off tags sink.
+///
+/// This is the deterministic floor. Real semantic clustering (embedding the
+/// titles and grouping by similarity) is the follow-up Ethan asked for and
+/// belongs server-side where embeddings can be cached per card revision —
+/// doing it here would mean an API call per keystroke.
+function _tagSuggestions(prefix, q) {
+  const mine = _tagState[prefix] || [];
+  const ident = _tagIdentifierFamilies(boardItems);
+  const isIdent = t => { const i = t.indexOf(':'); return i > 0 && ident.has(t.slice(0, i)); };
+
+  // Context. `bd` = the detail overlay, which knows its card; `be` = the
+  // create form, which has no card yet, so it falls back to the live title
+  // field. Reading the DRAFT title rather than only a saved card is what makes
+  // suggestions useful while typing a new issue — the moment you most want
+  // them.
+  const card = (prefix === 'bd' && typeof boardDetailId !== 'undefined' && boardDetailId)
+    ? boardItems.find(i => i.id === boardDetailId)
+    : null;
+  const titleEl = document.getElementById(prefix === 'bd' ? 'bd-title' : 'be-title');
+  const titleText = (card && card.title) || (titleEl && titleEl.value) || '';
+  // Worker scope: the card's owner, else the peek session whose board is open.
+  const worker = (card && card.session)
+    || (typeof peekSession !== 'undefined' ? peekSession : null);
+  const titleWords = new Set(String(titleText)
+    .toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 3));
+
+  const freq = {}, coocc = {}, byWorker = {};
+  for (const it of boardItems) {
+    const tags = it.tags || [];
+    for (const t of tags) {
+      freq[t] = (freq[t] || 0) + 1;
+      if (worker && it.session === worker) byWorker[t] = (byWorker[t] || 0) + 1;
+      if (mine.some(m => tags.includes(m))) coocc[t] = (coocc[t] || 0) + 1;
+    }
+  }
+  const score = t => {
+    let s = 0;
+    s += (coocc[t] || 0) * 10;          // same-theme evidence, strongest
+    s += (byWorker[t] || 0) * 4;        // this lane's vocabulary
+    if ([...titleWords].some(w => t.toLowerCase().includes(w))) s += 8;
+    s += Math.min(freq[t] || 0, 8);     // weak prior, capped so a mega-tag cannot dominate
+    return s;
+  };
+
+  const all = [...new Set(boardItems.flatMap(i => i.tags || []))];
+  return all
+    .filter(t => !mine.includes(t))
+    .filter(t => !q || t.toLowerCase().includes(q))
+    // A typed query is an explicit request: honour it even for identifier
+    // tags, so a tag you can name is never unreachable. Only the UNPROMPTED
+    // list hides them.
+    .filter(t => q ? true : !isIdent(t))
+    .sort((a, b) => score(b) - score(a) || a.localeCompare(b))
+    .slice(0, 12);   // a wall of chips is the thing being fixed
+}
+
 function _beTagInputUpdate(prefix) {
   const inp = document.getElementById(prefix + '-tag-input');
   const q = inp ? inp.value.toLowerCase() : '';
-  const allTags = [...new Set(boardItems.flatMap(i => i.tags || []))].sort();
-  const suggestions = allTags.filter(t => !_tagState[prefix].includes(t) && (!q || t.toLowerCase().includes(q)));
+  const suggestions = _tagSuggestions(prefix, q);
   const el = document.getElementById(prefix + '-tag-suggestions');
   if (!el) return;
+  // Data attributes + a delegated listener, NOT an inline onclick.
+  //
+  // The inline version was silently dead. `JSON.stringify(t)` emits DOUBLE
+  // quotes, and it was interpolated into a double-quoted HTML attribute:
+  //     onclick="_beTagAdd("bd","needs:you");..."
+  // so the parser closed the attribute at the first inner quote and the whole
+  // handler was the string `_beTagAdd(`. Clicking a suggestion did nothing, in
+  // every browser, for as long as this code has existed — the "click caused
+  // nothing" class: no error, no network call, no state change, and nothing
+  // visibly broken to report. Found by asserting the click's EFFECT rather
+  // than that the element existed.
+  //
+  // esc() on the value and a listener bound to the container removes the
+  // quoting hazard entirely instead of escaping it more carefully.
   el.innerHTML = suggestions.map(t =>
-    '<button class="be-tag-suggestion" onclick="_beTagAdd(' + JSON.stringify(prefix) + ',' + JSON.stringify(t) + ');document.getElementById(' + JSON.stringify(prefix + '-tag-input') + ').value=\'\';_beTagInputUpdate(' + JSON.stringify(prefix) + ')">' + esc(t) + '</button>'
+    '<button class="be-tag-suggestion" data-tag="' + esc(t) + '">' + esc(t) + '</button>'
   ).join('');
+  if (!el._tagDelegated) {
+    el._tagDelegated = true;
+    el.addEventListener('click', ev => {
+      const b = ev.target.closest('.be-tag-suggestion');
+      if (!b) return;
+      ev.stopPropagation();
+      _beTagAdd(prefix, b.dataset.tag);
+      const inp2 = document.getElementById(prefix + '-tag-input');
+      if (inp2) inp2.value = '';
+      _beTagInputUpdate(prefix);
+    });
+  }
 }
 
 function _beTagAdd(prefix, tag) {

@@ -2052,28 +2052,37 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <!-- Issues panel (board issues for this session) -->
   <div id="peek-issues-panel" class="peek-tasks-panel">
-    <div class="peek-tasks-add" style="gap:10px;">
-      <div class="board-view-toggle">
+    <!-- ONE toolbar row (Ethan, 2026-08-09). Was two: controls above, filter +
+         search below, costing a whole row of vertical space on a panel whose
+         job is showing cards. The search input is the only elastic member
+         (flex:1); everything else is flex:0 0 auto so nothing collapses as the
+         panel narrows. Wraps rather than overflows below 600px — the row is
+         `flex-wrap:wrap` in CSS, so on a phone it becomes two rows again by
+         layout rather than by markup. -->
+    <div class="peek-tasks-add peek-board-toolbar" style="gap:8px;">
+      <div class="board-view-toggle" style="flex:0 0 auto;">
         <button id="piv-list" class="bv-btn" onclick="setPeekIssuesView('list')" title="List view">&#x2630;</button>
         <button id="piv-kanban" class="bv-btn" onclick="setPeekIssuesView('kanban')" title="Board view">&#x25A4;</button>
       </div>
-      <button id="piv-scope" class="btn" style="font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
-      <span id="peek-issues-count" style="flex:1;font-size:0.82rem;color:var(--dim);align-self:center;"></span>
-      <button class="btn primary" style="font-size:0.8rem;padding:5px 12px;" onclick="openBoardAdd('backlog')">+ New issue</button>
+      <button id="piv-scope" class="btn" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
+      <span id="peek-issues-count" style="flex:0 0 auto;font-size:0.78rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
+      <button class="btn" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;">+ Filter</button>
+      <span class="board-search-wrap" style="flex:1 1 160px;min-width:0;display:flex;position:relative;">
+        <input id="peek-issues-search" class="search-input" type="text" style="width:100%;min-width:0;"
+               placeholder="Search or filter: is:rotting, status:doing"
+               autocapitalize="off" autocorrect="off" spellcheck="false"
+               oninput="_peekIssuesQuery=this.value;_bfTarget='peek';_bfRenderChips();renderPeekIssues()">
+        <button class="search-clear"
+                onclick="document.getElementById('peek-issues-search').value='';_peekIssuesQuery='';_bfRenderChips();renderPeekIssues()">&#x2715;</button>
+      </span>
+      <button class="btn primary" style="flex:0 0 auto;font-size:0.78rem;padding:5px 11px;white-space:nowrap;" onclick="openBoardAdd('backlog')">+ New issue</button>
     </div>
     <!-- Same query language as the global board (_bqFilter), so is:rotting /
          status:doing / -tag:x behave identically on both surfaces. Scoped by the
-         session filter above, not by a separate code path. -->
+         session filter above, not by a separate code path. Stays its OWN row:
+         chips wrap to arbitrary height, so folding them into the toolbar would
+         reintroduce the second row it just lost, only unpredictably. -->
     <div id="bf-chips-peek" style="display:none;flex-wrap:wrap;gap:6px;padding:0 10px 6px;"></div>
-    <div class="board-search-wrap" style="padding:0 10px 6px;display:flex;gap:6px;">
-      <button class="btn" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;min-height:44px;">+ Filter</button>
-      <input id="peek-issues-search" class="search-input" type="text"
-             placeholder="Search or filter: is:rotting, status:doing, -worker:none"
-             autocapitalize="off" autocorrect="off" spellcheck="false"
-             oninput="_peekIssuesQuery=this.value;_bfTarget='peek';_bfRenderChips();renderPeekIssues()">
-      <button class="search-clear" style="right:16px;"
-              onclick="document.getElementById('peek-issues-search').value='';_peekIssuesQuery='';renderPeekIssues()">&#x2715;</button>
-    </div>
     <div class="peek-tasks-list" id="peek-issues-list"></div>
   </div>
 

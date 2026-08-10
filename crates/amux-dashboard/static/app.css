@@ -2945,7 +2945,19 @@
       order: 4; flex: 1 0 100%; text-align: left; margin: 0;
     }
     #peek-issues-panel .board-view-toggle .bv-btn { min-width: 44px; min-height: 44px; }
+    /* Search joined this row when the toolbar merged to one line. On a phone
+       it takes its own full-width line rather than competing with four
+       controls for ~120px, which is what made it unusable before. Ordered
+       after the count so the tappable controls stay together at the top. */
+    #peek-issues-panel .peek-tasks-add > .board-search-wrap {
+      order: 5; flex: 1 0 100% !important;
+    }
+    #peek-issues-panel .peek-tasks-add > .board-search-wrap .search-input { min-height: 40px; }
   }
+  /* The merged single-row toolbar (Ethan: "put all of these ... on the same
+     row"). Wrap is what makes the mobile rules above possible without a second
+     markup path: same DOM, different layout. */
+  .peek-board-toolbar { flex-wrap: wrap; align-items: center; padding: 8px 10px 6px; }
   .board-search-wrap .search-input { width: 100%; box-sizing: border-box; }
   .board-search-wrap .search-clear { display: none; }
   .board-search-wrap:has(.search-input:not(:placeholder-shown)) .search-clear { display: flex; }
