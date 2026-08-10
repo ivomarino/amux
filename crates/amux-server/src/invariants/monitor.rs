@@ -14,7 +14,9 @@ use serde_json::json;
 /// needing faster detection belongs on a post-mutation hook, not here. A poll
 /// interval is a ceiling on detection latency, never a substitute for a
 /// postcondition at the mutation site.
-const TICK_SECS: u64 = 30;
+/// pub so lib.rs registers the cadence this loop actually sleeps with
+/// `runtime_jobs::registry`, instead of a second copy of the number.
+pub const TICK_SECS: u64 = 30;
 
 /// Run every registered invariant once against live state.
 ///
@@ -266,6 +268,7 @@ pub async fn run(state: AppState) {
     // and teach everyone the monitor is noisy.
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     loop {
+        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::INVARIANTS);
         let st = state.clone();
         // A panic in one pass must not kill the monitor for the process
         // lifetime — a dead monitor is the failure this whole module exists to
