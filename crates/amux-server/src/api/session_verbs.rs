@@ -2248,6 +2248,63 @@ pub(crate) async fn is_running(name: &str) -> bool {
 // this gate is what keeps it honest until the protocol takes over.
 // ---------------------------------------------------------------------------
 
+
+/// Does `text` read as an ANSWER to the picker currently on `pane`?
+///
+/// AMUX-2823. A queued message and a queued KEYPRESS are different objects and
+/// the steering queue only models the first. A prompt is text the model reads;
+/// late delivery is fine. A picker answer is only meaningful WHILE THAT PICKER
+/// IS UP, and delivering it afterwards is worse than dropping it — it becomes an
+/// instruction the model tries to obey.
+///
+/// Live specimen: Ethan typed "1. Stop and wait for limit to reset" at a
+/// rate-limit menu. It queued (selector guard), the menu was dismissed before it
+/// drained, and the queue then typed the literal string into an empty prompt.
+/// mvs-infra spent 1m41s reasoning about it.
+///
+/// DELIBERATELY NARROW. Not every message queued during a picker is an answer to
+/// it — "go fix the tests" typed while a picker happens to be up is meant for
+/// afterwards, and voiding that would be data loss. So this requires the text to
+/// MATCH A VISIBLE OPTION: the bare option number, or a prefix of the option's
+/// own words. Anything else is treated as an ordinary prompt and delivered
+/// normally.
+pub(crate) fn answers_visible_picker(text: &str, pane: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() || t.chars().count() > 120 {
+        return false; // a paragraph is not a menu answer
+    }
+    let clean = strip_ansi(pane).to_lowercase();
+    // Option lines look like "  1. stop and wait for limit to reset" or
+    // "❯ 2. switch to usage credits".
+    let mut options: Vec<(String, String)> = Vec::new();
+    for line in clean.lines() {
+        let l = line.trim().trim_start_matches(['\u{276f}', '>', ' ']).trim();
+        let Some((num, rest)) = l.split_once(". ") else { continue };
+        let num = num.trim();
+        if num.len() == 1 && num.chars().all(|c| c.is_ascii_digit()) && !rest.trim().is_empty() {
+            options.push((num.to_string(), rest.trim().to_string()));
+        }
+    }
+    if options.is_empty() {
+        return false; // no picker visible: nothing to be an answer to
+    }
+    for (num, label) in &options {
+        // "1", "1." or "1. stop and wait…" — the shapes a person types or a UI
+        // sends when clicking a numbered option.
+        if t == *num || t == format!("{num}.") {
+            return true;
+        }
+        let stripped = t
+            .trim_start_matches(num.as_str())
+            .trim_start_matches('.')
+            .trim();
+        if !stripped.is_empty() && (label.starts_with(stripped) || stripped.starts_with(label.as_str())) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn at_picker_text(text: &str) -> bool {
     // py:25538 _AT_PICKER_RE = r'(?:^|\s)@\S' — an @ that STARTS a token, plus
     // a leading slash. NOT `contains('@')`: that also matches emails
@@ -5973,15 +6030,15 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
-    let queued: Vec<(String, String, String, f64)> = {
+    let queued: Vec<(String, String, String, f64, String)> = {
         let Ok(conn) = state.store.read() else { return 0 };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text, queued_at FROM steering_queue ORDER BY queued_at ASC",
+            "SELECT id, session, text, queued_at, COALESCE(guard,'') FROM steering_queue ORDER BY queued_at ASC",
         ) else {
             return 0;
         };
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
         rows
@@ -6006,7 +6063,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     let mut delivered_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut checked_lane: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut delivered = 0usize;
-    for (id, session, text, queued_at) in queued {
+    for (id, session, text, queued_at, guard) in queued {
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
         }
@@ -6033,6 +6090,51 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // into a working lane within minutes ("i sent as a queue but it looks
         // like it was sent directly even though this worker was still
         // working"), which defeats the entire point of queueing.
+        // VOID A STALE PICKER ANSWER rather than typing it as prose
+        // (AMUX-2823). A keypress is only meaningful while its picker is up;
+        // once it is gone the same characters become an instruction the model
+        // will try to obey. Ethan's "1. Stop and wait for limit to reset"
+        // delivered into an empty prompt and cost mvs-infra 1m41s.
+        if guard == "selector-answer" {
+            let pane = tmux_capture(&session, 30).await;
+            if !answers_visible_picker(&text, &pane) {
+                tracing::warn!(
+                    session = %session, id = %id,
+                    "voided a stale picker answer — the menu it answered is gone; \
+                     delivering it as text would be an instruction nobody gave"
+                );
+                let (id2, sess2, text2) = (id.clone(), session.clone(), text.clone());
+                let _ = state
+                    .store
+                    .write_async(move |conn| {
+                        ensure_fleet_tables(conn)?;
+                        conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
+                             VALUES(?,?,?,?,?)",
+                            rusqlite::params![
+                                id2,
+                                sess2,
+                                format!("[VOIDED: picker gone] {}", redact_secrets(&text2)),
+                                queued_at,
+                                now_f64()
+                            ],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    })
+                    .await;
+                emit_event(
+                    state,
+                    &session,
+                    "message.voided",
+                    Some(json!({"reason": "picker-gone", "preview": chars_truncate(&text, 80)})),
+                    Some(format!("void:{id}")),
+                    "steering",
+                )
+                .await;
+                continue;
+            }
+        }
         let age = now_f64() - queued_at;
         let decision = steer_delivery_for(state, &session, age).await;
         let mid_turn = match decision {
@@ -7444,7 +7546,16 @@ async fn steer_mutate(
                 }),
             );
         }
-        let msg_id = steer_enqueue(state, name, &text, "", &hdr_worker(headers)).await;
+        // IS THIS A PICKER ANSWER? Decide NOW, while the picker is still on
+        // screen — intent is only knowable at the moment it existed (AMUX-2823).
+        // The `selector-answer` guard also dedupes: at most one pending menu
+        // answer per lane, which is the right cardinality for a keypress.
+        let picker_answer = {
+            let pane = tmux_capture(name, 30).await;
+            answers_visible_picker(&text, &pane)
+        };
+        let guard = if picker_answer { "selector-answer" } else { "" };
+        let msg_id = steer_enqueue(state, name, &text, guard, &hdr_worker(headers)).await;
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
             cmd_hist_record(state, name, &text, "user", email).await;
@@ -11506,6 +11617,40 @@ mod steer_max_age_tests {
         // ...but it does not exempt the lane from the deadline either, or a
         // hookless lane would starve exactly like the reported ones.
         assert_eq!(steer_decide(None, None, MAX + 1.0, MAX), SteerDelivery::OverdueMidTurn);
+    }
+
+    /// A KEYPRESS IS NOT A PROMPT (AMUX-2823). The risk runs both ways: too
+    /// loose and this silently eats real instructions; too tight and Ethan's
+    /// menu answer gets typed as prose again.
+    #[test]
+    fn a_picker_answer_is_recognised_but_an_ordinary_message_is_not() {
+        let menu = "\
+   What do you want to do?
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+   Enter to confirm · Esc to cancel";
+
+        // THE LIVE SPECIMEN — exactly what Ethan sent, which was delivered as
+        // prose and cost mvs-infra 1m41s.
+        assert!(answers_visible_picker("1. Stop and wait for limit to reset", menu));
+        // The shapes a person or a UI actually produces.
+        assert!(answers_visible_picker("1", menu));
+        assert!(answers_visible_picker("2.", menu));
+        assert!(answers_visible_picker("Switch to usage credits", menu));
+        assert!(answers_visible_picker("  3. Switch to Team plan  ", menu));
+
+        // ORDINARY MESSAGES typed while a picker happens to be up are meant for
+        // AFTERWARDS. Voiding these would be real data loss, which is worse than
+        // the bug being fixed.
+        assert!(!answers_visible_picker("go fix the failing tests", menu));
+        assert!(!answers_visible_picker("1 more thing: check the deploy", menu));
+        assert!(!answers_visible_picker(
+            "when you get a chance, switch to usage-based billing and tell me what it costs", menu));
+
+        // NO PICKER ON SCREEN: nothing can be an answer, so nothing is voided.
+        assert!(!answers_visible_picker("1. Stop and wait for limit to reset", "❯ "));
+        assert!(!answers_visible_picker("1", ""));
     }
 
     /// THE DISTINCTION, IN BOTH DIRECTIONS. Getting it wrong one way deadlocks a
