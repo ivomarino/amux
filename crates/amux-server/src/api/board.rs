@@ -44,11 +44,12 @@ pub fn routes() -> Router<AppState> {
             "/statuses/{sid}",
             axum::routing::patch(patch_status).delete(delete_status),
         )
-        // Static /session-gates outranks /{id} (same precedence note as above).
+        // Static /session-gates and /contract outrank /{id}.
         .route(
             "/session-gates",
             get(list_session_gates).patch(patch_session_gates),
         )
+        .route("/contract", get(get_contract))
         // DELETE was never registered, so the SPA's own Delete button on a
         // card 405'd — and `deleteBoardItem` removes the card optimistically
         // BEFORE the request, so the card vanished, the server kept it, and it
@@ -57,6 +58,40 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+}
+
+/// GET /api/board/contract — the gate table, types, and CLI syntax.
+/// Every gate-blocked 409 tells the caller to `GET /api/board/contract`
+/// to understand the rules. Without this endpoint that instruction is a
+/// dead link (AR-123).
+async fn get_contract() -> Response {
+    use serde_json::json;
+    let statuses = ["doing", "review", "done", "verified"];
+    let mut gates = serde_json::Map::new();
+    for ty in bs::KNOWN_TYPES {
+        let mut ty_gates = serde_json::Map::new();
+        for &st in &statuses {
+            if let Some(target) = bs::parse_status(st) {
+                let g = bs::default_gates_for(ty, target);
+                if !g.is_empty() {
+                    ty_gates.insert(st.to_string(), json!(g));
+                }
+            }
+        }
+        if !ty_gates.is_empty() {
+            gates.insert(ty.to_string(), serde_json::Value::Object(ty_gates));
+        }
+    }
+    Json(json!({
+        "types": bs::KNOWN_TYPES,
+        "gates": gates,
+        "how_to_ack": {
+            "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
+            "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
+            "wrong_type": "If the item has no code, set its type first — the gate is DERIVED from the type.",
+        },
+    }))
+    .into_response()
 }
 
 /// GET /api/board/statuses — Python `_load_board_statuses` (amux-server.py

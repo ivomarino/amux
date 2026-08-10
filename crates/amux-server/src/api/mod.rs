@@ -208,6 +208,15 @@ pub fn router(state: AppState) -> Router {
         // (`except Exception: return 0`), so every commit on every shared
         // checkout has been unguarded and SILENT about it. See api/git_guard.rs.
         .route("/api/git/staged-guard", axum::routing::post(git_guard::staged_guard))
+        // Client diagnostic beacons (AR-128): the SPA sends geometry/tap
+        // traces for mobile layout debugging. Fire-and-forget, logged only.
+        .route(
+            "/api/client-debug",
+            axum::routing::post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+                tracing::debug!(kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("?"), "client-debug beacon");
+                axum::Json(serde_json::json!({"ok": true}))
+            }),
+        )
         .route(
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
