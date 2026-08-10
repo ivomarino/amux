@@ -1,33 +1,36 @@
 #!/bin/bash
+# amux-staged-guard  (see the block below for why this call is HERE now)
+g="$(dirname -- "$0")/amux-staged-guard"
+if [ -x "$g" ]; then "$g" || exit 1; else echo "amux: staged-guard MISSING at $g - cross-session sweep protection is OFF (AMUX-1730)" >&2; fi
 # Pre-commit hook: security scan + Rust/client-JS syntax
 set -e
 
 ROOT="$(git rev-parse --show-toplevel)"
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
-# NO staged-guard CALL HERE ON PURPOSE — the server injects it (2026-08-06).
+# THE staged-guard CALL IS AT THE TOP OF THIS FILE AGAIN (2026-08-09), and the
+# history below is why that is not a re-run of a mistake.
 #
-# `.git/hooks/amux-staged-guard` is a GENERATED artifact:
-# `_install_amux_precommit_guard()` in the amux server (Python-era; see git
-# history of amux-server.py) writes it from
-# `_AMUX_GUARD_BODY` for every work_dir, and inserts its own shim line into
-# whatever pre-commit exists. It is deliberately untracked — the server's own
-# comment says so ("goes in .git/hooks/ where it is untracked and harmless"),
-# because it must be regenerated per checkout and follow core.hooksPath.
+# It used to be injected by the server: `_install_amux_precommit_guard()` in
+# amux-server.py generated `.git/hooks/amux-staged-guard` per work_dir and
+# inserted a shim line into whatever pre-commit existed. On 2026-08-06 a
+# session added a tracked copy plus a call here, and that was correctly
+# reverted for two reasons — it made install-hooks.sh a SECOND producer of a
+# generated file (running it overwrote the server's live guard with a frozen
+# one, reverting AC-241), and the shim was already injected, so the guard ran
+# TWICE and printed every NOTE twice.
 #
-# I briefly added a tracked copy under scripts/git-hooks/ plus a call here,
-# believing the guard had gone untracked by mistake. That was wrong twice over,
-# and both failures are the reason for this comment rather than a silent revert:
-#   1. It created a SECOND producer of a generated file. install-hooks.sh then
-#      overwrote the server's live guard with a frozen copy — which reverted
-#      AC-241's improvement the moment anyone ran it, and would revert every
-#      future one. Fix the generator, never the generated file.
-#   2. The server injects its shim into this hook anyway, so a call here is a
-#      DUPLICATE: the guard ran twice and printed every NOTE twice. I first
-#      misread that as a peer hand-editing the installed copy, and said so.
+# Both reasons are now dead. amux-server.py is deleted (rust cutover) and
+# nothing in the rust server generates the hook or injects the shim, so:
+#   1. there is no first producer to collide with — the tracked copy in
+#      scripts/git-hooks/ is the only one; and
+#   2. nothing injects a second call, so this one cannot duplicate.
 #
-# If the guard is ever missing, the fix is to start the amux server for this
-# work_dir, not to add a call here.
+# The cost of the old arrangement was measured: with no generator, this hook
+# was whatever the retired python last wrote, and running install-hooks.sh —
+# which overwrites this file — would have DELETED the injected shim and turned
+# the guard off, while printing "ok ... matches". If a generator ever returns,
+# delete this call and the tracked guard in the same commit that adds it.
 
 # ── 1. Security scan (runs on every commit) ─────────────────────────────────
 
