@@ -2394,6 +2394,14 @@ async function fetchSessions() {
   }
 }
 
+function _waitingLabel(s) {
+  const wr = s.waiting_reason || '';
+  if (wr === 'permission_prompt') return 'permission prompt';
+  if (wr === 'rate_limit') return 'rate limited';
+  if (wr === 'user_input') return 'needs input';
+  return 'needs input';
+}
+
 // ═══════ RENDERING ═══════
 function updatePeekStatus() {
   const el = document.getElementById('peek-session-status');
@@ -2402,7 +2410,7 @@ function updatePeekStatus() {
   if (!s) { el.innerHTML = ''; return; }
   let badge = '';
   if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _liveWorkLine(s);
-  else if (s.status === 'waiting') badge = '<span class="status-badge waiting">needs input</span>';
+  else if (s.status === 'waiting') badge = '<span class="status-badge waiting">' + _waitingLabel(s) + '</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -2770,7 +2778,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
               the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
-          ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
+          ${s.status === 'waiting' ? `<span class="status-badge waiting">${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
@@ -6900,7 +6908,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.572';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.573';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
