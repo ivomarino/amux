@@ -62,11 +62,32 @@ fallback when a finding needs row-level inspection.
    Routing questions along the way ("is PATCH mounted at X?") are answered by
    `GET /api/debug/routes` — the ROUTE_TABLE as JSON — never by a grep.
 
-3. **Proxy volume — must trend to zero post-cutover.**
+3. **Proxy volume — now zero, so ANY row is a finding.**
    `GET /api/logs?since=$SINCE&answered_by=python-proxy&limit=1` -> `total_matched`.
-   Record the number. Finding = it rose vs yesterday, or any family outside
-   `GET /api/debug/boundary`'s `proxied` list shows proxy rows (a boundary
-   regression).
+   `GET /api/debug/boundary` -> `proxied` is `[]` (49 native families) since the
+   Python retirement, and there is no Python process left to proxy TO. So the
+   finding is simply: **any `python-proxy` row timestamped after the cutover.**
+   Cross-check the family against `proxied` — a row naming a family that is not
+   even on that list is the same regression seen from the other side.
+
+   Rewritten 2026-08-09 (AF-33) because the old condition — "record the number,
+   finding = it ROSE VS YESTERDAY" — could never fire. Nothing persisted
+   yesterday's number: the sweep is a scheduler prompt to a fresh session with no
+   memory of the prior run, `/api/logs` takes only `since` and has no upper bound,
+   so the comparison had no left-hand side. A check that cannot fail, sitting
+   inside the sweep whose whole job is catching regressions (ethos rule 7).
+
+   Note the fix is NOT "persist a baseline". The cutover made the baseline
+   unnecessary: the expected value is now a constant zero, and a rule with a
+   constant needs no history. Building a store to compare against would have been
+   machinery in service of a question that had stopped being the right one.
+
+   **Reading the residue correctly.** Rows can be pre-cutover and harmless. When
+   this was written, 10 rows existed in the window, all `/api/scope`, timestamped
+   19:07–19:36 against a cutover at 20:43 — historical, and they age out with
+   `AMUX_REQLOG_RETAIN_DAYS`. Compare each row's `ts` against the cutover before
+   calling it a regression; "10 proxy rows" alone is not a finding, and reporting
+   it as one is how this sweep loses credibility.
 
 4. **401/403 spikes by client IP.**
    `GET /api/logs?since=$SINCE&min_status=401&limit=2000`, keep status 401/403,
