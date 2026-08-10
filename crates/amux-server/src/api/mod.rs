@@ -43,6 +43,7 @@ pub mod schedules;
 pub mod scope;
 pub mod search;
 pub mod session_verbs;
+pub mod commit_mentions;
 pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
@@ -207,6 +208,10 @@ pub fn router(state: AppState) -> Router {
         // path, so all three failed silently: no branch badges, per-worker
         // gates rendering as deleted, and an unactionable red offline banner.
         .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
+        .route(
+            "/api/board/commit-mentions",
+            axum::routing::get(commit_mentions::commit_mentions),
+        )
         // The shared-checkout staged-guard's endpoint. UNROUTED since the
         // rust cutover — 405, ~1,147 calls/hour, and the installed
         // .git/hooks/amux-staged-guard swallowed every one of them
