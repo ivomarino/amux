@@ -202,7 +202,31 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
+/// Restore the default SIGPIPE disposition (AMUX-2653).
+///
+/// Rust's runtime sets SIGPIPE to SIG_IGN before `main`, so a write to a closed
+/// pipe returns EPIPE instead of killing the process. Every bare `println!` then
+/// unwraps that error and panics — `amux-rs board list | head -2` exited 101 with
+/// a panic message, which is the most ordinary thing a user does with a CLI.
+///
+/// This is the ROOT fix rather than converting the ~30 `println!` sites to the
+/// `outln!` guard: it covers every existing verb AND every verb written later,
+/// and it makes `amux-rs` behave like `ls`/`git`/`cat` — die quietly on EPIPE.
+/// `outln!` stays for the paths that want a clean `Ok(0)` instead of death.
+///
+/// Safety: `signal(2)` with SIG_DFL is async-signal-safe and this runs before any
+/// thread is spawned, so there is no race with another thread's signal state.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     let client = Client::new(cli.url.clone(), cli.session.clone());
     let result = run(&cli.cmd, &client);

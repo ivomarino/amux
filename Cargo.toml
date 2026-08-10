@@ -44,6 +44,9 @@ sha2 = "0.10"
 # already-prepared copies in ~/.amux/media-cache survive the cutover.
 sha1 = "0.10"
 hex = "0.4"
+# The CLI only needs libc to restore the DEFAULT SIGPIPE disposition, which Rust
+# sets to SIG_IGN before main. Already in the tree transitively (rusqlite, tokio).
+libc = "0.2"
 # Web Push (RR-0094): ES256 VAPID + RFC 8291 aes128gcm. `ecdh` and `pem` are
 # feature additions to the same crate: ecdh for the RFC 8291 key agreement,
 # pem so the Python server's PKCS#8 PEM VAPID key (~/.amux/vapid_private.pem)

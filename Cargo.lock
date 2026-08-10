@@ -71,6 +71,7 @@ dependencies = [
  "amux-core",
  "anyhow",
  "clap",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

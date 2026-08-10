@@ -17,3 +17,6 @@ serde_json.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
