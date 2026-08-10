@@ -1824,6 +1824,19 @@ async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &st
     cmd_hist_record_full(state, session, text, ctype, origin, Some(Delivery::Direct), None).await
 }
 
+/// A scheduled command that was DELIVERED (py parity: origin = the schedule's
+/// title, so a peek shows scheduled commands distinctly from a human's). Only
+/// called once delivery is confirmed — recording history for a command that
+/// never landed is how the Messages tab starts disagreeing with the run log.
+pub(crate) async fn cmd_hist_record_schedule(
+    state: &AppState,
+    session: &str,
+    text: &str,
+    origin: &str,
+) {
+    cmd_hist_record_full(state, session, text, "schedule", origin, Some(Delivery::Direct), None).await
+}
+
 /// The full recorder. `queued_at` is the moment the message entered the
 /// steering queue (`None` for anything not queued), so the wait a message
 /// endured is answerable from the row the Messages tab already reads instead of
@@ -2615,6 +2628,135 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
 
 async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
     send_text_inner(state, name, text, defer_if_busy, false, false, false).await
+}
+
+/// WHAT "sent" MEANS, as a pure function of the send's own verdict string.
+///
+/// `send_post` derived `submitted`/`submission` inline, and the scheduler now
+/// needs the identical classification to put on a run row. Two spellings of the
+/// same fact drift (D6), and this one decides whether an audit row says a
+/// command was delivered — so it is computed in ONE place and both callers read
+/// it. Returns `(submitted, submission)`; `None` is the honest third state, not
+/// a failure (ethos rule 3).
+pub(crate) fn submission_verdict(ok: bool, msg: &str) -> (Option<bool>, &'static str) {
+    if msg.starts_with("queued") {
+        (None, "deferred")
+    } else if msg.contains("could not be verified") {
+        (None, "unverified")
+    } else if ok {
+        (Some(true), "confirmed")
+    } else {
+        (Some(false), "not_submitted")
+    }
+}
+
+/// What an automated delivery actually did.
+///
+/// Note there is no `ok` field. `ok` is the send path's "did the request do its
+/// job" bit, and it is true for a queued message, for an unverified one, and for
+/// a message still sitting in the composer — reading it as "delivered" is the
+/// exact conflation that put `status:"ok"` on 20k run rows. The caller must
+/// decide from `submitted` and `refused`, which cannot be misread that way.
+pub(crate) struct AutoDelivery {
+    /// The send path's own verdict string, verbatim — it is what a human reads
+    /// in the run history and in the run-now toast.
+    pub message: String,
+    /// `Some(true/false)` once read back from Claude Code's artifacts; `None`
+    /// while queued, or when the composer could not be read.
+    pub submitted: Option<bool>,
+    pub submission: &'static str,
+    /// The steering-queue row this message is waiting in, when queued. It is the
+    /// only handle anyone has on a message that has not landed yet, so it rides
+    /// on the run row rather than being discoverable only by grepping a table.
+    pub queue_id: Option<String>,
+    /// Terminal refusal: nothing was delivered and nothing is pending. The
+    /// caller must record this as a REFUSAL, never as a run that succeeded.
+    pub refused: bool,
+}
+
+/// THE DELIVERY ENTRY POINT FOR AUTOMATED SENDERS (AMUX-2647) — the scheduler.
+///
+/// Deliberately NOT `send_text(.., defer_if_busy = true)`, which is the HTTP
+/// send's rule: that only defers on a live SELECTOR, so a merely GENERATING lane
+/// falls straight through and gets typed into mid-turn. For a human pressing
+/// send that is a considered trade; for a scheduled command nobody is watching
+/// it is how a fire lands in the middle of someone's turn at 3am.
+///
+/// So an automated send follows the STEERING rule instead: deliver at a turn
+/// boundary, otherwise park on the steering queue and let `steer_deliver_loop`
+/// own the wait — including the `AMUX_STEER_MAX_AGE_S` deadline past which the
+/// message goes into the running turn anyway. That loop is also the only
+/// delivery path with a retry behind it, which is what a fire needs: the
+/// scheduler has already advanced `next_run` by the time we get here, so a
+/// message dropped on the floor is not fired again.
+///
+/// Three outcomes and no fourth: delivered (verified), queued (with the row id),
+/// or refused (with the reason). `ok == true` never means "delivered" on its
+/// own — read `submitted`.
+pub(crate) async fn deliver_automated(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+) -> AutoDelivery {
+    let refuse = |why: String| AutoDelivery {
+        message: why,
+        submitted: Some(false),
+        submission: "not_submitted",
+        queue_id: None,
+        refused: true,
+    };
+    let classify = |ok: bool, msg: String| {
+        let (submitted, submission) = submission_verdict(ok, &msg);
+        AutoDelivery { message: msg, submitted, submission, queue_id: None, refused: !ok }
+    };
+
+    if name.trim().is_empty() {
+        return refuse("schedule has no target session".into());
+    }
+    if !env_path(name).exists() {
+        return refuse(format!("target '{name}' is not a registered session"));
+    }
+    // A schedule must never be a wake path for an ARCHIVED lane (Ethan,
+    // 2026-08-02). The send path would refuse anyway, but refusing here keeps
+    // the reason in the run row instead of surfacing as a nightly `error`
+    // forever. Unarchiving is a human's call (ethos rule 8).
+    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
+        return refuse(format!("target '{name}' is archived — not delivered, not woken"));
+    }
+    // A stopped (but not archived) lane is `send_text`'s auto-wake path, exactly
+    // as under Python. It must NOT be queued: `steer_deliver_loop` skips lanes
+    // that are not running and leaves the row pending, so a queued command for a
+    // stopped lane would wait forever while the run row claimed it was pending.
+    if !is_running(name).await {
+        let (ok, msg) = send_text(state, name, text, false).await;
+        return classify(ok, msg);
+    }
+
+    // Age 0: a fire is new, so it is never overdue yet — the deadline belongs to
+    // the steering loop, which re-evaluates it every tick with the real age.
+    let decision = steer_delivery_for(state, name, 0.0).await;
+    if decision == SteerDelivery::AtBoundary {
+        // `from_steering = true` makes the callee REFUSE rather than type into a
+        // turn that started between the gate and the send. A lost race then
+        // falls through to the queue below instead of being reported as failed.
+        let (ok, msg) = send_text_inner(state, name, text, false, true, false, false).await;
+        if ok {
+            return classify(ok, msg);
+        }
+        tracing::info!(
+            session = %name, reason = %msg,
+            "automated send lost the boundary race — parking on the steering queue"
+        );
+    }
+    let queue_id = steer_enqueue(state, name, text, guard).await;
+    AutoDelivery {
+        message: format!("queued (steering) — delivers to '{name}' at its next turn boundary"),
+        submitted: None,
+        submission: "deferred",
+        queue_id: Some(queue_id),
+        refused: false,
+    }
 }
 
 fn send_text_boxed<'a>(
@@ -3854,6 +3996,13 @@ async fn wake_session(state: &AppState, name: &str) -> (bool, String) {
 
 /// py:25832 _resize_pane — refuse when a real client is attached.
 async fn resize_pane(name: &str, cols: i64, rows: i64) -> (bool, String) {
+    // AMUX-2634: refresh the VIEWER LEASE first, before any early return.
+    // `resize-window` makes tmux pin `window-size manual`, so this call used to
+    // narrow the worker's output permanently; `runtime_jobs::pane_size` now
+    // restores the pane once the lease goes stale. It must be refreshed on the
+    // "already sized" path too — a reader sitting still at one width is still a
+    // reader, and refreshing only on CHANGE would yank the pane back under them.
+    crate::runtime_jobs::pane_size::note_resize(&tmux_name(name));
     let cols = cols.clamp(50, 300);
     let rows = rows.clamp(20, 100);
     let stq = st(name);
@@ -6598,7 +6747,7 @@ async fn post_dispatch(
                 Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
             }
         }
-        "report" => report_post(state, name, body).await,
+        "report" => report_post(state, name, headers, body).await,
         "apply-template" => {
             let re = regex::Regex::new(r"[^a-z0-9\-]").unwrap();
             let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
@@ -6762,20 +6911,13 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // callers do not silently change behaviour; `submitted` is the new,
     // narrower claim. Never widen `ok` to mean "submitted" — a deferred
     // message is a legitimate success that has not been submitted yet.
-    resp["submitted"] = if msg.starts_with("queued") || msg.contains("could not be verified") {
-        Value::Null
-    } else {
-        json!(ok)
-    };
-    resp["submission"] = json!(if msg.starts_with("queued") {
-        "deferred"
-    } else if msg.contains("could not be verified") {
-        "unverified"
-    } else if ok {
-        "confirmed"
-    } else {
-        "not_submitted"
-    });
+    //
+    // Derived by `submission_verdict`, which the SCHEDULER also reads to decide
+    // what a run row may claim — one function, so an audit row and an HTTP
+    // response can never disagree about whether the same send was delivered.
+    let (submitted, submission) = submission_verdict(ok, &msg);
+    resp["submitted"] = submitted.map(Value::from).unwrap_or(Value::Null);
+    resp["submission"] = json!(submission);
     // A retry means the FIRST Enter was dropped. Reported even on success:
     // smoothing it into a plain "sent" is how a degrading delivery path stays
     // invisible until it drops a message for ten minutes (AMUX-2629).
@@ -6942,7 +7084,55 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
 /// state into the SHARED prefs store Python reads at boot and
 /// sessions_legacy reads live.
-async fn report_post(state: &AppState, name: &str, body: &Value) -> Response {
+async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
+    // ONLY ever legitimate from inside the session it describes: the hooks
+    // that produce it run in that process and post to
+    // `/api/sessions/$AMUX_SESSION/report`. Everything downstream then treats
+    // it as ground truth — the steering gate, the card, the board's `stale`.
+    //
+    // It was accepting any state, for any session, from any caller, with no
+    // record of who wrote it. A hand-run hook test posted
+    // `{"state":"idle","source":"stop-hook-test"}` onto a LIVE working lane
+    // and it stuck for 1076s, and the store could not say where it came from:
+    // `source` is a free string the CALLER chooses, so it is a label, not
+    // provenance.
+    //
+    // So: the server-verified `X-Amux-Session` stamp (AMUX-1768, the same
+    // mechanism `amux send` uses) must name this session or nothing. A
+    // mismatch is refused; a stamped write records its origin.
+    //
+    // Why this and not "reject sources that look synthetic": a `*-test`
+    // suffix check is a string match on a field the caller picks, so the
+    // identical write named `stop-hook` sails through — a check that cannot
+    // fail on a determined caller, which is the failure mode this repo keeps
+    // paying for. Test ISOLATION (a throwaway AMUX_HOME) is the other half
+    // and is necessary too, but it could not have prevented THIS write: it
+    // came from a hand-run curl against the live server, not from a test
+    // process, so no amount of test-side sandboxing sees it.
+    //
+    // Residual, stated plainly: the shipped hooks send no header, so an
+    // UNSTAMPED write is still accepted (rejecting it would break every lane
+    // on the next hook fire). This closes cross-session writes for every
+    // caller that carries the stamp — the CLI, the dashboard, and any agent
+    // following the documented curl recipe — and makes the rest attributable.
+    // The stronger guarantee is that no report is unfalsifiable any more:
+    // `derive_status` now lets physical evidence override a stale idle, so a
+    // bad report costs one contradiction window instead of a day.
+    let origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    if !origin.is_empty() && origin != name {
+        return jresp(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": format!(
+                    "session '{origin}' may not report state for '{name}' — a self-report \
+                     is only valid from inside the session it describes"
+                ),
+                "origin": origin,
+                "target": name,
+            }),
+        );
+    }
     let st_raw = body_str(body, "state").trim().to_lowercase();
     let st = match st_raw.as_str() {
         "working" | "busy" => "active",
@@ -6966,6 +7156,7 @@ async fn report_post(state: &AppState, name: &str, body: &Value) -> Response {
     let name_s = name.to_string();
     let st2 = st.clone();
     let src2 = src.clone();
+    let origin2 = origin.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -6984,8 +7175,13 @@ async fn report_post(state: &AppState, name: &str, body: &Value) -> Response {
             if src2 == "tool-hook" && prev_state != "active" {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
+            // `origin` is the SERVER-VERIFIED writer; `source` is the label
+            // the caller chose. Keeping both is the point — when a report is
+            // wrong, "who wrote this" must be answerable from the store
+            // itself rather than reconstructed from access logs nobody kept.
             reports[&name_s] = json!({
-                "state": st2, "detail": detail, "source": src2, "ts": now_f64(),
+                "state": st2, "detail": detail, "source": src2,
+                "origin": origin2, "ts": now_f64(),
             });
             conn.execute(
                 "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \

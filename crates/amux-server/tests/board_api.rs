@@ -1073,11 +1073,13 @@ async fn status_column_crud_matches_python() {
     // audit line on each card (AMUX-2491).
     let (st, _, _) = send(&app, "DELETE", "/api/board/statuses/done", None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    // Hand-INSERT a row in the custom status (the python-interop idiom):
-    // rust card CREATE refuses statuses outside the typed vocabulary — a
-    // known divergence from Python's dynamic columns, carded separately —
-    // but rows in custom statuses EXIST in the shared DB and the column
-    // delete must still audit + move them.
+    // Hand-INSERT a row in the custom status (the python-interop idiom).
+    // NOTE: the API can create a card here directly now (AMUX-2609 lifted the
+    // typed-vocabulary refusal — see `cards_move_into_and_out_of_user_created
+    // _columns`). The hand-INSERT is KEPT deliberately: it is the python-shaped
+    // row this test exists to prove we do not corrupt, and it still covers the
+    // case the API cannot reach — a row already sitting in a column that was
+    // deleted out from under it.
     let cid = "PY-777".to_string();
     {
         let conn = rusqlite::Connection::open(_dir.path().join("amux-test.db")).unwrap();
@@ -1097,4 +1099,138 @@ async fn status_column_crud_matches_python() {
         .as_str()
         .unwrap()
         .contains("column 'waiting-on-vendor' deleted by"));
+}
+
+/// AMUX-2609 — cards must be able to enter AND leave user-created columns.
+///
+/// Python's columns are fully dynamic; the rust origin refused any status
+/// outside the closed `TaskStatus` enum, so a drag into a custom column 400'd.
+/// The SPA had already moved the card optimistically and cached it, so the user
+/// saw it sit in the new column behind a bare "Error: 400" toast until the next
+/// poll snapped it back — a refusal nobody could read.
+///
+/// The exit direction is asserted deliberately: allowing entry without exit
+/// would build a roach motel, which is the shape ethos rule 3 forbids (every
+/// legitimate state needs a truthful exit). Before this landed, moving OUT
+/// answered 409 telling the caller to "fix it via the Python board first" — a
+/// server that had already been retired.
+#[tokio::test]
+async fn cards_move_into_and_out_of_user_created_columns() {
+    let (app, _dir) = app();
+
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board/statuses",
+        Some(json!({ "label": "QA Review" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["id"], json!("qa-review"));
+
+    // 1. CREATE directly into a user column.
+    let born = create(&app, json!({ "title": "born in qa", "status": "qa-review" })).await;
+    assert_eq!(born["status"], json!("qa-review"), "{born}");
+
+    // 2. MOVE IN — the drag that used to 400.
+    let card = create(&app, json!({ "title": "drag me", "type": "chore" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "qa-review" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "move into custom column refused: {v}");
+    assert_eq!(v["status"], json!("qa-review"), "{v}");
+    // Not laundered through the force path: a routine move must not write a
+    // bypass line into the one audit trail that is supposed to mean something.
+    let log = v["log"].as_str().unwrap_or("");
+    assert!(log.contains("todo -> qa-review"), "no honest audit line: {log}");
+    assert!(!log.contains("force by"), "routine move logged as a force: {log}");
+
+    // 3. MOVE OUT — the roach-motel guard.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "todo" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "no exit from a custom column: {v}");
+    assert_eq!(v["status"], json!("todo"), "{v}");
+
+    // 4. A REAL typo still refuses — and names BOTH vocabularies, so the
+    //    answer is actionable rather than a list the caller already read.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "qa-reviewww" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["configured_columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "qa-review"),
+        "the refusal must list the columns that DO exist: {v}"
+    );
+    assert!(v["valid_statuses"].as_array().unwrap().iter().any(|c| c == "todo"), "{v}");
+}
+
+/// A user column carrying a gate must enforce it. `statuses.gate` is written by
+/// the column editor and was read by nothing, so a custom column would
+/// otherwise have been a gate-shaped hole in the board — a move that looks
+/// governed and is not.
+#[tokio::test]
+async fn a_user_column_with_a_gate_enforces_it() {
+    let (app, _dir) = app();
+    send(
+        &app,
+        "POST",
+        "/api/board/statuses",
+        Some(json!({ "label": "Security Review" })),
+    )
+    .await;
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        "/api/board/statuses/security-review",
+        Some(json!({ "gate": ["Threat model written"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let card = create(&app, json!({ "title": "gate me", "type": "chore" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // Unacknowledged -> 409 carrying the column's own gate.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "security-review" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "column gate not enforced: {v}");
+    assert_eq!(v["gate"], json!(["Threat model written"]), "{v}");
+
+    // Acknowledged -> through, with the ack recorded on the card.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "security-review", "gate_checked": ["Threat model written"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("security-review"), "{v}");
+    assert!(
+        v["log"].as_str().unwrap_or("").contains("gate satisfied via gate_checked"),
+        "the ack must be recorded on the card: {v}"
+    );
 }

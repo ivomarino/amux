@@ -795,7 +795,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
     // -- workers (+dead-letters merge)
@@ -840,10 +841,16 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/cal-events", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/cal-events/{id}", methods: &["PATCH", "DELETE"] },
     // -- sessions (legacy list + native per-name verbs) / identity / scope
-    RouteEntry { path: "/api/sessions", methods: &["GET"] },
+    RouteEntry { path: "/api/sessions", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/sessions-git", methods: &["GET"] },
+    // The git hooks' endpoint. Listed here because "is it routed?" was the
+    // question nobody could answer for the whole cutover: the hook's
+    // `except: return 0` hid the 405, so the only visible symptom was silence.
+    RouteEntry { path: "/api/git/staged-guard", methods: &["POST"] },
     RouteEntry { path: "/api/sessions/{name}", methods: ANY },
     RouteEntry { path: "/api/sessions/{name}/{*verb}", methods: ANY },
     RouteEntry { path: "/api/identity", methods: &["GET"] },
+    RouteEntry { path: "/api/offline-origin", methods: &["GET"] },
     RouteEntry { path: "/api/scope", methods: ANY },
     // -- browser
     RouteEntry { path: "/api/browser/start", methods: &["POST"] },
@@ -1936,7 +1943,7 @@ mod tests {
             "/api/torrents/{gid}/{action}"
         );
         // Unrouted paths: conservative collapse — words stay, ids fold.
-        assert_eq!(normalize_target("/api/sessions-git"), "/api/sessions-git");
+        assert_eq!(normalize_target("/api/sessions-graph"), "/api/sessions-graph");
         assert_eq!(normalize_target("/api/stripe/status"), "/api/stripe/status");
         assert_eq!(normalize_target("/api/lookup"), "/api/lookup");
         assert_eq!(normalize_target("/api/foo/AMUX-9"), "/api/foo/{id}");
@@ -1948,7 +1955,7 @@ mod tests {
         // the best (static) match wins, exactly as axum dispatches.
         assert_eq!(routed_methods_at("/api/torrents/g1/file"), vec!["GET"]);
 
-        let near = nearest_routes("/api/sessions-git", 3);
+        let near = nearest_routes("/api/sessions-graph", 3);
         assert!(near.contains(&"/api/sessions"), "{near:?}");
         assert!(near.len() <= 3);
     }
@@ -2029,9 +2036,9 @@ mod tests {
         seed(&store, now - 30.0, "POST", "/api/lookup", 405, 1.0, "", "native", None).await;
         // 404s: one unrouted path (gets nearest_routes), one routed path
         // whose HANDLER 404'd (routed_methods shows it is a real route).
-        seed(&store, now - 20.0, "GET", "/api/sessions-git", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
-        seed(&store, now - 19.0, "GET", "/api/sessions-git", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
-        seed(&store, now - 10.0, "GET", "/api/board/session-gates", 404, 1.0, "lane-a", "native", Some("{\"error\":\"item not found\"}")).await;
+        seed(&store, now - 20.0, "GET", "/api/sessions-graph", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
+        seed(&store, now - 19.0, "GET", "/api/sessions-graph", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
+        seed(&store, now - 10.0, "GET", "/api/board/AMUX-9999", 404, 1.0, "lane-a", "native", Some("{\"error\":\"item not found\"}")).await;
         // Excluded: a success row, and an error outside the window.
         seed(&store, now - 5.0, "GET", "/api/board", 200, 1.0, "lane-a", "native", None).await;
         seed(&store, now - 90_000.0, "PATCH", "/api/board/statuses/review", 405, 1.0, "lane-a", "native", None).await;
@@ -2062,7 +2069,7 @@ mod tests {
         assert_eq!(g["routed_methods"], json!(["PATCH", "DELETE"]));
         assert_eq!(g["sample"]["path"], "/api/board/statuses/review");
 
-        let g = find(404, "GET", "/api/sessions-git");
+        let g = find(404, "GET", "/api/sessions-graph");
         assert_eq!(g["count"], 2);
         assert_eq!(g["routed_methods"], json!([]));
         assert!(

@@ -44,7 +44,17 @@ pub fn routes() -> Router<AppState> {
             "/statuses/{sid}",
             axum::routing::patch(patch_status).delete(delete_status),
         )
-        .route("/{id}", get(get_item).patch(patch_item))
+        // Static /session-gates outranks /{id} (same precedence note as above).
+        .route(
+            "/session-gates",
+            get(list_session_gates).patch(patch_session_gates),
+        )
+        // DELETE was never registered, so the SPA's own Delete button on a
+        // card 405'd — and `deleteBoardItem` removes the card optimistically
+        // BEFORE the request, so the card vanished, the server kept it, and it
+        // came back on the next poll. That is the reported "tons of board
+        // items are not moving" (AMUX board sweep, 2026-08-09).
+        .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
 }
@@ -102,6 +112,139 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
     Json(Value::Array(out)).into_response()
 }
 
+
+// ---- per-session gate overrides (AMUX-2599) -------------------------------
+//
+// Python `_load_session_gates` (py:16105) + the GET/PATCH pair at py:69563.
+// The layer between the global per-status default and the per-card override.
+//
+// The SPA fetches this on EVERY board load, in the same `Promise.all` as the
+// board and the status list. Its failure mode is the reason this is worth
+// porting carefully: the client does
+// `try { const d = await r.json(); if (d && typeof d === 'object') sessionGates = d; } catch {}`
+// — and a 404 body `{"error":"not found"}` IS an object, so it was assigned
+// wholesale. Every `sessionGates[worker][status]` lookup then missed, and the
+// user's per-worker gates rendered as if they had been DELETED. A 404 that
+// deserializes into the success path is not a missing endpoint, it is a silent
+// data-loss illusion (ethos rule 4: the wrong answer must be visible).
+
+/// GET /api/board/session-gates -> `{session: {status: [criteria]}}`.
+///
+/// Empty gates are dropped rather than returned as `[]`: a missing
+/// (session, status) MEANS "inherit the global default for that status", and
+/// an empty array would read as "this worker has an override that requires
+/// nothing" — the opposite of inheritance.
+async fn list_session_gates(State(state): State<AppState>) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let mut out: Map<String, Value> = Map::new();
+    // Python wrapped the SELECT in a bare `except: return {}` — the table is
+    // absent on a fresh DB and an empty map is the honest answer there.
+    if let Ok(mut stmt) = conn.prepare("SELECT session, status, gate FROM session_gates") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        }) {
+            for (session, status, gate) in rows.flatten() {
+                let items: Vec<String> = gate
+                    .as_deref()
+                    .and_then(|g| serde_json::from_str(g).ok())
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    continue;
+                }
+                out.entry(session)
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .expect("just inserted an object")
+                    .insert(status, json!(items));
+            }
+        }
+    }
+    Json(Value::Object(out)).into_response()
+}
+
+/// PATCH /api/board/session-gates {session|worker, status, gate[]} -> {ok:true}.
+///
+/// Accepts BOTH spellings of the key on purpose. Python read `session`; the
+/// shipped SPA has always sent `worker` (app.js `editSessionGate`), so the
+/// python endpoint would have answered 400 to its own dashboard. Rather than
+/// re-ship that mismatch, take either — `worker` is the alias `aliases.rs`
+/// already maps to `session` everywhere else in this API.
+async fn patch_session_gates(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let key = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let (Some(session), Some(status)) = (key("session").or_else(|| key("worker")), key("status"))
+    else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "missing session or status"}),
+        );
+    };
+    let items: Vec<String> = body
+        .get("gate")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|x| match x {
+                    Value::String(s) => s.trim().to_string(),
+                    other => other.to_string().trim().to_string(),
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let write = state
+        .store
+        .write_async(move |conn| {
+            if items.is_empty() {
+                // Empty -> revert this session to the global default for that
+                // status. Deleting the row is what "inherit" means here; an
+                // empty-array row would be an override requiring nothing.
+                conn.execute(
+                    "DELETE FROM session_gates WHERE session = ?1 AND status = ?2",
+                    rusqlite::params![session, status],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO session_gates (session, status, gate) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(session, status) DO UPDATE SET gate = excluded.gate",
+                    rusqlite::params![
+                        session,
+                        status,
+                        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+                    ],
+                )?;
+            }
+            Ok(WriteOutcome {
+                applied: true,
+                // Board-flavoured so the SSE tick makes open dashboards refetch
+                // — python called `_board_changed()` here for the same reason.
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: format!("session_gates:{session}:{status}"),
+                    mutation: MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match write {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => internal(e),
+    }
+}
 
 // ---- board status (column) mutations -------------------------------------
 //
@@ -761,13 +904,54 @@ pub async fn create_item(
     };
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
-    let Some(status) = bs::parse_status(&status_in) else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": format!("unknown status {status_in:?}"), "valid_statuses": VALID_STATUSES }),
-        );
+    // AMUX-2609: a status outside the typed vocabulary may still be a real
+    // user-created column. The `statuses` table is the vocabulary for those —
+    // see the long note in `patch_item` for why `TaskStatus` stays closed.
+    let status_raw = match bs::parse_status(&status_in) {
+        Some(st) => bs::db_status_spelling(st).to_string(),
+        None => {
+            let id = status_in.trim().to_lowercase();
+            let known = state
+                .store
+                .read()
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT id FROM statuses WHERE id = ?1",
+                        rusqlite::params![id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                });
+            match known {
+                Some(id) => id,
+                None => {
+                    let cols: Vec<String> = state
+                        .store
+                        .read()
+                        .ok()
+                        .map(|conn| {
+                            conn.prepare("SELECT id FROM statuses ORDER BY position")
+                                .and_then(|mut st| {
+                                    st.query_map([], |r| r.get::<_, String>(0))
+                                        .map(|rows| rows.flatten().collect::<Vec<String>>())
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({
+                            "error": format!("unknown status {status_in:?}"),
+                            "valid_statuses": VALID_STATUSES,
+                            "configured_columns": cols,
+                            "how_to_add": "POST /api/board/statuses {\"label\": \"...\"}",
+                        }),
+                    );
+                }
+            }
+        }
     };
-    let status_raw = bs::db_status_spelling(status).to_string();
 
     let item_type = body_str(&map, "type")
         .map(|t| t.trim().to_lowercase())
@@ -1350,7 +1534,198 @@ pub async fn patch_item(
 
             // ---- status transition through the core state machine --------
             let mut status_event: Option<(String, String)> = None;
-            if let Some(target_in) = body_str(&map, "status") {
+
+            // ---- user-created columns (AMUX-2609) ------------------------
+            //
+            // Python's board columns are fully dynamic: create a column, drag
+            // cards into it. Rust's `TaskStatus` is a closed enum, so
+            // `parse_status` returned None and the PATCH bounced 400 — while
+            // the SPA had ALREADY moved the card optimistically and cached it.
+            // The user saw the card sit in the new column behind a bare
+            // "Error: 400" toast until the next poll silently snapped it back.
+            //
+            // This deliberately does NOT add a `Custom(String)` cell to
+            // `TaskStatus`. That enum is the BUILTIN LIFECYCLE the state
+            // machine reasons about, and widening it would:
+            //   * lose `Copy`, breaking ~40 by-value sites (20 of them
+            //     `match task.status` inside `apply_transition` alone);
+            //   * break `db_status_spelling`'s `&'static str` return, which
+            //     cannot express an owned custom id;
+            //   * leave `disposition_is_total_over_every_status` iterating
+            //     `TaskStatus::ALL`, a `const [TaskStatus; 11]` that CANNOT
+            //     contain a `Custom` — so the totality PROOF silently narrows
+            //     to builtins while still passing (ethos rule 7: a check that
+            //     can no longer fail);
+            //   * and route every custom move through `BoardTransition::Force`
+            //     (no `named_transition` arm exists), filling the one audited
+            //     bypass trail with routine traffic until it means nothing
+            //     (ethos rule 6).
+            // `amux_core::workflow` already models dynamic columns properly
+            // (ColumnId + ColumnRole::Custom); a `Custom` variant here would be
+            // a THIRD spelling of the same idea.
+            //
+            // So the vocabulary is read from where users actually create
+            // columns — the `statuses` table. Both `issues.status` and that
+            // table are raw strings already, so nothing migrates. The card's
+            // required semantics fall out for free: `board_drive`'s pickup and
+            // the WIP-1 guard compare raw SQL against 'todo'/'doing', and the
+            // terminal/rot checks against their own literals, so a custom
+            // column is non-WIP, non-terminal and never auto-picked WITHOUT a
+            // single new exclusion list (ethos rule 1: an exemption nobody
+            // maintains is how things go invisible).
+            //
+            // A transition is UNMODELLED when EITHER end is outside the typed
+            // vocabulary. Handling only the "into" direction would build a
+            // roach motel — cards could enter a custom column and never leave —
+            // which is precisely what ethos rule 3 forbids: every legitimate
+            // state needs a truthful exit.
+            let unmodelled_status = body_str(&map, "status").filter(|s| {
+                bs::parse_status(s).is_none() || bs::parse_status(&next.status).is_none()
+            });
+            if let Some(target_in) = unmodelled_status {
+                let target_typed = bs::parse_status(&target_in);
+                let target_raw = match target_typed {
+                    Some(t) => bs::status_to_db(t, &next.status),
+                    None => target_in.trim().to_lowercase(),
+                };
+
+                // NOTE for whoever wires the orchestrator half (AMUX-2631/2/3,
+                // de8a079): `db::workflow_store::load_workflow` is the richer
+                // reader of this same `statuses` table and models column ROLE
+                // and terminal behaviour. It is the right oracle once planning
+                // needs to reason about custom columns; the membership check
+                // here is deliberately the narrowest question ("does this
+                // column exist"), against the same table, so the two cannot
+                // disagree about what a column IS.
+                //
+                // The gate for an unmodelled move: a typed target keeps its
+                // normal derived/override gate; a custom target uses the gate
+                // the column itself carries (`statuses.gate`, written by the
+                // column editor). Without this a custom column would be a
+                // gate-shaped hole in the board.
+                let eff_gate: Vec<String> = match target_typed {
+                    Some(t) => bs::effective_gate(&next, t),
+                    None => {
+                        let found: Option<Option<String>> = conn
+                            .query_row(
+                                "SELECT gate FROM statuses WHERE id = ?1",
+                                rusqlite::params![target_raw],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .ok();
+                        let Some(gate_json) = found else {
+                            // Neither a builtin nor a column that exists: a
+                            // real typo. Name BOTH vocabularies and how to add
+                            // one, so the refusal is actionable rather than a
+                            // list the caller has already read.
+                            let mut cols: Vec<String> = Vec::new();
+                            if let Ok(mut stmt) =
+                                conn.prepare("SELECT id FROM statuses ORDER BY position")
+                            {
+                                if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                                    cols = rows.flatten().collect();
+                                }
+                            }
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::BAD_REQUEST,
+                                    json!({
+                                        "error": format!("unknown status {target_in:?}"),
+                                        "valid_statuses": VALID_STATUSES,
+                                        "configured_columns": cols,
+                                        "how_to_add": "POST /api/board/statuses {\"label\": \"...\"}",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        };
+                        gate_json
+                            .as_deref()
+                            .and_then(|g| serde_json::from_str::<Vec<String>>(g).ok())
+                            .unwrap_or_default()
+                    }
+                };
+
+                if target_raw != next.status {
+                    let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+                    let reason = body_str(&map, "reason").unwrap_or_default();
+                    let mut ack_via: Option<String> = None;
+                    if !eff_gate.is_empty() && !force {
+                        let gc = map.get("gate_checked").and_then(Value::as_array).map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(|s| s.trim().to_string())
+                                .collect::<Vec<_>>()
+                        });
+                        if let Some(gc) = &gc {
+                            let missing: Vec<&String> =
+                                eff_gate.iter().filter(|c| !gc.contains(c)).collect();
+                            if !missing.is_empty() {
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "gate_checked does not match the gate",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "gate": eff_gate,
+                                            "missing": missing,
+                                            "you_sent": gc,
+                                            "attempted_status": target_raw,
+                                            "item": row.id,
+                                            "item_type": next.item_type,
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
+                            ack_via =
+                                Some(format!("gate_checked ({}/{})", gc.len(), eff_gate.len()));
+                        } else if map.get("gate_ack").and_then(Value::as_bool).unwrap_or(false) {
+                            ack_via = Some("gate_ack".into());
+                        } else {
+                            // `why_blocked` is deliberately EMPTY here: core
+                            // cannot compute it for a column it does not
+                            // model, and an empty list says exactly that
+                            // rather than inventing a reason.
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    gate_409(&next, &eff_gate, &target_raw, &[]),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    let from_raw = next.status.clone();
+                    let stamp = hhmm();
+                    if let Some(via) = &ack_via {
+                        next.log = Some(bs::append_log(
+                            next.log.as_deref(),
+                            &stamp,
+                            &format!("{actor_name}: gate satisfied via {via} for {target_raw}"),
+                        ));
+                    }
+                    // NOT logged as a force: this is an ordinary move between
+                    // configured columns. Calling it a bypass would be the
+                    // ethos-rule-6 failure in reverse — an audit line that
+                    // cries wolf is as useless as one that never fires.
+                    let line = if force {
+                        format!("force by {force_actor}: {from_raw}->{target_raw} reason={reason}")
+                    } else {
+                        format!("{actor_name}: {from_raw} -> {target_raw} (user column)")
+                    };
+                    next.log = Some(bs::append_log(next.log.as_deref(), &stamp, &line));
+                    next.status = target_raw.clone();
+                    next.version += 1;
+                    status_event = Some((from_raw, target_raw));
+                    changed.push("status".into());
+                }
+            } else if let Some(target_in) = body_str(&map, "status") {
                 let Some(target) = bs::parse_status(&target_in) else {
                     return finish(
                         &slot_w,
@@ -1372,9 +1747,18 @@ pub async fn patch_item(
                             PatchOut::Refused(
                                 StatusCode::CONFLICT,
                                 json!({
+                                    // Unreachable since AMUX-2609: the
+                                    // `unmodelled_status` branch above claims
+                                    // every case where either end is outside
+                                    // the typed vocabulary. Kept as an honest
+                                    // 409 rather than an unwrap so a future
+                                    // edit to that predicate degrades to a
+                                    // refusal instead of a panic — and no
+                                    // longer instructs the caller to go use a
+                                    // server that was retired.
                                     "error": format!(
-                                        "current status {:?} is not in the shared vocabulary; \
-                                         fix it via the Python board first",
+                                        "current status {:?} is outside the typed vocabulary \
+                                         and was not routed to the user-column path",
                                         next.status
                                     ),
                                 }),
@@ -1779,7 +2163,7 @@ async fn archive_restore(
                     Out::Refused(json!({
                         "error": format!(
                             "current status {:?} is not in the shared vocabulary; \
-                             fix it via the Python board first",
+                             move it to a builtin status first (PATCH status)",
                             row.status
                         ),
                     })),
@@ -1868,4 +2252,73 @@ pub async fn restore_item(
     body: Option<Json<Value>>,
 ) -> Response {
     archive_restore(state, id, headers, body.map(|Json(v)| v), true).await
+}
+
+// ---- DELETE /api/board/{id} ---------------------------------------------
+
+/// SOFT delete, Python parity: stamp `deleted` and the row disappears from
+/// every read path (all of them filter `deleted IS NULL`) while staying on
+/// disk for forensics. The SPA has always called this; it simply had no
+/// handler, and the 405 was invisible because the card had already been
+/// removed from the local list.
+pub async fn delete_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_actor, actor_name) = actor_from_headers(&headers);
+    enum Out {
+        NotFound,
+        Deleted(Value),
+    }
+    let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let id_w = id.clone();
+    let who = actor_name.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let Some(row) = bs::get_issue(conn, &id_w)? else {
+                return finish(&slot_w, Out::NotFound, no_write());
+            };
+            // Record WHO deleted it before the row leaves every read path —
+            // a delete that leaves no trace of its author is the audit hole
+            // ethos rule 6 is about, and the log column survives soft delete.
+            let mut logged = row.clone();
+            logged.log = Some(bs::append_log(
+                logged.log.as_deref(),
+                &hhmm(),
+                &format!("{who}: deleted"),
+            ));
+            logged.rev = row.rev + 1;
+            logged.version = row.version + 1;
+            logged.updated = now_secs();
+            bs::save_patched(conn, &logged)?;
+            if !bs::soft_delete(conn, &id_w)? {
+                return finish(&slot_w, Out::NotFound, no_write());
+            }
+            let event = ev_snap(&logged, MutationKind::Deleted);
+            finish(
+                &slot_w,
+                Out::Deleted(json!({"ok": true, "deleted": true, "id": id_w})),
+                WriteOutcome {
+                    applied: true,
+                    events: vec![event],
+                },
+            )
+        })
+        .await;
+    let reply = match write {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let outcome = slot.lock().expect("outcome slot poisoned").take();
+    match outcome {
+        None => internal("delete produced no outcome"),
+        Some(Out::NotFound) => not_found(&id),
+        Some(Out::Deleted(mut body)) => {
+            body["global_rev"] = json!(reply.rev.0);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+    }
 }

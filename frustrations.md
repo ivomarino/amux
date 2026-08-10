@@ -1770,3 +1770,177 @@ predicate (`pane_is_at_boundary`). They did not for one build, and the disagreem
 delivery in a way that was a bug in neither half: the gate read the frame as idle (so it never
 consulted the deadline) while the send path read it as generating (so it refused) — every tick,
 forever. A view that disagrees with the mechanism it describes is worse than no view.
+
+## `git add -A` on the shared checkout committed module declarations for five files it did not stage
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux (batch: AMUX-2618/2599/2636/2634/2609)
+CARD: AMUX-2654
+SYMPTOM: `main` has not compiled since 22:43. Someone committed with `git add -A`, which swept in three
+sessions' in-flight edits to `api/mod.rs`, `runtime_jobs/mod.rs` and `ghost_rescue.rs` — including the
+`pub mod offline_origin; pub mod sessions_git; pub mod search; pub mod why; pub mod pane_size;` lines —
+while the FILES those lines name stayed untracked, because they belong to other sessions who had not
+finished. `scripts/rust-auto-build.sh` builds a worktree of HEAD, so it sees only committed files:
+`error[E0583]: file not found for module offline_origin` x5. Four builder cycles logged BUILD FAILED in
+`~/.amux/logs/rust-auto-build.log` (83ab8ac, 0b156bb, 1155f25 twice) and the stamp is still stuck at
+62e9bdd. Separately and on the same checkout, a one-line edit of mine inside `resize_pane`
+(`note_resize`, AMUX-2634) was silently reverted by a concurrent writer of `session_verbs.rs` between
+my edit and my test run.
+COST: nothing whatsoever errors. The builder is designed to keep the last good build on failure, so the
+server stays up and every session tonight believes its change will deploy; none will, and no session is
+told. It cost me a wrong conclusion in the other direction too: I measured the pane-restore timing three
+times and read the results as a lease bug in my own code, because the reverted line produced *plausible*
+behaviour (a restore, just too early) rather than a crash — the unit tests could not catch it, since what
+vanished was the CALL SITE, not the function. Roughly 25 minutes, and it was only caught because the
+live end-to-end test disagreed with the passing tests.
+FIX: two halves. (1) Immediate: `git add` the five missing files (or revert the declarations), then
+confirm with the builder's own recipe — `git worktree add --detach $W HEAD && cd $W && cargo build`.
+(2) Structural, and the one worth building: CLAUDE.md's Deploy section already warns that a push ships
+other sessions' COMMITS, but the same hazard exists one step earlier, at STAGING, and it is worse —
+`git add -A` produces a HEAD nobody can build, whereas a bad push at least builds. A `pre-commit` hook
+that refuses when the staged set contains a `pub mod X;` whose `X.rs` is untracked would have caught
+this exact commit in under a second, and it is checkable by the machine rather than by remembering.
+The generalisable point: on a shared checkout the unit of work is a PATH, never `-A`, and the tell that
+the rule is not being followed is a build that fails in a file its committer never opened.
+
+## The dashboard's "New worker" button cannot create a worker (405)
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2655
+SYMPTOM: `POST /api/sessions` answers `405, allow: GET,HEAD`. The create dialog shows
+  "Create failed: error 405" and stays open. `POST /api/workers` exists but writes a
+  `workers` table row, a different substrate from the `~/.amux/sessions/*.env` registry
+  the fleet actually reads — so it is not a workaround, it creates an invisible worker.
+COST: the only way to make a worker for a UI test was to duplicate an existing one; a
+  user with an empty fleet has no path at all. Found only because a test needed it.
+FIX: `sessions_legacy::create_session_legacy` + `.post()` on the route (written,
+  uncommitted — this session is barred from committing). Verified 201 + worker present.
+
+## Board card Delete removes the card and never deletes it
+AREA: board
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2656
+SYMPTOM: `DELETE /api/board/{id}` -> 405 (the route was `get().patch()` only).
+  `deleteBoardItem` filters the card out of `boardItems` and re-renders BEFORE awaiting
+  the request, and does not roll back on failure — so the card disappears at ~40ms, the
+  server still has it, and the next `fetchBoard()` brings it back.
+COST: this is the reported "tons of board items are not moving". Every board delete
+  since the cutover was a no-op that looked like a success.
+FIX: `board_store::soft_delete` + `board::delete_item` + `.delete()` on the route, and
+  rollback in `deleteBoardItem`/`updateBoardItem` (written, uncommitted). Verified: card
+  gone at 21ms, DELETE 200, 404 on re-GET, stays gone after refresh.
+
+## Two endpoints disagree about whether a worker is running, and the card believes the wrong one
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2657
+SYMPTOM: after Stop, `GET /api/sessions` says `running: true` forever while
+  `GET /api/sessions/<n>/info` says `false`. The list derives running from "a tmux
+  session named amux-<n> exists"; `stop` deliberately leaves the tmux shell alive. The
+  card therefore never shows the Start button and Stop reads as having done nothing.
+COST: a full measurement pass concluded "Stop returns 202 and does not stop the
+  session" — the agent WAS dead; only the card was lying. Wrong conclusion, ~20 min.
+FIX: one batched `tmux list-panes -a -F '#{session_name}:#{pane_current_command}'` into
+  `FleetSignals.shell_only`, plus `agent_running()` as the single accessor so the two
+  answers cannot drift again (written, uncommitted). Verified both agree after Stop.
+
+## Every server refusal reached the user as a bare status code
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2658
+SYMPTOM: `apiCall` did `showToast('Error: ' + r.status)` and dropped the body. Archive
+  on a PINNED worker returns `403 {"error":"cannot archive pinned session — unpin
+  first"}` and the user saw "Error: 403". Board gate 409s carry the full checklist AND
+  the exact `cli:` string that would work; none of it was ever shown.
+COST: this is most of the reported "nothing happens if i delete or archive" — the
+  server explained itself every time and the UI threw it away.
+FIX: `_apiErrText()` surfaces `error`/`message` plus `cli` (written, uncommitted).
+  Verified: "403: cannot archive pinned session — unpin first" and "409: already
+  holding doing — try: amux board doing AMUX-X --override-doing".
+
+## Editing static/app.js does not rebuild the embedded dashboard
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2659
+SYMPTOM: `crates/amux-dashboard` has no `build.rs` and rust_embed did not invalidate.
+  After editing `static/app.js`, `cargo build --release -p amux-server` recompiled only
+  `amux-server` and produced a binary serving the PREVIOUS app.js — the page reported
+  `APP_VER 0.9.553` while the file on disk said `0.9.555`. Only
+  `touch crates/amux-dashboard/src/lib.rs` forced the re-embed.
+COST: a full verification pass was run against the OLD client and reported the fixes as
+  not working (the pinned-worker toast still said "Error: 403"). ~25 min, and it is the
+  loud-wrong kind: the sweep produced confident, plausible, false results. Worse in
+  production — a dashboard-only commit can deploy stale client code silently.
+FIX: add `crates/amux-dashboard/build.rs` emitting
+  `cargo:rerun-if-changed=static` (and assert the served APP_VER matches the file, so
+  the check can fail).
+
+---
+## The staged-guard endpoint was unrouted on the rust server and the hook printed nothing
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux-rust
+CARD: AR-132
+SYMPTOM: `POST /api/git/staged-guard` answered **405** on the rust origin (8822/8824) —
+  ~1,147 calls/hour — while the generated `.git/hooks/amux-staged-guard` wrapped the call
+  in `except Exception: return 0  # fail open` and printed NOTHING. Every commit on every
+  shared checkout ran with cross-session sweep protection OFF, and nothing anywhere said
+  so. Two independent things hid it: the hook's silent fail-open, and the fact that an
+  unrouted `/api/*` path on this server answers **405 from the GET-only SPA catch-all**,
+  which reads as "wrong method" rather than "no such route".
+COST: Two sweeps landed on this checkout in one night with the guard nominally armed, and
+  a third while I was fixing it — peer commit 572047d swept four uncommitted `pub(crate)`
+  edits of mine in `session_verbs.rs` into an unrelated steering fix. Same guard had
+  already regressed to silence once before (AC-261), and nothing detected either
+  regression: the only signal was the absence of output, which is what a passing check
+  also looks like.
+FIX: Ported natively — `crates/amux-server/src/api/git_guard.rs`, mounted in `api/mod.rs`,
+  registry row in `py_proxy.rs`, ROUTE_TABLE row in `request_log.rs`. The server never
+  500s into a fail-open: it answers `undecided` + `reason` when nothing could be compared
+  and `degraded` when the verdict may UNDER-report (e.g. a cotenant whose transcript it
+  cannot read), so an empty verdict is no longer indistinguishable from a clean one.
+
+---
+## A guard's only client swallowed the failure it existed to report
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux-rust
+CARD: AR-132
+SYMPTOM: The hook had ONE `except Exception: return 0` covering the local git calls, the
+  HTTP request, and the JSON parse. "Server unreachable", "route gone", "server broke" and
+  "answered garbage" were the same silent exit 0. Meanwhile `scripts/install-hooks.sh`
+  refused to install the guard and told the reader to "start the amux server for this
+  work_dir" — advice that was true under python and false after the cutover, because the
+  generator was deleted with `amux-server.py` and nothing in rust writes the hook.
+COST: The advertised recovery path did nothing, and running install-hooks.sh would have
+  made things WORSE: the tracked `scripts/git-hooks/pre-commit` had no staged-guard shim,
+  so installing it DELETED the shim the retired python had injected — turning the guard
+  off while printing `ok .git/hooks/pre-commit matches ...`. A second silent-disable path,
+  sitting inside the tool meant to repair the first.
+FIX: `scripts/git-hooks/amux-staged-guard` is now the tracked source (the previous
+  "second producer" objection died with the generator); the shim is back in the tracked
+  pre-commit; install-hooks.sh installs BOTH, verifies the shim link — not just file
+  equality — and probes the live endpoint so an unrouted server is reported where someone
+  is already looking at hooks. Three distinct failure messages in the hook; fail-open
+  stays, silence does not.
