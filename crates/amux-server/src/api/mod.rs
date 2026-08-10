@@ -263,8 +263,17 @@ pub fn router(state: AppState) -> Router {
         // each. Route names only — nothing secret, so public like its
         // debug sibling above.
         .route("/api/debug/boundary", axum::routing::get(py_proxy::boundary))
+        // Legacy-port retirement counter (ethos rule 4): "can we stop
+        // answering 8822 yet?" as a number rather than a guess — hit count,
+        // which IPs/user-agents are still calling it, and the exit condition
+        // in the payload itself. Public like its debug siblings.
+        .route(
+            "/api/debug/legacy-port",
+            axum::routing::get(crate::legacy_port::debug),
+        )
         .merge(invariants_api::routes())
         .merge(crate::runtime_jobs::board_drive::routes())
+        .merge(crate::runtime_jobs::autofix::routes())
         // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
         // routed, with which methods" is a GET, not a grep. Public like its
         // debug siblings (route names only, nothing secret).

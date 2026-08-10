@@ -2322,6 +2322,16 @@ fn bg_view_refusal(generating: bool) -> String {
 /// added later cannot silently land in the 500 bucket.
 pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str>) {
     let m = msg.trim();
+    // THE WRAPPER CARRIES THE REAL OUTCOME. A send to a stopped lane auto-wakes
+    // it, and a wake that legitimately declines comes back as
+    // "auto-wake failed: session is archived; wake it first" — a refusal with an
+    // obvious next step, wearing a prefix that reads like a crash. Classifying
+    // the wrapper buried every one of them at 500. Recurse on the inner message
+    // instead; a genuinely broken wake ("auto-wake failed: tmux refused") still
+    // falls through to 500 because the inner text is unclassified.
+    if let Some(inner) = m.strip_prefix("auto-wake failed: ") {
+        return send_failure_status(inner);
+    }
     // --- 404: the target does not exist.
     if m.starts_with("session '") && m.ends_with("not found") {
         return (StatusCode::NOT_FOUND, Some("GET /api/sessions lists the live lanes"));
@@ -2336,6 +2346,12 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     // --- 501: honest degradation. The capability is ABSENT, not broken — the
     //     same shape as /api/email/search on an unconnected account, which is
     //     deliberately not a bug and deliberately not filed by the autofix.
+    if m.starts_with("herdr-backed session start is not ported") {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Some("herdr session start is not ported to this origin — start the lane from herdr"),
+        );
+    }
     if m.starts_with("iTerm2-backed sessions are not supported") {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -2347,6 +2363,15 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     //     on its own without anybody fixing amux.
     let conflict: &[(&str, &str)] = &[
         ("not running", "POST /api/sessions/<name>/start, or send again to auto-wake it"),
+        // The keys landed and Claude Code did not take them. amux did its job
+        // and the composer declined, so the text is still in the input box —
+        // recoverable, and the caller needs to know it is NOT delivered.
+        // `submit_verdict_of` already calls this "stuck"; the status code was
+        // the only place still calling it a crash.
+        (
+            "not submitted",
+            "the text is sitting in the lane's composer, NOT delivered — retry at the next              turn boundary",
+        ),
         ("session is in resume picker", "choose a conversation in the pane, or send the Escape key"),
         (
             BG_VIEW_REFUSAL_PREFIX,
@@ -3807,7 +3832,12 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             "-e".into(), format!("TMUX_SESSION_NAME={name}"),
             "-e".into(), format!("AMUX_WORKER={name}"),
             "-e".into(), format!("AMUX_SESSION={name}"),
-            "-e".into(), format!("AMUX_URL={scheme}://localhost:8822"),
+            // The port THIS server answers on, never a literal: a new lane must
+            // reach the server that started it. The old hardcoded 8822 outlived
+            // its own deployment — it kept minting the retired address into
+            // every new session locally, and it forced the cloud image to bind
+            // 8822 to match (cloud/docker/Dockerfile named this line).
+            "-e".into(), format!("AMUX_URL={scheme}://localhost:{}", crate::config::canonical_port()),
         ];
         args.extend(env_args.iter().cloned());
         args.push(user_shell());
@@ -8908,15 +8938,30 @@ async fn share_handler(
             if let Err(e) = reply {
                 return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
             }
+            // Fall back to the port this server actually answers on. A share
+            // link minted with the retired 8822 literal points a recipient at a
+            // bind that is being removed (see crate::legacy_port).
+            let self_host = format!("localhost:{}", crate::config::canonical_port());
             let host = headers
                 .get("x-forwarded-host")
                 .or_else(|| headers.get("host"))
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("localhost:8822")
+                .unwrap_or(&self_host)
                 .to_string();
+            // "It is one of OUR ports, so it is TLS." Both the canonical port
+            // and the legacy bind qualify while the latter exists — pinning
+            // this to a literal would emit http:// share links the day the
+            // canonical port moved.
+            let is_own_port = [
+                Some(crate::config::canonical_port().to_string()),
+                std::env::var("AMUX_RS_LEGACY_PORT").ok(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|p| host.ends_with(&format!(":{p}")));
             let scheme = if headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https")
                 || !host.contains(':')
-                || host.ends_with(":8822")
+                || is_own_port
             {
                 "https"
             } else {
@@ -10916,14 +10961,30 @@ mod refusal_status_tests {
         const SRC: &str = include_str!("session_verbs.rs");
         // Built by concat! so this marker never appears literally in this
         // file — otherwise the scan would find its own needle.
-        let marker = concat!("(false", ", \"");
+        //
+        // NOTE the marker stops at the COMMA, not at the quote. The first
+        // version required `(false, "` contiguously and so was blind to the
+        // rustfmt-wrapped form —
+        //     return (
+        //         false,
+        //         "herdr-backed session start is not ported ...".into(),
+        //     );
+        // — which is how EVERY long refusal in this file is written. The scan
+        // reported a clean 15 outcomes while silently skipping the wrapped
+        // ones: a probe that guessed where the answer lived and missed. It now
+        // skips whitespace after the comma before requiring the quote.
+        let marker = concat!("fal", "se,");
         // Literals that MUST classify as a hard failure. Everything else the
         // scan finds must be a refusal (non-5xx). Both lists are explicit:
         // "I did not think about it" is not a state this test has.
         // 501, and NOT a bug: the capability is absent, not broken. Kept in
         // its own list because the autofix watcher must never file these —
         // same class as /api/email/search on an unconnected account.
-        let degraded: &[&str] = &["iTerm2-backed sessions are not supported by the rust origin yet"];
+        let degraded: &[&str] = &[
+            "iTerm2-backed sessions are not supported by the rust origin yet",
+            "herdr-backed session start is not ported to the rust origin yet \
+             (gap named in api/session_verbs.rs)",
+        ];
         let hard: &[&str] = &[
             "herdr prompt failed",
             "could not stage paste buffer",
@@ -10935,6 +10996,8 @@ mod refusal_status_tests {
             "could not write session env",
         ];
         let mut found = 0usize;
+        let mut seen: Vec<String> = Vec::new();
+        let mut unclassified: Vec<String> = Vec::new();
         let mut at = 0usize;
         while let Some(i) = SRC[at..].find(marker) {
             let hit = at + i;
@@ -10948,7 +11011,21 @@ mod refusal_status_tests {
             if SRC[line_start..hit].trim_start().starts_with("//") {
                 continue;
             }
-            let rest = &SRC[at..];
+            // IT MUST BE A TUPLE RETURN, not any `false,` followed by a
+            // string. Widening the marker to catch the rustfmt-wrapped form
+            // also caught `json!({"ok": false, "message": ...})` — 11 JSON
+            // KEYS reported as unclassified refusals. The discriminator is the
+            // open paren: `(false,` and `(\n false,` both have `(` as the
+            // previous non-whitespace char; a JSON literal has `:` or `,`.
+            if !SRC[..hit].trim_end().ends_with('(') {
+                continue;
+            }
+            // Skip whitespace/newlines between the comma and the literal.
+            let ws = SRC[at..].len() - SRC[at..].trim_start().len();
+            if !SRC[at + ws..].starts_with('"') {
+                continue;
+            }
+            let rest = &SRC[at + ws + 1..];
             // Read to the closing quote, honouring \" and \\ escapes.
             let bytes = rest.as_bytes();
             let mut j = 0usize;
@@ -10995,6 +11072,7 @@ mod refusal_status_tests {
                 continue;
             }
             found += 1;
+            seen.push(lit.clone());
             let (code, _) = send_failure_status(&lit);
             if degraded.contains(&lit.as_str()) {
                 assert_eq!(code, StatusCode::NOT_IMPLEMENTED, "absent capability: {lit:?}");
@@ -11004,18 +11082,32 @@ mod refusal_status_tests {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "listed as a hard failure but classified {code}: {lit:?}"
                 );
-            } else {
-                assert!(
-                    !code.is_server_error(),
-                    "UNCLASSIFIED session-verb outcome {lit:?} falls through to {code}. \
-                     Classify it: add a refusal arm to send_failure_status (with a next \
-                     step), or add the literal to this test's `hard` list if a 500 is \
-                     genuinely correct."
-                );
+            } else if code.is_server_error() {
+                // Collected, not asserted one at a time: a future author who
+                // adds three refusals should see all three, not rerun the
+                // suite three times.
+                unclassified.push(lit.clone());
             }
         }
         // The scan itself must have found something — an extraction bug that
         // matched nothing would pass every assertion above in silence.
-        assert!(found >= 15, "literal scan found only {found} outcomes — extraction is broken");
+        assert!(
+            unclassified.is_empty(),
+            "{} UNCLASSIFIED session-verb outcome(s) fall through to HTTP 500. For each: add a \
+             refusal arm to send_failure_status (with a next step), or add the literal to this \
+             test's `hard` list if a 500 is genuinely correct.\n{unclassified:#?}",
+            unclassified.len()
+        );
+        // POSITIVE CONTROL. Before trusting that the scan found everything,
+        // confirm it found the specimen that motivated widening it — the
+        // rustfmt-wrapped herdr refusal, which the contiguous `(false, "`
+        // marker could not see. Without this line the scan can silently narrow
+        // again and every assertion above still passes.
+        assert!(
+            seen.iter().any(|l| l.starts_with("herdr-backed session start is not ported")),
+            "the scan no longer sees rustfmt-wrapped refusals — it found {} literals: {seen:#?}",
+            seen.len()
+        );
+        assert!(found >= 20, "literal scan found only {found} outcomes — extraction is broken");
     }
 }

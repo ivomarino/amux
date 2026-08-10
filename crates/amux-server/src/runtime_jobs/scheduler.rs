@@ -1039,6 +1039,79 @@ fn weekday_from_mon0(n: u32) -> Option<Weekday> {
 }
 
 // ---------------------------------------------------------------------------
+// AMUX-2679: skip ONE occurrence
+// ---------------------------------------------------------------------------
+
+/// The `next_run` a schedule should carry once the PENDING occurrence is
+/// skipped — i.e. the occurrence strictly after the one currently armed.
+/// `None` means "cannot be computed", which the API turns into a 400 rather
+/// than guessing.
+///
+/// # This is python's `_skip_next_run`, confirmed against the code and not the
+/// button's name
+///
+/// The base is the row's CURRENT `next_run`, never `now`. That is what makes
+/// Skip mean "drop the next fire and resume the cadence" instead of "pause for
+/// one interval from now": for `daily at 9am` pressed at 14:00, python bases on
+/// tomorrow-09:00 and yields the day after at 09:00, so the 9am slot is kept.
+/// Basing on `now` would have silently rewritten the cadence to 14:00 — a
+/// different feature wearing the same label.
+///
+/// Skip records nothing else: no run row (nothing ran), no `last_run` bump
+/// (the scheduler did not act on the row), no `run_count`. The audit row is
+/// this port's addition — python left the one mutation that moves a fire time
+/// unattributed, which is the AMUX-1812 shape.
+///
+/// # Where this is deliberately BETTER than python
+///
+/// Python re-implemented the grammar here as a second, shorter parser, and the
+/// two disagree: `_skip_next_run` never learned `every morning`, `every
+/// evening`, `every night`, or the bare `daily`/`weekly`/`monthly`-by-name
+/// forms unless `recurrence` also happened to say so — those rows parse fine
+/// for FIRING and returned `None` here, so Skip answered 400 on a schedule that
+/// was running normally. Parsing with the same [`ScheduleExpr`] the fire loop
+/// uses removes the second grammar entirely: whatever can fire can be skipped,
+/// by construction. The legacy `recurrence` tail below is python's, kept for
+/// rows that predate `schedule_expr`.
+pub fn skip_next_run(s: &DurableSchedule) -> Option<String> {
+    let base = parse_minute(s.str_field("next_run"))?;
+    // A parseable expr is authoritative — same parser as the fire loop, so
+    // "fires" and "can be skipped" cannot drift apart.
+    if let Some(expr) = s.schedule_expr() {
+        if let Ok(parsed) = ScheduleExpr::parse(expr) {
+            return parsed.next_run_after(base).map(fmt_minute);
+        }
+    }
+    // Legacy rows: no schedule_expr, cadence lives in `recurrence` (python's
+    // tail). Anything unrecognised returns None ON PURPOSE — the `+1 day`
+    // catch-all python once had here is the filter-that-matches-everything
+    // shape, and it silently re-armed "every 3 potatoes" as a daily schedule.
+    let next = match s.str_field("recurrence").to_ascii_lowercase().as_str() {
+        "hourly" => base + ChronoDuration::hours(1),
+        "weekly" => base + ChronoDuration::weeks(1),
+        "monthly" => add_one_month(base)?,
+        "daily" => base + ChronoDuration::days(1),
+        _ => return None,
+    };
+    Some(fmt_minute(next))
+}
+
+/// Same calendar month + 1, clamping the day to that month's length (python's
+/// `min(base.day, calendar.monthrange(...)[1])`) so Jan 31 -> Feb 28/29 rather
+/// than failing or overflowing into March.
+fn add_one_month(base: DateTime<Local>) -> Option<DateTime<Local>> {
+    let (y, mo) = if base.month() == 12 { (base.year() + 1, 1) } else { (base.year(), base.month() + 1) };
+    let last = days_in_month(y, mo)?;
+    let date = NaiveDate::from_ymd_opt(y, mo, base.day().min(last))?;
+    at_local_time(date, base.hour(), base.minute())
+}
+
+fn days_in_month(y: i32, mo: u32) -> Option<u32> {
+    let (ny, nmo) = if mo == 12 { (y + 1, 1) } else { (y, mo + 1) };
+    Some(NaiveDate::from_ymd_opt(ny, nmo, 1)?.pred_opt()?.day())
+}
+
+// ---------------------------------------------------------------------------
 // The production deliverer (AMUX-2647)
 // ---------------------------------------------------------------------------
 
@@ -2277,5 +2350,111 @@ mod tests {
         assert!(manual.ends_with("do the thing"), "{manual}");
         let trig = delivered_text("do the thing", "trigger:board");
         assert!(trig.contains("Off-cadence fire (trigger:board)"), "{trig}");
+    }
+
+    // ---- AMUX-2679: skip one occurrence ----------------------------------
+
+    fn skip_of(expr: Option<&str>, next_run: &str) -> Option<String> {
+        skip_next_run(&make_row("SCHED-1", "alpha", expr, next_run))
+    }
+
+    /// THE semantic, and the one a name-based reading gets wrong: the base is
+    /// the row's ARMED `next_run`, never `now`. Pressed at any hour of any
+    /// day, `daily at 09:00` armed for the 10th must land on the 11th at
+    /// 09:00 — not on "now + 24h", which would silently rewrite the cadence
+    /// to whatever o'clock the button was pressed.
+    #[test]
+    fn skip_advances_from_the_armed_occurrence_not_from_now() {
+        assert_eq!(
+            skip_of(Some("daily at 09:00"), "2026-08-10T09:00").as_deref(),
+            Some("2026-08-11T09:00")
+        );
+        // Same row, an armed time far from `now`: still exactly one step.
+        assert_eq!(
+            skip_of(Some("daily at 09:00"), "2026-12-24T09:00").as_deref(),
+            Some("2026-12-25T09:00")
+        );
+    }
+
+    #[test]
+    fn skip_moves_exactly_one_occurrence_for_every_cadence() {
+        // interval
+        assert_eq!(
+            skip_of(Some("every 15m"), "2026-08-10T09:00").as_deref(),
+            Some("2026-08-10T09:15")
+        );
+        assert_eq!(skip_of(Some("every 2h"), "2026-08-10T09:00").as_deref(), Some("2026-08-10T11:00"));
+        // weekday: Friday -> Monday, never Saturday
+        assert_eq!(
+            skip_of(Some("every weekday at 09:00"), "2026-08-14T09:00").as_deref(),
+            Some("2026-08-17T09:00"),
+            "Friday's skip lands on Monday"
+        );
+        // weekly
+        assert_eq!(
+            skip_of(Some("weekly on monday at 09:00"), "2026-08-10T09:00").as_deref(),
+            Some("2026-08-17T09:00")
+        );
+        // monthly
+        assert_eq!(
+            skip_of(Some("monthly on 15 at 09:00"), "2026-08-15T09:00").as_deref(),
+            Some("2026-09-15T09:00")
+        );
+        // cron, including the DOW translation the fire loop uses
+        assert_eq!(
+            skip_of(Some("30 9 * * 1-5"), "2026-08-14T09:30").as_deref(),
+            Some("2026-08-17T09:30")
+        );
+    }
+
+    /// Python re-implemented the grammar inside `_skip_next_run` as a second,
+    /// shorter parser, so a row that FIRES fine could still be unskippable:
+    /// `every morning` parses for the fire loop and hit python's `return None`
+    /// tail, answering 400 on a healthy schedule. Reusing `ScheduleExpr`
+    /// deletes the second grammar, and this is the specimen that proves it.
+    #[test]
+    fn expressions_the_fire_loop_accepts_are_all_skippable() {
+        for expr in ["every morning", "every evening", "every night", "in 30m", "every 1d"] {
+            let armed = ScheduleExpr::parse(expr)
+                .unwrap_or_else(|e| panic!("{expr} must parse for firing: {e}"))
+                .next_run_after(Local::now())
+                .map(fmt_minute)
+                .unwrap();
+            assert!(
+                skip_of(Some(expr), &armed).is_some(),
+                "'{expr}' fires but cannot be skipped — the second-parser gap is back"
+            );
+        }
+    }
+
+    /// The legacy tail: rows predating `schedule_expr` carry the cadence in
+    /// `recurrence`. Also pins the clamp — Jan 31 + 1 month is Feb 28, not a
+    /// failure and not March 3.
+    #[test]
+    fn legacy_recurrence_rows_still_skip_and_month_ends_clamp() {
+        let mut s = make_row("SCHED-2", "alpha", None, "2026-01-31T09:00");
+        s.set("sched_type", Value::from("recurring"));
+        s.set("recurrence", Value::from("monthly"));
+        assert_eq!(skip_next_run(&s).as_deref(), Some("2026-02-28T09:00"));
+        s.set("recurrence", Value::from("hourly"));
+        assert_eq!(skip_next_run(&s).as_deref(), Some("2026-01-31T10:00"));
+        s.set("recurrence", Value::from("weekly"));
+        assert_eq!(skip_next_run(&s).as_deref(), Some("2026-02-07T09:00"));
+    }
+
+    /// Refusing is the honest answer, and it has to stay refusing. The `+1
+    /// day` catch-all python once had here is the filter-that-matches-
+    /// everything shape: it would re-arm a row whose cadence nobody can name,
+    /// at a cadence nobody chose, and report success doing it.
+    #[test]
+    fn unskippable_rows_return_none_rather_than_guessing_a_cadence() {
+        // No armed next_run at all.
+        assert_eq!(skip_of(Some("daily at 09:00"), ""), None);
+        // Garbage expr, no recurrence to fall back on.
+        assert_eq!(skip_of(Some("whenever i feel like it"), "2026-08-10T09:00"), None);
+        // Legacy row with an unrecognised recurrence.
+        let mut s = make_row("SCHED-3", "alpha", None, "2026-08-10T09:00");
+        s.set("recurrence", Value::from("fortnightly"));
+        assert_eq!(skip_next_run(&s), None);
     }
 }

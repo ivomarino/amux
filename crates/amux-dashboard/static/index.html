@@ -285,6 +285,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             </label>
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Every command you send becomes a board issue, so the board is the source of truth without you filing anything. Control words (&quot;continue&quot;, &quot;yes&quot;) are skipped.</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">Autofix: file a card when something breaks</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="autofix-checkbox" onchange="toggleAutofix(this.checked)" checked>
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Watches server errors, latency, dead routes, stalled subsystems, invariants and the build &mdash; files one board card per distinct fault, with the evidence, and lets the board hand it to a worker. It never fixes anything itself. Off still detects and records; only the card is skipped (see <code>/api/debug/autofix</code>).</div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section">
@@ -1505,7 +1513,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="sched-mode-seg" style="margin-bottom:8px;">
         <button type="button" class="sched-mode-btn" data-mode="loop" onclick="setSchedMode('loop')"><span class="sched-mode-ico">&#x21BB;</span>Loop</button>
         <button type="button" class="sched-mode-btn" data-mode="routine" onclick="setSchedMode('routine')"><span class="sched-mode-ico">&#x2600;</span>Routine</button>
-        <button type="button" class="sched-mode-btn" data-mode="trigger" onclick="setSchedMode('trigger')"><span class="sched-mode-ico">&#x26A1;</span>Trigger</button>
+        <!-- A "Trigger" mode sat here (wake on session_idle / board change).
+             It wrote trigger_on/trigger_cooldown/trigger_sessions, which this
+             server reads nowhere — the Python event loop was never ported, and
+             across 20,618 recorded runs not one was ever sourced `trigger:*`,
+             so it never fired under Python either. Removed rather than left
+             offered; the capability is carded (AMUX-2680) to be rebuilt as a
+             runtime job with a named consumer, not as columns on a form. -->
         <button type="button" class="sched-mode-btn" data-mode="once" onclick="setSchedMode('once')"><span class="sched-mode-ico">&#x25B6;</span>Once</button>
       </div>
       <div style="display:flex;gap:10px;align-items:flex-end;">
@@ -1554,12 +1568,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <input id="sched-loop-every" type="text" placeholder="custom (e.g. 45m)" autocomplete="off"
             style="width:120px;font-size:0.72rem;padding:5px 8px;" oninput="markLoopChipActive(this.value)">
         </div>
-        <div class="field-group" style="margin-top:10px;">
-          <label class="field-label">Stop when output matches <span class="field-optional">(optional — ends the loop)</span></label>
-          <input id="sched-done-pattern" type="text" placeholder='e.g. "all complete", "under 50.?ms", "nothing to do"' autocomplete="off">
-        </div>
-        <select id="sched-done-action" style="display:none;"><option value="disable"></option><option value="notify"></option></select>
-        <div class="sched-mode-help"><b>Loop</b> — sends the command to the worker over and over on a fixed interval. Add a stop pattern to auto-disable when the work is done ("keep optimizing until under 50ms").</div>
+        <!-- "Stop when output matches" (done_pattern + done_action) lived
+             here. It promised the loop would end itself when a regex matched
+             the worker's pane; nothing in this server reads either column, so
+             the box saved and did nothing. Not re-implemented as written
+             either: regex-matching a rendered terminal to guess whether a
+             model has finished is exactly the scraping the harness is meant
+             to stop doing, and a worker can already report its own completion
+             (POST /api/sessions/<name>/report). See AMUX-2680. -->
+        <div class="sched-mode-help"><b>Loop</b> — sends the command to the worker over and over on a fixed interval. Disable it here, or have the worker disable it, when the work is done.</div>
       </div>
       <!-- ROUTINE -->
       <div id="sched-panel-routine" class="sched-panel" style="display:none;">
@@ -1575,44 +1592,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
         <div class="sched-mode-help"><b>Routine</b> — runs on a fixed daily or weekly schedule. Accepts natural language ("daily at 9am") or cron.</div>
       </div>
-      <!-- TRIGGER -->
-      <div id="sched-panel-trigger" class="sched-panel" style="display:none;">
-        <label class="field-label">Wake the worker when&hellip;</label>
-        <div style="display:flex;flex-direction:column;gap:6px;margin-top:3px;">
-          <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:0.82rem;min-height:32px;">
-            <input type="checkbox" id="sched-trigger-idle" style="width:auto;accent-color:var(--accent);">
-            &#x1F4A4; a worker goes idle <span style="color:var(--dim);font-size:0.7rem;">(a worker finished a turn)</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:0.82rem;min-height:32px;">
-            <input type="checkbox" id="sched-trigger-board" style="width:auto;accent-color:var(--accent);">
-            &#x1F4CB; the board changes <span style="color:var(--dim);font-size:0.7rem;">(issue created/moved)</span>
-          </label>
-        </div>
-        <div class="field-group" style="margin-top:8px;">
-          <label class="field-label">Only these workers <span class="field-optional">(comma-separated; blank = any)</span></label>
-          <input id="sched-trigger-sessions" type="text" placeholder="e.g. backend, mvs-infra, ts-gke" autocomplete="off" style="width:100%;box-sizing:border-box;">
-        </div>
-        <div style="display:flex;gap:12px;">
-          <div style="flex:1;">
-            <label class="field-label">Cooldown <span class="field-optional">(sec)</span></label>
-            <input id="sched-trigger-cooldown" type="number" min="10" max="3600" value="120" style="width:100%;box-sizing:border-box;">
-          </div>
-          <div style="flex:2;">
-            <label class="field-label">Also on a timer <span class="field-optional">(optional heartbeat)</span></label>
-            <input id="sched-trigger-expr" type="text" placeholder='e.g. "every 1h"' autocomplete="off" style="width:100%;box-sizing:border-box;">
-          </div>
-        </div>
-        <div class="sched-mode-help"><b>Trigger</b> — closed-loop orchestration. The worker wakes in response to events instead of (or in addition to) a clock. Cooldown caps how often event-fired runs happen.</div>
-      </div>
       <!-- ONCE -->
       <div id="sched-panel-once" class="sched-panel" style="display:none;">
         <label class="field-label">Run at</label>
         <input id="sched-run-at" type="datetime-local" class="board-detail-session-select" style="width:100%;margin-bottom:0;">
         <div class="sched-mode-help"><b>Once</b> — runs a single time, then disables itself.</div>
       </div>
-      <!-- hidden carriers -->
-      <input type="checkbox" id="sched-watch" style="display:none;">
-      <input type="number" id="sched-watch-timeout" value="120" style="display:none;">
+      <!-- The hidden sched-watch / sched-watch-timeout carriers were here.
+           They existed only to keep two dead columns in the save payload. -->
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
         <button class="btn" onclick="closeSchedModal()">Cancel</button>
         <button class="btn btn-primary" onclick="saveSchedModal()" id="sched-save-btn">Save</button>

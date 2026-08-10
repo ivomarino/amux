@@ -131,6 +131,36 @@ async function toggleAutoResume(checked) {
     if (cb) cb.checked = d.value !== '0';   // default ON
   } catch(e) {}
 })();
+// AUTOFIX (AMUX-2681). Same prefs shape as the toggles above, and the SERVER
+// re-reads `autofix_enabled` on every tick — so this switch takes effect live,
+// with no restart. A pref that needed a bounce would silently disagree with the
+// UI showing it.
+//
+// Turning it OFF does not blind the watcher: detection still runs and every
+// finding is still published on /api/debug/autofix as suppressed, with the
+// reason. Only the board write is skipped. Otherwise the one window somebody
+// switched it off to look at is the one window with no evidence in it.
+async function toggleAutofix(checked) {
+  await fetch('/api/prefs', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ key: 'autofix_enabled', value: checked ? '1' : '0' })
+  });
+  if (typeof showToast === 'function') {
+    showToast(checked ? 'Autofix on — breakage becomes a board card'
+                      : 'Autofix off — still detecting, not filing');
+  }
+}
+(async function initAutofix() {
+  try {
+    const r = await fetch('/api/prefs?key=autofix_enabled');
+    const d = await r.json();
+    const cb = document.getElementById('autofix-checkbox');
+    // Default ON when unset — an absent pref must not read as disabled, or a
+    // fresh install ships with its own watchdog switched off.
+    if (cb) cb.checked = String((d && d.value) ?? '1') !== '0';
+  } catch (e) {}
+})();
+
 (async function initAutoCompact() {
   try {
     const r = await fetch('/api/prefs?key=auto_compact_enabled');
@@ -6766,7 +6796,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.567';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.568';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17640,9 +17670,12 @@ function renderScheduler(opts) {
         : '';
       const _lrTitle = s.last_run ? (/^\d+$/.test(String(s.last_run)) ? new Date((+s.last_run > 2e9 ? +s.last_run : +s.last_run * 1000)).toLocaleString() : new Date(s.last_run).toLocaleString()) : '';
       const lastRel = s.last_run ? `<span style="color:var(--dim);" title="${esc(_lrTitle)}">&#x2713; ${relTime(s.last_run)}</span>` : `<span style="color:var(--dim);">never</span>`;
-      const trigLabel = s.trigger_on ? `&nbsp;&middot;&nbsp;<span style="color:var(--accent);font-size:0.65rem;">&#x26A1; ${esc((s.trigger_on||'').split(',').map(t=>t==='session_idle'?'idle':t==='board'?'board':t).join('+')).trim()}</span>` : '';
-      const watchLabel = s.watch ? `&nbsp;&middot;&nbsp;<span style="color:var(--dim);font-size:0.65rem;">&#x1F441; watch</span>` : '';
-      const doneLabel = s.done_pattern ? `&nbsp;&middot;&nbsp;<span style="color:var(--dim);font-size:0.65rem;">stop: <code style="font-size:0.6rem;">${esc(s.done_pattern.length > 20 ? s.done_pattern.slice(0,20)+'…' : s.done_pattern)}</code></span>` : '';
+      // The ⚡trigger / 👁watch / "stop:" badges lived here. They advertised
+      // behaviour this server does not have — the pane-polling watcher and the
+      // event-trigger loop were never ported from Python — so a badge could
+      // only ever tell a user their schedule reacts to events when it does
+      // not. The fields are refused at the write path now (AMUX-2680); the
+      // badges go with them rather than painting stale rows as armed.
       return `<div class="card sched-item" data-sched-id="${esc(s.id)}" style="padding:9px 12px;">
         <div style="display:flex;align-items:flex-start;gap:8px;">
           <label class="sched-toggle-label" title="${s.enabled ? 'Disable' : 'Enable'}">
@@ -17655,7 +17688,6 @@ function renderScheduler(opts) {
               <code class="sched-id-badge" title="Schedule id — click to copy" onclick="event.stopPropagation();_copySchedId('${esc(s.id)}')">${esc(s.id)}</code>
               <span style="font-weight:600;font-size:0.84rem;cursor:pointer;" onclick="toggleSchedExpand('${esc(s.id)}')">${esc(s.title)}</span>
               <code class="sched-cadence-pill">${esc(recLabel)}</code>${fireBadge}
-              ${trigLabel}${watchLabel}${doneLabel}
             </div>
             <div style="font-size:0.72rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dim);">
               <span style="display:flex;align-items:center;gap:3px;">${sessLink}</span>
@@ -17713,11 +17745,11 @@ function renderScheduler(opts) {
       </div>`;
     };
 
-    // Apply search filter (title, session, command, cadence, id, trigger, stop pattern)
+    // Apply search filter (title, session, command, cadence, id)
     const q = searchQ.trim().toLowerCase();
     const filtered = !q ? scope : scope.filter(s => {
-      const hay = [s.title, s.session, s.command, s.schedule_expr, s.recurrence, s.id,
-                   s.trigger_on, s.done_pattern].filter(Boolean).join(' ').toLowerCase();
+      const hay = [s.title, s.session, s.command, s.schedule_expr, s.recurrence, s.id]
+        .filter(Boolean).join(' ').toLowerCase();
       return hay.includes(q);
     });
 
@@ -17838,17 +17870,43 @@ async function runScheduleNow(id) {
   }
 }
 async function skipSchedule(id) {
-  try {
-    const r = await fetch(API + '/api/schedules/' + id + '/skip', {
-      method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) { if (typeof showToast === 'function') showToast(d.error || 'Could not skip'); return; }
-    await fetchSchedules();
-    renderScheduler();
-    _peekRefreshSchedIfActive();
-    if (typeof showToast === 'function' && d.next_run) showToast('Skipped → next ' + relTime(d.next_run));
-  } catch(e) { if (typeof showToast === 'function') showToast('Skip failed'); }
+  // Through apiCall, not a bare fetch (AMUX-2679). The bare fetch swallowed
+  // the server's sentence and toasted its own 'Could not skip' whenever the
+  // body had no `error` key — which is what a 404 from the MISSING route
+  // produced for months, so a routing gap was reported as a broken schedule.
+  // apiCall surfaces the real refusal text and carries the auth header.
+  const r = await apiCall(API + '/api/schedules/' + id + '/skip', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
+  });
+  if (!r) return;   // apiCall already toasted the server's reason
+  const d = await r.json().catch(() => ({}));
+  await fetchSchedules();
+  renderScheduler();
+  _peekRefreshSchedIfActive();
+  if (typeof showToast !== 'function') return;
+  // NAME THE OCCURRENCE THAT WAS DROPPED. "next in 15m" alone is unfalsifiable
+  // on a 15m loop — it reads the same whether the skip landed or nothing
+  // happened at all. The pair (gave up X, resumes at Y) is the only rendering
+  // that can be checked against the card.
+  if (d.next_run) {
+    showToast(d.skipped
+      ? 'Skipped ' + _schedWhen(d.skipped) + ' — next ' + _schedWhen(d.next_run)
+      : 'Skipped → next ' + relTime(d.next_run));
+  } else {
+    showToast('Skip returned no next occurrence');
+  }
+}
+
+// A stored next_run ("YYYY-MM-DDTHH:MM", LOCAL wall clock) as a short human
+// time. `relTime` alone collapses today and next Tuesday into "in 3h"-ish
+// shapes; the clock time is what a user matches against the schedule.
+function _schedWhen(s) {
+  const d = new Date(String(s).replace(' ', 'T'));
+  if (isNaN(d)) return String(s);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return sameDay ? time : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time;
 }
 
 async function toggleSchedEnabled(id, enabled) {
@@ -19787,7 +19845,10 @@ function _populateSessionSelect(selectId, current) {
 let _schedMode = 'loop';
 function setSchedMode(mode) {
   _schedMode = mode;
-  ['loop','routine','trigger','once'].forEach(m => {
+  // 'trigger' was a fourth mode. Every control in it wrote a column nothing
+  // reads (AMUX-2680), so it is gone rather than disabled — an offered mode
+  // that saves and never fires is worse than an absent one.
+  ['loop','routine','once'].forEach(m => {
     const panel = document.getElementById('sched-panel-' + m);
     if (panel) panel.style.display = m === mode ? '' : 'none';
   });
@@ -19858,7 +19919,6 @@ function updateSchedKindUI() {
 }
 // Determine which mode an existing schedule maps to
 function schedModeOf(s) {
-  if (s.trigger_on) return 'trigger';
   if (s.sched_type === 'once' && !s.schedule_expr) return 'once';
   if (isLoopCadence(s)) return 'loop';
   return 'routine';
@@ -19877,16 +19937,7 @@ function openSchedModal(editId) {
   setVal('sched-command', '');
   setVal('sched-loop-every', '30m');
   setVal('sched-expr', '');
-  setVal('sched-trigger-expr', '');
   setVal('sched-run-at', new Date(Date.now() + 3600000).toISOString().slice(0,16));
-  setChk('sched-watch', false);
-  setVal('sched-done-pattern', '');
-  setVal('sched-done-action', 'disable');
-  setVal('sched-watch-timeout', 120);
-  setChk('sched-trigger-idle', false);
-  setChk('sched-trigger-board', false);
-  setVal('sched-trigger-cooldown', 120);
-  setVal('sched-trigger-sessions', '');
 
   let mode = 'loop';
   if (editId) {
@@ -19897,15 +19948,6 @@ function openSchedModal(editId) {
       sel.value = s.session;
       setVal('sched-command', s.command);
       setVal('sched-run-at', s.run_at && s.run_at.includes('T') ? s.run_at : '');
-      setVal('sched-done-pattern', s.done_pattern || '');
-      setVal('sched-done-action', s.done_action || 'disable');
-      setChk('sched-watch', !!s.watch);
-      setVal('sched-watch-timeout', s.watch_timeout || 120);
-      const trig = (s.trigger_on || '').split(',').map(x => x.trim());
-      setChk('sched-trigger-idle', trig.includes('session_idle'));
-      setChk('sched-trigger-board', trig.includes('board'));
-      setVal('sched-trigger-cooldown', s.trigger_cooldown || 120);
-      setVal('sched-trigger-sessions', s.trigger_sessions || '');
       mode = schedModeOf(s);
       const expr = s.schedule_expr || '';
       if (mode === 'loop') {
@@ -19913,8 +19955,6 @@ function openSchedModal(editId) {
         setVal('sched-loop-every', m ? m[1].replace(/\s+/g,'') : (expr === 'hourly' ? '1h' : '30m'));
       } else if (mode === 'routine') {
         setVal('sched-expr', expr);
-      } else if (mode === 'trigger') {
-        setVal('sched-trigger-expr', expr);
       }
     }
     document.getElementById('sched-save-btn').textContent = 'Update';
@@ -19958,37 +19998,29 @@ async function saveSchedModal() {
   const v = (id) => (document.getElementById(id).value || '').trim();
   const mode = _schedMode;
   let stype = 'recurring', run_at = '', schedExpr = '';
-  let watch = 0, donePattern = '', doneAction = 'disable';
-  const trig = [];
-  let triggerCooldown = 120, triggerSessions = '';
 
   if (mode === 'loop') {
     let every = v('sched-loop-every') || '30m';
     if (!/^\d+\s*[mh]$/i.test(every)) { showToast && showToast('Interval looks off — try "30m" or "1h"'); return; }
     schedExpr = 'every ' + every.replace(/\s+/g,'');
-    donePattern = v('sched-done-pattern');
-    if (donePattern) { watch = 1; doneAction = 'disable'; }
   } else if (mode === 'routine') {
     schedExpr = v('sched-expr');
     if (!schedExpr) { showToast && showToast('Enter a schedule (e.g. "daily at 9am")'); return; }
-  } else if (mode === 'trigger') {
-    if (document.getElementById('sched-trigger-idle').checked) trig.push('session_idle');
-    if (document.getElementById('sched-trigger-board').checked) trig.push('board');
-    schedExpr = v('sched-trigger-expr');  // optional heartbeat
-    if (!trig.length && !schedExpr) { showToast && showToast('Pick a trigger event or add a heartbeat timer'); return; }
-    triggerCooldown = parseInt(v('sched-trigger-cooldown')) || 120;
-    triggerSessions = v('sched-trigger-sessions').split(',').map(x => x.trim()).filter(Boolean).join(',');
   } else { // once
     stype = 'once';
     run_at = v('sched-run-at');
     if (!run_at) { showToast && showToast('Pick a date & time'); return; }
   }
 
-  const watchTimeout = parseInt(v('sched-watch-timeout')) || 120;
+  // watch / done_pattern / done_action / watch_timeout / trigger_on /
+  // trigger_cooldown / trigger_sessions were sent on every save and read by
+  // nothing — the columns exist, the row round-tripped, and the loop's "stop
+  // when output matches" box therefore looked like it worked. The server now
+  // REFUSES to arm them (400, AMUX-2680), so sending them would turn every
+  // save into an error; they are gone from the payload for the same reason
+  // they are gone from the form.
   const payload = { title, worker, kind, command, sched_type: stype, recurrence: null, run_at,
                     schedule_expr: schedExpr || null,
-                    watch, done_pattern: donePattern || null, done_action: doneAction, watch_timeout: watchTimeout,
-                    trigger_on: trig.join(','), trigger_cooldown: triggerCooldown, trigger_sessions: triggerSessions,
                     by: 'dashboard' };
   const url = _schedEditId ? API + '/api/schedules/' + _schedEditId : API + '/api/schedules';
   const method = _schedEditId ? 'PATCH' : 'POST';

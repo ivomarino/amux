@@ -2141,3 +2141,104 @@ FIX: the pre-commit guard should refuse a `git add` that stages files no lane ha
   when a commit's file set spans more than one lane's recent edits. Until then: write
   new files outside the repo until the change is ready, which is what I should have
   done here.
+
+---
+## Booting a second amux-server to test something drives the PRODUCTION tmux fleet
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-10
+SESSION: autofix (subagent)
+CARD: none — needs filing; see the autofix handoff report
+SYMPTOM: Started an isolated server (`AMUX_HOME=/tmp/amux-af-home`, port 8899, own DB) to
+  verify a change without touching the fleet. Within 4 seconds its log showed:
+    pane-size: restoring detached window ... session=amux-amux from=220x50 to=220x50
+    pane-size: restoring detached window ... session=amux-mixpeek-autopilot ...
+    pane-size: one-shot repair complete count=3 sessions=["amux-amux", ...]
+  `pane_size::spawn()` takes no state and enumerates tmux DIRECTLY, so AMUX_HOME does not
+  scope it. `ghost_rescue` is the same shape and it SUBMITS STUCK MESSAGES — i.e. a test
+  instance can press Enter in a production lane's pane. Neither has an off switch;
+  `commit_nudge` and `board_drive` both do (`AMUX_*_SECS=0`).
+COST: Killed the instance and rebuilt the whole live verification as in-process router
+  tests instead. This time the resize was a no-op (220x50 -> 220x50) so nothing was lost,
+  but that is luck: a peer is running `/tmp/amux-sched-target/debug/amux-server` on this
+  same box right now, and the repo's own docs tell you to build to a private target dir
+  and run it.
+FIX: Give `pane_size` and `ghost_rescue` the same `AMUX_<JOB>_SECS=0` disable knob the
+  other two runtime jobs already have, and default them OFF when `AMUX_HOME` is not the
+  real `~/.amux` — a server pointed at a scratch home has no business steering the fleet.
+
+## /api/debug/routes reports a mounted debug route as NOT MOUNTED
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-10
+SESSION: autofix (subagent)
+CARD: none — needs filing; owner is whoever owns api/request_log.rs
+SYMPTOM: `/api/debug/board-drive` is mounted (api/mod.rs merges `board_drive::routes()`)
+  and answers, but it is absent from `ROUTE_TABLE`, so `/api/debug/routes` — the
+  instrument CLAUDE.md tells you to consult INSTEAD of grepping — does not list it. I hit
+  this adding `/api/debug/autofix` and deliberately left mine unlisted too rather than
+  edit a file another lane owns, which means the gap is now two routes wide.
+COST: Minutes deciding whether to touch a contested file. The real cost lands later: the
+  same comment at request_log.rs:~840 records this exact failure happening once already
+  ("reported it NOT MOUNTED while the handler was answering") and the fix did not
+  generalise to runtime-job routes.
+FIX: One `RouteEntry` per runtime-job debug route, or better — have `routes()` of each
+  runtime job contribute its paths so the table cannot be forgotten.
+
+## The live-DB migration guard test fails on any target dir not literally named `target`
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: autofix (subagent)
+CARD: none — needs filing
+SYMPTOM: `db::migrate::guard_tests::it_actually_refuses_a_pending_migration_against_the_live_db`
+  panics with "precondition: the test binary should live under a cargo target dir, got
+  /tmp/amux-autofix-target/debug/deps/amux_server-...". `is_cargo_target_build` requires
+  the literal substring `/target/debug/`, and `/tmp/amux-autofix-target/debug/` does not
+  contain it. Building to a private `CARGO_TARGET_DIR` is exactly what this repo tells
+  sessions to do so they do not clobber each other's builds.
+COST: ~10 minutes proving a red test was not mine — and the failure message says
+  "precondition", which reads like the test is protecting something real rather than
+  pattern-matching a path. A session in a hurry files a bug against its own change.
+FIX: Match on the cargo-provided fact rather than the path spelling — `OUT_DIR`/
+  `CARGO_TARGET_TMPDIR`, or accept any path ending `/debug/deps/`.
+
+## Two alerts tests pass alone and fail together — a process-global HOME race
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: autofix (subagent)
+CARD: none — needs filing
+SYMPTOM: `cargo test -p amux-server` failed `api::alerts::tests::owner_alert_full_send_shape_channels_and_ledger`
+  (channels came back `{"sms":"imessage"}` instead of `{"push":"sent","sms":"imessage"}`)
+  and `..._60s_dedupe_and_ledger_visibility`. Both pass with `--test-threads=1`. They use
+  `test_env::set_home`, and cargo runs tests as threads in ONE process, so the override
+  races whichever sibling is mid-assertion.
+COST: Two of the three red tests in my first full run were not mine; separating them from
+  my own work took a serial re-run plus a per-test run to confirm. I then hit the SAME
+  class twice in my own new tests within the hour (one set `AMUX_AUTOFIX_WINDOW_H`, one
+  set `AMUX_HOME`) — which is the argument that this is a pattern, not an accident.
+FIX: A shared `static ENV_LOCK: Mutex<()>` that every env-mutating test takes, or pass the
+  home in as an argument. Anything a test writes to the process environment is shared
+  state with every other test in the binary.
+
+## A correct refusal shipped as HTTP 500 for months, and poisoned the error sweep
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: autofix (subagent)
+CARD: AMUX-2678
+SYMPTOM: `POST /api/sessions/<n>/send` answered 500 for every pane-state refusal, because
+  `send_post` mapped exactly one string ("not running") to 409 and everything else to 500.
+  15 of the 19 errors in the live 6h window were one refusal wearing a 500.
+COST: Beyond the noisy sweep: this is what an autofix loop would have spent lanes on. The
+  first detector I wrote would have filed a card for a subsystem that was working
+  correctly, which is how an automated filer teaches people to stop reading the board.
+FIX: `send_failure_status()` classifies the outcome (409/404/400/501, 500 only for
+  unhandled), used by send + archive/wake/reset, with a `fix` hint in the body. Uncommitted
+  in the working tree at time of writing; see the autofix handoff report.

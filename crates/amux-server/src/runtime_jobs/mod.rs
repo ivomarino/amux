@@ -47,6 +47,7 @@
 //!   instead of silently recording a run that delivered nothing (ethos rule
 //!   3: the honest refusal beats the quiet lie).
 
+pub mod autofix;
 pub mod board_drive;
 pub mod commit_nudge;
 pub mod ghost_rescue;
