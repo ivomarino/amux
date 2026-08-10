@@ -4252,8 +4252,9 @@ async function shareSession(session) {
 
 async function deleteSession(session) {
   closeAllMenus();
-  if (!await showConfirm('Delete worker "' + worker + '"?', 'Delete', true)) return;
-  await apiCall(API + '/api/sessions/' + session + '/delete', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  if (!await showConfirm('Delete worker "' + session + '"?', 'Delete', true)) return;
+  const r = await apiCall(API + '/api/sessions/' + session + '/delete', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  if (r) showToast('Worker "' + session + '" deleted');
   expanded.delete(session);
   await fetchSessions();
 }
@@ -6608,7 +6609,35 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.539';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.540';   // bump together with the sw.js CACHE version
+
+// ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
+// kind of response in the ui — i just deleted a worker and nothing happened").
+// That delete died on a ReferenceError inside its async handler: no dialog,
+// no request, no error — the rejection vanished. Every UI action runs through
+// handlers, so a global rejection/error net guarantees the MINIMUM response:
+// a visible failure toast naming the error. Rate-limited so a render-loop
+// error cannot toast-storm. This is the floor, not the goal — actions should
+// still give their own success feedback (toast / row animation / re-render).
+(function () {
+  let _lastErrToast = 0;
+  function _surface(kind, msg) {
+    try {
+      const now = Date.now();
+      if (now - _lastErrToast < 4000) return;
+      _lastErrToast = now;
+      const text = String(msg || 'unknown error').slice(0, 140);
+      if (typeof showToast === 'function') showToast('\u26a0 ' + kind + ': ' + text);
+      console.error('amux ' + kind + ':', msg);
+    } catch (e) {}
+  }
+  window.addEventListener('unhandledrejection', function (ev) {
+    _surface('action failed', ev.reason && (ev.reason.message || ev.reason));
+  });
+  window.addEventListener('error', function (ev) {
+    _surface('script error', ev.message);
+  });
+})();
 let _peekScrollLockY = 0;
 // Paint a cached peek entry (offline / instant-open). Returns false when the
 // cache has no real content — the caller then keeps 'Loading…'/reconnecting
