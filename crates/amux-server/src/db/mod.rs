@@ -95,7 +95,7 @@ impl Store {
         // touch the DB. Health returns 503 until `open` completes.
         let mut conn = Connection::open(db_path)?;
         configure_connection(&conn)?;
-        migrate::apply_all(&mut conn)?;
+        migrate::apply_all_guarded(&mut conn, db_path)?;
 
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>();
         let (events_tx, _) = tokio::sync::broadcast::channel(4096);
