@@ -8922,6 +8922,74 @@ mod tests {
         )
     }
 
+    // The column ALIGNMENT, which submit_verdict_of's unit tests cannot catch:
+    // the INSERT lists 9 columns and 9 placeholders, and getting that pairing
+    // wrong writes the verdict into the wrong column silently. Round-trip a
+    // real write through the real store (AMUX-2643).
+    #[tokio::test]
+    async fn a_recorded_send_round_trips_its_delivery_metadata() {
+        let (st, _dir) = state();
+        cmd_hist_record_full(
+            &st,
+            "lane-a",
+            "hello",
+            "user",
+            "ethan@example.com",
+            DeliveryMeta {
+                delivery: Some(Delivery::Queued),
+                queued_at_ms: Some(1_000),
+                submit_verdict: Some("retried"),
+            },
+        )
+        .await;
+
+        let row = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT session, type, origin, delivery, queued_at, submit_verdict \
+                 FROM cmd_history ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("the row must exist");
+        assert_eq!(row.0, "lane-a");
+        assert_eq!(row.1, "user");
+        assert_eq!(row.2, "ethan@example.com");
+        assert_eq!(row.3.as_deref(), Some("queued"));
+        assert_eq!(row.4, Some(1_000));
+        assert_eq!(row.5.as_deref(), Some("retried"));
+    }
+
+    // NULL must survive as NULL. Coalescing it to a verdict would turn "we did
+    // not look" into "we looked and could not confirm" — inventing a fact.
+    #[tokio::test]
+    async fn an_unverified_path_records_null_not_a_guess() {
+        let (st, _dir) = state();
+        cmd_hist_record_full(&st, "lane-b", "hi", "user", "", DeliveryMeta::direct()).await;
+        let v: Option<String> = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT submit_verdict FROM cmd_history ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, None, "an unverified path must record NULL, not a verdict");
+    }
+
     async fn call(
         app: &Router,
         method: &str,
