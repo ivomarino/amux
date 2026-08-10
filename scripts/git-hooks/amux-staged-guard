@@ -32,7 +32,57 @@
 # cannot report its own absence is indistinguishable from a guard that passed.
 import json, os, ssl, subprocess, sys, urllib.error, urllib.request
 
-GUARD_VERSION = 2  # bumped when the request/response contract changes
+# Bump on ANY change to this file, not only on a request/response contract
+# change. It is what the installed-copy inventory greps
+# (`grep -L 'GUARD_VERSION = 3' */.git/hooks/amux-staged-guard`), so a tracked
+# file that changed without moving this number makes every stale installed copy
+# read as current — the two-components-disagreeing shape this hook exists to
+# report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
+# read for "which checkouts are behind".
+GUARD_VERSION = 3
+
+
+def amux_base_url():
+    """Where to reach the amux server, self-healing a STALE INHERITED PORT.
+
+    A git hook runs as a child of the `claude` process that invoked git, so it
+    inherits that process's `AMUX_URL`. About 55 live sessions predate the
+    8822 -> 8824 cutover and carry `AMUX_URL=https://localhost:8822` in their
+    process env, which cannot be rotated without killing them. That is why
+    "just fix the default" does nothing here: `os.environ.get("AMUX_URL",
+    <default>)` only consults the default when the variable is UNSET, and it
+    never is. The retired port stayed the busiest one on the machine while
+    three separate "fixes" to defaults were in place (ethos rule 1 — capability
+    that reaches nobody).
+
+    A one-shot hook has exactly one way to know its inherited URL is stale: ask
+    something on this machine that knows better. `endpoint.json` is written by
+    the server itself at boot, so the numbers are never hardcoded here — which
+    matters because they are REVERSED in the cloud image (8822 is canonical
+    there), and a hook with a baked-in `8822 -> 8824` rewrite would break it.
+
+    The rule is deliberately narrow: swap ONLY a localhost URL that is on the
+    port the server itself calls retired. A session pointed at a dev instance on
+    some other port, or at a remote amux, has made a deliberate choice and is
+    left alone.
+    """
+    url = (os.environ.get("AMUX_URL") or "").strip().rstrip("/")
+    home = os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux")
+    try:
+        with open(os.path.join(home, "endpoint.json")) as fh:
+            ep = json.load(fh)
+        legacy, canonical = ep.get("legacy_port"), (ep.get("canonical_url") or "").rstrip("/")
+        if legacy and canonical:
+            from urllib.parse import urlsplit
+            sp = urlsplit(url)
+            if sp.hostname in ("localhost", "127.0.0.1", "::1") and sp.port == legacy:
+                return canonical
+    except Exception:
+        # Missing/garbled file is not an error: fall back to the inherited URL,
+        # which is what every version before this one did. The legacy bind still
+        # answers, so the worst case is the status quo, never a broken guard.
+        pass
+    return url or "https://localhost:8824"
 
 
 def main():
@@ -62,8 +112,7 @@ def main():
           "Cross-session sweep protection is OFF for this commit.\n" % (e,))
         return 0
 
-    url = os.environ.get("AMUX_URL", "https://localhost:8824").rstrip("/") \
-        + "/api/git/staged-guard"
+    url = amux_base_url() + "/api/git/staged-guard"
     body = json.dumps({"session": sess, "dir": top, "paths": paths,
                        "op": "commit", "guard_version": GUARD_VERSION}).encode()
     ctx = ssl.create_default_context()
@@ -225,4 +274,8 @@ def main():
     return 1
 
 
-sys.exit(main())
+# Guarded so `amux_base_url` can be imported (install-hooks.sh reuses it rather
+# than writing a THIRD copy of the stale-port rule — a rule spelled three ways
+# is a rule that will disagree with itself the first time one copy changes).
+if __name__ == "__main__":
+    sys.exit(main())

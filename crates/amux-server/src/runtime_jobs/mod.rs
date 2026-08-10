@@ -52,7 +52,11 @@ pub mod board_drive;
 pub mod commit_nudge;
 pub mod ghost_rescue;
 pub mod pane_size;
+/// The live registry of the jobs below — see [`registry`] for why it is
+/// derived from the spawn sites rather than declared alongside them.
+pub mod registry;
 pub mod scheduler;
+pub mod storage;
 
 pub use scheduler::{
     firing_enabled, run_scheduler, scheduler_tick, DueRuns, DurableSchedule, ExprParseError,
@@ -126,6 +130,16 @@ where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let name = name.into();
+    // VISIBILITY IS NOT OPTIONAL, and it is not the job's responsibility.
+    // Because this is the ONLY constructor of a PeriodicTask, registering here
+    // means every internal job — including ones written years from now by
+    // someone who has never read `registry` — appears on
+    // `GET /api/system-jobs` with a real interval and real tick timing. The
+    // wrapper below brackets the job's own closure, so the tick timestamps are
+    // recorded by the SPAWNER: a job cannot forget to report, and cannot
+    // report a tick it did not run. See registry's docs for the three loops
+    // that were dead for hours with nothing visible anywhere.
+    let job_id = name.clone();
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // Delay, not Burst: a run that overshoots must not be "paid back"
@@ -134,9 +148,12 @@ where
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            registry::tick_start(&job_id);
             f().await;
+            registry::tick_end(&job_id);
         }
     });
+    registry::register(&name, "periodic", Some(interval), Some(handle.abort_handle()));
     PeriodicTask {
         name,
         interval,

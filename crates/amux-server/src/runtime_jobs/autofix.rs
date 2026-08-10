@@ -149,6 +149,52 @@ fn quiet_h() -> f64 {
 
 /// Signature substrings that never file. Environmental causes with no code
 /// fix: put them here rather than teaching a detector to lie about them.
+// --- CI detector knobs (AMUX-2780) ------------------------------------------
+
+/// Repos to watch, `owner/name`, comma-separated. Defaults to amux's own repo:
+/// the detector that exists because THIS repo's deploy was red for three days
+/// must watch this repo without anyone opting in (ethos rule 1 — an extension
+/// point nobody is enrolled in is decoration).
+fn ci_repos() -> Vec<String> {
+    let raw = env_str("AMUX_CI_REPOS");
+    let raw = if raw.is_empty() { "mixpeek/amux".to_string() } else { raw };
+    raw.split(',').map(|s| s.trim().to_string()).filter(|s| s.contains('/')).collect()
+}
+/// How often to actually ask GitHub. The tick is 120s; asking every tick would
+/// be 720 API calls/day per repo for a signal that changes on push.
+fn ci_poll_min() -> f64 {
+    env_f64("AMUX_CI_POLL_MIN", 15.0).clamp(1.0, 24.0 * 60.0)
+}
+/// How many consecutive failures before filing.
+///
+/// The honest note: BOTH 1 and 2 are guesses, and the ethos is explicit that
+/// picking a threshold at all is the tell that you are guessing. There is no
+/// structurally-absent signal available here — "red on main" is a level, not an
+/// absence. 2 is chosen because it is the smallest number that distinguishes a
+/// fault from a single flaky run, and the cost of the extra wait is one push;
+/// the incident this detector exists for ran to 31. Set to 1 to file on the
+/// first red run.
+fn ci_min_failures() -> i64 {
+    env_i64("AMUX_CI_MIN_FAILURES", 2).max(1)
+}
+/// How many recent runs to fetch per repo.
+///
+/// NOT merely a page size. The window is shared across ALL workflows, and every
+/// push to this repo starts three of them — so 100 runs is only ~33 per
+/// workflow, and the streak anchor is stable only while the last SUCCESS is
+/// still inside it. Measured on the real 2026-08-10 outage: at 100 the deploy
+/// streak reported "AT LEAST 21, last success unknown" when the truth was 31
+/// with a known green run. 200 recovers both. When the success still falls out,
+/// the finding says so rather than reporting a floor as a count.
+fn ci_run_limit() -> i64 {
+    env_i64("AMUX_CI_RUN_LIMIT", 200).clamp(10, 600)
+}
+/// Hard timeout on each `gh` invocation. A hung network call must not stall the
+/// tick that every other detector shares.
+fn ci_cmd_timeout_s() -> u64 {
+    env_i64("AMUX_CI_TIMEOUT_S", 20).clamp(2, 120) as u64
+}
+
 fn ignore_list() -> Vec<String> {
     env_str("AMUX_AUTOFIX_IGNORE")
         .split(',')
@@ -201,6 +247,12 @@ pub enum DetectorKind {
     InvariantBreach,
     /// The build/deploy path itself is stuck.
     BuildDeploy,
+    /// Free disk is below the floor, or falling fast enough to reach it soon.
+    DiskPressure,
+    /// A GitHub Actions workflow is failing on the default branch and has
+    /// stayed failing. The one detector whose instrument lives OUTSIDE this
+    /// machine — see [`detect_ci`] for why that changes the failure modes.
+    CiFailure,
 }
 
 impl DetectorKind {
@@ -212,6 +264,8 @@ impl DetectorKind {
             DetectorKind::SilentSubsystem => "silent",
             DetectorKind::InvariantBreach => "invariant",
             DetectorKind::BuildDeploy => "build",
+            DetectorKind::DiskPressure => "disk",
+            DetectorKind::CiFailure => "ci",
         }
     }
 
@@ -223,12 +277,15 @@ impl DetectorKind {
     /// sentence the fixing lane can write truthfully either way.
     pub fn item_type(self) -> &'static str {
         match self {
-            DetectorKind::BuildDeploy | DetectorKind::SilentSubsystem => "blocker",
+            DetectorKind::BuildDeploy
+            | DetectorKind::SilentSubsystem
+            | DetectorKind::DiskPressure
+            | DetectorKind::CiFailure => "blocker",
             _ => "investigation",
         }
     }
 
-    pub fn all() -> [DetectorKind; 6] {
+    pub fn all() -> [DetectorKind; 8] {
         [
             DetectorKind::Http5xx,
             DetectorKind::Latency,
@@ -236,6 +293,8 @@ impl DetectorKind {
             DetectorKind::SilentSubsystem,
             DetectorKind::InvariantBreach,
             DetectorKind::BuildDeploy,
+            DetectorKind::DiskPressure,
+            DetectorKind::CiFailure,
         ]
     }
 }
@@ -1019,8 +1078,690 @@ pub fn detect_build(_conn: &Connection, now: f64, home: &std::path::Path) -> (Ve
 }
 
 // ---------------------------------------------------------------------------
+// Disk pressure (AMUX-2700, after the 2026-08-10 ENOSPC incident).
+// ---------------------------------------------------------------------------
+
+/// Free space below this files a card. Default 50GB: high enough that a fleet
+/// of 50 sessions plus a Rust build (a debug target tree is 10-15GB on its own)
+/// has room to finish what it started, rather than a floor that is only crossed
+/// once writes are already failing.
+fn disk_min_free_gb() -> f64 {
+    env_f64("AMUX_DISK_MIN_FREE_GB", 50.0).max(1.0)
+}
+/// The RATE trigger. An absolute floor is a lagging indicator: on 2026-08-10
+/// the volume went from comfortable to 741MB with nothing reported, because
+/// every sample before the last one was fine. Falling faster than this — over a
+/// window long enough to not be a single build — is the signal that would have
+/// fired hours earlier.
+fn disk_fall_gb_per_h() -> f64 {
+    env_f64("AMUX_DISK_FALL_GB_PER_H", 20.0).max(1.0)
+}
+/// Minimum span before a rate is a rate and not two adjacent samples.
+fn disk_rate_window_min() -> f64 {
+    env_f64("AMUX_DISK_RATE_WINDOW_MIN", 20.0).clamp(2.0, 24.0 * 60.0)
+}
+
+/// Free-space samples, newest last. **In memory, and therefore fiction across a
+/// restart** — this process re-execs whenever anyone saves the binary, and the
+/// ethos file is explicit that in-memory state which survives nothing is the
+/// same as no state. That is tolerable HERE and only here: the absolute floor
+/// is a pure function of one sample and keeps working through a restart, so a
+/// restart costs the rate trigger its window (~20 min) and costs the floor
+/// nothing. Persisting a sample every tick would itself be an append-only table
+/// with no retention, which is the bug this detector exists to report.
+fn disk_samples() -> &'static std::sync::RwLock<Vec<(f64, u64)>> {
+    static CELL: std::sync::OnceLock<std::sync::RwLock<Vec<(f64, u64)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+fn du_top(paths: &[std::path::PathBuf], limit: usize) -> Vec<(String, u64)> {
+    let mut sized: Vec<(String, u64)> = paths
+        .iter()
+        .filter(|p| p.exists())
+        .filter_map(|p| {
+            let out = std::process::Command::new("/usr/bin/du")
+                .args(["-skx"])
+                .arg(p)
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let kb: u64 = text.split_whitespace().next()?.parse().ok()?;
+            Some((p.display().to_string(), kb * 1024))
+        })
+        .collect();
+    sized.sort_by(|a, b| b.1.cmp(&a.1));
+    sized.truncate(limit);
+    sized
+}
+
+/// Candidate consumers. Deliberately NOT just `~/.amux`: on the night this was
+/// written the top three consumers were a Trash full of screen recordings, a
+/// pile of per-agent cargo target dirs under /private/tmp, and 24 hourly Time
+/// Machine snapshots — none of which live under amux's home. A detector that
+/// could only see its own directory would have named the innocent party.
+fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(home) {
+        for e in rd.flatten() {
+            if e.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                v.push(e.path());
+            }
+        }
+    }
+    // Build trees, wherever sessions put them.
+    if let Ok(rd) = std::fs::read_dir("/private/tmp") {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.contains("target") && e.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                v.push(e.path());
+            }
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        for p in ["Library/Caches", ".cache", ".claude", ".Trash", ".npm"] {
+            v.push(std::path::Path::new(&h).join(p));
+        }
+    }
+    v
+}
+
+/// Count APFS local snapshots. **This is the instrument that was missing.**
+/// On 2026-08-10 roughly 450GB was deleted and free space moved by 8GB, because
+/// 24 hourly Time Machine snapshots were pinning every deleted block. Without
+/// this number in the evidence, the only available conclusion is "we deleted
+/// the wrong things" and the next action is deleting more of the right ones,
+/// which also does nothing. Snapshots are purgeable by macOS under pressure and
+/// thinnable with `tmutil`, so this line turns an unexplainable non-recovery
+/// into a one-command fix.
+fn local_snapshot_count() -> Option<usize> {
+    let out = std::process::Command::new("/usr/bin/tmutil")
+        .args(["listlocalsnapshots", "/"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).matches("com.apple.TimeMachine").count())
+}
+
+pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
+    let mut out = Vec::new();
+    let mut suppressed = Vec::new();
+    const GB: f64 = 1_073_741_824.0;
+
+    let Some(free) = crate::runtime_jobs::storage::disk_free_bytes(home) else {
+        suppressed.push(sup(
+            DetectorKind::DiskPressure,
+            "disk|unreadable",
+            "df returned nothing — cannot measure free space, so not filing either way",
+        ));
+        return (out, suppressed);
+    };
+    let free_gb = free as f64 / GB;
+
+    // Record the sample, keep a bounded window.
+    let (mut rate_gb_h, mut span_min) = (0.0f64, 0.0f64);
+    if let Ok(mut s) = disk_samples().write() {
+        s.push((now, free));
+        let keep_from = now - 6.0 * 3600.0;
+        s.retain(|(t, _)| *t >= keep_from);
+        if let (Some(first), Some(last)) = (s.first().copied(), s.last().copied()) {
+            span_min = (last.0 - first.0) / 60.0;
+            if span_min >= disk_rate_window_min() {
+                let dropped_gb = (first.1 as f64 - last.1 as f64) / GB;
+                rate_gb_h = dropped_gb / (span_min / 60.0);
+            }
+        }
+    }
+
+    let floor = disk_min_free_gb();
+    let falling = rate_gb_h >= disk_fall_gb_per_h();
+    if free_gb >= floor && !falling {
+        return (out, suppressed);
+    }
+
+    // Only now pay for `du` — a directory walk on every tick would be a
+    // detector whose cost lands on the resource it is watching.
+    let top = du_top(&disk_candidates(home), 8);
+    let listing = top
+        .iter()
+        .map(|(p, b)| format!("  {:>8.1} GB  {p}", *b as f64 / GB))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let snaps = local_snapshot_count();
+
+    let (signature, title, verdict) = if free_gb < floor {
+        (
+            "disk|below-floor".to_string(),
+            format!("disk: {free_gb:.1} GB free, below the {floor:.0} GB floor"),
+            "Free space is under the floor with a fleet running. Writes fail with ENOSPC \
+             before anything else reports a fault: on 2026-08-10 this surfaced as transcript \
+             writes failing, not as a disk alert."
+                .to_string(),
+        )
+    } else {
+        (
+            "disk|falling".to_string(),
+            format!("disk: falling {rate_gb_h:.0} GB/h — {free_gb:.1} GB left"),
+            format!(
+                "Free space is dropping at {rate_gb_h:.1} GB/h over the last {span_min:.0} min. \
+                 At this rate the {floor:.0} GB floor is {:.1} h away. Nothing is broken yet — \
+                 this is the lead time an absolute floor cannot give you.",
+                ((free_gb - floor) / rate_gb_h).max(0.0)
+            ),
+        )
+    };
+
+    let mut evidence = vec![
+        ("verdict".into(), verdict),
+        ("free_gb".into(), format!("{free_gb:.1}")),
+        ("floor_gb".into(), format!("{floor:.0} (AMUX_DISK_MIN_FREE_GB)")),
+        (
+            "fall_gb_per_h".into(),
+            format!("{rate_gb_h:.1} over {span_min:.0} min (trigger: {:.0}, AMUX_DISK_FALL_GB_PER_H)", disk_fall_gb_per_h()),
+        ),
+        ("top_consumers".into(), format!("\n{listing}")),
+    ];
+    if let Some(n) = snaps {
+        evidence.push((
+            "apfs_local_snapshots".into(),
+            format!(
+                "{n} — READ THIS BEFORE DELETING ANYTHING. Each hourly Time Machine snapshot \
+                 pins the blocks of every file deleted since it was taken, so with snapshots \
+                 present, deleting files frees NOTHING until they age out (24h) or are thinned. \
+                 On 2026-08-10, 450GB was deleted and free space moved 8GB for exactly this \
+                 reason. Thin them first: sudo tmutil thinlocalsnapshots / 500000000000 4"
+            ),
+        ));
+    }
+
+    out.push(Finding {
+        kind: DetectorKind::DiskPressure,
+        signature,
+        title,
+        evidence,
+        recheck: "df -h /System/Volumes/Data; tmutil listlocalsnapshots / | wc -l; \
+                  curl -sk $AMUX_URL/api/debug/storage"
+            .into(),
+        owner: None,
+        count: 1,
+        last_ts: now,
+    });
+    (out, suppressed)
+}
+
+// ---------------------------------------------------------------------------
 // The one filing path.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Detector 8 — CI / deploy (AMUX-2780).
+//
+// The motivating incident: `deploy-cloud.yml` failed 31 consecutive times over
+// three days and NOBODY SAW IT. cloud.amux.io received no deploy at all in that
+// window. Every push printed a red X that no instrument in amux read, because
+// amux had no instrument that read GitHub at all. The defect is not the SSH key
+// that broke — that is one incident. The defect is that CI can fail every night
+// and nothing tells anyone.
+//
+// Two things make this detector different from the other seven, and both are
+// worth stating because they change what can go wrong:
+//
+//  1. **Its instrument is off-machine.** Every other detector reads SQLite or
+//     the local filesystem, so "no data" means "nothing happened". Here "no
+//     data" can also mean gh is missing, unauthenticated, rate-limited, or the
+//     network is down — i.e. the detector is blind, which looks EXACTLY like
+//     the all-clear. So every one of those cases emits a `Suppressed` naming
+//     the reason. A blind CI detector that reports silence is the precise
+//     failure this file exists to end.
+//  2. **Failure here is a LEVEL, not an absence.** The ethos warns that
+//     picking a threshold is the tell that you are guessing, and it is right:
+//     `ci_min_failures()` is a guess. What is NOT a guess is the dedupe key —
+//     see the streak anchor below, which is what turns "red every night" into
+//     one card instead of thirty.
+// ---------------------------------------------------------------------------
+
+/// One completed workflow run, as GitHub reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CiRun {
+    pub repo: String,
+    /// `workflowName` — the human name, which is what a card should say.
+    pub workflow: String,
+    pub run_id: i64,
+    /// `completed` / `in_progress` / `queued`.
+    pub status: String,
+    /// `success` / `failure` / `cancelled` / `timed_out` / `startup_failure` / …
+    pub conclusion: String,
+    /// `push` / `pull_request` / `schedule` / `workflow_dispatch` / …
+    pub event: String,
+    pub branch: String,
+    /// Computed at fetch time against the repo's real default branch, so the
+    /// decision function stays pure and testable without a network call.
+    pub on_default_branch: bool,
+    pub created_at: f64,
+    pub url: String,
+    /// Populated only for the newest failing run of a failing workflow — it
+    /// costs one extra API call each, so it is not fetched for history.
+    pub failing_step: Option<String>,
+}
+
+/// Conclusions that mean "this run failed".
+fn ci_is_failure(c: &str) -> bool {
+    matches!(c, "failure" | "timed_out" | "startup_failure")
+}
+
+/// Conclusions that carry NO evidence either way and must not break a streak.
+///
+/// `cancelled` is here because the owner cancelling a run is not a fault (the
+/// task's own suppression requirement), and because letting it break the streak
+/// would reset the anchor and refile a card mid-outage — the 08-10 16:42 run in
+/// the motivating incident was exactly this.
+fn ci_is_inconclusive(c: &str) -> bool {
+    matches!(c, "cancelled" | "skipped" | "neutral" | "stale" | "action_required" | "")
+}
+
+fn ci_sanitize(s: &str) -> String {
+    s.replace('|', "/").trim().to_string()
+}
+
+fn ci_when(ts: f64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M %Z").to_string())
+        .unwrap_or_else(|| format!("{ts:.0}"))
+}
+
+/// The decision. Pure: same runs in, same findings out, no clock beyond `now`
+/// and no network — which is what lets the tests build a 31-failure streak and
+/// a recovery without touching GitHub.
+///
+/// # The dedupe key is a STREAK ANCHOR, not the workflow
+///
+/// `ci|<repo>|<workflow>|<run id of the OLDEST failure in the current streak>`.
+///
+/// Keying on the workflow alone files once and then never again, so a workflow
+/// that is fixed and breaks again months later stays silent forever. Keying on
+/// the latest run files nightly, which is the thing the card asks us not to do.
+/// The anchor is stable for as long as the outage lasts and changes exactly
+/// when a green run splits one outage from the next — so a three-day outage is
+/// one card, and a genuinely new outage after a fix is a genuinely new card.
+///
+/// The anchor's one dependency is that the last SUCCESS is still inside the
+/// fetched window. When it is not, the anchor would silently drift older every
+/// time a run ages out and refile on every drift; so that case gets the fixed
+/// anchor `since-beyond-window` and says so in the evidence, rather than
+/// pretending to a precision it does not have.
+pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    let mut out = Vec::new();
+    let mut suppressed = Vec::new();
+    let min_failures = ci_min_failures();
+
+    // Group by (repo, workflow). BTreeMap so the output order is deterministic
+    // — a detector whose findings reorder between ticks is one nobody can diff.
+    let mut groups: BTreeMap<(String, String), Vec<&CiRun>> = BTreeMap::new();
+    for r in runs {
+        groups.entry((r.repo.clone(), ci_sanitize(&r.workflow))).or_default().push(r);
+    }
+
+    for ((repo, workflow), all) in groups {
+        // --- eligibility, with the exclusions PUBLISHED -----------------
+        let mut n_pr = 0usize;
+        let mut n_branch = 0usize;
+        let mut n_running = 0usize;
+        let mut eligible: Vec<&CiRun> = Vec::new();
+        for r in &all {
+            if r.event == "pull_request" || r.event == "pull_request_target" {
+                n_pr += 1;
+                continue;
+            }
+            if !r.on_default_branch {
+                n_branch += 1;
+                continue;
+            }
+            if r.status != "completed" {
+                n_running += 1;
+                continue;
+            }
+            eligible.push(r);
+        }
+        if n_pr + n_branch + n_running > 0 {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}|{workflow}"),
+                &format!(
+                    "excluded {n_pr} pull-request/fork run(s), {n_branch} non-default-branch \
+                     run(s), {n_running} still-running run(s) — only completed default-branch \
+                     runs are evidence about main"
+                ),
+            ));
+        }
+
+        // Newest first. Sorted here rather than trusting the caller: `gh`
+        // happens to return newest-first today and a pure function that
+        // silently depends on its input order is a bug waiting for a caller.
+        eligible.sort_by(|a, b| {
+            b.created_at
+                .partial_cmp(&a.created_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.run_id.cmp(&a.run_id))
+        });
+
+        // Inconclusive runs are dropped ENTIRELY (not counted, not
+        // streak-breaking) — see `ci_is_inconclusive`.
+        let decisive: Vec<&&CiRun> = eligible.iter().filter(|r| !ci_is_inconclusive(&r.conclusion)).collect();
+        let n_cancelled = eligible.len() - decisive.len();
+        if n_cancelled > 0 {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}|{workflow}|cancelled"),
+                &format!(
+                    "{n_cancelled} cancelled/skipped run(s) ignored — a cancelled run is not a \
+                     fault and must not break or reset the failure streak"
+                ),
+            ));
+        }
+
+        let Some(newest) = decisive.first() else { continue };
+        if !ci_is_failure(&newest.conclusion) {
+            // Green right now. Nothing to file. Whether an EXISTING card should
+            // hear about it is `ci_recovered`'s job, and the answer is a note,
+            // never a close.
+            continue;
+        }
+
+        // --- the streak -------------------------------------------------
+        let mut streak: Vec<&&CiRun> = Vec::new();
+        let mut last_success: Option<&&CiRun> = None;
+        for r in &decisive {
+            if ci_is_failure(&r.conclusion) {
+                streak.push(r);
+            } else {
+                last_success = Some(r);
+                break;
+            }
+        }
+        let count = streak.len() as i64;
+        if count < min_failures {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}|{workflow}"),
+                &format!(
+                    "{count} consecutive failure(s), below AMUX_CI_MIN_FAILURES={min_failures} — \
+                     not filed yet; a single red run is not distinguishable from a flake"
+                ),
+            ));
+            continue;
+        }
+
+        let oldest = streak.last().copied().expect("streak is non-empty: count >= min_failures >= 1");
+        let anchor = match last_success {
+            Some(_) => oldest.run_id.to_string(),
+            // The window ran out before a green run did. Fixed anchor so the
+            // key cannot drift as runs age out; the evidence says so out loud.
+            None => "since-beyond-window".to_string(),
+        };
+        let signature = format!("ci|{repo}|{workflow}|{anchor}");
+        let first_seen = oldest.created_at;
+        let step = newest.failing_step.clone().unwrap_or_else(|| "<step not resolved>".into());
+
+        let mut evidence: Vec<(String, String)> = vec![
+            (
+                "verdict".into(),
+                format!(
+                    "`{workflow}` has failed {count} consecutive time(s) on {repo}'s default \
+                     branch and is failing NOW. Nothing else in amux reads GitHub, so a red CI \
+                     is invisible unless a human happens to look — this card is the only place \
+                     it shows up."
+                ),
+            ),
+            ("repo".into(), repo.clone()),
+            ("workflow".into(), workflow.clone()),
+            ("consecutive_failures".into(), count.to_string()),
+            ("first_failure_at".into(), format!("{} (run {})", ci_when(first_seen), oldest.run_id)),
+            ("first_failure_url".into(), oldest.url.clone()),
+            ("failing_for".into(), format!("{:.1}h", ((now - first_seen) / 3600.0).max(0.0))),
+            ("latest_run".into(), format!("{} (run {})", ci_when(newest.created_at), newest.run_id)),
+            ("latest_run_url".into(), newest.url.clone()),
+            ("failing_step".into(), step),
+            ("trigger".into(), format!("{} on {}", newest.event, newest.branch)),
+        ];
+        match last_success {
+            Some(s) => evidence.push((
+                "last_success".into(),
+                format!("{} (run {}) — {}", ci_when(s.created_at), s.run_id, s.url),
+            )),
+            None => evidence.push((
+                "last_success".into(),
+                format!(
+                    "NONE in the last {} runs fetched — the streak is AT LEAST {count} and \
+                     started before the window, so `consecutive_failures` is a floor, not a \
+                     count. Raise AMUX_CI_RUN_LIMIT to see further back.",
+                    ci_run_limit()
+                ),
+            )),
+        }
+
+        out.push(Finding {
+            kind: DetectorKind::CiFailure,
+            signature,
+            title: format!(
+                "CI red: {workflow} — {count}x consecutive since {}",
+                ci_when(first_seen)
+            ),
+            evidence,
+            recheck: format!(
+                "gh run list --repo {repo} --workflow '{workflow}' --limit 10; \
+                 gh run view {} --repo {repo} --log-failed",
+                newest.run_id
+            ),
+            owner: None,
+            count: count as u64,
+            last_ts: newest.created_at,
+        });
+    }
+
+    (out, suppressed)
+}
+
+/// Has the workflow behind an already-filed `ci|…` signature gone green?
+///
+/// Returns the sentence to LOG on the card. It never returns a status, because
+/// there is no status this may set: "stopped failing is not fixed" applies with
+/// full force here — a green run can mean the bug is fixed, or that someone
+/// disabled the failing step, or that the workflow no longer runs the assertion
+/// at all. The lane holding the card decides (ethos rule 8).
+pub fn ci_recovered(runs: &[CiRun], signature: &str) -> Option<String> {
+    let rest = signature.strip_prefix("ci|")?;
+    let parts: Vec<&str> = rest.split('|').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let (repo, workflow) = (parts[0], parts[1]);
+    let mut mine: Vec<&CiRun> = runs
+        .iter()
+        .filter(|r| {
+            r.repo == repo
+                && ci_sanitize(&r.workflow) == workflow
+                && r.on_default_branch
+                && r.status == "completed"
+                && r.event != "pull_request"
+                && r.event != "pull_request_target"
+                && !ci_is_inconclusive(&r.conclusion)
+        })
+        .collect();
+    mine.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal));
+    let newest = mine.first()?;
+    if ci_is_failure(&newest.conclusion) {
+        return None;
+    }
+    Some(format!(
+        "autofix: `{workflow}` is GREEN again as of {} (run {}, {}). STOPPED FAILING IS NOT \
+         FIXED — this may be the fix, or the failing step may have been removed, disabled or \
+         skipped. This card stays open and stays yours; say which it was and close it yourself.",
+        ci_when(newest.created_at),
+        newest.run_id,
+        newest.url
+    ))
+}
+
+/// Cached run list, so the 120s tick does not become 720 GitHub calls a day.
+#[allow(clippy::type_complexity)]
+fn ci_cache() -> &'static std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppressed>)>> {
+    static CELL: std::sync::OnceLock<std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppressed>)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+async fn gh(args: &[String], timeout_s: u64) -> Result<String, String> {
+    let fut = tokio::process::Command::new("gh").args(args).output();
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await {
+        Err(_) => return Err(format!("`gh {}` timed out after {timeout_s}s", args.join(" "))),
+        Ok(Err(e)) => return Err(format!("cannot run `gh`: {e}")),
+        Ok(Ok(o)) => o,
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("`gh {}` failed: {}", args.join(" "), truncate(err.trim(), 300)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn ci_parse_ts(s: &str) -> f64 {
+    chrono::DateTime::parse_from_rfc3339(s).map(|d| d.timestamp() as f64).unwrap_or(0.0)
+}
+
+/// Ask GitHub. Impure by definition — kept in its own function so
+/// [`ci_findings`] can stay a pure decision over a `Vec<CiRun>`.
+///
+/// Runs OUTSIDE the store lock (see [`autofix_tick`]): a network call while
+/// holding the SQLite read lock would make every other request on the server
+/// wait on GitHub.
+async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
+    if let Ok(g) = ci_cache().read() {
+        if let Some((at, runs, sup)) = g.as_ref() {
+            if now - at < ci_poll_min() * 60.0 {
+                return (runs.clone(), sup.clone());
+            }
+        }
+    }
+
+    let mut runs: Vec<CiRun> = Vec::new();
+    let mut suppressed: Vec<Suppressed> = Vec::new();
+    let timeout_s = ci_cmd_timeout_s();
+
+    for repo in ci_repos() {
+        let default_branch = match gh(
+            &["api".into(), format!("repos/{repo}"), "--jq".into(), ".default_branch".into()],
+            timeout_s,
+        )
+        .await
+        {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                // BLINDNESS IS PUBLISHED. gh missing, unauthenticated, rate
+                // limited or offline all land here, and all of them look
+                // identical to "CI is fine" if we return quietly.
+                suppressed.push(sup(
+                    DetectorKind::CiFailure,
+                    &format!("ci|{repo}"),
+                    &format!("cannot read {repo} — detector is BLIND, not clear: {e}"),
+                ));
+                continue;
+            }
+        };
+
+        let list = match gh(
+            &[
+                "run".into(), "list".into(),
+                "--repo".into(), repo.clone(),
+                "--limit".into(), ci_run_limit().to_string(),
+                "--json".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+            ],
+            timeout_s,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                suppressed.push(sup(
+                    DetectorKind::CiFailure,
+                    &format!("ci|{repo}"),
+                    &format!("cannot list runs for {repo} — detector is BLIND, not clear: {e}"),
+                ));
+                continue;
+            }
+        };
+        let parsed: Vec<Value> = serde_json::from_str(&list).unwrap_or_default();
+        if parsed.is_empty() {
+            suppressed.push(sup(
+                DetectorKind::CiFailure,
+                &format!("ci|{repo}"),
+                "gh returned no runs — either the repo has none or the response did not parse",
+            ));
+        }
+        for v in parsed {
+            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let branch = s("headBranch");
+            runs.push(CiRun {
+                repo: repo.clone(),
+                workflow: s("workflowName"),
+                run_id: v.get("databaseId").and_then(Value::as_i64).unwrap_or(0),
+                status: s("status"),
+                conclusion: s("conclusion"),
+                event: s("event"),
+                on_default_branch: branch == default_branch,
+                branch,
+                created_at: ci_parse_ts(&s("createdAt")),
+                url: s("url"),
+                failing_step: None,
+            });
+        }
+    }
+
+    // Resolve the failing STEP, but only for the newest failing run of each
+    // workflow — one extra API call each, versus one per run in the window.
+    let mut want: BTreeMap<(String, String), (i64, f64)> = BTreeMap::new();
+    for r in &runs {
+        if !ci_is_failure(&r.conclusion) || !r.on_default_branch || r.status != "completed" {
+            continue;
+        }
+        let key = (r.repo.clone(), ci_sanitize(&r.workflow));
+        let e = want.entry(key).or_insert((r.run_id, r.created_at));
+        if r.created_at > e.1 {
+            *e = (r.run_id, r.created_at);
+        }
+    }
+    for ((repo, _wf), (run_id, _)) in want {
+        let jq = r#".jobs[] | select(.conclusion=="failure") | .name as $j | .steps[] | select(.conclusion=="failure") | "\($j) / \(.name)""#;
+        let step = gh(
+            &[
+                "api".into(),
+                format!("repos/{repo}/actions/runs/{run_id}/jobs"),
+                "--jq".into(),
+                jq.into(),
+            ],
+            timeout_s,
+        )
+        .await
+        .ok()
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .filter(|s| !s.is_empty());
+        if let Some(step) = step {
+            for r in runs.iter_mut().filter(|r| r.run_id == run_id) {
+                r.failing_step = Some(step.clone());
+            }
+        }
+    }
+
+    if let Ok(mut g) = ci_cache().write() {
+        *g = Some((now, runs.clone(), suppressed.clone()));
+    }
+    (runs, suppressed)
+}
 
 fn sup(kind: DetectorKind, signature: &str, reason: &str) -> Suppressed {
     Suppressed { kind, signature: signature.to_string(), reason: reason.to_string() }
@@ -1081,6 +1822,11 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
     let now = unix_now();
     let mut rep = AutofixReport { at: now, ..Default::default() };
 
+    // BEFORE the store lock, on purpose: this is a network call, and holding
+    // the SQLite read lock across GitHub's latency would stall every request on
+    // the server behind a detector.
+    let (ci_runs, ci_sup) = fetch_ci_runs(now).await;
+
     let (findings, suppressed, on) = {
         let conn = match state.store.read() {
             Ok(c) => c,
@@ -1093,7 +1839,7 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
         };
         let on = enabled(&conn);
         let mut findings = Vec::new();
-        let mut suppressed = Vec::new();
+        let mut suppressed = ci_sup;
         for kind in DetectorKind::all() {
             let (f, s) = match kind {
                 DetectorKind::Http5xx => detect_5xx(&conn, now),
@@ -1102,6 +1848,8 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
                 DetectorKind::SilentSubsystem => detect_silent(&conn, now),
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
+                DetectorKind::DiskPressure => detect_disk(now, home),
+                DetectorKind::CiFailure => ci_findings(&ci_runs, now),
             };
             findings.extend(f);
             suppressed.extend(s);
@@ -1148,7 +1896,7 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
         }
     }
 
-    match note_quiet_signatures(state, now).await {
+    match note_quiet_signatures(state, now, &ci_runs).await {
         Ok(v) => rep.quiet_noted = v,
         Err(e) => rep.errors.push(format!("quiet sweep: {e}")),
     }
@@ -1259,9 +2007,21 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
 /// it means is the job of the lane holding the card. One line per card, ever —
 /// the idem key makes the note exactly-once so a quiet signature cannot
 /// re-nag forever (which is its own well-documented failure here).
-async fn note_quiet_signatures(state: &AppState, now: f64) -> anyhow::Result<Vec<(String, String)>> {
+async fn note_quiet_signatures(
+    state: &AppState,
+    now: f64,
+    ci: &[CiRun],
+) -> anyhow::Result<Vec<(String, String)>> {
     let quiet_cut = now - quiet_h() * 3600.0;
-    let mut candidates: Vec<(String, String)> = Vec::new();
+    /// One pending note: the card, the short "what" for the report, the line to
+    /// log, and the idem that makes it exactly-once.
+    struct Note {
+        card: String,
+        what: String,
+        line: String,
+        idem: String,
+    }
+    let mut candidates: Vec<Note> = Vec::new();
     {
         let conn = state.store.read()?;
         let mut stmt = conn.prepare(
@@ -1273,6 +2033,22 @@ async fn note_quiet_signatures(state: &AppState, now: f64) -> anyhow::Result<Vec
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for (id, sref) in rows.flatten() {
             let sig = sref.trim_start_matches("autofix:").to_string();
+
+            // CI is the second detector with a per-occurrence record to ask —
+            // GitHub's own run list. Same rule as the 5xx sweep and stated in
+            // `ci_recovered`: the card gets a LINE, never a status change.
+            if sig.starts_with("ci|") {
+                if let Some(line) = ci_recovered(ci, &sig) {
+                    candidates.push(Note {
+                        card: id.clone(),
+                        what: "workflow is green again".into(),
+                        line,
+                        idem: format!("autofix-ci-green:{id}"),
+                    });
+                }
+                continue;
+            }
+
             // Only the request-log-backed detectors can be asked "has this
             // recurred?"; the others have no per-occurrence row to count, so
             // they are left alone rather than guessed at.
@@ -1291,13 +2067,23 @@ async fn note_quiet_signatures(state: &AppState, now: f64) -> anyhow::Result<Vec
                 )
                 .unwrap_or(1);
             if recent == 0 {
-                candidates.push((id, format!("{method} {target} → {status}")));
+                candidates.push(Note {
+                    card: id.clone(),
+                    what: format!("{method} {target} → {status}"),
+                    line: format!(
+                        "autofix: no occurrence of this signature for {:.0}h ({method} {target} → \
+                         {status}). STOPPED HAPPENING IS NOT FIXED — it may be fixed, or the \
+                         caller may have given up, or the path may now be unreachable. This card \
+                         stays open; whoever holds it decides which.",
+                        quiet_h()
+                    ),
+                    idem: format!("autofix-quiet:{id}"),
+                });
             }
         }
     }
     let mut noted = Vec::new();
-    for (card, what) in candidates {
-        let idem = format!("autofix-quiet:{card}");
+    for Note { card, what, line, idem } in candidates {
         let already = {
             let conn = state.store.read()?;
             conn.query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", rusqlite::params![idem], |_| Ok(()))
@@ -1306,12 +2092,6 @@ async fn note_quiet_signatures(state: &AppState, now: f64) -> anyhow::Result<Vec
         if already {
             continue;
         }
-        let line = format!(
-            "autofix: no occurrence of this signature for {:.0}h ({what}). STOPPED HAPPENING IS \
-             NOT FIXED — it may be fixed, or the caller may have given up, or the path may now be \
-             unreachable. This card stays open; whoever holds it decides which.",
-            quiet_h()
-        );
         let c2 = card.clone();
         let i2 = idem.clone();
         state
@@ -1406,6 +2186,11 @@ async fn debug_autofix(axum::extract::State(state): axum::extract::State<AppStat
             "invariant_min_occurrences": invariant_min_occurrences(),
             "build_stale_h": build_stale_h(),
             "quiet_h": quiet_h(),
+            "ci_repos": ci_repos(),
+            "ci_poll_min": ci_poll_min(),
+            "ci_min_failures": ci_min_failures(),
+            "ci_run_limit": ci_run_limit(),
+            "ci_timeout_s": ci_cmd_timeout_s(),
         },
         "fixer_session": fixer_session(),
         "ignore": ignore_list(),
@@ -1478,6 +2263,14 @@ mod tests {
     use std::sync::Arc;
 
     fn state() -> (AppState, tempfile::TempDir) {
+        // NO TEST MAY TOUCH GITHUB. The CI detector shells out to `gh` inside
+        // `autofix_tick`; seeding its cache with an empty, fresh result makes
+        // `fetch_ci_runs` short-circuit, so every existing test stays offline
+        // and deterministic. The CI tests below deliberately do NOT go through
+        // the tick — they drive the pure decision and the real filing path
+        // directly, which is the only way to assert on a 31-failure streak
+        // without a network and without inventing one.
+        *ci_cache().write().unwrap() = Some((unix_now(), Vec::new(), Vec::new()));
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         (
@@ -1797,7 +2590,7 @@ mod tests {
         };
         let id = file_finding(&st, &f).await.unwrap().expect("card filed");
 
-        let noted = note_quiet_signatures(&st, now).await.unwrap();
+        let noted = note_quiet_signatures(&st, now, &[]).await.unwrap();
         assert_eq!(noted.len(), 1, "a quiet signature must be noted: {noted:?}");
 
         let conn = st.store.read().unwrap();
@@ -1813,7 +2606,7 @@ mod tests {
 
         // And it must not re-nag: a second sweep adds nothing. A note that
         // fires every tick forever is its own well-documented failure here.
-        let again = note_quiet_signatures(&st, now).await.unwrap();
+        let again = note_quiet_signatures(&st, now, &[]).await.unwrap();
         assert!(again.is_empty(), "the quiet note must be exactly-once, got {again:?}");
     }
 
@@ -1826,5 +2619,282 @@ mod tests {
             assert_ne!(k.item_type(), "code", "{k:?} would be gated on a merge it cannot claim");
             assert!(!k.slug().is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CI / deploy detector (AMUX-2780).
+    //
+    // These drive `ci_findings` (the pure decision) and `file_finding` (the
+    // REAL filing path, dedupe included) rather than `autofix_tick`, because
+    // the tick's CI input is a `gh` subprocess. Testing through the tick would
+    // mean either hitting GitHub — which makes the suite non-deterministic and
+    // makes a red suite mean "the network is down" — or mocking the tick, which
+    // proves nothing about the code that ships.
+    // -----------------------------------------------------------------------
+
+    /// A run fixture. `mins_ago` keeps the timeline readable at the call site;
+    /// getting the ORDER wrong is how a streak test silently measures nothing.
+    fn ci_run(wf: &str, id: i64, conclusion: &str, mins_ago: f64) -> CiRun {
+        CiRun {
+            repo: "mixpeek/amux".into(),
+            workflow: wf.into(),
+            run_id: id,
+            status: "completed".into(),
+            conclusion: conclusion.into(),
+            event: "push".into(),
+            branch: "main".into(),
+            on_default_branch: true,
+            created_at: unix_now() - mins_ago * 60.0,
+            url: format!("https://github.com/mixpeek/amux/actions/runs/{id}"),
+            failing_step: None,
+        }
+    }
+
+    fn card_row(st: &AppState, id: &str) -> (String, String, String) {
+        let conn = st.store.read().unwrap();
+        conn.query_row(
+            "SELECT status, COALESCE(log,''), COALESCE(source_ref,'') FROM issues WHERE id=?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// THE test the whole card exists for. `deploy-cloud.yml` failed 31
+    /// consecutive times over three days and produced NOTHING anyone could see.
+    /// If the detector is removed, misfiltered, or its threshold is set above
+    /// the streak, this fails — which is the property "nobody saw 29 failures"
+    /// needed and did not have.
+    #[tokio::test]
+    async fn a_failing_workflow_produces_a_card_with_its_streak() {
+        let (st, _d) = state();
+        let mut runs = vec![ci_run("Deploy to cloud.amux.io", 31_182_322_406, "success", 4400.0)];
+        for i in 0..31 {
+            let mut r = ci_run("Deploy to cloud.amux.io", 31_200_000_000 + i, "failure", 4000.0 - i as f64 * 100.0);
+            if i == 30 {
+                r.failing_step = Some("deploy / Gateway env — admin emails".into());
+            }
+            runs.push(r);
+        }
+        let (f, _s) = ci_findings(&runs, unix_now());
+        assert_eq!(f.len(), 1, "31 failures of one workflow are ONE incident, got {}", f.len());
+        let ev: BTreeMap<&str, &str> =
+            f[0].evidence.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(ev["consecutive_failures"], "31", "the count is the whole point");
+        assert!(ev["first_failure_at"].contains("31200000000"), "first-seen names the run: {ev:?}");
+        assert!(ev["latest_run_url"].contains("31200000030"), "run URL must be the NEWEST failure");
+        assert!(ev["failing_step"].contains("Gateway env"), "the failing STEP is required evidence");
+        assert!(ev["last_success"].contains("31182322406"), "last green run belongs on the card");
+        assert!(f[0].recheck.contains("--log-failed"), "recheck must be runnable: {}", f[0].recheck);
+
+        // …and it reaches the board through the real filing path.
+        let card = file_finding(&st, &f[0]).await.unwrap().expect("a finding must file a card");
+        let (status, _log, sref) = card_row(&st, &card);
+        assert_eq!(status, "todo", "a filed fault is queued, not pre-closed");
+        assert_eq!(sref, format!("autofix:{}", f[0].signature));
+        let c = cards(&st);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].3, "blocker", "a red deploy is a blocker, not a code card");
+        assert!(c[0].1.contains("31x"), "count belongs in the computed title: {}", c[0].1);
+    }
+
+    /// Dedupe, durably. A nightly failure files ONCE. This is the property that
+    /// separates a detector from a nightly spam machine, and the one an
+    /// in-memory dedupe passes in-process and fails in production on every
+    /// re-exec.
+    #[tokio::test]
+    async fn a_nightly_failure_files_once_not_nightly() {
+        let (st, _d) = state();
+        let base = vec![
+            ci_run("rust", 900, "success", 5000.0),
+            ci_run("rust", 901, "failure", 400.0),
+            ci_run("rust", 902, "failure", 300.0),
+        ];
+        let f1 = ci_findings(&base, unix_now()).0;
+        assert_eq!(f1.len(), 1);
+        assert!(file_finding(&st, &f1[0]).await.unwrap().is_some(), "first sighting files");
+
+        // Night 2 and night 3: the SAME outage, more failures. Same anchor,
+        // same signature, no new card.
+        let mut later = base.clone();
+        later.push(ci_run("rust", 903, "failure", 200.0));
+        later.push(ci_run("rust", 904, "failure", 100.0));
+        let f2 = ci_findings(&later, unix_now()).0;
+        assert_eq!(f2[0].signature, f1[0].signature, "the streak anchor must not move mid-outage");
+        assert!(file_finding(&st, &f2[0]).await.unwrap().is_none(), "night 2 must not refile");
+
+        // A RESTART: new AppState over the same DB, in-memory report cleared.
+        *last_report_cell().write().unwrap() = None;
+        let restarted = AppState {
+            store: st.store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "after-restart".into(),
+            auth_token: None,
+        };
+        assert!(
+            file_finding(&restarted, &f2[0]).await.unwrap().is_none(),
+            "a restart refiled the same outage — the dedupe is not durable"
+        );
+        assert_eq!(cards(&st).len(), 1, "three nights and a restart are ONE card");
+    }
+
+    /// The other half of dedupe, which a workflow-keyed signature gets wrong:
+    /// a workflow that is FIXED and breaks again later must file again. A key
+    /// that never changes goes silent forever after the first fix.
+    #[test]
+    fn a_new_outage_after_a_green_run_is_a_new_card() {
+        let old = vec![
+            ci_run("rust", 80, "success", 5000.0),
+            ci_run("rust", 90, "failure", 4000.0),
+            ci_run("rust", 100, "failure", 3000.0),
+        ];
+        let sig_old = ci_findings(&old, unix_now()).0[0].signature.clone();
+
+        let mut new = old.clone();
+        new.push(ci_run("rust", 150, "success", 2000.0)); // fixed
+        new.push(ci_run("rust", 200, "failure", 1000.0)); // …and broke again
+        new.push(ci_run("rust", 210, "failure", 500.0));
+        let sig_new = ci_findings(&new, unix_now()).0[0].signature.clone();
+
+        assert_ne!(sig_old, sig_new, "a second outage must not be deduped against the first");
+        assert!(sig_new.ends_with("|200"), "the anchor is the streak's OLDEST failure: {sig_new}");
+    }
+
+    /// "Stopped failing is not fixed." A green run appends a line and changes
+    /// NOTHING else — not the status, not the archive flag. A detector that
+    /// auto-closes on green declares a fix it did not verify, and the one time
+    /// that is wrong is the time the failing step was quietly deleted.
+    #[tokio::test]
+    async fn a_green_run_is_noted_never_closed() {
+        let (st, _d) = state();
+        let broken = vec![
+            ci_run("checks", 10, "success", 5000.0),
+            ci_run("checks", 11, "failure", 400.0),
+            ci_run("checks", 12, "failure", 300.0),
+        ];
+        let f = ci_findings(&broken, unix_now()).0;
+        let card = file_finding(&st, &f[0]).await.unwrap().unwrap();
+
+        // While red, there is nothing to say.
+        let noted = note_quiet_signatures(&st, unix_now(), &broken).await.unwrap();
+        assert!(noted.is_empty(), "a still-failing workflow must not be reported as recovered");
+
+        let mut green = broken.clone();
+        green.push(ci_run("checks", 13, "success", 10.0));
+        let noted = note_quiet_signatures(&st, unix_now(), &green).await.unwrap();
+        assert_eq!(noted.len(), 1, "a green run must be NOTED: {noted:?}");
+
+        let (status, log, _) = card_row(&st, &card);
+        assert_eq!(status, "todo", "green must not close, move or resolve the card");
+        assert!(log.contains("GREEN again"), "the note must be on the card: {log}");
+        assert!(log.contains("STOPPED FAILING IS NOT FIXED"), "and must say what green does NOT prove");
+
+        // Exactly once, forever — a recovery that re-nags every tick is its
+        // own well-documented failure in this repo.
+        let again = note_quiet_signatures(&st, unix_now(), &green).await.unwrap();
+        assert!(again.is_empty(), "the green note must be exactly-once, got {again:?}");
+    }
+
+    /// The suppressions the card asked for, and the rule that a decision NOT to
+    /// file is published rather than silent.
+    #[test]
+    fn cancelled_and_pull_request_runs_are_not_evidence() {
+        let now = unix_now();
+
+        // A cancelled run is the NEWEST. It must neither file (it is not a
+        // fault) nor reset the streak behind it (the 08-10 16:42 cancel sat in
+        // the middle of a 31-failure outage).
+        let mut runs = vec![
+            ci_run("Deploy to cloud.amux.io", 1, "success", 900.0),
+            ci_run("Deploy to cloud.amux.io", 2, "failure", 800.0),
+            ci_run("Deploy to cloud.amux.io", 3, "failure", 700.0),
+        ];
+        runs.push(ci_run("Deploy to cloud.amux.io", 4, "cancelled", 600.0));
+        let (f, s) = ci_findings(&runs, now);
+        assert_eq!(f.len(), 1, "a cancelled run must not mask the outage behind it");
+        assert!(f[0].signature.ends_with("|2"), "cancel must not move the anchor: {}", f[0].signature);
+        assert!(
+            s.iter().any(|x| x.reason.contains("cancelled")),
+            "the decision to ignore a cancelled run must be PUBLISHED: {s:?}"
+        );
+
+        // A fork/PR run that fails is somebody else's branch, not main's CI.
+        let mut pr = ci_run("rust", 50, "failure", 10.0);
+        pr.event = "pull_request".into();
+        pr.on_default_branch = false;
+        pr.branch = "contributor:patch-1".into();
+        let mut pr2 = pr.clone();
+        pr2.run_id = 51;
+        let (f, s) = ci_findings(&[pr, pr2], now);
+        assert!(f.is_empty(), "PR/fork runs must never file against main: {f:?}");
+        assert!(
+            s.iter().any(|x| x.reason.contains("pull-request")),
+            "the exclusion must be visible, not silent: {s:?}"
+        );
+
+        // One red run is below the threshold — and says so, rather than
+        // vanishing. An unexplained non-filing is the failure this file exists
+        // to end.
+        let one = vec![ci_run("rust", 60, "success", 900.0), ci_run("rust", 61, "failure", 10.0)];
+        let (f, s) = ci_findings(&one, now);
+        assert!(f.is_empty());
+        assert!(
+            s.iter().any(|x| x.reason.contains("AMUX_CI_MIN_FAILURES")),
+            "a sub-threshold streak must name the threshold that held it back: {s:?}"
+        );
+    }
+
+    /// The probe against the REAL incident, run by hand.
+    ///
+    /// `#[ignore]` and honest about why: it shells out to `gh` and talks to
+    /// GitHub, so in CI it would be a test that fails when the network hiccups
+    /// or the token expires — and a check that goes red for reasons unrelated
+    /// to the code is a check people learn to ignore. It is NOT decoration:
+    /// this is the only thing that exercises `fetch_ci_runs`' parsing, the
+    /// default-branch comparison and the failing-step API call against real
+    /// GitHub JSON, none of which a fixture can prove. Run it after touching
+    /// any of those:
+    ///
+    /// ```text
+    /// cargo test -p amux-server --lib ci_detector_against_live_github -- --ignored --nocapture
+    /// ```
+    ///
+    /// First run, 2026-08-10: reported `Deploy to cloud.amux.io` at 31
+    /// consecutive failures since 2026-08-07, plus `rust` and `checks` — the
+    /// exact outage that went unseen for three days.
+    #[tokio::test]
+    #[ignore = "hits live GitHub via the gh CLI; manual probe, not a CI gate"]
+    async fn ci_detector_against_live_github() {
+        *ci_cache().write().unwrap() = None;
+        let now = unix_now();
+        let (runs, sup) = fetch_ci_runs(now).await;
+        println!("fetched {} runs; {} suppression(s)", runs.len(), sup.len());
+        for s in &sup {
+            println!("  SUPPRESSED {}: {}", s.signature, s.reason);
+        }
+        assert!(!runs.is_empty(), "gh returned nothing — is it installed and authenticated?");
+        let (f, s2) = ci_findings(&runs, now);
+        for x in &s2 {
+            println!("  SUPPRESSED {}: {}", x.signature, x.reason);
+        }
+        for x in &f {
+            println!("\n=== WOULD FILE: {}\nsignature: {}", x.title, x.signature);
+            println!("{}", render_desc(x));
+        }
+    }
+
+    /// Blindness must not read as an all-clear. This is the failure mode unique
+    /// to the one detector whose instrument is off-machine: `gh` missing,
+    /// logged out, rate-limited or offline all produce zero runs, which is
+    /// byte-identical to a healthy CI unless the reason is published.
+    #[test]
+    fn no_runs_is_not_the_same_as_no_failures() {
+        let (f, s) = ci_findings(&[], unix_now());
+        assert!(f.is_empty());
+        assert!(s.is_empty(), "an empty list alone says nothing — the REASON comes from the fetch");
+        // The fetch is what knows why the list is empty, and it emits a
+        // Suppressed naming the cause; `ci_findings` cannot and must not guess.
+        // Guarded here so nobody later "helpfully" makes an empty list file a
+        // card, which would fire on every network blip.
     }
 }

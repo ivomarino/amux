@@ -197,22 +197,47 @@ async fn async_main() {
         build_hash: build_hash(),
         auth_token,
     };
+    // EVERY BACKGROUND LOOP BELOW GOES THROUGH `registry::spawn_loop`, and
+    // that is not a style preference. Three of these were dead or had never
+    // been spawned at all — for hours, silently, because a loop that is not
+    // running and a loop with nothing to do are byte-identical from outside.
+    // `spawn_loop` makes the spawn AND the visibility one call, so the two
+    // cannot come apart; `runtime_jobs::registry` explains why the list is
+    // derived here rather than declared somewhere, and tests/system_jobs.rs
+    // fails if a bare `tokio::spawn` of a background loop reappears in this
+    // file. The whole set is readable at `GET /api/system-jobs` and in the
+    // dashboard's Scheduler tab under "System".
+    use runtime_jobs::registry as jobs;
+    let secs = std::time::Duration::from_secs;
+
     // Steering DELIVERY (AMUX-2617). `steer_enqueue` had three call sites and no
     // consumer: queued messages were stored durably and never handed to the lane,
     // so a busy worker's queue only grew (amux-rust: IDLE, 9 QUEUED, oldest 2h6m).
     // Spawned before the router takes `state` by value.
-    tokio::spawn(api::session_verbs::steer_deliver_loop(state.clone()));
+    jobs::spawn_loop(
+        jobs::ids::STEER_DELIVER,
+        Some(secs(api::session_verbs::STEER_TICK_SECS)),
+        api::session_verbs::steer_deliver_loop(state.clone()),
+    );
 
     // pipe-pane reconciler (AMUX-2671). `pipe-pane` is attached in
     // start_session and nowhere else, so a pane that loses its writer stays
     // unlogged forever — indistinguishable from a lane that was never started.
-    tokio::spawn(api::session_verbs::pipe_reconcile_loop());
+    jobs::spawn_loop(
+        jobs::ids::PIPE_RECONCILE,
+        Some(secs(api::session_verbs::PIPE_RECONCILE_SECS)),
+        api::session_verbs::pipe_reconcile_loop(),
+    );
 
     // Continuous invariant checking (AMUX-2622). Spawned before the router
     // takes `state` by value. Runs forever; a panic in one pass is caught
     // inside so the monitor cannot die quietly — a dead monitor's silence
     // reads as health, which is the failure this module exists to prevent.
-    tokio::spawn(invariants::monitor::run(state.clone()));
+    jobs::spawn_loop(
+        jobs::ids::INVARIANTS,
+        Some(secs(invariants::monitor::TICK_SECS)),
+        invariants::monitor::run(state.clone()),
+    );
 
     // Ghost-rescue (AMUX-2629): the FALLBACK sweep for the keystroke delivery
     // path — it presses Enter for an amux message that was typed into a lane's
@@ -243,8 +268,13 @@ async fn async_main() {
     drop(runtime_jobs::pane_size::spawn());
     // The idle uncommitted-work nudge (AMUX-2638). Ownership comes from the
     // staged-guard, never from the dirty tree — see the module docs for the
-    // three sweeps that rule exists to prevent.
-    drop(runtime_jobs::commit_nudge::spawn(state.clone()));
+    // three sweeps that rule exists to prevent. It owns its own tokio::spawn
+    // (it decides whether to run at all from AMUX_COMMIT_NUDGE_SECS), so it is
+    // `adopt`ed rather than spawned here — same contract, same call site.
+    {
+        let h = runtime_jobs::commit_nudge::spawn(state.clone());
+        jobs::adopt(jobs::ids::COMMIT_NUDGE, None, &h);
+    }
 
     // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
     // purpose: the thing that watches for breakage must not share fate with
@@ -254,6 +284,14 @@ async fn async_main() {
     // exists. If every worker in the fleet is dead, the cards still get filed
     // and wait. Noticing is infrastructure; fixing is work.
     drop(runtime_jobs::autofix::spawn(state.clone()));
+
+    // STORAGE RETENTION (AMUX-2700). Seven append-only tables and three cache
+    // directories had no retention at all — not leaking, just working as
+    // written, forever. Driven by time rather than traffic on purpose: the
+    // prune logic media-cache and uploads already had was correct and only ran
+    // while those directories were GROWING, so a fleet that stopped transcoding
+    // never evicted a transcode.
+    drop(runtime_jobs::storage::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
@@ -271,7 +309,11 @@ async fn async_main() {
         let firing = runtime_jobs::firing_enabled();
         let deliverer: std::sync::Arc<dyn runtime_jobs::scheduler::Deliverer> =
             std::sync::Arc::new(runtime_jobs::scheduler::LiveDeliverer::new(state.clone()));
-        tokio::spawn(runtime_jobs::run_scheduler(store.clone(), firing, deliverer));
+        jobs::spawn_loop(
+            jobs::ids::SCHEDULER,
+            Some(secs(runtime_jobs::SCHEDULER_TICK_SECS)),
+            runtime_jobs::run_scheduler(store.clone(), firing, deliverer),
+        );
     }
 
     let app = api::router(state);
@@ -342,7 +384,8 @@ async fn async_main() {
         ),
         Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
     }
-    tokio::spawn(runtime.clone().run());
+    let orch_tick_secs = runtime.tick_secs.max(1);
+    jobs::spawn_loop(jobs::ids::ORCH_RUNTIME, Some(secs(orch_tick_secs)), runtime.clone().run());
 
     // Worker event processors (RR-0065, AMUX-2613 gap 1): the durable
     // subscriber to protocol.events(). Without this spawn the whole event
@@ -354,10 +397,14 @@ async fn async_main() {
     // Idle + command confirmation + the drift-note path, all journaled
     // with payloads (RR-0111a). The scan loop stays the FALLBACK voice:
     // it already demotes any worker whose protocol session is live.
-    tokio::spawn(orchestrator::events::run_event_processors(
-        store.clone(),
-        runtime.protocol.clone().expect("protocol constructed above"),
-    ));
+    jobs::spawn_loop(
+        jobs::ids::EVENT_PROCESSORS,
+        Some(secs(orchestrator::events::SUPERVISE_SECS)),
+        orchestrator::events::run_event_processors(
+            store.clone(),
+            runtime.protocol.clone().expect("protocol constructed above"),
+        ),
+    );
 
     // Terminal scan loop (RR-0067): the fallback voice for hookless
     // interactive workers, with structured-session demotion built in.
@@ -371,7 +418,7 @@ async fn async_main() {
         .get("AMUX_RS_SCAN_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
-    tokio::spawn(scan.run(scan_secs));
+    jobs::spawn_loop(jobs::ids::SCAN, Some(secs(scan_secs.max(5))), scan.run(scan_secs));
 
     // Session bootstrap (backend::bootstrap): the spawn/registration glue
     // that turns the API's durable Starting/ended records into real backend
@@ -389,7 +436,7 @@ async fn async_main() {
         .get("AMUX_RS_BOOTSTRAP_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
-    tokio::spawn(boot.run(boot_secs));
+    jobs::spawn_loop(jobs::ids::BOOTSTRAP, Some(secs(boot_secs.max(1))), boot.run(boot_secs));
 
     // Self-adoption (parity with the Python server's own-mtime watch): when
     // the INSTALLED binary changes underneath us — the builder agent just
@@ -397,13 +444,14 @@ async fn async_main() {
     // the new code. The binary is the unit of deploy; a server that keeps
     // running stale code after a deploy is the Python shared-checkout
     // staleness incident wearing a compiled coat.
-    tokio::spawn(async {
+    jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async {
         let Ok(exe) = std::env::current_exe() else { return };
         let Ok(meta) = std::fs::metadata(&exe) else { return };
         let initial = meta.modified().ok();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
+            jobs::tick(jobs::ids::SELF_ADOPT);
             let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
             if current.is_some() && current != initial {
                 tracing::info!("binary changed on disk — exiting for relaunch (self-adoption)");
@@ -428,10 +476,18 @@ async fn async_main() {
     // condition and `GET /api/debug/legacy-port` for the number that decides
     // it. DO NOT drop this bind on the assumption the fleet has rotated; read
     // the counter, because being wrong breaks ~60 live sessions at once.
-    if let Some(legacy_port) = std::env::var("AMUX_RS_LEGACY_PORT")
+    let legacy_cfg = std::env::var("AMUX_RS_LEGACY_PORT")
         .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-    {
+        .and_then(|v| v.parse::<u16>().ok());
+
+    // Publish where this server actually is, for the one class of client that
+    // cannot be told any other way: a hook spawned by a pre-cutover `claude`
+    // process, which inherits `AMUX_URL=…:8822` from an env that cannot be
+    // rotated. Fixing those hooks' DEFAULTS did nothing — a default only fires
+    // when the variable is UNSET. See `legacy_port::publish_endpoint`.
+    legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, legacy_cfg);
+
+    if let Some(legacy_port) = legacy_cfg {
         let legacy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], legacy_port));
         let legacy_acceptor = tls::RedirectingAcceptor::new(
             axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg.clone()),
@@ -444,7 +500,7 @@ async fn async_main() {
             .clone()
             .layer(axum::middleware::from_fn(legacy_port::count));
         legacy_port::arm(legacy_port);
-        tokio::spawn(legacy_port::run_reporter());
+        jobs::spawn_loop(jobs::ids::LEGACY_PORT, None, legacy_port::run_reporter());
         tracing::info!(%legacy_addr, "listening on LEGACY port (fleet AMUX_URL compatibility)");
         tokio::spawn(async move {
             if let Err(e) = axum_server::bind(legacy_addr)

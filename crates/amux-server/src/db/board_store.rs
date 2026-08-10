@@ -947,8 +947,30 @@ pub fn depends_on_cycle(
         let to = intern(d, &mut names);
         edges.push((from, to));
     }
-    Ok(board::detect_cycle(&edges).map(|cycle| {
-        cycle
+    // REFUSE ONLY A CYCLE THIS CALLER IS PART OF (AC-335).
+    //
+    // The graph above is EVERY depends_on edge on the board, and detect_cycle
+    // returns the first cycle it finds anywhere in it. So one stale cycle
+    // between two unrelated cards made every subsequent depends_on write fail —
+    // with an error naming two ids the caller had never touched, which reads as
+    // "your edit is circular" when it is not.
+    //
+    // Live specimen: GE-473 <-> MHC-256, two cards owned by other lanes and BOTH
+    // already closed (done and verified). Setting AC-331 -> AC-330, which shares
+    // no node with either, was refused as "circular depends_on: GE-473 ->
+    // MHC-256". Board-wide, for everyone, until someone broke a cycle between two
+    // finished cards nobody was looking at.
+    //
+    // The check is sound because new edges all originate at `self_id`: adding
+    // them can only create cycles that pass THROUGH self_id. A cycle without
+    // self_id therefore pre-existed this request and is not this caller's to fix.
+    //
+    // Pre-existing cycles are still real board damage, so they are logged rather
+    // than swallowed — the caller is unblocked, and the problem stays visible to
+    // whoever owns those cards.
+    let self_tid = internal_id(self_id);
+    Ok(board::detect_cycle(&edges).and_then(|cycle| {
+        let named: Vec<String> = cycle
             .iter()
             .map(|t| {
                 names
@@ -956,13 +978,63 @@ pub fn depends_on_cycle(
                     .cloned()
                     .unwrap_or_else(|| t.as_str().to_string())
             })
-            .collect()
+            .collect();
+        if cycle.contains(&self_tid) {
+            Some(named)
+        } else {
+            tracing::warn!(
+                cycle = %named.join(" -> "),
+                self_id = %self_id,
+                "pre-existing depends_on cycle elsewhere on the board — not blocking this write (AC-335)"
+            );
+            None
+        }
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_cycle_elsewhere_does_not_block_an_unrelated_edge() {
+        // AC-335. GE-473 <-> MHC-256 is a real cycle between two CLOSED cards
+        // owned by other lanes. Adding AC-331 -> AC-330, which shares no node
+        // with it, was refused board-wide as "circular depends_on: GE-473 ->
+        // MHC-256". New edges originate only at self_id, so a cycle without
+        // self_id cannot be this caller's doing.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, depends_on TEXT, deleted INT);
+             INSERT INTO issues VALUES ('GE-473',  '[\"MHC-256\"]', NULL);
+             INSERT INTO issues VALUES ('MHC-256', '[\"GE-473\"]',  NULL);
+             INSERT INTO issues VALUES ('AC-331',  '',               NULL);
+             INSERT INTO issues VALUES ('AC-330',  '',               NULL);",
+        )
+        .unwrap();
+
+        // The unrelated edge must be ALLOWED even though the board has a cycle.
+        let unrelated = depends_on_cycle(&conn, "AC-331", &["AC-330".to_string()]).unwrap();
+        assert!(
+            unrelated.is_none(),
+            "a stale cycle between two other cards blocked an unrelated edge: {unrelated:?}"
+        );
+
+        // CONTROL: a genuinely circular edge MUST still be refused, or this fix
+        // would have removed the protection instead of scoping it.
+        let real = depends_on_cycle(&conn, "AC-330", &["AC-331".to_string()]).unwrap();
+        assert!(
+            real.is_none(),
+            "AC-330 -> AC-331 is not yet a cycle (AC-331 has no deps stored)"
+        );
+        conn.execute("UPDATE issues SET depends_on='[\"AC-330\"]' WHERE id='AC-331'", [])
+            .unwrap();
+        let real = depends_on_cycle(&conn, "AC-330", &["AC-331".to_string()]).unwrap();
+        assert!(
+            real.is_some(),
+            "a real cycle through self_id must still be refused"
+        );
+    }
 
     #[test]
     fn sse_terminal_quota_gives_verified_its_own_floor() {

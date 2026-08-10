@@ -274,6 +274,11 @@ pub fn router(state: AppState) -> Router {
         .merge(invariants_api::routes())
         .merge(crate::runtime_jobs::board_drive::routes())
         .merge(crate::runtime_jobs::autofix::routes())
+        .merge(crate::runtime_jobs::storage::routes())
+        // Every internal background job, its last tick, and a status that can
+        // say STALLED (AMUX-2703). Public like its debug siblings: job names
+        // and timings only.
+        .merge(crate::runtime_jobs::registry::routes())
         // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
         // routed, with which methods" is a GET, not a grep. Public like its
         // debug siblings (route names only, nothing secret).

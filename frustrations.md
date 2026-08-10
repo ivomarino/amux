@@ -2409,3 +2409,59 @@ FIX: The existing guard checks for a peer's modified files in the index. It shou
   between shipping a peer's diff and shipping a build break. Cheaper interim: make the
   auto-build service's failure page name the untracked file, since "cannot find module
   legacy_port" is currently only visible to whoever next compiles.
+
+## CLAUDE.md told every session to make its own 15GB cargo target dir, and the disk filled
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: storage-audit
+CARD: AMUX-2700
+SYMPTOM: The volume reached 741MB free of 1.8TB and transcript writes started failing with
+  ENOSPC while a 50-session fleet was running. The dominant consumer was ~37 per-agent cargo
+  target dirs under `/private/tmp/amux-*target`, 10-15GB each, ~450GB total. They existed
+  because CLAUDE.md's Workflow section said, in as many words: "Use a scratch
+  `CARGO_TARGET_DIR` (e.g. `/tmp/amux-target`) so parallel sessions don't thrash one lock."
+  Every session followed the instruction correctly.
+COST: A full disk on the machine that runs the fleet, an owner alert at ~13:00, and roughly
+  an hour of three sessions' time (parent + this one) spent measuring and deleting. Worse
+  than the deletion time: the first 450GB of deletions freed only ~8GB, so the obvious
+  reading was "we deleted the wrong things" and the natural next action was to delete more —
+  see the sibling entry on Time Machine snapshots.
+FIX: Fixed in this session. The lock the instruction was avoiding is nearly free: measured
+  here, one incremental rebuild is 1.48s and two concurrent ones against the SAME dir finish
+  in 1.65s (1.11x) — cargo's build lock makes the second builder wait and then find the work
+  already done. Because every session builds the same shared checkout, one target dir is a
+  warm cache sessions hand each other, while per-session dirs paid 15GB AND a full rebuild
+  each to avoid a second of waiting. CLAUDE.md now says `CARGO_TARGET_DIR=~/.amux/rust-build-target`
+  and explicitly says never a per-session dir. The generalisable half: this is ethos rule 7's
+  "the sanctioned instruction itself can be the theatre" applied to a resource rather than a
+  command — an instruction that is cheap per session and ruinous per fleet reads as correct
+  to every individual session that follows it, and none of them can see the aggregate.
+
+## Deleting 450GB freed 8GB, because hourly Time Machine snapshots pin every deleted block
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-10
+SESSION: storage-audit
+CARD: AMUX-2701
+SYMPTOM: With the volume at 741MB free, ~450GB of stale cargo target dirs was deleted and
+  `df` moved to 9.0GB free — about 8GB recovered from 450GB deleted. Deleting a further
+  26.8GB moved free space DOWN (8.1Gi -> 6.6Gi). The cause was 24 hourly APFS local Time
+  Machine snapshots spanning 2026-08-09 13:18 to 2026-08-10 12:18: a snapshot pins the
+  blocks of every file deleted after it was taken, so deletion frees nothing until the
+  snapshots age out (24h) or are thinned. They had accumulated because the Time Machine
+  destination ("My Book") is not connected, so nothing ever thinned them. macOS eventually
+  purged all 24 on its own under pressure and free space jumped to 418Gi.
+COST: A wrong conclusion that was already corroborated: two sessions independently read
+  "deleted a lot, freed nothing" as "we deleted the wrong things", whose remedy is deleting
+  MORE — the one action that could not work. It also produced an owner alert asking for a
+  root password (`sudo tmutil thinlocalsnapshots`) that turned out not to be needed, which
+  is a fire alarm spent on a self-resolving condition.
+FIX: Partly fixed: the new autofix `disk` detector puts `tmutil listlocalsnapshots / | wc -l`
+  in the card's evidence with an explicit "READ THIS BEFORE DELETING ANYTHING" note, so the
+  next session sees the discriminator in the place it is already looking rather than having
+  to know APFS semantics. Still open: nothing warns that the TM destination has been absent
+  for long enough to accumulate a full day of local snapshots, which is the actual upstream
+  condition and is invisible until it interacts with a disk-full event.

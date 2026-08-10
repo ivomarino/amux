@@ -17,8 +17,89 @@
 # So the tracked copies are now the ONLY producer. If a generator ever comes
 # back, remove them here in the same commit that adds it (the 2026-08-06 revert
 # explains what a second producer costs).
+#
+# USAGE
+#   ./scripts/install-hooks.sh                 # this repo (both files)
+#   ./scripts/install-hooks.sh /path/to/repo   # ANOTHER checkout: guard only
+#   ./scripts/install-hooks.sh --all           # every checkout that already has it
+#
+# WHY THE OTHER-CHECKOUT MODE EXISTS (2026-08-10). The guard is installed in
+# nine checkouts on this machine; eight of them are not amux and have their own
+# `pre-commit` (a repo-specific hook with the amux shim injected at the top).
+# Only ONE of the nine was reachable by this script, because it resolved
+# `$ROOT` from the CURRENT repo and then read `$ROOT/scripts/git-hooks/` —
+# which exists nowhere but amux. So after the python generator was deleted,
+# every non-amux checkout was frozen on whatever the generator last wrote and
+# nothing could update it: eight stale guards, all still addressing the retired
+# port, with no supported way to fix them. Sources come from the AMUX checkout
+# (where this script lives) and the TARGET is an argument.
+#
+# The foreign mode NEVER writes `pre-commit`. Those files are the other repo's,
+# they carry that repo's own checks (jekyll builds, `pre-commit run`, secret
+# scans), and amux's tracked pre-commit runs Rust/client-JS checks that are
+# meaningless there. Overwriting one would destroy a user's hook as a side
+# effect of a refactor (ethos rule 8) — and it is exactly the mistake this
+# script already made once, in the other direction, by overwriting amux's
+# pre-commit and silently deleting the shim. It reports instead.
 set -e
-ROOT="$(git rev-parse --show-toplevel)"
+# Sources always come from the amux checkout this script lives in, never from
+# the target — that is the whole bug the foreign mode fixes.
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- foreign checkout: install the guard, verify, never touch their pre-commit
+install_guard_only() {
+  local target="$1" fail=0
+  if [ ! -d "$target/.git/hooks" ]; then
+    echo "  SKIP $target — no .git/hooks (not a checkout, or a linked worktree)" >&2
+    return 0
+  fi
+  install -m 0755 "$SRC/scripts/git-hooks/amux-staged-guard" "$target/.git/hooks/amux-staged-guard"
+  if cmp -s "$SRC/scripts/git-hooks/amux-staged-guard" "$target/.git/hooks/amux-staged-guard"; then
+    echo "  ok   $target/.git/hooks/amux-staged-guard matches the tracked source"
+  else
+    echo "  FAIL $target/.git/hooks/amux-staged-guard differs after install" >&2
+    fail=1
+  fi
+  # The shim is the whole chain: an installed guard nothing calls is a file, not
+  # a guard. We do not write their pre-commit, so all we can do is check it and
+  # hand over the exact lines — which is the honest move, not a silent no-op.
+  local pc="$target/.git/hooks/pre-commit"
+  if [ -f "$pc" ] && grep -q 'amux-staged-guard' "$pc" && grep -q '"\$g" || exit 1' "$pc"; then
+    echo "  ok   $target pre-commit calls amux-staged-guard"
+  else
+    echo "  WARN $target pre-commit does NOT call amux-staged-guard — sweep protection is OFF there." >&2
+    echo "       This script will not edit another repo's pre-commit. Add these 3 lines near the top:" >&2
+    echo '         g="$(dirname -- "$0")/amux-staged-guard"' >&2
+    echo '         if [ -x "$g" ]; then "$g" || exit 1; fi' >&2
+    fail=1
+  fi
+  return $fail
+}
+
+if [ "${1:-}" = "--all" ]; then
+  # Bounded scan, and it PRINTS its bounds: a discovery step that silently
+  # missed a checkout would report "all clear" over an unpatched hook, which is
+  # the same class of false-green as a grep that could not have matched.
+  roots="${AMUX_HOOK_SCAN_ROOTS:-$HOME/Dev}"
+  echo "scanning for installed amux guards under: $roots (override: AMUX_HOOK_SCAN_ROOTS)"
+  allfail=0
+  found=0
+  # shellcheck disable=SC2086
+  while IFS= read -r g; do
+    repo="${g%/.git/hooks/amux-staged-guard}"
+    found=$((found + 1))
+    if [ "$repo" = "$SRC" ]; then continue; fi   # self is handled below
+    install_guard_only "$repo" || allfail=1
+  done < <(find $roots -maxdepth 6 -type f -path '*/.git/hooks/amux-staged-guard' -not -path '*/node_modules/*' 2>/dev/null | sort)
+  echo "  ($found checkouts had the guard installed)"
+  [ "$allfail" -eq 0 ] || echo "one or more checkouts need attention (see WARN/FAIL above)" >&2
+  # fall through to install into the amux checkout itself
+elif [ -n "${1:-}" ]; then
+  install_guard_only "$(cd "$1" && pwd)"
+  exit $?
+fi
+
+ROOT="$SRC"
 
 install -m 0755 "$ROOT/scripts/git-hooks/pre-commit" "$ROOT/.git/hooks/pre-commit"
 install -m 0755 "$ROOT/scripts/git-hooks/amux-staged-guard" "$ROOT/.git/hooks/amux-staged-guard"
@@ -54,7 +135,17 @@ fi
 # fails open and (before 2026-08-09) said nothing: POST /api/git/staged-guard
 # answered 405 for the whole rust cutover, ~1,147 calls an hour, every one
 # swallowed. Report it here, where someone is already looking at hooks.
-URL="${AMUX_URL:-https://localhost:8824}/api/git/staged-guard"
+#
+# The base URL comes from the guard's OWN resolver, imported rather than
+# re-spelled: it self-heals a stale inherited `AMUX_URL` (see the docstring on
+# `amux_base_url`). Checking a different address than the guard will use would
+# make this line report on a server the guard never talks to.
+BASE="$(python3 -c "
+import importlib.machinery, sys
+m = importlib.machinery.SourceFileLoader('amux_guard', '$ROOT/scripts/git-hooks/amux-staged-guard').load_module()
+print(m.amux_base_url())" 2>/dev/null)" || BASE=""
+[ -n "$BASE" ] || BASE="${AMUX_URL:-https://localhost:8824}"
+URL="$BASE/api/git/staged-guard"
 code=$(curl -sk -o /dev/null -w '%{http_code}' -m 3 -X POST \
         -H 'Content-Type: application/json' -d '{}' "$URL" 2>/dev/null || echo 000)
 case "$code" in

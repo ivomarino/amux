@@ -211,8 +211,26 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   nothing (this cost a wrong "it's live" call on AMUX-4).
 - Syntax/type gates after edits: `cargo check --workspace` (and `cargo clippy
   --workspace --all-targets -- -D warnings` before pushing — CI denies warnings).
-  Tests: `cargo test -p amux-server`. Use a scratch `CARGO_TARGET_DIR` (e.g.
-  `/tmp/amux-target`) so parallel sessions don't thrash one lock.
+  Tests: `cargo test -p amux-server`.
+- **ONE shared build dir: `CARGO_TARGET_DIR=~/.amux/rust-build-target`. Never a
+  per-session scratch dir.** This line used to say the opposite ("use a scratch
+  `CARGO_TARGET_DIR` so parallel sessions don't thrash one lock") and that
+  instruction filled the disk: a debug target tree is 10-15GB, ~37 of them
+  accumulated under `/private/tmp/amux-*target`, and on 2026-08-10 the volume hit
+  741MB free with a 50-session fleet running and writes failing with ENOSPC.
+  The lock it was avoiding costs almost nothing — measured on this machine, an
+  incremental rebuild is 1.48s alone and two concurrent ones finish in 1.65s
+  (1.11x), because cargo's build lock makes the second builder WAIT and then find
+  the work already done. Every session builds the same checkout, so a shared
+  target dir is a warm cache they hand each other, not a conflict: per-session
+  dirs paid 15GB *and* a full rebuild each to avoid a second of waiting.
+  Set it once in your shell rather than per command:
+  ```bash
+  export CARGO_TARGET_DIR=~/.amux/rust-build-target
+  ```
+  If you find a stale `/private/tmp/*target` dir with no live build in it
+  (`lsof +D <dir>` empty and mtime hours old), delete it — it is somebody's
+  abandoned 15GB.
 - **Bracket any timing/availability measurement with `/health`'s `build`.** The builder
   swaps the running binary whenever ANYONE's commit lands — on this shared checkout that
   is routinely not you, with your own tree clean and nothing in your session hinting the

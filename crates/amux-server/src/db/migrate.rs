@@ -182,13 +182,32 @@ fn is_live_db(db_path: &std::path::Path, home: Option<&std::path::Path>) -> bool
 /// is untouched. Refusing too eagerly would be worse than the hazard: a server
 /// that will not start is a live outage, and this must never be that.
 fn guard_live_db(db_path: &std::path::Path, pending: &[&str]) -> anyhow::Result<()> {
-    if pending.is_empty() || truthy_env("AMUX_ALLOW_LIVE_DB") {
-        return Ok(());
-    }
     let Ok(exe) = std::env::current_exe() else {
         return Ok(()); // cannot tell what we are: do not block a real server
     };
-    if !is_cargo_target_build(&exe) {
+    guard_live_db_with_exe(db_path, pending, &exe)
+}
+
+/// The guard with its one environmental input injected.
+///
+/// Split out so the positive test can supply a cargo-target-shaped path
+/// instead of asserting something about where IT happens to have been built.
+/// That assertion was a real trap: `is_cargo_target_build` deliberately does
+/// NOT match `~/.amux/rust-build-target/` (it needs a leading-slash
+/// `/target/`), which is exactly the shared build dir the workflow tells every
+/// session to use — so running the sanctioned command failed the test, on code
+/// that was entirely correct. A test whose precondition depends on the build
+/// location cannot survive a change in build location, and the fleet is
+/// changing its build location precisely to stop making 15GB target trees.
+fn guard_live_db_with_exe(
+    db_path: &std::path::Path,
+    pending: &[&str],
+    exe: &std::path::Path,
+) -> anyhow::Result<()> {
+    if pending.is_empty() || truthy_env("AMUX_ALLOW_LIVE_DB") {
+        return Ok(());
+    }
+    if !is_cargo_target_build(exe) {
         return Ok(());
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -430,20 +449,22 @@ mod guard_tests {
     // the real predicate rather than a stubbed one.
     #[test]
     fn it_actually_refuses_a_pending_migration_against_the_live_db() {
-        let exe = std::env::current_exe().expect("current_exe");
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             panic!("HOME unset — this test cannot express its precondition, \
                     which is a broken test, not a passing one");
         };
-        assert!(
-            is_cargo_target_build(&exe),
-            "precondition: the test binary should live under a cargo target dir, got {}",
-            exe.display()
-        );
+        // A cargo-target-shaped path, supplied rather than inherited: the real
+        // hazard is a binary built from a working tree, and that shape is a
+        // property of the PATH, not of wherever this test binary was written.
+        // (Asserting on `current_exe()` made the test fail under
+        // CARGO_TARGET_DIR=~/.amux/rust-build-target — the shared build dir the
+        // workflow now standardises on — while the guard itself was correct.)
+        let exe = PathBuf::from("/Users/someone/Dev/amux/target/debug/deps/amux_server-abc123");
+        assert!(is_cargo_target_build(&exe), "the fixture must be the shape the guard looks for");
 
         let live = home.join(".amux").join("amux.db");
         std::env::remove_var("AMUX_ALLOW_LIVE_DB");
-        let err = guard_live_db(&live, &["0099_pretend_uncommitted"])
+        let err = guard_live_db_with_exe(&live, &["0099_pretend_uncommitted"], &exe)
             .expect_err("the guard MUST refuse a pending migration against the live DB");
         let msg = err.to_string();
         assert!(msg.contains("LIVE database"), "{msg}");
@@ -457,8 +478,12 @@ mod guard_tests {
         // lie and the guard is unwalkable (the AMUX-2325 shape: a constraint
         // whose documented exit does not exist gets routed around by something
         // worse). Same test, so nothing can race on this env var.
+        // Injected exe here too. With `current_exe()` this assertion passed
+        // VACUOUSLY under a target dir outside the checkout: the guard returns
+        // Ok at the is_cargo_target_build check, before it ever reads the env
+        // var, so it would have gone green with the escape hatch deleted.
         std::env::set_var("AMUX_ALLOW_LIVE_DB", "1");
-        let permitted = guard_live_db(&live, &["0099_pretend_uncommitted"]);
+        let permitted = guard_live_db_with_exe(&live, &["0099_pretend_uncommitted"], &exe);
         std::env::remove_var("AMUX_ALLOW_LIVE_DB");
         assert!(
             permitted.is_ok(),
