@@ -21,10 +21,34 @@ use std::path::{Path, PathBuf};
 /// depends on this default.
 ///
 /// The CLIENT default deliberately differs (`DEFAULT_CLIENT_URL` in amux-cli
-/// points at 8822): a client's job is to reach the server that IS running, and
-/// pointing it here is what made every bare `amux-rs` invocation fail with a
-/// connection error indistinguishable from the server being down (AMUX-2672).
+/// points at the installed port, 8824): a client's job is to reach the server
+/// that IS running, and pointing it here is what made every bare `amux-rs`
+/// invocation fail with a connection error indistinguishable from the server
+/// being down (AMUX-2672).
 pub const DEFAULT_PORT: u16 = 8823;
+
+/// The port THIS server is actually answering on — the one a client should be
+/// told to call.
+///
+/// Reads the same `AMUX_RS_PORT` that [`ServerConfig::load`] does, which is
+/// safe from anywhere because that load exports server.env into the process env
+/// (setdefault) before anything else runs. Deliberately NOT the legacy port and
+/// NOT a literal.
+///
+/// This exists because the literal was the bug. `session_verbs` hardcoded
+/// `AMUX_URL=https://localhost:8822` into every tmux lane it started, which
+/// pinned two deployments to one number at once: the local install (8824) could
+/// not retire the legacy address while new sessions kept minting it, and the
+/// cloud image had to bind 8822 *because* of the hardcode — its Dockerfile said
+/// so in a comment, naming this exact line. One env-derived accessor lets each
+/// deployment answer for itself, with no build-time branch (the single-codebase
+/// rule) and nothing to keep in step.
+pub fn canonical_port() -> u16 {
+    std::env::var("AMUX_RS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {

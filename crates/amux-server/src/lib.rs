@@ -7,6 +7,7 @@
 pub mod api;
 pub mod backend;
 pub mod config;
+pub mod legacy_port;
 pub mod db;
 pub mod integrations;
 pub mod invariants;
@@ -245,6 +246,15 @@ async fn async_main() {
     // three sweeps that rule exists to prevent.
     drop(runtime_jobs::commit_nudge::spawn(state.clone()));
 
+    // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
+    // purpose: the thing that watches for breakage must not share fate with
+    // the thing that breaks, so nothing in it touches a pane, a send or a turn
+    // boundary. It reads SQLite and writes a board card; `board_drive` above
+    // then hands that card to a lane through the delivery path that already
+    // exists. If every worker in the fleet is dead, the cards still get filed
+    // and wait. Noticing is infrastructure; fixing is work.
+    drop(runtime_jobs::autofix::spawn(state.clone()));
+
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
     // sites, so setting the gate armed a loop nobody started. Nothing errored,
@@ -410,6 +420,14 @@ async fn async_main() {
     // same router, same TLS, same auth. Gated on AMUX_RS_LEGACY_PORT so a
     // deliberate python resurrection (unset it) gets the port back without a
     // code change. Set to 8822 in ~/.amux/server.env.
+    //
+    // THE ADDRESS IS RETIRED (2026-08-10); only these carried-over processes
+    // keep it alive. Every config, doc, CLI default and newly-spawned session
+    // now uses the canonical port (AMUX_RS_PORT, 8824 locally). This bind is
+    // therefore a countdown, not a feature — see `legacy_port` for the exit
+    // condition and `GET /api/debug/legacy-port` for the number that decides
+    // it. DO NOT drop this bind on the assumption the fleet has rotated; read
+    // the counter, because being wrong breaks ~60 live sessions at once.
     if let Some(legacy_port) = std::env::var("AMUX_RS_LEGACY_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
@@ -419,7 +437,14 @@ async fn async_main() {
             axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg.clone()),
             format!("localhost:{legacy_port}"),
         );
-        let legacy_app = app.clone();
+        // Counted by LAYER on this clone, so a hit means the request physically
+        // arrived on the legacy socket — a Host-header sniff would also count
+        // requests that merely SAY 8822 while arriving on the canonical port.
+        let legacy_app = app
+            .clone()
+            .layer(axum::middleware::from_fn(legacy_port::count));
+        legacy_port::arm(legacy_port);
+        tokio::spawn(legacy_port::run_reporter());
         tracing::info!(%legacy_addr, "listening on LEGACY port (fleet AMUX_URL compatibility)");
         tokio::spawn(async move {
             if let Err(e) = axum_server::bind(legacy_addr)
