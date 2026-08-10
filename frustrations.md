@@ -2731,3 +2731,69 @@ FIX: two halves. (1) The staged-guard must not fail open silently — AMUX-2807;
   server, the unguarded commit should at least be COUNTED durably, or the guard is decoration exactly
   when it matters. (2) `commit -a` on a shared checkout is the hazard itself; the guard should refuse
   it, not merely warn, when the staged set spans files the committing session never touched.
+
+## Browser API drove the user's live Chrome and said ok:true for every keystroke
+AREA: browser
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-cloud
+CARD: AC-336
+SYMPTOM: `POST /api/browser/start {"profile":"default","url":"https://cloud.amux.io/sign-in"}` returned
+  {ok:true, pid:90649, cdp_port:65059}. That pid was already dead: 10 Chrome processes share
+  user-data-dir=/Users/ethan/.amux/playwright-auth/profile and hold SingletonLock, so Chrome's
+  singleton handoff exits the new process and reuses the running one — the user's own browser.
+  `GET /api/browser/status` then reported running:true on a DIFFERENT port (65140) listing the user's
+  tabs, and `POST /api/browser/action` eval returned location.href =
+  http://localhost:4177/solutions/creative-dna. `type` returned ok:true at every step. The endpoint's
+  own hint says "They never attach to a browser this server did not launch", which is precisely what
+  it did.
+COST: I typed AMUX_GODMODE_PASSWORD and pressed Enter into the user's live Chrome believing I was
+  driving an amux-owned browser. The frontmost page had no text inputs so it almost certainly went
+  nowhere, but a god-mode credential now needs rotating on "almost certainly". Roughly 40 minutes lost,
+  and the god-mode UI verification (AC-332) is still not done because the subsystem cannot be trusted
+  to target the browser it says it launched.
+FIX: start must confirm the pid it returns is alive AND that its own cdp_port answers, failing loudly
+  when the singleton hands off — returning a dead pid as ok:true is the primary defect. status/action
+  must bind to the port start launched and refuse any other. Default to a per-session profile dir so
+  two sessions cannot contend for one lock. Control proving the diagnosis: an isolated profile
+  (its own user_data_dir) survives, its CDP answers, and eval sees the URL actually requested.
+
+## A guard on status.running cannot catch this, because status is the thing that lies
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-cloud
+CARD: AC-336
+SYMPTOM: After discovering the fallback above I added a liveness assertion that refused to act unless
+  `GET /api/browser/status` reported running:true. It passed, and the very next eval still executed
+  against the user's Chrome at localhost:4177. The guard could not fail: it consulted the same
+  component that had already substituted a different browser.
+COST: One wasted round of "now it is safe" — I ran a second credential sequence behind a guard that
+  was structurally incapable of detecting the failure it was written for. What actually caught it was
+  a cheap independent probe: eval `location.href` and compare against the URL I had asked start for.
+FIX: Verify from a source that is not the suspect component. For this API the discriminating check is
+  two lines — ask the launched cdp_port for /json/list, ask /action what location.href is, and require
+  they agree. Generally: a guard that reads the lying instrument inherits the lie (ethos rule 7).
+
+## Shared checkout swept my board_store fix and its test into another lane's commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-cloud
+CARD: AMUX-2807
+SYMPTOM: AC-335 (depends_on_cycle scoped to cycles containing self_id) plus its falsifiable test
+  landed inside e188b0e, amux's "feat(storage): retention on seven unbounded tables..." commit, which
+  is unrelated to the board. `git status` came back clean on a file I had just edited. Found only by
+  `git log -S "pre-existing depends_on cycle elsewhere"`. amux reports the mirror the same day: their
+  AMUX-2785 steering fix went into 70dc3a8, a commit they did not write.
+COST: Not lost work — fix and test both intact — but the commit carries a change its author cannot
+  explain, and they will be the one asked about it. Two sweeps in opposite directions in one day.
+  My AC-335 also bounced twice on other lanes' compile errors before landing, since the pre-commit
+  hook runs cargo check --workspace against a tree four lanes are editing.
+FIX: The staged-guard is the designed prevention and it was DOWN for both events — it printed
+  "NOT ENFORCED — could not reach the amux server" against 8822, then 8824, timing out both times,
+  so cross-session sweep protection was off exactly when four lanes were committing into one tree.
+  Being loud about it is right; being down is the hazard it exists for. See AMUX-2807.
