@@ -104,7 +104,7 @@ fn mem_file(name: &str) -> PathBuf {
 }
 
 /// Python's `_VALID_SESSION_NAME_RE` (py:25529): `^[a-zA-Z0-9_.\-]+$`.
-fn valid_session_name(name: &str) -> bool {
+pub(crate) fn valid_session_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -2628,7 +2628,7 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
     }
 }
 
-async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
+pub(crate) async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
     send_text_inner(state, name, text, defer_if_busy, false, false, false).await
 }
 
