@@ -15,6 +15,45 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use sha2::Digest;
 
+
+/// The public iCal URL the dashboard's Subscribe button shows.
+///
+/// This read `AMUX_S3_ICAL_URL` — A VARIABLE NOTHING SETS. The documented and
+/// actually-configured spelling is `AMUX_S3_BUCKET` + `AMUX_S3_KEY`
+/// (+ `AMUX_S3_REGION`), which is what CLAUDE.md tells operators to put in
+/// server.env and what the feed uploader already uses. So the button rendered
+/// an empty string on a machine with the feed fully configured and working, and
+/// there was no way to subscribe Apple Calendar from the dashboard at all
+/// (AMUX-2772).
+///
+/// An explicit `AMUX_S3_ICAL_URL` still wins, so an operator who publishes the
+/// feed somewhere other than S3 is not overridden. Otherwise it is composed from
+/// the vars that exist.
+///
+/// The composed value is a SECRET-BEARING URL: the key is a random token and the
+/// bucket denies listing, so the token IS the access control. It is injected
+/// into a localhost, auth-gated page — the same place it has always been shown —
+/// and must never be logged, committed, or written to a board card.
+fn ical_subscribe_url() -> String {
+    if let Ok(u) = std::env::var("AMUX_S3_ICAL_URL") {
+        if !u.trim().is_empty() {
+            return u.trim().to_string();
+        }
+    }
+    let bucket = std::env::var("AMUX_S3_BUCKET").unwrap_or_default();
+    let key = std::env::var("AMUX_S3_KEY").unwrap_or_default();
+    if bucket.trim().is_empty() || key.trim().is_empty() {
+        return String::new(); // not configured: an honest empty, not a broken URL
+    }
+    let region = std::env::var("AMUX_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+    format!(
+        "https://{}.s3.{}.amazonaws.com/{}",
+        bucket.trim(),
+        region.trim(),
+        key.trim().trim_start_matches('/')
+    )
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(index))
@@ -120,7 +159,7 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
          window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};</script>\n",
-        jstr(&std::env::var("AMUX_S3_ICAL_URL").unwrap_or_default()),
+        jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
         jstr(&std::env::var("POSTHOG_KEY").unwrap_or_default()),
