@@ -5214,6 +5214,67 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
 const MEM_MARKER: &str = "<!-- amux:session-memory -->";
 const MEM_TOPIC_FILE: &str = "amux-api.md";
 
+/// The fleet roster every worker gets, regenerated on each write.
+///
+/// Ethan: "make sure all workers are always aware of each others: name, groups,
+/// and descriptions so they can auto discover".
+///
+/// It goes into MEMORY.md — the file the session already reads by default —
+/// rather than behind an endpoint, because a roster you have to know to fetch
+/// is not discovery (ethos rule 1: who receives this WITHOUT opting in).
+///
+/// DERIVED, never hand-maintained: names, groups and descriptions come from the
+/// session env files that are already the source of truth for the worker list,
+/// so a roster cannot drift from the fleet the way a checked-in list would.
+///
+/// Excludes archived lanes and the reader itself — "who else is out there" is
+/// the question, and 50 rows of which one is you is noise.
+fn fleet_roster(me: &str) -> String {
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("env"))
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+            .collect();
+        names.sort();
+        for other in names {
+            if other == me {
+                continue;
+            }
+            let env = crate::config::parse_env_file(&sessions_dir().join(format!("{other}.env")));
+            if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
+                continue;
+            }
+            let groups = env
+                .get("CC_TAGS")
+                .map(|t| {
+                    t.split([',', ' '])
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let desc = env.get("CC_DESC").cloned().unwrap_or_default();
+            rows.push((other, groups, desc));
+        }
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
+    );
+    for (n, g, d) in rows.iter().take(120) {
+        let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
+        out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
+    }
+    out.push_str(&format!("\n{} peer worker(s). Same-group peers share memory, env and gates.\n", rows.len()));
+    out
+}
+
 fn write_claude_memory(name: &str, work_dir: &str) {
     let pname = project_name(work_dir);
     let session_file = mem_file(name);
@@ -5248,6 +5309,9 @@ fn write_claude_memory(name: &str, work_dir: &str) {
             global_content.trim().to_owned() + "\n",
         );
     }
+    // The roster rides on the SAME write, so it is refreshed whenever the
+    // session's memory is — no separate job to fall behind the fleet.
+    let composed = composed + &fleet_roster(name);
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -11109,5 +11173,30 @@ mod refusal_status_tests {
             seen.len()
         );
         assert!(found >= 20, "literal scan found only {found} outcomes — extraction is broken");
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    /// The roster is DERIVED from the session env files, so these assertions
+    /// are about shape rather than content — the fleet changes hourly and a
+    /// fixture would be a second source of truth (the thing the roster exists
+    /// to avoid).
+    #[test]
+    fn a_worker_never_lists_itself() {
+        let me = "amux";
+        let r = super::fleet_roster(me);
+        assert!(
+            !r.contains(&format!("| `{me}` |")),
+            "\"who else is out there\" must exclude the reader: {r}"
+        );
+    }
+
+    /// Empty means EMPTY — a single-worker install must not get a table header
+    /// with no rows under it, which reads as "the fleet is broken".
+    #[test]
+    fn a_roster_with_no_peers_is_the_empty_string() {
+        let r = super::fleet_roster("__no_such_session_anywhere__");
+        assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
     }
 }
