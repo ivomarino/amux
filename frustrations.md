@@ -2022,3 +2022,67 @@ FIX: Not a rule ("remember to `git add` specific files" is the kind of rule that
   the writer knowable — or per-lane git worktrees, which the harness already supports.
   CLAUDE.md's Deploy section documents the REBASE version of this hazard; this is the
   `git add -A` version, and it needs the same warning.
+
+## `amux-rs board list | head` panicked with 254 bytes of Rust backtrace noise
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux-rust
+CARD: AMUX-2653
+SYMPTOM: `amux-rs board list | head -2` exited 101 and printed "thread 'main'
+  panicked at library/std/src/io/stdio.rs:1165: failed printing to stdout: Broken
+  pipe (os error 32)" plus a RUST_BACKTRACE note. Piping a verb to `head` is the
+  most ordinary thing a user does with a CLI.
+COST: Low per occurrence, but it makes every `| head` look like amux crashed, and
+  it trains you to distrust exit codes from the CLI — which is expensive later,
+  because a real failure and a pipe close were byte-identical from the caller.
+FIX: e3acb7d — restore SIG_DFL for SIGPIPE once in main() instead of converting
+  ~30 println! sites. Process-wide fault, process-wide fix: covers every verb
+  added later too. Regression test crates/amux-cli/tests/sigpipe.rs, shown to
+  fail with the call removed.
+
+## A CLI probe measured a connection failure and it read as the bug reproducing
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-rust
+CARD: AMUX-2672
+SYMPTOM: While reproducing AMUX-2653, every verb returned exit 1 whether piped or
+  not. That reads as "the panic is everywhere". It was not: amux-rs defaults to
+  https://localhost:8823, nothing listens there (8822 and 8824 both answer
+  /health), so each verb died on connect before writing a byte. The real bug only
+  appeared once AMUX_RS_URL was set by hand — and then only for `board list`,
+  because the other verbs are too short to fill the pipe buffer.
+COST: ~20 minutes and one wrong intermediate conclusion, which was then corrected
+  only because 101 vs 1 did not match the card's claim. A less specific card would
+  have let the wrong reading stand.
+FIX: AMUX-2672 — point the default at a port that exists. The general shape is the
+  one already in ethos rule 7: a probe whose failure mode is indistinguishable from
+  the fault it is hunting will corroborate whatever you already believe. A
+  connection error and an application error should not both surface as exit 1 with
+  no discriminator.
+
+## A stderr capture moved stdout off the pipe, so nothing could break
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-rust
+CARD: AMUX-2653
+SYMPTOM: Comparing panic noise before/after the fix with
+  `amux-rs board list 2>&1 >/dev/null | head -2` returned EMPTY for both binaries.
+  The redirection order sends stderr to the pipe and stdout to /dev/null — so
+  stdout was never attached to a pipe, no EPIPE was possible, and the pre-fix
+  binary could not panic. Both looked identically silent, which reads as "no
+  difference, fine".
+COST: Would have certified the fix on a probe that could not fail, in the same
+  session that ran the pre-fix binary and saw exit 101 ten minutes earlier. Caught
+  only because "0 bytes of panic noise BEFORE the fix" contradicted a measurement
+  already in hand.
+FIX: Capture stderr to a FILE and leave stdout on the pipe
+  (`cmd 2>err.txt | head`). Generally: when a probe reports no difference between
+  a known-broken and a known-fixed artifact, the probe is the candidate before the
+  conclusion is. This is the "loud wrong probe" from ethos rule 7 — it answered,
+  and its answer was agreeable.
