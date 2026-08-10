@@ -7410,6 +7410,31 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
         s.chars().take(40).collect()
     };
     let detail: String = body_str(body, "detail").chars().take(200).collect();
+    // AMUX-2676. The harness knows its own model and token spend; amux does
+    // not, and the card's `active_model`/`tokens` have been hardcoded empty
+    // fleet-wide (48/48) since the python scanner that held them in memory was
+    // retired. Accepting them HERE rather than adding a scraper is D1's stated
+    // exit: a better harness reports better, with no amux change.
+    //
+    // ABSENT != EMPTY. A heartbeat that carries no model must not wipe one a
+    // previous report established, or the field would flicker on every
+    // tool-hook fire. Only a present, non-empty value overwrites.
+    let model_opt: Option<String> = {
+        let m = body_str(body, "model");
+        let m: String = m.trim().chars().take(60).collect();
+        (!m.is_empty()).then_some(m)
+    };
+    let tokens_opt: Option<Value> = body.get("tokens").and_then(|t| {
+        let get = |k: &str| t.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
+        let (i, o) = (get("input"), get("output"));
+        let total = match t.get("total").and_then(Value::as_i64) {
+            Some(v) if v > 0 => v,
+            _ => i + o,
+        };
+        // All-zero is what an uninstrumented caller sends; recording it would
+        // replace "not reported" with a confident zero.
+        (total > 0).then(|| json!({"input": i, "output": o, "total": total}))
+    });
     let name_s = name.to_string();
     let st2 = st.clone();
     let src2 = src.clone();
@@ -7436,7 +7461,13 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
             // the caller chose. Keeping both is the point — when a report is
             // wrong, "who wrote this" must be answerable from the store
             // itself rather than reconstructed from access logs nobody kept.
+            // Carry forward anything this report did not carry (see
+            // ABSENT != EMPTY above): the model does not change per tool call.
+            let prev_model = reports[&name_s]["model"].clone();
+            let prev_tokens = reports[&name_s]["tokens"].clone();
             reports[&name_s] = json!({
+                "model": model_opt.clone().map(Value::from).unwrap_or(prev_model),
+                "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
                 "state": st2, "detail": detail, "source": src2,
                 "origin": origin2, "ts": now_f64(),
             });

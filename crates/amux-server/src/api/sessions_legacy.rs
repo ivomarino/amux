@@ -1258,6 +1258,17 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         "age_s": ((signals.now - ts).max(0.0)) as i64,
                         "source": rep["source"].as_str().unwrap_or(""),
                     });
+                    // AMUX-2676: a REPORTED model/token count replaces the
+                    // honest-empty above. Still never invented — the empty
+                    // stays empty unless the harness itself said otherwise,
+                    // which is the whole point of preferring the report
+                    // endpoint over a scraper.
+                    if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
+                        v["active_model"] = json!(m);
+                    }
+                    if rep["tokens"].is_object() {
+                        v["tokens"] = rep["tokens"].clone();
+                    }
                 }
             }
         }

@@ -255,3 +255,89 @@ async fn this_suite_cannot_reach_the_live_amux_home() {
         "the store must live inside the temp home, got {real_db:?} vs {real_set:?}"
     );
 }
+
+/// AMUX-2676: the harness can report its own model and token spend.
+///
+/// Ethan, 01:54: "this worker says working but is not doing anything." It was
+/// working; the card just had nothing behind the badge — `active_model` and
+/// `tokens` were hardcoded empty on 48/48 running sessions since the python
+/// scanner that held them in memory retired. Accepting them on the report
+/// endpoint is D1's exit: the harness states its own facts, and a better
+/// harness improves the card with no amux change.
+#[tokio::test]
+async fn a_report_can_carry_the_model_and_token_spend() {
+    let lane = "lane-model";
+    let (app, store) = app(&[lane]);
+    let (st, _) = post(
+        &app,
+        &format!("/api/sessions/{lane}/report"),
+        json!({
+            "state": "active", "source": "prompt-hook",
+            "model": "claude-opus-5",
+            "tokens": {"input": 1200, "output": 340}
+        }),
+        &[("X-Amux-Session", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let rep = stored_report(&store, lane);
+    assert_eq!(rep["model"], json!("claude-opus-5"), "{rep}");
+    // total is derived when the caller omits it — a hook should not have to do
+    // arithmetic to be useful.
+    assert_eq!(rep["tokens"]["total"], json!(1540), "{rep}");
+}
+
+/// ABSENT IS NOT EMPTY — the subtle one, and the reason this is not a plain
+/// overwrite.
+///
+/// tool-hook fires on EVERY tool call and carries no model. If a heartbeat
+/// blanked the field, the model would appear and vanish many times a minute:
+/// worse than never showing it, because it would look like the model kept
+/// changing. Only a present, non-empty value overwrites.
+#[tokio::test]
+async fn a_heartbeat_without_a_model_does_not_erase_the_one_already_reported() {
+    let lane = "lane-carry";
+    let (app, store) = app(&[lane]);
+    post(
+        &app,
+        &format!("/api/sessions/{lane}/report"),
+        json!({"state": "active", "source": "prompt-hook", "model": "claude-opus-5",
+               "tokens": {"input": 10, "output": 5}}),
+        &[("X-Amux-Session", lane)],
+    )
+    .await;
+    // A bare heartbeat, exactly as the shipped tool-hook sends it today.
+    let (st, _) = post(
+        &app,
+        &format!("/api/sessions/{lane}/report"),
+        json!({"state": "active", "source": "tool-hook"}),
+        &[("X-Amux-Session", lane)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let rep = stored_report(&store, lane);
+    assert_eq!(rep["model"], json!("claude-opus-5"), "model was erased: {rep}");
+    assert_eq!(rep["tokens"]["total"], json!(15), "tokens were erased: {rep}");
+}
+
+/// An all-zero token payload is what an UNINSTRUMENTED caller sends. Recording
+/// it would replace "not reported" with a confident zero — the same class of
+/// mislabelling that made the card claim "working" with no evidence.
+#[tokio::test]
+async fn an_all_zero_token_payload_is_not_recorded_as_a_measurement() {
+    let lane = "lane-zero";
+    let (app, store) = app(&[lane]);
+    post(
+        &app,
+        &format!("/api/sessions/{lane}/report"),
+        json!({"state": "active", "source": "prompt-hook",
+               "tokens": {"input": 0, "output": 0, "total": 0}}),
+        &[("X-Amux-Session", lane)],
+    )
+    .await;
+    let rep = stored_report(&store, lane);
+    assert!(
+        !rep["tokens"].is_object(),
+        "an all-zero payload must not be stored as a measurement: {rep}"
+    );
+}
