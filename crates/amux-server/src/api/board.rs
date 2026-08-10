@@ -615,16 +615,40 @@ fn hhmm() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
-/// The verified caller identity from `X-Amux-Session` (AMUX-1768: provenance
-/// is the header, never body text). Returns (core actor, log display name).
-/// No worker registry lookup exists yet, so a named caller maps to
+/// The verified caller identity from the attribution header (AMUX-1768:
+/// provenance is the header, never body text). Returns (core actor, log display
+/// name). No worker registry lookup exists yet, so a named caller maps to
 /// `Actor::System{component: <name>}` — honest about being unverified-as-a-
 /// Worker while still carrying the name into every audit line.
+///
+/// BOTH SPELLINGS, and this module was the only one that took just one (AC-322).
+/// `X-Amux-Worker` is canonical and `X-Amux-Session` is still honored — the rule
+/// every other module already implements via [`crate::api::groups::hdr_worker`]
+/// (groups, session_verbs, schedules, email, alerts, git_guard). board.rs read
+/// `x-amux-session` alone, and the installed `amux` CLI is the bash script,
+/// whose 14 board-path PATCH sites all send `X-Amux-Worker`. So a correctly
+/// attributed CLI call was byte-identical to an anonymous one HERE and nowhere
+/// else, which broke two things at once:
+///
+///   1. `amux board <status> --force` was unwalkable. The force check below
+///      refuses `api-anonymous`, so the sanctioned CLI could not satisfy the
+///      attribution requirement force demands, and its own error told the caller
+///      to "use the CLI" — which is what they had done. That is ethos rule 6
+///      exactly: a constraint whose sanctioned escape is unwalkable from the
+///      audited path gets walked from an unaudited one (a hand-rolled curl,
+///      which is where unattributed writes come from in the first place).
+///   2. The cross-lane ARCHIVE guard (AMUX-2492) was blind to every bash-CLI
+///      caller. `caller_lane` derives from this same name, so it was empty for
+///      all of them, and an empty caller_lane disables the guard — meaning the
+///      guard that stops one lane archiving another lane's card has been open
+///      for the entire installed-CLI population, silently.
+///
+/// Fixed at the seam rather than at the CLI's call sites: one resolver here
+/// fixes every already-installed CLI copy at once, and closes both effects
+/// together, whereas patching curl lines fixes only the machines that upgrade.
 fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
-    match headers
-        .get("x-amux-session")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
+    match Some(crate::api::groups::hdr_worker(headers))
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
         Some(name) => (
@@ -1294,6 +1318,13 @@ fn gate_409(
 /// content as the side effect of a tidy-up button is the ethos-rule-8 failure.
 pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (_, actor) = actor_from_headers(&headers);
+    // HOW MANY, not merely "ok" (ethos rule 4). A bare success is
+    // indistinguishable from the dead button this card is about: both leave
+    // the caller with no way to tell "archived 957" from "matched nothing".
+    // The count is the UPDATE's own rowcount, so it cannot drift from what
+    // the write did — and the SPA renders it instead of a silent hide.
+    let slot: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
     let res = state
         .store
         .write_async(move |conn| {
@@ -1302,13 +1333,23 @@ pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Re
                  WHERE status = 'done' AND COALESCE(archived,0) = 0 AND deleted IS NULL",
                 [],
             )?;
+            *slot_w.lock().unwrap() = Some(n as i64);
             Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
         })
         .await;
     match res {
         Ok(_) => {
-            tracing::info!(actor = %actor, "board: cleared done cards (archived)");
-            (StatusCode::OK, Json(json!({"ok": true, "archived": true}))).into_response()
+            let n = slot.lock().unwrap().unwrap_or(0);
+            tracing::info!(actor = %actor, archived = n, "board: cleared done cards (archived)");
+            // `action` travels WITH the count because the count alone loses the
+            // load-bearing fact: these cards still exist. A client that reads
+            // only "archived: 957" must not have to guess whether 957 rows were
+            // destroyed.
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "archived": n, "action": "archived"})),
+            )
+                .into_response()
         }
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,

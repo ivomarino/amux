@@ -323,7 +323,12 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \
 
 <h3>Clearing done items</h3>
 
-<pre><code>curl -sk -X POST https://localhost:8822/api/board/clear-done</code></pre>
+<p>Archives every card whose status is &ldquo;done&rdquo; &mdash; it does not delete them.
+They leave the default board view and stay readable under Archived, and the
+response says how many moved.</p>
+
+<pre><code>curl -sk -X POST https://localhost:8822/api/board/clear-done
+{"ok": true, "archived": 957, "action": "archived"}</code></pre>
 
 <h3>Importing from GitHub</h3>
 
@@ -360,7 +365,7 @@ curl -sk -X PATCH -H 'Content-Type: application/json' \
 <tr><td>PATCH</td><td><code>/api/board/&lt;id&gt;</code></td><td>Update a board item (status, title, desc, etc.)</td></tr>
 <tr><td>DELETE</td><td><code>/api/board/&lt;id&gt;</code></td><td>Delete a board item</td></tr>
 <tr><td>POST</td><td><code>/api/board/&lt;id&gt;/claim</code></td><td>Atomically claim a task for a session</td></tr>
-<tr><td>POST</td><td><code>/api/board/clear-done</code></td><td>Delete all items with status &ldquo;done&rdquo;</td></tr>
+<tr><td>POST</td><td><code>/api/board/clear-done</code></td><td>Archive every item with status &ldquo;done&rdquo; (recoverable; returns how many)</td></tr>
 <tr><td>POST</td><td><code>/api/board/statuses</code></td><td>Add a custom status column</td></tr>
 </tbody>
 </table>

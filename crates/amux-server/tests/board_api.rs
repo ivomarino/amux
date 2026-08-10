@@ -1316,3 +1316,171 @@ async fn desc_append_appends_and_is_never_reported_ignored() {
     let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
     assert_eq!(d["desc"].as_str().unwrap(), "replaced");
 }
+
+// ---- POST /api/board/clear-done (AMUX-2630) ------------------------------
+//
+// The button was dead: the SPA POSTed, the GET-only catch-all answered 405,
+// the optimistically-hidden cards came back on refresh, and nothing was ever
+// said. `route_table.rs` now walks the table entry so a MISSING route fails
+// the build — but a mounted route can still be wrong in the one way that
+// cannot be undone, so this pins BEHAVIOUR:
+//
+//   * it ARCHIVES, it does not delete. On the live board this runs against a
+//     957-card done column; a delete would be irreversible loss of the user's
+//     own record (ethos rule 8). The assertion that the rows are still
+//     readable afterwards is the whole point of this test.
+//   * it reports HOW MANY (ethos rule 4). A bare {"ok":true} cannot tell
+//     "archived 957" from "matched nothing", which is exactly the ambiguity
+//     that let the dead button pass for a working one.
+#[tokio::test]
+async fn clear_done_archives_and_reports_the_count() {
+    let (app, _d) = app();
+
+    let mut done_ids = Vec::new();
+    for i in 0..3 {
+        let v = create(&app, json!({ "title": format!("finished {i}"), "status": "done" })).await;
+        done_ids.push(v["id"].as_str().unwrap().to_string());
+    }
+    let keep = create(&app, json!({ "title": "still open", "status": "todo" })).await;
+    let keep_id = keep["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(&app, "POST", "/api/board/clear-done", None).await;
+    // Not 405: the failure this card is about is the route not existing.
+    assert_eq!(st, StatusCode::OK, "clear-done did not answer 200: {v}");
+    assert_eq!(v["archived"], json!(3), "must report the count, not a bare flag: {v}");
+    assert_eq!(v["action"], json!("archived"), "the payload must say it archived: {v}");
+
+    // NOT DELETED. Each card is still individually readable, with archived=1.
+    for id in &done_ids {
+        let (st, _, row) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(st, StatusCode::OK, "clear-done DELETED {id} — data loss");
+        assert_eq!(row["archived"], json!(1), "{id} should be archived, got {row}");
+        assert_eq!(row["status"], json!("done"), "status must be untouched: {row}");
+    }
+    // ...and gone from the default (non-archived) view, which is what the
+    // button promises.
+    let (_, _, active) = send(&app, "GET", "/api/board?archived=0", None).await;
+    let live: Vec<&str> = active
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    for id in &done_ids {
+        assert!(!live.contains(&id.as_str()), "{id} still in the default view");
+    }
+    assert!(live.contains(&keep_id.as_str()), "a todo card was swept: {active}");
+
+    // Idempotent, and honest about it: nothing left to archive reports 0
+    // rather than repeating the first run's number.
+    let (st, _, v) = send(&app, "POST", "/api/board/clear-done", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["archived"], json!(0), "second run must report 0: {v}");
+}
+
+// ---- AC-322: X-Amux-Worker is attribution here too -----------------------
+//
+// board.rs was the ONE module of eight that read `x-amux-session` alone, while
+// the installed `amux` CLI is the bash script whose 14 board-path PATCH sites
+// all send `X-Amux-Worker`. Both tests below fail against the pre-fix
+// `actor_from_headers` (they were written against it), and they cover the TWO
+// independent things that one header resolution broke. The controls matter as
+// much as the cases: without them a blanket "always attributed" bug would pass.
+
+/// EFFECT 1 — the sanctioned escape becomes walkable again.
+///
+/// `amux board <status> --force` sends X-Amux-Worker, so the force check saw
+/// `api-anonymous` and refused with an error telling the caller to use the CLI
+/// they had just used. Ethos rule 6: a constraint whose sanctioned escape is
+/// unwalkable from the audited path gets walked from an unaudited one.
+#[tokio::test]
+async fn force_accepts_x_amux_worker_attribution_like_every_other_module() {
+    let (app, _d) = app();
+    let item = create(&app, json!({ "title": "gated card", "type": "code" })).await;
+    let id = item["id"].as_str().unwrap().to_string();
+
+    // CONTROL: no header at all must still be refused, or this test would pass
+    // against a build that simply stopped checking.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "force": true })),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "unattributed force must refuse: {v}");
+    assert_eq!(v["error"], json!("force requires attribution"), "{v}");
+
+    // THE CASE: the spelling the bash CLI actually sends.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "force": true })),
+        &[("x-amux-worker", "amux")],
+    )
+    .await;
+    assert_ne!(
+        v["error"], json!("force requires attribution"),
+        "X-Amux-Worker IS attribution — every other module accepts it: {v}"
+    );
+    assert_eq!(st, StatusCode::OK, "forced transition should apply: {v}");
+
+    // And the ledger must NAME the forcer — an unattributed-in-effect force
+    // that merely stopped erroring would be the worse bug (ethos rule 6).
+    let (_, _, row) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let log = row["log"].as_str().unwrap_or_default().to_string();
+    assert!(
+        log.contains("amux"),
+        "the force must be attributed to the caller in the log: {log}"
+    );
+}
+
+/// EFFECT 2 — the cross-lane ARCHIVE guard stops being blind.
+///
+/// `caller_lane` derives from the same resolver, and an EMPTY caller_lane
+/// disables the guard entirely (board.rs: `!caller_lane.is_empty() && ...`).
+/// So AMUX-2492's protection — one lane may not archive another lane's card —
+/// was open for every bash-CLI caller for as long as the CLI has sent
+/// X-Amux-Worker. Fixing the header closes this without touching the guard.
+#[tokio::test]
+async fn cross_lane_archive_guard_sees_x_amux_worker_callers() {
+    let (app, _d) = app();
+    let item = create(&app, json!({ "title": "lane-a's card", "session": "lane-a" })).await;
+    let id = item["id"].as_str().unwrap().to_string();
+
+    // THE CASE: a DIFFERENT lane archives it, identifying itself the way the
+    // bash CLI does. Pre-fix caller_lane was "" and this silently succeeded.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "archived": 1 })),
+        &[("x-amux-worker", "lane-b")],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "lane-b archiving lane-a's card must be refused: {v}"
+    );
+    assert_eq!(v["error"], json!("cross-lane destruction requires authorized_by"), "{v}");
+
+    // CONTROL A: the card must be untouched — a guard that refuses AND writes
+    // is not a guard.
+    let (_, _, row) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(row["archived"], json!(0), "refused archive must not write: {row}");
+
+    // CONTROL B: the OWNER archiving its own card is still allowed, so the test
+    // discriminates rather than proving archiving is broken for everyone.
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "archived": 1 })),
+        &[("x-amux-worker", "lane-a")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the owner may archive its own card: {v}");
+}

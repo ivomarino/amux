@@ -1134,6 +1134,98 @@ pub fn title_from_prompt(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// Bare demonstratives/pronouns: words whose referent lives OUTSIDE the title.
+const DEICTIC: [&str; 9] = ["this", "that", "these", "those", "it", "they", "them", "here", "there"];
+
+/// Words that, following a demonstrative, mean it was used as a bare SUBJECT
+/// ("this should…", "that broke…") rather than as a determiner with its own
+/// noun ("this endpoint…", "that migration…"). The distinction is the whole
+/// precision of the check: "This endpoint returns 500 for archived cards" is
+/// perfectly dispatchable and must NOT be flagged, while "This should be one
+/// row" is not dispatchable by anyone who was not in the room.
+/// Kept generous on purpose: the two errors are not symmetric. A false
+/// positive costs one extra sentence in one turn; a false negative is a card
+/// nobody can action, which is the defect. Precision is preserved by the
+/// determiner cases pinned in `self_contained_titles_are_left_alone`.
+const DEICTIC_VERBS: [&str; 46] = [
+    "should", "shouldn't", "is", "isn't", "are", "aren't", "was", "wasn't", "were",
+    "needs", "need", "will", "won't", "can", "can't", "must", "does", "doesn't",
+    "has", "hasn't", "have", "looks", "seems", "seemed", "breaks", "broke", "broken",
+    "fail", "fails", "failed", "work", "works", "worked", "happened", "went",
+    "stopped", "started", "keeps", "kept", "got", "gets", "did", "didn't",
+    "still", "just", "also",
+];
+
+/// Imperative openers that carry no object of their own.
+const IMPERATIVES: [&str; 14] = [
+    "fix", "update", "change", "remove", "delete", "add", "move", "revert",
+    "check", "make", "do", "redo", "undo", "adjust",
+];
+
+/// Why a captured title cannot be dispatched, or `None` when it is fine
+/// (AMUX-2604).
+///
+/// A prompt is spoken INTO a context — a screen both parties are looking at, a
+/// card just discussed — and capture cannot see any of it. "This should be one
+/// row" and "fix the logo" are perfectly clear when said and meaningless three
+/// hours later in a queue, which is how the amux-rust lane ended up holding
+/// cards nobody (including their author) could action.
+///
+/// This is deliberately a COMPUTED check, never a model call: it runs on every
+/// captured prompt, and paying a CLI boot to label a card is the exact waste
+/// ethos rule 2 exists to stop. The model DOES get involved — later, in the
+/// worker that received the prompt, which is the only party that ever had the
+/// missing context. Capture's job is just to notice and say so.
+///
+/// Returns the reason so the nudge can name it rather than assert a vague
+/// defect (ethos rule 4: the record must explain itself).
+pub fn title_needs_self_description(title: &str) -> Option<&'static str> {
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let n = words.len();
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+
+    // A long title has usually said enough to stand alone even if it opens
+    // with a demonstrative, so the checks below are all length-bounded. The
+    // bound is what keeps this from flagging most of the board.
+    if n > 8 {
+        return None;
+    }
+
+    // 1. Bare demonstrative SUBJECT: "This should be one row", "that broke".
+    if DEICTIC.contains(&w(0)) && (n == 1 || DEICTIC_VERBS.contains(&w(1))) {
+        return Some("it opens with a bare \"this/that/it\" whose referent is not in the title");
+    }
+    // 2. Bare pronoun subject — "it", "they", "there" are never determiners.
+    if ["it", "they", "them", "here", "there"].contains(&w(0)) {
+        return Some("it opens with a pronoun whose referent is not in the title");
+    }
+    // 3. Imperative with a deictic object: "fix this", "make it one row".
+    for i in 0..n.saturating_sub(1).min(3) {
+        if IMPERATIVES.contains(&w(i)) && DEICTIC.contains(&w(i + 1)) {
+            return Some("its object is \"this/that/it\" rather than the thing itself");
+        }
+    }
+    // 4. A short imperative on a DEFINITE object: "Fix the logo". The
+    //    definite article is the tell — "the logo" presupposes a referent both
+    //    parties can see, and the queue cannot. Measured against 907 live
+    //    titles: without the determiner requirement this also flagged "Fix
+    //    Namespace Pollution", "Revert VPA Configuration" and two more, all of
+    //    which NAME their subject outright and are perfectly dispatchable.
+    //    Requiring the article is what separates presupposing a referent from
+    //    stating one.
+    if n <= 4 && IMPERATIVES.contains(&w(0)) && ["the", "a", "an", "this", "that", "it"].contains(&w(1)) {
+        return Some("it points at \"the <thing>\" without saying which one or where");
+    }
+    None
+}
+
 #[cfg(test)]
 mod capture_tests {
     use super::*;
@@ -1871,5 +1963,84 @@ mod tests {
             v["blocked"][0]["suggested_command"],
             "cargo test --workspace"
         );
+    }
+}
+
+#[cfg(test)]
+mod self_description_tests {
+    use super::*;
+
+    /// The card's own examples, plus the shapes the amux-rust queue actually
+    /// filled up with.
+    #[test]
+    fn deictic_titles_are_flagged() {
+        for s in [
+            "This should be one row",
+            "Fix the logo",
+            "that broke again",
+            "It needs to be centered",
+            "fix this",
+            "Make it one row",
+            "Do that instead",
+            "these are wrong",
+            "there is a bug",
+            "Update this",
+        ] {
+            assert!(
+                title_needs_self_description(s).is_some(),
+                "{s:?} has no referent and should be flagged"
+            );
+        }
+    }
+
+    /// The half that matters more. A filter that flags EVERYTHING is the same
+    /// defect as one that flags nothing, except it is confidently wrong and
+    /// would nag every worker on every prompt (ethos rule 7). These must all
+    /// come back clean, and several open with the very words the check looks
+    /// for — "this"/"that" as DETERMINERS, which have their referent right
+    /// there in the title.
+    #[test]
+    fn self_contained_titles_are_left_alone() {
+        for s in [
+            "This endpoint returns 500 for archived cards",
+            "That migration drops the wrong index",
+            "Fix the flaky auth test that only fails on CI",
+            "Update the deploy docs; the old runbook is stale",
+            "Add a route for /api/board/clear-done",
+            "Rename the amux session and re-pin its harness name",
+            "Board gates derive from item type",
+            "Deploy the gateway change to staging",
+        ] {
+            assert_eq!(
+                title_needs_self_description(s),
+                None,
+                "{s:?} is dispatchable and must NOT be flagged"
+            );
+        }
+    }
+
+    /// A long title stands on its own even when it opens deictically — the
+    /// length bound is what stops this flagging most of the board.
+    #[test]
+    fn length_bounds_the_check() {
+        assert!(title_needs_self_description("This is wrong").is_some());
+        assert_eq!(
+            title_needs_self_description(
+                "This is wrong because the archived filter runs before the join and drops rows"
+            ),
+            None
+        );
+    }
+
+    /// It composes with the capture path it actually runs in: whatever
+    /// title_from_prompt yields is what gets checked, filler stripped and all.
+    #[test]
+    fn it_runs_on_the_derived_title_not_the_raw_prompt() {
+        let t = title_from_prompt("could you please fix this").expect("mints a card");
+        assert_eq!(t, "Fix this");
+        assert!(title_needs_self_description(&t).is_some());
+
+        let t2 = title_from_prompt("please add a route for /api/board/clear-done").unwrap();
+        assert_eq!(title_needs_self_description(&t2), None, "{t2:?}");
     }
 }

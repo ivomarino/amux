@@ -21,11 +21,21 @@ pub fn routes() -> Router<AppState> {
         .route("/{*path}", axum::routing::get(serve_path))
 }
 
-async fn index(State(state): State<AppState>) -> Response {
-    serve_index(&state)
+/// The retired port this request arrived on, if it did. Inserted by the legacy
+/// listener's own middleware, so it is `Some` only when the request physically
+/// came in on that socket — never from a client-supplied `Host` header, which
+/// would let any client trigger the migration prompt against the real origin.
+type Legacy = Option<axum::Extension<crate::legacy_port::OnLegacyListener>>;
+
+fn legacy_port_of(l: Legacy) -> Option<u16> {
+    l.map(|axum::Extension(crate::legacy_port::OnLegacyListener(p))| p)
 }
 
-async fn serve_path(State(state): State<AppState>, uri: Uri) -> Response {
+async fn index(State(state): State<AppState>, legacy: Legacy) -> Response {
+    serve_index(&state, legacy_port_of(legacy))
+}
+
+async fn serve_path(State(state): State<AppState>, uri: Uri, legacy: Legacy) -> Response {
     let path = uri.path().trim_start_matches('/');
     // UNKNOWN /api/* paths reach this catch-all (the API router only claims
     // registered routes) and must answer the Python server's JSON 404 — not
@@ -48,16 +58,16 @@ async fn serve_path(State(state): State<AppState>, uri: Uri) -> Response {
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
-        None => serve_index(&state),
+        None => serve_index(&state, legacy_port_of(legacy)),
     }
 }
 
-fn serve_index(state: &AppState) -> Response {
+fn serve_index(state: &AppState, legacy: Option<u16>) -> Response {
     let Some(index) = DashboardAssets::get("index.html") else {
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
     let html = String::from_utf8_lossy(&index.data).into_owned();
-    let injected = inject_bootstrap(&html, state);
+    let injected = inject_bootstrap(&html, state, legacy);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         injected,
@@ -69,7 +79,26 @@ fn serve_index(state: &AppState) -> Response {
 /// derived exactly as the Python does (sha256("amux-ui-guard:"+AUTH)[..40],
 /// amux-server.py:801) so a dashboard served by either server produces
 /// headers the OTHER server also accepts during coexistence.
-fn inject_bootstrap(html: &str, state: &AppState) -> String {
+/// `legacy` is `Some(port)` when this document is being served on the RETIRED
+/// listener.
+///
+/// # Why the shell is the only place this can be fixed
+///
+/// The iPhone PWA was installed from `https://localhost:8822`, so the install
+/// is a bookmark to that ORIGIN and everything it fetches is a relative
+/// `/api/...` on it — ~3,200 requests an hour that no server-side change and no
+/// process restart can move, because there is no process to restart. The
+/// manifest cannot fix it either: `start_url` and `scope` must be same-origin
+/// as the manifest itself (a port change IS a different origin), so a manifest
+/// served on 8822 that points at 8824 is invalid and browsers fall back to the
+/// document URL. That leaves exactly one lever — the document — and exactly one
+/// thing it can do: tell the client, in the client, to go to the canonical
+/// origin. See `_amuxLegacyOriginMigrate` in app.js for what it does with this.
+///
+/// `_AMUX_LEGACY_PORT` is 0 on the canonical listener, so the SPA's check is
+/// "did the server say I am on the retired port", not "does my URL look odd" —
+/// the client never has to know either number.
+fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>) -> String {
     const BEGIN: &str = "<!-- AMUX-BOOTSTRAP-BEGIN";
     const END: &str = "<!-- AMUX-BOOTSTRAP-END -->";
     let (Some(b), Some(e)) = (html.find(BEGIN), html.find(END)) else {
@@ -89,7 +118,8 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
         "<!-- AMUX-BOOTSTRAP-BEGIN (injected at serve time) -->\n<script>\
          window._AMUX_S3_ICAL_URL={};window._AMUX_AUTH_TOKEN={};window._AMUX_HOME={};\
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
-         window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};</script>\n",
+         window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
+         window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};</script>\n",
         jstr(&std::env::var("AMUX_S3_ICAL_URL").unwrap_or_default()),
         jstr(&auth),
         jstr(&home),
@@ -108,6 +138,8 @@ fn inject_bootstrap(html: &str, state: &AppState) -> String {
                         .join(".amux")
                 }),
         )),
+        legacy.unwrap_or(0),
+        crate::legacy_port::canonical_port(),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python
@@ -164,7 +196,7 @@ mod tests {
     #[test]
     fn bootstrap_injects_auth_and_derived_ui_token() {
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
-        let out = inject_bootstrap(html, &state(Some("tok123")));
+        let out = inject_bootstrap(html, &state(Some("tok123")), None);
         assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
         // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
         let mut h = sha2::Sha256::new();
@@ -181,17 +213,58 @@ mod tests {
         // or a backend-only deploy shows UI Python never showed.
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
-        let out = inject_bootstrap(html, &s);
+        let out = inject_bootstrap(html, &s, None);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
         assert!(!out.contains("amux-update-bar"));
         // The CRM feature-flag layer still injects.
         assert!(out.contains("AMUX-FEATURE-FLAGS"));
     }
 
+    /// The migration signal must be ON only for documents actually served by
+    /// the retired listener — and it must actually be ON there.
+    ///
+    /// Both halves are load-bearing and neither alone is a check. If it were
+    /// always 0 the PWA would never be told to move and the port would never
+    /// drain (the failure that is invisible: nothing appears broken). If it
+    /// were always non-zero, every desktop client already on 8824 would be
+    /// prompted to migrate to where it already is — a loop the user cannot
+    /// exit. The bug this pins is the easy one to write: reading the port from
+    /// the `Host` header, which any client can set, instead of from which
+    /// SOCKET the request arrived on.
+    #[test]
+    fn legacy_marker_is_injected_only_when_served_on_the_retired_port() {
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let s = state(Some("tok"));
+
+        let canonical = inject_bootstrap(html, &s, None);
+        assert!(
+            canonical.contains("window._AMUX_LEGACY_PORT=0"),
+            "a document served on the canonical port must report legacy 0, or every \
+             already-migrated client is told to migrate: {canonical}"
+        );
+
+        let from_legacy = inject_bootstrap(html, &s, Some(8822));
+        assert!(
+            from_legacy.contains("window._AMUX_LEGACY_PORT=8822"),
+            "a document served on the retired port must say so — this is the ONLY \
+             signal the installed PWA can ever receive: {from_legacy}"
+        );
+        // The canonical port has to travel with it: the client builds the target
+        // origin from its own hostname plus this number, so a LAN or tailscale
+        // client is sent somewhere that exists rather than to `localhost`.
+        assert!(
+            from_legacy.contains(&format!(
+                "window._AMUX_CANONICAL_PORT={}",
+                crate::legacy_port::canonical_port()
+            )),
+            "{from_legacy}"
+        );
+    }
+
     #[test]
     fn missing_markers_serve_untouched() {
         let html = "<head>no markers</head>";
-        assert_eq!(inject_bootstrap(html, &state(None)), html);
+        assert_eq!(inject_bootstrap(html, &state(None), None), html);
     }
 
     #[tokio::test]

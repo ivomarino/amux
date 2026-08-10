@@ -1433,6 +1433,59 @@ Sets the session whose sign-off is required for review -> done."
       echo "$result" | _board_outcome "$id" "" "reviewer set to ${who:-none}"
       return $?
       ;;
+    retitle)
+      # AMUX-2604. Capture flags a card whose title has no referent ("This
+      # should be one row", "Fix the logo") and asks the worker that received
+      # the prompt to rewrite it self-contained — the worker being the only
+      # party that ever had the missing context. That ask needs somewhere to
+      # land: until now TITLE and DESC had no attributed setter either, so the
+      # instruction would have read "fix your card" while the only route was a
+      # raw PATCH with no X-Amux-Session. That is the third instance of the
+      # `type`/`reviewer` defect above (AMUX-2325) and the one where the nudge
+      # itself would have been manufacturing the unattributed writes.
+      #
+      # --stdin/--file are the preferred forms: an inline title is evaluated by
+      # YOUR shell first, so `backticks` and $(...) in it are EXECUTED
+      # (AMUX-1888) — and a rewritten title very often quotes code.
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: amux board retitle <ISSUE-ID> <title> | --stdin | --file <path>
+       amux board retitle <ISSUE-ID> --desc-stdin      (rewrite the body instead)
+Rewrites a card's title (and/or desc) so it stands alone without the
+conversation it was captured from."
+      shift
+      local new_title="" new_desc="" _mode=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --stdin|-)      new_title=$(cat); _mode=1; shift ;;
+          --file)         [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board retitle <ID> --file <path>"
+                          new_title=$(cat "$2"); _mode=1; shift 2 ;;
+          --desc-stdin)   new_desc=$(cat); _mode=1; shift ;;
+          --desc-file)    [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board retitle <ID> --desc-file <path>"
+                          new_desc=$(cat "$2"); _mode=1; shift 2 ;;
+          --desc)         new_desc="${2:-}"; _mode=1; shift 2 ;;
+          *)              new_title="$1"; _mode=1; shift ;;
+        esac
+      done
+      [[ -n "$_mode" ]] || die "Usage: amux board retitle <ISSUE-ID> <title> | --stdin | --file <path>"
+      [[ -n "$new_title" || -n "$new_desc" ]] && : || die "nothing to write: pass a title, --stdin, --file, or --desc*"
+      local result
+      result=$(T="$new_title" D="$new_desc" python3 -c 'import json,os
+b={}
+t=os.environ.get("T","").strip()
+d=os.environ.get("D","")
+if t: b["title"]=t
+# desc_append=False so a rewrite REPLACES the captured body rather than
+# appending to it — the whole point is that the original text lacked context.
+if d.strip(): b["desc"]=d; b["desc_append"]=False
+print(json.dumps(b))' \
+        | curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      local _what="title rewritten"
+      [[ -n "$new_desc" && -n "$new_title" ]] && _what="title + desc rewritten"
+      [[ -n "$new_desc" && -z "$new_title" ]] && _what="desc rewritten"
+      echo "$result" | _board_outcome "$id" "" "$_what"
+      return $?
+      ;;
     add|create)
       # Title via --stdin/--file keeps it out of a shell-evaluated string
       # (AMUX-1888); the JSON body is built with json.dumps, not string
@@ -1799,6 +1852,8 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board backlog <ID>          Move issue to backlog
   amux board status <ID> <status>  Set any status
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
+  amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
+                                   (--stdin/--file preferred; --desc-stdin for the body)
 
   Every status verb above takes the gate-satisfying flags, so a gated move
   never needs a hand-rolled curl (which is how attribution gets lost):
