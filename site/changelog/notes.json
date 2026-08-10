@@ -1,5 +1,68 @@
 [
   {
+    "hash": "eda75251ef1849cb09f6fbd083e3f1a5f52b5512",
+    "short": "eda7525",
+    "title": "Commit nudge — agents are reminded to commit before progress is lost",
+    "date": "2026-08-10",
+    "type": "feat",
+    "tags": ["nudge", "git", "automation", "safety"],
+    "description": "amux now detects when a worker has made meaningful progress — changed files, new output — without committing, and sends a nudge before the window closes. The nudge records which session owns the work so it cannot be re-derived from context. Prevents the silent work-loss pattern where a context compaction or crash wipes a session's entire in-progress diff."
+  },
+  {
+    "hash": "9de7684a8229d5e0a9ca02d4e72a27bd06d0d5ab",
+    "short": "9de7684",
+    "title": "amux IaC — define your entire agent team in one YAML file",
+    "date": "2026-08-10",
+    "type": "feat",
+    "tags": ["iac", "fleet", "automation", "api"],
+    "description": "A 'vertical' — a complete agent team with workers, groups, schedules, and skills — can now be declared as a single YAML file and applied with `amux iac apply vertical.yaml`. The operation is idempotent: run it again and amux reconciles to the desired state without duplication. Enables GitOps workflows for AI engineering teams: version-control your agent configuration, apply it on any machine, diff it like any other infra."
+  },
+  {
+    "hash": "d6782efdb26456e60438f6e76b3ba89e14357c68",
+    "short": "d6782ef",
+    "title": "Worker model and token spend — visible per session in the dashboard",
+    "date": "2026-08-10",
+    "type": "feat",
+    "tags": ["cost", "monitoring", "sessions", "observability"],
+    "description": "Each worker now reports its active model name and running token spend directly to the harness. The dashboard shows these alongside the worker card so you can see at a glance which agents are on Claude Sonnet vs Opus, and how much each has consumed this session. Useful for managing costs across a large fleet with mixed model tiers."
+  },
+  {
+    "hash": "d5b25f6b21a2a5d344656702c62dfaf9550716d8",
+    "short": "d5b25f6",
+    "title": "Message delivery verdict — know when your send actually landed",
+    "date": "2026-08-10",
+    "type": "feat",
+    "tags": ["messages", "channels", "monitoring", "attribution"],
+    "description": "When you send a message to a session, the submission verdict — delivered, queued, or failed — is now recorded in the store and displayed in the Messages tab. Previously a send that failed silently looked identical to one that succeeded. Now every message has a visible outcome, and the history shows whether it reached the target session."
+  },
+  {
+    "hash": "cad8ba68d5fd2c8089ea4c1dc9802862ef1b5cf5",
+    "short": "cad8ba6",
+    "title": "Smart tag suggestions — based on what your board is actually about",
+    "date": "2026-08-10",
+    "type": "feat",
+    "tags": ["board", "tags", "fleet", "ux"],
+    "description": "Tag suggestions in the board are now driven by `GET /api/board/themes` — the server's analysis of what themes the current board covers — rather than a static list. Suggestions surface the groups and topics already active in your fleet, so tagging a new card connects it to real ongoing work rather than guessing from a generic vocabulary."
+  },
+  {
+    "hash": "c45393ee188dac86fe040da756177c25442395b7",
+    "short": "c45393e",
+    "title": "Column gates are now enforced when edited in the UI",
+    "date": "2026-08-10",
+    "type": "fix",
+    "tags": ["board", "gates", "safety"],
+    "description": "Editing a column gate through the board UI now actually enforces the new definition on subsequent transitions. Previously a gate edited in the UI was stored but not applied — agents could move cards past a gate that the board showed as active. The fix closes the gap between what the UI displays and what the server enforces."
+  },
+  {
+    "hash": "6a4099a008a3cf6480c18f38a8cb734154d36f4e",
+    "short": "6a4099a",
+    "title": "Worker status card — 'working' now shows what the agent is actually doing",
+    "date": "2026-08-10",
+    "type": "fix",
+    "tags": ["dashboard", "monitoring", "sessions", "ux"],
+    "description": "The worker card used to show a generic 'working' label whenever a session was active. It now surfaces the actual current task — the board card title or the active prompt — so you can scan the fleet at a glance and see what each agent is working on without opening their terminal."
+  },
+  {
     "hash": "f211ef6ed62adc69e011748c76a71678117562de",
     "short": "f211ef6",
     "title": "Tag-scoped board — board list now says when it is showing a subset",

@@ -247,6 +247,8 @@ Claude Code runs one agent per terminal. amux runs dozens — with live monitori
 - [Best AI Tools for Solopreneurs 2026](https://amux.io/lists/ai-tools-for-solopreneurs-2026/): 10 tools — what each replaces, monthly cost, time saved. amux, Claude, Cursor, Notion AI, Copilot, Perplexity, Make, v0, Bolt.new, Linear AI.
 - [AI Agent Frameworks Compared 2026](https://amux.io/lists/ai-agent-frameworks-comparison-2026/): amux, LangGraph, CrewAI, AutoGen, Semantic Kernel, Bee Agent, Agency Swarm, MetaGPT — language, multi-agent, state management, best use cases.
 
+- [Declarative AI Agent Setup](https://amux.io/guides/declarative-ai-agent-setup/): Configure your entire AI engineering team with a single YAML file (a "vertical") using amux IaC. Covers declarative vs imperative setup, idempotent apply, GitOps workflow, multi-runtime teams (Claude Code, Codex, Gemini CLI), skins/personas, version control, and CI/CD integration. New August 2026.
+
 ## Source
 
 - GitHub: https://github.com/mixpeek/amux
