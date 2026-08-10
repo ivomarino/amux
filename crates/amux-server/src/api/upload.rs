@@ -66,7 +66,15 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/chunk/{n}", put({
             let s = state.clone();
             move |path, body| chunk(s, path, body)
-        }))
+        }).layer(
+            // The SPA uploads 5MB chunks (app.js:8459 CHUNK_SIZE); axum's
+            // default 2MB body cap 413'd EVERY chunk 0 after the client had
+            // already streamed it (27s wasted per attempt — live incident
+            // 2026-08-09, found via /api/logs/analyze in one call). 8MB =
+            // chunk + protocol slack; anything larger is a client bug and
+            // the 413 is then honest.
+            axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024),
+        ))
         .route("/{id}/finish", post({
             let s = state.clone();
             move |path| finish(s, path)

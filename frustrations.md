@@ -1117,3 +1117,24 @@ FIX: same commit as this entry: the ledger card mints as `doing` (in flight, own
   card after the turn lands in the stall detector's designed drift cell. Regression:
   captured_ledger_card_is_not_redispatched_by_the_planner (runtime.rs) fails on the
   pre-fix mint.
+
+## The rust request log recorded a ~15-second restart choreography as a 76ms request
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-rust (lifecycle-fix subagent)
+CARD: AR-111
+SYMPTOM: Forensics on the amux start incident: `_amux_request_log` shows
+  `PATCH /api/sessions/amux/config` at ts 19:10:35 with latency 76.26ms — but the SAME
+  request wrote its "Captured before model swap" log marker at 19:10:20 and the env
+  header at 19:10:35.42, i.e. the handler ran a synchronous ~15s stop/relaunch
+  choreography that the request log renders as a sub-100ms call. Whatever the
+  middleware stamps (completion-time ts + an inner-layer latency, or a batched flush
+  clock), a long-running request is indistinguishable from a fast one.
+COST: ~30 minutes of incident reconstruction chasing a phantom second actor, because
+  the timeline read as "capture at :20 cannot belong to a 76ms request at :35" — the
+  instrument manufactured a contradiction that had to be disproved with three other
+  artifacts (env header, session log markers, session_events).
+FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
+  WHOLE handler future; a restart choreography should be a visibly long row.

@@ -1426,8 +1426,17 @@ fn strip_token_from_flags(flags: &str, flag: &str) -> Result<String, String> {
     let mut i = 0;
     while i < tokens.len() {
         let t = &tokens[i];
-        if t == flag && i + 1 < tokens.len() {
-            i += 2;
+        if t == flag {
+            // Value-aware: consume the next token as this flag's value only
+            // when it is not itself a flag. Stripping a boolean flag (e.g.
+            // --dangerously-skip-permissions) must never eat its neighbour —
+            // that would silently delete an unrelated flag (found while fixing
+            // the duplicate --model incident, 2026-08-09).
+            if i + 1 < tokens.len() && !tokens[i + 1].starts_with('-') {
+                i += 2;
+            } else {
+                i += 1;
+            }
             continue;
         }
         if t.starts_with(&eq_form) {
@@ -1442,6 +1451,44 @@ fn strip_token_from_flags(flags: &str, flag: &str) -> Result<String, String> {
 
 fn strip_model_from_flags(flags: &str) -> Result<String, String> {
     strip_token_from_flags(flags, "--model")
+}
+
+/// Flag names present in a flags string: `--x v` and `--x=v` both yield `--x`.
+fn flag_names(flags: &str) -> Vec<String> {
+    let Ok(tokens) = split_flags(flags) else { return Vec::new() };
+    tokens
+        .iter()
+        .filter(|t| t.starts_with('-'))
+        .map(|t| t.split('=').next().unwrap_or(t).to_string())
+        .collect()
+}
+
+/// Defaults are defaults: any flag name the session (CC_FLAGS), the resume
+/// choreography (session_flag) or the caller (extra_flags) already carries is
+/// stripped from CC_DEFAULT_FLAGS before assembly, so the session's value is
+/// the only one on the command line.
+///
+/// Why (2026-08-09 incident): defaults.env carried `--model claude-opus-4-6`
+/// and the naive concat produced `claude --model claude-opus-4-6 --model
+/// claude-fable-5 ...` fleet-wide (Claude Code last-wins, so sessions ran the
+/// right model by argument-ORDER luck, and any future reordering or a parser
+/// that rejects duplicates flips every session's model silently). Generic by
+/// token name — --model, --effort, --max-tokens, whatever defaults.env grows
+/// next — session wins, never the default. Python has the same naive concat
+/// (amux-server.py:24498); fixed right here per the port mandate.
+fn dedupe_default_flags(default_flags: &str, overrides: &[&str]) -> String {
+    let mut out = default_flags.to_string();
+    for src in overrides {
+        for name in flag_names(src) {
+            match strip_token_from_flags(&out, &name) {
+                Ok(next) => out = next,
+                // Malformed defaults: leave as-is; build_claude_cmd quotes the
+                // raw string verbatim, same as before this dedupe existed.
+                Err(_) => return out,
+            }
+        }
+    }
+    out
 }
 
 fn extract_model_from_flags(flags: &str) -> String {
@@ -1790,6 +1837,25 @@ async fn send_dedup_forget(state: &AppState, name: &str, msg_id: &str) {
 // verb layer; here it reads not-running).
 // ---------------------------------------------------------------------------
 
+/// Does the pane's shell have a live child process? `Some(true)` = a child is
+/// running (claude or similar), `Some(false)` = shell confirmed childless,
+/// `None` = could not determine (tmux/pgrep unavailable or errored). This is
+/// the process-level discriminator the scrape detectors cannot fake: a pane
+/// whose shell has a child is hosting SOMETHING, however the frame reads.
+async fn pane_has_live_child(name: &str) -> Option<bool> {
+    let stq = st(name);
+    let out = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await?;
+    if !out.status.success() {
+        return None;
+    }
+    let pid = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
+    if pid.is_empty() {
+        return None;
+    }
+    let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
+    Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
 async fn is_running(name: &str) -> bool {
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
@@ -1810,18 +1876,8 @@ async fn is_running(name: &str) -> bool {
         return false;
     }
     // Shell alive but childless == claude gone even without a visible prompt.
-    let stq = st(name);
-    if let Some(out) = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await {
-        if out.status.success() {
-            let pid = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
-            if !pid.is_empty() {
-                if let Some(ch) = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await {
-                    if ch.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-                        return false;
-                    }
-                }
-            }
-        }
+    if pane_has_live_child(name).await == Some(false) {
+        return false;
     }
     true
 }
@@ -2116,8 +2172,11 @@ async fn type_line(name: &str, line: &str) {
 fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_flag: &str, extra_flags: &str) -> String {
     let custom = std::env::var("AMUX_CLAUDE_CMD").unwrap_or_default().trim().to_string();
     let mut cmd = if custom.is_empty() { "claude".to_string() } else { custom };
+    // Session flags override defaults — see dedupe_default_flags for the
+    // 2026-08-09 duplicate --model incident this prevents.
+    let default_flags = dedupe_default_flags(default_flags, &[flags, session_flag, extra_flags]);
     if !default_flags.is_empty() {
-        cmd = format!("{cmd} {}", shell_quote_flags(default_flags));
+        cmd = format!("{cmd} {}", shell_quote_flags(&default_flags));
     }
     if !flags.is_empty() {
         cmd = format!("{cmd} {}", shell_quote_flags(flags));
@@ -2146,10 +2205,37 @@ fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_fla
     cmd
 }
 
+/// Per-session choreography lock — Python parity (`_get_session_lock`,
+/// py:24231 wraps the whole start choreography).
+///
+/// Why (2026-08-09 amux incident): the rust origin had NO lock, so a model
+/// swap's restart choreography (stop → relaunch) interleaved with a second
+/// Start pressed from the dashboard, and two choreographies typed into the
+/// SAME pane concurrently — the session log shows repeated respawned shells,
+/// relaunches and instant exits over an 80-second window, which the owner
+/// experienced as "the fresh claude exited immediately". Each start/stop now
+/// owns the pane exclusively; a queued second start finds claude running and
+/// returns "already running" instead of typing over a healthy boot.
+fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::Mutex::new(None);
+    let mut g = LOCKS.lock().unwrap();
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
 async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
+    // Serialize with any concurrent start/stop on this session — see
+    // session_op_lock for the incident this prevents. Held for the whole
+    // choreography; restart_for_swap composes stop+start sequentially so each
+    // leg takes the lock in turn (no re-entrancy).
+    let op_lock = session_op_lock(name);
+    let _op = op_lock.lock().await;
     if is_session_blocked(name) {
         return (false, "session is blocked; remove it from blocked-sessions.txt first".into());
     }
@@ -2459,7 +2545,11 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     if !launched && !skip_conv_id && provider == "claude" {
         let mut out_check = strip_ansi(&tmux_capture(name, 10).await);
         if at_resume_picker(&out_check) {
-            // Escape the picker, drop the stale ids, fall through to fresh.
+            // Escape ONLY on a positive picker match (the ⌕ glyph + picker
+            // text, at_resume_picker) — never on a mere launch timeout. A slow
+            // boot (MCP startup) exhausts the watch loop looking exactly like
+            // this branch's entry condition, and an Escape/C-c fired into a
+            // healthy booting TUI kills it (2026-08-09 hardening).
             send_key(name, "Escape").await;
             sleep_ms(500).await;
             send_key(name, "C-c").await;
@@ -2475,8 +2565,36 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             meta.remove("cc_conversation_id");
             save_meta(name, &meta);
             out_check = strip_ansi(&tmux_capture(name, 10).await);
+        } else if !at_shell_prompt(&out_check) && pane_has_live_child(name).await == Some(true) {
+            // Not a picker, not a shell, and the pane's shell HAS a child:
+            // claude is alive but its UI was not recognized within the watch
+            // window (slow MCP boot, an unrecognized frame). Give it one more
+            // window instead of falling through to a retry that would C-c a
+            // healthy process. Scrape says nothing; the process table says
+            // running — trust the process table (ethos rule 7: positive
+            // evidence over a timed-out detector).
+            for _ in 0..10 {
+                sleep_ms(500).await;
+                let o = strip_ansi(&tmux_capture(name, 10).await);
+                if claude_ui_visible(&o) {
+                    launched = true;
+                    break;
+                }
+                if at_shell_prompt(&o) {
+                    break;
+                }
+            }
+            out_check = strip_ansi(&tmux_capture(name, 10).await);
         }
-        if at_shell_prompt(&out_check) {
+        // Retype only on POSITIVE evidence claude is gone: the frame reads as
+        // a shell prompt AND the pane shell is childless. at_shell_prompt
+        // alone can false-positive on TUI frames whose bottom lines end in
+        // '%'/'$' (context-percent status lines), and a C-c + full command
+        // retyped into a live claude becomes a garbage prompt to the model.
+        if !launched
+            && at_shell_prompt(&out_check)
+            && pane_has_live_child(name).await != Some(true)
+        {
             // --resume failed: fresh start with --name (py:24762).
             meta.remove("cc_session_name");
             meta.remove("cc_conversation_id");
@@ -2598,6 +2716,11 @@ async fn stop_session(name: &str) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
+    // Same exclusion as start_session (see session_op_lock): a stop typing
+    // /exit into a pane a concurrent start is booting is exactly the 2026-08-09
+    // interleaving incident.
+    let op_lock = session_op_lock(name);
+    let _op = op_lock.lock().await;
     let cfg = parse_env(name);
     if backend_of_cfg(&cfg) == "herdr" {
         if !herdr_agent_running(name).await {
@@ -4887,9 +5010,17 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
             sid
         } else {
             // py:20480 _find_latest_session_id — newest jsonl with real turns.
+            // Guarded like restart_for_swap: on a shared work dir the newest
+            // jsonl can be a NEIGHBOUR lane's live conversation; forking it
+            // would clone another session's brain (2026-08-09 cross-link).
             let cfg = parse_env(name);
             let wd = work_dir_of(&cfg);
-            find_latest_session_id(&wd)
+            let latest = find_latest_session_id(&wd);
+            if !latest.is_empty() && conversation_owned_by_other(&latest, name).is_empty() {
+                latest
+            } else {
+                String::new()
+            }
         }
     };
     let (ok, msg, method_used) = if !session_id.is_empty() {
@@ -5138,7 +5269,16 @@ async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool 
         let wd = work_dir_of(&cfg);
         if meta_str(&load_meta(name), "cc_conversation_id").is_empty() {
             let sid = find_latest_session_id(&wd);
-            if !sid.is_empty() {
+            // Cross-link guard (2026-08-09 incident): find_latest_session_id
+            // is "newest jsonl in the project dir" — on a SHARED work dir
+            // (~/Dev/amux hosts amux, amux-rust, amux-frustrations, ...) that
+            // is whichever NEIGHBOUR spoke last. Unguarded, this stamped the
+            // amux session with amux-rust's live conversation during a model
+            // swap, and the next start resumed a copy of another lane's brain
+            // (conv-guard log: "already owned by 'amux'", 19:10:30). Adopt the
+            // latest id only when no sibling's meta claims it — the same
+            // refusal the tracked-files endpoint applies (py:75437 parity).
+            if !sid.is_empty() && conversation_owned_by_other(&sid, name).is_empty() {
                 update_meta(name, &[("cc_conversation_id", json!(sid))]);
             }
         }
@@ -5888,6 +6028,94 @@ mod tests {
         // yolo strip covers --approval-mode yolo.
         assert_eq!(strip_provider_yolo_flags("--yolo --model auto"), "--model auto");
         assert_eq!(strip_provider_yolo_flags("--approval-mode yolo -x"), "-x");
+        // Value-aware strip: removing a boolean flag never eats its neighbour.
+        assert_eq!(
+            strip_token_from_flags("--dangerously-skip-permissions --model opus", "--dangerously-skip-permissions")
+                .unwrap(),
+            "--model opus"
+        );
+        // A trailing bare flag is stripped rather than kept dangling.
+        assert_eq!(strip_token_from_flags("--model opus --effort", "--effort").unwrap(), "--model opus");
+    }
+
+    /// Pins the 2026-08-09 incident: defaults.env carried `--model
+    /// claude-opus-4-6`, the session carried its own model, and the naive
+    /// concat launched `claude --model claude-opus-4-6 --model claude-fable-5
+    /// ...` fleet-wide. Defaults lose; the session's flag is the only one.
+    #[test]
+    fn duplicate_model_incident_defaults_lose_session_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let cfg = EnvFile::default();
+        // The exact incident shape (flags from amux.env, defaults from
+        // defaults.env, --name from the fresh-start choreography).
+        let cmd = build_claude_cmd(
+            &cfg,
+            "--model claude-fable-5 --dangerously-skip-permissions",
+            "--model claude-opus-4-6",
+            "--name amux",
+            "",
+        );
+        assert_eq!(cmd.matches("--model").count(), 1, "{cmd}");
+        assert!(cmd.contains("--model claude-fable-5"), "{cmd}");
+        assert!(!cmd.contains("claude-opus-4-6"), "{cmd}");
+        assert!(cmd.contains("--dangerously-skip-permissions"), "{cmd}");
+        assert!(cmd.contains("--name amux"), "{cmd}");
+        // Generic by token name: --effort/--max-tokens defaults fall to the
+        // session's values; defaults the session does not override survive.
+        let cmd2 = build_claude_cmd(
+            &cfg,
+            "--effort high --model opus",
+            "--model sonnet --effort low --max-tokens 4096 --verbose",
+            "--name s",
+            "",
+        );
+        assert_eq!(cmd2.matches("--model").count(), 1, "{cmd2}");
+        assert_eq!(cmd2.matches("--effort").count(), 1, "{cmd2}");
+        assert!(cmd2.contains("--effort high") && cmd2.contains("--model opus"), "{cmd2}");
+        assert!(cmd2.contains("--max-tokens 4096") && cmd2.contains("--verbose"), "{cmd2}");
+        // Boolean dedupe must not eat the default's neighbouring flag.
+        let cmd3 = build_claude_cmd(
+            &cfg,
+            "--dangerously-skip-permissions --model fable",
+            "--dangerously-skip-permissions --model claude-opus-4-6",
+            "",
+            "",
+        );
+        assert_eq!(cmd3.matches("--dangerously-skip-permissions").count(), 1, "{cmd3}");
+        assert_eq!(cmd3.matches("--model").count(), 1, "{cmd3}");
+        assert!(cmd3.contains("--model fable"), "{cmd3}");
+        // --model= eq form dedupes the same.
+        let cmd4 = build_claude_cmd(&cfg, "--model=fable", "--model claude-opus-4-6", "", "");
+        assert_eq!(cmd4.matches("--model").count(), 1, "{cmd4}");
+        assert!(!cmd4.contains("claude-opus-4-6"), "{cmd4}");
+    }
+
+    /// Pins the 2026-08-09 cross-link: on a shared work dir the newest jsonl
+    /// belonged to amux-rust, and an unguarded latest-id adoption stamped the
+    /// amux session with a NEIGHBOUR's live conversation. The guard must name
+    /// the sibling owner (blocking adoption) and stay silent for the owner
+    /// itself.
+    #[test]
+    fn conv_adoption_guard_blocks_neighbour_latest() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::write(env_path("rusty"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(
+            meta_path("rusty"),
+            json!({"cc_conversation_id": "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            conversation_owned_by_other("1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", "amuxy"),
+            "rusty",
+            "a sibling's conversation must be reported as owned"
+        );
+        assert!(
+            conversation_owned_by_other("1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", "rusty").is_empty(),
+            "the owner itself is never blocked"
+        );
     }
 
     #[test]
