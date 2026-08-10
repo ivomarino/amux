@@ -5646,6 +5646,93 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
 }
 
 /// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
+// ---------------------------------------------------------------------------
+// pipe-pane RECONCILER (AMUX-2671).
+//
+// `pipe-pane` is attached in start_session and NOWHERE ELSE — there was no
+// reconciler anywhere in runtime_jobs. So a pane that loses its writer (it
+// died, or the pane predates a writer fix) stays unlogged forever and nothing
+// notices: pane_pipe=0 looks identical to a lane that simply has not been
+// started. Found on rec-gov — a live `node` agent, 1 child, logging nothing.
+//
+// SAFETY, from the code rather than assumed: plain `pipe-pane` (NO `-o`) is
+// idempotent — tmux closes any existing pipe before running the new command.
+// Do NOT add `-o`: it means "only if none exists" but is implemented as
+// close-then-decline, i.e. a toggle OFF on an already-piped pane, which once
+// silently unlogged 29 of 60 panes.
+//
+// The writer comes from log_pipe_command() and is never hand-rolled, because
+// that function is where REDACTION lives (sk-ant-, ANTHROPIC_API_KEY=, ghp_,
+// AIza..., sk-proj-, POSTHOG_KEY). Re-arming a pane with a bare `cat` works and
+// redacts nothing — I did exactly that by hand while diagnosing this and had to
+// detach it. "Re-arming is safe" is true of the tmux VERB, not of an arbitrary
+// command handed to it.
+// ---------------------------------------------------------------------------
+
+/// Should this pane be re-armed? Pure, so the discriminator is testable without
+/// a tmux server — and so the NEGATIVE case is pinned as tightly as the
+/// positive one.
+///
+/// `children == 0` is a BARE SHELL: the tmux session outlived its agent. Piping
+/// those would spray shell noise into per-worker logs for lanes that have no
+/// worker; 10 of the 11 unpiped panes measured were exactly that (disposable
+/// smprobe*/zz-* test lanes) and only ONE was a live agent.
+fn should_rearm_pipe(pane_pipe: i64, children: usize) -> bool {
+    pane_pipe == 0 && children > 0
+}
+
+/// One reconciliation pass. Returns how many panes were re-armed — a count, so
+/// "the reconciler ran and found nothing" is distinguishable from "it did not
+/// run", which is the failure this whole module exists to make visible.
+pub async fn pipe_reconcile_tick() -> usize {
+    let Some(out) = tmux(&[
+        "list-panes", "-a", "-F", "#{session_name} #{pane_pipe} #{pane_pid}",
+    ])
+    .await
+    else {
+        return 0; // tmux unreachable: not a reconciliation, and not a pass
+    };
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut rearmed = 0usize;
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(sess), Some(pipe), Some(pid)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Some(name) = sess.strip_prefix("amux-") else { continue };
+        let pipe: i64 = pipe.parse().unwrap_or(1); // unparsable -> assume piped, never re-arm blind
+        let children = tokio::process::Command::new("pgrep")
+            .args(["-P", pid])
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0);
+        if !should_rearm_pipe(pipe, children) {
+            continue;
+        }
+        let lp = log_path(name);
+        let cmd = log_pipe_command(&lp);
+        let pt = pane_target(sess);
+        let _ = tmux(&["pipe-pane", "-t", &pt, &cmd]).await;
+        rearmed += 1;
+        tracing::warn!(session = %name, children, "re-armed a lost pipe-pane");
+    }
+    rearmed
+}
+
+/// Background driver. 60s: a lost pipe is a durable condition, not a race, and
+/// this shells out per unpiped pane — polling it hard would cost more than the
+/// logging it restores.
+pub async fn pipe_reconcile_loop() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if let Err(e) = tokio::spawn(pipe_reconcile_tick()).await {
+            tracing::error!(error = %e, "pipe reconcile tick panicked");
+        }
+    }
+}
+
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;
@@ -10261,5 +10348,36 @@ mod gate_agreement_tests {
             steer_decide(None, Some(pane_is_at_boundary(BUSY_BAR)), 1400.0, 600.0),
             SteerDelivery::OverdueMidTurn
         );
+    }
+}
+
+#[cfg(test)]
+mod pipe_reconcile_tests {
+    use super::should_rearm_pipe;
+
+    /// THE POSITIVE CASE: the incident that motivated this — rec-gov, a live
+    /// `node` agent with 1 child and pane_pipe=0, logging nothing.
+    #[test]
+    fn a_live_agent_with_no_pipe_is_rearmed() {
+        assert!(should_rearm_pipe(0, 1), "rec-gov's exact shape must re-arm");
+        assert!(should_rearm_pipe(0, 5));
+    }
+
+    /// THE NEGATIVE CASE, and the one that makes this check worth having.
+    /// Without it the test passes trivially by re-arming EVERYTHING, which
+    /// would spray shell noise into per-worker logs for lanes with no worker —
+    /// 10 of the 11 unpiped panes measured were bare shells (smprobe*, zz-*).
+    #[test]
+    fn a_bare_shell_is_never_rearmed() {
+        assert!(!should_rearm_pipe(0, 0), "a pane whose agent is gone has nothing to log");
+    }
+
+    /// An already-piped pane is left alone. Re-arming it would be harmless
+    /// (plain pipe-pane is idempotent) but pointless, and doing it every tick
+    /// would restart 51 writer processes a minute across the fleet.
+    #[test]
+    fn an_already_piped_pane_is_left_alone() {
+        assert!(!should_rearm_pipe(1, 1));
+        assert!(!should_rearm_pipe(1, 0));
     }
 }
