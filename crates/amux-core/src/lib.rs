@@ -48,5 +48,6 @@ pub mod session;
 pub mod stall;
 pub mod turn;
 pub mod verification;
+pub mod workflow;
 pub mod worker;
 
