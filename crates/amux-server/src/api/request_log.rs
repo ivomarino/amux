@@ -606,7 +606,14 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "method": method,
         "ms": latency_ms.round() as i64,
         // Additive (rust request log; the sweep's discriminators):
-        "category": "http",
+        //
+        // DERIVED from the family, not hardcoded "http" (Ethan, 2026-08-10:
+        // "these tabs in the logs dont work"). The Logs view offers
+        // All/Board/Workers/Memory/Files/HTTP, but every row claimed "http", so
+        // five of the six tabs matched ZERO events — the filter worked, the data
+        // could never satisfy it. The family is already on this row, so the
+        // answer was present and being overwritten with a constant.
+        "category": category_of(&family),
         "level": level,
         "latency_ms": latency_ms,
         "family": family,
@@ -1489,6 +1496,25 @@ fn round4(v: f64) -> f64 {
 /// (native|proxied) derives from the boundary registry, the same source
 /// /api/debug/boundary serves. Mounted in mod.rs next to its debug siblings;
 /// public for the same reason boundary is (route names only, nothing secret).
+/// Which Logs tab a request belongs to.
+///
+/// The tabs are a HUMAN grouping ("show me board activity"), not a URL prefix,
+/// so this maps families onto them rather than exposing the family list raw —
+/// a tab per API family would be 49 tabs.
+///
+/// Anything unmapped stays "http": an honest catch-all beats inventing a
+/// category, and the All tab shows it regardless.
+fn category_of(family: &str) -> &'static str {
+    match family {
+        "/api/board" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
+        "/api/sessions" | "/api/workers" | "/api/sessions-git" | "/api/channels" => "session",
+        "/api/memory" | "/api/memories" | "/api/scope" | "/api/notes" => "memory",
+        "/api/fs" | "/api/file" | "/api/files" | "/api/upload" | "/api/uploads"
+        | "/api/library" => "files",
+        _ => "http",
+    }
+}
+
 pub async fn debug_routes() -> axum::Json<Value> {
     let proxied = |path: &str| {
         super::py_proxy::PROXIED_FAMILIES.iter().any(|f| {
@@ -2214,5 +2240,39 @@ mod tests {
         // module.
         assert!(routes.iter().all(|r| r["owner"] == "native"), "{v}");
         assert_eq!(find("/api/scope")["methods"], json!(["*"]));
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::category_of;
+
+    /// Ethan, 2026-08-10: "these tabs in the logs dont work". Five of the six
+    /// Logs tabs matched ZERO events because every row was stamped "http". The
+    /// tab labels are the contract — each one a user can click must be
+    /// reachable by some real family.
+    #[test]
+    fn every_clickable_tab_is_reachable_from_some_family() {
+        for (family, want) in [
+            ("/api/board", "board"),
+            ("/api/schedules", "board"),
+            ("/api/sessions", "session"),
+            ("/api/workers", "session"),
+            ("/api/memory", "memory"),
+            ("/api/scope", "memory"),
+            ("/api/fs", "files"),
+            ("/api/upload", "files"),
+        ] {
+            assert_eq!(category_of(family), want, "family {family}");
+        }
+    }
+
+    /// An unmapped family stays "http" rather than inventing a bucket. The All
+    /// tab shows it either way, so a wrong guess would only mislabel it.
+    #[test]
+    fn an_unmapped_family_is_honestly_http() {
+        assert_eq!(category_of("/api/usage"), "http");
+        assert_eq!(category_of("/health"), "http");
+        assert_eq!(category_of(""), "http");
     }
 }
