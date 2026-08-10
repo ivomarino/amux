@@ -134,8 +134,13 @@ depends on it.
   the contract memory; they compare against recordings, not a live server)
 - `install.sh` — one-command install (build + `~/.local/bin` + launchd agents)
 - `mcp.json` — centralized MCP server config (shared by local and cloud)
-- `cloud/` — GCP provisioning for cloud.amux.io. **DEPRECATED-pending-rust-migration:**
-  it still runs the last-built Python image; keep it deployable, build nothing new on it.
+- `cloud/` — cloud.amux.io: the workspace image (`docker/Dockerfile`, a rust
+  multi-stage build of `crates/`), the python auth/orchestration gateway
+  (`gateway/`), litestream replication, and the seed + e2e scripts. Shipped by
+  `.github/workflows/deploy-cloud.yml`, which **cannot build a python image** —
+  a guard job asserts it. Read `cloud/README.md` before changing anything there:
+  it names what degrades in the container and the two gateway↔server contract
+  gaps (`/api/observability`, `/api/share/<token>/info`) that are still open.
 
 ## Claude Code hook entries: matchers are REGEXES, and tool events require one
 
@@ -314,7 +319,16 @@ When the user says **"deploy"**, run the full pipeline:
 
 - Never add cloud-only or OSS-only code branches (no `if IS_CLOUD`, no `CLOUD` env build flags).
 - Features that differ between environments must be driven by headers/env vars injected by the gateway (e.g., `X-Amux-User-Email`) or by presence/absence of configuration, not by build-time flags.
-- `cloud/docker/amux-server.py` must never be committed — it is a generated artifact of the deprecated Python cloud image (still what cloud.amux.io runs, pending its rust migration). It is in `.gitignore`.
+- The cloud image is the SAME binary built from `crates/`. Everything it needs
+  that a laptop does not lives in `cloud/docker/Dockerfile` as env or as a
+  binary on PATH — `IS_SANDBOX=1` (Claude Code refuses `--dangerously-skip-permissions`
+  as root, and only the deployment knows it is an isolated single-tenant
+  container), `AMUX_RS_PORT=8822`, and a chromium shim carrying the flags a
+  display-less container needs. If you find yourself wanting `if container`, the
+  answer is one of those three shapes.
+- `cloud/docker/amux-server.py` is a dead artifact of the retired python image.
+  Nothing builds or reads it any more; it stays in `.gitignore` so a stray copy
+  can never be committed.
 
 ## Server config — `~/.amux/server.env`
 
