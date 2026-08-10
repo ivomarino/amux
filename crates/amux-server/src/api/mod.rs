@@ -37,6 +37,7 @@ pub mod org;
 pub mod prefs;
 pub mod py_proxy;
 pub mod request_log;
+pub mod review;
 pub mod schedules;
 pub mod scope;
 pub mod search;
@@ -103,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/usage", usage::routes())
+        .nest("/api/review", review::routes())
         .nest("/api/alert", alerts::routes())
         .route("/api/stats/daily", axum::routing::get(stats::daily))
         .route("/api/branding", axum::routing::get(branding::get_branding)
