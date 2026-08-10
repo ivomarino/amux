@@ -488,16 +488,34 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         .unwrap_or(200)
         .clamp(1, 2000);
     let category = q.get("category").map(String::as_str).unwrap_or("");
-    // Every row here is an HTTP event. A category filter for anything else
-    // honestly matches nothing (Python's semantic categories — board,
-    // session, memory — live in its own process; this origin does not
-    // fabricate them).
-    if !category.is_empty() && category != "http" {
-        return Json(json!({"events": [], "count": 0, "total_matched": 0})).into_response();
-    }
+    // This EARLY RETURN was the bug (Ethan: "these tabs in the logs dont
+    // work"). It answered empty for every category except http, so five of the
+    // six Logs tabs were dead — and the comment justified it by saying the
+    // categories "live in python's process", which stopped being true when this
+    // origin became the only server.
+    //
+    // The row already carries `family`, and a category is just a human grouping
+    // OF families, so the filter is a family clause rather than a fabrication.
+    // `http` keeps meaning "everything not in a named group", which is what the
+    // tab has always shown.
 
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if !category.is_empty() {
+        let fams = families_for_category(category);
+        if fams.is_empty() {
+            // "http" = everything NOT claimed by a named group, so it is the
+            // complement rather than a list.
+            let named = NAMED_CATEGORY_FAMILIES.join("','");
+            clauses.push(format!("COALESCE(family,'') NOT IN ('{named}')"));
+        } else {
+            let holes = fams.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            clauses.push(format!("COALESCE(family,'') IN ({holes})"));
+            for f in fams {
+                params.push(rusqlite::types::Value::Text(f.to_string()));
+            }
+        }
+    }
     if let Some(s) = q.get("session").filter(|s| !s.is_empty()) {
         // Python's `session` concept on http events mixes the TARGET session
         // (classified from the path) with the caller header; match either so
@@ -1496,6 +1514,31 @@ fn round4(v: f64) -> f64 {
 /// (native|proxied) derives from the boundary registry, the same source
 /// /api/debug/boundary serves. Mounted in mod.rs next to its debug siblings;
 /// public for the same reason boundary is (route names only, nothing secret).
+/// Every family claimed by a NAMED tab. `http` is the complement of this set,
+/// so the two definitions cannot disagree about what "everything else" means.
+const NAMED_CATEGORY_FAMILIES: &[&str] = &[
+    "/api/board", "/api/schedules", "/api/cal-events", "/api/calendar",
+    "/api/sessions", "/api/workers", "/api/sessions-git", "/api/channels",
+    "/api/memory", "/api/memories", "/api/scope", "/api/notes",
+    "/api/fs", "/api/file", "/api/files", "/api/upload", "/api/uploads", "/api/library",
+];
+
+/// The families a tab selects. Empty for `http`, which is the complement.
+///
+/// Derived from [`category_of`] rather than written twice — a second list would
+/// drift, and then the tab would show rows whose own `category` field disagreed
+/// with the tab they arrived under.
+fn families_for_category(cat: &str) -> Vec<&'static str> {
+    if cat == "http" {
+        return Vec::new();
+    }
+    NAMED_CATEGORY_FAMILIES
+        .iter()
+        .copied()
+        .filter(|f| category_of(f) == cat)
+        .collect()
+}
+
 /// Which Logs tab a request belongs to.
 ///
 /// The tabs are a HUMAN grouping ("show me board activity"), not a URL prefix,
@@ -2269,6 +2312,22 @@ mod category_tests {
 
     /// An unmapped family stays "http" rather than inventing a bucket. The All
     /// tab shows it either way, so a wrong guess would only mislabel it.
+    /// The two definitions must agree: every family a tab SELECTS must also be
+    /// STAMPED with that tab's category. If they drift, a row shows up under a
+    /// tab while its own category field says something else.
+    #[test]
+    fn the_selector_and_the_stamp_cannot_disagree() {
+        for cat in ["board", "session", "memory", "files"] {
+            let fams = super::families_for_category(cat);
+            assert!(!fams.is_empty(), "tab {cat} selects no families — it would be dead");
+            for f in fams {
+                assert_eq!(category_of(f), cat, "{f} is selected by {cat} but stamped differently");
+            }
+        }
+        // http is the COMPLEMENT, so it names no families by design.
+        assert!(super::families_for_category("http").is_empty());
+    }
+
     #[test]
     fn an_unmapped_family_is_honestly_http() {
         assert_eq!(category_of("/api/usage"), "http");
