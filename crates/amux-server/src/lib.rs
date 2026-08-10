@@ -202,6 +202,11 @@ async fn async_main() {
     // Spawned before the router takes `state` by value.
     tokio::spawn(api::session_verbs::steer_deliver_loop(state.clone()));
 
+    // pipe-pane reconciler (AMUX-2671). `pipe-pane` is attached in
+    // start_session and nowhere else, so a pane that loses its writer stays
+    // unlogged forever — indistinguishable from a lane that was never started.
+    tokio::spawn(api::session_verbs::pipe_reconcile_loop());
+
     // Continuous invariant checking (AMUX-2622). Spawned before the router
     // takes `state` by value. Runs forever; a panic in one pass is caught
     // inside so the monitor cannot die quietly — a dead monitor's silence
