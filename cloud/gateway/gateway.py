@@ -5,7 +5,7 @@ Verifies Clerk JWTs, starts/stops Docker containers per user, reverse-proxies re
 """
 
 import os, json, time, sqlite3, subprocess, threading, urllib.request, urllib.error, base64
-import hmac, hashlib, secrets, re, queue as _queue
+import hmac, hashlib, secrets, re, ssl, queue as _queue
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -43,6 +43,33 @@ ADMIN_EMAILS    = set(e.strip() for e in os.environ.get("ADMIN_EMAILS", "").spli
 # Public origin containers use to reach the Anthropic proxy on this gateway.
 PROXY_PUBLIC_BASE = os.environ.get("AMUX_PROXY_BASE", "https://cloud.amux.io")
 GATEWAY_LOG     = "/var/log/amux-gateway.log"
+
+# ── The loopback hop to a workspace container ────────────────────────────────
+# The python image ran `amux-server.py --no-tls` and spoke plain HTTP on this
+# hop. The RUST image cannot: the rust server always serves TLS and answers a
+# plain-HTTP request with a 301 to https://localhost:8822 — which, followed from
+# the HOST, points at the host's own port 8822 and not at any container. So the
+# scheme has to change WITH the image.
+#
+# It is an explicit switch and not a probe. A probe would have to distinguish
+# "python container" from "rust container" per request, and the two are
+# indistinguishable until you have already made the wrong call once; a switch is
+# read once, logged at startup, and flipped by the same deploy that pushes the
+# image. Set CONTAINER_SCHEME=https in /etc/amux/gateway.env (deploy-cloud.yml
+# does this idempotently) as part of the rust cutover. Default stays `http` so a
+# gateway deployed ahead of the image keeps the existing fleet working.
+#
+# Certificate verification is OFF on this hop by design: the cert is self-signed,
+# minted per container into its own volume, and the connection never leaves
+# loopback. The trust boundary is this gateway, which is also why the container
+# runs with AMUX_AUTH_TOKEN=none.
+CONTAINER_SCHEME = os.environ.get("CONTAINER_SCHEME", "http").strip().lower()
+_CTR_SSL = ssl._create_unverified_context() if CONTAINER_SCHEME == "https" else None
+
+
+def _ctr_url(port, path=""):
+    """Base URL for a workspace container on the loopback hop."""
+    return f"{CONTAINER_SCHEME}://127.0.0.1:{port}{path}"
 
 # ── Starting HTML (shown while container boots) ──────────────────────────────
 _STARTING_HTML = """<!DOCTYPE html>
@@ -1059,8 +1086,8 @@ def _is_admin_email(email):
 def _container_api(port, path, method="GET", timeout=10):
     """Call a user container's local API. Returns parsed JSON or None."""
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        req = urllib.request.Request(_ctr_url(port, path), method=method)
+        resp = urllib.request.urlopen(req, timeout=timeout, context=_CTR_SSL)
         return json.loads(resp.read())
     except Exception:
         return None
@@ -1636,7 +1663,7 @@ def _resolve_share_token(token: str) -> int | None:
         port = row["port"]
         try:
             resp = urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/api/share/{token}/info", timeout=3)
+                _ctr_url(port, f"/api/share/{token}/info"), timeout=3, context=_CTR_SSL)
             if resp.status == 200:
                 with _share_cache_lock:
                     _share_cache[token] = (port, now + 60)
@@ -1825,7 +1852,7 @@ def _tunnel_routes(handler, path, qs):
 
 # ── Proxy helper ───────────────────────────────────────────────────────────────
 def proxy(handler, port, path, qs, user_email="", user_id=None):
-    url = f"http://127.0.0.1:{port}{path}"
+    url = _ctr_url(port, path)
     if qs:
         url += "?" + qs
     length = int(handler.headers.get("Content-Length", 0))
@@ -1838,7 +1865,7 @@ def proxy(handler, port, path, qs, user_email="", user_id=None):
     is_sse = handler.headers.get("Accept", "") == "text/event-stream"
     req = urllib.request.Request(url, data=body, method=handler.command, headers=fwd)
     try:
-        resp = urllib.request.urlopen(req, timeout=None if is_sse else 60)
+        resp = urllib.request.urlopen(req, timeout=None if is_sse else 60, context=_CTR_SSL)
         handler.send_response(resp.status)
         for k, v in resp.headers.items():
             if k.lower() not in ("transfer-encoding",):
@@ -3394,4 +3421,11 @@ if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
     get_db()
     print(f"[gateway] listening on :{PORT}")
+    # Say which scheme this process will use to reach workspaces. A gateway
+    # talking http to rust containers fails as "502 / Starting page forever",
+    # which reads as a container problem and sends you into docker logs; the
+    # one fact that discriminates it is this line (ethos rule 4).
+    print(f"[gateway] container hop: {CONTAINER_SCHEME}:// "
+          f"(cert verification {'off' if _CTR_SSL else 'n/a'}) — "
+          f"set CONTAINER_SCHEME in /etc/amux/gateway.env")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

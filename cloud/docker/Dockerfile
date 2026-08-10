@@ -1,76 +1,183 @@
-FROM python:3.11-slim
+# amux per-user workspace image — RUST server (cloud.amux.io).
+#
+# Replaces the python:3.11-slim image that copied a generated `amux-server.py`
+# into /app. That server no longer exists in this repo (deleted 792ce1f), so
+# this file is the only thing that can produce a cloud image at all.
+#
+# BUILD CONTEXT IS THE REPO ROOT, not this directory:
+#     docker build -f cloud/docker/Dockerfile -t ghcr.io/mixpeek/amux:latest .
+# (the old image built with `context: .` too — the `-f` is what changed).
+#
+# SINGLE-CODEBASE RULE (CLAUDE.md): there is no cloud-only code in the server.
+# Everything environment-specific in here is an env var or the presence of a
+# binary. Nothing in crates/ knows it is in a container.
 
+# ─────────────────────────────── build ────────────────────────────────────────
+FROM rust:1-slim-bookworm AS build
+
+# Three native deps need a toolchain and none of them announce themselves until
+# late in a cold build, which is why they are installed up front rather than
+# discovered:
+#   * libsqlite3-sys (rusqlite `bundled`) compiles SQLite from C   -> cc
+#   * ring (rustls/rcgen) compiles C + asm                          -> cc, perl
+#   * aws-lc-sys IS in the dependency graph (rustls 0.23 pulls both
+#     providers even though lib.rs pins `ring` at runtime)          -> cmake
+# `cargo tree` confirms aws-lc-sys -> aws-lc-rs -> rustls; without cmake the
+# build dies ~8 minutes in with a message that reads like a cargo bug.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux curl git procps ca-certificates gnupg \
+      build-essential cmake perl pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Node 22 — Debian's `nodejs` package is far too old for the Claude Code CLI.
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+
+# --release is REQUIRED, not a preference. `rust-embed` is built without the
+# `debug-embed` feature, so a DEBUG binary reads the dashboard from
+# CARGO_MANIFEST_DIR at runtime — a path that does not exist in the runtime
+# stage. The container would boot, answer /health, and serve "dashboard not
+# embedded" for every page, with nothing in the logs naming the cause.
+#
+# The cache mounts make an incremental rebuild cheap, and they are also why the
+# binaries are copied to /out INSIDE this RUN: a cache mount is not part of the
+# layer, so anything left in /src/target vanishes when the step ends.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release -p amux-server -p amux-cli \
+    && mkdir -p /out \
+    && cp target/release/amux-server /out/amux-server-rs \
+    && cp target/release/amux-rs     /out/amux-rs
+
+# ────────────────────────────── runtime ───────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime binaries the server actually spawns (every one of these is a
+# `Command::new` site in crates/amux-server — see cloud/README.md for the map):
+#   tmux      session backend (the default; herdr is deliberately absent)
+#   git       /api/sessions/<n>/git, worktree + branch resolution
+#   python3   tmux `pipe-pane` log writer — WITHOUT IT EVERY SESSION LOG IS
+#             EMPTY and nothing reports why (session_verbs.rs:2904)
+#   procps    ps / pgrep / pkill — child discovery and session kill
+#   ripgrep   /api/fs/search (falls back to an honest "rg not found" message)
+#   ffmpeg    /api/file/prepare + transcode
+#   chromium  the browser primitive drives Chrome over CDP directly
+#   curl      the image HEALTHCHECK below
+#   xdg-utils /api/fs reveal-in-file-manager on Linux
+# python3-pip / openssh-client / jq / less are not server dependencies: they are
+# for the AGENT working in the workspace, which is the actual product. The old
+# python image had all of them by virtue of its base image; dropping them would
+# be a silent capability regression for every customer.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git tmux procps ripgrep ffmpeg \
+      python3 python3-pip python3-venv \
+      openssh-client less jq unzip \
+      chromium fonts-liberation xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 22 — Debian's `nodejs` is far too old for the Claude Code CLI.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir requests
-
-# Claude Code. This MUST run the postinstall: it downloads the platform-native
-# binary. The previous build used `--ignore-scripts ... 2>/dev/null || true`,
+# Claude Code. This MUST run its postinstall: it downloads the platform-native
+# binary. A previous build used `--ignore-scripts ... 2>/dev/null || true`,
 # which skipped that download and swallowed the error, so every cloud container
-# shipped a claude that failed at runtime with "native binary not installed" —
-# and the smoke test never noticed, because it only asserted that a session
-# produced *some* output, which a bare shell prompt satisfies.
+# shipped a `claude` that failed at runtime with "native binary not installed".
 RUN npm install -g @anthropic-ai/claude-code
 
-# Fail the BUILD, not the customer's session, if the CLI is not actually runnable.
-RUN claude --version && echo "claude CLI verified at build time"
+# Fail the BUILD, not the customer's session, if the CLI is not runnable.
+# Same reasoning for chromium: the browser primitive resolving to nothing is a
+# capability that silently does not exist, and this is the last moment it is
+# cheap to notice.
+RUN claude --version && echo "claude CLI verified at build time" \
+    && chromium --version && echo "chromium verified at build time"
+
+# Chrome cannot start with the server's launch flags in a container: there is no
+# display and the process is root, so it spawns and then never opens its CDP
+# port — which surfaces as `Chrome spawned (pid N) but CDP on port P never
+# answered within 12s`, a message that names the symptom and not the cause.
+# Verified in the built image before this shim existed.
+#
+# The server resolves a browser by NAME on PATH (`google-chrome`,
+# `google-chrome-stable`, `chromium`, `chromium-browser` — integrations/
+# browser.rs), and /usr/local/bin precedes /usr/bin, so a shim here is found
+# first. This is a deployment property (a display-less single-tenant container),
+# not a server branch: nothing in crates/ learns it is in docker, and an agent
+# in the workspace typing `chromium` gets flags that also work for it.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      '# amux cloud: chromium with the flags a container needs. See cloud/docker/Dockerfile.' \
+      '#   --headless=new        no X display exists here' \
+      '#   --no-sandbox          the workspace process is root; the CONTAINER is the sandbox' \
+      '#   --disable-dev-shm-usage  /dev/shm defaults to 64MB and chrome dies on it' \
+      'exec /usr/bin/chromium --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"' \
+      > /usr/local/bin/chromium \
+    && chmod 0755 /usr/local/bin/chromium \
+    && [ "$(command -v chromium)" = "/usr/local/bin/chromium" ] \
+    && echo "chromium container shim installed and resolves first on PATH"
+
+COPY --from=build /out/amux-server-rs /usr/local/bin/amux-server-rs
+COPY --from=build /out/amux-rs        /usr/local/bin/amux-rs
+# The bash CLI is an HTTP CLIENT of the server, not part of the deleted python
+# server. Fleet muscle memory (`amux send`, `amux board`) runs through it and
+# every CLAUDE.md tells agents to use it, so a workspace without it hands the
+# agent instructions it cannot follow (ethos rule 1: capability that never
+# reaches the model). It needs curl + python3, both installed above.
+COPY amux /usr/local/bin/amux
+RUN chmod 0755 /usr/local/bin/amux-server-rs /usr/local/bin/amux-rs /usr/local/bin/amux
 
 WORKDIR /app
+ENV HOME=/root
 
-# Browser automation. amux launches Playwright via `require('playwright')` with
-# cwd=/app, so the node package must resolve from HERE (not -g), and Chromium
-# plus its OS libs must be present. Cloud has no display, so this is the
-# headless engine; an interactive sign-in is handled by importing a saved
-# storage-state/profile rather than popping a window. This is a DEPLOYMENT
-# concern only — amux-server.py is byte-identical to local.
-RUN npm install playwright \
-    && npx playwright install --with-deps chrome \
-    && node -e "require('playwright'); console.log('playwright resolves from /app')"
+# 8822, not the rust default 8823 or the installer's 8824, and this is load
+# bearing in two places at once:
+#   1. the gateway proxies 127.0.0.1:<host_port> -> :8822 in the container, and
+#   2. the server injects `AMUX_URL=https://localhost:8822` into every tmux lane
+#      it starts (session_verbs.rs:3270) with that port HARDCODED. Move the
+#      listener and every agent in the workspace gets an AMUX_URL pointing at
+#      nothing, which fails as "amux board did nothing" rather than as a port
+#      mismatch.
+ENV AMUX_RS_PORT=8822
 
-# The Browser tab drives browser-use (python console script at
-# /usr/local/bin/browser-use), with playwright underneath — the node package
-# alone is not enough. Verify both entrypoints exist at build time so this
-# capability cannot ship broken the way the claude CLI did.
-# PIN to the version local runs. browser-use 3.x removed --json and the
-# preset subcommands amux drives, so an unpinned install builds fine and
-# then fails at runtime — exactly the class of break this file now guards.
-RUN pip install --no-cache-dir 'browser-use==0.12.2' playwright \
-        && test -x /usr/local/bin/browser-use \
-    && browser-use --help 2>&1 | grep -q -- "--json" \
-    && echo "browser-use 0.12.2 verified at build time (--json present)"
-
-# browser-use 0.12.2 looks for real Chrome, not Chromium — locally that is
-# the desktop install. Assert a chrome binary exists so this cannot ship
-# half-working again.
-RUN (which google-chrome || which google-chrome-stable || ls /root/.cache/ms-playwright/chrome-*/chrome-linux*/chrome) \
-    && echo "chrome binary verified at build time"
-
-COPY amux-server.py .
-
-ENV AMUX_PORT=8822
-# Bring the user's sessions back when this container is replaced. Deploying a
-# new image recreates it; the volume restores every session's .env, the board
-# and the schedules, but the tmux processes died with the old container — so the
-# workspace reads fully populated through the API and shows its owner nothing.
+# WITHOUT THIS, EVERY AGENT LANE IN EVERY WORKSPACE DIES AT LAUNCH.
+# The server launches `claude --dangerously-skip-permissions` (provider/
+# claude.rs), and Claude Code v2.1.69+ refuses that flag as root:
+#     --dangerously-skip-permissions cannot be used with root/sudo privileges
+# The pane exits 1 immediately and the worker reports `idle`, so the failure
+# looks like an idle session rather than a dead one. Reproduced in this image,
+# then fixed and re-checked with a control run: without IS_SANDBOX the refusal
+# appears, with it the CLI proceeds (to "Not logged in", i.e. past the gate).
 #
-# Set HERE rather than by the gateway because the deploy path never touches the
-# gateway: .github/workflows/deploy-cloud.yml runs `docker compose up -d
-# --no-recreate` directly, so a per-container write in start_container() reaches
-# only containers the gateway itself starts — which is exactly why the first
-# live test of this found every session still down on a container that already
-# had the code. Image-level covers every start path.
+# The python image did not need this because the python server STRIPPED the flag
+# when `os.getuid() == 0` (amux-server.py:24348) and compensated with a
+# permissions allow-list in ~/.claude/settings.json. The rust server has no such
+# branch — and it should not grow one, since "am I root" is not the question;
+# "am I in an isolated single-tenant container" is, and only the deployment can
+# answer that. So the environment declares it here.
+ENV IS_SANDBOX=1
+
+# The server ALWAYS serves TLS (crates/amux-server/src/lib.rs — there is no
+# no-tls switch), so the loopback hop from the gateway is https with a
+# self-signed cert minted into /root/.amux/tls on first boot. `curl -k` here is
+# not laziness: the cert is per-container and per-volume, and the trust boundary
+# is the gateway, not this hop. See cloud/README.md for the one-knob change that
+# would remove this hop's TLS entirely.
 #
-# amux-server.py defaults this OFF, which is the right default on a workstation
-# (starting an entire fleet on every restart). This image is the environment
-# where the opposite is right, so the image is what says so.
-ENV AMUX_AUTOSTART_SESSIONS=1
+# The healthcheck lives HERE and nowhere else — the compose template used to
+# carry its own copy, which is one more thing to keep in step for no gain. It
+# checks /health rather than /api/sessions because /health is the endpoint that
+# reports `store:"hung"` — a wedged store with a live port is precisely the
+# failure a liveness probe on a list endpoint cannot see.
+HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=6 \
+  CMD curl -fsk https://127.0.0.1:8822/health || exit 1
+
 EXPOSE 8822
 
-CMD ["python", "amux-server.py", "8822", "--no-tls"]
+# NOTE — capability that does NOT carry over from the python image:
+# `AMUX_AUTOSTART_SESSIONS=1` was set here so a replaced container brought its
+# owner's sessions back. The Rust server does not implement that variable
+# (grep: zero hits in crates/), so setting it would be a lie the deploy tooling
+# then acts on. It is left UNSET and tracked in cloud/README.md instead.
+
+CMD ["amux-server-rs"]

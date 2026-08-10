@@ -1,0 +1,332 @@
+name: Deploy to cloud.amux.io
+
+# RUST CUTOVER (AMUX-2619). The previous version of this file rsync'd
+# `amux-server.py` onto the host and touched it to restart every container. That
+# file was deleted from the repo (792ce1f) and this workflow went with it, which
+# is why no cloud image could be built from main at all.
+#
+# The deploy unit is now the IMAGE, not a file under a running container:
+#   build -> ghcr.io/mixpeek/amux:{latest,<sha>}  (same registry as before)
+#   host  -> gateway.py + compose template + `docker pull`
+#
+# It deliberately does NOT recreate running workspaces by default — see the
+# `recreate` input on the redeploy job. A recreate stops every tmux session in a
+# customer's workspace, and the rust server does not implement the
+# AMUX_AUTOSTART_SESSIONS restore the python image had, so nothing brings them
+# back. Whether to take a customer's sessions down is a human's call, not a
+# push's (ethos rule 8).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'cloud/**'
+      - '.dockerignore'
+      - '.github/workflows/deploy-cloud.yml'
+  workflow_dispatch:
+    inputs:
+      recreate:
+        description: 'Recreate running workspaces onto the new image (STOPS every session in them)'
+        required: false
+        default: 'no'
+        type: choice
+        options: ['no', 'yes']
+
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+env:
+  CLOUD_HOST: 34.121.177.76
+  IMAGE: ghcr.io/mixpeek/amux
+
+jobs:
+  # ── 1. The image cannot be a python image again ────────────────────────────
+  # This gate exists because the failure it guards is invisible: a python image
+  # builds and runs perfectly well, it just runs a server that no longer exists
+  # in this repo. Every assertion below is written so it CAN fail — verified by
+  # running each one against the deleted python Dockerfile
+  # (`git show 792ce1f^:cloud/docker/Dockerfile`), where all four trip.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The cloud image is a rust build, and nothing here resurrects the python server
+        run: |
+          fail=0
+          if [ -e amux-server.py ]; then
+            echo "::error::amux-server.py is back in the repo — the python server was deleted in 792ce1f"
+            fail=1
+          fi
+          if ! grep -qE '^FROM rust:' cloud/docker/Dockerfile; then
+            echo "::error::cloud/docker/Dockerfile does not start from a rust image"
+            fail=1
+          fi
+          if grep -qiE '^FROM python' cloud/docker/Dockerfile; then
+            echo "::error::cloud/docker/Dockerfile has a python base image"
+            fail=1
+          fi
+          # COMMENT LINES STRIPPED FIRST. Both files explain in prose what they
+          # stopped doing, and a bare grep matched that prose — the check failed
+          # on a correct tree the first time it was run, which is the cheap
+          # version of this mistake. What must not come back is a COPY of the
+          # file or a bind mount of it, and those are never comments.
+          if grep -vE '^[[:space:]]*#' cloud/docker/Dockerfile cloud/docker/docker-compose.template.yml \
+             | grep -q 'amux-server\.py'; then
+            echo "::error::the image or compose template still copies/mounts amux-server.py"
+            fail=1
+          fi
+          [ "$fail" = 0 ] && echo "guard: cloud image is rust-only"
+          exit "$fail"
+
+  # ── 2. Build + push ────────────────────────────────────────────────────────
+  build:
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          # Context is the REPO ROOT: the Dockerfile builds the cargo workspace
+          # (Cargo.toml, Cargo.lock, crates/) and copies in the `amux` bash CLI.
+          context: .
+          file: cloud/docker/Dockerfile
+          # The cloud host is x86_64. Building only what is deployed keeps this
+          # under the runner's time budget; a multi-arch build here would emulate
+          # arm64 for nobody. (Local arm64 verification builds natively.)
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 3. Host: gateway + compose template + pull ─────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Gateway env — admin emails and the container hop scheme (idempotent)
+        run: |
+          # CONTAINER_SCHEME is the rust cutover switch: the rust server always
+          # serves TLS and answers plain HTTP with a 301 to https://localhost:8822,
+          # which from the host points at the host and not at any container. A
+          # gateway left on `http` serves the Starting page forever and looks
+          # like a container fault. Written here so the gateway and the image
+          # cross over in the same deploy.
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            set -e
+            touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env
+            grep -q "^ADMIN_EMAILS=" /etc/amux/gateway.env || echo "ADMIN_EMAILS=ethan@mixpeek.com,esteininger21@gmail.com" >> /etc/amux/gateway.env
+            grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "hello@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=hello@amux.io,/" /etc/amux/gateway.env
+            grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "qa-godmode@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=qa-godmode@amux.io,/" /etc/amux/gateway.env
+            grep -v "^CONTAINER_SCHEME=" /etc/amux/gateway.env > /etc/amux/.ge.tmp || true
+            mv /etc/amux/.ge.tmp /etc/amux/gateway.env
+            chmod 600 /etc/amux/gateway.env
+            echo "CONTAINER_SCHEME=https" >> /etc/amux/gateway.env
+            echo "admin emails now: $(grep ^ADMIN_EMAILS= /etc/amux/gateway.env)"
+            echo "container hop:    $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env)"'
+
+      - name: Sync gateway secrets from repo secrets (host-only, never in a container)
+        run: |
+          # Secrets live in GitHub (encrypted) and land in /etc/amux/gateway.env on
+          # the HOST. The gateway process reads them; user containers never receive
+          # them. Values are piped over stdin so they never appear in a command line
+          # or in the workflow log.
+          sync_secret() {
+            NAME="$1"; VAL="$2"
+            if [ -z "$VAL" ]; then echo "$NAME: not set in repo secrets — skipped"; return; fi
+            printf '%s' "$VAL" | ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
+              "read -r V; N='$NAME'; touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env;
+               if grep -q \"^\$N=\" /etc/amux/gateway.env; then
+                 grep -v \"^\$N=\" /etc/amux/gateway.env > /etc/amux/.ge.tmp
+                 mv /etc/amux/.ge.tmp /etc/amux/gateway.env
+                 chmod 600 /etc/amux/gateway.env
+               fi
+               printf '%s=%s\n' \"\$N\" \"\$V\" >> /etc/amux/gateway.env
+               echo \"\$N updated (\${#V} chars, value not shown)\""
+          }
+          sync_secret STRIPE_SECRET_KEY "${{ secrets.STRIPE_SECRET_KEY }}"
+          sync_secret ANTHROPIC_API_KEY "${{ secrets.ANTHROPIC_API_KEY }}"
+          sync_secret STRIPE_PLATFORM_FEE_PRICE_ID "${{ secrets.STRIPE_PLATFORM_FEE_PRICE_ID }}"
+          sync_secret STRIPE_PLATFORM_PRICE_ID "${{ secrets.STRIPE_PLATFORM_PRICE_ID }}"
+
+      - name: Deploy gateway.py + compose template + litestream config
+        run: |
+          rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/gateway.py \
+            "root@$CLOUD_HOST:/opt/amux-cloud/gateway/gateway.py"
+          rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/docker/docker-compose.template.yml \
+            "root@$CLOUD_HOST:/opt/amux-cloud/docker/docker-compose.template.yml"
+          rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/litestream/litestream.yml \
+            "root@$CLOUD_HOST:/opt/amux-cloud/litestream/litestream.yml"
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
+            'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
+
+      - name: Gateway is actually on the https hop (fails if the restart did not take)
+        run: |
+          # `systemctl is-active` proves a process exists, not that it read the
+          # new env. The startup line names the scheme; grepping for it is the
+          # only thing that distinguishes "restarted" from "restarted with the
+          # config we just wrote".
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            line=$(grep -a "container hop:" /var/log/amux-gateway.log | tail -1)
+            echo "gateway says: ${line:-<no container-hop line — gateway.py is older than this deploy>}"
+            case "$line" in
+              *"container hop: https://"*) exit 0 ;;
+              *) echo "::error::gateway is not on the https container hop"; exit 1 ;;
+            esac'
+
+      - name: Pull the new image and (re)generate per-workspace compose files
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+            set -u
+            source /etc/amux/gateway.env
+            R2_ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            TEMPLATE=/opt/amux-cloud/docker/docker-compose.template.yml
+
+            docker image prune -af >/dev/null 2>&1 || true
+            docker pull ghcr.io/mixpeek/amux:latest
+            WANT=$(docker image inspect -f '{{.Id}}' ghcr.io/mixpeek/amux:latest)
+            echo "target image: $WANT"
+
+            # The glob has silently matched nothing before, and an empty glob
+            # leaves `user_dir` as the literal pattern — indistinguishable from
+            # "there were no workspaces" unless the preflight says so out loud.
+            echo "== deploy loop preflight =="
+            echo "  template exists: $([ -f "$TEMPLATE" ] && echo yes || echo NO)"
+            _n=$(ls -d /var/amux/users/*/ 2>/dev/null | wc -l | tr -d ' ')
+            echo "  /var/amux/users/*/ matched: ${_n} dir(s)"
+            if [ "${_n}" = "0" ]; then
+              echo "  LOOP WILL DO NOTHING — what actually exists under /var/amux:"
+              ls -la /var/amux/ 2>&1 | head -10 | sed 's/^/    /'
+              exit 0
+            fi
+
+            stale=""
+            for user_dir in /var/amux/users/*/; do
+              user_id=$(basename "$user_dir")
+              compose_file="$user_dir/docker-compose.yml"
+              # Search the WHOLE file for the host port bound to :8822. A
+              # `grep -A1 ports:` parse broke silently once when a comment moved
+              # in above the mapping, and skipped all 19 workspaces while the
+              # step still exited 0.
+              port=$(grep -oP "[0-9]{4,}(?=:8822)" "$compose_file" 2>/dev/null | head -1)
+              if [ -z "$port" ]; then
+                echo "  SKIP ${user_id}: no port parsed from ${compose_file}"
+                continue
+              fi
+              sed "s/\${USER_ID}/${user_id}/g;
+                   s/\${USER_PORT}/${port}/g;
+                   s/\${CF_ACCOUNT_ID}/${CF_ACCOUNT_ID}/g;
+                   s|\${R2_ENDPOINT}|${R2_ENDPOINT}|g;
+                   s/\${R2_ACCESS_KEY}/${R2_ACCESS_KEY}/g;
+                   s/\${R2_SECRET_KEY}/${R2_SECRET_KEY}/g;
+                   s/\${POSTHOG_KEY}/${POSTHOG_KEY:-}/g;
+                   s|\${POSTHOG_HOST}|${POSTHOG_HOST:-https://us.i.posthog.com}|g" \
+                "$TEMPLATE" > "$compose_file"
+
+              # --no-recreate ON PURPOSE. A recreate stops every tmux session in
+              # this customer's workspace and nothing restores them (the rust
+              # server has no AMUX_AUTOSTART_SESSIONS). New/stopped workspaces
+              # come up on the new image; running ones keep serving until a human
+              # runs this workflow with recreate=yes.
+              ( cd "$user_dir" && docker compose up -d --no-recreate 2>&1 | grep -v '^#' | tail -3 )
+
+              have=$(docker inspect -f '{{.Image}}' "amux-user-${user_id}" 2>/dev/null || echo none)
+              if [ "$have" != "$WANT" ]; then
+                stale="${stale} ${user_id}"
+                echo "  ${user_id}: STILL ON THE OLD IMAGE (running ${have:0:19}…)"
+              else
+                echo "  ${user_id}: on the new image"
+              fi
+            done
+
+            echo ""
+            if [ -n "$stale" ]; then
+              echo "WORKSPACES NOT YET ON THIS BUILD:${stale}"
+              echo "They are running the previous server. To move them:"
+              echo "  gh workflow run deploy-cloud.yml -f recreate=yes"
+              echo "…which STOPS every session in each one. That is a human's call."
+            else
+              echo "every workspace is on the new image"
+            fi
+          ENDSSH
+
+  # ── 4. Recreate — explicit, never automatic ────────────────────────────────
+  redeploy:
+    needs: [build, deploy]
+    if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
+          chmod 600 ~/.ssh/amux_cloud
+          ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Recreate running workspaces and prove the new server answers
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+            set -u
+            WANT=$(docker image inspect -f '{{.Id}}' ghcr.io/mixpeek/amux:latest)
+            bad=0
+            for d in /var/amux/users/*/; do
+              id=$(basename "$d")
+              docker ps --format '{{.Names}}' | grep -qx "amux-user-${id}" || continue
+              echo "recreating $id"
+              ( cd "$d" && docker compose up -d --force-recreate 2>&1 | tail -2 )
+            done
+            echo ""
+            echo "verifying each workspace serves the RUST server:"
+            for d in /var/amux/users/*/; do
+              id=$(basename "$d")
+              c="amux-user-${id}"
+              docker ps --format '{{.Names}}' | grep -qx "$c" || continue
+              have=$(docker inspect -f '{{.Image}}' "$c")
+              port=$(grep -oP "[0-9]{4,}(?=:8822)" "$d/docker-compose.yml" | head -1)
+              # `server` discriminates rust from python; `build` is the content
+              # hash of the running binary. A 200 alone would not tell them apart.
+              h=$(curl -fsk --max-time 5 "https://127.0.0.1:${port}/health" 2>/dev/null || echo '')
+              srv=$(printf '%s' "$h" | grep -o '"server":"[^"]*"' || echo '"server":<none>')
+              if [ "$have" = "$WANT" ] && printf '%s' "$srv" | grep -q 'amux-rust'; then
+                echo "  $c: OK  $srv"
+              else
+                echo "  $c: FAILED — image=$([ "$have" = "$WANT" ] && echo new || echo old) health=${h:-<no answer>}"
+                bad=1
+              fi
+            done
+            exit "$bad"
+          ENDSSH

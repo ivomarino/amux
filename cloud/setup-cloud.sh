@@ -19,6 +19,10 @@ fi
 systemctl enable --now docker
 
 # ── Python deps for gateway ───────────────────────────────────────────────────
+# The GATEWAY stays python. It is a host process, not the product server: it
+# verifies Clerk JWTs, owns per-tenant docker orchestration and billing, and
+# never runs a customer's code. Deleting the python SERVER did not make it
+# python-free, and rewriting it was not part of the server cutover.
 pip3 install -q "PyJWT[crypto]" cryptography stripe
 
 # ── Directories ───────────────────────────────────────────────────────────────
@@ -31,10 +35,17 @@ else
   git -C /opt/amux pull --ff-only
 fi
 
-# ── Build and push Docker image ───────────────────────────────────────────────
-log "Building amux Docker image..."
-cp /opt/amux/amux-server.py /opt/amux/cloud/docker/
-docker build -t ghcr.io/mixpeek/amux:latest /opt/amux/cloud/docker/
+# ── Build the workspace image ─────────────────────────────────────────────────
+# The image is a RUST build now (AMUX-2619). Two things changed and both are
+# load-bearing:
+#   * there is no `cp amux-server.py cloud/docker/` step — that file was deleted
+#     from the repo; the server is compiled into the image from crates/.
+#   * the build CONTEXT is the repo root, not cloud/docker/, because the
+#     Dockerfile needs Cargo.toml, Cargo.lock, crates/ and the `amux` CLI.
+# Normally the image arrives from ghcr.io via .github/workflows/deploy-cloud.yml;
+# this local build is the bootstrap/offline path.
+log "Building amux Docker image (rust)..."
+docker build -f /opt/amux/cloud/docker/Dockerfile -t ghcr.io/mixpeek/amux:latest /opt/amux
 
 # ── Gateway env ───────────────────────────────────────────────────────────────
 mkdir -p /etc/amux
