@@ -793,7 +793,9 @@ async fn write_gates(
                         None
                     };
                     conn.execute(
-                        "UPDATE statuses SET gate=?1 WHERE id=?2",
+                        // See AMUX-2641 / board.rs: a human-authored gate is
+                        // flagged so enforcement can tell it from a seed row.
+                        "UPDATE statuses SET gate=?1, gate_custom=1 WHERE id=?2",
                         rusqlite::params![gate_txt, st],
                     )?;
                 } else if crate::api::py_truthy(gate_items) {

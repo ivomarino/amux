@@ -409,7 +409,11 @@ async fn patch_status(
             }
             if let Some(g) = &gate_update {
                 conn.execute(
-                    "UPDATE statuses SET gate = ? WHERE id = ?",
+                    // gate_custom=1: a person edited this column's gate, so
+                    // enforcement must honour it over the type default
+                    // (AMUX-2641). Without the flag a stale seed row is
+                    // indistinguishable from operator intent.
+                    "UPDATE statuses SET gate = ?, gate_custom = 1 WHERE id = ?",
                     rusqlite::params![g, sid_w],
                 )?;
             }
@@ -1678,7 +1682,7 @@ pub async fn patch_item(
                 // column editor). Without this a custom column would be a
                 // gate-shaped hole in the board.
                 let eff_gate: Vec<String> = match target_typed {
-                    Some(t) => bs::effective_gate(&next, t),
+                    Some(t) => bs::effective_gate_configured(conn, &next, t),
                     None => {
                         let found: Option<Option<String>> = conn
                             .query_row(
@@ -1944,7 +1948,7 @@ pub async fn patch_item(
                             }
                         }
                     }
-                    let eff_gate = bs::effective_gate(&next, target);
+                    let eff_gate = bs::effective_gate_configured(conn, &next, target);
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);
 

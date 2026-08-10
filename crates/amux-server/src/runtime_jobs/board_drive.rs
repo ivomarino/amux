@@ -1306,7 +1306,12 @@ pub fn select_advance(
         };
     }
     let gate_next = advance_target(&status).unwrap_or(TaskStatus::Done);
-    let gate = bs::effective_gate(&row, gate_next);
+    // SAME resolver as the enforcer (AMUX-2641). The nudge QUOTES this gate;
+    // if it derived the gate differently from the PATCH that enforces it, an
+    // operator editing a column would get nudged toward criteria the server
+    // then refuses — the two going stale together is the defect this card is
+    // about, and one shared call is what keeps them from diverging.
+    let gate = bs::effective_gate_configured(conn, &row, gate_next);
     let gate_txt = if gate.is_empty() {
         "  (no gate configured)".to_string()
     } else {

@@ -228,6 +228,61 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
 /// `gate` column override (a JSON array) wins when non-empty, else the
 /// type-derived defaults. Mirrors Python `_effective_gate` minus the
 /// worker/group tiers (RR-0051).
+/// The gate actually enforced for `row` entering `target`, including a column
+/// gate an operator configured in the UI (AMUX-2641).
+///
+/// Precedence, most specific first:
+///   1. the card's own `gate` override — one card, deliberately special;
+///   2. the CONFIGURED column gate, but only when `gate_custom` says a human
+///      wrote it (see migration 0017 for why a flag and not a comparison);
+///   3. the type-aware defaults.
+///
+/// [`effective_gate`] remains for callers with no DB handle and is the same
+/// function minus step 2. They must not drift: this one delegates rather than
+/// re-deriving, so a change to type defaults cannot land in one and not the
+/// other.
+pub fn effective_gate_configured(
+    conn: &rusqlite::Connection,
+    row: &IssueRow,
+    target: TaskStatus,
+) -> Vec<String> {
+    let over = row.gate_criteria();
+    if !over.is_empty() {
+        return over;
+    }
+    if let Some(cfg) = configured_gate(conn, target) {
+        return cfg;
+    }
+    effective_gate(row, target)
+}
+
+/// The operator-authored gate for a column, or None.
+///
+/// Returns None for a seeded row, an empty list, or unreadable JSON — every
+/// "cannot tell" answer falls back to the type defaults rather than to an empty
+/// gate. An empty gate would mean NO gate, so a malformed row must never read as
+/// permission (it would silently open the strictest transitions on the board).
+fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Option<Vec<String>> {
+    let id = status_to_db(target, "");
+    let (gate, custom): (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT gate, gate_custom FROM statuses WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    if custom.unwrap_or(0) != 1 {
+        return None;
+    }
+    let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let list: Vec<String> = list
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
 pub fn effective_gate(row: &IssueRow, target: TaskStatus) -> Vec<String> {
     let over = row.gate_criteria();
     if !over.is_empty() {
@@ -1026,5 +1081,118 @@ mod tests {
         );
         // Ungated statuses stay ungated.
         assert!(default_gates_for("code", TaskStatus::Todo).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod configured_gate_tests {
+    use super::*;
+
+    fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
+        IssueRow {
+            id: "T-1".into(), title: String::new(), desc: String::new(),
+            status: "doing".into(), session: None, creator: String::new(),
+            due: None, created: 0, updated: 0, owner_type: "agent".into(),
+            due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
+            gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
+            archived: 0, depends_on: vec![], reviewer: None, log: None, rev: 0,
+            source_ref: None, last_verified_at: None, version: 0, tags: vec![],
+        }
+    }
+
+    /// `gate_custom` defaults absent; a row written by the seed has no flag.
+    fn conn_with(gate: Option<&str>, custom: Option<i64>) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
+             is_builtin INTEGER, gate TEXT, mode TEXT, gate_custom INTEGER);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO statuses (id,label,position,is_builtin,gate,mode,gate_custom)
+             VALUES ('done','Done',4,1,?1,'implicit',?2)",
+            rusqlite::params![gate, custom],
+        )
+        .unwrap();
+        c
+    }
+
+    // TRAP 1, and the reason this is not "prefer statuses.gate when set".
+    // The table is TYPE-BLIND and was seeded from the CODE defaults. Honouring a
+    // seeded row would put "Implemented and merged / Tests / lint pass" on a doc
+    // card — the unsatisfiable gate that made 1,143 of 1,215 cards type `code`.
+    #[test]
+    fn a_seeded_row_does_not_override_type_aware_defaults() {
+        let c = conn_with(
+            Some(r#"["Implemented and merged","Tests / lint pass"]"#),
+            None, // seeded: no human wrote this
+        );
+        let doc = effective_gate_configured(&c, &row("doc", None), TaskStatus::Done);
+        assert_eq!(
+            doc,
+            default_gates_for("doc", TaskStatus::Done),
+            "a doc card must keep its own gate when the column was never customised"
+        );
+        assert!(
+            !doc.contains(&"Implemented and merged".to_string()),
+            "the code gate must not leak onto a doc card: {doc:?}"
+        );
+    }
+
+    // TRAP 2: "differs from the current default" cannot mean "customised",
+    // because the seed DRIFTS — `verified` already diverges in the live DB.
+    // Only the explicit flag counts.
+    #[test]
+    fn a_stale_seed_that_differs_from_the_default_is_still_not_a_customisation() {
+        let c = conn_with(Some(r#"["CI/CD green (incl. e2e)"]"#), None);
+        let got = effective_gate_configured(&c, &row("code", None), TaskStatus::Done);
+        assert_eq!(got, default_gates_for("code", TaskStatus::Done));
+    }
+
+    #[test]
+    fn an_operator_authored_gate_is_honoured() {
+        let c = conn_with(Some(r#"["Signed off by Ethan","Screenshot attached"]"#), Some(1));
+        let got = effective_gate_configured(&c, &row("code", None), TaskStatus::Done);
+        assert_eq!(got, vec!["Signed off by Ethan", "Screenshot attached"]);
+    }
+
+    /// A card's own override is MORE specific than a column default and keeps
+    /// winning — otherwise configuring a column would silently retype every
+    /// deliberately-special card on the board.
+    #[test]
+    fn a_card_override_still_beats_a_configured_column() {
+        let c = conn_with(Some(r#"["Column rule"]"#), Some(1));
+        let got = effective_gate_configured(
+            &c,
+            &row("code", Some(r#"["This card only"]"#)),
+            TaskStatus::Done,
+        );
+        assert_eq!(got, vec!["This card only"]);
+    }
+
+    /// Every "cannot tell" answer must fall back to the defaults, NEVER to an
+    /// empty gate — an empty gate means NO gate, so a malformed row would
+    /// silently open the strictest transitions on the board.
+    #[test]
+    fn malformed_or_empty_configuration_never_reads_as_permission() {
+        for bad in [Some("not json"), Some("[]"), Some(r#"["","  "]"#), None] {
+            let c = conn_with(bad, Some(1));
+            let got = effective_gate_configured(&c, &row("code", None), TaskStatus::Done);
+            assert_eq!(
+                got,
+                default_gates_for("code", TaskStatus::Done),
+                "input {bad:?} must fall back to defaults, not open the gate"
+            );
+            assert!(!got.is_empty(), "input {bad:?} produced an EMPTY gate");
+        }
+    }
+
+    /// A missing `statuses` table (a DB that predates the column editor) must
+    /// not panic or open the gate.
+    #[test]
+    fn a_db_without_the_statuses_table_falls_back_quietly() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        let got = effective_gate_configured(&c, &row("code", None), TaskStatus::Done);
+        assert_eq!(got, default_gates_for("code", TaskStatus::Done));
     }
 }
