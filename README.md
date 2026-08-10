@@ -82,14 +82,14 @@ On top of it sits a **daily log sweep**: a scheduler entry that prompts a sessio
 
 ## CLI
 
-`amux-rs` talks to the Rust server (default `https://localhost:8823`, override with `--url` or `AMUX_RS_URL`; the installed service runs on 8824):
+`amux-rs` finds the server via `--url`, then `$AMUX_RS_URL`, then `$AMUX_URL` (every running amux session has it), falling back to `https://localhost:8822`. The installed service answers both 8822 and 8824, so a bare invocation just works:
 
 ```bash
-amux-rs --url https://localhost:8824 health
+amux-rs health                                        # no env or flags needed
 amux-rs board add "task title" --type code
 amux-rs board list --status todo
 amux-rs board doing PROJ-1
-amux-rs board done PROJ-1 --ack "Tests / lint pass"   # gates are surfaced loudly, never bypassed silently
+amux-rs board done PROJ-1 --checked "Tests / lint pass"   # gates are surfaced loudly, never bypassed silently
 amux-rs workers list
 amux-rs send worker-1 "implement the login endpoint and report back"
 amux-rs schedules list

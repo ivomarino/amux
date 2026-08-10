@@ -11,9 +11,19 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The Rust server binds 8823 by default while the Python server owns 8822.
-/// Phase 11's cutover flips this; until then both run side by side against
-/// the same DB (WAL allows concurrent readers).
+/// The port a server binds when nothing says otherwise.
+///
+/// 8823 originally meant "not 8822, which Python owns". Python retired
+/// (792ce1f) and the installed service now answers 8822 AND 8824 — but the
+/// value stays, for a different and still-live reason: `cargo run -p
+/// amux-server` on a dev machine must not collide with the running service.
+/// The launchd agent sets `AMUX_RS_PORT` explicitly; nothing in production
+/// depends on this default.
+///
+/// The CLIENT default deliberately differs (`DEFAULT_CLIENT_URL` in amux-cli
+/// points at 8822): a client's job is to reach the server that IS running, and
+/// pointing it here is what made every bare `amux-rs` invocation fail with a
+/// connection error indistinguishable from the server being down (AMUX-2672).
 pub const DEFAULT_PORT: u16 = 8823;
 
 #[derive(Debug, Clone)]

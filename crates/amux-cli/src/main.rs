@@ -2,8 +2,8 @@
 //! Phase 11 cutover renames it; verbs mirror the bash script's core surface
 //! so muscle memory transfers.
 //!
-//! Talks to the RUST server (default https://localhost:8823) with the
-//! shared bearer token from ~/.amux/auth-token. Gate 409s are surfaced
+//! Talks to the RUST server with the shared bearer token from
+//! ~/.amux/auth-token; see `resolve_url` for where it looks. Gate 409s are surfaced
 //! LOUDLY with the exact retry command (the AMUX-2325 lesson: the sanctioned
 //! escape must be walkable from the sanctioned tool, or agents hand-roll
 //! curl and lose attribution).
@@ -14,9 +14,9 @@ use serde_json::{json, Value};
 #[derive(Parser)]
 #[command(name = "amux-rs", version, about = "amux command-line interface (Rust server)")]
 struct Cli {
-    /// Server base URL.
-    #[arg(long, env = "AMUX_RS_URL", default_value = "https://localhost:8823")]
-    url: String,
+    /// Server base URL. Falls back to $AMUX_URL, then the local server.
+    #[arg(long, env = "AMUX_RS_URL")]
+    url: Option<String>,
     /// Session/worker name stamped as X-Amux-Session on mutations.
     #[arg(long, env = "AMUX_SESSION")]
     session: Option<String>,
@@ -225,10 +225,41 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+/// Where a client should look for the server, in order (AMUX-2672).
+///
+/// The old default was `https://localhost:8823` — the port the Rust server used
+/// while Python still owned 8822. Python retired and the Rust server took over
+/// BOTH 8822 and 8824, so nothing has listened on 8823 since, and every bare
+/// `amux-rs <verb>` failed with a connection error.
+///
+/// That is worse than it sounds: a connection error is indistinguishable from
+/// the server being down, so the CLI's own misconfiguration reads as a server
+/// fault. It cost a wrong diagnosis on AMUX-2653, where "exit 1 on every verb"
+/// was taken for the bug under investigation reproducing everywhere.
+///
+/// `$AMUX_URL` is the fix for the general case rather than a second hardcoded
+/// port: every running amux session already has it in its process env, so a
+/// session's CLI reaches the same server its shell does, including when that is
+/// not localhost. The literal is only the last resort.
+///
+/// Note this is the CLIENT's default and deliberately differs from the SERVER's
+/// `DEFAULT_PORT` (8823), which stays put so a dev `cargo run -p amux-server`
+/// binds a free port instead of colliding with the running service.
+const DEFAULT_CLIENT_URL: &str = "https://localhost:8822";
+
+fn resolve_url(explicit: Option<String>) -> String {
+    [explicit, std::env::var("AMUX_URL").ok()]
+        .into_iter()
+        .flatten()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .find(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_CLIENT_URL.to_string())
+}
+
 fn main() {
     restore_default_sigpipe();
     let cli = Cli::parse();
-    let client = Client::new(cli.url.clone(), cli.session.clone());
+    let client = Client::new(resolve_url(cli.url.clone()), cli.session.clone());
     let result = run(&cli.cmd, &client);
     match result {
         Ok(code) => std::process::exit(code),
