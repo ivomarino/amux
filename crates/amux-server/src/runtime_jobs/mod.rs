@@ -47,6 +47,7 @@
 //!   instead of silently recording a run that delivered nothing (ethos rule
 //!   3: the honest refusal beats the quiet lie).
 
+pub mod ghost_rescue;
 pub mod scheduler;
 
 pub use scheduler::{

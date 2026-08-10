@@ -23,20 +23,44 @@ Discriminate with `answered_by`: `native` = rust, `python` = python origin,
 day again, check `SELECT answered_by, COUNT(*)` before believing it — a
 single-origin result is the tell that coverage regressed.
 
+**Steps 1 and 2 are single calls to deterministic endpoints (AMUX-2610).** They
+exist because the old shape of these steps — pull 2000 raw rows, group them,
+compute percentiles, then grep mod.rs and read handlers to explain a 404/405 —
+was a model burning tokens on pure computation (a real 405 diagnosis cost a
+grep-the-router session; Ethan: "we need deterministic tools in the api").
+Ethos rule 2: spend the model on JUDGING the numbers, never on producing them.
+The raw `/api/logs` queries in steps 3-5 and below remain the deep-dive
+fallback when a finding needs row-level inspection.
+
 ## The five sweeps, in order
 
-1. **Errors, grouped by family.**
-   `GET /api/logs?since=$SINCE&min_status=400&limit=2000`
-   Group by `family` yourself; read `error_body`(`resp`), `worker`, `amux_session`.
-   Finding = any family with a new error shape, or an error count out of line
-   with its own norm. 401/404 noise from probes is not a finding; a 500 is
-   always a finding.
+1. **Errors: one call.** `GET /api/logs/analyze?since_h=24`
+   Pre-grouped error rows (status >= 400) by (status, method, family,
+   normalized target — ids collapsed, `/api/board/AMUX-123` ->
+   `/api/board/{id}`), each with count / first / last / distinct_clients and
+   one full sample row incl. `error_body`. 404/405 groups carry
+   `routed_methods` (what IS mounted at that path, from the ROUTE_TABLE) and
+   404s carry `nearest_routes`; the response ends with `verdicts` — a computed
+   one-liner per 405 group that already states the conclusion (not routed /
+   unknown path answered by the GET-only catch-all / routed NOW so the rows
+   predate the running build). The judgment call is unchanged: 401/404 probe
+   noise is not a finding; a 500 is always a finding; a verdict naming a
+   missing route is a finding. Deep-dive fallback:
+   `GET /api/logs?since=$SINCE&min_status=400&limit=2000` (raw rows).
 
-2. **Latency p95 outliers vs the family's trailing norm.** Per busy family:
-   `GET /api/logs?since=$SINCE&family=/api/board&limit=2000` -> p95 of `latency_ms`;
-   compare against the trailing week: same query with `since=$(( $(date +%s) - 691200 ))`.
-   Finding = today's p95 > ~2x trailing p95 (use judgment on low-volume families;
-   never conclude from n < 20 requests).
+2. **Latency: one call.** `GET /api/logs/stats?since_h=24`
+   Per family: count, p50_ms / p95_ms / max_ms (nearest-rank percentiles over
+   the window's sorted latencies; the method is named in `percentile_method`),
+   error_count, error_rate, proxy_count (strictly `python-proxy`), `origins`
+   (per-`answered_by` counts — the coverage tell above, precomputed),
+   distinct_workers, distinct_clients, plus `slow_outliers` (rows > 5x their
+   family p50, capped 20) and `totals`. For the trailing norm, call it again
+   with `since_h=192` and compare. Finding = today's p95 > ~2x trailing p95
+   (use judgment on low-volume families; never conclude from n < 20 requests).
+   Deep-dive fallback: `GET /api/logs?since=$SINCE&family=/api/board&limit=2000`.
+
+   Routing questions along the way ("is PATCH mounted at X?") are answered by
+   `GET /api/debug/routes` — the ROUTE_TABLE as JSON — never by a grep.
 
 3. **Proxy volume — must trend to zero post-cutover.**
    `GET /api/logs?since=$SINCE&answered_by=python-proxy&limit=1` -> `total_matched`.

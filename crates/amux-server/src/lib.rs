@@ -208,6 +208,16 @@ async fn async_main() {
     // reads as health, which is the failure this module exists to prevent.
     tokio::spawn(invariants::monitor::run(state.clone()));
 
+    // Ghost-rescue (AMUX-2629): the FALLBACK sweep for the keystroke delivery
+    // path — it presses Enter for an amux message that was typed into a lane's
+    // input box and never submitted. Every rescue logs at WARN because a
+    // rescue means the send path failed. It retires when interactive lanes are
+    // protocol-driven; see runtime_jobs::ghost_rescue for the exit condition.
+    // The handle is dropped on purpose — a PeriodicTask is NOT aborted on drop
+    // (runtime_jobs' contract: an internal maintenance loop outlives the handle
+    // that spawned it, and is stopped only by an explicit `abort`).
+    drop(runtime_jobs::ghost_rescue::spawn(state.clone()));
+
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed

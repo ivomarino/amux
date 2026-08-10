@@ -8,6 +8,7 @@
 //! BEFORE the rewrite middleware so it wins over the path alias.
 
 use super::AppState;
+use crate::backend::tmux::pane_target;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -813,16 +814,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     let running = *running;
                     std::thread::spawn(move || {
                         if running {
+                            // Via the L2 helper, not an inline format!: this was
+                            // the ONE tmux target in the crate spelled by hand.
+                            // It happened to be exact, but `tmux_target_audit`
+                            // cannot tell a correct hand-spelling from the
+                            // prefix-matching kind, and a rule with an
+                            // exception is a rule nobody can enforce.
+                            let pt = pane_target(&format!("amux-{n}"));
                             let out = std::process::Command::new("tmux")
-                                .args([
-                                    "capture-pane",
-                                    "-t",
-                                    &format!("=amux-{n}:"),
-                                    "-p",
-                                    "-e",
-                                    "-S",
-                                    "-30",
-                                ])
+                                .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
                                 .output()
                                 .ok()?;
                             Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
