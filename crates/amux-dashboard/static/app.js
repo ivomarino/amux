@@ -6766,7 +6766,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.563';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.564';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18047,6 +18047,61 @@ function _beTagRenderChips(prefix) {
 /// about one card each, it is an identifier namespace. A real theme (`perf`,
 /// `parity`, `backend`) is reused across many cards by construction — that is
 /// what makes it a theme.
+// Board themes (AMUX-2677), fetched ONCE and cached — never per keystroke.
+//
+// Clustering 662 open card titles is the server's job precisely so the tag
+// input does not do it on every character. The cache is the whole reason this
+// lives behind an endpoint rather than in _tagSuggestions.
+//
+// A miss is silent and harmless: _tagSuggestions keeps its local co-occurrence
+// ranking as the floor, which is what makes suggestions work offline AND while
+// typing a brand-new card that has no id for the server to match against — the
+// moment they are most useful and the moment the server cannot help.
+let _themeCache = { ts: 0, themes: [] };
+let _themeFetching = false;
+const _THEME_TTL_MS = 5 * 60 * 1000;
+
+function _themesRefresh(prefix) {
+  const fresh = Date.now() - _themeCache.ts < _THEME_TTL_MS;
+  if (fresh || _themeFetching || !online) return;
+  _themeFetching = true;
+  apiCall('/api/board/themes?min_size=4', { method: 'GET' })
+    .then(r => r && r.json())
+    .then(d => {
+      if (d && Array.isArray(d.themes)) _themeCache = { ts: Date.now(), themes: d.themes };
+      // Re-render with what arrived; the input is still open.
+      if (prefix) _beTagInputUpdate(prefix);
+    })
+    .catch(() => {})
+    .finally(() => { _themeFetching = false; });
+}
+
+/// Theme candidates for THIS card, as {tag, note, score}.
+///
+/// Two ways a theme applies, strongest first:
+///   * the card is literally IN the cluster (its id is in card_ids) — the
+///     server grouped it there, which is as direct as evidence gets;
+///   * the card's title shares the cluster's term, which is what makes this
+///     work for a card being typed right now and therefore not in any cluster.
+function _themeCandidates(cardId, titleWords) {
+  const out = [];
+  for (const t of _themeCache.themes || []) {
+    const tag = t.suggested_tag;
+    if (!tag) continue;
+    const inCluster = cardId && Array.isArray(t.card_ids) && t.card_ids.includes(cardId);
+    const titleHit = titleWords.has(tag);
+    if (!inCluster && !titleHit) continue;
+    out.push({
+      tag,
+      // Say WHY it is suggested. A bare word asks for trust; "30 cards" is the
+      // evidence, and it is the number that makes a tag worth creating.
+      note: t.size + ' card' + (t.size === 1 ? '' : 's'),
+      score: inCluster ? 40 : 14,
+    });
+  }
+  return out;
+}
+
 function _tagIdentifierFamilies(items) {
   const fam = {};
   for (const it of items) {
@@ -18119,7 +18174,16 @@ function _tagSuggestions(prefix, q) {
     return s;
   };
 
-  const all = [...new Set(boardItems.flatMap(i => i.tags || []))];
+  // Server-derived themes ride ON TOP of the local ranking, never instead
+  // of it (AMUX-2677). If the fetch never lands, everything below still works.
+  const themed = _themeCandidates(card ? card.id : '', titleWords);
+  const themeScore = {};
+  const themeNote = {};
+  for (const c of themed) {
+    themeScore[c.tag] = Math.max(themeScore[c.tag] || 0, c.score);
+    themeNote[c.tag] = c.note;
+  }
+  const all = [...new Set(boardItems.flatMap(i => i.tags || []).concat(Object.keys(themeScore)))];
   return all
     .filter(t => !mine.includes(t))
     .filter(t => !q || t.toLowerCase().includes(q))
@@ -18127,13 +18191,15 @@ function _tagSuggestions(prefix, q) {
     // tags, so a tag you can name is never unreachable. Only the UNPROMPTED
     // list hides them.
     .filter(t => q ? true : !isIdent(t))
-    .sort((a, b) => score(b) - score(a) || a.localeCompare(b))
-    .slice(0, 12);   // a wall of chips is the thing being fixed
+    .sort((a, b) => (score(b) + (themeScore[b] || 0)) - (score(a) + (themeScore[a] || 0)) || a.localeCompare(b))
+    .slice(0, 12)   // a wall of chips is the thing being fixed
+    .map(t => ({ tag: t, note: themeNote[t] || '' }));
 }
 
 function _beTagInputUpdate(prefix) {
   const inp = document.getElementById(prefix + '-tag-input');
   const q = inp ? inp.value.toLowerCase() : '';
+  _themesRefresh(prefix);   // once per TTL; re-renders itself when it lands
   const suggestions = _tagSuggestions(prefix, q);
   const el = document.getElementById(prefix + '-tag-suggestions');
   if (!el) return;
@@ -18151,8 +18217,10 @@ function _beTagInputUpdate(prefix) {
   //
   // esc() on the value and a listener bound to the container removes the
   // quoting hazard entirely instead of escaping it more carefully.
-  el.innerHTML = suggestions.map(t =>
-    '<button class="be-tag-suggestion" data-tag="' + esc(t) + '">' + esc(t) + '</button>'
+  el.innerHTML = suggestions.map(s =>
+    '<button class="be-tag-suggestion" data-tag="' + esc(s.tag) + '">' + esc(s.tag)
+    + (s.note ? '<span class="be-tag-why">' + esc(s.note) + '</span>' : '')
+    + '</button>'
   ).join('');
   if (!el._tagDelegated) {
     el._tagDelegated = true;
