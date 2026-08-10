@@ -5517,7 +5517,7 @@ const MEM_TOPIC_FILE: &str = "amux-api.md";
 ///
 /// Excludes archived lanes and the reader itself — "who else is out there" is
 /// the question, and 50 rows of which one is you is noise.
-fn fleet_roster(me: &str) -> String {
+fn fleet_roster() -> String {
     let mut rows: Vec<(String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         let mut names: Vec<String> = rd
@@ -5528,9 +5528,17 @@ fn fleet_roster(me: &str) -> String {
             .collect();
         names.sort();
         for other in names {
-            if other == me {
-                continue;
-            }
+            // NO SELF-EXCLUSION (AMUX-2831). MEMORY.md is keyed on the PROJECT
+            // DIRECTORY, not the lane, so a shared checkout has ONE file for
+            // every lane in it — 17 lanes share ~/Dev/mixpeek. A roster that
+            // omitted "me" was therefore correct for exactly one reader (the
+            // lane that wrote last) and wrong for the other sixteen, who read a
+            // list including themselves and omitting the writer. Last-writer-wins,
+            // which is this card's subject, and my own feature was an instance.
+            //
+            // Listing everyone is the only shape true for every reader of a
+            // shared file. A lane identifies itself by $AMUX_SESSION, which it
+            // always has; the file cannot know who is reading it.
             let env = crate::config::parse_env_file(&sessions_dir().join(format!("{other}.env")));
             if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
                 continue;
@@ -5553,7 +5561,9 @@ fn fleet_roster(me: &str) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
+        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
+this directory, so it cannot omit the reader. You are the one whose name matches $AMUX_SESSION.\n\n\
+Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
     );
     for (n, g, d) in rows.iter().take(120) {
         let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
@@ -5637,7 +5647,7 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     }
     // The roster rides on the SAME write, so it is refreshed whenever the
     // session's memory is — no separate job to fall behind the fleet.
-    let composed = composed + &fleet_roster(name);
+    let composed = composed + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -12218,21 +12228,34 @@ mod roster_tests {
     /// are about shape rather than content — the fleet changes hourly and a
     /// fixture would be a second source of truth (the thing the roster exists
     /// to avoid).
+    /// SUPERSEDES `a_worker_never_lists_itself`, which asserted the OPPOSITE and
+    /// was wrong (AMUX-2831). Excluding the reader is only expressible when each
+    /// reader gets its own file, and they do not: MEMORY.md is keyed on the
+    /// PROJECT DIRECTORY, so 17 lanes share the one under ~/Dev/mixpeek. A
+    /// self-excluding roster is therefore correct for whichever lane wrote last
+    /// and wrong for the other sixteen — they read a list that includes
+    /// themselves and omits the writer. That is the last-writer-wins bug this
+    /// card is about, and the roster was an instance of it.
     #[test]
-    fn a_worker_never_lists_itself() {
-        let me = "amux";
-        let r = super::fleet_roster(me);
+    fn the_roster_lists_every_live_worker_because_the_file_is_shared() {
+        let r = super::fleet_roster();
+        if r.is_empty() {
+            return; // no live workers on this machine; nothing to assert
+        }
+        // It must say so, or a reader seeing its own name concludes the roster
+        // is buggy — which is what a correct shared roster looks like.
         assert!(
-            !r.contains(&format!("| `{me}` |")),
-            "\"who else is out there\" must exclude the reader: {r}"
+            r.contains("INCLUDING YOU"),
+            "a shared roster must tell the reader it lists them too: {r}"
         );
+        assert!(r.contains("$AMUX_SESSION"), "and how to identify themselves in it: {r}");
     }
 
     /// Empty means EMPTY — a single-worker install must not get a table header
     /// with no rows under it, which reads as "the fleet is broken".
     #[test]
     fn a_roster_with_no_peers_is_the_empty_string() {
-        let r = super::fleet_roster("__no_such_session_anywhere__");
+        let r = super::fleet_roster();
         assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
     }
 }
