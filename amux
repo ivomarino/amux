@@ -1151,9 +1151,25 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--r
   if [[ -n "$outcome" ]]; then
     local _obody
     _obody=$(O="$outcome" python3 -c 'import json,os;print(json.dumps({"desc_append":os.environ["O"]}))')
+      # Do NOT discard this response. This write exists so the outcome survives
+      # a refused transition — piping it to /dev/null made a DROPPED outcome
+      # look identical to a saved one. AC-323 shape a third time (board
+      # progress, --trigger stamp, now here), found by the sweep
+      # mixpeek-frustrations suggested rather than by it being reported.
     curl -sk -X PATCH -H 'Content-Type: application/json' \
       -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$_obody" \
-      "${AMUX_API:-https://localhost:8822}/api/board/$id" >/dev/null
+      "${AMUX_API:-https://localhost:8822}/api/board/$id" \
+    | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception:
+    sys.stderr.write("warning: outcome NOT recorded — server sent no JSON\n"); sys.exit(0)
+if d.get("error") or d.get("blocked"):
+    sys.stderr.write("warning: outcome NOT recorded: %s\n" % (d.get("error") or "blocked")); sys.exit(0)
+ign = [f for f in (d.get("ignored_fields") or []) if f]
+if ign:
+    sys.stderr.write("warning: outcome NOT recorded — server ignored %s\n" % ", ".join(ign))
+'
   fi
   local body
   body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" python3 -c '
