@@ -1726,9 +1726,20 @@
   .peek-tab-count.has-pending { background: rgba(210,153,34,0.16); color: #d29922; border-color: rgba(210,153,34,0.34); }
   .peek-tab-count.sched-off { background: rgba(139,148,158,0.14); color: var(--dim); border-color: rgba(139,148,158,0.28); }
   /* Schedules badge: two numbers — active (green) / inactive (red). */
-  .peek-tab-count .psc-on  { color: #3fb950; font-weight: 700; }
-  .peek-tab-count .psc-off { color: #f85149; font-weight: 700; }
-  .peek-tab-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
+  /* Schedule active/inactive pair. Selector-list rather than a
+     .peek-tab-count prefix so the worker card and the peek badge share ONE
+     colour definition — the JS helper (_schedCountHTML) emits the same markup
+     for both, and a second CSS spelling is how the two would drift apart.
+     .psc-zero: a count of zero is deliberately UNCOLOURED. Painting "0
+     inactive" red announces a problem about the healthiest possible state, and
+     a badge that shouts during normal operation stops being read. */
+  .peek-tab-count .psc-on,  .meta-count .psc-on  { color: #3fb950; font-weight: 700; }
+  .peek-tab-count .psc-off, .meta-count .psc-off { color: #f85149; font-weight: 700; }
+  .peek-tab-count .psc-sep, .meta-count .psc-sep { color: var(--dim); margin: 0 3px; opacity: 0.7; }
+  .peek-tab-count .psc-zero,.meta-count .psc-zero{ color: var(--dim); font-weight: 600; opacity: 0.75; }
+  /* In-progress board issues for this worker: informational, so accent rather
+     than a success/failure colour — it is a count, not a verdict. */
+  .meta-count .mc-doing { color: var(--accent); font-weight: 700; }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
   /* ── Dictation: compact recording popup (above the composer) ── */
@@ -2720,8 +2731,16 @@
     font-size: 0.62rem; color: var(--dim); line-height: 1.2; }
   .wlog-method { font-weight: 700; min-width: 42px; flex-shrink: 0; font-size: 0.68rem; }
   .wlog-status { font-weight: 600; min-width: 28px; flex-shrink: 0; font-size: 0.72rem; }
-  .wlog-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    color: var(--fg); font-size: 0.72rem; }
+  /* WRAPS, never ellipsizes. A truncated path is the one thing a request log
+     cannot afford to lose — `/api/workers/amux-frustrations/send` and
+     `/api/workers/amux-frustrations/peek` differ only past the point a narrow
+     column cuts, so ellipsis turned distinct rows into identical ones. The
+     title= tooltip that used to cover for it does not exist on touch.
+     overflow-wrap:anywhere (not word-break:break-all) so breaks land at the
+     path separators when they can, mid-token only when a segment genuinely
+     exceeds the line. */
+  .wlog-path { flex: 1; min-width: 0; color: var(--fg); font-size: 0.72rem;
+    white-space: normal; overflow-wrap: anywhere; }
   .wlog-lat { min-width: 44px; text-align: right; flex-shrink: 0; color: var(--dim); font-size: 0.68rem; }
   .wlog-lat-slow { color: #e07000; font-weight: 600; }
   .wlog-caret { color: var(--dim); font-size: 0.7rem; flex-shrink: 0; width: 12px; text-align: center; }

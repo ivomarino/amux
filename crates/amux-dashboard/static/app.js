@@ -2589,8 +2589,10 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
                the two-figure version of it. */
             const d = _cardDoingCount(s.name);
             const parts = [];
-            if (s.sched_on || s.sched_off) parts.push(`${s.sched_on}/${s.sched_off} sched`);
-            if (d) parts.push(`${d} doing`);
+            if (s.sched_on || s.sched_off) {
+              parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
+            }
+            if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
             return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
@@ -6104,6 +6106,23 @@ function _renderPeekIssuesKanban(items, list) {
 // Schedules tab badge shows TWO numbers: active (green) / inactive (red), so
 // you can see at a glance how many of this session's schedules are enabled vs
 // paused without opening the tab.
+/// The active/inactive schedule pair, coloured. ONE definition, used by both
+/// the worker card and the peek tab badge — two spellings of the same colour
+/// vocabulary is how they drift.
+///
+/// A ZERO IS NEVER COLOURED. Painting "0 inactive" red says "something is
+/// wrong" about the healthiest possible state, and a badge that shouts on
+/// normal operation is one people stop reading. Colour marks what is worth
+/// looking at: schedules that are ON (green), and schedules that are OFF and
+/// therefore silently not running (red).
+function _schedCountHTML(on, off) {
+  const n = v => Number(v) || 0;
+  const onC = n(on), offC = n(off);
+  return '<span class="' + (onC ? 'psc-on' : 'psc-zero') + '">' + onC + '</span>'
+       + '<span class="psc-sep">/</span>'
+       + '<span class="' + (offC ? 'psc-off' : 'psc-zero') + '">' + offC + '</span>';
+}
+
 function _peekColorSchedBadge(schedList) {
   const el = document.getElementById('peek-tab-schedules-count');
   if (!el) return;
@@ -6113,9 +6132,7 @@ function _peekColorSchedBadge(schedList) {
   const active = list.filter(s => s.enabled).length;
   const inactive = list.length - active;
   el.classList.add('has-count');
-  el.innerHTML = '<span class="psc-on">' + active + '</span>'
-    + '<span class="psc-sep">/</span>'
-    + '<span class="psc-off">' + inactive + '</span>';
+  el.innerHTML = _schedCountHTML(active, inactive);   // shared with the card
   el.title = active + ' active, ' + inactive + ' inactive schedule' + (list.length === 1 ? '' : 's');
 }
 async function _peekUpdateTabCounts() {
@@ -6615,7 +6632,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.544';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.545';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
