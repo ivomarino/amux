@@ -1795,9 +1795,17 @@ mod tests {
         );
         {
             let guard = RUNNING.lock().expect("browser registry poisoned");
-            let child_pid = guard.as_ref().and_then(|r| r.child.id());
-            assert_eq!(child_pid, info.pid, "acting Chrome is the registry's spawned child");
-            assert!(child_pid.is_some());
+            // `pid` rather than `child.id()`: an ADOPTED browser has no Child
+            // (AC-325) and the registry must still name the process it is
+            // acting on. Asserting through the Option would pass vacuously the
+            // day adoption is exercised here.
+            let reg_pid = guard.as_ref().map(|r| r.pid);
+            assert_eq!(reg_pid, info.pid, "acting Chrome is the registry's process");
+            assert!(reg_pid.is_some());
+            assert!(
+                guard.as_ref().and_then(|r| r.child.as_ref()).is_some(),
+                "a browser this test SPAWNED must carry its Child handle"
+            );
         }
         let mut c = CdpClient::connect(&page.ws_url).await.expect("cdp ws connect");
         let v = c.eval("1+1", 10).await.expect("eval");
