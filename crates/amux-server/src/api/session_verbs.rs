@@ -3337,6 +3337,18 @@ async fn send_text_inner(
     if waiting && rate_limit_action() != "off" {
         let pane = tmux_capture(name, 30).await;
         if is_rate_limit_menu(&pane) {
+            // STAMP IT BEFORE ANSWERING, so the condition is visible even if the
+            // keypress fails — and so a lane whose policy is `off` still shows
+            // up as limited rather than merely stuck. /api/sessions reads these
+            // keys for credit_limited (AMUX-2820); without the stamp the whole
+            // fleet reports healthy while a lane is parked.
+            update_meta(
+                name,
+                &[
+                    ("rate_limited_since", json!(now_i64())),
+                    ("rate_limited_model", json!(parse_env(name).get_or("CC_MODEL", ""))),
+                ],
+            );
             // Enter selects the highlighted default, option 1 "stop and wait".
             // NOT 2 or 3 — those spend money, and choosing to spend is a human's
             // call however cheap it looks from here (ethos rule 8).
@@ -3356,6 +3368,10 @@ async fn send_text_inner(
             .await;
             if ok {
                 // The menu is gone; this send is no longer facing a selector.
+                // Clear the stamp in the SAME breath — a `credit_limited` that
+                // is set and never cleared is the mirror of one that is never
+                // set, and it would leave the fleet view permanently red.
+                update_meta(name, &[("rate_limited_since", json!(0))]);
                 waiting = false;
             }
         }
@@ -6435,6 +6451,84 @@ pub async fn pipe_reconcile_loop() {
     }
 }
 
+
+/// How often the fleet is swept for rate-limit menus. NOT every steering tick:
+/// that is 5s, and a pane capture per running lane across ~113 lanes would be
+/// ~22 captures/second forever, paid on the resource the fleet is already
+/// contending for.
+fn rate_limit_sweep_secs() -> f64 {
+    std::env::var("AMUX_RATE_LIMIT_SWEEP_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 10.0)
+        .unwrap_or(60.0)
+}
+
+/// Stamp (and, unless the policy says otherwise, ANSWER) every lane sitting on a
+/// rate-limit menu.
+///
+/// THE SEND PATH ALONE IS NOT ENOUGH. Detection there only fires when somebody
+/// happens to be sending, so a lane that hits its limit with nothing queued is
+/// invisible until someone tries to talk to it — which is precisely the state
+/// mvs-infra was in. A fleet that only notices a limit when you poke it does not
+/// answer "which workers are limited right now", which is the question this
+/// exists for.
+async fn rate_limit_sweep(state: &AppState) -> usize {
+    let dir = sessions_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
+    let mut found = 0usize;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|x| x.to_str()) else { continue };
+        let cfg = parse_env(name);
+        if cfg.get("CC_ARCHIVED") == Some("1") {
+            continue;
+        }
+        if !is_running(name).await {
+            continue;
+        }
+        let pane = tmux_capture(name, 30).await;
+        if !is_rate_limit_menu(&pane) {
+            // Recovered on its own (or was never limited): clear a stale stamp
+            // so the fleet view does not stay red after the fact.
+            if load_meta(name)["rate_limited_since"].as_i64().unwrap_or(0) > 0 {
+                update_meta(name, &[("rate_limited_since", json!(0))]);
+            }
+            continue;
+        }
+        found += 1;
+        if load_meta(name)["rate_limited_since"].as_i64().unwrap_or(0) == 0 {
+            update_meta(
+                name,
+                &[
+                    ("rate_limited_since", json!(now_i64())),
+                    ("rate_limited_model", json!(cfg.get_or("CC_MODEL", ""))),
+                ],
+            );
+            emit_event(
+                state,
+                name,
+                "session.rate_limited",
+                Some(json!({"detected_by": "sweep"})),
+                Some(format!("rl:{name}:{}", now_i64() / 3600)),
+                "rate-limit",
+            )
+            .await;
+        }
+        if rate_limit_action() != "off" {
+            let (ok, msg) = send_keys_op(name, "Enter").await;
+            tracing::warn!(session = %name, ok, detail = %msg, "swept a rate-limit menu — answered 'stop and wait'");
+            if ok {
+                update_meta(name, &[("rate_limited_since", json!(0))]);
+            }
+        }
+    }
+    found
+}
+
 /// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
@@ -6444,6 +6538,25 @@ pub async fn steer_deliver_loop(state: AppState) {
         let st = state.clone();
         if let Err(e) = tokio::spawn(async move { steer_deliver_tick(&st).await }).await {
             tracing::warn!(error = %e, "steering delivery tick panicked");
+        }
+        // Time-gated so the 5s steering cadence does not become a 5s fleet-wide
+        // pane capture (AMUX-2820).
+        let due = {
+            static LAST: std::sync::OnceLock<std::sync::Mutex<f64>> = std::sync::OnceLock::new();
+            let cell = LAST.get_or_init(|| std::sync::Mutex::new(0.0));
+            let mut g = cell.lock().unwrap();
+            if now_f64() - *g >= rate_limit_sweep_secs() {
+                *g = now_f64();
+                true
+            } else {
+                false
+            }
+        };
+        if due {
+            let st2 = state.clone();
+            if let Err(e) = tokio::spawn(async move { rate_limit_sweep(&st2).await }).await {
+                tracing::warn!(error = %e, "rate-limit sweep panicked");
+            }
         }
     }
 }

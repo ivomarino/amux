@@ -1015,12 +1015,28 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "api_error": false,
             "api_error_code": "",
             "api_error_count": 0,
-            "credit_limited": false,
-            "credit_limit_model": "",
-            "credit_limited_since": 0,
-            "rate_limit_banner": false,
-            "rate_limit_weekly": false,
-            "rate_limited_until": 0,
+            // COMPUTED, NOT HARDCODED (AMUX-2820). These were literal `false`
+            // and `0`, with a comment calling them "a correct-TYPED honest
+            // empty (Invariant 20: never invent)". That was right at cutover
+            // and became a lie by omission the moment nothing filled them:
+            // `false` and "not computed" are byte-identical over JSON, so every
+            // consumer read a lane parked on Claude Code's rate-limit menu as
+            // HEALTHY. mvs-infra sat there with two of Ethan's messages queued
+            // behind it and /api/sessions reported status=idle,
+            // credit_limited=false the whole time. Nothing downstream — not the
+            // log sweep, not autofix, not the invariants monitor — could see a
+            // condition its own field says is absent (ethos rule 4).
+            //
+            // The writer is the rate-limit detector in session_verbs, which
+            // stamps meta when it sees the menu and clears it when it answers.
+            // Read from meta because THIS LOOP ALREADY LOADS IT — computing it
+            // here from a pane capture would cost ~113 tmux calls per request.
+            "credit_limited": meta["rate_limited_since"].as_i64().unwrap_or(0) > 0,
+            "credit_limit_model": meta["rate_limited_model"].as_str().unwrap_or(""),
+            "credit_limited_since": meta["rate_limited_since"].as_i64().unwrap_or(0),
+            "rate_limit_banner": meta["rate_limited_since"].as_i64().unwrap_or(0) > 0,
+            "rate_limit_weekly": meta["rate_limited_weekly"].as_bool().unwrap_or(false),
+            "rate_limited_until": meta["rate_limited_until"].as_i64().unwrap_or(0),
             "last_human_ts": 0,
             "waiting_since": 0,
             "self_report": serde_json::Value::Null,
