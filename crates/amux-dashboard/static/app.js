@@ -3377,6 +3377,7 @@ const PEEK_TABS = [
   { id: 'commits',    label: 'Commits' },
   { id: 'memory',     label: 'Memory' },
   { id: 'git',        label: 'Worktree' },
+  { id: 'logs',       label: 'Logs' },
 ];
 let peekHiddenTabs = (function() {
   try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
@@ -5310,6 +5311,10 @@ function setPeekTab(tab) {
   const scheds = document.getElementById('peek-schedules-panel');
   if (tab === 'schedules') { scheds.classList.add('active'); _peekLoadSchedules(); }
   else { scheds.classList.remove('active'); }
+  document.getElementById('peek-tab-logs')?.classList.toggle('active', tab === 'logs');
+  const logsP = document.getElementById('peek-logs-panel');
+  if (tab === 'logs') { logsP.classList.add('active'); _peekLogsLoad(); }
+  else { logsP.classList.remove('active'); }
 }
 
 // ── Standing instructions (autonomy config) ──
@@ -6205,6 +6210,148 @@ async function _peekNewSchedule() {
   openSchedModal();
   const sel = document.getElementById('sched-session');
   if (sel && peekSession) sel.value = peekSession;
+}
+
+// ── Peek worker logs ──
+let _peekLogsEvents = [];
+let _peekLogsFilter = '';
+let _peekLogsSearchQ = '';
+let _peekLogsTimer = null;
+
+async function _peekLogsLoad() {
+  if (!peekSession) return;
+  const params = ['limit=500', 'worker=' + encodeURIComponent(peekSession)];
+  try {
+    const r = await fetch(API + '/api/logs?' + params.join('&'));
+    if (!r.ok) return;
+    const d = await r.json();
+    _peekLogsEvents = (d.events || []).map(e => ({
+      ...e, type: e.type || 'http',
+      status: e.status || 200,
+      latency_ms: e.latency_ms || e.ms || 0,
+    }));
+    const st = document.getElementById('peek-logs-stats');
+    if (st) {
+      const errs = _peekLogsEvents.filter(e => e.status >= 400).length;
+      const total = d.total_matched || _peekLogsEvents.length;
+      st.textContent = total + ' requests' + (errs ? ' · ' + errs + ' errors' : '');
+    }
+    const badge = document.getElementById('peek-tab-logs-count');
+    if (badge) {
+      const errs = _peekLogsEvents.filter(e => e.status >= 400).length;
+      badge.textContent = errs > 0 ? errs : '';
+      badge.style.display = errs > 0 ? '' : 'none';
+    }
+    _peekLogsRender();
+  } catch(e) {}
+}
+
+function _peekLogsSetFilter(f) {
+  _peekLogsFilter = f;
+  document.getElementById('plf-all')?.classList.toggle('active', f === '');
+  document.getElementById('plf-err')?.classList.toggle('active', f === 'errors');
+  document.getElementById('plf-slow')?.classList.toggle('active', f === 'slow');
+  _peekLogsRender();
+}
+
+function _peekLogsRender() {
+  const el = document.getElementById('peek-logs-list');
+  if (!el) return;
+  let evts = _peekLogsEvents.slice();
+  if (_peekLogsFilter === 'errors') evts = evts.filter(e => e.status >= 400);
+  if (_peekLogsFilter === 'slow') evts = evts.filter(e => e.latency_ms > 500);
+  if (_peekLogsSearchQ) {
+    const q = _peekLogsSearchQ.toLowerCase();
+    evts = evts.filter(e =>
+      (e.target||'').toLowerCase().includes(q) ||
+      (e.method||'').toLowerCase().includes(q) ||
+      (e.resp||'').toLowerCase().includes(q) ||
+      (e.user_agent||'').toLowerCase().includes(q) ||
+      (e.answered_by||'').toLowerCase().includes(q) ||
+      String(e.status).includes(q)
+    );
+  }
+  if (!evts.length) {
+    el.innerHTML = '<div style="padding:32px 16px;text-align:center;color:var(--dim);font-size:0.82rem;">' +
+      (_peekLogsFilter || _peekLogsSearchQ ? 'No matching requests' : 'No request log for this worker yet') + '</div>';
+    return;
+  }
+  let html = '';
+  for (const e of evts) {
+    const isErr = e.status >= 400;
+    const isSlow = e.latency_ms > 500;
+    const when = new Date(e.ts * 1000);
+    const timeStr = when.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const dateStr = when.toLocaleDateString([], {month:'short',day:'numeric'});
+    const statusColor = isErr ? 'var(--red)' : (isSlow ? '#e07000' : 'var(--green,#3fb950)');
+    const methodColor = e.method === 'GET' ? 'var(--accent)' :
+                        e.method === 'POST' ? 'var(--green,#3fb950)' :
+                        e.method === 'PATCH' ? '#e07000' :
+                        e.method === 'DELETE' ? 'var(--red)' : 'var(--dim)';
+    const latStr = e.latency_ms < 1 ? '<1ms' : (e.latency_ms >= 1000 ? (e.latency_ms/1000).toFixed(1) + 's' : Math.round(e.latency_ms) + 'ms');
+    const hasPay = !!(e.resp || e.req);
+    const meta = [];
+    if (e.answered_by && e.answered_by !== 'native') meta.push('<span style="color:var(--purple,#a78bfa);">via ' + escHtml(e.answered_by) + '</span>');
+    if (e.ip && e.ip !== '127.0.0.1' && e.ip !== '::1') meta.push('<span style="color:var(--dim);">' + escHtml(e.ip) + '</span>');
+    if (e.req_bytes) meta.push('<span style="color:var(--dim);">' + _fmtBytes(e.req_bytes) + ' in</span>');
+    if (e.resp_bytes) meta.push('<span style="color:var(--dim);">' + _fmtBytes(e.resp_bytes) + ' out</span>');
+    if (e.user_agent) {
+      const ua = _shortUA(e.user_agent);
+      if (ua) meta.push('<span style="color:var(--dim);font-size:0.62rem;" title="' + escHtml(e.user_agent) + '">' + escHtml(ua) + '</span>');
+    }
+    html += '<div class="wlog-row' + (hasPay ? ' wlog-row-x' : '') + (isErr ? ' wlog-err' : '') + (isSlow ? ' wlog-slow' : '') + '"' +
+      (hasPay ? ' onclick="_peekLogsToggle(this)"' : '') + '>' +
+      '<div class="wlog-ts"><span>' + escHtml(dateStr) + '</span><span>' + escHtml(timeStr) + '</span></div>' +
+      '<span class="wlog-method" style="color:' + methodColor + '">' + escHtml(e.method) + '</span>' +
+      '<span class="wlog-status" style="color:' + statusColor + '">' + e.status + '</span>' +
+      '<span class="wlog-path" title="' + escHtml(e.target) + '">' + escHtml(e.target) + '</span>' +
+      '<span class="wlog-lat' + (isSlow ? ' wlog-lat-slow' : '') + '">' + latStr + '</span>' +
+      (hasPay ? '<span class="wlog-caret">▸</span>' : '') +
+    '</div>';
+    if (meta.length) {
+      html += '<div class="wlog-meta">' + meta.join(' · ') + '</div>';
+    }
+    if (hasPay) {
+      html += '<div class="wlog-payload">';
+      if (e.req) html += '<div class="wlog-pay-label">REQUEST</div><pre class="wlog-pay-body">' + escHtml(_tryPrettyJson(e.req)) + '</pre>';
+      if (e.resp) html += '<div class="wlog-pay-label">RESPONSE' + (isErr ? ' — HTTP ' + e.status : '') + '</div><pre class="wlog-pay-body">' + escHtml(_tryPrettyJson(e.resp)) + '</pre>';
+      html += '</div>';
+    }
+  }
+  el.innerHTML = html;
+}
+
+function _peekLogsToggle(rowEl) {
+  let sib = rowEl.nextElementSibling;
+  while (sib && sib.classList.contains('wlog-meta')) sib = sib.nextElementSibling;
+  if (!sib || !sib.classList.contains('wlog-payload')) return;
+  sib.classList.toggle('open');
+  const caret = rowEl.querySelector('.wlog-caret');
+  if (caret) caret.textContent = sib.classList.contains('open') ? '▾' : '▸';
+}
+
+function _tryPrettyJson(s) {
+  try {
+    const parsed = JSON.parse(s);
+    return JSON.stringify(parsed, null, 2);
+  } catch(e) { return s; }
+}
+
+function _fmtBytes(n) {
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n/1024).toFixed(1) + 'KB';
+  return (n/1048576).toFixed(1) + 'MB';
+}
+
+function _shortUA(ua) {
+  if (!ua) return '';
+  if (/curl/i.test(ua)) return 'curl';
+  if (/python/i.test(ua)) return 'Python';
+  const m = ua.match(/Chrome\/(\d+)/);
+  if (m) return 'Chrome/' + m[1];
+  const s = ua.match(/Safari\/(\d+)/);
+  if (s && !/Chrome/.test(ua)) return 'Safari';
+  return '';
 }
 
 // ── Peek notes ──
@@ -16767,13 +16914,14 @@ function renderStats() {
 
 function logsSetTab(tab) {
   _logsSubtab = tab;
-  ['activity','raw','stats'].forEach(t => {
+  ['activity','raw','stats','health'].forEach(t => {
     document.getElementById('lst-' + t)?.classList.toggle('active', t === tab);
     const p = document.getElementById('logs-' + t);
     if (p) p.style.display = t === tab ? '' : 'none';
   });
   if (tab === 'raw') fetchRawLogs();
   else if (tab === 'stats') { fetchLogs(); }
+  else if (tab === 'health') { _logsHealthLoad(); }
   else renderActivity();
 }
 
@@ -16795,6 +16943,113 @@ function _startLogsTimer() {
 function _stopLogsTimer() {
   if (_logsTimer) { clearInterval(_logsTimer); _logsTimer = null; }
 }
+async function _logsHealthLoad() {
+  const el = document.getElementById('logs-health-body');
+  if (!el) return;
+  el.innerHTML = '<div style="padding:20px;color:var(--dim);font-size:0.85rem;">Loading health data...</div>';
+  try {
+    const [statsR, analyzeR] = await Promise.all([
+      fetch(API + '/api/logs/stats?since_h=24'),
+      fetch(API + '/api/logs/analyze?since_h=24'),
+    ]);
+    const stats = statsR.ok ? await statsR.json() : null;
+    const analyze = analyzeR.ok ? await analyzeR.json() : null;
+    _renderHealth(el, stats, analyze);
+  } catch(e) {
+    el.innerHTML = '<div style="padding:20px;color:var(--red);">Failed to load health data</div>';
+  }
+}
+
+function _renderHealth(el, stats, analyze) {
+  let html = '';
+  if (stats && stats.families) {
+    const fams = stats.families.sort((a, b) => b.count - a.count);
+    const totalReqs = fams.reduce((s, f) => s + f.count, 0);
+    const totalErrs = fams.reduce((s, f) => s + (f.error_count || 0), 0);
+    const maxP95 = Math.max(...fams.map(f => f.p95_ms || f.p95 || 0), 0);
+    html += '<div class="stats-grid" style="margin-bottom:12px;">';
+    html += '<div class="stat-card"><div class="stat-card-label">Total Requests (24h)</div><div class="stat-card-value">' + totalReqs.toLocaleString() + '</div></div>';
+    html += '<div class="stat-card"><div class="stat-card-label">Errors (24h)</div><div class="stat-card-value" style="color:' + (totalErrs > 0 ? 'var(--red)' : 'var(--green,#3fb950)') + '">' + totalErrs + '</div></div>';
+    const maxP50 = Math.max(...fams.map(f => f.p50_ms || f.p50 || 0), 0);
+    html += '<div class="stat-card"><div class="stat-card-label">Median Latency</div><div class="stat-card-value">' + (maxP50 >= 1000 ? (maxP50/1000).toFixed(1) + 's' : Math.round(maxP50) + 'ms') + '</div></div>';
+    html += '<div class="stat-card"><div class="stat-card-label">Max p95 Latency</div><div class="stat-card-value" style="color:' + (maxP95 > 1000 ? 'var(--red)' : maxP95 > 500 ? '#e07000' : 'var(--fg)') + '">' + (maxP95 >= 1000 ? (maxP95/1000).toFixed(1) + 's' : Math.round(maxP95) + 'ms') + '</div></div>';
+    html += '<div class="stat-card"><div class="stat-card-label">API Families</div><div class="stat-card-value">' + fams.length + '</div></div>';
+    html += '</div>';
+    html += '<div class="stat-card" style="margin-bottom:12px;overflow-x:auto;">';
+    html += '<div style="font-size:0.73rem;font-weight:700;margin-bottom:8px;">Latency by API Family</div>';
+    html += '<table style="width:100%;font-size:0.72rem;border-collapse:collapse;">';
+    html += '<tr style="color:var(--dim);text-align:left;"><th style="padding:3px 6px;">Family</th><th style="padding:3px 6px;text-align:right;">Count</th><th style="padding:3px 6px;text-align:right;">Errors</th><th style="padding:3px 6px;text-align:right;">p50</th><th style="padding:3px 6px;text-align:right;">p95</th><th style="padding:3px 6px;text-align:right;">p99</th><th style="padding:3px 6px;">Origin</th></tr>';
+    for (const f of fams.slice(0, 30)) {
+      const p50 = f.p50_ms || f.p50 || 0;
+      const p95 = f.p95_ms || f.p95 || 0;
+      const p99 = f.p99_ms || f.p99 || 0;
+      const errPct = f.count > 0 ? (100 * (f.error_count || 0) / f.count).toFixed(1) : '0';
+      const errColor = (f.error_count || 0) > 0 ? 'var(--red)' : 'var(--dim)';
+      const p95Color = p95 > 1000 ? 'var(--red)' : p95 > 500 ? '#e07000' : 'var(--fg)';
+      const origins = f.origins ? Object.entries(f.origins).map(([k,v]) => escHtml(k) + ':' + v).join(', ') : '';
+      html += '<tr style="border-top:1px solid rgba(127,127,127,.1);">';
+      html += '<td style="padding:4px 6px;font-family:monospace;font-size:0.68rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(f.family) + '">' + escHtml(f.family) + '</td>';
+      html += '<td style="padding:4px 6px;text-align:right;">' + f.count.toLocaleString() + '</td>';
+      html += '<td style="padding:4px 6px;text-align:right;color:' + errColor + '">' + (f.error_count || 0) + (errPct > 0 ? ' (' + errPct + '%)' : '') + '</td>';
+      html += '<td style="padding:4px 6px;text-align:right;">' + Math.round(p50) + 'ms</td>';
+      html += '<td style="padding:4px 6px;text-align:right;color:' + p95Color + '">' + Math.round(p95) + 'ms</td>';
+      html += '<td style="padding:4px 6px;text-align:right;">' + Math.round(p99) + 'ms</td>';
+      html += '<td style="padding:4px 6px;font-size:0.64rem;color:var(--dim);">' + origins + '</td>';
+      html += '</tr>';
+    }
+    html += '</table></div>';
+    if (stats.slow_outliers && stats.slow_outliers.length) {
+      html += '<div class="stat-card" style="margin-bottom:12px;">';
+      html += '<div style="font-size:0.73rem;font-weight:700;margin-bottom:8px;color:#e07000;">Slow Outliers (>5x family p50)</div>';
+      for (const o of stats.slow_outliers.slice(0, 15)) {
+        const when = new Date((o.ts || 0) * 1000).toLocaleString();
+        html += '<div style="display:flex;gap:6px;align-items:center;padding:3px 0;font-size:0.72rem;border-bottom:1px solid rgba(127,127,127,.06);">';
+        html += '<span style="color:var(--dim);font-size:0.64rem;min-width:90px;">' + escHtml(when) + '</span>';
+        html += '<span style="font-weight:600;color:#e07000;">' + Math.round(o.latency_ms || 0) + 'ms</span>';
+        html += '<span style="font-family:monospace;font-size:0.68rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(o.path || '') + '">' + escHtml(o.method || '') + ' ' + escHtml(o.path || '') + '</span>';
+        if (o.ratio) html += '<span style="color:var(--dim);font-size:0.64rem;">' + o.ratio.toFixed(1) + 'x p50</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+  }
+  if (analyze && analyze.groups && analyze.groups.length) {
+    html += '<div class="stat-card" style="margin-bottom:12px;">';
+    html += '<div style="font-size:0.73rem;font-weight:700;margin-bottom:8px;color:var(--red);">Error Groups (24h) — ' + (analyze.total_errors || 0) + ' total errors</div>';
+    for (const g of analyze.groups.slice(0, 20)) {
+      const clients = (g.clients || []).join(', ');
+      html += '<div style="padding:6px 0;border-bottom:1px solid rgba(127,127,127,.08);">';
+      html += '<div style="display:flex;gap:6px;align-items:center;font-size:0.76rem;">';
+      html += '<span style="font-weight:700;color:var(--red);">' + g.status + '</span>';
+      html += '<span style="font-weight:600;">' + escHtml(g.method) + '</span>';
+      html += '<span style="font-family:monospace;font-size:0.68rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(g.target) + '</span>';
+      html += '<span style="font-weight:600;min-width:40px;text-align:right;">' + g.count + 'x</span>';
+      html += '</div>';
+      html += '<div style="font-size:0.64rem;color:var(--dim);padding-top:2px;">';
+      html += escHtml(g.first || '') + ' - ' + escHtml(g.last || '') + ' · ' + g.distinct_clients + ' client(s)';
+      if (clients) html += ' · ' + escHtml(clients);
+      html += '</div>';
+      if (g.sample && g.sample.error_body) {
+        html += '<pre style="margin:4px 0 0;padding:4px 8px;background:var(--code-bg,rgba(127,127,127,.08));border-radius:4px;font-size:0.66rem;max-height:80px;overflow:auto;white-space:pre-wrap;word-break:break-all;">' + escHtml(g.sample.error_body) + '</pre>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  if (analyze && analyze.verdicts && analyze.verdicts.length) {
+    html += '<div class="stat-card" style="margin-bottom:12px;">';
+    html += '<div style="font-size:0.73rem;font-weight:700;margin-bottom:6px;">Route Verdicts</div>';
+    for (const v of analyze.verdicts) {
+      html += '<div style="font-size:0.72rem;padding:4px 0;border-bottom:1px solid rgba(127,127,127,.06);line-height:1.4;">' + escHtml(v) + '</div>';
+    }
+    html += '</div>';
+  }
+  if (!html) {
+    html = '<div style="padding:20px;color:var(--dim);font-size:0.85rem;">No health data available. The server must have the /api/logs/stats and /api/logs/analyze endpoints.</div>';
+  }
+  el.innerHTML = html;
+}
+
 // ── end Logs tab ──────────────────────────────────────────────────────────────
 
 async function fetchSchedules() {

@@ -2682,6 +2682,44 @@
   .stat-card-label { font-size: 0.69rem; color: var(--dim); margin-bottom: 5px; }
   .stat-card-value { font-size: 1.5rem; font-weight: 700; color: var(--text); }
 
+  /* Worker request log (peek Logs tab) */
+  .wlog-row {
+    display: flex; align-items: center; gap: 6px; padding: 5px 12px;
+    font-size: 0.76rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border-bottom: 1px solid rgba(127,127,127,0.08);
+  }
+  .wlog-row-x { cursor: pointer; }
+  .wlog-row-x:hover { background: var(--hover, rgba(127,127,127,.07)); }
+  .wlog-err { background: rgba(248,81,73,0.06); }
+  .wlog-slow { background: rgba(224,112,0,0.05); }
+  .wlog-ts { display: flex; flex-direction: column; gap: 1px; min-width: 60px; flex-shrink: 0;
+    font-size: 0.62rem; color: var(--dim); line-height: 1.2; }
+  .wlog-method { font-weight: 700; min-width: 42px; flex-shrink: 0; font-size: 0.68rem; }
+  .wlog-status { font-weight: 600; min-width: 28px; flex-shrink: 0; font-size: 0.72rem; }
+  .wlog-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--fg); font-size: 0.72rem; }
+  .wlog-lat { min-width: 44px; text-align: right; flex-shrink: 0; color: var(--dim); font-size: 0.68rem; }
+  .wlog-lat-slow { color: #e07000; font-weight: 600; }
+  .wlog-caret { color: var(--dim); font-size: 0.7rem; flex-shrink: 0; width: 12px; text-align: center; }
+  .wlog-meta { padding: 0 12px 4px 68px; font-size: 0.64rem; color: var(--dim);
+    display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+  .wlog-payload { display: none; margin: 0 12px 6px 68px; border-left: 2px solid var(--border);
+    padding-left: 10px; }
+  .wlog-payload.open { display: block; }
+  .wlog-pay-label { font-size: 0.62rem; letter-spacing: 0.06em; color: var(--dim); text-transform: uppercase;
+    margin: 4px 0 2px; }
+  .wlog-pay-body { margin: 0 0 4px; padding: 6px 8px; background: var(--code-bg, rgba(127,127,127,.10));
+    border-radius: 5px; font-size: 0.68rem; line-height: 1.45; overflow-x: auto;
+    max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  @media (max-width: 600px) {
+    .wlog-row { padding: 4px 8px; gap: 4px; }
+    .wlog-ts { min-width: 50px; font-size: 0.58rem; }
+    .wlog-method { font-size: 0.64rem; min-width: 36px; }
+    .wlog-path { font-size: 0.68rem; }
+    .wlog-meta { padding-left: 54px; }
+    .wlog-payload { margin-left: 54px; }
+  }
+
   /* Session sort dropdown */
   .sort-menu {
     position: absolute; right: 0; top: calc(100% + 5px); z-index: 60;

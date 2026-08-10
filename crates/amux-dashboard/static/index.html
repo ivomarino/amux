@@ -791,6 +791,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button id="lst-activity" class="lst-btn active" onclick="logsSetTab('activity')">Activity</button>
     <button id="lst-raw" class="lst-btn" onclick="logsSetTab('raw')">Raw Logs</button>
     <button id="lst-stats" class="lst-btn" onclick="logsSetTab('stats')">Stats</button>
+    <button id="lst-health" class="lst-btn" onclick="logsSetTab('health')">Health</button>
   </div>
   <div id="logs-activity" style="flex:1;overflow-y:auto;padding:0 12px 12px;">
     <div id="logs-activity-body"></div>
@@ -804,6 +805,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div id="logs-stats" style="display:none;flex:1;overflow-y:auto;padding:8px 12px;">
     <div id="logs-stats-body"></div>
+  </div>
+  <div id="logs-health" style="display:none;flex:1;overflow-y:auto;padding:8px 12px;">
+    <div id="logs-health-body"></div>
   </div>
 </div>
 
@@ -1889,6 +1893,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-commits" onclick="setPeekTab('commits')"><span class="tab-ico">◇</span><span class="tab-lbl">Commits</span></button>
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
+    <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
     <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
   </div>
@@ -2216,6 +2221,20 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </summary>
       <div id="peek-schedules-runs" style="max-height:38vh;overflow-y:auto;-webkit-overflow-scrolling:touch;"></div>
     </details>
+  </div>
+  <div id="peek-logs-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
+    <div style="padding:8px 12px 6px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;">
+      <span style="font-weight:600;font-size:0.85rem;">Request Log</span>
+      <span id="peek-logs-stats" style="font-size:0.68rem;color:var(--dim);flex:1;"></span>
+      <button class="btn" title="Refresh" onclick="_peekLogsLoad()" style="font-size:0.7rem;padding:2px 6px;">&#x21BB;</button>
+    </div>
+    <div style="padding:4px 12px;display:flex;gap:6px;align-items:center;flex-shrink:0;border-bottom:1px solid var(--border);">
+      <button class="lf-btn active" id="plf-all" onclick="_peekLogsSetFilter('')">All</button>
+      <button class="lf-btn" id="plf-err" onclick="_peekLogsSetFilter('errors')">Errors</button>
+      <button class="lf-btn" id="plf-slow" onclick="_peekLogsSetFilter('slow')">Slow</button>
+      <input id="peek-logs-search" class="search-input" type="text" placeholder="Filter..." style="flex:1;font-size:0.72rem;padding:4px 8px;min-width:60px;" oninput="_peekLogsSearchQ=this.value;_peekLogsRender()">
+    </div>
+    <div class="peek-tasks-list" id="peek-logs-list" style="padding:0;"></div>
   </div>
   <!-- Notes panel -->
 </div>
