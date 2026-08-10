@@ -1757,7 +1757,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                      ... \`git log --grep=x\` stays literal ...
                                      EOF
     --type T                       retype in the same write
-    --reviewer W                   name the peer this card is handed to. `review`
+    --reviewer W                   name the peer this card is handed to. \`amux board review ID --reviewer W\`
                                      sets the STATUS; the review gate rests on the
                                      REVIEWER's sign-off, so a card in review with
                                      no reviewer is one nobody was asked to look at

@@ -1028,7 +1028,7 @@ FIX: fixed in the AMUX-2608 change: REPO now derives from the script's own locat
 ## Idle nudge told me to commit 11 files I never touched, while the staged-guard said I owned none
 AREA: notices
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux-frustrations
 CARD: AF-38
@@ -1047,6 +1047,11 @@ FIX: have the nudge resolve ownership through the same call the staged-guard use
   differently is the duplicated-precedence bug AMUX-2330 already fixed once for gates: one
   answer, one owner. Note the nudge is not blind - it correctly excluded 2 files - so it has
   SOME signal and is wrong in one direction only, which is the more dangerous shape.
+
+RESOLVED 2026-08-09 by the python retirement, NOT by a fix — recorded because 'fixed' and 'the code is gone' are different things. The nudge, including its NOT-YOURS exclusion, lived only in amux-server.py (792ce1f^:amux-server.py, exclusion at line 20190); that file is deleted from HEAD and nothing in crates/ implements it. AF-38 discarded.
+  The finding survives as AMUX-2638: when the nudge is ported it must resolve ownership through the staged-guard path, not from dirty-tree membership — that substitution IS the bug and a fresh port reintroduces it by default, because `git status` is the obvious source.
+  Also note the capability is simply GONE meanwhile: nothing tells any session about uncommitted work, on a shared checkout with ~7 lanes and 82 dirty files.
+
 
 ## Two entries validated and deleted today have already recurred
 AREA: board
@@ -1417,3 +1422,23 @@ every amux-originated message carried a machine-readable origin marker, the guar
 be exact instead of a heuristic. (2) Better: deliver over the structured protocol, where
 there is no composer to get stuck in and nothing to sweep for; the sweep's exit condition
 is written into its module docs for that reason.
+
+## `amux board` help executed a command out of its own help text
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux-frustrations
+CARD: AF-38
+SYMPTOM: `amux board discard AF-38` (a verb that does not exist) printed the unknown-verb
+  error AND `/Users/ethan/.local/bin/amux: line 1726: review: command not found`. The help
+  body is emitted with an UNQUOTED `cat <<EOF`, so backticks in it are command substitution.
+  Line 1760 had a literal `review` in backticks while lines 1753/1757 correctly escape
+  theirs, so bash ran `review`, printed the error, and spliced its empty stdout — silently
+  deleting the words from the rendered help ("handed to. " then nothing).
+COST: two minutes and a wrong first impression that the CLI was broken. The real cost is
+  latent: any backticked text anyone adds to that help block gets EXECUTED on every
+  `amux board` with no verb. This is the same class the help text itself warns about two
+  lines above, for `--outcome`.
+FIX: escaped the backticks to match the neighbouring lines (and restored the text the
+  substitution had been eating). Verified: stderr is now empty and the line renders in full.
