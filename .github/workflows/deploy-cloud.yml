@@ -223,7 +223,20 @@ jobs:
           ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
             'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
 
+      # GATED WITH THE WRITER IT VERIFIES, and that pairing is the point.
+      #
+      # Gating the flip (AMUX-2809) without gating its verifier would have made
+      # every ordinary push-deploy fail here: the gateway is deliberately on
+      # http while the containers are still python, so a step asserting https
+      # unconditionally now contradicts the step that decides the scheme. That
+      # is the "which signal will people reach for next" trap — killing a bad
+      # write and leaving its assertion behind just relocates the wrong answer,
+      # and a red deploy that is red on purpose teaches everyone to ignore it.
+      #
+      # So: this asserts the hop ONLY on the run that set it. On every other
+      # deploy there is nothing to verify, because nothing changed the scheme.
       - name: Gateway is actually on the https hop (fails if the restart did not take)
+        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
         run: |
           # `systemctl is-active` proves a process exists, not that it read the
           # new env. The startup line names the scheme; grepping for it is the
@@ -236,6 +249,17 @@ jobs:
               *"container hop: https://"*) exit 0 ;;
               *) echo "::error::gateway is not on the https container hop"; exit 1 ;;
             esac'
+
+      # The half worth keeping on EVERY deploy: that the gateway came back at
+      # all. It is scheme-agnostic on purpose — it must pass both before and
+      # after the cutover, or it becomes another assertion that has to be
+      # remembered and re-gated the next time the scheme moves.
+      - name: Gateway restarted and is serving
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            systemctl is-active --quiet amux-gateway || { echo "::error::amux-gateway is not active"; exit 1; }
+            line=$(grep -a "container hop:" /var/log/amux-gateway.log | tail -1)
+            echo "gateway is active; hop currently: ${line:-<not yet logged>}"'
 
       - name: Pull the new image and (re)generate per-workspace compose files
         run: |
