@@ -3730,6 +3730,119 @@ fn hdr_worker(headers: &HeaderMap) -> String {
     String::new()
 }
 
+// ---------------------------------------------------------------------------
+// Steering DELIVERY loop (py:8959 _steer_deliver_tick + py:8811
+// _steer_try_deliver). AMUX-2617.
+//
+// The producer shipped without its consumer. `steer_enqueue` is wired at three
+// call sites and writes durable `steering_queue` rows; nothing ever took a row
+// OUT except an explicit user cancel or a session delete, and `send_text_inner`
+// carries a `from_steering` parameter that NOTHING passed `true`. So a message
+// queued to a busy lane was stored perfectly and never delivered: amux-rust sat
+// IDLE with 9 QUEUED, the oldest 2h6m old, all of them Ethan's.
+//
+// This is the same shape as the pickup outage (AMUX-2616) — the cutover carried
+// the API surface across and left the background loops behind. Both present as
+// "idle with work waiting", which is the state the fleet should never be in.
+//
+// STATE COMES FROM THE HARNESS FIRST, scrape only as fallback. Python's tick was
+// hardwired to the Claude pane detector, which is why a Gemini lane sat 2h at
+// IDLE with 1 QUEUED (its comment says so). Since the fleet now runs herdr and
+// opencode as well as tmux+claude, keying delivery on a pane regex would rebuild
+// that bug for every new backend. `session_status` already resolves the D1
+// reported state and falls back to the scrape for hookless lanes, and
+// `send_text_inner` already dispatches herdr via `herdr_send` — so delivery is
+// backend-agnostic by construction rather than by a per-backend branch here.
+const STEER_TICK_SECS: u64 = 5;
+
+/// One pass: deliver queued steering to every lane that is at a turn boundary.
+/// Returns how many messages were delivered (the count is the test's handle —
+/// a loop whose only evidence is "no rows left" cannot distinguish delivered
+/// from dropped).
+pub async fn steer_deliver_tick(state: &AppState) -> usize {
+    // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
+    // and keeps the pane captures below proportional to real work.
+    let queued: Vec<(String, String, String)> = {
+        let Ok(conn) = state.store.read() else { return 0 };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session, text FROM steering_queue ORDER BY queued_at ASC",
+        ) else {
+            return 0;
+        };
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        rows
+    };
+    if queued.is_empty() {
+        return 0;
+    }
+    // ONE message per lane per tick, oldest first. Delivering a whole backlog
+    // into a single turn boundary would concatenate 9 unrelated instructions
+    // into one prompt; the next tick takes the next one once the lane is idle
+    // again, which is what "delivers at the turn boundary" has to mean to be
+    // worth anything.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut delivered = 0usize;
+    for (id, session, text) in queued {
+        if !seen.insert(session.clone()) {
+            continue;
+        }
+        if !env_path(&session).exists() {
+            continue; // the expiry sweep owns dead lanes, not this loop
+        }
+        if !is_running(&session).await {
+            continue; // stopped lane: its nudge stays pending, per python
+        }
+        // from_steering=true: the callee REFUSES rather than re-queues when the
+        // lane turns out to be generating or at a selector, so a failed attempt
+        // leaves the row exactly where it was instead of duplicating it.
+        let (ok, msg) = send_text_inner(state, &session, &text, false, true).await;
+        if !ok {
+            continue;
+        }
+        // Delivered — move the row to history under the SAME contract the
+        // manual deliver path uses (redacted text, queued_at preserved).
+        let (id2, sess2, text2) = (id.clone(), session.clone(), text.clone());
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                let queued_at: f64 = conn
+                    .query_row(
+                        "SELECT queued_at FROM steering_queue WHERE id=?",
+                        [&id2],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| now_f64());
+                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
+                     VALUES(?,?,?,?,?)",
+                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64()],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        delivered += 1;
+        tracing::info!(session = %session, id = %id, detail = %msg, "steering delivered");
+    }
+    delivered
+}
+
+/// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
+pub async fn steer_deliver_loop(state: AppState) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;
+        // A panic in one tick must not kill delivery for the whole fleet.
+        let st = state.clone();
+        if let Err(e) = tokio::spawn(async move { steer_deliver_tick(&st).await }).await {
+            tracing::warn!(error = %e, "steering delivery tick panicked");
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions/{name}", any(session_root_handler))

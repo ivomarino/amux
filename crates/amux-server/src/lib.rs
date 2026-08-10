@@ -195,6 +195,12 @@ async fn async_main() {
         build_hash: build_hash(),
         auth_token,
     };
+    // Steering DELIVERY (AMUX-2617). `steer_enqueue` had three call sites and no
+    // consumer: queued messages were stored durably and never handed to the lane,
+    // so a busy worker's queue only grew (amux-rust: IDLE, 9 QUEUED, oldest 2h6m).
+    // Spawned before the router takes `state` by value.
+    tokio::spawn(api::session_verbs::steer_deliver_loop(state.clone()));
+
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
