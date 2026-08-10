@@ -2598,12 +2598,46 @@ class Handler(BaseHTTPRequestHandler):
 
         # GET /api/gateway/orgs → list orgs accessible to this user
         if path == "/api/gateway/orgs" and self.command == "GET":
-            rows = db.execute(
-                "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, m.role "
-                "FROM org_memberships m JOIN orgs o ON m.org_id = o.id "
-                "WHERE m.user_id=? ORDER BY o.created_at",
-                (user_id,)
-            ).fetchall()
+            # GOD MODE LISTS EVERY WORKSPACE, NOT JUST ITS OWN MEMBERSHIPS.
+            #
+            # This endpoint filtered strictly on org_memberships, with no
+            # is_admin branch — while GET /api/gateway/orgs/<id> twenty lines
+            # below DOES check it. So an ADMIN_EMAILS user could open any org by
+            # id and could not LIST them, which is the only way a human finds one
+            # in the UI. hello@amux.io is a member of exactly one org (its own
+            # personal workspace), so the switcher rendered a single entry and
+            # god mode had nothing to switch TO.
+            #
+            # Reported by Ethan with a screenshot: signed in on cloud.amux.io as
+            # hello@amux.io and seeing only `hello-world` at /root/dev, with no
+            # customer environments reachable. The switcher UI was present and
+            # working the whole time (_switchOrg is in the served bundle); it was
+            # being handed a one-item list.
+            #
+            # Read-only widening, and it matches the gate already used for org
+            # DETAIL rather than inventing a second rule: same _is_admin_email /
+            # is_e2e_admin predicate, no membership rows created, nothing else
+            # about the request changes. Admins get role 'admin' for orgs they do
+            # not belong to so the UI can tell "mine" from "god mode", and
+            # is_personal stays keyed to the user's OWN id so a customer's org is
+            # never mislabelled as theirs.
+            if is_admin:
+                rows = db.execute(
+                    "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, "
+                    "       COALESCE(m.role, 'admin') AS role "
+                    "FROM orgs o "
+                    "LEFT JOIN org_memberships m "
+                    "       ON m.org_id = o.id AND m.user_id = ? "
+                    "ORDER BY o.created_at",
+                    (user_id,)
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, m.role "
+                    "FROM org_memberships m JOIN orgs o ON m.org_id = o.id "
+                    "WHERE m.user_id=? ORDER BY o.created_at",
+                    (user_id,)
+                ).fetchall()
             cookies = _parse_cookies(self.headers.get("Cookie", ""))
             active = cookies.get("amux_org", user_id)
             return self._json([{
