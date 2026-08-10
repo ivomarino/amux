@@ -49,12 +49,34 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 // ---- system metrics (shell-command based, matching Python's non-psutil fallback) ----
 
 fn cmd_output(program: &str, args: &[&str]) -> Option<String> {
-    std::process::Command::new(program)
+    let resolved = resolve_bin(program);
+    std::process::Command::new(resolved)
         .args(args)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// launchd gives a minimal PATH; resolve common binaries to full paths.
+fn resolve_bin(name: &str) -> &str {
+    match name {
+        "sysctl" => "/usr/sbin/sysctl",
+        "vm_stat" => "/usr/bin/vm_stat",
+        "hostname" => "/bin/hostname",
+        "df" => "/bin/df",
+        "ps" => "/bin/ps",
+        "tmux" => {
+            if std::path::Path::new("/usr/local/bin/tmux").exists() {
+                "/usr/local/bin/tmux"
+            } else if std::path::Path::new("/opt/homebrew/bin/tmux").exists() {
+                "/opt/homebrew/bin/tmux"
+            } else {
+                "tmux"
+            }
+        }
+        other => other,
+    }
 }
 
 fn collect_system_metrics() -> serde_json::Value {
