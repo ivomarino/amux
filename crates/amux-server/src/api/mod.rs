@@ -45,6 +45,8 @@ pub mod search;
 pub mod session_verbs;
 pub mod board_themes;
 pub mod lookup;
+pub mod config_iac;
+pub mod skin;
 pub mod commit_mentions;
 pub mod sessions_git;
 pub mod sessions_legacy;
@@ -212,6 +214,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
         .route("/api/board/themes", axum::routing::get(board_themes::board_themes))
         .route("/api/lookup", axum::routing::post(lookup::lookup))
+        .route("/api/skin", axum::routing::get(skin::get_skin))
+        .route("/api/config/export", axum::routing::get(config_iac::export))
+        .route("/api/config/apply", axum::routing::put(config_iac::apply))
         .route(
             "/api/board/commit-mentions",
             axum::routing::get(commit_mentions::commit_mentions),

@@ -113,6 +113,8 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
     ("/api/lookup", "explain-selection helper (peek view)"),
+    ("/api/skin", "resolved skin (terms/colours/tabs) for a worker"),
+    ("/api/config", "declarative instance config: export + idempotent apply"),
     // ---- Mounted in mod.rs but never declared here, so
     // `every_mounted_api_family_is_claimed_by_the_registry` was RED on main and
     // CI could not go green for anyone. Native like everything else:

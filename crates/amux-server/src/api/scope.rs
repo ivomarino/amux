@@ -127,6 +127,24 @@ pub const SCOPE_CAPS: &[ScopeCap] = &[
         merge: "replace",
         explain: "/api/board/gate?item={id}&status={status}",
     },
+    // AMUX-2678. A SKIN is not a new subsystem — it is a scopable capability
+    // like the five above, so it inherits their precedence (global -> group ->
+    // worker), their write authorization, and their audit row for free. That is
+    // the whole reason it belongs here rather than in a `/api/skins` of its
+    // own: a vertical's UX becomes CONFIGURATION of a primitive, not code.
+    //
+    // merge-by-key, not replace: a group skin that renames one noun must not
+    // have to restate the global palette, and a worker override of a single
+    // colour must not drop the group's terminology.
+    ScopeCap {
+        key: "skin",
+        label: "Skin (terms, colours, tabs)",
+        levels: &["global", "group", "worker"],
+        kind: "json",
+        order: &["global", "group", "worker"],
+        merge: "merge-by-key",
+        explain: "/api/skin?worker={worker}",
+    },
     ScopeCap {
         key: "status_mode",
         label: "Status availability",
@@ -218,7 +236,10 @@ fn split_tags(raw: &str) -> Vec<String> {
     raw.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
 }
 
-fn session_tags_of(home: &Path, name: &str) -> Vec<String> {
+/// pub(crate) so the skin resolver uses the SAME reader (AMUX-2678). Two
+/// readers of "which groups is this worker in" would eventually disagree, and
+/// the scope screen and the resolved skin must not.
+pub(crate) fn session_tags_of(home: &Path, name: &str) -> Vec<String> {
     let env = crate::config::parse_env_file(&home.join("sessions").join(format!("{name}.env")));
     split_tags(env.get("CC_TAGS").map(String::as_str).unwrap_or(""))
 }
@@ -271,6 +292,24 @@ fn read_cap_value(
     key: &str,
 ) -> Result<(Value, bool), String> {
     match key {
+        "skin" => {
+            // Stored in `prefs` rather than a file: a skin is structured
+            // config the SPA reads on every load, and the prefs table is
+            // already the DB-backed key/value the branding prefs use.
+            let k = skin_pref_key(level, name);
+            let raw: Option<String> = conn.and_then(|c| {
+                c.query_row("SELECT value FROM prefs WHERE key=?1", rusqlite::params![k], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+            });
+            let set = raw.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let parsed: Value = raw
+                .as_deref()
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or_else(|| json!({}));
+            Ok((json!({ "skin": parsed }), set))
+        }
         "memory" | "rules" => {
             let f = memory_file(home, level, name, key);
             let sz = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0) as usize;
@@ -365,6 +404,56 @@ fn read_cap_value(
 
 /// session_gates key convention: `group:<name>` for groups, the bare name
 /// for workers (py:16147 / py:16290).
+/// Where a skin lives in `prefs`. One key shape for all three levels so a
+/// resolver can enumerate them without knowing which exist.
+fn skin_pref_key(level: &str, name: &str) -> String {
+    match level {
+        "global" => "skin:global".to_string(),
+        "group" => format!("skin:group:{name}"),
+        _ => format!("skin:worker:{name}"),
+    }
+}
+
+/// Write a skin layer. The value is a JSON object; `{}` or null CLEARS the
+/// layer rather than storing an empty object, so "unset" and "set to nothing"
+/// stay distinguishable — the resolver treats an absent layer as transparent
+/// and an empty one identically, but a configuration screen must be able to
+/// say which it is.
+async fn write_skin(
+    state: &AppState,
+    level: &str,
+    name: &str,
+    value: &Value,
+) -> Result<(), (u16, String)> {
+    let obj = value.get("skin").unwrap_or(value);
+    if !obj.is_object() && !obj.is_null() {
+        return Err((400, "skin must be a JSON object".into()));
+    }
+    let key = skin_pref_key(level, name);
+    let empty = obj.is_null() || obj.as_object().map(|m| m.is_empty()).unwrap_or(true);
+    let payload = if empty { None } else { Some(obj.to_string()) };
+    state
+        .store
+        .write_async(move |conn| {
+            match &payload {
+                None => {
+                    conn.execute("DELETE FROM prefs WHERE key=?1", rusqlite::params![key])?;
+                }
+                Some(v) => {
+                    conn.execute(
+                        "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        rusqlite::params![key, v],
+                    )?;
+                }
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map_err(|e| (500, format!("skin write failed: {e}")))?;
+    Ok(())
+}
+
 fn session_gate_key(level: &str, name: &str) -> String {
     if level == "group" {
         format!("group:{name}")
@@ -643,6 +732,7 @@ async fn scope_write(
         "env" => write_env(&home, level, name, &value),
         "gates" => write_gates(state, level, name, &value).await,
         "status_mode" => write_status_mode(state, level, name, &value).await,
+        "skin" => write_skin(state, level, name, &value).await,
         // Structural fallback (py:16316) — unreachable while every
         // descriptor above has a write arm, kept so a future capability
         // without one fails honestly instead of silently succeeding.
@@ -1075,7 +1165,26 @@ mod tests {
         let (s, v) = call(&app, "GET", "/api/scope", None, None).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["level"], "global");
-        assert_eq!(v["capabilities"].as_array().unwrap().len(), 5);
+        // The FIVE python capabilities must all still be here — that is what
+        // this assertion was protecting. Amux-native additions (skin,
+        // AMUX-2678) are allowed on top now that python is deleted, so assert
+        // the parity SET rather than a count, which would have to be edited on
+        // every addition and says nothing about whether parity survived.
+        {
+            // The READ publishes descriptor OBJECTS (key/label/levels/...),
+            // unlike the PUT refusal which lists bare names — two shapes, and
+            // asserting the wrong one unwraps None.
+            let caps: Vec<&str> = v["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.get("key").and_then(|k| k.as_str()))
+                .collect();
+            for expected in ["memory", "rules", "env", "gates", "status_mode"] {
+                assert!(caps.contains(&expected), "python capability {expected} is missing: {caps:?}");
+            }
+            assert!(caps.contains(&"skin"), "the native skin capability should be published: {caps:?}");
+        }
         // Global groups include ARCHIVED sessions' tags (Python filters
         // archived only for group members).
         assert_eq!(v["groups"], json!(["alpha", "beta"]));
@@ -1161,7 +1270,19 @@ mod tests {
             call(&app, "PUT", "/api/scope", Some(json!({"level": "global"})), None).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "capability required");
-        assert_eq!(v["capabilities"], json!(["memory", "rules", "env", "gates", "status_mode"]));
+        {
+            // Same rule as above: the python five, in their python ORDER
+            // (the refusal lists them and the UI renders them in order), with
+            // native additions permitted to follow or interleave.
+            let caps: Vec<&str> =
+                v["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+            let py: Vec<&str> = caps
+                .iter()
+                .copied()
+                .filter(|c| ["memory", "rules", "env", "gates", "status_mode"].contains(c))
+                .collect();
+            assert_eq!(py, vec!["memory", "rules", "env", "gates", "status_mode"], "{caps:?}");
+        }
 
         let (s, v) = call(
             &app,

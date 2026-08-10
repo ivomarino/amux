@@ -927,6 +927,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // CLAUDE.md tells people to consult instead of grepping, lying about the
     // very route that was just added.
     RouteEntry { path: "/api/lookup", methods: &["POST"] },
+    RouteEntry { path: "/api/skin", methods: &["GET"] },
+    RouteEntry { path: "/api/config/export", methods: &["GET"] },
+    RouteEntry { path: "/api/config/apply", methods: &["PUT"] },
     RouteEntry { path: "/api/board/themes", methods: &["GET"] },
     RouteEntry { path: "/api/board/commit-mentions", methods: &["GET"] },
     RouteEntry { path: "/api/logs/raw", methods: &["GET"] },
