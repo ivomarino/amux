@@ -20,6 +20,55 @@ pub struct Health {
     pub store: &'static str,
     pub pid: u32,
     pub server: &'static str,
+    /// Open descriptors / the process's own RLIMIT_NOFILE soft limit.
+    ///
+    /// AMUX-2812: on 2026-08-10 this process hit macOS's launchd default of 256
+    /// and every open and spawn began failing with EMFILE. `/health` then went
+    /// SILENT — which from the outside is indistinguishable from a dead
+    /// machine, so the dashboard simply read "offline" and the first stretch of
+    /// the investigation went looking for a crash that had not happened.
+    ///
+    /// Answering "out of descriptors" while out of descriptors is not reliably
+    /// possible: the reply needs a socket. So the useful move is the one BEFORE
+    /// that — publish the number continuously, so the approach is visible in
+    /// the instrument everyone already polls, and `degraded` arrives while the
+    /// server can still say it. `None` when unmeasurable, which is honestly
+    /// different from zero.
+    pub fds: Option<FdHealth>,
+}
+
+#[derive(Serialize)]
+pub struct FdHealth {
+    pub open: usize,
+    pub limit: u64,
+    pub ratio: f64,
+}
+
+/// The same `AMUX_FD_MAX_RATIO` the autofix detector triggers on, read from the
+/// same env var — so `/health` saying `degraded` and a card being filed are the
+/// SAME condition, not two thresholds that drift apart. A view must share the
+/// predicate of the mechanism it describes (ethos rule 1).
+fn fd_ceiling() -> f64 {
+    std::env::var("AMUX_FD_MAX_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.7)
+        .clamp(0.1, 0.99)
+}
+
+/// Costs one descriptor and NO subprocess — `lsof` would fail exactly when the
+/// condition it reports is present, and each attempt would consume the resource
+/// being measured (ethos rule 7: what does the detector cost, and is it paid in
+/// the same resource as the fault?).
+fn fd_health() -> Option<FdHealth> {
+    let open = std::fs::read_dir("/dev/fd").ok()?.count();
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes into a fully-initialised local; no aliasing.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 || rl.rlim_cur == 0 {
+        return None;
+    }
+    let limit = rl.rlim_cur;
+    Some(FdHealth { open, limit, ratio: open as f64 / limit as f64 })
 }
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
@@ -30,16 +79,29 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
         Ok(rev) => (Some(rev.0), "ok", StatusCode::OK),
         Err(_) => (None, "hung", StatusCode::SERVICE_UNAVAILABLE),
     };
+    let fds = fd_health();
+    // Descriptor pressure degrades `status` but does NOT fail the request: the
+    // server is still serving, and returning 503 here would take the fleet down
+    // on a warning. `status` is the field that carries the warning; `store` is
+    // the one that gates the code.
+    let fd_tight = fds.as_ref().is_some_and(|f| f.ratio >= fd_ceiling());
     (
         code,
         Json(Health {
-            status: if store == "ok" { "ok" } else { "degraded" },
+            status: if store != "ok" {
+                "degraded"
+            } else if fd_tight {
+                "degraded-fds"
+            } else {
+                "ok"
+            },
             build: state.build_hash.clone(),
             uptime_s: state.started.elapsed().as_secs(),
             rev,
             store,
             pid: std::process::id(),
             server: "amux-rust",
+            fds,
         }),
     )
 }

@@ -116,6 +116,7 @@ dependencies = [
  "futures",
  "hex",
  "hkdf",
+ "libc",
  "p256",
  "proptest",
  "r2d2",

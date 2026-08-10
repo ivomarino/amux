@@ -253,6 +253,9 @@ pub enum DetectorKind {
     /// stayed failing. The one detector whose instrument lives OUTSIDE this
     /// machine — see [`detect_ci`] for why that changes the failure modes.
     CiFailure,
+    /// Open file descriptors are close to the process limit, or climbing toward
+    /// it fast enough to get there.
+    FdPressure,
 }
 
 impl DetectorKind {
@@ -266,6 +269,7 @@ impl DetectorKind {
             DetectorKind::BuildDeploy => "build",
             DetectorKind::DiskPressure => "disk",
             DetectorKind::CiFailure => "ci",
+            DetectorKind::FdPressure => "fd",
         }
     }
 
@@ -280,12 +284,13 @@ impl DetectorKind {
             DetectorKind::BuildDeploy
             | DetectorKind::SilentSubsystem
             | DetectorKind::DiskPressure
-            | DetectorKind::CiFailure => "blocker",
+            | DetectorKind::CiFailure
+            | DetectorKind::FdPressure => "blocker",
             _ => "investigation",
         }
     }
 
-    pub fn all() -> [DetectorKind; 8] {
+    pub fn all() -> [DetectorKind; 9] {
         [
             DetectorKind::Http5xx,
             DetectorKind::Latency,
@@ -295,6 +300,7 @@ impl DetectorKind {
             DetectorKind::BuildDeploy,
             DetectorKind::DiskPressure,
             DetectorKind::CiFailure,
+            DetectorKind::FdPressure,
         ]
     }
 }
@@ -1292,6 +1298,225 @@ pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppr
 }
 
 // ---------------------------------------------------------------------------
+// File-descriptor pressure (AMUX-2812, after the 2026-08-10 EMFILE incident).
+//
+// At ~18:26 every operation started failing with "Too many open files", the
+// process spun at 115% CPU retrying spawns, `/health` stopped answering, and
+// the dashboard read as OFFLINE — which is indistinguishable from a dead
+// machine, so the first hour was spent looking in the wrong place. The launchd
+// plist never set `NumberOfFiles`, so the service ran at macOS's default 256
+// with ~60 tmux sessions, SSE clients and subprocess spawns against it. The
+// limit is now 65536 soft+hard, which removes THIS occurrence and removes
+// nothing about the next one: a fleet that grows into any limit reports the
+// same silence.
+// ---------------------------------------------------------------------------
+
+/// Open descriptors as a FRACTION of the process limit.
+///
+/// A ratio, not a count, because the limit is precisely what changed: the same
+/// 220 open descriptors were fatal at 256 and are unremarkable at 65536. A
+/// count-based floor would have to be re-chosen every time the plist changes,
+/// and a floor nobody re-chooses is a floor that silently stops meaning
+/// anything.
+fn fd_max_ratio() -> f64 {
+    env_f64("AMUX_FD_MAX_RATIO", 0.7).clamp(0.1, 0.99)
+}
+
+/// The RATE trigger, in ratio-points per hour. Same reasoning as
+/// `AMUX_DISK_FALL_GB_PER_H`: an absolute ceiling is a lagging indicator that
+/// fires once things are already failing, and descriptors are LEAKED far more
+/// often than they are legitimately consumed — a steady climb with no plateau
+/// is the shape worth catching, hours before the ceiling.
+fn fd_rise_per_h() -> f64 {
+    env_f64("AMUX_FD_RISE_PER_H", 0.2).max(0.01)
+}
+
+/// Minimum span before a rate is a rate rather than two adjacent samples.
+fn fd_rate_window_min() -> f64 {
+    env_f64("AMUX_FD_RATE_WINDOW_MIN", 20.0).clamp(2.0, 24.0 * 60.0)
+}
+
+/// In-memory, and therefore fiction across a restart — the same trade
+/// [`disk_samples`] documents, and tolerable for the same reason: the ceiling
+/// check is a pure function of ONE sample and survives a restart intact, so a
+/// restart costs the rate trigger its window and costs the ceiling nothing.
+fn fd_samples() -> &'static std::sync::RwLock<Vec<(f64, usize)>> {
+    static CELL: std::sync::OnceLock<std::sync::RwLock<Vec<(f64, usize)>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Open descriptors for THIS process, counted WITHOUT spawning anything.
+///
+/// `lsof -p $$ | wc -l` is the obvious instrument and it is the wrong one here,
+/// for the reason ethos rule 7 records about the spin-catcher: **what does the
+/// detector cost, and is the cost paid in the same resource as the fault?** The
+/// fault is "this process cannot open files or spawn subprocesses" — during the
+/// incident it was burning 115% CPU failing to spawn — so a detector that
+/// shells out would fail exactly when it is needed, and each attempt would
+/// consume the descriptors it is trying to report on. Reading `/dev/fd` costs
+/// one descriptor, no fork, and no PATH lookup.
+///
+/// The returned count includes the directory handle this read itself holds, so
+/// it is high by one. Left uncorrected on purpose: an off-by-one against a
+/// 70%-of-limit trigger is noise, and a fudge factor in the measurement is
+/// something the next reader has to reverse-engineer.
+fn open_fd_count() -> Option<usize> {
+    // /dev/fd on macOS and Linux both enumerate the CALLING process's
+    // descriptors (on Linux via the /proc/self/fd symlink).
+    std::fs::read_dir("/dev/fd").ok().map(|it| it.count())
+}
+
+/// The process's own soft limit — NOT `launchctl limit maxfiles`, which reports
+/// the system-wide default and would have said 256 while the service ran at
+/// 65536, or vice versa. The number that matters is the one this process is
+/// actually subject to.
+fn fd_limit() -> Option<u64> {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes into a fully-initialised local; no aliasing.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        Some(rl.rlim_cur)
+    } else {
+        None
+    }
+}
+
+/// THE DECISION, pure — so the regression corpus is the incident's own numbers
+/// (220 open against a 256 limit) rather than whatever this machine happens to
+/// be doing while the test runs. A detector whose trigger can only be exercised
+/// by reproducing the outage is a detector nobody checks.
+///
+/// Returns the signature suffix, or `None` for "nothing to report".
+fn fd_trigger(
+    ratio: f64,
+    rise_per_h: f64,
+    ceiling: f64,
+    rise_trigger: f64,
+) -> Option<&'static str> {
+    if ratio >= ceiling {
+        // The ceiling wins when both fire: "you are nearly out" is a more
+        // actionable sentence than "you are heading for nearly out".
+        return Some("near-limit");
+    }
+    if rise_per_h >= rise_trigger {
+        return Some("climbing");
+    }
+    None
+}
+
+pub fn detect_fd(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    let mut out = Vec::new();
+    let mut suppressed = Vec::new();
+
+    let (Some(open), Some(limit)) = (open_fd_count(), fd_limit()) else {
+        suppressed.push(sup(
+            DetectorKind::FdPressure,
+            "fd|unreadable",
+            "could not read /dev/fd or getrlimit — cannot measure descriptor use, so not \
+             filing either way",
+        ));
+        return (out, suppressed);
+    };
+    if limit == 0 {
+        suppressed.push(sup(DetectorKind::FdPressure, "fd|no-limit", "RLIMIT_NOFILE is 0"));
+        return (out, suppressed);
+    }
+    let ratio = open as f64 / limit as f64;
+
+    let (mut rise_per_h, mut span_min) = (0.0f64, 0.0f64);
+    if let Ok(mut s) = fd_samples().write() {
+        s.push((now, open));
+        let keep_from = now - 6.0 * 3600.0;
+        s.retain(|(t, _)| *t >= keep_from);
+        if let (Some(first), Some(last)) = (s.first().copied(), s.last().copied()) {
+            span_min = (last.0 - first.0) / 60.0;
+            if span_min >= fd_rate_window_min() {
+                let gained = (last.1 as f64 - first.1 as f64) / limit as f64;
+                rise_per_h = gained / (span_min / 60.0);
+            }
+        }
+    }
+
+    let ceiling = fd_max_ratio();
+    let Some(trigger) = fd_trigger(ratio, rise_per_h, ceiling, fd_rise_per_h()) else {
+        return (out, suppressed);
+    };
+
+    let (signature, title, verdict) = if trigger == "near-limit" {
+        (
+            "fd|near-limit".to_string(),
+            format!("fds: {open}/{limit} open ({:.0}% of the limit)", ratio * 100.0),
+            format!(
+                "This process holds {open} of its {limit} allowed descriptors. Past the limit, \
+                 EVERY open and EVERY spawn fails with EMFILE at once — on 2026-08-10 that \
+                 surfaced as /health going SILENT and the dashboard reading offline, which is \
+                 indistinguishable from the machine being down. Nothing reports 'out of \
+                 descriptors' because reporting it also needs one."
+            ),
+        )
+    } else {
+        (
+            "fd|climbing".to_string(),
+            format!(
+                "fds: climbing {:.0} pts/h — {open}/{limit} ({:.0}%)",
+                rise_per_h * 100.0,
+                ratio * 100.0
+            ),
+            format!(
+                "Descriptor use is rising at {:.1} percentage points per hour over the last \
+                 {span_min:.0} min, now at {:.0}% of {limit}. At this rate the {:.0}% ceiling is \
+                 {:.1} h away. Nothing is broken yet — a steady climb with no plateau is a LEAK, \
+                 and it is the shape a ceiling check cannot report until it is too late.",
+                rise_per_h * 100.0,
+                ratio * 100.0,
+                ceiling * 100.0,
+                ((ceiling - ratio) / rise_per_h).max(0.0)
+            ),
+        )
+    };
+
+    out.push(Finding {
+        kind: DetectorKind::FdPressure,
+        signature,
+        title,
+        evidence: vec![
+            ("verdict".into(), verdict),
+            ("open_fds".into(), open.to_string()),
+            ("limit".into(), format!("{limit} (RLIMIT_NOFILE soft, this process)")),
+            ("ratio".into(), format!("{:.2}", ratio)),
+            (
+                "ceiling".into(),
+                format!("{:.2} (AMUX_FD_MAX_RATIO)", ceiling),
+            ),
+            (
+                "rise_per_h".into(),
+                format!(
+                    "{:.3} over {span_min:.0} min (trigger: {:.3}, AMUX_FD_RISE_PER_H)",
+                    rise_per_h,
+                    fd_rise_per_h()
+                ),
+            ),
+            (
+                "if_the_limit_is_low".into(),
+                "macOS defaults a launchd service to 256 descriptors and the amux plist did \
+                 not set NumberOfFiles until 2026-08-10. If `limit` above reads 256, the plist \
+                 is stale — check SoftResourceLimits/HardResourceLimits/NumberOfFiles in \
+                 ~/Library/LaunchAgents/com.amux.server-rs.plist (should be 65536), then \
+                 `launchctl kickstart -k gui/$(id -u)/com.amux.server-rs`."
+                    .to_string(),
+            ),
+        ],
+        recheck: "launchctl print gui/$(id -u)/com.amux.server-rs | grep -A3 'resource limits'; \
+                  lsof -p $(curl -sk $AMUX_URL/health | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"pid\"])') | wc -l"
+            .into(),
+        owner: None,
+        count: 1,
+        last_ts: now,
+    });
+    (out, suppressed)
+}
+
+// ---------------------------------------------------------------------------
 // The one filing path.
 // ---------------------------------------------------------------------------
 
@@ -1878,6 +2103,7 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
                 DetectorKind::DiskPressure => detect_disk(now, home),
                 DetectorKind::CiFailure => ci_findings(ci_runs, now),
+                DetectorKind::FdPressure => detect_fd(now),
             };
             findings.extend(f);
             suppressed.extend(s);
@@ -2952,5 +3178,71 @@ mod tests {
         // Suppressed naming the cause; `ci_findings` cannot and must not guess.
         // Guarded here so nobody later "helpfully" makes an empty list file a
         // card, which would fire on every network blip.
+    }
+
+    // -----------------------------------------------------------------------
+    // FD pressure (AMUX-2812). The corpus is the 2026-08-10 EMFILE incident.
+    // -----------------------------------------------------------------------
+
+    /// THE INCIDENT'S OWN NUMBERS: 220 descriptors against macOS's launchd
+    /// default of 256. The convenient fixture would be a round "80% of 1000",
+    /// and it is convenient precisely because it lacks the property that made
+    /// the incident — a limit nobody knew was in force.
+    #[test]
+    fn the_emfile_incident_fires_and_the_same_count_at_the_fixed_limit_does_not() {
+        let ceiling = 0.7;
+        let rise = 0.2;
+        let incident = 220.0 / 256.0; // 0.859 — what was actually happening
+        assert_eq!(
+            fd_trigger(incident, 0.0, ceiling, rise),
+            Some("near-limit"),
+            "220/256 must fire: this is the state in which /health went silent"
+        );
+        // THE WHOLE REASON THIS IS A RATIO. The plist fix moved the limit to
+        // 65536; the same 220 descriptors are now unremarkable. A count-based
+        // floor would have to be rechosen by hand every time the limit changes,
+        // and a floor nobody rechooses stops meaning anything silently.
+        assert_eq!(
+            fd_trigger(220.0 / 65536.0, 0.0, ceiling, rise),
+            None,
+            "220/65536 must NOT fire — otherwise the detector nags forever after the fix"
+        );
+    }
+
+    #[test]
+    fn a_leak_is_caught_climbing_before_it_reaches_the_ceiling() {
+        // Well under the ceiling, but gaining 25 ratio-points per hour: at that
+        // rate it is roughly two hours from EMFILE. An absolute ceiling cannot
+        // say anything until it is already too late, which is exactly how the
+        // incident arrived with no warning.
+        assert_eq!(fd_trigger(0.20, 0.25, 0.7, 0.2), Some("climbing"));
+        // A flat fleet at the same level is silent — the detector must not
+        // report that the process is merely RUNNING (the ethos-7 spin-catcher:
+        // a threshold below the baseline is not a detector).
+        assert_eq!(fd_trigger(0.20, 0.0, 0.7, 0.2), None);
+        assert_eq!(fd_trigger(0.69, 0.0, 0.7, 0.2), None, "just under the ceiling, not climbing");
+    }
+
+    /// When both fire, "you are nearly out" beats "you are heading for nearly
+    /// out" — two cards for one condition is how a board stops being read.
+    #[test]
+    fn the_ceiling_wins_over_the_rate_when_both_trigger() {
+        assert_eq!(fd_trigger(0.95, 0.9, 0.7, 0.2), Some("near-limit"));
+    }
+
+    /// The measurement path must work on THIS machine, or the pure logic above
+    /// is being tested in a vacuum. Both are cheap and neither spawns a
+    /// process — which is the point: `lsof` would fail exactly when the fault
+    /// it reports is present.
+    #[test]
+    fn the_descriptor_measurement_works_without_spawning_anything() {
+        let open = open_fd_count().expect("/dev/fd must be readable");
+        let limit = fd_limit().expect("getrlimit(RLIMIT_NOFILE) must answer");
+        assert!(open > 0, "a running test process holds at least stdin/stdout/stderr");
+        assert!(limit > 0, "RLIMIT_NOFILE must be a real limit");
+        assert!(
+            (open as u64) < limit,
+            "a healthy test process is under its own limit ({open}/{limit})"
+        );
     }
 }

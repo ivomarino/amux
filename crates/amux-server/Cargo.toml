@@ -42,6 +42,11 @@ base64.workspace = true
 toml.workspace = true
 futures.workspace = true
 tokio-tungstenite.workspace = true
+# getrlimit(RLIMIT_NOFILE) for the FD-pressure detector (AMUX-2812). The
+# process's OWN limit is the only number that matters — `launchctl limit
+# maxfiles` reports the system default and disagreed with the service's actual
+# limit during the incident.
+libc.workspace = true
 # Runtime (not just dev): the native dictation engine hands the whisper
 # worker its audio via a named temp file, exactly as the Python engine does.
 tempfile.workspace = true

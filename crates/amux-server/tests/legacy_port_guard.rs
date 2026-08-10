@@ -53,6 +53,25 @@ const ALLOW: &[(&str, &str)] = &[
         "crates/amux-server/tests/legacy_port_guard.rs",
         "this guard — it must contain the pattern it searches for",
     ),
+    // -- prose ABOUT the retired port, in code that does not USE it --
+    //
+    // Both of these arrived on main already red (2026-08-10) and made
+    // `cargo test -p amux-server` fail for every lane, which is the shape this
+    // guard is least entitled to have: it polices a real hazard and it caught
+    // two comments. Allowlisted rather than reworded because the sentences are
+    // load-bearing PROVENANCE — each explains why a pre-cutover client still
+    // arrives at 8822, and deleting the number from the explanation is how the
+    // next person re-derives it from scratch.
+    (
+        "crates/amux-server/src/api/static_files.rs",
+        "the PWA install-origin comment: records WHERE the phone installed from, a historical \
+         fact, not an address this code dials",
+    ),
+    (
+        "scripts/git-hooks/amux-staged-guard",
+        "explains why pre-cutover sessions carry AMUX_URL=https://localhost:8822 in their \
+         process env — the hook itself resolves the URL, it does not hardcode one",
+    ),
     // NOTE: crates/amux-cli/tests/url_resolution.rs is deliberately NOT here.
     // It contains `!err.contains(":8822")`, where the quote before the colon
     // means it is not an address — so it needs no exemption. The first draft
