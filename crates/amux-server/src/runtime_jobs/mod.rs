@@ -48,6 +48,7 @@
 //!   3: the honest refusal beats the quiet lie).
 
 pub mod board_drive;
+pub mod commit_nudge;
 pub mod ghost_rescue;
 pub mod pane_size;
 pub mod scheduler;
