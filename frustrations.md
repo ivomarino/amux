@@ -44,27 +44,6 @@ needs rebuilding. No single entry makes that argument, and free-form prose canno
 counted.
 
 ---
-## The `needs:you` tag does not exempt a card from auto-pickup
-AREA: board
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-06
-SESSION: amux-cloud
-CARD: AC-223
-SYMPTOM: A card tagged `needs:you` — the sanctioned way to say "blocked on a human" —
-  was claimed by auto-pickup ~40 min later and handed back as ordinary work.
-  `_pickup_next_board_task` filters on `owner_type` and `archived` and never references
-  `needs:you` or `issue_tags`. Two representations exist (tag vs `status=needsyou`) and
-  only the minority one actually stops dispatch.
-COST: A worker can be handed a card whose owner never made the decision. Hit twice in
-  one session, by two different lanes. Also cost me two cards silently sitting in `todo`
-  while I believed they were parked.
-FIX: b4ea1d0 — the pickup query now excludes cards carrying the tag. Chose that over
-  converting the tag to a status: the status route reclassifies ~142 cards in one
-  migration and surfaces them all in Needs-you at once, while the exclusion exempts
-  exactly 2 currently-dispatchable cards. Measured before shipping, not after. The
-  tag/status split itself is still open — this closed the dispatch hole, not the
-  representation question.
 ## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
 AREA: attribution
 SEVERITY: slows
@@ -82,21 +61,6 @@ COST: Blocked my own push, asked a peer for permission they did not need to give
 FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
   comparison step to identify cherry-picks/rebases before asking about foreign commits.
   Validated by amux-cloud.
-## The co-edit sweep notice named the reporting session, not the commit's author
-AREA: attribution
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-06
-SESSION: amux-cloud
-CARD: AC-230
-SYMPTOM: "Commit 1b743ec by session 'amux-homepage' touched files you also edited" — that
-  commit's own `Amux-Session` trailer reads `amux-cloud`. The notice interpolated the
-  session that POSTED commit-report, which on a shared checkout is routinely not the author.
-COST: The same message ends "Do not report a sha you did not create". Following it
-  literally means disowning your own work; the mirror case is claiming someone else's — on
-  the one subject this fleet has spent the most effort getting right.
-FIX: 6ecc3cb — read the trailer for the sha it was already fetching with `git show`; fall
-  back to the reporter only for untrailered commits, and say so.
 ## A reviewer who BLOCKS a card is re-nudged forever
 AREA: notices
 SEVERITY: annoys
@@ -119,7 +83,7 @@ FIX: e20a112 — the advance loop now checks interaction_log for deliberate revi
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
 SEVERITY: blocks
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-236
@@ -140,6 +104,16 @@ FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` w
   The author editing their own card passes, restores pass, and `force:true` remains the
   logged escape (with the prior value recorded). AC-236 already marked done on the board.
   Validated by amux-cloud.
+
+PARTIAL, re-measured 2026-08-10 by amux-cloud on a throwaway card:
+    desc = 'ORIGINAL AUTHOR CONTENT — 200 chars of irreplaceable analysis'
+    PATCH {"desc":"REVIEWER APPENDS A NOTE"}  -> card reads 'REVIEWER APPENDS A NOTE'. 200 OK.
+  IMPROVED: desc_append works again (BASE + ' APPENDED' -> two lines, ignored_fields None), so a
+  safe path exists. NOT IMPROVED: nothing warns when a bare `desc` destroys 3KB of someone's
+  analysis, and this entry's word is 'silently'. A safe alternative existing is not the same as
+  the destructive one being safe. Reopened as partial rather than deleted, at their request.
+
+
 ## `git add amux-server.py` on a shared checkout ships another session's uncommitted hunk under your message
 AREA: attribution
 SEVERITY: slows
@@ -243,36 +217,6 @@ NOTE: the general shape is a nudge asserting a fact with a shorter shelf life th
   not the code — I selected it with status='todo' and no `deleted IS NULL`, so I picked a
   deleted card. The same missing-predicate mistake in the probe that the guard fixes in the
   product, one layer down, which is the nesting ethos rule 1 describes.
-## Editing amux-server.py silently disables the guard that protects amux-server.py commits
-AREA: git
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-06
-SESSION: amux-cloud
-CARD: AC-261
-SYMPTOM: `_has_cotenants` in the generated staged-guard hook does `except Exception:
-  return False`. When the amux server is unreachable the co-tenant check is skipped and
-  nothing is printed — output identical to "checked, you have no co-tenants". The server
-  re-execs on every save of `amux-server.py`, so editing that file is itself what makes the
-  server briefly unreachable. The file where a co-edit sweep is most likely on this shared
-  checkout is the one whose editing turns off the check for it.
-COST: `b1c3e93` swept ~93 lines of another session's uncommitted work (their
-  `_inherited_instruction_files` and memory-inherited handler) into my commit under my
-  message and my `Amux-Session` trailer, with no warning shown. Not recoverable by rewrite:
-  `git reset --soft HEAD~1` is the right tool and the shared-checkout guard correctly
-  refuses it, because moving shared HEAD decapitates other sessions' commits. So the peer
-  gets a disclosure and a misattributed commit instead of a clean history.
-FIX: `5865401` — the skip now announces itself, naming what was not checked and what to run
-  instead. Fail-open preserved deliberately: blocking every lane when the server is down is
-  worse than missing a warning. The change is visibility, not behaviour.
-NOTE: the AC-241 numstat was already on screen when I did this. It printed "114 insertions"
-  against an edit I knew was ~20 lines and I committed anyway. That is the argument for why
-  the fix here is a SKIP NOTICE rather than a better number: a figure the reader has learned
-  to skim does not become informative by being correct. What was missing was not a more
-  accurate measurement but a statement that the measurement had not been taken. Same family
-  as the ethos rule-4 point that a skip leaving no trace is indistinguishable from a scan
-  that found nothing — and this is the third entry today whose root is that a signal could
-  not distinguish two sessions or two states (see AC-256).
 ## Assignment notices arrive for cards that were deleted a second after being created
 AREA: notices
 SEVERITY: slows
@@ -315,7 +259,7 @@ REOPENED 2026-08-09 by amux-frustrations on COUNTER-EVIDENCE from amux-cloud, th
 ## `amux send` fell back to raw tmux and the message never arrived
 AREA: cli
 SEVERITY: slows
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-07
 SESSION: amux-cloud
 CARD: AC-174
@@ -337,6 +281,14 @@ FIX: Credit where due: the warning is exactly right — it names the degradation
   keystroke injection is least likely to survive and most expensive to lose. Failing that,
   verify-after-inject (grep the recipient's history for a nonce) so the CLI itself reports the
   loss rather than leaving the sender to discover it.
+
+REFUSED A THIRD TIME 2026-08-10 by amux-cloud — now MEASURED, not 'unproven'. During the
+  python cutover the fallback lost TWO long messages to amux. They verified the loss rather
+  than assuming it: peeked 1261 lines of amux's history, twice, and none of their content was
+  there; they routed it through a board card instead. The retry code exists and messages are
+  still being lost. Flipped fixed -> open on that evidence.
+
+
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
@@ -1176,7 +1128,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-09
 SESSION: no-silent-actions agent (subagent; no $AMUX_SESSION in env)
-CARD: none (agent has no session identity to attribute a card; parent should file — see report)
+CARD: ARE-5
 SYMPTOM: three consecutive runs of `npx playwright test --config e2e/playwright.config.ts`
 on the same working tree: run 1 = 83 passed / 0 failed; run 2 = 12 failed; run 3 =
 5 failed, all in phase0 auth ("protected API rejects a bad bearer token" expected
@@ -1200,7 +1152,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-08-09
 SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
-CARD: none (agent has no session identity to attribute a card; parent should file — see report)
+CARD: ARE-6
 SYMPTOM: peek stopped wrapping. Measured on #peek-body against a 220-col lane:
 scrollWidth 4196px vs clientWidth 1416px at 1440px desktop (2780px of every line
 unreachable without horizontal panning), and 4196 vs 366 at 390px phone — about 9%
@@ -1252,7 +1204,7 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-09
 SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
-CARD: none (agent has no session identity to attribute a card; parent should file — see report)
+CARD: ARE-7
 SYMPTOM: #peek-agent-nav (the ⌂/▲/▼ strip), agentNav(), the clickable .peek-agent-row
 rows and the rust `agent-nav` verb are all present and byte-identical to the python
 original — nothing was lost in the SPA extraction. The strip is gated on a VISIBLE
@@ -1692,7 +1644,7 @@ SEVERITY: annoys
 STATUS: fixed
 DATE: 2026-08-09
 SESSION: rust-rebuild (RR-0109/0110 lane)
-CARD: none — fixed in the same change that introduced the verbs; logging it because
+CARD: ARE-9
   every OTHER verb in crates/amux-cli/src/main.rs still has it
 SYMPTOM: `amux-rs why schedule SCHED-30` emits 220 lines for a schedule with 3,303
   recorded runs. Piped into `head -3` it printed the first lines and then exited
@@ -1719,7 +1671,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-09
 SESSION: rust-rebuild (RR-0109/0110 lane)
-CARD: none — needs one; the mechanism is fleet-wide, not this lane's
+CARD: ARE-10
 SYMPTOM: I created `crates/amux-server/migrations/0013_search.sql` at 22:16:42 EDT and
   never installed or restarted anything. At 22:18:23 EDT the migration was applied to
   `~/.amux/amux.db` — the live 269MB database — creating 2 tables, 24 triggers and
@@ -2086,31 +2038,6 @@ FIX: Capture stderr to a FILE and leave stdout on the pipe
   a known-broken and a known-fixed artifact, the probe is the candidate before the
   conclusion is. This is the "loud wrong probe" from ethos rule 7 — it answered,
   and its answer was agreeable.
-
-## `amux board progress` printed "progress noted" and wrote nothing, for weeks
-AREA: board
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux-rust
-CARD: AC-323
-SYMPTOM: Wrote an outcome note to AMUX-2653, then to AMUX-2672. Both printed
-  "AMUX-xxxx — progress noted", exit 0. Re-reading the cards minutes later:
-  AMUX-2653 still showed only its original 209-char text and AMUX-2672's desc was
-  empty. The rust cutover dropped `desc_append`; the server correctly named it in
-  `ignored_fields`, but the CLI only checked that the reply contained an `id` and
-  hid the rest behind `2>/dev/null`.
-COST: Two outcome records lost outright, and every progress note fleet-wide since
-  the cutover — silently. Worse than the lost text: this is the verb CLAUDE.md
-  tells sessions to use to record an outcome BEFORE a gate transition, precisely
-  because a gate-blocked PATCH discards the desc. So the sanctioned mitigation for
-  losing your outcome text WAS losing your outcome text.
-FIX: d0b2150 — server implements desc_append at python parity; CLI confirms at the
-  FIELD (reads ignored_fields, exits 1, names the destructive {"desc":...} retry
-  it must not reach for). The general shape is ethos rule 6: the mechanism that
-  would have made this visible already existed and was unread. `ignored_fields`
-  is only worth having if callers are made to look at it — consider whether any
-  other caller in the tree ignores it too.
 
 ## Five finished cards sat in `todo` and kept being auto-picked
 AREA: board
