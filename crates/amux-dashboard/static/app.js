@@ -57,6 +57,9 @@ async function toggleAutoCompact(checked) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ key: 'auto_compact_enabled', value: checked ? '1' : '0' })
   });
+  // No-silent-actions: the checkbox flips natively even when the save fails,
+  // so say the save happened (same idiom as toggleAutotask below).
+  showToast(checked ? 'Auto-compact on' : 'Auto-compact off');
 }
 async function toggleAutotask(checked) {
   await fetch('/api/prefs', {
@@ -83,6 +86,7 @@ async function toggleAutoResume(checked) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ key: 'auto_resume_summary', value: checked ? '1' : '0' })
   });
+  showToast(checked ? 'Resume summaries on' : 'Resume summaries off');  // no-silent-actions
 }
 (async function initAutoResume() {
   try {
@@ -4213,7 +4217,9 @@ function cloneSession(session) {
 
 async function newConversation(session) {
   closeAllMenus();
-  if (!await showConfirm('Start a fresh conversation for "' + worker + '"?\n\nThe next time you start this worker, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
+  // was `worker` — undefined here, so the click died as an invisible rejected
+  // promise (the exact bug class this gate exists for; caught by no-undef)
+  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\nThe next time you start this worker, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
   await apiCall(API + '/api/sessions/' + session + '/config', {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ new_conversation: true })
@@ -6609,7 +6615,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.541';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.543';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9791,7 +9797,7 @@ async function _voiceStart() {
         },
         systemInstruction: { parts: [{ text:
           'You are a voice assistant for amux, a terminal multiplexer. '
-          + 'The user is interacting with worker "' + worker + '". '
+          + 'The user is interacting with worker "' + session + '". '  // was `worker` (undefined): ReferenceError in onopen silently killed the voice setup message
           + 'You can send commands or messages to their terminal worker using the send_to_session tool. '
           + 'Keep responses concise and conversational. '
           + 'Here is recent worker output for context:\\n' + recentOutput.replace(/"/g, '\\"').slice(0, 1500)
@@ -14665,7 +14671,7 @@ function _pasteTextInto(target) {
     target.selectionStart = target.selectionEnd = s + text.length;
     target.dispatchEvent(new Event('input', { bubbles: true }));
     if (typeof autoGrow === 'function') autoGrow(target);
-  }).catch(() => {});
+  }).catch(() => showToast('Paste failed — clipboard blocked?'));  // user action: never fail silently
 }
 function _pwaCb(e) {
   if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return false;
@@ -14689,7 +14695,8 @@ function _pwaCb(e) {
       const sel = inp.value.slice(inp.selectionStart, inp.selectionEnd);
       if (sel) {
         e.preventDefault();
-        navigator.clipboard.writeText(sel).catch(() => {});
+        // Copy is a user action: confirm it, and surface a clipboard denial
+        navigator.clipboard.writeText(sel).then(() => showToast('Copied'), () => showToast('Copy failed'));
         if (k === 'x') {
           const s = inp.selectionStart, en = inp.selectionEnd;
           inp.value = inp.value.slice(0, s) + inp.value.slice(en);
@@ -14705,7 +14712,7 @@ function _pwaCb(e) {
       const sel = window.getSelection()?.toString();
       if (sel) {
         e.preventDefault();
-        navigator.clipboard.writeText(sel).catch(() => {});
+        navigator.clipboard.writeText(sel).then(() => showToast('Copied'), () => showToast('Copy failed'));
         return true;
       }
     }
@@ -18513,6 +18520,9 @@ async function _togglePin(id) {
   if (!item) return;
   const newVal = item.pinned ? 0 : 1;
   item.pinned = newVal; // optimistic update
+  // Repaint NOW — the optimistic write only mutated the model, so without this
+  // the pin icon didn't change until the next poll/SSE refresh (silent action).
+  renderBoard();
   await apiCall(API + '/api/board/' + id, {
     method: 'PATCH', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ pinned: newVal }),
@@ -20532,7 +20542,7 @@ async function loadTunnelSettings() {
   }
 }
 function _tunnelCopyURL(btn, url) {
-  navigator.clipboard.writeText(url).then(() => { const t = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = t, 1200); }).catch(() => {});
+  navigator.clipboard.writeText(url).then(() => { const t = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = t, 1200); }).catch(() => showToast('Copy failed'));
 }
 async function _tunnelSettingsStart(btn) {
   btn.disabled = true; btn.textContent = 'Starting…';
@@ -20549,7 +20559,7 @@ async function _tunnelSettingsStop(btn) {
 function _tunnelCopy(btn, url) {
   navigator.clipboard.writeText(url).then(() => {
     const t = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = t, 1200);
-  }).catch(() => {});
+  }).catch(() => showToast('Copy failed'));  // user action: surface clipboard denial
 }
 async function _tunnelStartUI(box) {
   const btn = box.querySelector('#tun-toggle'); if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
@@ -21158,7 +21168,9 @@ function _wsTermSetupHandlers(pid) {
     fetch(API + '/api/terminal/' + p.ptyId + '/input', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: btoa(unescape(encodeURIComponent(d))) }),
-    }).catch(() => {});
+      // Dropped keystrokes into a live-looking pane are the worst silent
+      // failure; the toast self-replaces so repeats can't storm.
+    }).catch(() => showToast('Terminal input failed'));
   });
   p.term.onResize(({ cols, rows }) => {
     if (!p.ptyId) return;
@@ -21289,7 +21301,9 @@ function wsTermSendTmux(pid) {
   fetch(API + '/api/terminal/' + p.ptyId + '/input', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ data: btoa(unescape(encodeURIComponent(cmd))) }),
-  }).catch(() => {});
+    // /api/terminal is outbox-skipped, so this catch is REAL — a swallowed one
+    // left the button doing visibly nothing (silent-dead-handler class).
+  }).catch(() => showToast('Terminal input failed'));
   if (p.term) p.term.focus();
 }
 
@@ -21297,7 +21311,7 @@ function wsRemoveTermPane(pid) {
   const p = _wsTerm[pid];
   if (!p || !_grid) return;
   if (p.poll) { clearTimeout(p.poll); p.poll = null; }
-  if (p.ptyId) { fetch(API + '/api/terminal/' + p.ptyId, { method: 'DELETE' }).catch(() => {}); p.ptyId = null; }
+  if (p.ptyId) { fetch(API + '/api/terminal/' + p.ptyId, { method: 'DELETE' }).catch(() => showToast('Pane closed, but its server shell may still be running')); p.ptyId = null; }
   if (p.term) { try { p.term.dispose(); } catch(e) {} p.term = null; }
   _wsTermSavePtyId(pid, null);
   try { _grid.removeWidget(p.widget); } catch(e) {}
@@ -23051,7 +23065,13 @@ async function saveAlertConfig() {
     sms: !!document.getElementById('alert-sms-cb')?.checked,
     phone: document.getElementById('alert-phone')?.value || '',
   };
-  try { await fetch(API + '/api/alert/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); } catch(e) {}
+  // No-silent-actions: this fires from Settings toggles/phone field — both the
+  // save and a failure must be visible, not swallowed (was an empty catch).
+  try {
+    const r = await fetch(API + '/api/alert/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (r && !r.ok) { showToast('Failed to save alert settings (' + r.status + ')'); return; }
+    showToast('Alert settings saved');
+  } catch(e) { showToast('Failed to save alert settings'); }
 }
 async function sendTestAlert(btn) {
   const st = document.getElementById('alert-test-status'); if (st) st.textContent = 'Sending…';
@@ -23376,7 +23396,10 @@ async function loadTeamSection() {
 }
 
 async function deleteInvite(token) {
-  await fetch('/api/org/invites/' + token, {method: 'DELETE'}).catch(() => {});
+  // Confirm at the response, not on faith — the old swallowed catch toasted
+  // "Invite revoked" even when the DELETE never landed.
+  const r = await fetch('/api/org/invites/' + token, {method: 'DELETE'}).catch(() => null);
+  if (!r || !r.ok) { showToast('Failed to revoke invite'); return; }
   showToast('Invite revoked');
   loadTeamSection();
 }
@@ -25514,7 +25537,9 @@ async function _termConnect() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: btoa(unescape(encodeURIComponent(data))) }),
-    }).catch(() => {});
+      // /api/terminal is outbox-skipped: a failure here means typed keys were
+      // dropped into a live-looking terminal — never swallow that.
+    }).catch(() => showToast('Terminal input failed'));
   });
 
   // Handle resize — debounce to avoid flooding the server during drag/animation
@@ -25564,7 +25589,8 @@ async function _termConnect() {
 function _termDisconnect() {
   if (_termPoll) { clearTimeout(_termPoll); _termPoll = null; }
   if (_termId) {
-    fetch(API + '/api/terminal/' + _termId, { method: 'DELETE' }).catch(() => {});
+    fetch(API + '/api/terminal/' + _termId, { method: 'DELETE' })
+      .catch(() => showToast('Disconnected locally, but the server shell may still be running'));
     _termId = null;
   }
   if (_term) {

@@ -68,10 +68,17 @@ pub async fn require_bearer(
     // tools). ConnectInfo is only present when the server was started with
     // into_make_service_with_connect_info (lib.rs does); absence — e.g. in
     // router-level tests — errs toward REQUIRING the token.
-    if req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ci| ci.0.ip().is_loopback())
+    //
+    // AMUX_RS_NO_LOOPBACK_BYPASS=1 disables it, for e2e that must exercise
+    // the TOKEN path: a browser test necessarily connects over loopback, so
+    // without this knob "reject a bad token" is a check that cannot pass
+    // (e2e/phase0.spec.ts asserted 401 and was reported as an auth
+    // regression, 2026-08-09 — the code was right, the check was unrunnable).
+    if !std::env::var("AMUX_RS_NO_LOOPBACK_BYPASS").is_ok_and(|v| v == "1")
+        && req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ci| ci.0.ip().is_loopback())
     {
         return next.run(req).await;
     }

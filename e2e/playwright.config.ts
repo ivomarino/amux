@@ -36,6 +36,11 @@ export default defineConfig({
     env: {
       AMUX_HOME: home,
       AMUX_RS_PORT: String(PORT),
+      // A browser test necessarily connects over loopback, which the server
+      // deliberately auth-bypasses (Python parity). Without this, every
+      // "rejects a bad token" assertion is a check that cannot pass — it was
+      // read as an auth regression on 2026-08-09 when the code was correct.
+      AMUX_RS_NO_LOOPBACK_BYPASS: '1',
     },
   },
 });
