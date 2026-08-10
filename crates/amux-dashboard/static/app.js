@@ -6766,7 +6766,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.564';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.565';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14902,7 +14902,22 @@ async function _peekLookupSelection() {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ text, session: peekSession })
     });
-    const d = await r.json();
+    // NEVER call r.json() unconditionally. /api/lookup was never ported from
+    // python, so nothing was mounted at that path and the GET-only SPA
+    // catch-all answered this POST with 405 and a ZERO-BYTE body. r.json()
+    // then threw "Unexpected end of JSON input" — a parser error naming
+    // neither the path nor the status, which sent the reader at the client
+    // instead of at a missing route.
+    const raw = await r.text();
+    let d = null;
+    try { d = raw ? JSON.parse(raw) : null; } catch (_) { /* handled next */ }
+    if (!d) {
+      const detail = raw ? raw.slice(0, 200) : '(empty body)';
+      _peekShowLookupModal(
+        text, 'Lookup failed: HTTP ' + r.status + ' from /api/lookup — ' + detail, false);
+      amuxTrack('lookup_non_json', { status: r.status, bytes: raw.length });
+      return;
+    }
     if (d.error) {
       _peekShowLookupModal(text, 'Error: ' + d.error, false);
     } else {
@@ -14910,6 +14925,7 @@ async function _peekLookupSelection() {
     }
   } catch (e) {
     _peekShowLookupModal(text, 'Lookup failed: ' + e.message, false);
+      amuxTrack('lookup_failed', { err: String(e).slice(0, 200) });
   }
 }
 function _peekShowLookupModal(query, result, loading) {

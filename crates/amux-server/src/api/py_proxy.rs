@@ -112,6 +112,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
+    ("/api/lookup", "explain-selection helper (peek view)"),
     // ---- Mounted in mod.rs but never declared here, so
     // `every_mounted_api_family_is_claimed_by_the_registry` was RED on main and
     // CI could not go green for anyone. Native like everything else:
