@@ -163,7 +163,7 @@ impl EnvFile {
         Self { pairs }
     }
 
-    fn get(&self, key: &str) -> Option<&str> {
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
         self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
     fn get_or<'a>(&'a self, key: &str, default: &'a str) -> &'a str {
@@ -208,7 +208,7 @@ impl EnvFile {
     }
 }
 
-fn parse_env(name: &str) -> EnvFile {
+pub(crate) fn parse_env(name: &str) -> EnvFile {
     EnvFile::load(&env_path(name))
 }
 
@@ -820,6 +820,41 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return "idle".into();
     }
     String::new()
+}
+
+/// Is the lane mid-turn according to its STATUS BAR — the only place that
+/// string is a status rather than a word?
+///
+/// py:25650 tests `"esc to interrupt" in tmux_capture(name, 12)`, i.e. a
+/// substring match over the whole pane. That is a content-dependent, permanent
+/// self-block, and it cost amux-rust four hours on 2026-08-09: the lane was
+/// genuinely idle (composer empty, status bar `⏵⏵ bypass permissions on
+/// (shift+tab to cycle) · ← 2 agents`, self-report `idle`), but lines 26-27 of
+/// its own pane were prose it had just written ABOUT the string —
+/// `Workers with "bypass permissions on" + "esc to interrupt" on the status bar
+/// were misdetected as IDLE`. Every steering delivery therefore refused with
+/// "session started generating", the tick took one row per lane oldest-first
+/// and stopped, and 10 messages sat queued for up to 229 minutes. The lane most
+/// likely to hit this is the one working on the terminal-scraping code, which
+/// is exactly the lane it hit.
+///
+/// So: look only at the bottom 3 non-blank lines. That also fixes the inverse
+/// (17c5a3c's bug, still live in `detect_claude_status`): a bypass bar that
+/// CONTAINS "esc to interrupt" is ACTIVE, and the bottom-up scan reads it as
+/// idle because a `❯` is present.
+///
+/// This is a scraper reading a rendered UI, so it is D1 debt either way — the
+/// durable answer is the lane's own reported state, which `steer_lane_at_boundary`
+/// already prefers. This narrows the fallback's blast radius; it does not make
+/// the fallback good.
+pub(crate) fn pane_bar_says_generating(raw_output: &str) -> bool {
+    let clean = strip_ansi(raw_output);
+    let nonblank: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    nonblank
+        .iter()
+        .rev()
+        .take(3)
+        .any(|l| l.to_lowercase().contains("esc to interrupt"))
 }
 
 /// py:18676 _clean_gemini_frame — keep only the LAST instance of each chrome
@@ -1756,7 +1791,7 @@ async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &st
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
 /// Dedup-on-enqueue: identical text (or same guard) replaces, never stacks.
-async fn steer_enqueue(state: &AppState, name: &str, text: &str, guard: &str) -> String {
+pub(crate) async fn steer_enqueue(state: &AppState, name: &str, text: &str, guard: &str) -> String {
     let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
     let id = msg_id.clone();
     let session = name.to_string();
@@ -1864,7 +1899,7 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
     Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
 }
 
-async fn is_running(name: &str) -> bool {
+pub(crate) async fn is_running(name: &str) -> bool {
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
         return false;
@@ -1910,7 +1945,7 @@ async fn is_running(name: &str) -> bool {
 // this gate is what keeps it honest until the protocol takes over.
 // ---------------------------------------------------------------------------
 
-fn at_picker_text(text: &str) -> bool {
+pub(crate) fn at_picker_text(text: &str) -> bool {
     // py:25538 _AT_PICKER_RE = r'(?:^|\s)@\S' — an @ that STARTS a token, plus
     // a leading slash. NOT `contains('@')`: that also matches emails
     // (mhoward@lucihub.com) and backticked `@backend` mentions, which
@@ -1922,30 +1957,166 @@ fn at_picker_text(text: &str) -> bool {
     re.is_match(text) || text.trim_start().starts_with('/')
 }
 
-/// Unsubmitted text sitting in Claude Code's input box, or None when no input
-/// prompt is visible (py:25349 `_pending_input`).
+// py:25349 `_pending_input` has NO rust counterpart on purpose. It returned a
+// String and could not say WHICH KIND of text it found, which is the whole
+// defect below; `composer_state` replaces it so there is exactly one way to
+// read the composer and it requires the raw capture. The box-unwrapping python
+// did (the ❯ line alone is not the whole message when it hard-wraps at the pane
+// width — the "random" ghost, 2026-07-10) is preserved inside it.
+/// What Claude Code's composer is showing, and — the part that matters —
+/// whether pressing Enter would submit anything.
 ///
-/// The box hard-wraps long text, so the ❯ line alone is NOT the whole pending
-/// message — collect its continuation lines down to the box's bottom border /
-/// status bar. Returned space-stripped, matching `verify_submitted`'s
-/// space-insensitive comparison. (Checking only the ❯ line is how a wrapped
-/// message's tail escaped verification and got dequeued as 'sent' while still
-/// sitting in the box — the "random" ghost, 2026-07-10.)
-pub(crate) fn pending_input(clean: &str) -> Option<String> {
-    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let idx = lines.iter().rposition(|l| {
-        matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}'))
-    })?;
-    let mut buf: Vec<String> =
-        vec![lines[idx].trim().trim_start_matches(['\u{276f}', '\u{203a}', ' ', '\u{a0}', '\t']).to_string()];
-    for l in &lines[idx + 1..] {
-        let s = l.trim();
-        if matches!(s.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
+/// THIS IS THE STATE CHECK THAT WAS MISSING (2026-08-09, second finding).
+/// `_pending_input` (py:25349) strips ANSI and then reads the ❯ line, which
+/// makes Claude Code's DIM SUGGESTION indistinguishable from text a person or
+/// amux actually typed. Both render as `❯ <words>` once the escapes are gone.
+/// They are not the same thing at all: Enter submits typed text and is a
+/// NO-OP on a suggestion (measured directly — Escape+Enter on a `Try "fix lint
+/// errors"` placeholder submitted nothing).
+///
+/// That single conflation produced a fleet-wide false positive: a scan reported
+/// 13 lanes "holding unsubmitted text for hours" (`backend` "continue with the
+/// queue", `ethan-dev` "push it", `mvs-infra` "Run the MVS prod health loop per
+/// the runbook", …). All 13 composers were EMPTY. Someone then pressed Enter,
+/// C-m and Escape+Enter on them and reported that none worked — correctly, and
+/// for a reason nobody could see: there was nothing to submit. The next step
+/// after that would have been submitting 13 stale instructions into live lanes.
+///
+/// The discriminator is in the bytes tmux already gives us and the ANSI strip
+/// was throwing away: **SGR 2 (dim)**. Verified in both directions on a live
+/// pane —
+///
+/// ```text
+/// placeholder: "\x1b[39m❯\u{a0}\x1b[2mTry \"fix lint errors\"\x1b[0m"
+/// real input:  "\x1b[39m❯\u{a0}[10:20 PM] look at @/Users/…/README.md please"
+/// ```
+///
+/// — and real input never uses dim: plain words, an `@`-mention and a >400-char
+/// paste all render undimmed, and a slash command is COLOURED (38;5;153), not
+/// dimmed. So: text is real if and only if some of it is not dim.
+///
+/// Callers must pass the RAW capture (`capture-pane -e`). Passing a
+/// pre-stripped frame silently re-creates the bug, which is why this takes
+/// `raw_frame` and does its own stripping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposerState {
+    /// No ❯ composer drawn — cold boot, a non-Claude frame, or a full-screen
+    /// view. NOT "submitted" and NOT "empty" (AC-271).
+    NotVisible,
+    /// Composer drawn and holding nothing.
+    Empty,
+    /// Composer drawn and empty, showing Claude Code's dim suggestion. Enter
+    /// here does nothing; there is nothing stuck.
+    Placeholder(String),
+    /// Real pending input. Enter would submit this.
+    Typed(String),
+    /// The background-conversation manager (`←`) is open over the lane. Its
+    /// composer is NOT the lane's — keystrokes sent now compose a NEW task
+    /// instead of a message to this session. A send must refuse, not type.
+    BackgroundManager,
+}
+
+impl ComposerState {
+    /// The text a caller may act on: real input only.
+    pub(crate) fn typed(&self) -> Option<&str> {
+        match self {
+            ComposerState::Typed(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// True while SGR 2 is in effect at each character. Per line: tmux's `-e`
+/// output re-emits the attribute context at the start of every line, and the
+/// composer's own placeholder closes with `\x1b[0m` on the same line.
+fn dim_mask(line: &str) -> (String, String) {
+    let (mut plain, mut dim) = (String::new(), String::new());
+    let mut is_dim = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Consume the escape sequence; only SGR (`[ … m`) affects dimness.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut body = String::new();
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        if c2 == 'm' {
+                            for code in body.split(';') {
+                                match code.trim() {
+                                    "2" => is_dim = true,
+                                    "0" | "" | "22" => is_dim = false,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    body.push(c2);
+                }
+            } else {
+                // OSC / charset / other: skip to its terminator.
+                for c2 in chars.by_ref() {
+                    if c2 == '\u{7}' || c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if is_dim {
+            dim.push(c);
+        } else {
+            plain.push(c);
+        }
+    }
+    (plain, dim)
+}
+
+pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
+    let clean = strip_ansi(raw_frame);
+    // The manager view owns the keyboard: its own status bar says so. Positive
+    // match on the chrome Claude Code prints, not on a timer or an absence.
+    if clean.contains("Your conversation moved to the background")
+        || (clean.contains("enter to collapse") && clean.contains("ctrl+x to delete all"))
+    {
+        return ComposerState::BackgroundManager;
+    }
+    // Work on RAW lines so the dim attribute survives; index by the stripped
+    // form so the ❯ scan is unchanged from python.
+    let raw_lines: Vec<&str> = raw_frame.lines().filter(|l| !strip_ansi(l).trim().is_empty()).collect();
+    let stripped: Vec<String> = raw_lines.iter().map(|l| strip_ansi(l)).collect();
+    let Some(idx) = stripped
+        .iter()
+        .rposition(|l| matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}')))
+    else {
+        return ComposerState::NotVisible;
+    };
+    let mut block: Vec<&str> = vec![raw_lines[idx]];
+    for (i, s) in stripped.iter().enumerate().skip(idx + 1) {
+        let t = s.trim();
+        if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}')) {
             break;
         }
-        buf.push(s.to_string());
+        block.push(raw_lines[i]);
     }
-    Some(buf.iter().flat_map(|b| b.split_whitespace()).collect::<String>())
+    let (mut plain, mut dim) = (String::new(), String::new());
+    for (n, l) in block.iter().enumerate() {
+        let (mut p, d) = dim_mask(l);
+        if n == 0 {
+            // Drop the prompt glyph itself; it is chrome, never content.
+            p = p.trim_start().trim_start_matches(['\u{276f}', '\u{203a}', ' ', '\u{a0}', '\t']).to_string();
+        }
+        plain.extend(p.split_whitespace());
+        dim.extend(d.split_whitespace());
+    }
+    if !plain.is_empty() {
+        ComposerState::Typed(plain)
+    } else if !dim.is_empty() {
+        ComposerState::Placeholder(dim)
+    } else {
+        ComposerState::Empty
+    }
 }
 
 /// Durable submission evidence (py:25373 `_jsonl_user_msg_since`): true if
@@ -2017,15 +2188,17 @@ pub(crate) enum FrameRead {
 }
 
 pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
-    let clean = strip_ansi(raw);
-    let pend = pending_input(&clean);
-    let has_prompt = clean
-        .lines()
-        .any(|l| matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}')));
-    if pend.is_none() && !has_prompt {
+    let state = composer_state(raw);
+    // No composer, or a composer that is not this lane's (the background
+    // manager): we cannot read our own message back, so we assert nothing.
+    if matches!(state, ComposerState::NotVisible | ComposerState::BackgroundManager) {
         return FrameRead::NoUi;
     }
-    let still_there = pend.as_deref().map(|p| p.contains(tail_sq)).unwrap_or(false);
+    // Only REAL input counts as "still there". A dim suggestion that happens to
+    // repeat our text is not our message sitting unsent — and treating it as
+    // one would make the verifier press Escape+Enter and re-submit a message
+    // that already landed.
+    let still_there = state.typed().map(|p| p.contains(tail_sq)).unwrap_or(false);
     if !still_there {
         return FrameRead::Cleared;
     }
@@ -2309,11 +2482,14 @@ pub(crate) fn lane_has_protocol_path(state: &AppState, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Lanes whose ONLY delivery channel is keystrokes: registered, not archived,
-/// tmux-hosted, and with no structured-protocol session. This is the set the
-/// ghost-rescue sweep may act on — and the set that shrinks to nothing when
-/// interactive lanes become protocol-driven, which is that job's exit.
-pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
+/// Every registered, non-archived lane, whatever backend hosts it.
+///
+/// ONE enumeration for the whole process: `keystroke_lanes` below is a FILTERED
+/// view of this, and the board-drive sweep takes it unfiltered. Two independent
+/// dir-walks would be two predicates that drift, and a lane visible to one loop
+/// and invisible to the other is precisely how a fleet-wide job silently stops
+/// covering part of the fleet.
+pub(crate) fn all_lane_names() -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(sessions_dir()) else { return vec![] };
     let mut names: Vec<String> = rd
         .flatten()
@@ -2322,10 +2498,19 @@ pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
         .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
         .collect();
     names.sort();
+    names.retain(|n| parse_env(n).get("CC_ARCHIVED") != Some("1"));
+    names
+}
+
+/// Lanes whose ONLY delivery channel is keystrokes: registered, not archived,
+/// tmux-hosted, and with no structured-protocol session. This is the set the
+/// ghost-rescue sweep may act on — and the set that shrinks to nothing when
+/// interactive lanes become protocol-driven, which is that job's exit.
+pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
+    let mut names = all_lane_names();
     names.retain(|n| {
         let cfg = parse_env(n);
-        cfg.get("CC_ARCHIVED") != Some("1")
-            && iterm2_id(&cfg).is_empty()
+        iterm2_id(&cfg).is_empty()
             && backend_of_cfg(&cfg) == "tmux"
             && !lane_has_protocol_path(state, n)
     });
@@ -2384,6 +2569,19 @@ async fn send_text_inner(
     let out_st = tmux_capture(name, 15).await;
     if !out_st.is_empty() && at_resume_picker(&strip_ansi(&out_st)) {
         return (false, "session is in resume picker".into());
+    }
+    // The background-conversation manager (opened with `←`) draws its OWN
+    // composer over the lane, and it starts a NEW task rather than messaging
+    // this session — so typing here silently addresses the wrong thing. Same
+    // shape as the resume-picker guard above: refuse, and name the key that
+    // clears it, rather than pressing something on the user's behalf.
+    if !out_st.is_empty() && composer_state(&out_st) == ComposerState::BackgroundManager {
+        return (
+            false,
+            "session is in the background-conversation view (its composer starts a new task, \
+             not a message to this session) — press esc or enter in the pane to collapse it"
+                .into(),
+        );
     }
     let mut needs_wake = false;
     if !out_st.is_empty() && at_shell_prompt(&strip_ansi(&out_st)) {
@@ -2473,9 +2671,11 @@ async fn send_text_inner(
     // (a second "continue" minutes later) must not count as this send.
     let sent_at = now_f64();
     if !generating {
-        // Fresh re-check right before the Escape (py:25597): "esc to
-        // interrupt" in the pane is the reliable generating signal.
-        if tmux_capture(name, 12).await.to_lowercase().contains("esc to interrupt") {
+        // Fresh re-check right before the Escape (py:25597): "esc to interrupt"
+        // in the STATUS BAR is the reliable generating signal. Scoped to the
+        // bar, never the transcript — see `pane_bar_says_generating` for the
+        // four-hour queue freeze the unscoped substring match caused.
+        if pane_bar_says_generating(&tmux_capture(name, 12).await) {
             generating = true;
             if from_steering {
                 return (false, "session started generating — retry at next turn boundary".into());
@@ -4648,7 +4848,7 @@ const STEER_TICK_SECS: u64 = 5;
 /// Fails CLOSED: anything not positively known to be idle returns false. A
 /// message that waits one more 5s tick costs nothing; a message delivered
 /// mid-turn is the bug this whole path exists to prevent.
-async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
+pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
     // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
     let reported: Option<String> = state
         .store
@@ -4699,21 +4899,37 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     if queued.is_empty() {
         return 0;
     }
-    // ONE message per lane per tick, oldest first. Delivering a whole backlog
+    // ONE DELIVERY per lane per tick, oldest first. Delivering a whole backlog
     // into a single turn boundary would concatenate 9 unrelated instructions
     // into one prompt; the next tick takes the next one once the lane is idle
     // again, which is what "delivers at the turn boundary" has to mean to be
     // worth anything.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    //
+    // ONE DELIVERY, NOT ONE ATTEMPT. This used to `continue` to the next LANE
+    // as soon as a row refused, so a single undeliverable row froze its lane's
+    // entire queue — amux-rust, 2026-08-09: its oldest row refused on every
+    // tick for 229 minutes and the nine messages behind it never got a turn.
+    // A queue where one bad row stops all the others is not a queue. So a
+    // refusal now moves to that lane's NEXT row within the same tick, and the
+    // stuck row is retried (it stays queued, ordering preserved for everything
+    // that CAN go) rather than blocking.
+    let mut delivered_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut checked_lane: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut delivered = 0usize;
     for (id, session, text) in queued {
-        if !seen.insert(session.clone()) {
-            continue;
+        if delivered_lanes.contains(&session) {
+            continue; // this lane already got its one delivery this tick
         }
         if !env_path(&session).exists() {
+            skip(&session, &id, "no-env-file");
             continue; // the expiry sweep owns dead lanes, not this loop
         }
-        if !is_running(&session).await {
+        // Per-lane preconditions are evaluated once, not per row.
+        if !checked_lane.insert(session.clone()) {
+            // Already passed the lane gates this tick; fall through to the send.
+        } else if !is_running(&session).await {
+            skip(&session, &id, "not-running");
+            delivered_lanes.insert(session.clone()); // stop walking a dead lane
             continue; // stopped lane: its nudge stays pending, per python
         }
         // THE TURN-BOUNDARY GATE. This has to live HERE, in the caller.
@@ -4726,6 +4942,8 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // like it was sent directly even though this worker was still
         // working"), which defeats the entire point of queueing.
         if !steer_lane_at_boundary(state, &session).await {
+            skip(&session, &id, "not-at-turn-boundary");
+            delivered_lanes.insert(session.clone()); // no row can go while mid-turn
             continue;
         }
         // from_steering=true is still passed: it makes the callee REFUSE rather
@@ -4733,7 +4951,8 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // send, so a lost race leaves the row where it is instead of duplicating.
         let (ok, msg) = send_text_inner(state, &session, &text, false, true).await;
         if !ok {
-            continue;
+            skip(&session, &id, &format!("send-refused: {msg}"));
+            continue; // NEXT ROW for this lane, not the next lane
         }
         // Delivered — move the row to history under the SAME contract the
         // manual deliver path uses (redacted text, queued_at preserved).
@@ -4759,9 +4978,117 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             })
             .await;
         delivered += 1;
+        delivered_lanes.insert(session.clone());
+        steer_skips().lock().unwrap().remove(&session);
         tracing::info!(session = %session, id = %id, detail = %msg, "steering delivered");
     }
+    // A lane whose oldest row keeps refusing must become VISIBLE. Four hours of
+    // silent refusal is the ethos-4 failure in this incident: the skip left no
+    // trace anywhere, so finding it took a hand-written DB read. The age comes
+    // from `queued_at`, so this needs no new state to be true after a restart.
+    warn_on_stalled_lanes(state).await;
     delivered
+}
+
+/// Why each lane's last skipped row was skipped. In-memory and therefore
+/// FICTION ACROSS A RESTART — deliberately: it is a debug surface, and the
+/// durable fact (how long the oldest row has been queued) lives in
+/// `steering_queue.queued_at` where the stall warning reads it from.
+fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, (String, String, f64)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, (String, String, f64)>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn skip(session: &str, id: &str, reason: &str) {
+    tracing::debug!(session = %session, id = %id, reason = %reason, "steering skipped");
+    steer_skips()
+        .lock()
+        .unwrap()
+        .insert(session.to_string(), (id.to_string(), reason.to_string(), now_f64()));
+}
+
+/// Lanes whose oldest queued message is older than this are announced at WARN
+/// with the last refusal reason. 20 minutes is far longer than any legitimate
+/// turn and far shorter than the 229 minutes nobody noticed.
+const STEER_STALL_WARN_S: f64 = 20.0 * 60.0;
+
+async fn warn_on_stalled_lanes(state: &AppState) {
+    let rows: Vec<(String, f64, i64)> = {
+        let Ok(conn) = state.store.read() else { return };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT session, MIN(queued_at), COUNT(*) FROM steering_queue GROUP BY session",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
+    };
+    let now = now_f64();
+    let skips = steer_skips().lock().unwrap().clone();
+    for (session, oldest, count) in rows {
+        let age = now - oldest;
+        if age < STEER_STALL_WARN_S {
+            continue;
+        }
+        let reason = skips
+            .get(&session)
+            .map(|(_, r, _)| r.clone())
+            .unwrap_or_else(|| "unknown (no skip recorded since this process started)".into());
+        tracing::warn!(
+            session = %session,
+            queued = count,
+            oldest_min = (age / 60.0) as i64,
+            reason = %reason,
+            "steering queue STALLED — messages are not reaching this lane"
+        );
+    }
+}
+
+/// GET /api/debug/steering — per-lane queue depth, oldest age, and why the last
+/// skipped row was skipped. Exists because this incident was undiagnosable from
+/// the outside: the tick logged only successes, so a lane that had refused
+/// every 5 seconds for four hours looked exactly like a lane with nothing to do.
+async fn steering_debug(State(state): State<AppState>) -> Response {
+    let rows: Vec<(String, f64, i64)> = {
+        let Ok(conn) = state.store.read() else {
+            return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "store unavailable"}));
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT session, MIN(queued_at), COUNT(*) FROM steering_queue GROUP BY session",
+        ) else {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "query failed"}));
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
+    };
+    let now = now_f64();
+    let skips = steer_skips().lock().unwrap().clone();
+    let lanes: Vec<Value> = rows
+        .into_iter()
+        .map(|(session, oldest, count)| {
+            let (last_id, reason, at) = skips
+                .get(&session)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), String::new(), 0.0));
+            json!({
+                "session": session,
+                "queued": count,
+                "oldest_age_s": (now - oldest) as i64,
+                "stalled": now - oldest >= STEER_STALL_WARN_S,
+                "last_skip_id": last_id,
+                "last_skip_reason": reason,
+                "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
+            })
+        })
+        .collect();
+    j200(json!({
+        "lanes": lanes,
+        "stall_warn_s": STEER_STALL_WARN_S,
+        "note": "last_skip_* is in-memory and resets when the server restarts; queued/oldest_age_s are durable",
+    }))
 }
 
 /// Deliver the oldest queued steering message for ONE specific session.
@@ -4772,29 +5099,50 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
 /// for over 2 hours while the session processed direct user input.
 pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool {
     let session_s = session.to_string();
-    let oldest: Option<(String, String)> = state
+    // OLDEST-FIRST, but walk past a row that refuses (AMUX-2629 head-of-line):
+    // taking only `LIMIT 1` meant one undeliverable message froze the lane's
+    // whole queue, which is how amux-rust accumulated 10 messages over 229
+    // minutes while this function ran on every idle report and did nothing.
+    let rows: Vec<(String, String)> = state
         .store
         .read()
         .ok()
         .and_then(|conn| {
-            conn.query_row(
-                "SELECT id, text FROM steering_queue WHERE session=?1 ORDER BY queued_at ASC LIMIT 1",
-                [&session_s],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+            conn.prepare(
+                "SELECT id, text FROM steering_queue WHERE session=?1 ORDER BY queued_at ASC",
             )
+            .and_then(|mut st| {
+                st.query_map([&session_s], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+            })
             .ok()
-        });
-    let Some((id, text)) = oldest else { return false };
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return false;
+    }
     if !env_path(session).exists() {
         return false;
     }
     if !is_running(session).await {
+        skip(session, "", "not-running");
         return false;
     }
-    let (ok, msg) = send_text_inner(state, session, &text, false, true).await;
-    if !ok {
-        return false;
+    let mut id = String::new();
+    let mut text = String::new();
+    let mut sent = None;
+    for (rid, rtext) in rows {
+        let (ok, msg) = send_text_inner(state, session, &rtext, false, true).await;
+        if ok {
+            id = rid;
+            text = rtext;
+            sent = Some(msg);
+            break;
+        }
+        skip(session, &rid, &format!("send-refused: {msg}"));
     }
+    let Some(msg) = sent else { return false };
+    steer_skips().lock().unwrap().remove(session);
     let (id2, sess2, text2) = (id.clone(), session_s.clone(), text.clone());
     let _ = state
         .store
@@ -4836,6 +5184,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions/{name}", any(session_root_handler))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
+        // Why steering is or is not moving. See `steering_debug`.
+        .route("/api/debug/steering", axum::routing::get(steering_debug))
         // CANONICAL SPELLING, same dispatcher. `/api/sessions/*` is exempt from
         // the alias layer (aliases.rs: the bare list has a dedicated shape
         // handler and the verbs used to proxy to Python), so nothing was
@@ -8960,7 +9310,7 @@ mod submission_gate_tests {
         let frame = format!(
             "\u{276f} an older prompt from the scrollback\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} {GHOST}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{23f5}\u{23f5} bypass permissions on\n"
         );
-        let p = pending_input(&frame).unwrap();
+        let p = composer_state(&frame).typed().unwrap().to_string();
         assert!(p.starts_with("[06:55PM]there"), "{p}");
         assert!(!p.contains("scrollback"), "must not fold in an earlier prompt: {p}");
     }
@@ -8986,5 +9336,216 @@ mod send_retry_reporting_tests {
         assert!(!clean.contains("on retry"));
         let (_, mid) = send_outcome(Submission::Confirmed, true, true);
         assert!(mid.contains("on retry"), "{mid}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The composer-state discriminator (2026-08-09, the SECOND finding on
+// AMUX-2629). Every fixture below is a VERBATIM `tmux capture-pane -e` line
+// from a live pane, kept byte-for-byte rather than paraphrased: the whole
+// defect was that the paraphrase (ANSI stripped) is identical for two states
+// that behave completely differently, so a hand-written fixture would have
+// reproduced the blindness instead of catching it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod composer_state_tests {
+    use super::*;
+
+    /// `backend`, captured 2026-08-09 while it was being reported as "holding
+    /// unsubmitted text for hours". The composer is EMPTY; `continue with the
+    /// queue` is Claude Code's dim suggestion. Three people pressed Enter,
+    /// C-m and Escape+Enter on this exact frame and reported all three as
+    /// failures — correctly, because there was nothing to submit.
+    const LIVE_PLACEHOLDER: &str = "\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500}\u{1b}[38;5;16m\u{1b}[48;5;37m backend \u{1b}[38;5;37m\u{1b}[49m\u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mcontinue with the queue\u{1b}[0m\n\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m  \u{1b}[38;5;211m\u{23f5}\u{23f5} bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) \u{b7} \u{2190} 2 agents\u{1b}[39m\n";
+
+    /// A live pane with text genuinely typed into it and not submitted. Note
+    /// there is no `\x1b[2m` anywhere in the composer body — that absence is
+    /// the entire signal.
+    const LIVE_TYPED: &str = "\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500} probe \u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}[10:20 PM] look at @/Users/ethan/Dev/amux/README.md please\n\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents\n";
+
+    /// A slash command is COLOURED, not dimmed — the near-miss that would
+    /// break a naive "any SGR means chrome" rule.
+    const LIVE_TYPED_SLASH: &str = "\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500} probe \u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[38;5;153m/compact\u{1b}[39m\n\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m  \u{23f5}\u{23f5} bypass permissions on\n";
+
+    const LIVE_EMPTY: &str = "\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500} probe \u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\n\u{1b}[38;5;37m\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m  \u{23f5}\u{23f5} bypass permissions on\n";
+
+    /// The background-conversation manager, opened with `←`. Its composer is
+    /// NOT the lane's: the placeholder literally says "describe a task for a
+    /// new session", and its status bar replaces the normal one.
+    const LIVE_BG_MANAGER: &str = "Your conversation moved to the background \u{2014} enter opens it \u{b7} esc returns to it \u{b7} ctrl+c twice quits\n\nNeeds input\n \u{273b} current session     send a prompt to start\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mdescribe a task for a new session\u{1b}[0m\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} bypass permissions \u{b7} enter to collapse \u{b7} ctrl+x to delete all \u{b7} ? for shortcuts\n";
+
+    #[test]
+    fn a_dim_suggestion_is_not_pending_input() {
+        assert_eq!(
+            composer_state(LIVE_PLACEHOLDER),
+            ComposerState::Placeholder("continuewiththequeue".into())
+        );
+        assert_eq!(composer_state(LIVE_PLACEHOLDER).typed(), None);
+        // The control that proves the discriminator is doing work rather than
+        // rejecting everything: strip the ANSI first — as python did — and the
+        // two states become the same string. This assertion is the bug.
+        let stripped_ph = strip_ansi(LIVE_PLACEHOLDER);
+        let stripped_ty = strip_ansi(LIVE_TYPED);
+        assert!(stripped_ph.contains("\u{276f}\u{a0}continue with the queue"));
+        assert!(stripped_ty.contains("\u{276f}\u{a0}[10:20 PM] look at"));
+        assert_eq!(
+            composer_state(&stripped_ph).typed(),
+            Some("continuewiththequeue"),
+            "a pre-stripped frame re-creates the blindness — callers MUST pass the raw capture"
+        );
+    }
+
+    #[test]
+    fn real_typed_input_is_recognised_including_the_near_misses() {
+        assert_eq!(
+            composer_state(LIVE_TYPED).typed(),
+            Some("[10:20PM]lookat@/Users/ethan/Dev/amux/README.mdplease")
+        );
+        // Coloured, not dim: must still be real input.
+        assert_eq!(composer_state(LIVE_TYPED_SLASH).typed(), Some("/compact"));
+        assert_eq!(composer_state(LIVE_EMPTY), ComposerState::Empty);
+        assert_eq!(composer_state(""), ComposerState::NotVisible);
+    }
+
+    #[test]
+    fn the_background_manager_is_not_this_lanes_composer() {
+        // Typing here composes a NEW task; the send verb must refuse rather
+        // than address the wrong thing. It is NOT reported as Typed even
+        // though the manager draws a ❯ line.
+        assert_eq!(composer_state(LIVE_BG_MANAGER), ComposerState::BackgroundManager);
+        assert_eq!(composer_state(LIVE_BG_MANAGER).typed(), None);
+        assert_eq!(composer_state(LIVE_BG_MANAGER).typed(), None);
+    }
+
+    #[test]
+    fn a_placeholder_can_never_be_mistaken_for_our_unsent_message() {
+        // The duplicate-send hazard: if the verifier read a dim suggestion as
+        // "our text is still in the box", it would press Escape+Enter and
+        // submit the message a second time.
+        let tail: String = "continue with the queue".split_whitespace().collect();
+        assert_eq!(read_frame(LIVE_PLACEHOLDER, &tail), FrameRead::Cleared);
+        // Same words, actually typed → the real stuck state.
+        let typed = LIVE_PLACEHOLDER.replace("\u{1b}[2mcontinue with the queue\u{1b}[0m", "continue with the queue");
+        assert_eq!(read_frame(&typed, &tail), FrameRead::StillThereIdle);
+    }
+
+    #[test]
+    fn the_13_lane_false_positive_is_reproduced_and_fixed() {
+        // Every one of the 13 lanes reported as stuck on 2026-08-09, by the
+        // text their composers showed. All were dim; none had anything to
+        // submit. If this ever reads as Typed again, the fleet-wide false
+        // alarm is back.
+        for text in [
+            "check if AC-294 and AC-295 have been deployed yet",
+            "continue with the queue",
+            "push it",
+            "delete the 5 looping rows",
+            "./tick_runner.sh rb2b",
+            "check on the staging e2e run",
+            "keep working FRUSTRATIONS.md",
+            "go ahead and exercise the guard against ddd",
+            "Run the MVS prod health loop per the runbook",
+            "yeah send them",
+            "what should i do in crested butte today",
+            "give me a real task",
+            "run the MS-1030 read",
+        ] {
+            let frame = LIVE_PLACEHOLDER.replace("continue with the queue", text);
+            assert_eq!(composer_state(&frame).typed(), None, "still reads as stuck: {text:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The four-hour queue freeze (AMUX-2629, third finding). amux-rust sat with 10
+// steering messages queued for up to 229 minutes while every other gate
+// passed: env file present, tmux running, self-report `idle` 198s old, composer
+// EMPTY, status bar `⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents`.
+// The refusal came from the "esc to interrupt" re-check matching the lane's own
+// PROSE about that string, 20+ lines up in the transcript.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod steer_freeze_tests {
+    use super::*;
+
+    /// Verbatim from `tmux capture-pane -p -S -12` on amux-rust, 2026-08-09,
+    /// while it was frozen. Lines 26-27 of the real capture are reproduced
+    /// exactly — they are the agent's own summary of a status-detection fix.
+    const FROZEN_IDLE_PANE: &str = "\
+  Two bugs found and fixed:
+
+  1. Status badge (17c5a3c): Workers with \"bypass permissions on\" + \"esc to interrupt\" on the status
+  bar were misdetected as IDLE. Fixed by checking \"esc to interrupt\" as an active signal before the
+  bottom-up scan.
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} amux-rust \u{2500}\u{2500}
+\u{276f}\u{a0}
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents                    /rc failed
+";
+
+    /// The same lane genuinely mid-turn: the marker is in the STATUS BAR.
+    const REALLY_GENERATING_PANE: &str = "\
+  some transcript text with no marker in it
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} amux-rust \u{2500}\u{2500}
+\u{276f}\u{a0}
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents
+";
+
+    #[test]
+    fn prose_about_esc_to_interrupt_is_not_a_generating_lane() {
+        // THE FREEZE. py:25650 searches the whole pane, so this frame reads as
+        // generating and every steering delivery refuses — forever, because the
+        // text is in the transcript and the transcript does not move while the
+        // lane is idle. The lane most likely to write that string is the one
+        // working on the status-detection code, which is the lane it hit.
+        assert!(
+            !pane_bar_says_generating(FROZEN_IDLE_PANE),
+            "the lane was idle; its own prose must not read as a live turn"
+        );
+        // The control: unscoped substring matching — the pre-fix predicate —
+        // DOES match this frame. Without this the test above could pass on a
+        // function that never returns true.
+        assert!(
+            FROZEN_IDLE_PANE.to_lowercase().contains("esc to interrupt"),
+            "fixture must still contain the string, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_status_bar_marker_is_still_a_generating_lane() {
+        assert!(
+            pane_bar_says_generating(REALLY_GENERATING_PANE),
+            "a bar-scoped check must still catch the real thing"
+        );
+        // And the inverse of 17c5a3c: a bypass bar CONTAINING the marker is
+        // active even though a ❯ is on screen, which `detect_claude_status`
+        // still gets wrong via its bottom-up ❯ fallback.
+        assert_eq!(
+            detect_claude_status(REALLY_GENERATING_PANE),
+            "idle",
+            "documenting the known-wrong reading this helper exists to bypass"
+        );
+    }
+
+    #[test]
+    fn at_shaped_text_is_deliverable_from_steering_when_the_lane_is_idle() {
+        // The competing theory for the freeze was the @-picker guard. It cannot
+        // be: that branch is reached only when the lane is GENERATING, and this
+        // lane was idle. On an idle lane @-text takes the normal path, which
+        // closes the picker with a spaced Escape and then submits — and now
+        // proves it landed. Five of amux-rust's ten queued rows had no @ at all,
+        // which also rules the theory out on the data.
+        let at_text = "[04:39 PM] fix the logo @/Users/ethan/.amux/uploads/b7965e0b2a8f-image.png";
+        assert!(at_picker_text(at_text), "this text does open the picker");
+        assert!(!pane_bar_says_generating(FROZEN_IDLE_PANE), "…but the lane is idle, so the guard is not reached");
+        for plain in [
+            "make sure we have a scroll to the bottom thing i think we have it sometimes",
+            "whwnever this is in the peek or whatever: https://localhost:8824/",
+        ] {
+            assert!(!at_picker_text(plain), "queued row without an @: {plain:?}");
+        }
     }
 }

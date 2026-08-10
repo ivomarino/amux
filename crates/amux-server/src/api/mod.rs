@@ -29,6 +29,7 @@ pub mod layout_presets;
 pub mod map;
 pub mod memories;
 pub mod metrics;
+pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
@@ -36,7 +37,9 @@ pub mod py_proxy;
 pub mod request_log;
 pub mod schedules;
 pub mod scope;
+pub mod search;
 pub mod session_verbs;
+pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
 pub mod skills;
@@ -46,6 +49,7 @@ pub mod sync;
 pub mod torrents;
 pub mod upload;
 pub mod verify;
+pub mod why;
 pub mod workers;
 pub mod workers_deadletters;
 
@@ -83,6 +87,15 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/memories", memories::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())
+        // RR-0110: universal FTS5 search across cards (incl. their log lines),
+        // messages, memories, workers, journal and schedules. Net-new — there
+        // was never a /api/search in the Python server or the SPA.
+        .nest("/api/search", search::routes())
+        // RR-0109: `why` — the provenance explainer over the durable trails
+        // (state-event journal, request log, card log, schedule runs/audit,
+        // turn ledger). The CLI verb is a printer over this; the correlation
+        // lives here so there is one place to be wrong.
+        .nest("/api/why", why::routes())
         .nest("/api/verify", verify::routes())
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
@@ -176,6 +189,15 @@ pub fn router(state: AppState) -> Router {
         // Absolute-path routes (merged, not nested): the gmail callback
         // below is public, and a nest wildcard at /api/gmail would shadow it.
         .merge(gmail_auth::routes())
+        // AMUX-2599 — three endpoints the SPA calls on EVERY load that 404'd
+        // here. Each 404 body deserialized cleanly into the client's success
+        // path, so all three failed silently: no branch badges, per-worker
+        // gates rendering as deleted, and an unactionable red offline banner.
+        .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
+        .route(
+            "/api/offline-origin",
+            axum::routing::get(offline_origin::offline_origin),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
@@ -195,6 +217,7 @@ pub fn router(state: AppState) -> Router {
         // debug sibling above.
         .route("/api/debug/boundary", axum::routing::get(py_proxy::boundary))
         .merge(invariants_api::routes())
+        .merge(crate::runtime_jobs::board_drive::routes())
         // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
         // routed, with which methods" is a GET, not a grep. Public like its
         // debug siblings (route names only, nothing secret).

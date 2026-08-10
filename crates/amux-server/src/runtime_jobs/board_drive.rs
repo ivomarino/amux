@@ -1,0 +1,2545 @@
+//! `[board-drive]` — the board→worker drive loop (AMUX-2637).
+//!
+//! # The outage this restores
+//!
+//! Python owned the entire loop that turns a board into work: `_pickup_next_
+//! board_task` (py:14418), `_advance_open_card` (py:13325) and the level sweep
+//! that drives both (`_pickup_level_sweep`, py:14305). The cutover carried the
+//! board API across and left the loop behind, and the Rust orchestrator only
+//! ever dispatches to RUST-managed workers (`pickup_unowned=false`; a
+//! python-owned card carries a `foreign_worker_id` and is never assigned). Every
+//! fleet session is python-owned, so since the cutover: no assignments, no
+//! advance nudges. Cards sat in `todo`, workers sat idle, and NOTHING errored.
+//!
+//! Pure absence is the failure mode this module is shaped against. Every tick
+//! writes a trace (`/api/debug/board-drive`) naming, per lane, what it did and
+//! **why it declined** — because a skip that leaves no trace is
+//! indistinguishable from a loop that is not running, which is exactly the state
+//! the fleet was in for hours (ethos rule 4; Python learned the same thing at
+//! py:14208, `_pickup_skip`, after Ethan had to read source to answer "why is
+//! this idle lane sitting on 4 todos?").
+//!
+//! # LEVEL-triggered, never edge-triggered
+//!
+//! Python fired pickup from `status == "idle" and prev in ("active","waiting")`
+//! — an EDGE — and then had to add `_pickup_level_sweep` because the edge is
+//! fragile in exactly this process: it re-execs on every deploy, which clears
+//! the previous-status map, so an already-idle lane waits for a transition that
+//! may never come (primis: IDLE 142 minutes on 3 pickable todos, py:14308).
+//! Only the LEVEL sweep is ported. There is no edge to keep in step with it, so
+//! the asymmetry that let one half of the edge (advance) go unbackstopped for
+//! months (py:14326) cannot recur here.
+//!
+//! # Delivery is the steering queue, not a second send path
+//!
+//! Nothing here types into a pane. A nudge or an assignment is
+//! `steer_enqueue`'d and the EXISTING delivery loop
+//! (`session_verbs::steer_deliver_tick`) applies the turn-boundary gate
+//! (`steer_lane_at_boundary`) and the send choreography. Two consequences, both
+//! deliberate:
+//!
+//! 1. A nudge can never land mid-turn. Interrupting a working model to tell it
+//!    something it could have read at its next boundary is the interruption the
+//!    ethos warns about, and it was a live bug in the steering path four days
+//!    ago ("i sent as a queue but it looks like it was sent directly even though
+//!    this worker was still working").
+//! 2. Delivery is DURABLE. Python called `send_text(...)` and stamped its
+//!    cooldown on the return value; a failed send meant the lane got nothing.
+//!    Here the row survives a restart and is delivered at the lane's next
+//!    boundary.
+//!
+//! # What is durable, and why that is not a detail
+//!
+//! Python held the per-session advance cooldown and the per-lane sweep stamp in
+//! process memory, on a server that re-execs many times a day — its own comment
+//! (py:14627) calls an in-memory cooldown "fiction" after one was wiped by the
+//! first reload and re-fired at the same lane within minutes. Every cooldown
+//! here reads `session_events`:
+//!
+//! | bound                     | key                                    |
+//! |---------------------------|----------------------------------------|
+//! | re-claim (24h, per card)  | `task.claimed`                         |
+//! | advance (15m, per lane)   | `advance.nudged` / `needsyou.renag` / `capture.decompose_ask` |
+//! | advance budget (3/24h)    | `advance.nudged` per card id           |
+//! | decompose (6h, per lane)  | `pickup.decompose_nudge`               |
+//! | needs:you re-nag (3d)     | `needsyou.renag` per card id           |
+//!
+//! `advance.nudged` additionally records the card's STATUS at nudge time, which
+//! Python kept only in memory (`_advance_last_card`, py:12960). That is what
+//! makes "did this lane make progress since we spoke?" survive a restart, so a
+//! lane that moved the card it was nudged about gets the next one immediately
+//! instead of waiting out a cooldown it already earned its way past.
+
+use std::collections::HashSet;
+use std::sync::{OnceLock, RwLock};
+
+use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::api::AppState;
+use crate::db::board_store as bs;
+use amux_core::board::TaskStatus;
+
+/// Sweep cadence. Python's level sweep ran every 300s behind an idle EDGE that
+/// fired immediately; with no edge, 300s would mean a lane finishing a turn
+/// waits up to five minutes for its next card. Volume is bounded by the
+/// cooldowns above, not by the tick, so the tick can be honest about latency.
+pub const BOARD_DRIVE_TICK_SECS: u64 = 60;
+
+/// py:12961 `_ADVANCE_COOLDOWN` — never push the same lane twice inside this.
+const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
+/// py:12855 `_DECOMPOSE_NUDGE_COOLDOWN`.
+const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
+/// py:14514 freshness gate — never auto-run a card nobody has touched in 7 days.
+const PICKUP_FRESHNESS_S: i64 = 7 * 86400;
+/// py:14515 re-claim cooldown (AMUX-1857).
+const RECLAIM_COOLDOWN_S: f64 = 86400.0;
+/// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
+const DEFAULT_ITEM_TYPE: &str = "code";
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// py:14453 `AMUX_MAX_DOING_PER_SESSION`.
+fn wip_cap() -> i64 {
+    env_i64("AMUX_MAX_DOING_PER_SESSION", 1).max(1)
+}
+/// py:13387 `AMUX_ADVANCE_CARD_BUDGET`.
+fn advance_card_budget() -> i64 {
+    env_i64("AMUX_ADVANCE_CARD_BUDGET", 3).max(1)
+}
+/// py:6885 `AMUX_NEEDSYOU_RENAG_DAYS`.
+fn needsyou_renag_days() -> f64 {
+    env_f64("AMUX_NEEDSYOU_RENAG_DAYS", 3.0)
+}
+
+fn now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+// ---------------------------------------------------------------------------
+// The trace. This is the product, not a byproduct.
+// ---------------------------------------------------------------------------
+
+/// What the tick did for ONE lane, and if it did nothing, WHY.
+///
+/// `reason` is a small closed vocabulary so it can be grepped and counted;
+/// `detail` carries the specifics a human needs. A lane always produces exactly
+/// one of these per tick — there is no path out of `drive_lane` that returns
+/// without one, which is what makes "the loop is running but this lane is
+/// skipped" distinguishable from "the loop is not running".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LaneTrace {
+    pub session: String,
+    /// `assigned` | `advance-nudged` | `review-routed` | `decompose-asked` |
+    /// `renag` | `skipped`
+    pub outcome: String,
+    pub reason: String,
+    pub detail: String,
+    /// Cards this lane could be handed RIGHT NOW, by the pickup predicate
+    /// itself — not a re-derivation of it (ethos rule 1: a view must share the
+    /// predicate of the mechanism it describes).
+    pub eligible_todos: i64,
+    /// Agent-owned, non-archived doing/review cards — what the advance half
+    /// selects over.
+    pub open_cards: i64,
+    pub card: Option<String>,
+}
+
+impl LaneTrace {
+    fn skip(session: &str, reason: &str, detail: impl Into<String>) -> Self {
+        Self {
+            session: session.to_string(),
+            outcome: "skipped".into(),
+            reason: reason.into(),
+            detail: detail.into(),
+            eligible_todos: 0,
+            open_cards: 0,
+            card: None,
+        }
+    }
+    fn acted(session: &str, outcome: &str, card: &str, detail: impl Into<String>) -> Self {
+        Self {
+            session: session.to_string(),
+            outcome: outcome.into(),
+            reason: String::new(),
+            detail: detail.into(),
+            eligible_todos: 0,
+            open_cards: 0,
+            card: Some(card.to_string()),
+        }
+    }
+    fn with_counts(mut self, eligible: i64, open: i64) -> Self {
+        self.eligible_todos = eligible;
+        self.open_cards = open;
+        self
+    }
+}
+
+/// One sweep's worth of traces.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DriveReport {
+    pub tick: u64,
+    pub started_at: f64,
+    pub finished_at: f64,
+    pub assigned: usize,
+    pub nudged: usize,
+    pub lanes: Vec<LaneTrace>,
+}
+
+static LAST_REPORT: OnceLock<RwLock<Option<DriveReport>>> = OnceLock::new();
+static TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn report_slot() -> &'static RwLock<Option<DriveReport>> {
+    LAST_REPORT.get_or_init(|| RwLock::new(None))
+}
+
+fn publish(report: &DriveReport) {
+    if let Ok(mut slot) = report_slot().write() {
+        *slot = Some(report.clone());
+    }
+}
+
+/// The last completed sweep, or None if the loop has never run — which is
+/// itself the answer to "is the drive loop alive?", and the question nobody
+/// could answer during the outage.
+pub fn last_report() -> Option<DriveReport> {
+    report_slot().read().ok().and_then(|s| s.clone())
+}
+
+// ---------------------------------------------------------------------------
+// The fleet seam. A trait so every guard is testable against a planted fleet
+// without a tmux server — mocking `subprocess` proves only that the mock was
+// called (the D6 lesson).
+// ---------------------------------------------------------------------------
+
+#[allow(async_fn_in_trait)]
+pub trait Fleet: Send + Sync {
+    /// Lane names to consider: every non-archived session env.
+    fn lanes(&self) -> Vec<String>;
+    /// py:14444 — OPT-OUT, not opt-in. `CC_AUTO_PICKUP=0|false|no|off` declines
+    /// the autonomous loop; anything else (including absent) enrolls. As opt-IN
+    /// this reached 4 of 101 sessions, so 97 lanes went idle on a full queue and
+    /// stayed there (py:14437).
+    fn auto_pickup_enabled(&self, lane: &str) -> bool;
+    /// `CC_TAGS`, lowercased — for explicit-mode status scoping (py:16096).
+    fn tags(&self, lane: &str) -> Vec<String>;
+    async fn is_running(&self, lane: &str) -> bool;
+    /// The turn-boundary gate. REUSED from the steering path, never
+    /// reimplemented: a second copy of "is this lane mid-turn" is the
+    /// two-implementations-of-one-rule defect the board keeps producing.
+    async fn at_boundary(&self, lane: &str) -> bool;
+    /// Hand text to the lane. Durable queue + the existing delivery loop.
+    async fn deliver(&self, lane: &str, text: &str);
+}
+
+/// The live fleet: session envs on disk, `session_verbs`' liveness and boundary
+/// gate, `steer_enqueue` for delivery.
+pub struct LiveFleet {
+    pub state: AppState,
+}
+
+impl Fleet for LiveFleet {
+    fn lanes(&self) -> Vec<String> {
+        crate::api::session_verbs::all_lane_names()
+    }
+    fn auto_pickup_enabled(&self, lane: &str) -> bool {
+        let cfg = crate::api::session_verbs::parse_env(lane);
+        !matches!(
+            cfg.get("CC_AUTO_PICKUP").map(|v| v.trim().to_lowercase()).as_deref(),
+            Some("0") | Some("false") | Some("no") | Some("off")
+        )
+    }
+    fn tags(&self, lane: &str) -> Vec<String> {
+        let cfg = crate::api::session_verbs::parse_env(lane);
+        cfg.get("CC_TAGS")
+            .unwrap_or("")
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+    async fn is_running(&self, lane: &str) -> bool {
+        crate::api::session_verbs::is_running(lane).await
+    }
+    async fn at_boundary(&self, lane: &str) -> bool {
+        crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
+    }
+    async fn deliver(&self, lane: &str, text: &str) {
+        crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive").await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Predicates, ported. Every one of these was a logged incident.
+// ---------------------------------------------------------------------------
+
+/// py:12889 `_pickup_junk_reason` — why auto-pickup must refuse this card, or
+/// "" if it is a real task.
+///
+/// ORDER IS LOAD-BEARING (py's "MG ground truth, second revision"): marker ->
+/// artifact/dormant -> STRUCTURE VETO -> journal -> shell. Structure beats the
+/// fold count because a real investigation card can carry fold RESIDUE from the
+/// folding era; a true journal has folds and no structure.
+pub fn pickup_junk_reason(title: &str, desc: &str) -> String {
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<regex::Regex> = OnceLock::new();
+    static CAPS_HEAD: OnceLock<regex::Regex> = OnceLock::new();
+    static STRUCTURE: OnceLock<regex::Regex> = OnceLock::new();
+    static PROMPT: OnceLock<regex::Regex> = OnceLock::new();
+
+    let folds = desc.matches("New task:").count();
+    if desc.contains("capture: session prompt") && folds < 2 {
+        return "captured chat prompt, not a unit of work".into();
+    }
+    // ANCHORED, and the word must END as a subject too (GCA-85 + creative-dna's
+    // residual): `\b` matches at a hyphen, and the fleet's own title convention
+    // is `[area] subject`, so `[test-hygiene]` fired on `test`. The comma in the
+    // lookahead is load-bearing — "[TRIPWIRE, fires on recurrence]" is a genuine
+    // armed tripwire.
+    let artifact = ARTIFACT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^\s*\[?(probe-stale|probe|temp|test|canary|tripwire|armed watch)([\s:,\]]|$)",
+        )
+        .expect("artifact regex")
+    });
+    if artifact.is_match(title) {
+        return "looks like a test artifact or armed tripwire".into();
+    }
+    // STRUCTURE VETO. 2+ ALLCAPS section heads, or an explicit structure marker.
+    let caps = CAPS_HEAD.get_or_init(|| {
+        regex::Regex::new(r"(?m)^[A-Z][A-Z0-9 /'\-]{3,40}:").expect("caps head regex")
+    });
+    let structure = STRUCTURE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?im)^#{1,3}\s|success criteri|acceptance criteri|^SCOPE:|^- \[[ x]\]|gate(?:_checked| policy| criteria)\b|ROOT CAUSE|unhappy path",
+        )
+        .expect("structure regex")
+    });
+    if caps.find_iter(desc).count() >= 2 || structure.is_match(desc) {
+        return String::new();
+    }
+    if folds >= 2 {
+        return format!("journal card ({folds} folded tasks)");
+    }
+    let prompt = PROMPT
+        .get_or_init(|| regex::Regex::new(r"(?s)^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$").expect("prompt regex"));
+    if let Some(c) = prompt.captures(desc.trim()) {
+        let body = c.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        return if body.starts_with('/') {
+            "harness slash command, not a task".into()
+        } else {
+            "captured chat prompt, not a unit of work".into()
+        };
+    }
+    String::new()
+}
+
+/// py:14597 — an irreversible operation named in a card is never auto-executed.
+pub fn irreversible_op(blob: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)stash\s+(drop|clear)|rm\s+-[rf]{1,2}\b|push\s+(--force|-f)\b|reset\s+--hard|git\s+clean\s+-[a-z]*[fd]|drop\s+table|truncate\s+table|delete\s+from\s+\w+\s*;|--no-preserve-root",
+        )
+        .expect("danger regex")
+    });
+    re.find(blob).map(|m| m.as_str().trim().to_string())
+}
+
+/// py:14566 — the PROSE dependency fallback. Fires ONLY when `depends_on` is
+/// empty: a card id in prose is ambiguous by nature (MG-1363's blocker names a
+/// card in words while the only ID in it is the EPIC it cites for authority), so
+/// a prose match can be the right answer via the wrong mechanism.
+pub fn prose_dependency(blob: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:blocked\s+(?:by|on)|cannot\s+start\s+until|depends\s+on|waits?\s+(?:for|on))\s+[\s\S]{0,40}?\b([A-Z][A-Z]+-\d+)(?:[^0-9]|$)",
+        )
+        .expect("prose dep regex")
+    });
+    re.captures(blob).and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+}
+
+/// py:13126 `_norm_actor` — a session name reduced to a comparable form.
+/// `cmd_history.origin` is NOT a clean session id: real values in one night were
+/// `mixpeek-frustrations`, `mixpeek frustrations`, and
+/// `mixpeek frustrations [manual:ip:100.66.26.84]`.
+pub fn norm_actor(name: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"[^a-z0-9]+").expect("norm regex"));
+    re.replace_all(name.trim().to_lowercase().as_str(), "-").trim_matches('-').to_string()
+}
+
+/// Strip a bracketed/parenthesized decoration BEFORE normalizing, then demand
+/// EXACT equality (AC-316 defect 2). `_norm_actor` flattens lane separators AND
+/// decorations to `-`, so post-norm "amux (queued...)" and "amux-cloud" both
+/// begin "amux-" and a prefix test made every `amux-*` lane count as the
+/// reviewer `amux`.
+fn origin_matches(origin: &str, want_normed: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"[\[(][\s\S]*$").expect("decoration regex"));
+    norm_actor(&re.replace(origin, "")) == want_normed
+}
+
+/// A card's own text, quoted into a board-drive message — or a POINTER to the
+/// card, when quoting it would open Claude Code's @/slash picker.
+///
+/// `send_text_inner` refuses a steering message that trips the picker while the
+/// lane is generating, and `steer_deliver_tick` takes the oldest row per lane
+/// per tick — so a refused message sits at the head and blocks everything
+/// behind it (measured live: 10 messages stuck 4 hours on one lane). That
+/// head-of-line bug is the SEND PATH's to fix and another lane owns it; this is
+/// the narrower obligation not to MANUFACTURE the hazard, since the only
+/// untrusted text in a board-drive message is the card body being quoted.
+///
+/// Uses `at_picker_text` — the send path's own predicate, called rather than
+/// copied. A second spelling of "does this open the picker" would drift from
+/// the one that actually decides (AMUX-2330).
+///
+/// EXIT: delete this when the send path stops refusing on picker text (or when
+/// delivery is protocol-based, where there is no composer to confuse). Nothing
+/// about a card's text should decide whether its lane hears about it.
+fn quoted_card_text(body: &str, card: &str) -> String {
+    if crate::api::session_verbs::at_picker_text(body) {
+        return format!(
+            "(withheld: this card's text contains an at-mention or a leading slash, which \
+             opens Claude Code's file picker and can make the send refuse — read it with \
+             `amux board show {card}`)"
+        );
+    }
+    body.to_string()
+}
+
+/// py:13112 `_advance_target` — the status a card in `status` moves to next.
+pub fn advance_target(status: &str) -> Option<TaskStatus> {
+    match status.trim().to_lowercase().as_str() {
+        "doing" => Some(TaskStatus::Review),
+        "review" => Some(TaskStatus::Done),
+        "done" => Some(TaskStatus::Verified),
+        _ => None,
+    }
+}
+
+/// py:13117 `_reviewer_acts_next` — DERIVED from the enforcement set
+/// (`_REVIEWER_SIGNOFF_TARGETS = ("done","verified")`), never restated beside
+/// it. Widening the enforcement set moves the routing with it; py:13036 records
+/// three bugs in one night from exactly that pair drifting.
+pub fn reviewer_acts_next(status: &str) -> bool {
+    matches!(advance_target(status), Some(TaskStatus::Done) | Some(TaskStatus::Verified))
+}
+
+// ---------------------------------------------------------------------------
+// DB reads
+// ---------------------------------------------------------------------------
+
+fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM session_events WHERE type=?1 AND ts > ?2 AND data LIKE ?3",
+        rusqlite::params![etype, since, format!("%\"{card}\"%")],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The lane's most recent nudge of ANY shape. Python kept this in memory
+/// (`_advance_last`) on a process that re-execs many times a day; deriving it
+/// from the durable event log is the same bound that actually survives.
+///
+/// `task.claimed` COUNTS AS A NUDGE. Caught by reading this loop's own
+/// end-to-end transcript: a lane was handed BDQ-1 and, one tick later, told
+/// "You went idle holding BDQ-1 in 'doing' — keep driving it", before it could
+/// have read the assignment. Python never hit this because its advance path ran
+/// off an idle EDGE plus a 10-minute per-lane sweep stamp, so the two could not
+/// stack; porting the level sweep without that stamp let them. Restating an
+/// instruction the lane was given seconds ago is the nag that does NOT compound
+/// with a better model — the assignment already told it what to do.
+fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>, Option<String>)> {
+    conn.query_row(
+        "SELECT ts, data FROM session_events \
+         WHERE session=?1 \
+         AND type IN ('advance.nudged','advance.routed','needsyou.renag', \
+                      'capture.decompose_ask','task.claimed') \
+         ORDER BY ts DESC LIMIT 1",
+        rusqlite::params![session],
+        |r| Ok((r.get::<_, f64>(0)?, r.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|(ts, data)| {
+        let v: Option<Value> = data.as_deref().and_then(|d| serde_json::from_str(d).ok());
+        let issue = v.as_ref().and_then(|v| v["issue"].as_str().map(str::to_string));
+        let status = v.as_ref().and_then(|v| v["status"].as_str().map(str::to_string));
+        (ts, issue, status)
+    })
+}
+
+/// py:14403 — the count the pickup predicate itself would select over, so the
+/// trace and the mechanism cannot disagree about what is eligible.
+fn eligible_todo_count(conn: &Connection, session: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='todo' \
+         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+         AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                         AND lower(t.tag) LIKE 'needs:you%')",
+        rusqlite::params![session],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+fn open_card_count(conn: &Connection, session: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE session=?1 AND deleted IS NULL \
+         AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent'",
+        rusqlite::params![session],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// py:16070 `_status_applies`. `implicit` (the default) means the status applies
+/// to every lane; `explicit` means only where opted in, by session or by tag.
+/// AMUX-2312: telling a lane that deploys nothing to drive every card to
+/// `verified` sets a target whose gate it cannot satisfy truthfully.
+fn status_applies(conn: &Connection, status_id: &str, session: &str, tags: &[String]) -> bool {
+    let mode: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(mode,'implicit') FROM statuses WHERE id=?1",
+            rusqlite::params![status_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    match mode.as_deref() {
+        // Unknown status: py returns (True, "unknown-status").
+        None => return true,
+        // Implicit (the default) applies to everyone.
+        Some(m) if m != "explicit" => return true,
+        // Explicit: fall through to the scope check.
+        Some(_) => {}
+    }
+    if session.is_empty() {
+        return false;
+    }
+    let mut opted = false;
+    if let Ok(mut st) =
+        conn.prepare("SELECT scope_type, scope_value FROM status_scope WHERE status=?1")
+    {
+        if let Ok(rows) = st.query_map(rusqlite::params![status_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for (kind, value) in rows.flatten() {
+                let hit = match kind.as_str() {
+                    "session" => value == session,
+                    "tag" => tags.iter().any(|t| *t == value.to_lowercase()),
+                    _ => false,
+                };
+                opted |= hit;
+            }
+        }
+    }
+    opted
+}
+
+/// py:14189 `_deps_blocking` — card ids in `depends_on` that are still OPEN.
+/// Deleted or absent ids do NOT block: an id that resolves to nothing cannot be
+/// worked, and treating it as a blocker parks the holder forever.
+fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
+    row.depends_on
+        .iter()
+        .filter(|d| {
+            let st: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                    rusqlite::params![d],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            match st.as_deref().map(bs::parse_status) {
+                Some(Some(TaskStatus::Done))
+                | Some(Some(TaskStatus::Verified))
+                | Some(Some(TaskStatus::Discarded)) => false,
+                Some(_) => true,
+                None => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn card_needsyou_asked_at(conn: &Connection, card: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT MIN(added_at) FROM issue_tags WHERE issue_id=?1 AND lower(tag) LIKE 'needs:you%'",
+        rusqlite::params![card],
+        |r| r.get::<_, Option<f64>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// py:13138 `_reviewer_msg_engagement` — the newest ms-timestamp of a MESSAGE
+/// from `reviewer` naming `card_id`, else 0.
+///
+/// ENGAGEMENT, NOT APPROVAL. Any message naming the card counts, whatever it
+/// says: a round-1 review that BLOCKS is a completed review action, and a check
+/// that parsed sentiment would score it "not an ack" and re-nudge an actively
+/// engaged reviewer. Engagement is decidable from an id-reference plus a
+/// timestamp; approval is not decidable from prose.
+///
+/// UNITS: `cmd_history.ts` and `interaction_log.ts` are both MILLISECONDS. They
+/// cancel when compared to each other, which is the only comparison the caller
+/// makes. Never compare either to wall-clock seconds unscaled.
+fn reviewer_msg_engagement(conn: &Connection, card_id: &str, reviewer: &str) -> i64 {
+    let want = norm_actor(reviewer);
+    if want.is_empty() || card_id.is_empty() {
+        return 0;
+    }
+    // Word-boundary guard so MF-500 does not match MF-5001. The LIKE is a cheap
+    // prefilter; the regex decides.
+    let Ok(pat) = regex::Regex::new(&format!(r"\b{}\b", regex::escape(card_id))) else {
+        return 0;
+    };
+    let Ok(mut st) = conn.prepare(
+        "SELECT origin, text, ts FROM cmd_history WHERE text LIKE ?1 ORDER BY ts DESC LIMIT 500",
+    ) else {
+        return 0;
+    };
+    let rows = st.query_map(rusqlite::params![format!("%{card_id}%")], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, String>(1).unwrap_or_default(),
+            r.get::<_, i64>(2).unwrap_or(0),
+        ))
+    });
+    let Ok(rows) = rows else { return 0 };
+    for (origin, text, ts) in rows.flatten() {
+        if !origin_matches(&origin, &want) {
+            continue;
+        }
+        if pat.is_match(&text) {
+            return ts;
+        }
+    }
+    0
+}
+
+/// Has the reviewer's last DELIBERATE action on this card outranked everyone
+/// else's? (py:13702, AC-234.) Blocking a card IS a completed review action but
+/// leaves it in `review`, so without this the sweep re-nudges a reviewer whose
+/// analysis is already on the card.
+///
+/// DELIBERATE excludes `commit_attached` — the automatic commit-attach hook
+/// fires on every commit into whatever card the author holds, and a naive
+/// "who wrote last" test reads ~75 of those as the author replying.
+fn reviewer_has_responded(conn: &Connection, card: &str, reviewer: &str) -> Option<&'static str> {
+    const DELIB: &str = "('patch','status_update','gate_force')";
+    let rev_ts: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT ts FROM interaction_log WHERE kind='board' AND target=?1 AND actor=?2 \
+                 AND action IN {DELIB} ORDER BY ts DESC LIMIT 1"
+            ),
+            rusqlite::params![card, reviewer],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let other_ts: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT ts FROM interaction_log WHERE kind='board' AND target=?1 AND actor<>?2 \
+                 AND action IN {DELIB} ORDER BY ts DESC LIMIT 1"
+            ),
+            rusqlite::params![card, reviewer],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let msg_ts = reviewer_msg_engagement(conn, card, reviewer);
+    let best = rev_ts.max(msg_ts);
+    if best > other_ts && best > 0 {
+        Some(if msg_ts > rev_ts { "message" } else { "board write" })
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-pickup (py:14418 _pickup_next_board_task)
+// ---------------------------------------------------------------------------
+
+/// A pickup decision: either a claim to make, or the reason there is none.
+pub enum Pickup {
+    /// Claim this card and send this prompt.
+    Claim { card: String, prompt: String },
+    /// Every candidate was a capture shell — ask for a decomposition instead of
+    /// going silent (py:14614, AMUX-2131). The guard is right that a shell is
+    /// not a unit of work; the fix is the session SPLITTING it, which is
+    /// judgment a model does well, not the card rotting.
+    Decompose { ids: Vec<String>, text: String },
+    /// Nothing to do, with the reason and the detail for the trace.
+    None { reason: &'static str, detail: String },
+}
+
+/// Select the next board task for `session`, or say why not. Pure over the
+/// connection: no sends, no writes — so a test can assert the DECISION without
+/// a fleet, and the caller owns the ordering of claim-then-deliver.
+pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
+    // WIP cap (py:14449). Pickup claimed via raw UPDATE, bypassing the limit the
+    // PATCH path enforces — one session accumulated TWELVE doing cards, a lie
+    // every other session reads. Archived cards do NOT hold WIP (Ethan, primis
+    // 2026-08-04: an archived `doing` card consumed a lane's entire WIP-1 budget
+    // forever while the board hid it), and neither do dormant types — an armed
+    // tripwire can never be completed by working it.
+    let cap = wip_cap();
+    let holding: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
+             AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+             ORDER BY id",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    if holding.len() as i64 >= cap {
+        return Pickup::None {
+            reason: "wip-cap",
+            detail: format!("holding {}/{} in doing: {}", holding.len(), cap, holding.join(", ")),
+        };
+    }
+
+    // py:14487 candidate selection. Board drag order IS the priority queue
+    // (AMUX-2128): `pos` is what the user reorders in the UI, so dragging a card
+    // up prioritizes it; `created` breaks ties for never-dragged cards.
+    //
+    // needs:you is matched as `lower(tag) LIKE 'needs:you%'`, NOT python's exact
+    // `tag='needs:you'`. Python's own advance path used the LIKE form and its
+    // pickup path used equality, so the two disagreed about which cards are
+    // blocked on a human — a sub-tagged ask (`needs:you:decision`) was exempt
+    // from one loop and dispatchable by the other. Unifying on the LIKE form
+    // only ever WIDENS the exemption, so the first run after the change emits
+    // nothing; the opposite direction would have discharged a backlog.
+    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let reclaim_cut = now - RECLAIM_COOLDOWN_S;
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT i.id FROM issues i \
+             WHERE i.session=?1 AND i.status='todo' AND i.owner_type='agent' AND i.deleted IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                             AND lower(t.tag) LIKE 'needs:you%') \
+             AND COALESCE(i.archived,0)=0 \
+             AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
+             AND i.updated >= ?2 \
+             AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
+                             AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%') \
+             ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Pickup::None {
+            reason: "no-eligible-card",
+            detail: "queue holds nothing dispatchable (needs:you, archived, dormant, \
+                     stale >7d and cards claimed in the last 24h are all exempt)"
+                .into(),
+        };
+    }
+
+    // REFUSAL GUARDS RUN INSIDE THE LOOP (py:14581, AMUX-2128): they used to
+    // return, so one refusable card at the head of the queue stalled the entire
+    // lane forever — 81 clean todos sat behind refusable heads when measured.
+    let mut shells: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for id in &ids {
+        let Ok(Some(row)) = bs::get_issue(conn, id) else { continue };
+        let blob_desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
+
+        let blocking = deps_blocking(conn, &row);
+        if !blocking.is_empty() {
+            skipped.push(format!("{id} blocked by {}", blocking.join(",")));
+            continue;
+        }
+        // Prose fallback fires ONLY when the structured field is empty.
+        if row.depends_on.is_empty() {
+            let hay = format!("{}\n{}", row.title, blob_desc);
+            if let Some(dep) = prose_dependency(&hay) {
+                let dep_status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                        rusqlite::params![dep],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let open = matches!(
+                    dep_status.as_deref().map(bs::parse_status),
+                    Some(Some(s)) if !matches!(s, TaskStatus::Done | TaskStatus::Verified | TaskStatus::Discarded)
+                );
+                if open {
+                    skipped.push(format!(
+                        "{id} prose-blocked by {dep} — POPULATE depends_on (prose cannot \
+                         distinguish a dependency from a citation)"
+                    ));
+                    continue;
+                }
+            }
+        }
+        let junk = pickup_junk_reason(&row.title, &blob_desc);
+        if !junk.is_empty() {
+            shells.push((id.clone(), row.title.chars().take(70).collect()));
+            skipped.push(format!("{id} — {junk}"));
+            continue;
+        }
+        let lower = format!("{}\n{}", row.title, blob_desc).to_lowercase();
+        if let Some(op) = irreversible_op(&lower) {
+            skipped.push(format!("{id} declined — names an irreversible operation ('{op}')"));
+            continue;
+        }
+        return Pickup::Claim {
+            card: id.clone(),
+            prompt: pickup_prompt(conn, session, &row),
+        };
+    }
+
+    // Every candidate was refused. If the refusals were capture shells, dispatch
+    // ONE decompose instruction instead of going silent; irreversible-op
+    // declines stay silent, because those need a human.
+    if !shells.is_empty() {
+        let listed: Vec<(String, String)> = shells.iter().take(8).cloned().collect();
+        let list = listed
+            .iter()
+            .map(|(id, t)| format!("  {id} — {}", quoted_card_text(t, id)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!(
+            "[amux auto-pickup] Your queue's next {} card(s) are captured prompts or journals \
+             — not dispatchable as-is:\n{list}\n\
+             Decompose each into real cards (one honest unit of work per card, correct type), \
+             carry the content over, then discard the shell. Auto-pickup will work the real \
+             cards at your next idle.\n\
+             PATCH THESE IDS SPECIFICALLY. Do not sweep whatever is open and do not write one \
+             outcome onto several cards: each carries its own, or the ledger records work \
+             against the wrong unit.",
+            shells.len()
+        );
+        return Pickup::Decompose {
+            ids: listed.into_iter().map(|(id, _)| id).collect(),
+            text,
+        };
+    }
+    Pickup::None {
+        reason: "all-candidates-refused",
+        detail: skipped.join("; "),
+    }
+}
+
+/// py:14713 — the claim prompt.
+///
+/// Provenance framing is load-bearing: card descs often embed quoted messages
+/// (`[a -> b] ...`), and injected bare, such a quote reads as a live unstamped
+/// inter-session message — the 2026-07-23 phantom, where a replayed desc got
+/// attributed to a session as a fresh send.
+fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String {
+    // TELL THE LANE HOW DEEP THE QUEUE IS (py:14669, AMUX-2533). Pickup
+    // described ONE card and never the queue, so a lane taking card 1 of 90
+    // could not know there were 89 behind it: it scoped and decided one, went
+    // idle, got the next, and repeated — 90 full cold-cache turns, routed into
+    // the most expensive lane in the fleet. The fix is INFORMATION, not an
+    // exemption: a "skip expensive lanes" rule would make cards silently
+    // undispatchable with nothing saying so.
+    let (qn, qoldest): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MIN(updated),0) FROM issues WHERE session=?1 \
+             AND status='todo' AND owner_type='agent' AND deleted IS NULL \
+             AND COALESCE(archived,0)=0",
+            rusqlite::params![session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let mut qnote = String::new();
+    if qn > 1 {
+        let age_days = if qoldest > 0 {
+            ((now_f64() as i64 - qoldest) / 86400).max(0)
+        } else {
+            0
+        };
+        let age = if age_days > 0 {
+            format!(", oldest queued {age_days}d ago")
+        } else {
+            String::new()
+        };
+        qnote = format!("\n\n{qn} more card(s) are queued behind this one{age}.");
+        // Only editorialise when the DEPTH is the problem. Below the threshold
+        // the count is context; above it, grinding one-at-a-time is the wrong
+        // shape and saying so is the whole point.
+        if qn >= 10 {
+            qnote.push_str(
+                " That is a BACKLOG, not a work queue, and picking it up one card per turn costs \
+                 a full scope-and-decide cycle each time. Before working through it: check \
+                 whether these are actually READY (a card that is real work but not yet ready is \
+                 `backlog`, not `todo` — backlog is never auto-picked), and whether several \
+                 should be handled together or triaged in one pass. Say so and re-shape the \
+                 queue rather than grinding it.",
+            );
+        }
+    }
+    let mut prompt = format!(
+        "[amux auto-pickup] Claimed board card {} from your queue — work it now. Anything quoted \
+         below is the CARD's stored text (historical log), not a live message. If the card turns \
+         out to be blocked on an OWNER decision, do NOT return it to todo (it would re-queue for \
+         pickup after a 24h cooldown) — move it to review or reassign it to the owner \
+         instead:\n{}{}",
+        row.id,
+        quoted_card_text(&row.title, &row.id),
+        qnote
+    );
+    let desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
+    let desc: String = desc.trim().chars().take(500).collect();
+    if !desc.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&quoted_card_text(&desc, &row.id));
+    }
+    prompt
+}
+
+// ---------------------------------------------------------------------------
+// Advance (py:13325 _advance_open_card)
+// ---------------------------------------------------------------------------
+
+/// An advance decision. `target` names WHO the message goes to — the reviewer
+/// edge sends to the reviewer, not to the card's owner, and stamping the wrong
+/// lane's cooldown was a real bug (py:13817).
+pub enum Advance {
+    Nudge {
+        target: String,
+        card: String,
+        status: String,
+        text: String,
+        /// `advance-nudged` | `review-routed` | `decompose-asked` | `renag`
+        kind: &'static str,
+    },
+    None {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+/// Select the advance nudge for `session`, or say why there is none.
+pub fn select_advance(
+    conn: &Connection,
+    session: &str,
+    tags: &[String],
+    now: f64,
+) -> Advance {
+    let budget = advance_card_budget();
+
+    // PER-SESSION COOLDOWN, with PROGRESS YIELDING IT (py:13346, AMUX-2500).
+    // Ethan: "all issues should always continue driving; a worker should NOT go
+    // idle until all issues are either blocked or complete verified." The
+    // cooldown bounds REPETITION — the token audit found 182 advance wakes in
+    // 24h, one card nudged nine times and then discarded, nine model turns spent
+    // pushing a card into the bin. But a lane that MOVED the card we last named
+    // has demonstrably not stalled, and making it wait 15 minutes to be handed
+    // the next one is what leaves hundreds of cards sitting.
+    if let Some((last_ts, last_card, last_status)) = last_advance(conn, session) {
+        if now - last_ts < ADVANCE_COOLDOWN_S {
+            let moved = match (&last_card, &last_status) {
+                (Some(card), Some(prev)) => conn
+                    .query_row(
+                        "SELECT status FROM issues WHERE id=?1",
+                        rusqlite::params![card],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .map(|s| s != *prev)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !moved {
+                return Advance::None {
+                    reason: "cooldown",
+                    detail: format!(
+                        "last nudge {:.0}s ago (cooldown {ADVANCE_COOLDOWN_S:.0}s) and the card \
+                         it named has not moved",
+                        now - last_ts
+                    ),
+                };
+            }
+        }
+    }
+
+    // STALE-ASK CHECK, AHEAD OF THE MAIN SELECTION (py:13389, AC-194). The >3d
+    // needs:you re-nag had never executed in production — 48 cycles, 0 fires —
+    // for two reasons that both live here rather than in the branch: the main
+    // query filters `archived=0` and every eligible card was archived, and
+    // `ORDER BY updated DESC` picks the lane's FRESHEST card while a >3d ask is
+    // by construction among its stalest. "Put it where the loop has nothing else
+    // to do" reads like politeness and is a filter on the population you most
+    // need to reach.
+    let renag_cut = now - needsyou_renag_days() * 86400.0;
+    let stale: Option<(String, String, i64, f64)> = conn
+        .query_row(
+            "SELECT i.id, i.title, COALESCE(i.archived,0), MIN(t.added_at) AS asked_at \
+             FROM issues i JOIN issue_tags t ON t.issue_id = i.id \
+             WHERE i.session=?1 AND i.deleted IS NULL AND i.owner_type='agent' \
+             AND lower(t.tag) LIKE 'needs:you%' \
+             AND i.status NOT IN ('done','verified','discarded') \
+             GROUP BY i.id HAVING asked_at IS NOT NULL AND asked_at < ?2 \
+             ORDER BY asked_at ASC LIMIT 1",
+            rusqlite::params![session, renag_cut],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((id, title, archived, asked_at)) = stale {
+        if let Some(text) = needsyou_renag_text(conn, session, &id, &title, now - asked_at, archived, now) {
+            return Advance::Nudge {
+                target: session.to_string(),
+                card: id,
+                status: "needsyou".into(),
+                text,
+                kind: "renag",
+            };
+        }
+    }
+
+    // NO `done` TIER (py:13460, Ethan 2026-08-08: "we shouldnt be sending
+    // commands to idle workers that genuinely have no more work"). `done` was
+    // briefly selected here so something drove done->verified; the daily
+    // verification sweep took that job and does it better — one batched message
+    // once a day — while this loop re-woke lanes per card, per cooldown: 294
+    // advance nudges/day against 25 human prompts, 46% repeats, each wake
+    // replaying a 400-600k context. A lane whose only remaining cards are `done`
+    // has nothing IN FLIGHT.
+    //
+    // CANDIDATES, not LIMIT 1 (py:13439, AMUX-2498). Taking the single
+    // highest-priority card meant an exhausted per-card budget silenced every
+    // OTHER card the lane held — and because the ordering puts `doing` first, a
+    // lane that peer-reviews continuously always has a populated review tier, so
+    // the lanes using reviewers most were starved hardest.
+    let cands: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT id, status FROM issues WHERE session=?1 AND deleted IS NULL \
+             AND COALESCE(archived,0)=0 AND status IN ('doing','review') AND owner_type='agent' \
+             ORDER BY CASE status WHEN 'doing' THEN 0 ELSE 1 END, updated DESC LIMIT 40",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    if cands.is_empty() {
+        return Advance::None {
+            reason: "no-open-card",
+            detail: "no agent-owned doing/review card to drive".into(),
+        };
+    }
+    let day_ago = now - 86400.0;
+    let mut chosen: Option<(String, String)> = None;
+    for (id, status) in &cands {
+        if card_event_count(conn, "advance.nudged", id, day_ago) < budget {
+            chosen = Some((id.clone(), status.clone()));
+            break;
+        }
+    }
+    let Some((card_id, status)) = chosen else {
+        return Advance::None {
+            reason: "budget-spent",
+            detail: format!(
+                "all {} candidate(s) have spent their {budget}-nudge 24h budget — repeating the \
+                 prompt is not the fix",
+                cands.len()
+            ),
+        };
+    };
+    let Ok(Some(row)) = bs::get_issue(conn, &card_id) else {
+        return Advance::None { reason: "card-vanished", detail: card_id };
+    };
+
+    // Same not-a-task guard as pickup, via the SAME predicate with the SAME
+    // inputs (py:13503 — this block used to inline its own copy of the regexes,
+    // which diverged the moment the shared one gained the structure veto: three
+    // paths, three verdicts, one unchanged card).
+    let blob_desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
+    let why = pickup_junk_reason(&row.title, &blob_desc);
+    if !why.is_empty() {
+        // TELL THE LANE, do not just log it (py:13513, board-exp-1). Refusing to
+        // nudge "advance it" at a capture shell is right — nothing about a chat
+        // prompt is done or not-done — but saying so only to a log the lane never
+        // reads left a worker that had DONE the work and committed it sitting idle
+        // on a `doing` card forever. Once per card, ever.
+        let idem = format!("decompose:{card_id}");
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                rusqlite::params![idem],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if already {
+            return Advance::None {
+                reason: "shell-card",
+                detail: format!("{card_id} is a capture shell ({why}); already asked for a split"),
+            };
+        }
+        let text = format!(
+            "[amux] {card_id} is a captured prompt, not a unit of work — {why}. It cannot move \
+             through the gates as it stands, so it is holding your WIP slot and nothing is \
+             driving it.\n\n\
+             Split it: create one card per unit of work that can honestly be finished \
+             (`amux board add \"...\"` for each), then discard {card_id} with a pointer to them, \
+             or retype it if it is really one unit. Then drive each new card through its gates \
+             to done.\n\n\
+             If the work is ALREADY finished, that is exactly the case to split and close \
+             honestly rather than leave open — the board is the record that it happened."
+        );
+        return Advance::Nudge {
+            target: session.to_string(),
+            card: card_id,
+            status,
+            text,
+            kind: "decompose-asked",
+        };
+    }
+
+    // DEPENDENCY EDGE: if the held card is blocked, the useful push is at the
+    // BLOCKER, not the holder.
+    let blocking = deps_blocking(conn, &row);
+    if let Some(dep_id) = blocking.first() {
+        let dep = bs::get_issue(conn, dep_id).ok().flatten();
+        let dep_session = dep.as_ref().and_then(|d| d.session.clone()).unwrap_or_default();
+        if dep_session != session {
+            return Advance::None {
+                reason: "dep-other-lane",
+                detail: format!(
+                    "{card_id} blocked by {dep_id} ({}) — not nudging the holder",
+                    if dep_session.is_empty() { "unassigned" } else { &dep_session }
+                ),
+            };
+        }
+        // IS THE BLOCKER ACTIONABLE BY THIS SESSION? (py:13572, AC-298.) Owning a
+        // card is not the same as being able to advance it: a card in `review`
+        // cannot be moved by its AUTHOR, and a card parked in backlog on an
+        // external trigger is waiting on the world. In both cases the nudge asks
+        // for something no honest action of the recipient's can produce — it
+        // fired EIGHT times for one card — so a nudge meant to enforce the gates
+        // was manufacturing pressure to lie to them (ethos rule 3).
+        let dep = dep.expect("dep_session came from dep");
+        let dstat = dep.status.to_lowercase();
+        let drev = dep.reviewer.clone().unwrap_or_default();
+        let why_stuck = if dstat == "review" {
+            Some(if drev.is_empty() {
+                "in review awaiting a peer's sign-off".to_string()
+            } else {
+                format!("in review awaiting {drev}'s sign-off")
+            })
+        } else if dstat == "backlog" && dep.source_ref.as_deref().unwrap_or("").trim() != "" {
+            Some("parked in backlog on an external trigger".into())
+        } else if matches!(dstat.as_str(), "done" | "verified" | "discarded") {
+            Some(format!("already {dstat}"))
+        } else {
+            None
+        };
+        if let Some(w) = why_stuck {
+            return Advance::None {
+                reason: "dep-not-actionable",
+                detail: format!("{card_id} blocked by own {dep_id}, but that is {w} (AC-298)"),
+            };
+        }
+        let text = format!(
+            "[amux] {card_id} is blocked by {dep_id} ({}), which is YOURS. Work the dependency \
+             first: drive {dep_id} through its gates, then return to {card_id}. Do not mark \
+             {card_id} done while its dependency is open.",
+            quoted_card_text(&dep.title.chars().take(80).collect::<String>(), dep_id)
+        );
+        return Advance::Nudge {
+            target: session.to_string(),
+            card: card_id,
+            status,
+            text,
+            kind: "advance-nudged",
+        };
+    }
+
+    // NEEDS-YOU EDGE, ABOVE THE REVIEWER EDGE (py:13619, general-canvas-apps).
+    // This block used to sit BELOW, so a needs:you card in review routed to its
+    // reviewer and never reached the quiet path — the reviewer then got
+    // "ack review->done yourself" repeatedly, and that one action is the action
+    // that HIDES the decision (a needs:you card drops out of the digest at
+    // status done). An instruction satisfiable only by doing the thing you were
+    // told not to do is the ethos rule 3 shape.
+    if row.tags.iter().any(|t| t.to_lowercase().starts_with("needs:you")) {
+        // Age the ASK, not the ROW (py:13648, AC-178). `updated` is last-touch,
+        // and amux writes to descs constantly, so the needs:you cards carrying
+        // the most commentary were exactly the ones whose stale-ask check could
+        // never fire. `issue_tags.added_at` is stamped when the TAG is applied.
+        let asked_at = card_needsyou_asked_at(conn, &card_id).unwrap_or(row.updated as f64);
+        let asked_age = now - asked_at;
+        if asked_age < needsyou_renag_days() * 86400.0 {
+            return Advance::None {
+                reason: "needsyou",
+                detail: format!(
+                    "{card_id} is needs:you ({}h) — the human owes the answer, not the lane",
+                    (asked_age / 3600.0) as i64
+                ),
+            };
+        }
+        return match needsyou_renag_text(conn, session, &card_id, &row.title, asked_age, row.archived, now) {
+            Some(text) => Advance::Nudge {
+                target: session.to_string(),
+                card: card_id,
+                status,
+                text,
+                kind: "renag",
+            },
+            None => Advance::None {
+                reason: "needsyou-renag-deduped",
+                detail: format!("{card_id} re-stated or already asked inside the window"),
+            },
+        };
+    }
+
+    // REVIEWER EDGE. A card whose next transition needs the reviewer's sign-off
+    // is the REVIEWER's work now — pushing the author asks for a self-ack the
+    // transition refuses.
+    let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
+    let mut ball_with_author = String::new();
+    if reviewer_acts_next(&status) && !rev.is_empty() && rev != session {
+        match reviewer_has_responded(conn, &card_id, &rev) {
+            // BALL IS WITH THE AUTHOR — SO TELL THE AUTHOR (py:13761, AMUX-2498).
+            // Python said exactly this in a log line and then nudged nobody, so
+            // the card sat with both parties silent and the author never learned
+            // they were unblocked. 70 cards across 12 lanes were in this state.
+            Some(how) => {
+                ball_with_author = format!(
+                    "{rev} has already responded (their {how} is the most recent action on this \
+                     card), so it is YOUR move — read their response on the card and either \
+                     satisfy it or say why you disagree"
+                );
+            }
+            None => {
+                // Charge the SAME per-card budget the holder edge uses (py:13782,
+                // AC-220): this edge returned before ever reaching the cap, so the
+                // budget was enforced on one of two symmetric paths and a reviewer
+                // was nudged three times for one card.
+                let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
+                if spent >= budget {
+                    return Advance::None {
+                        reason: "budget-spent",
+                        detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
+                    };
+                }
+                // Name the ACTUAL transition. A card at `done` told to "ack
+                // review->done" is being pointed at a move it already made.
+                let next = advance_target(&status)
+                    .map(bs::db_status_spelling)
+                    .unwrap_or("done");
+                let text = format!(
+                    "[amux] {card_id} ({}) sits in '{status}' and names YOU as reviewer. Review \
+                     it: if the work holds, ack {status}->{next} yourself (your X-Amux-Session is \
+                     the required sign-off); if not, say what fails on the card. The author \
+                     cannot close it.",
+                    quoted_card_text(&row.title.chars().take(80).collect::<String>(), &card_id)
+                );
+                return Advance::Nudge {
+                    target: rev,
+                    card: card_id,
+                    status,
+                    text,
+                    kind: "review-routed",
+                };
+            }
+        }
+    }
+
+    // The author nudge.
+    let term = if status_applies(conn, "verified", session, tags) {
+        "verified"
+    } else {
+        "done"
+    };
+    if status == "done" && term != "verified" {
+        // `done` IS terminal for this lane, so there is nothing to advance to
+        // and the nudge could only re-fire forever with no honest exit.
+        return Advance::None {
+            reason: "terminal-for-lane",
+            detail: format!("{card_id} is done and `verified` does not apply to {session}"),
+        };
+    }
+    let gate_next = advance_target(&status).unwrap_or(TaskStatus::Done);
+    let gate = bs::effective_gate(&row, gate_next);
+    let gate_txt = if gate.is_empty() {
+        "  (no gate configured)".to_string()
+    } else {
+        gate.iter().map(|g| format!("  - {g}")).collect::<Vec<_>>().join("\n")
+    };
+    let gate_next_s = bs::db_status_spelling(gate_next);
+    let queued: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM issues WHERE session=?1 AND deleted IS NULL \
+             AND COALESCE(archived,0)=0 AND status IN ('todo','backlog') AND owner_type='agent'",
+            rusqlite::params![session],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let text = advance_text(AdvanceMsg {
+        card: &card_id,
+        status: &status,
+        title: &row.title,
+        gate_next: gate_next_s,
+        gate_txt: &gate_txt,
+        term,
+        queued,
+        reviewer: &rev,
+        ball_with_author: &ball_with_author,
+        item_type: &row.item_type,
+        has_evidence: board_has_evidence(&row.desc),
+    });
+    Advance::Nudge {
+        target: session.to_string(),
+        card: card_id,
+        status,
+        text,
+        kind: "advance-nudged",
+    }
+}
+
+/// py:15727 `_BOARD_EVIDENCE_RE` — does the desc carry a commit/PR/merge
+/// reference? Advisory only: it decides nothing, it just changes how loudly the
+/// retype hint speaks.
+fn board_has_evidence(desc: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(commit|sha|merged?|pull request|pr #|#\d+|[0-9a-f]{7,40})\b")
+            .expect("evidence regex")
+    });
+    re.is_match(desc)
+}
+
+struct AdvanceMsg<'a> {
+    card: &'a str,
+    status: &'a str,
+    title: &'a str,
+    gate_next: &'a str,
+    gate_txt: &'a str,
+    term: &'a str,
+    queued: i64,
+    reviewer: &'a str,
+    ball_with_author: &'a str,
+    item_type: &'a str,
+    has_evidence: bool,
+}
+
+/// py:13878 — the nudge body.
+///
+/// Option 5 exists because a prompt offering exactly `done` or `todo` about a
+/// standing-role or mis-shaped card forces a false statement either way, and the
+/// less-wrong pick recycles the card into the rot queue forever. Option 3b names
+/// the command for parking on an external condition, because an exit the reader
+/// has to go and discover is one they may reasonably conclude does not exist.
+fn advance_text(m: AdvanceMsg<'_>) -> String {
+    let reviewer_owns_gate = !m.reviewer.is_empty() && reviewer_acts_next(m.status);
+    // py:13845 RE-TYPE, the honest exit the menu never offered (AMUX-2478). Four
+    // finished cards sat terminal-at-done re-firing this nudge because, typed
+    // `code`, they faced gates (CI green / deployed / confirmed-in-prod) with
+    // NOTHING TO BIND TO, and correctly refused all three exits offered: false
+    // verified, fabricated trigger, false discard. When a gate does not fit, the
+    // fix is the TYPE, not the truth.
+    let eff_type = if m.item_type.trim().is_empty() {
+        DEFAULT_ITEM_TYPE
+    } else {
+        m.item_type.trim()
+    };
+    let retype = if eff_type.eq_ignore_ascii_case("code") {
+        let lead = if m.has_evidence { "" } else { "THIS CARD LOOKS MIS-TYPED. " };
+        let no_ev = if m.has_evidence {
+            ""
+        } else {
+            " — and its description carries no commit, PR or merge reference, which is what a \
+             code card would have by now"
+        };
+        format!(
+            "  1b. {lead}If the work on this card is NOT CODE — a doc or file move, an \
+             investigation whose result was negative, a research finding, a chore — then the \
+             gate above does not fit it, and the reason is the card's TYPE, not the work. It is \
+             typed `code`, so it inherits code's gates{no_ev}. Retyping is the HONEST exit and \
+             it already exists:\n       amux board type {} <investigation|research|doc|chore|ops>\n\
+             \x20    Those types gate on 'Outcome recorded in the item' for done and 'Outcome \
+             confirmed to still hold' for verified — satisfiable truthfully for work that ships \
+             no code. Fix the type, not the truth; never ack a merge or a deploy that did not \
+             happen.\n",
+            m.card
+        )
+    } else {
+        String::new()
+    };
+    // py:13884, AC-316 defect 1: telling the HOLDER of a review card to "satisfy
+    // the done gate and move it" offers an exit only the named reviewer can
+    // take, while the closing line forbids the force that is the sole way to
+    // obey. Same predicate as the reviewer edge, not re-derived.
+    let option_one = if reviewer_owns_gate {
+        format!(
+            "  1. Address the reviewer's feedback on the card, then ask {} to re-ack — \
+             '{}'->'{}' is {}'s sign-off, not yours; do NOT force it. If their feedback is \
+             already addressed, say so on the card and ping them.\n",
+            m.reviewer, m.status, m.gate_next, m.reviewer
+        )
+    } else {
+        format!(
+            "  1. Advance it. The gate for '{}' is:\n{}\n     Satisfy those honestly and move \
+             it, then continue to the next card.\n",
+            m.gate_next, m.gate_txt
+        )
+    };
+    let ball = if m.ball_with_author.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}.\n", m.ball_with_author)
+    };
+    format!(
+        "[amux] You went idle holding {} in '{}': {}\n\n{}Keep driving it. Do exactly one of:\n\
+         {}{}\
+         \x20 2. If it is genuinely finished, close it out to {} with the evidence.\n\
+         \x20 3. If it is BLOCKED, say what on — and if the blocker is another card, go work \
+         that dependency instead of waiting.\n\
+         \x20 3b. If it is blocked on something EXTERNAL that no one here controls (a provider \
+         outage, a deploy that cannot run, a third-party queue): record the condition and the \
+         resume trigger on the card, then `amux board backlog {} --trigger \"<the external \
+         condition>\"`. The --trigger records it as the card's source_ref and stamps \
+         last_verified_at, so a trigger nobody re-checks becomes detectable instead of the card \
+         sleeping forever — parking without it buys silence with no expiry. Do NOT leave it in \
+         'doing' (this nudge re-fires) or move it to 'todo' (the untracked-work guard fires \
+         instead). If it is a standing watcher rather than a one-off wait, retype it `watch` so \
+         it also stays out of auto-pickup and shows under is:armed.\n\
+         \x20 4. If it is blocked on a HUMAN decision, record that on the card and pick up the \
+         next unblocked one.\n\
+         \x20 5. If NEITHER done nor todo would be a TRUE statement about this card — a standing \
+         role, a journal, a mis-shape — it cannot rot because it cannot finish: DISCARD it with \
+         a note pointing at the closable units (or retype it tripwire/watch if it is a real \
+         dormant watch).\n\n\
+         You have {} more card(s) queued. Do not stall on a full queue: the aim is every card \
+         driven to {}, working dependencies first. Never --force a gate you cannot satisfy — an \
+         honest blocker beats a false 'done'.",
+        m.card,
+        m.status,
+        quoted_card_text(&m.title.chars().take(110).collect::<String>(), m.card),
+        ball,
+        option_one,
+        retype,
+        m.term,
+        m.card,
+        m.queued,
+        m.term,
+    )
+}
+
+/// py:12964 `_needsyou_renag` — ONE stale-ask re-nag, deduped, shared by both
+/// callers.
+///
+/// There were two copies of this in Python and they diverged: one recorded the
+/// durable event and suppressed within the window, the other checked only tag
+/// age and re-sent every ~15 minutes forever. One implementation, two callers.
+///
+/// COMPLIANCE RESETS THE WINDOW. The message asks the lane to "re-state it on
+/// the card so it resurfaces fresh"; keying purely on tag age made that
+/// instruction unsatisfiable, and a guard whose prescribed remedy cannot clear
+/// it teaches sessions to ignore it (ethos rule 3). Returns None when the ask is
+/// deduped or re-confirmed — i.e. when the honest output is silence.
+fn needsyou_renag_text(
+    conn: &Connection,
+    _session: &str,
+    card: &str,
+    title: &str,
+    asked_age: f64,
+    archived: i64,
+    now: f64,
+) -> Option<String> {
+    let win = needsyou_renag_days() * 86400.0;
+    let last_ts: f64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(ts),0) FROM session_events WHERE type='needsyou.renag' \
+             AND data LIKE ?1",
+            rusqlite::params![format!("%\"{card}\"%")],
+            |r| r.get(0),
+        )
+        .unwrap_or(0.0);
+    if last_ts > 0.0 && (now - last_ts) < win {
+        return None;
+    }
+    if last_ts > 0.0 {
+        let updated: f64 = conn
+            .query_row(
+                "SELECT COALESCE(updated,0) FROM issues WHERE id=?1",
+                rusqlite::params![card],
+                |r| r.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0);
+        if updated > last_ts {
+            // Re-stated since we last asked: that IS the remedy the message
+            // prescribes. Say nothing this round.
+            return None;
+        }
+    }
+    let days = (asked_age / 86400.0) as i64;
+    let arch = if archived != 0 {
+        "This card is ARCHIVED, which does NOT clear the ask — needs:you stays visible to the \
+         human by design.\n\n"
+    } else {
+        ""
+    };
+    Some(format!(
+        "[amux] {card} has been waiting on a human answer for at least {days} days: {}\n\n\
+         {arch}Not asking you to advance it — you cannot. Asking whether the ASK is still right: \
+         is the question you recorded still the question? If it is, re-state it on the card and \
+         that counts as re-confirming it — you will not be asked again for {} days. If it has \
+         been overtaken by events, clear the needs:you tag and move the card to whatever is now \
+         true.",
+        quoted_card_text(&title.chars().take(90).collect::<String>(), card),
+        needsyou_renag_days() as i64
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// The tick
+// ---------------------------------------------------------------------------
+
+/// One sweep over the fleet. ADVANCE BEFORE PICKUP, the same order and the same
+/// two calls Python's idle edge used (py:14389): a lane holding a doing/review
+/// card cannot be helped by pickup — WIP-1 forbids a second card — so a
+/// successful nudge ends that lane's turn.
+pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
+    let tick = TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut report = DriveReport {
+        tick,
+        started_at: now_f64(),
+        ..Default::default()
+    };
+    for lane in fleet.lanes() {
+        let trace = drive_lane(state, fleet, &lane).await;
+        match trace.outcome.as_str() {
+            "assigned" => report.assigned += 1,
+            "skipped" => {}
+            _ => report.nudged += 1,
+        }
+        report.lanes.push(trace);
+    }
+    report.finished_at = now_f64();
+    publish(&report);
+    report
+}
+
+async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTrace {
+    // COUNT THE BACKLOG BEFORE THE GATES, ALWAYS. Found by reading this
+    // instrument's own output during verification: a lane skipped for
+    // `not-running` reported `eligible_todos: 0` while a dispatchable card was
+    // sitting in its queue, because the counts were only filled in on the paths
+    // that got past the gates. That is the ethos rule 4 failure in the very
+    // surface built to prevent it — the reader's question is "how much work is
+    // this lane sitting on, and why did it not get any", and half of that
+    // answer was reported as zero. Every trace row now carries the true depth,
+    // whatever stopped the lane.
+    let (eligible, open) = match state.store.read() {
+        Ok(conn) => (eligible_todo_count(&conn, lane), open_card_count(&conn, lane)),
+        Err(_) => {
+            return LaneTrace::skip(lane, "store-unavailable", "could not open a read connection")
+        }
+    };
+
+    if !fleet.auto_pickup_enabled(lane) {
+        return LaneTrace::skip(lane, "opted-out", "CC_AUTO_PICKUP=0 in the session env")
+            .with_counts(eligible, open);
+    }
+    if !fleet.is_running(lane).await {
+        return LaneTrace::skip(lane, "not-running", "no live session").with_counts(eligible, open);
+    }
+    // THE TURN-BOUNDARY GATE, reused from the steering path. Fails CLOSED:
+    // anything not positively known to be idle is left alone. A nudge that waits
+    // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
+    if !fleet.at_boundary(lane).await {
+        return LaneTrace::skip(lane, "mid-turn", "lane is not at a turn boundary")
+            .with_counts(eligible, open);
+    }
+
+    let now = now_f64();
+    let tags = fleet.tags(lane);
+    let Ok(conn) = state.store.read() else {
+        return LaneTrace::skip(lane, "store-unavailable", "could not open a read connection")
+            .with_counts(eligible, open);
+    };
+    let advance = select_advance(&conn, lane, &tags, now);
+    let pickup = match &advance {
+        Advance::Nudge { .. } => None,
+        Advance::None { .. } => Some(select_pickup(&conn, lane, now)),
+    };
+    drop(conn);
+
+    if let Advance::Nudge { target, card, status, text, kind } = advance {
+        fleet.deliver(&target, &text).await;
+        // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
+        // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
+        // once stamped the card owner's cooldown while the message went to the
+        // reviewer, so the reviewer's own cooldown was never touched). But then
+        // NOTHING stamps the OWNER's lane, and the owner's lane is what
+        // re-selects the same review card on the next tick. Measured live at
+        // 22:07/22:08/22:09: amux-agent was nudged about AC-233 on three
+        // consecutive ticks, 60s apart, stopping only when the per-CARD budget
+        // hit 3 — a bound meant to span 24h, spent in three minutes.
+        //
+        // So the route writes a second, cheap marker under the OWNER. It is a
+        // DIFFERENT type on purpose: `last_advance` counts it (the owner's lane
+        // goes quiet for 15 minutes) while the per-card budget counts only
+        // `advance.nudged`, so recording it cannot burn the reviewer's three
+        // nudges at twice the rate.
+        if kind == "review-routed" && target != lane {
+            crate::api::session_verbs::emit_event(
+                state,
+                lane,
+                "advance.routed",
+                Some(json!({"issue": card, "status": status, "reviewer": target})),
+                None,
+                "board-drive",
+            )
+            .await;
+        }
+        let etype = if kind == "renag" { "needsyou.renag" } else { "advance.nudged" };
+        let idem = if kind == "decompose-asked" {
+            Some(format!("decompose:{card}"))
+        } else {
+            None
+        };
+        // The event carries the card's STATUS, which Python kept only in memory.
+        // That is what makes "did the lane make progress since we spoke?"
+        // survive the restart this process takes on every deploy.
+        crate::api::session_verbs::emit_event(
+            state,
+            &target,
+            etype,
+            Some(json!({"issue": card, "status": status, "kind": kind})),
+            idem,
+            "board-drive",
+        )
+        .await;
+        return LaneTrace::acted(lane, kind, &card, format!("delivered to {target}"))
+            .with_counts(eligible, open);
+    }
+
+    let advance_reason = match &advance {
+        Advance::None { reason, detail } => (*reason, detail.clone()),
+        Advance::Nudge { .. } => unreachable!("handled above"),
+    };
+
+    match pickup.expect("pickup computed whenever advance declined") {
+        Pickup::Claim { card, prompt } => {
+            claim_card(state, lane, &card).await;
+            fleet.deliver(lane, &prompt).await;
+            LaneTrace::acted(lane, "assigned", &card, "claimed and prompt queued")
+                .with_counts(eligible, open)
+        }
+        Pickup::Decompose { ids, text } => {
+            // DURABLE cooldown (py:14627): the in-memory dict was wiped by the
+            // very first reload after shipping and the dispatch re-fired at the
+            // same lane within minutes.
+            let recent = state
+                .store
+                .read()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type='pickup.decompose_nudge' AND ts > ?2 LIMIT 1",
+                        rusqlite::params![lane, now - DECOMPOSE_COOLDOWN_S],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                })
+                .unwrap_or(false);
+            if recent {
+                return LaneTrace::skip(
+                    lane,
+                    "decompose-cooldown",
+                    "every candidate is a capture shell; already asked within 6h",
+                )
+                .with_counts(eligible, open);
+            }
+            crate::api::session_verbs::emit_event(
+                state,
+                lane,
+                "pickup.decompose_nudge",
+                Some(json!({"shells": ids})),
+                None,
+                "board-drive",
+            )
+            .await;
+            fleet.deliver(lane, &text).await;
+            LaneTrace::acted(lane, "decompose-asked", ids.first().map(String::as_str).unwrap_or(""), "queue is all capture shells")
+                .with_counts(eligible, open)
+        }
+        Pickup::None { reason, detail } => {
+            // SILENCE IS THE CORRECT OUTPUT FOR AN EMPTY BOARD (Invariant 20).
+            // Nothing here invents work; the trace records that the lane was
+            // examined and had nothing, which is the fact that was missing.
+            let (areason, adetail) = advance_reason;
+            LaneTrace::skip(
+                lane,
+                reason,
+                if adetail.is_empty() {
+                    detail
+                } else {
+                    format!("{detail} | advance: {areason} ({adetail})")
+                },
+            )
+            .with_counts(eligible, open)
+        }
+    }
+}
+
+/// Claim the card: `doing` + the durable `task.claimed` event the 24h re-claim
+/// cooldown reads + a line in the card's own log.
+///
+/// Claim happens BEFORE delivery, and delivery is a durable queue row, so the
+/// two cannot disagree for long: Python called `send_text` after the UPDATE, so
+/// a failed send left a card claimed with nobody told.
+async fn claim_card(state: &AppState, session: &str, card: &str) {
+    let card_s = card.to_string();
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            let now = now_f64() as i64;
+            conn.execute(
+                "UPDATE issues SET status='doing', updated=?1 WHERE id=?2",
+                rusqlite::params![now, card_s],
+            )?;
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT log FROM issues WHERE id=?1",
+                    rusqlite::params![card_s],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let hhmm = chrono::Local::now().format("%H:%M").to_string();
+            let log = bs::append_log(existing.as_deref(), &hhmm, "Auto-picked up from queue");
+            conn.execute(
+                "UPDATE issues SET log=?1 WHERE id=?2",
+                rusqlite::params![log, card_s],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    crate::api::session_verbs::emit_event(
+        state,
+        session,
+        "task.claimed",
+        // `status` rides along so the progress-yields-cooldown check reads a
+        // claim the same way it reads a nudge: if the lane moves this card
+        // before the 15 minutes are up, that IS progress and it gets the next
+        // one immediately.
+        Some(json!({"issue": card, "status": "doing"})),
+        None,
+        "board-drive",
+    )
+    .await;
+}
+
+/// Background driver.
+pub fn spawn(state: AppState) -> super::PeriodicTask {
+    let secs = std::env::var("AMUX_BOARD_DRIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(BOARD_DRIVE_TICK_SECS);
+    super::spawn_periodic("board-drive", secs, move || {
+        let state = state.clone();
+        async move {
+            let fleet = LiveFleet { state: state.clone() };
+            let r = drive_tick(&state, &fleet).await;
+            if r.assigned > 0 || r.nudged > 0 {
+                tracing::info!(
+                    assigned = r.assigned,
+                    nudged = r.nudged,
+                    lanes = r.lanes.len(),
+                    "[board-drive] tick"
+                );
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// /api/debug/board-drive — the surface whose absence WAS the incident
+// ---------------------------------------------------------------------------
+
+/// Answers, without reading source: is the drive loop running, which lanes did
+/// it examine, what did it hand them, and for every lane it passed over, WHY.
+///
+/// `loop_running: false` is a real answer, not a missing field: before this
+/// existed, a dead loop and a fleet with nothing to do produced byte-identical
+/// evidence, which is how the outage went unnoticed for hours.
+pub async fn debug_board_drive(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let report = last_report();
+    let now = now_f64();
+    // Fleet-wide backlog: how many lanes are sitting on eligible cards right
+    // now. This is the number that says how much work the loop is responsible
+    // for, independent of what the last tick happened to do.
+    let mut waiting: Vec<Value> = Vec::new();
+    if let Ok(conn) = state.store.read() {
+        let lanes = crate::api::session_verbs::all_lane_names();
+        for lane in lanes {
+            let n = eligible_todo_count(&conn, &lane);
+            if n > 0 {
+                waiting.push(json!({"session": lane, "eligible_todos": n}));
+            }
+        }
+    }
+    let seen: HashSet<String> = waiting
+        .iter()
+        .filter_map(|v| v["session"].as_str().map(str::to_string))
+        .collect();
+    let body = json!({
+        "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
+                 was passed over. A skip that leaves no trace is indistinguishable from a loop \
+                 that is not running.",
+        "loop_running": report.is_some(),
+        "tick_secs": std::env::var("AMUX_BOARD_DRIVE_SECS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(BOARD_DRIVE_TICK_SECS),
+        "wip_cap": wip_cap(),
+        "advance_card_budget": advance_card_budget(),
+        "advance_cooldown_s": ADVANCE_COOLDOWN_S,
+        "last_tick_age_s": report.as_ref().map(|r| now - r.finished_at),
+        "last": report,
+        "lanes_with_eligible_cards": waiting.len(),
+        "backlog": waiting,
+        "distinct_lanes_waiting": seen.len(),
+    });
+    (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+pub fn routes() -> axum::Router<AppState> {
+    axum::Router::new().route("/api/debug/board-drive", axum::routing::get(debug_board_drive))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The live board schema, trimmed to the columns these predicates read.
+    fn board_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("memdb");
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
+                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
+                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
+                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
+                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                deleted INTEGER);
+             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));
+             CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT, idem TEXT,
+                source TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cmd_history (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'direct', session TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT '');
+             CREATE TABLE interaction_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER,
+                kind TEXT, actor TEXT, target TEXT, action TEXT, url TEXT, detail TEXT,
+                before TEXT, result TEXT, ok INTEGER, ms INTEGER, seq INTEGER);
+             CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
+                is_builtin INTEGER DEFAULT 1, gate TEXT, mode TEXT DEFAULT 'implicit');
+             CREATE TABLE status_scope (status TEXT, scope_type TEXT, scope_value TEXT);",
+        )
+        .expect("schema");
+        conn
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_card(conn: &Connection, id: &str, session: &str, status: &str, title: &str, desc: &str) {
+        let now = now_f64() as i64;
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+             VALUES (?1,?2,?3,?4,?5,?6,?6,'agent','code')",
+            rusqlite::params![id, title, desc, status, session, now],
+        )
+        .expect("insert");
+    }
+
+    fn tag(conn: &Connection, id: &str, t: &str, added_at: f64) {
+        conn.execute(
+            "INSERT INTO issue_tags (issue_id, tag, added_at) VALUES (?1,?2,?3)",
+            rusqlite::params![id, t, added_at],
+        )
+        .expect("tag");
+    }
+
+    fn claimed(p: &Pickup) -> Option<&str> {
+        match p {
+            Pickup::Claim { card, .. } => Some(card),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_eligible_todo_is_selected_and_the_prompt_names_the_card() {
+        let conn = board_db();
+        add_card(&conn, "T-1", "lane", "todo", "Fix the parser", "SCOPE: real work\n- [ ] do it");
+        let p = select_pickup(&conn, "lane", now_f64());
+        assert_eq!(claimed(&p), Some("T-1"), "an eligible todo must be claimed");
+        let Pickup::Claim { prompt, .. } = &p else { unreachable!() };
+        assert!(prompt.contains("T-1"), "the prompt must name the card id: {prompt}");
+    }
+
+    /// AC-223, hit three times in one session by two different lanes. A card
+    /// marked needs:you is BLOCKED ON A HUMAN; handing it to an agent is handing
+    /// out a decision its owner has not made.
+    #[test]
+    fn a_needs_you_card_is_never_picked_up() {
+        for t in ["needs:you", "needs:you:decision", "NEEDS:YOU"] {
+            let conn = board_db();
+            add_card(&conn, "T-1", "lane", "todo", "Ask Ethan about pricing", "SCOPE: x\n- [ ] y");
+            tag(&conn, "T-1", t, now_f64());
+            let p = select_pickup(&conn, "lane", now_f64());
+            assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
+            assert_eq!(eligible_todo_count(&conn, "lane"), 0, "{t} must not count as eligible");
+        }
+    }
+
+    /// The view must share the predicate of the mechanism it describes: the
+    /// trace's `eligible_todos` and the selector must agree on every card.
+    #[test]
+    fn the_trace_count_agrees_with_the_selector() {
+        let conn = board_db();
+        add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
+        add_card(&conn, "T-2", "lane", "todo", "also real", "SCOPE: x\n- [ ] y");
+        add_card(&conn, "T-3", "lane", "todo", "human", "SCOPE: x\n- [ ] y");
+        tag(&conn, "T-3", "needs:you", now_f64());
+        conn.execute("UPDATE issues SET archived=1 WHERE id='T-2'", []).expect("archive");
+        assert_eq!(eligible_todo_count(&conn, "lane"), 1);
+        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    #[test]
+    fn a_session_at_the_wip_cap_gets_nothing() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "already working", "SCOPE: x");
+        add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::None { reason, detail } => {
+                assert_eq!(reason, "wip-cap");
+                assert!(detail.contains("D-1"), "the trace must name what is held: {detail}");
+            }
+            _ => panic!("a lane holding a doing card must not be handed a second"),
+        }
+    }
+
+    /// Ethan/primis 2026-08-04: an ARCHIVED `doing` card consumed a lane's whole
+    /// WIP-1 budget forever while the board hid it — the lane rendered
+    /// "IN PROGRESS 0" while being structurally unable to take work. Archiving
+    /// means CLEARED; a cleared card cannot be in progress.
+    #[test]
+    fn an_archived_doing_card_does_not_hold_wip() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "cleared", "SCOPE: x");
+        conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
+        add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
+        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// An armed tripwire "costs nothing until it fires" and can never be
+    /// completed by working it — one held a lane's entire WIP-1 budget.
+    #[test]
+    fn dormant_types_neither_hold_wip_nor_get_dispatched() {
+        let conn = board_db();
+        add_card(&conn, "W-1", "lane", "doing", "watch prod", "SCOPE: x");
+        conn.execute("UPDATE issues SET type='watch' WHERE id='W-1'", []).expect("type");
+        add_card(&conn, "W-2", "lane", "todo", "tripwire card", "SCOPE: x");
+        conn.execute("UPDATE issues SET type='tripwire' WHERE id='W-2'", []).expect("type");
+        add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
+        assert_eq!(
+            claimed(&select_pickup(&conn, "lane", now_f64())),
+            Some("T-1"),
+            "the watch must not hold WIP and the tripwire must not be dispatched"
+        );
+    }
+
+    /// Ethos rule 8: a session-tagged HUMAN commitment is queued to the lane for
+    /// visibility only. Silently executing it is an agent deciding a person's
+    /// work is its own (AMUX-1471).
+    #[test]
+    fn a_human_owned_card_is_never_auto_run() {
+        let conn = board_db();
+        add_card(&conn, "H-1", "lane", "todo", "Ethan: call the bank", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET owner_type='human' WHERE id='H-1'", []).expect("owner");
+        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert_eq!(eligible_todo_count(&conn, "lane"), 0);
+    }
+
+    /// py:14515, AMUX-1857: sessions legitimately return owner-blocked cards to
+    /// todo after doing the workable prep; without the cooldown auto-pickup
+    /// re-claimed the same card at the very next idle — infinite churn.
+    #[test]
+    fn a_card_claimed_in_the_last_24h_is_not_reclaimed() {
+        let conn = board_db();
+        add_card(&conn, "T-1", "lane", "todo", "returned", "SCOPE: x\n- [ ] y");
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','task.claimed','{\"issue\": \"T-1\"}','board-drive')",
+            rusqlite::params![now_f64() - 3600.0],
+        )
+        .expect("event");
+        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        // ...and it becomes eligible again once the window passes.
+        conn.execute("UPDATE session_events SET ts=?1", rusqlite::params![now_f64() - 90000.0])
+            .expect("age");
+        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// py:14510: fossils get triaged by a human, not silently executed at idle.
+    #[test]
+    fn a_card_nobody_has_touched_in_seven_days_is_not_auto_run() {
+        let conn = board_db();
+        add_card(&conn, "T-1", "lane", "todo", "fossil", "SCOPE: x\n- [ ] y");
+        conn.execute(
+            "UPDATE issues SET updated=?1 WHERE id='T-1'",
+            rusqlite::params![now_f64() as i64 - 8 * 86400],
+        )
+        .expect("age");
+        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+    }
+
+    /// py:14581, AMUX-2128: refusals used to RETURN, so one refusable card at the
+    /// head of the queue stalled the whole lane — 81 clean todos sat behind
+    /// refusable heads. A refusal must try the next candidate.
+    #[test]
+    fn a_refusable_head_does_not_stall_the_queue() {
+        let conn = board_db();
+        // pos orders the queue, so the shell is first.
+        add_card(&conn, "S-1", "lane", "todo", "shell", "**Prompt:** do a thing for me");
+        conn.execute("UPDATE issues SET pos=1 WHERE id='S-1'", []).expect("pos");
+        add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET pos=2 WHERE id='T-1'", []).expect("pos");
+        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    #[test]
+    fn an_irreversible_operation_is_never_auto_executed() {
+        let conn = board_db();
+        add_card(
+            &conn,
+            "T-1",
+            "lane",
+            "todo",
+            "cleanup",
+            "SCOPE: x\n- [ ] run git reset --hard on the shared checkout",
+        );
+        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+    }
+
+    #[test]
+    fn a_card_blocked_by_an_open_dependency_is_skipped_and_a_closed_one_is_not() {
+        let conn = board_db();
+        add_card(&conn, "B-1", "other", "doing", "blocker", "SCOPE: x");
+        add_card(&conn, "T-1", "lane", "todo", "dependent", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='T-1'", []).expect("dep");
+        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        conn.execute("UPDATE issues SET status='verified' WHERE id='B-1'", []).expect("close");
+        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// Invariant 20: silence is the correct output for an empty board, and the
+    /// trace must SAY so rather than being absent.
+    #[test]
+    fn an_empty_queue_produces_a_reason_not_a_silent_return() {
+        let conn = board_db();
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::None { reason, detail } => {
+                assert_eq!(reason, "no-eligible-card");
+                assert!(!detail.is_empty(), "an empty board must still explain itself");
+            }
+            _ => panic!("nothing should have been claimed"),
+        }
+    }
+
+    #[test]
+    fn every_shell_in_the_queue_produces_a_decompose_ask_not_silence() {
+        let conn = board_db();
+        add_card(&conn, "S-1", "lane", "todo", "shell one", "**Prompt:** please do a thing");
+        add_card(&conn, "S-2", "lane", "todo", "shell two", "capture: session prompt");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::Decompose { ids, text } => {
+                assert_eq!(ids.len(), 2);
+                assert!(text.contains("S-1") && text.contains("S-2"), "must name the ids: {text}");
+            }
+            _ => panic!("an all-shell queue must ask for a decomposition"),
+        }
+    }
+
+    // --- advance ---------------------------------------------------------
+
+    #[test]
+    fn a_lane_holding_a_doing_card_is_nudged_with_the_gate_for_the_next_status() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "the work", "SCOPE: x\n- [ ] y");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { target, card, text, kind, .. } => {
+                assert_eq!(target, "lane");
+                assert_eq!(card, "D-1");
+                assert_eq!(kind, "advance-nudged");
+                assert!(text.contains("D-1"), "must name the card: {text}");
+                assert!(text.contains("review"), "must name the next status: {text}");
+            }
+            Advance::None { reason, detail } => panic!("expected a nudge, got {reason}: {detail}"),
+        }
+    }
+
+    /// py:13375: 182 advance wakes in 24h, one card nudged nine times and then
+    /// discarded. After the budget the loop goes quiet FOR THAT CARD.
+    #[test]
+    fn the_per_card_budget_silences_that_card_but_not_the_lane() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "stuck", "SCOPE: x");
+        add_card(&conn, "D-2", "lane", "review", "other", "SCOPE: x");
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,source) \
+                 VALUES (?1,'lane','advance.nudged','{\"issue\": \"D-1\"}','board-drive')",
+                rusqlite::params![now_f64() - 60.0],
+            )
+            .expect("event");
+        }
+        // The lane's cooldown would normally suppress this; age the events past it.
+        conn.execute(
+            "UPDATE session_events SET ts=?1",
+            rusqlite::params![now_f64() - ADVANCE_COOLDOWN_S - 60.0],
+        )
+        .expect("age");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { card, .. } => assert_eq!(card, "D-2", "must fall through to the next card"),
+            Advance::None { reason, detail } => panic!("expected D-2, got {reason}: {detail}"),
+        }
+    }
+
+    /// AMUX-2270: a session that DID what option 4 told it to do — record the
+    /// human blocker on the card — got nagged again the next night, and the
+    /// night after. An instruction you can comply with and still be re-asked is
+    /// the ethos rule 3 shape.
+    #[test]
+    fn a_fresh_needs_you_card_is_quiet_not_nudged() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "asked Ethan", "SCOPE: x");
+        tag(&conn, "D-1", "needs:you", now_f64() - 3600.0);
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::None { reason, .. } => assert_eq!(reason, "needsyou"),
+            Advance::Nudge { text, .. } => panic!("must stay quiet on a fresh ask: {text}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_needs_you_ask_gets_exactly_one_renag_per_window() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "asked Ethan", "SCOPE: x");
+        let asked = now_f64() - 10.0 * 86400.0;
+        tag(&conn, "D-1", "needs:you", asked);
+        conn.execute("UPDATE issues SET updated=?1 WHERE id='D-1'", rusqlite::params![asked as i64])
+            .expect("age");
+        let first = select_advance(&conn, "lane", &[], now_f64());
+        let Advance::Nudge { kind, .. } = &first else {
+            panic!("a 10-day-old ask must be re-nagged once");
+        };
+        assert_eq!(*kind, "renag");
+        // Record the fire the way drive_lane does, then assert the dedupe holds.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','needsyou.renag','{\"issue\": \"D-1\"}','board-drive')",
+            rusqlite::params![now_f64()],
+        )
+        .expect("event");
+        match select_advance(&conn, "lane", &[], now_f64() + 1.0) {
+            Advance::None { .. } => {}
+            Advance::Nudge { text, .. } => panic!("re-nag must not repeat inside the window: {text}"),
+        }
+    }
+
+    /// py:12979: the message asks the lane to "re-state it on the card so it
+    /// resurfaces fresh". A card edited SINCE the last re-nag counts as
+    /// re-confirmed — a guard whose prescribed remedy cannot clear it teaches
+    /// sessions to ignore it.
+    #[test]
+    fn re_stating_a_needs_you_card_resets_the_window() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "asked Ethan", "SCOPE: x");
+        tag(&conn, "D-1", "needs:you", now_f64() - 10.0 * 86400.0);
+        let renagged_at = now_f64() - 10.0 * 86400.0 + 1.0;
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','needsyou.renag','{\"issue\": \"D-1\"}','board-drive')",
+            rusqlite::params![renagged_at],
+        )
+        .expect("event");
+        conn.execute(
+            "UPDATE issues SET updated=?1 WHERE id='D-1'",
+            rusqlite::params![(renagged_at + 60.0) as i64],
+        )
+        .expect("restate");
+        assert!(
+            needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64()).is_none(),
+            "a re-stated ask must not be re-nagged"
+        );
+    }
+
+    /// A card in review with a named reviewer is the REVIEWER's work: pushing
+    /// the author asks for a self-ack the transition refuses.
+    #[test]
+    fn a_review_card_routes_to_the_reviewer_not_the_author() {
+        let conn = board_db();
+        add_card(&conn, "R-1", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='peer' WHERE id='R-1'", []).expect("rev");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { target, kind, text, .. } => {
+                assert_eq!(target, "peer", "the reviewer is the one who can act");
+                assert_eq!(kind, "review-routed");
+                assert!(text.contains("review->done"), "must name the real transition: {text}");
+            }
+            Advance::None { reason, detail } => panic!("expected routing, got {reason}: {detail}"),
+        }
+    }
+
+    /// AC-234: blocking a card IS a completed review action but leaves it in
+    /// `review`, so without this the sweep re-nudges a reviewer whose analysis is
+    /// already on the card — and AMUX-2498: the conclusion "the author owes the
+    /// next move" must be ACTED on, not thrown away.
+    #[test]
+    fn a_reviewer_who_already_responded_is_not_renudged_and_the_author_is_told() {
+        let conn = board_db();
+        add_card(&conn, "R-1", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='peer' WHERE id='R-1'", []).expect("rev");
+        conn.execute(
+            "INSERT INTO interaction_log (ts,kind,actor,target,action) \
+             VALUES (?1,'board','peer','R-1','patch')",
+            rusqlite::params![chrono::Utc::now().timestamp_millis()],
+        )
+        .expect("ilog");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { target, kind, text, .. } => {
+                assert_eq!(target, "lane", "the ball is with the author");
+                assert_eq!(kind, "advance-nudged");
+                assert!(
+                    text.contains("already responded"),
+                    "the author must be told the reviewer answered: {text}"
+                );
+            }
+            Advance::None { reason, detail } => panic!("expected an author nudge, got {reason}: {detail}"),
+        }
+    }
+
+    /// AMUX-2479: reviewer acks routinely arrive as inter-session MESSAGES, and a
+    /// check that read board writes only re-nudged reviewers who had done the
+    /// work. ENGAGEMENT, not approval — a round-1 BLOCK counts.
+    #[test]
+    fn a_reviewer_ack_delivered_as_a_message_counts_as_engagement() {
+        let conn = board_db();
+        conn.execute(
+            "INSERT INTO cmd_history (text,type,session,ts,origin) \
+             VALUES ('R-1 is blocked: three things must move back','direct','lane',?1,'peer')",
+            rusqlite::params![chrono::Utc::now().timestamp_millis()],
+        )
+        .expect("msg");
+        assert!(reviewer_msg_engagement(&conn, "R-1", "peer") > 0);
+        // AC-316 defect 2: EXACT lane, never a prefix. `amux-cloud`'s message
+        // must not read as engagement by the reviewer `amux`.
+        assert_eq!(reviewer_msg_engagement(&conn, "R-1", "peer-cloud"), 0);
+        // Word boundary: R-1 must not match R-1000.
+        assert_eq!(reviewer_msg_engagement(&conn, "R-10", "peer"), 0);
+    }
+
+    /// AC-298: owning a card is not the same as being able to advance it. This
+    /// nudge fired EIGHT times for one card whose blocker was in review awaiting
+    /// someone else's sign-off — asking for something no honest action of the
+    /// recipient's could produce.
+    #[test]
+    fn a_dependency_the_lane_cannot_act_on_is_not_nudged() {
+        let conn = board_db();
+        add_card(&conn, "B-1", "lane", "review", "blocker in review", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='peer' WHERE id='B-1'", []).expect("rev");
+        add_card(&conn, "D-1", "lane", "doing", "dependent", "SCOPE: x");
+        conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='D-1'", []).expect("dep");
+        // `doing` sorts ahead of `review`, so D-1 is the selected candidate.
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::None { reason, detail } => {
+                assert_eq!(reason, "dep-not-actionable");
+                assert!(detail.contains("B-1"), "{detail}");
+            }
+            Advance::Nudge { text, .. } => panic!("must not nudge an unactionable dependency: {text}"),
+        }
+    }
+
+    /// AMUX-2500: the cap stays on saying the same thing again and LIFTS on
+    /// continuing. A lane that moved the card we named has not stalled.
+    #[test]
+    fn progress_yields_the_cooldown_but_repetition_does_not() {
+        let conn = board_db();
+        add_card(&conn, "D-1", "lane", "doing", "the work", "SCOPE: x");
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) VALUES \
+             (?1,'lane','advance.nudged','{\"issue\":\"D-1\",\"status\":\"doing\"}','board-drive')",
+            rusqlite::params![now_f64() - 60.0],
+        )
+        .expect("event");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
+            Advance::Nudge { text, .. } => panic!("inside the cooldown with no progress: {text}"),
+        }
+        // The lane moved it. The next card should come immediately.
+        conn.execute("UPDATE issues SET status='review' WHERE id='D-1'", []).expect("move");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { card, .. } => assert_eq!(card, "D-1"),
+            Advance::None { reason, detail } => panic!("progress must yield the cooldown, got {reason}: {detail}"),
+        }
+    }
+
+    /// REBUILT FROM THE LIVE SPECIMEN, not a convenient fixture: amux-agent was
+    /// routed AC-233 at 22:07:14, 22:08:14 and 22:09:14 — one per tick, stopping
+    /// only when the per-CARD budget hit 3. The per-LANE cooldown never applied
+    /// because the event is recorded under the REVIEWER while the lane that
+    /// re-selects the card is the OWNER. Three nudges is the 24h budget, spent
+    /// in three minutes.
+    #[test]
+    fn routing_a_review_quiets_the_owner_lane_for_the_cooldown() {
+        let conn = board_db();
+        add_card(&conn, "R-1", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='peer' WHERE id='R-1'", []).expect("rev");
+        let Advance::Nudge { target, kind, .. } = select_advance(&conn, "lane", &[], now_f64())
+        else {
+            panic!("expected the first route");
+        };
+        assert_eq!((target.as_str(), kind), ("peer", "review-routed"));
+        // Record it the way drive_lane does: advance.nudged under the REVIEWER
+        // (budget + reviewer cooldown) and advance.routed under the OWNER.
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) VALUES \
+             (?1,'peer','advance.nudged','{\"issue\":\"R-1\",\"status\":\"review\"}','board-drive'), \
+             (?1,'lane','advance.routed','{\"issue\":\"R-1\",\"status\":\"review\"}','board-drive')",
+            rusqlite::params![now_f64()],
+        )
+        .expect("events");
+        match select_advance(&conn, "lane", &[], now_f64() + 60.0) {
+            Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
+            Advance::Nudge { target, .. } => {
+                panic!("the owner lane must not re-route on the next tick (target {target})")
+            }
+        }
+    }
+
+    /// A board-drive message must never be the thing that wedges a lane's queue.
+    /// Built from the live specimen: amux-rust had 10 steering messages stuck 4
+    /// hours behind a head-of-line message carrying
+    /// `@/Users/ethan/.amux/uploads/x.png`. The send path's refusal is another
+    /// lane's fix; not QUOTING a card's @-mention into a prompt is this one's.
+    #[test]
+    fn a_card_whose_text_opens_the_picker_is_pointed_at_not_quoted() {
+        let conn = board_db();
+        add_card(
+            &conn,
+            "T-1",
+            "lane",
+            "todo",
+            "Fix the logo",
+            "SCOPE: real work\n- [ ] see @/Users/ethan/.amux/uploads/b7965e0b2a8f-image.png",
+        );
+        let Pickup::Claim { prompt, .. } = select_pickup(&conn, "lane", now_f64()) else {
+            panic!("the card is otherwise dispatchable and must still be claimed");
+        };
+        assert!(prompt.contains("T-1"), "the card id must survive: {prompt}");
+        assert!(prompt.contains("amux board show T-1"), "must point at the card: {prompt}");
+        assert!(
+            !crate::api::session_verbs::at_picker_text(&prompt),
+            "a board-drive prompt must never open the picker: {prompt}"
+        );
+        // POSITIVE CONTROL: without an @-mention the desc is quoted in full, so
+        // this test is measuring the filter and not a prompt that never quotes.
+        let conn2 = board_db();
+        add_card(&conn2, "T-2", "lane", "todo", "Fix the logo", "SCOPE: real work\n- [ ] do it");
+        let Pickup::Claim { prompt: p2, .. } = select_pickup(&conn2, "lane", now_f64()) else {
+            panic!("expected a claim");
+        };
+        assert!(p2.contains("- [ ] do it"), "ordinary card text must be quoted: {p2}");
+        assert!(!p2.contains("withheld"));
+    }
+
+    /// REBUILT FROM THE INCIDENT'S OWN ARTIFACT, not from a convenient fixture:
+    /// the end-to-end run queued `[amux auto-pickup] Claimed board card BDQ-1`
+    /// and then, one tick later, `[amux] You went idle holding BDQ-1 in
+    /// 'doing'`. A lane must not be told to drive a card it was handed seconds
+    /// ago — that is restating an instruction it already has, which is the nudge
+    /// shape that does not compound with a better model.
+    #[test]
+    fn a_lane_just_handed_a_card_is_not_immediately_told_to_advance_it() {
+        let conn = board_db();
+        add_card(&conn, "BDQ-1", "lane", "doing", "Port the parser guard", "SCOPE: real work");
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) VALUES \
+             (?1,'lane','task.claimed','{\"issue\":\"BDQ-1\",\"status\":\"doing\"}','board-drive')",
+            rusqlite::params![now_f64() - 5.0],
+        )
+        .expect("event");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::None { reason, .. } => assert_eq!(reason, "cooldown"),
+            Advance::Nudge { text, .. } => {
+                panic!("a card claimed 5s ago must not draw an advance nudge: {text}")
+            }
+        }
+        // ...but the claim does not buy silence forever: once the lane MOVES it,
+        // progress yields the cooldown exactly as it does after a nudge.
+        conn.execute("UPDATE issues SET status='review' WHERE id='BDQ-1'", []).expect("move");
+        assert!(
+            matches!(select_advance(&conn, "lane", &[], now_f64()), Advance::Nudge { .. }),
+            "progress after a claim must still yield the cooldown"
+        );
+    }
+
+    /// AMUX-2312: telling a lane that deploys nothing to drive every card to
+    /// `verified` sets a target whose gate it cannot satisfy truthfully.
+    #[test]
+    fn verified_is_only_named_for_lanes_it_applies_to() {
+        let conn = board_db();
+        conn.execute(
+            "INSERT INTO statuses (id,label,position,gate,mode) VALUES ('verified','Verified',6,NULL,'explicit')",
+            [],
+        )
+        .expect("status");
+        add_card(&conn, "D-1", "lane", "doing", "the work", "SCOPE: x");
+        let Advance::Nudge { text, .. } = select_advance(&conn, "lane", &[], now_f64()) else {
+            panic!("expected a nudge");
+        };
+        assert!(text.contains("close it out to done"), "must aim at done: {text}");
+        // Opt the lane in by tag and the aim becomes verified.
+        conn.execute(
+            "INSERT INTO status_scope (status,scope_type,scope_value) VALUES ('verified','tag','infra')",
+            [],
+        )
+        .expect("scope");
+        conn.execute("DELETE FROM session_events", []).expect("clear");
+        let Advance::Nudge { text, .. } =
+            select_advance(&conn, "lane", &["infra".into()], now_f64())
+        else {
+            panic!("expected a nudge");
+        };
+        assert!(text.contains("close it out to verified"), "must aim at verified: {text}");
+    }
+
+    #[test]
+    fn a_shell_card_in_doing_gets_a_split_ask_not_an_advance_nudge() {
+        let conn = board_db();
+        add_card(&conn, "S-1", "lane", "doing", "shell", "**Prompt:** please do a thing");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::Nudge { kind, text, .. } => {
+                assert_eq!(kind, "decompose-asked");
+                assert!(text.contains("Split it"), "{text}");
+            }
+            Advance::None { reason, detail } => panic!("expected a split ask, got {reason}: {detail}"),
+        }
+    }
+
+    // --- predicates ------------------------------------------------------
+
+    #[test]
+    fn the_junk_predicate_matches_pythons_specimens() {
+        // Structure beats the fold count: a real card with fold RESIDUE.
+        let structured = "ROOT CAUSE: the thing\nNew task: a\nNew task: b\nNew task: c";
+        assert_eq!(pickup_junk_reason("MG-1328 real investigation", structured), "");
+        // A true journal: folds, no structure.
+        assert!(pickup_junk_reason("journal", "New task: a\nNew task: b").contains("journal card"));
+        // GCA-85 + creative-dna: the artifact word must be the SUBJECT.
+        assert!(
+            pickup_junk_reason("Investigate the canary alerting path", "").is_empty(),
+            "a card ABOUT a canary is not a canary (GCA-85: three investigation cards fired \
+             on a mid-title mention)"
+        );
+        assert!(pickup_junk_reason("[test-hygiene] flaky suite", "").is_empty(), "area prefix is vocabulary");
+        assert!(!pickup_junk_reason("[TRIPWIRE, fires on recurrence]", "").is_empty());
+        assert!(!pickup_junk_reason("probe: is the server up", "").is_empty());
+        // Shells.
+        assert!(pickup_junk_reason("x", "**Prompt:** /compact").contains("slash command"));
+        assert!(pickup_junk_reason("x", "**Prompt:** go fix the thing").contains("captured chat prompt"));
+    }
+
+    #[test]
+    fn the_prose_dependency_fallback_finds_a_blocker_and_ignores_a_citation() {
+        assert_eq!(prose_dependency("blocked by AC-138 until it lands"), Some("AC-138".into()));
+        assert_eq!(prose_dependency("depends on MG-1363"), Some("MG-1363".into()));
+        // A bare citation is not a dependency.
+        assert_eq!(prose_dependency("see AC-138 for context"), None);
+    }
+
+    #[test]
+    fn norm_actor_flattens_the_real_origin_spellings() {
+        assert_eq!(norm_actor("mixpeek-frustrations"), "mixpeek-frustrations");
+        assert_eq!(norm_actor("mixpeek frustrations"), "mixpeek-frustrations");
+        assert!(origin_matches("mixpeek frustrations [manual:ip:1.2.3.4]", "mixpeek-frustrations"));
+        assert!(!origin_matches("amux-cloud", "amux"), "prefixes must not match (AC-316)");
+    }
+
+    #[test]
+    fn the_advance_ladder_and_the_reviewer_pairing_stay_derived() {
+        assert_eq!(advance_target("doing"), Some(TaskStatus::Review));
+        assert_eq!(advance_target("review"), Some(TaskStatus::Done));
+        assert_eq!(advance_target("done"), Some(TaskStatus::Verified));
+        assert_eq!(advance_target("todo"), None);
+        // Derived from the enforcement set: review->done and done->verified are
+        // the transitions that need a sign-off.
+        assert!(reviewer_acts_next("review"));
+        assert!(reviewer_acts_next("done"));
+        assert!(!reviewer_acts_next("doing"), "doing->review is not a sign-off");
+    }
+}

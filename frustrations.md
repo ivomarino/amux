@@ -1469,3 +1469,55 @@ FIX: Fixed. The probe is now discriminating (provider/claude.rs `UsageProbe`:
   a good reading is also kept and re-served for AMUX_USAGE_STALE_S (default 600s)
   marked `stale: true` with the live failure in `stale_reason`, so the meter stops
   flickering dark.
+
+## A peer's `install` shipped my uncommitted, unverified WIP straight to the live server
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: board-drive (AMUX-2637)
+CARD: AMUX-2637
+SYMPTOM: I created `crates/amux-server/src/runtime_jobs/board_drive.rs` and wired it
+  into `lib.rs` at ~22:0x, having run NO tests yet. At 22:07 another session rebuilt
+  and installed `~/.local/bin/amux-server-rs` from this shared checkout; `strings` on
+  the live binary shows `runtime_jobs/board_drive.rs`, and `/api/debug/board-drive` —
+  an endpoint I had written minutes earlier — answered on :8822. Within 3 minutes the
+  live loop had claimed AF-38 and AR-112 and routed two review nudges on the real
+  fleet. I never installed anything.
+COST: Unverified code reached production and mutated the live board. It happened to be
+  correct (AF-38/AF-34/AF-33/RH-96 all moved, WIP-1 held), but two defects I found
+  MINUTES LATER by testing shipped with it: a lane was told "you went idle holding
+  BDQ-1" one tick after being handed BDQ-1, and a review route re-fired every 60s until
+  the 24h per-card budget was spent in three minutes. The live build still carries both.
+  The `git push` guard in CLAUDE.md ("check what you are shipping that is not yours")
+  covers the git dimension only; the BUILD dimension has no guard at all, and it is
+  strictly worse — a push ships committed work, an install ships whatever is in the
+  working tree, including a file that has never been compiled by its author.
+FIX: The install path should refuse, or at minimum announce, a build made from a dirty
+  tree containing files no commit references. Cheapest honest version: have the
+  installer stamp `git status --porcelain` + the untracked file list into the binary
+  and surface it at `/health` as `built_from_dirty_tree: [...]`, so "is this build
+  someone's WIP?" is answerable from the instrument everyone already reads instead of
+  from `strings`. Related to the shared-checkout push rule, same root: on a shared
+  checkout, one session's routine action ships another session's in-flight work.
+
+## The board-drive trace reported `eligible_todos: 0` for lanes with cards waiting
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: board-drive (AMUX-2637)
+CARD: AMUX-2637
+SYMPTOM: `/api/debug/board-drive` — the surface built specifically so a skipped lane is
+  distinguishable from a dead loop — showed `bdq-assign  skipped  not-running  elig=0`
+  while BDQ-1 sat dispatchable in that lane's queue. The counts were only filled in on
+  the code paths that got PAST the liveness and turn-boundary gates, so every lane
+  stopped by a gate reported its backlog as zero.
+COST: Caught during my own verification, before anyone else read it — but it is the
+  exact ethos rule 4 failure inside the instrument written to prevent it. The reader's
+  question is "how much work is this lane sitting on, and why did it get none", and
+  half the answer was a confident zero. A wrong number is worse than a missing one.
+FIX: Fixed in board_drive.rs `drive_lane`: the backlog counts are computed BEFORE any
+  gate and attached to every trace row, whatever stopped the lane. General form: when a
+  trace has both a "why" and a "how much", the "how much" must not be computed on the
+  happy path only.

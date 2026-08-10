@@ -218,6 +218,24 @@ async fn async_main() {
     // that spawned it, and is stopped only by an explicit `abort`).
     drop(runtime_jobs::ghost_rescue::spawn(state.clone()));
 
+    // Board -> worker drive loop (AMUX-2637): auto-pickup + the advance nudge.
+    // Python owned this entire loop and the cutover left it behind, so no card
+    // was assigned and no nudge was sent to any of the fleet's python-owned
+    // lanes — and NOTHING errored, because the failure is pure absence. It
+    // delivers through the steering queue, so every nudge lands at a turn
+    // boundary and survives a restart; `/api/debug/board-drive` is the trace
+    // whose absence is why the outage went unnoticed for hours.
+    drop(runtime_jobs::board_drive::spawn(state.clone()));
+
+    // Pane-size restoration (AMUX-2634): a peek resizes the worker's tmux
+    // window to the READER's viewport and tmux pins `window-size manual`, so
+    // one phone glance used to narrow that worker's output permanently — the
+    // fleet was found running at 50/94/102 columns instead of 220. Python had
+    // this restorer (py:4443) and the cutover dropped it. Runs a one-shot
+    // repair at boot, then holds the line on a 20s sweep against an
+    // expiring viewer lease.
+    drop(runtime_jobs::pane_size::spawn());
+
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
