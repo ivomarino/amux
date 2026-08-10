@@ -1,0 +1,963 @@
+//! `POST /api/git/staged-guard` — the shared-checkout staged-state guard.
+//!
+//! # Why this file exists at all
+//!
+//! The endpoint is called by `.git/hooks/amux-staged-guard`, a script the
+//! Python server generated per work_dir and which is therefore **installed on
+//! machines and checkouts this repo cannot see**. Python is retired; the
+//! generator went with it; the hooks did not. So the contract below is not a
+//! design — it is a transcription of what the installed clients already speak,
+//! recovered from `git show 792ce1f^:amux-server.py` (`_staged_guard_check`
+//! py:19400, `_staged_guard_window` py:19187, route py:71813) and from the
+//! generated hook on disk. **The server adapts to the hooks, never the
+//! reverse.**
+//!
+//! Between the rust cutover and this file, `POST /api/git/staged-guard`
+//! answered 405 — 1,147 times an hour — and the hook's `except Exception:
+//! return 0  # fail open` swallowed every one of them. The guard printed
+//! nothing and exited 0 on every commit, fleet-wide, which is precisely the
+//! silent-permissiveness failure it exists to prevent (it was already
+//! silently skipped once before, AC-261). That is the reason this module
+//! reports `undecided` / `degraded` instead of quietly returning an empty
+//! verdict: an empty `foreign` list and "I could not see half the fleet" are
+//! the same bytes on the wire, and the hook cannot tell them apart unless the
+//! server says so (ethos rule 4).
+//!
+//! # Request (from the hook)
+//!
+//! ```json
+//! {"session": "<name>", "dir": "<git toplevel>", "paths": ["<repo-relative>"],
+//!  "op": "commit", "guard_version": 2}
+//! ```
+//! plus `X-Amux-Session` (or `X-Amux-Worker`). The **header wins** over
+//! `body.session`: provenance is the server-verified origin, never body text
+//! (AMUX-1768). `op` and `guard_version` are optional — old hooks send
+//! neither.
+//!
+//! # Response (what the installed hooks read)
+//!
+//! ```json
+//! {"ok": true,
+//!  "foreign":   [{"path","owner","age_secs","has_unstaged_changes","why"}],
+//!  "shared":    [{"path","owner","peer","age_secs","has_unstaged_changes"}],
+//!  "unclaimed": [{"path","has_unstaged_changes"}],
+//!  "cotenants": ["<session>"], "window_secs": 21600}
+//! ```
+//! Every key is present on EVERY return path, including the disabled and
+//! no-cotenant short circuits — python's own comment on that: a caller that
+//! reads `d["shared"]` should get `[]`, not `None`. `foreign` non-empty means
+//! the hook exits 1 and the commit is blocked.
+//!
+//! Fields this server ADDS (old hooks ignore them; the v2 hook prints them):
+//! `undecided` + `reason` (no verdict was computable — do not read the empty
+//! lists as "all clear"), `degraded` (a verdict was computed but may
+//! UNDER-report, with the reasons), and `hook_outdated` (the caller sent no
+//! `guard_version`, so it is a pre-rust hook that swallows server errors).
+//!
+//! # The classification, verbatim from python
+//!
+//! Attribution comes from each session's own JSONL transcript, not from git
+//! state — git state is exactly what is ambiguous when N agents share one
+//! index (AMUX-1730). Sessions are paired by **git repo root**, not by CC_DIR
+//! string (AMUX-2337: in a monorepo those differ, and pairing by string left
+//! 23 of 36 lanes invisible to the guard while it returned 200).
+//!
+//! - `foreign`  — a peer's first-hand write, no first-hand write of yours:
+//!   BLOCKED. Also fires when you have no record of the path at all.
+//! - `shared`   — you edited it too (or it is yours with unstaged changes):
+//!   warned, never blocked. Blocking would deadlock a genuinely shared file.
+//! - `unclaimed` — staged, and NO session has an edit record inside the
+//!   window: warned. Not blockable (no owner to defer to) but silence here is
+//!   what let 762e06e sweep a peer's staged work.
+
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use super::session_verbs::{
+    all_session_workdirs, iter_jsonl_tail, session_jsonl_path, session_work_dir,
+};
+
+/// py:19187 `_staged_guard_window` — floor 600s, default 6h.
+const WINDOW_DEFAULT: f64 = 21600.0;
+const WINDOW_FLOOR: f64 = 600.0;
+/// py `_SHELL_WRITE_SLACK` — how far a file's mtime may sit from a Bash
+/// command's timestamp and still count as that command's write.
+const SHELL_WRITE_SLACK_DEFAULT: f64 = 180.0;
+/// py `_iter_jsonl_tail(jf, max_bytes=4_000_000)`.
+const JSONL_TAIL_BYTES: u64 = 4_000_000;
+/// py `_edit_paths_cache` — 30s per (session, window, provenance).
+const EDIT_CACHE_TTL: f64 = 30.0;
+/// py `rel_paths[:2000]`. Truncation is REPORTED (see `degraded`): a silently
+/// dropped path is an unguarded path.
+const MAX_PATHS: usize = 2000;
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn now_epoch() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default)
+}
+
+fn window_secs() -> f64 {
+    env_f64("AMUX_STAGED_GUARD_WINDOW_SECS", WINDOW_DEFAULT).max(WINDOW_FLOOR)
+}
+
+fn guard_enabled() -> bool {
+    !matches!(
+        std::env::var("AMUX_STAGED_GUARD").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// `os.path.realpath` semantics: resolve symlinks, but NEVER require the path
+/// to exist. `Path::canonicalize` requires existence, and a staged path that
+/// no longer exists is not an edge case here — it is a staged DELETION, one of
+/// the two sweeps that happened on this checkout tonight. Falling back to the
+/// unresolved string would key deletions under a different realpath than the
+/// transcript's, so a peer's deletion would classify as `unclaimed` instead of
+/// `foreign`: the guard would go quiet on exactly the case it was reported for.
+fn realpath(p: &Path) -> String {
+    if let Ok(c) = p.canonicalize() {
+        return c.to_string_lossy().into_owned();
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    while let Some(parent) = cur.parent().map(Path::to_path_buf) {
+        let Some(fname) = cur.file_name().map(|f| f.to_os_string()) else { break };
+        tail.push(fname);
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out.to_string_lossy().into_owned();
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        cur = parent;
+    }
+    p.to_string_lossy().into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// git
+// ---------------------------------------------------------------------------
+
+async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// py:19380 `_repo_root`, memoized — a commit is latency-sensitive and this is
+/// called once per session per check.
+///
+/// Deliberately diverges on ONE point: python memoized the empty string too,
+/// so a directory probed before its repo existed stayed permanently
+/// unresolvable, and unresolvable means the cotenant pairing silently falls
+/// back to string equality (the AMUX-2337 blindness). Failures are not cached.
+static REPO_ROOT_MEMO: Mutex<Option<BTreeMap<String, String>>> = Mutex::new(None);
+
+async fn repo_root(dir: &str) -> Option<String> {
+    if dir.is_empty() {
+        return None;
+    }
+    if let Ok(g) = REPO_ROOT_MEMO.lock() {
+        if let Some(hit) = g.as_ref().and_then(|m| m.get(dir)).cloned() {
+            return Some(hit);
+        }
+    }
+    let root = git_out(dir, &["rev-parse", "--show-toplevel"])
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if let Ok(mut g) = REPO_ROOT_MEMO.lock() {
+        g.get_or_insert_with(BTreeMap::new).insert(dir.to_string(), root.clone());
+    }
+    Some(root)
+}
+
+// ---------------------------------------------------------------------------
+// Transcript-derived edit records (py:19207 `_session_recent_edit_paths`)
+// ---------------------------------------------------------------------------
+
+const EDIT_TOOL_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// py `_PATHLIKE_RE`. Deliberately loose — the mtime check is what decides
+/// ownership, not this regex.
+fn pathlike_re() -> &'static regex::Regex {
+    static RE: Mutex<Option<&'static regex::Regex>> = Mutex::new(None);
+    let mut g = RE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = *g {
+        return r;
+    }
+    // The pattern is a compile-time constant and known good; the leak is a
+    // one-time 'static promotion, not per-call.
+    let r: &'static regex::Regex = Box::leak(Box::new(
+        regex::Regex::new(r"[\w./~-]*[\w-]+\.[A-Za-z0-9]{1,8}").expect("static regex"),
+    ));
+    *g = Some(r);
+    r
+}
+
+/// One session's edit records plus whether we could actually SEE its
+/// transcript. `transcript_found=false` is the difference between "this
+/// session edited nothing" and "this session is invisible to the guard" —
+/// identical `paths` maps, opposite meanings, and only the second one can let
+/// a sweep through.
+#[derive(Clone, Default)]
+struct EditScan {
+    paths: HashMap<String, f64>,
+    transcript_found: bool,
+}
+
+type EditCacheKey = (String, u64, bool);
+static EDIT_CACHE: Mutex<Option<HashMap<EditCacheKey, (f64, EditScan)>>> = Mutex::new(None);
+
+fn parse_ts(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.timestamp() as f64 + f64::from(dt.timestamp_subsec_millis()) / 1000.0);
+    }
+    // `datetime.fromisoformat` also accepts a naive stamp; python then read it
+    // as local time. Claude's transcripts are always Z-suffixed, so this is a
+    // fallback, and UTC is the safe reading: guessing local could shift a
+    // record by hours and silently drop it out of the window.
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .map(|n| n.and_utc().timestamp() as f64)
+}
+
+/// py:19207. `{abs realpath: epoch ts}` of files this session edited inside
+/// the window, read from its own JSONL transcript.
+///
+/// Two provenances, and callers must choose (AMUX-2456): FIRST-HAND is an
+/// Edit/Write/MultiEdit `tool_use` naming the file — the transcript says this
+/// session wrote it. INFERRED is a Bash command naming a path whose mtime
+/// moved within the slack window; that catches `sed -i` and heredocs, but
+/// mtime is a SHARED resource on a shared checkout, so it can claim a peer's
+/// write. `firsthand_only` drops the inferred half.
+fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditScan {
+    let now = now_epoch();
+    let key: EditCacheKey = (name.to_string(), since_secs.to_bits(), firsthand_only);
+    if let Ok(g) = EDIT_CACHE.lock() {
+        if let Some((at, scan)) = g.as_ref().and_then(|m| m.get(&key)) {
+            if now - at < EDIT_CACHE_TTL {
+                return scan.clone();
+            }
+        }
+    }
+    let mut scan = EditScan::default();
+    let slack = env_f64("AMUX_SHELL_WRITE_SLACK", SHELL_WRITE_SLACK_DEFAULT);
+    // Base for RELATIVE paths named in shell commands. Python's comment: without
+    // it the per-block `except` swallowed a NameError and the shell-write
+    // detection was silently inert — shipped and doing nothing.
+    let work_hint = session_work_dir(name);
+    if let Some(jf) = session_jsonl_path(name) {
+        scan.transcript_found = true;
+        let cutoff = now - since_secs;
+        for e in iter_jsonl_tail(&jf, JSONL_TAIL_BYTES) {
+            let Some(ts) = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts) else {
+                continue;
+            };
+            if ts < cutoff {
+                continue;
+            }
+            let Some(content) = e.get("message").and_then(|m| m.get("content")).and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for blk in content {
+                if blk.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let tool = blk.get("name").and_then(Value::as_str).unwrap_or("");
+                if tool == "Bash" {
+                    if firsthand_only {
+                        continue;
+                    }
+                    let cmd = blk
+                        .get("input")
+                        .and_then(|i| i.get("command"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if cmd.is_empty() {
+                        continue;
+                    }
+                    for m in pathlike_re().find_iter(cmd) {
+                        let cand = m.as_str().trim_matches(|c| "'\"),;:".contains(c));
+                        if cand.len() < 4 {
+                            continue;
+                        }
+                        let abs = if Path::new(cand).is_absolute() {
+                            PathBuf::from(cand)
+                        } else if work_hint.is_empty() {
+                            continue
+                        } else {
+                            Path::new(&work_hint).join(cand)
+                        };
+                        // MTIME IS WHAT KEEPS THIS HONEST: naming a path is not
+                        // writing it. `grep x foo.rs` mentions foo.rs and changes
+                        // nothing, so a path is only claimed if the file actually
+                        // moved while the command ran.
+                        let Ok(md) = std::fs::metadata(&abs) else { continue };
+                        if !md.is_file() {
+                            continue;
+                        }
+                        let Some(mt) = md
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs_f64())
+                        else {
+                            continue;
+                        };
+                        if (mt - ts).abs() <= slack {
+                            let ap = realpath(&abs);
+                            if mt > *scan.paths.get(&ap).unwrap_or(&0.0) {
+                                scan.paths.insert(ap, mt);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !EDIT_TOOL_NAMES.contains(&tool) {
+                    continue;
+                }
+                let inp = blk.get("input");
+                let fp = inp
+                    .and_then(|i| i.get("file_path"))
+                    .or_else(|| inp.and_then(|i| i.get("notebook_path")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !fp.is_empty() {
+                    scan.paths.insert(realpath(Path::new(fp)), ts);
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = EDIT_CACHE.lock() {
+        g.get_or_insert_with(HashMap::new).insert(key, (now, scan.clone()));
+    }
+    scan
+}
+
+// ---------------------------------------------------------------------------
+// Classification — pure, so the FIRING path is testable (ethos rule 7)
+// ---------------------------------------------------------------------------
+
+/// Everything the verdict is computed from. Split out so `classify` takes no
+/// filesystem, no git and no clock: the tests below fire the BLOCK path
+/// directly, because a guard that has never been observed refusing is theatre.
+#[derive(Default)]
+pub(crate) struct GuardInputs {
+    /// abs realpath -> ts, requesting session, both provenances.
+    pub mine: HashMap<String, f64>,
+    /// abs realpath, requesting session, first-hand only.
+    pub mine_firsthand: HashSet<String>,
+    /// abs realpath -> (owner session, newest ts), all cotenants.
+    pub theirs: HashMap<String, (String, f64)>,
+    /// abs realpath, any cotenant, first-hand only.
+    pub theirs_firsthand: HashSet<String>,
+    /// abs realpath of files with UNSTAGED changes right now.
+    pub dirty: HashSet<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct Verdict {
+    pub foreign: Vec<Value>,
+    pub shared: Vec<Value>,
+    pub unclaimed: Vec<Value>,
+}
+
+/// py:19470-19545. `paths` is (repo-relative, absolute realpath) pairs.
+pub(crate) fn classify(
+    paths: &[(String, String)],
+    now: f64,
+    window: f64,
+    inp: &GuardInputs,
+) -> Verdict {
+    let mut v = Verdict::default();
+    for (rel, ap) in paths {
+        if rel.trim().is_empty() {
+            continue;
+        }
+        let hit = inp.theirs.get(ap);
+        let is_dirty = inp.dirty.contains(ap);
+        // PROVENANCE STRENGTH, not mere presence (AF-19). `mine` includes the
+        // INFERRED half, and this branch `continue`s — so an inferred
+        // self-claim used to SUPPRESS the block below and downgrade it to a
+        // note. Measured on the incident: a staged test file amux had never
+        // opened classified `shared` because their `git add` named it while
+        // its mtime was moving, and 762e06e swept it. A first-hand peer claim
+        // outranks an inferred self-claim; both first-hand or both inferred is
+        // still genuinely shared.
+        if !inp.mine_firsthand.contains(ap) {
+            if let Some((owner, ts)) = hit {
+                if inp.theirs_firsthand.contains(ap) {
+                    v.foreign.push(json!({
+                        "path": rel,
+                        "owner": owner,
+                        "age_secs": (now - ts).max(0.0) as i64,
+                        "has_unstaged_changes": is_dirty,
+                        // Python emitted "your claim is inferred" here
+                        // unconditionally, including when the committer had NO
+                        // claim on the path at all — a false statement about
+                        // the reader's own work, printed at the moment they are
+                        // deciding whether to override. Same verdict, honest
+                        // sentence: only say the claim was inferred when there
+                        // actually is one (AF-26 applied to its own wording).
+                        "why": if inp.mine.contains_key(ap) {
+                            "they wrote it (transcript); your claim is inferred".to_string()
+                        } else {
+                            format!(
+                                "they wrote it (transcript); you have no edit record on this path in the last {}m — basis is edit records, not the staged diff",
+                                (window / 60.0) as i64
+                            )
+                        },
+                    }));
+                    continue;
+                }
+            }
+        }
+        if inp.mine.contains_key(ap) {
+            if hit.is_some() || is_dirty {
+                // `peer` distinguishes the two reasons this fires, which the
+                // owner field alone cannot (AF-24): a real co-editor, versus
+                // YOUR OWN file that merely has unstaged changes. The renderer
+                // said "also edited by session '(unknown)'" for the second
+                // case — a phantom co-editor on a solo edit, which is how a
+                // real co-edit warning stops being read.
+                v.shared.push(json!({
+                    "path": rel,
+                    "owner": hit.map(|(o, _)| o.as_str()).unwrap_or("(unknown)"),
+                    "peer": hit.is_some(),
+                    "age_secs": hit.map(|(_, ts)| (now - ts).max(0.0) as i64).unwrap_or(0),
+                    "has_unstaged_changes": is_dirty,
+                }));
+            }
+            continue;
+        }
+        if let Some((owner, ts)) = hit {
+            v.foreign.push(json!({
+                "path": rel,
+                "owner": owner,
+                "age_secs": (now - ts).max(0.0) as i64,
+                "has_unstaged_changes": is_dirty,
+                // WHY, recorded on the verdict (AF-26): a block that says only
+                // "edited by X" cannot be told apart from a block that is
+                // wrong. The basis is edit RECORDS in a window — this never
+                // reads the staged patch — so say that where the reader is.
+                "why": format!(
+                    "no edit of yours on this path in the last {}m; basis is edit records, not the staged diff",
+                    (window / 60.0) as i64
+                ),
+            }));
+            continue;
+        }
+        // THE BELT (AMUX-2443 / AF-19 residual / AC-297): staged, not yours by
+        // any record, and no peer trail either. Not blockable — no owner to
+        // defer to, and it may be the committer's own pre-window work — but
+        // silence is what made 762e06e a sweep.
+        v.unclaimed.push(json!({"path": rel, "has_unstaged_changes": is_dirty}));
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+/// Every response carries EVERY key python's did, on every path — including
+/// the short circuits. A caller reading `d["shared"]` must get `[]`, never
+/// `None`; shape-inconsistent returns are how a consumer ends up special-casing
+/// one branch and silently mishandling the other.
+#[derive(Default)]
+struct Envelope {
+    verdict: Verdict,
+    cotenants: Vec<String>,
+    window: f64,
+    /// A verdict WAS computed but may UNDER-report: a peer we could not see, a
+    /// git call that failed, paths truncated.
+    degraded: Vec<String>,
+    /// Set when NO verdict was computable. The empty lists are then not "all
+    /// clear", and the v2 hook says so out loud rather than exiting 0 silently.
+    undecided: Option<String>,
+    hook_outdated: bool,
+}
+
+impl Envelope {
+    fn json(self) -> Value {
+        json!({
+            "ok": true,
+            "foreign": self.verdict.foreign,
+            "shared": self.verdict.shared,
+            "unclaimed": self.verdict.unclaimed,
+            "cotenants": self.cotenants,
+            "window_secs": self.window as i64,
+            "undecided": self.undecided.is_some(),
+            "reason": self.undecided.unwrap_or_default(),
+            "degraded": self.degraded,
+            "hook_outdated": self.hook_outdated,
+        })
+    }
+}
+
+/// Sessions still running a pre-rust hook — the one whose `except: return 0`
+/// hid the 405 for the entire cutover. Warned once per session per hour: the
+/// hook fires ~1,147 times an hour fleet-wide, and a detector that logs on
+/// every call spends the same resource (log volume) as the faults it is
+/// hunting (ethos rule 7).
+static OUTDATED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
+
+fn warn_outdated_hook(session: &str, dir: &str) {
+    let now = now_epoch();
+    let key = format!("{session}\u{1}{dir}");
+    if let Ok(mut g) = OUTDATED_WARNED.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.get(&key).is_some_and(|at| now - at < 3600.0) {
+            return;
+        }
+        m.insert(key, now);
+    }
+    tracing::warn!(
+        target: "staged_guard",
+        "[staged-guard] OUTDATED HOOK: {} in {} sent no guard_version — that hook swallows \
+         server errors (`except Exception: return 0`) and printed nothing for the whole \
+         405 window. Reinstall: scripts/install-hooks.sh",
+        if session.is_empty() { "(no session)" } else { session },
+        dir
+    );
+}
+
+pub async fn staged_guard(headers: HeaderMap, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
+    // Parsed by hand rather than via `Json<T>`: axum's rejection is a
+    // PLAIN-TEXT 400, which the hook's `json.loads` throws on — straight into
+    // the `except` that started this incident. Every answer from here is JSON.
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let obj = parsed.as_object();
+    let get_str = |k: &str| -> String {
+        obj.and_then(|o| o.get(k)).and_then(Value::as_str).unwrap_or("").trim().to_string()
+    };
+
+    // Server-verified origin wins over the claimed body session (AMUX-1768).
+    let origin = super::alerts::hdr_worker(&headers);
+    let session: String =
+        if origin.is_empty() { get_str("session") } else { origin }.chars().take(64).collect();
+    let wd_raw = get_str("dir");
+    let op: String = {
+        let o = get_str("op");
+        if o.is_empty() { "commit".into() } else { o.chars().take(24).collect() }
+    };
+    let guard_version =
+        obj.and_then(|o| o.get("guard_version")).and_then(Value::as_i64).unwrap_or(0);
+    let hook_outdated = guard_version < 2;
+    if hook_outdated {
+        warn_outdated_hook(&session, &wd_raw);
+    }
+
+    if wd_raw.is_empty() {
+        // py:71821 — the one non-200, kept byte-compatible.
+        return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "dir required"})));
+    }
+    let window = window_secs();
+    if !guard_enabled() {
+        let mut v = Envelope { window, hook_outdated, ..Default::default() }.json();
+        v["enabled"] = json!(false);
+        return (StatusCode::OK, Json(v));
+    }
+
+    let raw_paths: Vec<String> = obj
+        .and_then(|o| o.get("paths"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let wd = std::fs::canonicalize(&wd_raw)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| wd_raw.clone());
+
+    let mut degraded: Vec<String> = Vec::new();
+
+    // ---- cotenants, paired by REPO ROOT (AMUX-2337) -----------------------
+    let all_dirs: BTreeMap<String, String> = all_session_workdirs();
+    if all_dirs.is_empty() {
+        // The one genuinely undecidable state: with no session inventory there
+        // are no cotenants to compare against, so the verdict would be an
+        // empty `foreign` — indistinguishable from "your commit is clean". Say
+        // so instead of answering it.
+        return (
+            StatusCode::OK,
+            Json(
+                Envelope {
+                    window,
+                    degraded,
+                    hook_outdated,
+                    undecided: Some(format!(
+                        "no session inventory readable ({}/sessions) — cotenants unknown, so an \
+                         empty verdict here means NOTHING was compared",
+                        amux_home().display()
+                    )),
+                    ..Default::default()
+                }
+                .json(),
+            ),
+        );
+    }
+    let wd_root = match repo_root(&wd).await {
+        Some(r) => r,
+        None => {
+            degraded.push(format!(
+                "`git -C {wd} rev-parse --show-toplevel` failed — falling back to the raw \
+                 directory for cotenant pairing, which misses lanes whose CC_DIR is a \
+                 subdirectory of the repo (AMUX-2337)"
+            ));
+            wd.clone()
+        }
+    };
+    let mut cotenants: Vec<String> = Vec::new();
+    for (other, od) in &all_dirs {
+        if other == &session {
+            continue;
+        }
+        let root = repo_root(od).await.unwrap_or_else(|| od.clone());
+        if root == wd_root {
+            cotenants.push(other.clone());
+        }
+    }
+
+    if cotenants.is_empty() || raw_paths.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(Envelope { cotenants, window, degraded, hook_outdated, ..Default::default() }.json()),
+        );
+    }
+
+    let truncated = raw_paths.len() > MAX_PATHS;
+    if truncated {
+        degraded.push(format!(
+            "{} staged paths, only the first {MAX_PATHS} were classified — the remainder are \
+             UNGUARDED in this verdict",
+            raw_paths.len()
+        ));
+    }
+    let rel_paths: Vec<String> = raw_paths.into_iter().take(MAX_PATHS).collect();
+
+    // ---- unstaged-right-now (AC-297): the working tree is ground truth ----
+    let mut dirty: HashSet<String> = HashSet::new();
+    match git_out(&wd, &["diff", "--name-only", "-z"]).await {
+        Some(out) => {
+            for p in out.split('\0').filter(|p| !p.trim().is_empty()) {
+                dirty.insert(realpath(&Path::new(&wd).join(p)));
+            }
+        }
+        None => degraded.push(format!(
+            "`git -C {wd} diff --name-only` failed — `has_unstaged_changes` is unknown, so \
+             co-edit notices may render as NOTE where they should be WARNING"
+        )),
+    }
+
+    // ---- transcripts (blocking IO, off the async executor) ----------------
+    let scan_session = session.clone();
+    let scan_cotenants = cotenants.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        let mine = if scan_session.is_empty() {
+            EditScan::default()
+        } else {
+            recent_edit_paths(&scan_session, window, false)
+        };
+        let mine_fh = if scan_session.is_empty() {
+            EditScan::default()
+        } else {
+            recent_edit_paths(&scan_session, window, true)
+        };
+        let mut theirs: HashMap<String, (String, f64)> = HashMap::new();
+        let mut theirs_fh: HashSet<String> = HashSet::new();
+        let mut blind: Vec<String> = Vec::new();
+        for other in &scan_cotenants {
+            let fh = recent_edit_paths(other, window, true);
+            if !fh.transcript_found {
+                blind.push(other.clone());
+            }
+            theirs_fh.extend(fh.paths.keys().cloned());
+            for (p, ts) in recent_edit_paths(other, window, false).paths {
+                match theirs.get(&p) {
+                    Some((_, cur)) if *cur >= ts => {}
+                    _ => {
+                        theirs.insert(p, (other.clone(), ts));
+                    }
+                }
+            }
+        }
+        (mine, mine_fh, theirs, theirs_fh, blind)
+    })
+    .await;
+
+    let (mine, mine_fh, theirs, theirs_fh, blind) = match scan {
+        Ok(t) => t,
+        Err(e) => {
+            // NEVER a 500. A 5xx reaches the hook as an exception and the whole
+            // point of this file is that an exception there is invisible.
+            return (
+                StatusCode::OK,
+                Json(
+                    Envelope {
+                        cotenants,
+                        window,
+                        degraded,
+                        hook_outdated,
+                        undecided: Some(format!(
+                            "transcript scan did not complete ({e}) — nothing was compared"
+                        )),
+                        ..Default::default()
+                    }
+                    .json(),
+                ),
+            );
+        }
+    };
+
+    if !mine.transcript_found && !session.is_empty() {
+        // Not undecided — a missing self-transcript makes the guard STRICTER
+        // (nothing is claimed as yours), so the verdict is still safe. But it
+        // is the reason a commit can be blocked on your own work, which is
+        // exactly the AF-26 false positive, so name it where the operator is.
+        degraded.push(format!(
+            "no transcript found for '{session}' — none of the staged paths can be claimed as \
+             yours, so this verdict is stricter than it should be"
+        ));
+    }
+    if !blind.is_empty() {
+        // The dangerous direction: their edits are invisible, so the verdict
+        // UNDER-reports and a sweep of their work would pass silently.
+        degraded.push(format!(
+            "no transcript for cotenant(s) {} — their edits are INVISIBLE to this verdict; \
+             an empty result does not clear their files",
+            blind.join(", ")
+        ));
+    }
+
+    let now = now_epoch();
+    let pairs: Vec<(String, String)> = rel_paths
+        .iter()
+        .map(|rel| (rel.clone(), realpath(&Path::new(&wd).join(rel))))
+        .collect();
+    let inputs = GuardInputs {
+        mine: mine.paths,
+        mine_firsthand: mine_fh.paths.keys().cloned().collect(),
+        theirs,
+        theirs_firsthand: theirs_fh,
+        dirty,
+    };
+    let v = classify(&pairs, now, window, &inputs);
+
+    if !v.foreign.is_empty() {
+        // BLOCK-TIME FORENSICS (AF-27). A block is the expensive verdict and
+        // the only one that was undiagnosable after the fact — by the time
+        // anyone looked, the claim set had been recomputed and the trail was
+        // gone. Logged AT the decision: what the committer's claim set held,
+        // how it was sourced, how old its newest entry was.
+        let newest = inputs.mine.values().copied().fold(0.0_f64, f64::max);
+        tracing::warn!(
+            target: "staged_guard",
+            "[staged-guard/AF-27] {} blocked {} in {} — window={}s mine={} (firsthand={}, newest={}) \
+             cotenants={}; per-path: {}",
+            if session.is_empty() { "(no session)" } else { &session },
+            op,
+            wd_root,
+            window as i64,
+            inputs.mine.len(),
+            inputs.mine_firsthand.len(),
+            if newest > 0.0 { format!("{:.1}s ago", now - newest) } else { "none".into() },
+            cotenants.len(),
+            v.foreign
+                .iter()
+                .take(8)
+                .map(|f| {
+                    let rel = f["path"].as_str().unwrap_or("");
+                    let ap = realpath(&Path::new(&wd).join(rel));
+                    format!(
+                        "{rel} in_mine={} in_firsthand={} owner={} age={}s",
+                        inputs.mine.contains_key(&ap),
+                        inputs.mine_firsthand.contains(&ap),
+                        f["owner"].as_str().unwrap_or(""),
+                        f["age_secs"].as_i64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(
+            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, ..Default::default() }
+                .json(),
+        ),
+    )
+}
+
+fn amux_home() -> PathBuf {
+    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests — every one of these fires the BLOCK path or a bypass of it. A guard
+// whose refusal has never been observed is theatre, and this one has already
+// regressed to silence twice (AC-261, then the rust cutover's 405).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(rel: &str) -> (String, String) {
+        (rel.to_string(), format!("/repo/{rel}"))
+    }
+
+    fn peer_wrote(path: &str, owner: &str, ts: f64) -> GuardInputs {
+        let mut g = GuardInputs::default();
+        g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
+        g.theirs_firsthand.insert(format!("/repo/{path}"));
+        g
+    }
+
+    /// THE FIRING PATH. A staged file a peer wrote and this session never
+    /// touched must BLOCK — this is the case the guard exists for and the case
+    /// that has been silently unenforced since the cutover.
+    #[test]
+    fn peer_edited_path_blocks() {
+        let inp = peer_wrote("amux-server.py", "peer-lane", 1000.0);
+        let v = classify(&[pair("amux-server.py")], 1600.0, 21600.0, &inp);
+        assert_eq!(v.foreign.len(), 1, "a peer's staged file MUST block");
+        assert_eq!(v.foreign[0]["owner"], json!("peer-lane"));
+        assert_eq!(v.foreign[0]["age_secs"], json!(600));
+        // The `why` must not assert a claim the committer does not have. This
+        // assertion failed on the first cut — python's wording said "your claim
+        // is inferred" even with an EMPTY claim set — which is what the message
+        // is for: telling the reader what was actually compared.
+        let why = v.foreign[0]["why"].as_str().unwrap();
+        assert!(why.contains("no edit record on this path"), "misleading why: {why}");
+        assert!(why.contains("edit records, not the staged diff"), "why: {why}");
+        assert!(v.shared.is_empty() && v.unclaimed.is_empty());
+    }
+
+    /// A staged DELETION of a peer's file blocks identically — the path no
+    /// longer exists on disk, which is why `realpath` must not require it to.
+    #[test]
+    fn peer_deleted_path_still_blocks() {
+        let inp = peer_wrote("gone.rs", "peer-lane", 1500.0);
+        let v = classify(&[pair("gone.rs")], 1600.0, 21600.0, &inp);
+        assert_eq!(v.foreign.len(), 1, "a staged deletion of a peer's file MUST block");
+    }
+
+    /// AF-19, the regression that let 762e06e through: an INFERRED self-claim
+    /// (a Bash command that merely named the file) must not outrank a peer's
+    /// first-hand write.
+    #[test]
+    fn inferred_self_claim_does_not_suppress_a_firsthand_peer_block() {
+        let mut inp = peer_wrote("test_x.py", "peer-lane", 1000.0);
+        inp.mine.insert("/repo/test_x.py".into(), 1200.0); // inferred only
+        let v = classify(&[pair("test_x.py")], 1600.0, 21600.0, &inp);
+        assert_eq!(v.foreign.len(), 1, "an inferred self-claim must not downgrade the block");
+        assert!(v.foreign[0]["why"].as_str().unwrap().contains("your claim is inferred"));
+    }
+
+    /// The legitimate claim: both sessions really edited it. Warned, never
+    /// blocked — blocking would deadlock a genuinely shared file.
+    #[test]
+    fn firsthand_on_both_sides_is_shared_not_foreign() {
+        let mut inp = peer_wrote("shared.rs", "peer-lane", 1000.0);
+        inp.mine.insert("/repo/shared.rs".into(), 1200.0);
+        inp.mine_firsthand.insert("/repo/shared.rs".into());
+        let v = classify(&[pair("shared.rs")], 1600.0, 21600.0, &inp);
+        assert!(v.foreign.is_empty());
+        assert_eq!(v.shared.len(), 1);
+        assert_eq!(v.shared[0]["peer"], json!(true));
+    }
+
+    /// AF-24: your OWN file with unstaged changes is not a co-edit. `peer`
+    /// false is what stops the renderer inventing a session named "(unknown)".
+    #[test]
+    fn own_dirty_file_is_shared_without_a_phantom_peer() {
+        let mut inp = GuardInputs::default();
+        inp.mine.insert("/repo/mine.rs".into(), 1200.0);
+        inp.mine_firsthand.insert("/repo/mine.rs".into());
+        inp.dirty.insert("/repo/mine.rs".into());
+        let v = classify(&[pair("mine.rs")], 1600.0, 21600.0, &inp);
+        assert_eq!(v.shared.len(), 1);
+        assert_eq!(v.shared[0]["peer"], json!(false));
+        assert_eq!(v.shared[0]["owner"], json!("(unknown)"));
+        assert_eq!(v.shared[0]["has_unstaged_changes"], json!(true));
+    }
+
+    /// THE BELT (AMUX-2443): staged, no record from anyone. Not blocked, but
+    /// never silent — silence is what made 762e06e a sweep.
+    #[test]
+    fn unrecorded_path_is_reported_unclaimed() {
+        let v = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &GuardInputs::default());
+        assert!(v.foreign.is_empty());
+        assert_eq!(v.unclaimed.len(), 1);
+        assert_eq!(v.unclaimed[0]["path"], json!("mystery.txt"));
+    }
+
+    /// The envelope shape the installed hooks parse. Every key on every path,
+    /// including the short circuits: a hook reading `d["shared"]` gets `[]`.
+    #[test]
+    fn envelope_carries_every_key_the_hook_reads() {
+        let v = Envelope { window: 21600.0, hook_outdated: true, ..Default::default() }.json();
+        for k in ["ok", "foreign", "shared", "unclaimed", "cotenants", "window_secs"] {
+            assert!(v.get(k).is_some(), "missing key the installed hook reads: {k}");
+        }
+        assert!(v["foreign"].is_array() && v["shared"].is_array() && v["unclaimed"].is_array());
+        assert_eq!(v["undecided"], json!(false));
+        assert_eq!(v["hook_outdated"], json!(true));
+    }
+
+    /// `undecided` must never look like a clean verdict.
+    #[test]
+    fn undecided_is_distinguishable_from_all_clear() {
+        let v = Envelope {
+            window: 21600.0,
+            undecided: Some("cotenants unknown".into()),
+            ..Default::default()
+        }
+        .json();
+        assert_eq!(v["undecided"], json!(true));
+        assert_eq!(v["reason"], json!("cotenants unknown"));
+        assert!(v["foreign"].as_array().unwrap().is_empty());
+    }
+
+    /// `realpath` on a path that does not exist must still resolve its
+    /// existing ancestors — otherwise staged deletions key differently from
+    /// the transcript records and drop out of the comparison entirely.
+    #[test]
+    fn realpath_resolves_nonexistent_leaf() {
+        let dir = std::env::temp_dir();
+        let real_dir = dir.canonicalize().unwrap();
+        let got = realpath(&dir.join("definitely-not-here-amux-guard.rs"));
+        assert_eq!(got, real_dir.join("definitely-not-here-amux-guard.rs").to_string_lossy());
+    }
+
+    #[test]
+    fn window_has_a_floor() {
+        // py:19187: max(600, env). A tiny window would make almost everything
+        // `unclaimed` and nothing `foreign` — a guard that never blocks.
+        assert!(window_secs() >= WINDOW_FLOOR);
+    }
+}
