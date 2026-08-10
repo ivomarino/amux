@@ -99,6 +99,17 @@ pub struct Runtime {
     pub resume_stagger_secs: u64,
 }
 
+
+/// True when a board status is outside the closed `TaskStatus` vocabulary.
+///
+/// Deliberately asks `parse_status` rather than keeping a second list — a
+/// duplicated vocabulary is one that disagrees with itself the first time either
+/// copy changes, which is the seam this repo keeps paying for.
+fn amux_server_parse_status_is_unmodelled(raw: &str) -> bool {
+    crate::db::board_store::parse_status(raw).is_none()
+}
+
+
 impl Runtime {
     /// Startup reconciliation (Invariant 9): the DB's picture of live
     /// sessions vs what each backend actually hosts. Every mismatch becomes
@@ -490,7 +501,24 @@ impl Runtime {
         }
         let mut out = Vec::new();
         for row in rows {
+            // `else { continue }` USED TO BE HERE, and it was the silent drop
+            // (AMUX-2632): a card in an operator-created column vanished from
+            // the orchestrator with no log, no wait state, and nothing on the
+            // card. `to_task` now maps an unmodelled column to Blocked, so the
+            // card is visible — but "visible as Blocked" without the column
+            // name is a card that reads as a dependency wait and will be
+            // debugged as one, so the raw status is named here where the row
+            // still has it.
             let Some(mut task) = row.to_task() else { continue };
+            if amux_server_parse_status_is_unmodelled(&row.status) {
+                tracing::warn!(
+                    card = %row.id,
+                    column = %row.status,
+                    "card sits in an unmodelled column — visible to the orchestrator as BLOCKED \
+                     on configuration, not actionable until the column is modelled or the card \
+                     is moved"
+                );
+            }
             match row.session.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(owner_name) => match names.get(&owner_name.to_lowercase()) {
                     Some(wid) => task.worker = Some(wid.clone()),

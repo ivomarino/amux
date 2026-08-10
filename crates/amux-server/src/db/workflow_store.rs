@@ -226,20 +226,56 @@ mod invisibility_tests {
     /// hypothetical — it is armed, and the only reason it has not fired is that
     /// every status currently in the production DB happens to parse.
     ///
-    /// This test asserts the CURRENT (broken) behaviour deliberately. It is the
-    /// pre-fix specimen: when unconfigured columns become visible structured
-    /// waits, this assertion flips, and that flip is the fix landing.
+    /// A row that differs from the default in exactly one way: the column it
+    /// sits in. That is the variable under test; spelling out the other
+    /// twenty-five fields would bury it.
+    fn row_in_status(status: &str) -> crate::db::board_store::IssueRow {
+        crate::db::board_store::IssueRow {
+            id: format!("T-{status}"),
+            title: "a card".into(),
+            status: status.into(),
+            item_type: "code".into(),
+            creator: "tester".into(),
+            ..Default::default()
+        }
+    }
+
+    /// THE ASSERTION FLIPPED (AMUX-2632). This test was the pre-fix specimen and
+    /// said so: "when unconfigured columns become visible structured waits, this
+    /// assertion flips, and that flip is the fix landing." It has landed.
+    ///
+    /// It now tests the level that actually carries the invariant. The old
+    /// version asserted on `parse_status`, which is a DETAIL — and the detail is
+    /// unchanged, deliberately: the enum stays closed, because "security-review"
+    /// is genuinely not a member of the shared vocabulary and a parser that
+    /// guessed would make every consumer's match arm a lie. What must never
+    /// happen is a card VANISHING, and that is a property of `to_task`.
     #[test]
-    fn a_custom_column_is_currently_invisible_to_the_orchestrator() {
-        assert_eq!(
-            parse_status("security-review"),
-            None,
-            "a user-created column does not parse into the closed enum"
-        );
+    fn a_custom_column_is_visible_to_the_orchestrator_as_blocked() {
+        // The vocabulary is still closed — this half is intentionally unchanged.
+        assert_eq!(parse_status("security-review"), None);
         assert_eq!(parse_status("qa"), None);
         assert_eq!(parse_status("customer-validation"), None);
-        // ...and None is what makes to_task() return None, which is what makes
-        // load_board_tasks `continue` past the card. The card vanishes.
+
+        // ...but the card no longer disappears. Before this fix `to_task()`
+        // returned None here and the orchestrator's `else { continue }` dropped
+        // the card with no trace anywhere.
+        for column in ["security-review", "qa", "customer-validation"] {
+            let row = row_in_status(column);
+            let task = row
+                .to_task()
+                .unwrap_or_else(|| panic!("a card in '{column}' must not vanish from the board"));
+            assert_eq!(
+                task.status,
+                amux_core::board::TaskStatus::Blocked,
+                "'{column}' is blocked on configuration the orchestrator cannot model"
+            );
+        }
+
+        // A modelled column is untouched — the mapping must not swallow real
+        // statuses on its way past.
+        let row = row_in_status("doing");
+        assert_eq!(row.to_task().unwrap().status, amux_core::board::TaskStatus::Doing);
     }
 
     /// Every status value present in the LIVE production board parses today.

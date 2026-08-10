@@ -388,7 +388,11 @@ pub fn next_issue_id(conn: &Connection, prefix: &str) -> rusqlite::Result<String
 
 /// One live `issues` row, Python column shapes preserved: raw status/type
 /// strings, unix-second ints, JSON-array TEXT columns decoded to vecs.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived so a test can name the ONE field it cares about and
+/// leave the other twenty-five alone. A test that has to spell out an entire row
+/// to check one property is a test that stops being written.
+#[derive(Debug, Clone, Default)]
 pub struct IssueRow {
     /// The semantic id ("AMUX-123") — the wire identity. See [`internal_id`].
     pub id: String,
@@ -497,8 +501,28 @@ impl IssueRow {
     ///
     /// `worker` is always `None`: `issues.session` is an owner NAME, not a
     /// claim by `WorkerId` — atomic claims/leases land with RR-0052.
+    /// NO CARD MAY VANISH (AMUX-2632).
+    ///
+    /// This opened `parse_status(&self.status)?`, so a status outside the
+    /// closed vocabulary returned None — and the orchestrator's one caller did
+    /// `else { continue }`. A card in an operator-created column was therefore
+    /// INVISIBLE to the orchestrator: not blocked, not waiting, not reported,
+    /// simply absent, with no log line anywhere saying so.
+    ///
+    /// That was theoretical until `board.rs` gained its `unmodelled_status`
+    /// branch, which lets a card MOVE INTO a custom column. It is now reachable
+    /// by the documented path — `POST /api/board/statuses` then a move — and
+    /// latent only because all eleven live statuses happen to parse.
+    ///
+    /// An unmodelled column maps to [`TaskStatus::Blocked`], which is exactly
+    /// what it is: blocked on configuration the orchestrator cannot model. The
+    /// ENUM STAYS CLOSED — `parse_status` still returns None, because "security
+    /// review" is genuinely not a member of the shared vocabulary and teaching
+    /// the parser to guess would make every consumer's match arm a lie. The
+    /// mapping belongs here, at the boundary, where the raw string is still
+    /// available to whoever needs to name the column.
     pub fn to_task(&self) -> Option<Task> {
-        let status = parse_status(&self.status)?;
+        let status = parse_status(&self.status).unwrap_or(TaskStatus::Blocked);
         let creator = if self.creator.trim().is_empty() {
             Actor::System {
                 component: "python-board".into(),
