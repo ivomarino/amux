@@ -5645,7 +5645,6 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     true
 }
 
-/// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
 // ---------------------------------------------------------------------------
 // pipe-pane RECONCILER (AMUX-2671).
 //
@@ -5733,6 +5732,7 @@ pub async fn pipe_reconcile_loop() {
     }
 }
 
+/// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;

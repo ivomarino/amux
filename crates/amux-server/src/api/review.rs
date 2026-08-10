@@ -86,7 +86,7 @@ async fn week(State(state): State<AppState>, Query(q): Query<WeekQuery>) -> Resp
                 if let Some(arr) = s.get_mut("samples").and_then(|v: &mut serde_json::Value| v.as_array_mut()) {
                     if arr.len() < 5 && !text.is_empty() {
                         let clean = text
-                            .trim_start_matches(|c: char| c == '[')
+                            .trim_start_matches('[')
                             .split_once(']')
                             .map(|(_, rest)| rest.trim())
                             .unwrap_or(&text);

@@ -112,6 +112,17 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
+    // ---- Mounted in mod.rs but never declared here, so
+    // `every_mounted_api_family_is_claimed_by_the_registry` was RED on main and
+    // CI could not go green for anyone. Native like everything else:
+    // PROXIED_FAMILIES is empty and Python is deleted, so there is no other
+    // value these could take. Found in one pass rather than one per test run —
+    // the assert reports only the first offender.
+    ("/api/channels", "per-session channels + message history"),
+    ("/api/client-debug", "SPA debug beacons (write-only, logged)"),
+    ("/api/log-search", "grep across session log files"),
+    ("/api/memory", "global memory document"),
+    ("/api/review", "weekly trends engine + digest markdown"),
     ("/api/workers", "modern worker API (+dead-letters)"),
     ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
