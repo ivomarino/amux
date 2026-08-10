@@ -3755,6 +3755,45 @@ fn hdr_worker(headers: &HeaderMap) -> String {
 // backend-agnostic by construction rather than by a per-backend branch here.
 const STEER_TICK_SECS: u64 = 5;
 
+/// Is this lane at a turn boundary — i.e. may a queued message be delivered NOW?
+///
+/// Report-first, scrape as fallback. The harness KNOWS its turn boundaries and
+/// posts them (D1); the pane regex only infers them, and infers nothing at all
+/// for a non-Claude frame — which is exactly how a Gemini lane sat 2h at IDLE
+/// with 1 QUEUED under Python. So a lane that reports its own state is believed,
+/// and only a lane with no report falls back to the pane.
+///
+/// Fails CLOSED: anything not positively known to be idle returns false. A
+/// message that waits one more 5s tick costs nothing; a message delivered
+/// mid-turn is the bug this whole path exists to prevent.
+async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
+    // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
+    let reported: Option<String> = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
+    if let Some(st) = reported {
+        return st == "idle";
+    }
+    // 2. Hookless lane: the pane. Empty capture means "cannot tell" — and for a
+    // herdr lane mid-turn the capture is empty BY DESIGN (herdr refuses a
+    // history read while working/blocked), so treating empty as idle would
+    // deliver into exactly the state we are trying to avoid.
+    let raw = tmux_capture(name, 12).await;
+    if raw.trim().is_empty() {
+        return false;
+    }
+    detect_claude_status(&raw) == "idle"
+}
+
 /// One pass: deliver queued steering to every lane that is at a turn boundary.
 /// Returns how many messages were delivered (the count is the test's handle —
 /// a loop whose only evidence is "no rows left" cannot distinguish delivered
@@ -3795,9 +3834,21 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         if !is_running(&session).await {
             continue; // stopped lane: its nudge stays pending, per python
         }
-        // from_steering=true: the callee REFUSES rather than re-queues when the
-        // lane turns out to be generating or at a selector, so a failed attempt
-        // leaves the row exactly where it was instead of duplicating it.
+        // THE TURN-BOUNDARY GATE. This has to live HERE, in the caller.
+        // `from_steering` inside send_text_inner only refuses on a selector, or
+        // on generating-AND-picker-text; a plain message to a merely GENERATING
+        // lane falls straight through and delivers. Python never relied on that
+        // — its tick computed the state and only called _steer_try_deliver at a
+        // boundary. Shipping without this gate delivered Ethan's queued message
+        // into a working lane within minutes ("i sent as a queue but it looks
+        // like it was sent directly even though this worker was still
+        // working"), which defeats the entire point of queueing.
+        if !steer_lane_at_boundary(state, &session).await {
+            continue;
+        }
+        // from_steering=true is still passed: it makes the callee REFUSE rather
+        // than re-queue if the lane starts generating between this check and the
+        // send, so a lost race leaves the row where it is instead of duplicating.
         let (ok, msg) = send_text_inner(state, &session, &text, false, true).await;
         if !ok {
             continue;
@@ -6712,4 +6763,84 @@ mod tests {
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
+}
+
+#[cfg(test)]
+mod steer_boundary_tests {
+    use super::*;
+
+    fn tstate() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        (
+            AppState {
+                store: std::sync::Arc::new(store),
+                started: std::time::Instant::now(),
+                build_hash: "test".into(),
+                auth_token: None,
+            },
+            dir,
+        )
+    }
+
+    async fn set_report(state: &AppState, name: &str, st: &str) {
+        let (n, s) = (name.to_string(), st.to_string());
+        state
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                let blob = serde_json::json!({ &n: { "state": s } }).to_string();
+                conn.execute(
+                    "INSERT INTO prefs(key,value) VALUES('session_reports',?1) \
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    [&blob],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// THE REGRESSION. Shipped without this and it went straight to prod:
+    /// `from_steering` inside send_text_inner refuses only on a selector, or on
+    /// generating-AND-picker-text, so a plain queued message to a merely
+    /// GENERATING lane fell through and delivered mid-turn. Ethan hit it within
+    /// minutes — "i sent as a queue but it looks like it was sent directly even
+    /// though this worker was still working" — and his follow-up was the right
+    /// criticism: this should have been caught by CI, not by him.
+    ///
+    /// `active` is the case that actually regressed. The others are here so a
+    /// future "simplification" to `st != "active"` cannot pass: `waiting` (at a
+    /// selector) and `error` are equally not-a-boundary, and only `idle` is.
+    #[tokio::test]
+    async fn a_reporting_lane_is_a_boundary_only_when_it_reports_idle() {
+        let (state, _d) = tstate();
+        for (reported, want) in [
+            ("active", false), // THE BUG: mid-turn. Delivering here is the defect.
+            ("waiting", false),
+            ("error", false),
+            ("idle", true),
+        ] {
+            set_report(&state, "probe", reported).await;
+            assert_eq!(
+                steer_lane_at_boundary(&state, "probe").await,
+                want,
+                "reported state {reported:?} should give at_boundary={want}"
+            );
+        }
+    }
+
+    /// Fail-closed is the whole safety property: an unknown lane must not be
+    /// treated as idle. With no report AND no pane (no tmux session under test),
+    /// the capture is empty and "cannot tell" must read as "do not deliver" —
+    /// notably for herdr, whose history read is REFUSED while working/blocked,
+    /// so empty-capture is precisely the mid-turn state.
+    #[tokio::test]
+    async fn an_unknown_lane_is_never_a_boundary() {
+        let (state, _d) = tstate();
+        assert!(
+            !steer_lane_at_boundary(&state, "no-such-lane-xyz").await,
+            "a lane with neither a report nor a readable pane must fail CLOSED"
+        );
+    }
 }
