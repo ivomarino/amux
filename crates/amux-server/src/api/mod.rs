@@ -23,6 +23,7 @@ pub mod gmail_auth;
 pub mod groups;
 pub mod health;
 pub mod history;
+pub mod invariants_api;
 pub mod journal;
 pub mod layout_presets;
 pub mod map;
@@ -190,6 +191,7 @@ pub fn router(state: AppState) -> Router {
         // each. Route names only — nothing secret, so public like its
         // debug sibling above.
         .route("/api/debug/boundary", axum::routing::get(py_proxy::boundary))
+        .merge(invariants_api::routes())
         // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
         // routed, with which methods" is a GET, not a grep. Public like its
         // debug siblings (route names only, nothing secret).

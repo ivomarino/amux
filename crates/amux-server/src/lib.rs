@@ -9,6 +9,7 @@ pub mod backend;
 pub mod config;
 pub mod db;
 pub mod integrations;
+pub mod invariants;
 pub mod opencode;
 pub mod orchestrator;
 pub mod provider;
@@ -200,6 +201,12 @@ async fn async_main() {
     // so a busy worker's queue only grew (amux-rust: IDLE, 9 QUEUED, oldest 2h6m).
     // Spawned before the router takes `state` by value.
     tokio::spawn(api::session_verbs::steer_deliver_loop(state.clone()));
+
+    // Continuous invariant checking (AMUX-2622). Spawned before the router
+    // takes `state` by value. Runs forever; a panic in one pass is caught
+    // inside so the monitor cannot die quietly — a dead monitor's silence
+    // reads as health, which is the failure this module exists to prevent.
+    tokio::spawn(invariants::monitor::run(state.clone()));
 
     let app = api::router(state);
 
