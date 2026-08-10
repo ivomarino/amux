@@ -76,6 +76,11 @@ pub struct RescueReport {
     pub left_alone: Vec<String>,
     /// Lanes whose stuck text was already rescued inside the cooldown.
     pub deduped: Vec<String>,
+    /// Lanes whose composer held only Claude Code's dim SUGGESTION — i.e.
+    /// nothing at all. Counted rather than ignored because this is exactly the
+    /// population a stripped-ANSI reader mistook for stuck messages; if this
+    /// number is large and `rescued` is zero, the sweep is working.
+    pub placeholders: usize,
 }
 
 /// The pane operations a sweep needs. A trait so the guards can be tested
@@ -137,8 +142,7 @@ impl Sweeper {
 /// One sweep. `state` is optional so the guards can be exercised without a DB;
 /// when present, a rescue emits the `message.rescued` session event.
 pub async fn sweep<P: Pane>(sweeper: &Sweeper, pane: &P, state: Option<&AppState>) -> RescueReport {
-    use crate::api::session_verbs::{detect_claude_status, pending_input};
-    use crate::api::sessions_legacy::strip_ansi;
+    use crate::api::session_verbs::{composer_state, detect_claude_status, ComposerState};
 
     let mut report = RescueReport::default();
     for lane in pane.lanes() {
@@ -147,13 +151,23 @@ pub async fn sweep<P: Pane>(sweeper: &Sweeper, pane: &P, state: Option<&AppState
             continue;
         }
         report.examined += 1;
-        let clean = strip_ansi(&raw);
         // Guard 2: only an IDLE lane. "active" means the Enter belongs to the
         // running turn; "waiting" means a selector owns it.
         if detect_claude_status(&raw) != "idle" {
             continue;
         }
-        let Some(ghost) = pending_input(&clean) else { continue };
+        // Guard 0, and the one that decides whether there is anything to do at
+        // all: REAL typed input, not Claude Code's dim suggestion. Keying this
+        // on the ANSI-stripped ❯ line (as python did) reported 13 live lanes as
+        // "stuck for hours" when all 13 composers were empty — see
+        // `composer_state`. A sweep that "rescues" a placeholder submits
+        // nothing and logs that it did, which is the worst of both.
+        let ComposerState::Typed(ghost) = composer_state(&raw) else {
+            if let ComposerState::Placeholder(_) = composer_state(&raw) {
+                report.placeholders += 1;
+            }
+            continue;
+        };
         if ghost.is_empty() {
             continue;
         }
@@ -172,8 +186,7 @@ pub async fn sweep<P: Pane>(sweeper: &Sweeper, pane: &P, state: Option<&AppState
         let lock = crate::api::session_verbs::session_send_lock(&lane);
         let _guard = lock.lock().await;
         let raw2 = pane.capture(&lane).await;
-        let clean2 = strip_ansi(&raw2);
-        if detect_claude_status(&raw2) != "idle" || pending_input(&clean2).as_deref() != Some(ghost.as_str()) {
+        if detect_claude_status(&raw2) != "idle" || composer_state(&raw2).typed() != Some(ghost.as_str()) {
             continue;
         }
         // Escape closes any picker WITHOUT selecting an entry (a bare Enter

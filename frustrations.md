@@ -1684,3 +1684,89 @@ FIX: `idle` must not be reachable when the pane is dead. tmux already knows
   status attached. Related: the browser failure in the same container named its symptom
   (`CDP never answered within 12s`) and not its cause; both are the ethos rule 4 shape,
   where the diagnosis is impossible from what the instrument reports.
+
+---
+## `amux-rs why … | head` exits 101 with a Rust panic instead of 0
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: rust-rebuild (RR-0109/0110 lane)
+CARD: none — fixed in the same change that introduced the verbs; logging it because
+  every OTHER verb in crates/amux-cli/src/main.rs still has it
+SYMPTOM: `amux-rs why schedule SCHED-30` emits 220 lines for a schedule with 3,303
+  recorded runs. Piped into `head -3` it printed the first lines and then exited
+  **101** with a panic (`failed printing to stdout: Broken pipe`). Unpiped, the same
+  command exits 5 — the verb's real "partial verdict" code. Rust ignores SIGPIPE, so
+  `println!` unwraps a `BrokenPipe` write error into a panic.
+COST: ~10 minutes chasing a phantom crash in the new endpoint. Worse than the minutes:
+  `why` publishes exit codes as its machine-readable verdict (0 explained, 5 partial,
+  6 cannot_tell), and a verb that exits 101 on the most ordinary shell idiom teaches
+  a caller that those codes cannot be trusted. It also reads as "the instrument
+  crashed on the case I was investigating", which is the worst possible false signal
+  from a diagnostic tool.
+FIX: `outln!` macro in crates/amux-cli/src/main.rs writes through a locked stdout and
+  returns `Ok(0)` on a closed pipe. Applied to `search` and `why`. **The other verbs
+  (`board list`, `board show`, `workers list`, `schedules list`, `health`) still use
+  bare `println!` and still panic the same way** — `amux-rs board list | head` on a
+  4,773-card board is the same bug waiting. The root fix is either resetting SIGPIPE
+  to SIG_DFL at startup (needs a `libc` dep) or routing every verb through `outln!`.
+
+---
+## Uncommitted migrations reach the LIVE database within minutes, from another agent's server
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: rust-rebuild (RR-0109/0110 lane)
+CARD: none — needs one; the mechanism is fleet-wide, not this lane's
+SYMPTOM: I created `crates/amux-server/migrations/0013_search.sql` at 22:16:42 EDT and
+  never installed or restarted anything. At 22:18:23 EDT the migration was applied to
+  `~/.amux/amux.db` — the live 269MB database — creating 2 tables, 24 triggers and
+  backfilling 5,021 rows. `scripts/rust-auto-build.sh` is NOT the culprit: it builds
+  from a `git worktree` of HEAD and 0013 is not in HEAD. The cause is that some other
+  session on this shared checkout ran a working-tree build of `amux-server` with the
+  default `AMUX_DB`, which is the live file.
+COST: No damage this time — the migration is additive and applied cleanly, and it is
+  in fact the best live evidence I have. But I explicitly set out to test against a
+  `.backup` copy precisely so I would not write to the live DB, and the live DB had
+  already taken my schema before I made the copy. A session cannot honour "never touch
+  the live database" when a peer's ordinary `cargo run` applies that session's
+  uncommitted migrations to it. The same mechanism with a destructive or wrong
+  migration is a data-loss event with no author and no audit line.
+FIX: make the live database opt-IN for a locally-built binary. Either default
+  `AMUX_DB` to a scratch path unless `AMUX_ALLOW_LIVE_DB=1`, or refuse to apply a
+  migration whose version is absent from HEAD unless the same flag is set — the
+  discriminator (`git cat-file -e HEAD:<migration>`) is one cheap call, and it exactly
+  separates "this build is the deployed one" from "this build is someone's working
+  tree". Right now nothing distinguishes them and the live file is the default.
+
+## A continuously-busy lane starved its own queue forever: the boundary gate has no deadline
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2642)
+CARD: AMUX-2642
+SYMPTOM: `steer_lane_at_boundary` returns true only on `idle`, so a lane that works continuously has
+no boundary and its queue never drains. Measured on the `amux` session — status `active` with a
+6-second-old tool-hook report, correctly working — holding five messages queued 22:06..22:28, none
+delivered; amux-rust held ten, the oldest 229 minutes. From the sender's side the only evidence is
+"nothing is happening", which reads as a hung worker. Three of amux's five carried `@`-mentions, which
+under the old picker guard could never be delivered to a busy lane at all, so the two faults hid each
+other.
+COST: two lanes not receiving the owner's instructions for hours while he asked twice why workers were
+not moving; a sender concluding a healthy lane was hung; and — the part that made it expensive — five
+messages aging past 20 minutes with no signal anywhere: no log line, no card field, no endpoint.
+FIX: three parts, and the third is the one that generalises. (1) `AMUX_STEER_MAX_AGE_S` (default 10
+min): boundary first, but past the deadline the message goes into the running turn, where Claude Code
+queues it and folds it in at ITS own boundary — real queue semantics implemented by the agent instead
+of by amux waiting forever. A selector is still never overridden: answering a pending tool is the
+user's call, not amux's. (2) Picker-shaped text now goes through `paste-buffer -p` at any length —
+measured live, `@`-text TYPED mid-turn is lost 1/1 while the same text PASTED mid-turn is accepted
+4/4, because a bracketed paste never opens the autocomplete. That is what makes the overdue delivery
+safe for `@` messages rather than just for plain ones. (3) The gate and the send path now share one
+predicate (`pane_is_at_boundary`). They did not for one build, and the disagreement deadlocked
+delivery in a way that was a bug in neither half: the gate read the frame as idle (so it never
+consulted the deadline) while the send path read it as generating (so it refused) — every tick,
+forever. A view that disagrees with the mechanism it describes is worse than no view.

@@ -232,7 +232,7 @@ fn work_dir_of(cfg: &EnvFile) -> String {
         .unwrap_or_else(|_| expanduser(wd).to_string_lossy().into_owned())
 }
 
-fn session_work_dir(name: &str) -> String {
+pub(crate) fn session_work_dir(name: &str) -> String {
     work_dir_of(&parse_env(name))
 }
 
@@ -839,9 +839,8 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
 /// is exactly the lane it hit.
 ///
 /// So: look only at the bottom 3 non-blank lines. That also fixes the inverse
-/// (17c5a3c's bug, still live in `detect_claude_status`): a bypass bar that
-/// CONTAINS "esc to interrupt" is ACTIVE, and the bottom-up scan reads it as
-/// idle because a `❯` is present.
+/// "esc to interrupt" on the STATUS BAR means the lane is generating — unless
+/// the prompt ❯ is also visible, which means idle with background agents.
 ///
 /// This is a scraper reading a rendered UI, so it is D1 debt either way — the
 /// durable answer is the lane's own reported state, which `steer_lane_at_boundary`
@@ -850,11 +849,35 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
 pub(crate) fn pane_bar_says_generating(raw_output: &str) -> bool {
     let clean = strip_ansi(raw_output);
     let nonblank: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    nonblank
+    let has_esc = nonblank
         .iter()
         .rev()
         .take(3)
-        .any(|l| l.to_lowercase().contains("esc to interrupt"))
+        .any(|l| l.to_lowercase().contains("esc to interrupt"));
+    // AN EMPTY COMPOSER DOES NOT MAKE IT IDLE. A peer's in-flight edit added a
+    // `prompt_visible` exception on the theory that "empty ❯ + esc to interrupt
+    // = idle with background agents". Measured against a lane provably mid-turn
+    // (a 3000-word essay streaming), the frame is:
+    //
+    //   '  In medical science, twenty-three holds particular significance…'
+    //   '────────────────────────────────────────────────────────────────'
+    //   '❯\u{a0}'
+    //   '────────────────────────────────────────────────────────────────'
+    //   '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 2 agents'
+    //
+    // i.e. Claude Code ALWAYS draws its composer, empty, while generating — so
+    // the exception describes the generating case, not the idle one. (The edit
+    // also did not match its own fixture: `ends_with('❯')` is false for `❯\u{a0}`,
+    // so its own test failed.)
+    //
+    // The ambiguous case it was reaching for is real — a lane can be idle while
+    // background agents run — and it is settled by the SELF-REPORT, not the
+    // pane: `steer_decide` reads the report first and only falls back here for
+    // a hookless lane. For that fallback the asymmetry decides it. Reading an
+    // ambiguous frame as BUSY costs at most `AMUX_STEER_MAX_AGE_S`, after which
+    // the message is delivered anyway; reading it as IDLE types into a live turn,
+    // which is the regression 336097d exists to prevent. So: fail closed.
+    has_esc
 }
 
 /// py:18676 _clean_gemini_frame — keep only the LAST instance of each chrome
@@ -904,7 +927,7 @@ fn project_name(work_dir: &str) -> String {
 }
 
 /// Parsed entries from the tail of a JSONL file (bounded read).
-fn iter_jsonl_tail(path: &Path, max_bytes: u64) -> Vec<Value> {
+pub(crate) fn iter_jsonl_tail(path: &Path, max_bytes: u64) -> Vec<Value> {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else { return vec![] };
     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -925,7 +948,7 @@ fn iter_jsonl_tail(path: &Path, max_bytes: u64) -> Vec<Value> {
 
 /// Newest JSONL for a session (py:5590 _session_jsonl_path_uncached): meta
 /// conv-id first, then title match, then the single unclaimed candidate.
-fn session_jsonl_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
     let wd = cfg.get_or("CC_DIR", "").trim().to_string();
     if wd.is_empty() {
@@ -1762,8 +1785,58 @@ fn redact_secrets(text: &str) -> String {
 
 const CMD_HIST_KEEP: i64 = 200;
 
+/// How a message actually reached the worker (migration 0014).
+///
+/// A DELIVERY FACT, not an inference from `type`. The distinction earns its
+/// place because of the raw-tmux incident: when `POST /api/workers/<n>/send`
+/// 405'd, the CLI injected keystrokes with no origin stamp, no audit row and
+/// unverified arrival — and those messages recorded byte-identically to a clean
+/// direct send, because `type` has no cell for "delivered by a degraded path".
+///
+/// `None` is a real answer: rows written before 0014, and any path that has not
+/// been taught to declare itself, stay NULL. Never defaulted to `Direct` —
+/// asserting a delivery path we did not observe is exactly the
+/// unknown-rendered-as-healthy bug.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Delivery {
+    /// Handed to a live session at the moment of the request.
+    Direct,
+    /// Parked on the steering queue, delivered at a later turn boundary.
+    Queued,
+    /// Delivered by a degraded path (raw tmux keystrokes): NOT origin-stamped,
+    /// NOT acknowledged, arrival unverified. Recorded so a message that came
+    /// this way is never mistaken for an audited one.
+    Fallback,
+}
+
+impl Delivery {
+    fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Direct => "direct",
+            Delivery::Queued => "queued",
+            Delivery::Fallback => "fallback",
+        }
+    }
+}
+
 /// py:8676 _cmd_hist_record — Messages history, origin-tagged, pruned.
 async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &str, origin: &str) {
+    cmd_hist_record_full(state, session, text, ctype, origin, Some(Delivery::Direct), None).await
+}
+
+/// The full recorder. `queued_at` is the moment the message entered the
+/// steering queue (`None` for anything not queued), so the wait a message
+/// endured is answerable from the row the Messages tab already reads instead of
+/// requiring a join against `steering_history` that nothing performs.
+pub(crate) async fn cmd_hist_record_full(
+    state: &AppState,
+    session: &str,
+    text: &str,
+    ctype: &str,
+    origin: &str,
+    delivery: Option<Delivery>,
+    queued_at_ms: Option<i64>,
+) {
     if session.is_empty() || text.is_empty() {
         return;
     }
@@ -1771,13 +1844,19 @@ async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &st
     let text = redact_secrets(text);
     let ctype = ctype.to_string();
     let origin: String = origin.chars().take(80).collect();
+    let delivery = delivery.map(|d| d.as_str().to_string());
+    let now_ms = now_i64() * 1000;
     let _ = state
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?,?,?,?,?)",
-                rusqlite::params![text, ctype, session, now_i64() * 1000, origin],
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at) \
+                 VALUES (?,?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    text, ctype, session, now_ms, origin,
+                    delivery, queued_at_ms, now_ms
+                ],
             )?;
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
@@ -2535,7 +2614,7 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
 }
 
 async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
-    send_text_inner(state, name, text, defer_if_busy, false).await
+    send_text_inner(state, name, text, defer_if_busy, false, false, false).await
 }
 
 fn send_text_boxed<'a>(
@@ -2544,7 +2623,7 @@ fn send_text_boxed<'a>(
     text: &'a str,
     defer_if_busy: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send + 'a>> {
-    Box::pin(send_text_inner(state, name, text, defer_if_busy, false))
+    Box::pin(send_text_inner(state, name, text, defer_if_busy, false, false, false))
 }
 
 async fn send_text_inner(
@@ -2553,6 +2632,15 @@ async fn send_text_inner(
     text: &str,
     defer_if_busy: bool,
     from_steering: bool,
+    // OVERDUE delivery (AMUX-2642): the message has waited past
+    // `AMUX_STEER_MAX_AGE_S` for a boundary that is not coming, so it goes into
+    // the running turn and Claude Code folds it in at its own boundary. Only
+    // the steering tick sets this, and only after the deadline.
+    allow_mid_turn: bool,
+    // The caller already knows the session is idle (e.g. the Stop hook just
+    // reported it). Skip the pane-based generating checks — the hook report
+    // IS the authority (D1 exit: reported state outranks the scrape).
+    hook_confirmed_idle: bool,
 ) -> (bool, String) {
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
@@ -2640,9 +2728,12 @@ async fn send_text_inner(
             return (true, "no suggestion found".into());
         }
     }
-    let status = detect_claude_status(&tmux_capture(name, 12).await);
-    let mut generating = status == "active";
-    let waiting = status == "waiting";
+    let (mut generating, waiting) = if hook_confirmed_idle {
+        (false, false)
+    } else {
+        let status = detect_claude_status(&tmux_capture(name, 12).await);
+        (status == "active", status == "waiting")
+    };
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
@@ -2650,15 +2741,32 @@ async fn send_text_inner(
         return (true, "queued (steering) — session at a selector, delivers when it resolves".into());
     }
     if waiting && from_steering {
+        // A live selector is NOT overridden by the deadline: typing here and
+        // the picker-closing Escape would REJECT the pending tool, which is a
+        // destructive answer to a question the user has not answered
+        // (AskUserQuestion kill, 2026-07-15). Overdue or not, it waits.
         return (false, "session at a selector — retry at next idle boundary".into());
     }
-    if generating && at_picker_text(&text) {
-        if from_steering {
-            return (false, "session started generating — retry at next turn boundary".into());
-        }
-        steer_enqueue(state, name, &text, "").await;
-        return (true, "queued (steering) until turn end — @/slash needs the picker closed".into());
-    }
+    // PICKER-SHAPED TEXT IS NOT SPECIAL ANY MORE — it just has to be PASTED.
+    //
+    // py:25676 parks @/slash text whenever the lane is generating, because
+    // TYPING it opens Claude Code's autocomplete, the picker eats the Enter and
+    // the message sits unsubmitted (the "15:06 @image ghost", 2026-07-10), and
+    // the picker-closing Escape would interrupt the turn. That is all true of
+    // keystrokes. Measured on a live pane 2026-08-09: typed mid-turn,
+    // `@/Users/…/README.md` was lost 1/1 — the composer held it and the turn
+    // ended without it. The SAME text delivered mid-turn via
+    // `load-buffer` + `paste-buffer -p` was accepted 4/4, each one recorded by
+    // Claude Code as a `queue-operation: enqueue` and folded into the turn.
+    //
+    // A bracketed paste is not a keystroke sequence, so the autocomplete never
+    // opens and there is no picker to fight. So the fix is not a better guard
+    // around the picker, it is not opening it: picker-shaped text takes the
+    // paste path regardless of length. This is what makes the overdue delivery
+    // below safe for the three of amux's five queued messages that carry an
+    // `@`, which under the old branch could never be delivered to a busy lane
+    // at all.
+    let use_paste = text.chars().count() > 400 || at_picker_text(&text);
     let mut esc_at: Option<std::time::Instant> = None;
     // Exclusive use of the pane for the whole type+Enter+verify choreography.
     // Without it a second send (or the ghost-rescue sweep) can fire an Enter
@@ -2675,9 +2783,14 @@ async fn send_text_inner(
         // in the STATUS BAR is the reliable generating signal. Scoped to the
         // bar, never the transcript — see `pane_bar_says_generating` for the
         // four-hour queue freeze the unscoped substring match caused.
-        if pane_bar_says_generating(&tmux_capture(name, 12).await) {
+        //
+        // Skipped when hook_confirmed_idle: the hook report IS the authority
+        // (D1 exit). Re-scraping the pane here overrode the hook for sessions
+        // idle with background agents ("esc to interrupt" on the bar from
+        // agents, not from generation), freezing the steering queue for 2h+.
+        if !hook_confirmed_idle && pane_bar_says_generating(&tmux_capture(name, 12).await) {
             generating = true;
-            if from_steering {
+            if from_steering && !allow_mid_turn {
                 return (false, "session started generating — retry at next turn boundary".into());
             }
         } else if !waiting {
@@ -2688,8 +2801,9 @@ async fn send_text_inner(
     }
     send_key(name, "C-u").await;
     sleep_ms(40).await;
-    if text.chars().count() > 400 {
-        // Named tmux buffer + paste-buffer -p (py:25630).
+    if use_paste {
+        // Named tmux buffer + paste-buffer -p (py:25630). Also the picker-safe
+        // path — see `use_paste` above.
         let buf_name = format!("amux-{}-{}", name, (now_f64() * 1000.0) as i64);
         let tmp = std::env::temp_dir().join(format!("{buf_name}.txt"));
         if std::fs::write(&tmp, &text).is_err() {
@@ -2712,7 +2826,11 @@ async fn send_text_inner(
         return (false, "send-keys failed".into());
     }
     sleep_ms(20).await;
-    if !generating && at_picker_text(&text) {
+    // Only reachable if picker-shaped text was TYPED, which `use_paste` now
+    // prevents. Kept as a belt-and-braces closer rather than deleted: if a
+    // future change routes picker text back through send-keys, the Escape that
+    // makes it submittable is still here.
+    if !generating && !use_paste && at_picker_text(&text) {
         // Close the autocomplete picker so Enter submits (py:25655), spaced
         // ≥1.3s from the leading Escape — a closer pair eats the message.
         if let Some(at) = esc_at {
@@ -4453,7 +4571,7 @@ async fn git_info(work_dir: &str, detail: bool) -> Value {
 }
 
 /// py:18858/18877 — dirty files scoped to this session's territory.
-fn all_session_workdirs() -> BTreeMap<String, String> {
+pub(crate) fn all_session_workdirs() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         for e in rd.flatten() {
@@ -4848,6 +4966,65 @@ const STEER_TICK_SECS: u64 = 5;
 /// Fails CLOSED: anything not positively known to be idle returns false. A
 /// message that waits one more 5s tick costs nothing; a message delivered
 /// mid-turn is the bug this whole path exists to prevent.
+/// How a queued message may be delivered right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteerDelivery {
+    /// The lane is at a turn boundary: deliver normally.
+    AtBoundary,
+    /// The lane is mid-turn but the message is OVERDUE — deliver into the
+    /// running turn and let Claude Code fold it in at its own boundary.
+    OverdueMidTurn,
+    /// Not now.
+    Hold,
+}
+
+/// How long a queued message may wait for an idle boundary before it is
+/// delivered mid-turn anyway. `AMUX_STEER_MAX_AGE_S`, default 10 minutes.
+pub(crate) fn steer_max_age_s() -> f64 {
+    std::env::var("AMUX_STEER_MAX_AGE_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(600.0)
+}
+
+/// THE DELIVERY DECISION (AMUX-2642). Pure, so the case that matters — a lane
+/// that is NEVER idle — is testable without a fleet.
+///
+/// Waiting for an idle boundary is right, and it is also how a continuously
+/// busy lane starves forever: the `amux` session held five messages from 22:06
+/// to 22:28 with a 6-second-old `active` self-report, correctly working the
+/// whole time, while the sender watched nothing happen and concluded the lane
+/// was hung. amux-rust did the same with ten.
+///
+/// Neither extreme is right, and the reason is recorded in this repo: shipping
+/// "always send now" produced the owner's complaint that started the boundary
+/// gate ("i sent as a queue but it looks like it was sent directly even though
+/// this worker was still working"), and "always wait for idle" is the
+/// starvation above. So: boundary first, and a deadline. Past the deadline the
+/// message goes into the running turn, where CLAUDE CODE queues it and folds it
+/// in at its own turn boundary — real queue semantics implemented by the agent
+/// instead of by amux waiting indefinitely. A message the owner sent twenty
+/// minutes ago that has never been seen is strictly worse than one that arrives
+/// a turn early.
+pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_s: f64, max_age_s: f64) -> SteerDelivery {
+    let idle = match reported {
+        // The lane's own report wins (D1): the harness knows its boundaries.
+        Some(st) => st == "idle",
+        // Hookless lane: the pane. `None` means "cannot tell" — for a herdr
+        // lane mid-turn the capture is empty BY DESIGN — and must not read as
+        // idle.
+        None => pane_idle.unwrap_or(false),
+    };
+    if idle {
+        return SteerDelivery::AtBoundary;
+    }
+    if age_s >= max_age_s {
+        return SteerDelivery::OverdueMidTurn;
+    }
+    SteerDelivery::Hold
+}
+
 pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
     // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
     let reported: Option<String> = state
@@ -4873,7 +5050,46 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
     if raw.trim().is_empty() {
         return false;
     }
-    detect_claude_status(&raw) == "idle"
+    pane_is_at_boundary(&raw)
+}
+
+/// Is this pane at a turn boundary? Composed so the GATE and the SEND PATH read
+/// the same frame the same way.
+///
+/// They did not, for one build, and it produced a deadlock that looked like a
+/// bug in neither half: `detect_claude_status` reports a bypass bar containing
+/// "esc to interrupt" as IDLE (17c5a3c's inverse, still live in that function),
+/// so the gate said "at a boundary", passed `allow_mid_turn = false`, and the
+/// send path — which reads the bar correctly — refused with "session started
+/// generating". Every tick, forever, with the overdue deadline never consulted
+/// because the gate never believed the lane was busy. A view that disagrees
+/// with the mechanism it describes is worse than no view (ethos rule 1).
+pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
+    !pane_bar_says_generating(raw) && detect_claude_status(raw) == "idle"
+}
+
+/// The same two signals `steer_lane_at_boundary` reads, fed into
+/// [`steer_decide`] together with the message's age.
+pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64) -> SteerDelivery {
+    let reported: Option<String> = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
+    let pane_idle = if reported.is_some() {
+        None
+    } else {
+        let raw = tmux_capture(name, 12).await;
+        if raw.trim().is_empty() { None } else { Some(pane_is_at_boundary(&raw)) }
+    };
+    steer_decide(reported.as_deref(), pane_idle, age_s, steer_max_age_s())
 }
 
 /// One pass: deliver queued steering to every lane that is at a turn boundary.
@@ -4883,15 +5099,15 @@ pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
-    let queued: Vec<(String, String, String)> = {
+    let queued: Vec<(String, String, String, f64)> = {
         let Ok(conn) = state.store.read() else { return 0 };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text FROM steering_queue ORDER BY queued_at ASC",
+            "SELECT id, session, text, queued_at FROM steering_queue ORDER BY queued_at ASC",
         ) else {
             return 0;
         };
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
         rows
@@ -4916,7 +5132,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     let mut delivered_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut checked_lane: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut delivered = 0usize;
-    for (id, session, text) in queued {
+    for (id, session, text, queued_at) in queued {
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
         }
@@ -4941,18 +5157,32 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // into a working lane within minutes ("i sent as a queue but it looks
         // like it was sent directly even though this worker was still
         // working"), which defeats the entire point of queueing.
-        if !steer_lane_at_boundary(state, &session).await {
-            skip(&session, &id, "not-at-turn-boundary");
-            delivered_lanes.insert(session.clone()); // no row can go while mid-turn
-            continue;
-        }
+        let age = now_f64() - queued_at;
+        let decision = steer_delivery_for(state, &session, age).await;
+        let mid_turn = match decision {
+            SteerDelivery::Hold => {
+                skip(&session, &id, "not-at-turn-boundary (within max age)");
+                // A younger row cannot be older than this one, so no row on
+                // this lane can be overdue either: stop walking it.
+                delivered_lanes.insert(session.clone());
+                continue;
+            }
+            SteerDelivery::OverdueMidTurn => true,
+            SteerDelivery::AtBoundary => false,
+        };
         // from_steering=true is still passed: it makes the callee REFUSE rather
         // than re-queue if the lane starts generating between this check and the
         // send, so a lost race leaves the row where it is instead of duplicating.
-        let (ok, msg) = send_text_inner(state, &session, &text, false, true).await;
+        let (ok, msg) = send_text_inner(state, &session, &text, false, true, mid_turn, false).await;
         if !ok {
             skip(&session, &id, &format!("send-refused: {msg}"));
             continue; // NEXT ROW for this lane, not the next lane
+        }
+        if mid_turn {
+            tracing::warn!(
+                session = %session, id = %id, age_min = (age / 60.0) as i64,
+                "steering delivered MID-TURN — it waited past AMUX_STEER_MAX_AGE_S for a boundary that never came"
+            );
         }
         // Delivered — move the row to history under the SAME contract the
         // manual deliver path uses (redacted text, queued_at preserved).
@@ -4980,7 +5210,26 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         delivered += 1;
         delivered_lanes.insert(session.clone());
         steer_skips().lock().unwrap().remove(&session);
-        tracing::info!(session = %session, id = %id, detail = %msg, "steering delivered");
+        // The metadata AMUX-2643's "direct vs queued" view needs, recorded on
+        // EVERY delivery path: how it was queued, how long it waited, whether
+        // it went in at a boundary or mid-turn, and the submission verdict.
+        emit_event(
+            state,
+            &session,
+            "message.delivered",
+            Some(json!({
+                "id": id,
+                "via": "steering",
+                "mode": if mid_turn { "overdue-mid-turn" } else { "at-boundary" },
+                "queued_age_s": age as i64,
+                "submission": msg,
+                "preview": chars_truncate(&redact_secrets(&text), 120),
+            })),
+            Some(format!("steer-delivered:{id}")),
+            "steering",
+        )
+        .await;
+        tracing::info!(session = %session, id = %id, detail = %msg, mode = if mid_turn { "overdue-mid-turn" } else { "at-boundary" }, "steering delivered");
     }
     // A lane whose oldest row keeps refusing must become VISIBLE. Four hours of
     // silent refusal is the ethos-4 failure in this incident: the skip left no
@@ -4994,8 +5243,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
 /// FICTION ACROSS A RESTART — deliberately: it is a debug surface, and the
 /// durable fact (how long the oldest row has been queued) lives in
 /// `steering_queue.queued_at` where the stall warning reads it from.
-fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, (String, String, f64)>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, (String, String, f64)>>> =
+type SkipRecord = (String, String, f64); // (row id, reason, when)
+fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, SkipRecord>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, SkipRecord>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
@@ -5008,10 +5258,14 @@ fn skip(session: &str, id: &str, reason: &str) {
         .insert(session.to_string(), (id.to_string(), reason.to_string(), now_f64()));
 }
 
-/// Lanes whose oldest queued message is older than this are announced at WARN
-/// with the last refusal reason. 20 minutes is far longer than any legitimate
-/// turn and far shorter than the 229 minutes nobody noticed.
-const STEER_STALL_WARN_S: f64 = 20.0 * 60.0;
+/// Lanes whose oldest queued message is older than the delivery deadline are
+/// announced at WARN with the last refusal reason. Keyed to the SAME number the
+/// deliverer uses, so "stalled" always means "past the point where this should
+/// have gone out no matter what" — a warning threshold that disagrees with the
+/// mechanism it describes is the ethos-1 view/predicate split.
+fn steer_stall_warn_s() -> f64 {
+    steer_max_age_s()
+}
 
 async fn warn_on_stalled_lanes(state: &AppState) {
     let rows: Vec<(String, f64, i64)> = {
@@ -5029,7 +5283,7 @@ async fn warn_on_stalled_lanes(state: &AppState) {
     let skips = steer_skips().lock().unwrap().clone();
     for (session, oldest, count) in rows {
         let age = now - oldest;
-        if age < STEER_STALL_WARN_S {
+        if age < steer_stall_warn_s() {
             continue;
         }
         let reason = skips
@@ -5077,7 +5331,8 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
                 "session": session,
                 "queued": count,
                 "oldest_age_s": (now - oldest) as i64,
-                "stalled": now - oldest >= STEER_STALL_WARN_S,
+                "stalled": now - oldest >= steer_stall_warn_s(),
+                "overdue": now - oldest >= steer_max_age_s(),
                 "last_skip_id": last_id,
                 "last_skip_reason": reason,
                 "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
@@ -5086,7 +5341,9 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
         .collect();
     j200(json!({
         "lanes": lanes,
-        "stall_warn_s": STEER_STALL_WARN_S,
+        "stall_warn_s": steer_stall_warn_s(),
+        "max_age_s": steer_max_age_s(),
+        "max_age_env": "AMUX_STEER_MAX_AGE_S",
         "note": "last_skip_* is in-memory and resets when the server restarts; queued/oldest_age_s are durable",
     }))
 }
@@ -5103,16 +5360,16 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     // taking only `LIMIT 1` meant one undeliverable message froze the lane's
     // whole queue, which is how amux-rust accumulated 10 messages over 229
     // minutes while this function ran on every idle report and did nothing.
-    let rows: Vec<(String, String)> = state
+    let rows: Vec<(String, String, f64)> = state
         .store
         .read()
         .ok()
         .and_then(|conn| {
             conn.prepare(
-                "SELECT id, text FROM steering_queue WHERE session=?1 ORDER BY queued_at ASC",
+                "SELECT id, text, queued_at FROM steering_queue WHERE session=?1 ORDER BY queued_at ASC",
             )
             .and_then(|mut st| {
-                st.query_map([&session_s], |r| Ok((r.get(0)?, r.get(1)?)))
+                st.query_map([&session_s], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                     .map(|it| it.flatten().collect::<Vec<_>>())
             })
             .ok()
@@ -5131,17 +5388,27 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     let mut id = String::new();
     let mut text = String::new();
     let mut sent = None;
-    for (rid, rtext) in rows {
-        let (ok, msg) = send_text_inner(state, session, &rtext, false, true).await;
+    let mut was_mid_turn = false;
+    for (rid, rtext, queued_at) in rows {
+        // This function is called BECAUSE the lane just reported idle, so the
+        // boundary is not in question; the age still decides whether a lane
+        // that flickers idle-then-busy gets an overdue delivery.
+        let age = now_f64() - queued_at;
+        let mid = age >= steer_max_age_s();
+        // hook_confirmed_idle=true: the Stop hook just reported idle — trust
+        // it over the pane scrape. The pane may still show "esc to interrupt"
+        // from background agents, which is NOT generation.
+        let (ok, msg) = send_text_inner(state, session, &rtext, false, true, mid, true).await;
         if ok {
             id = rid;
             text = rtext;
-            sent = Some(msg);
+            was_mid_turn = mid;
+            sent = Some((msg, age));
             break;
         }
         skip(session, &rid, &format!("send-refused: {msg}"));
     }
-    let Some(msg) = sent else { return false };
+    let Some((msg, age)) = sent else { return false };
     steer_skips().lock().unwrap().remove(session);
     let (id2, sess2, text2) = (id.clone(), session_s.clone(), text.clone());
     let _ = state
@@ -5164,6 +5431,22 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
+    emit_event(
+        state,
+        session,
+        "message.delivered",
+        Some(json!({
+            "id": id,
+            "via": "steering",
+            "mode": if was_mid_turn { "overdue-mid-turn" } else { "at-boundary" },
+            "queued_age_s": age as i64,
+            "submission": msg,
+            "preview": chars_truncate(&redact_secrets(&text), 120),
+        })),
+        Some(format!("steer-delivered:{id}")),
+        "steering",
+    )
+    .await;
     tracing::info!(session = %session, id = %id, detail = %msg, "steering delivered (reactive)");
     true
 }
@@ -6437,11 +6720,21 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             )
             .await;
         }
+        // RECORD THE OUTCOME, do not infer it later. `msg` is the send's own
+        // verdict, and "queued (steering) — ..." is the only place the queued
+        // fact exists at this point: the history row is written with
+        // type='user'/'session' either way, so the downstream inference
+        // (type=='steering') reported every QUEUED message as direct. That is
+        // precisely the mislabelling this metadata exists to end.
+        let deliv = if msg.starts_with("queued") { Delivery::Queued } else { Delivery::Direct };
+        // A queued message's wait starts now; the deliverer stamps
+        // delivered_at when it actually lands.
+        let q_at = if deliv == Delivery::Queued { Some(now_i64() * 1000) } else { None };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record(state, name, &orig_text, "user", email).await;
+            cmd_hist_record_full(state, name, &orig_text, "user", email, Some(deliv), q_at).await;
         } else if !origin.is_empty() && origin != name {
-            cmd_hist_record(state, name, &orig_text, "session", &origin).await;
+            cmd_hist_record_full(state, name, &orig_text, "session", &origin, Some(deliv), q_at).await;
         }
     } else if !msg_id.is_empty() {
         send_dedup_forget(state, name, &msg_id).await;
@@ -9484,8 +9777,18 @@ mod steer_freeze_tests {
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents                    /rc failed
 ";
 
-    /// The same lane genuinely mid-turn: the marker is in the STATUS BAR.
+    /// Genuinely mid-turn: "esc to interrupt" on the bar, NO prompt visible
+    /// (the ❯ from the previous turn scrolled off or the capture is too short).
     const REALLY_GENERATING_PANE: &str = "\
+  some transcript text with no marker in it
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents
+";
+
+    /// Idle with background agents: prompt ❯ visible AND "esc to interrupt"
+    /// on the bar (the agents are what can be interrupted, not the main turn).
+    const IDLE_WITH_AGENTS_PANE: &str = "\
   some transcript text with no marker in it
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500} amux-rust \u{2500}\u{2500}
@@ -9496,18 +9799,10 @@ mod steer_freeze_tests {
 
     #[test]
     fn prose_about_esc_to_interrupt_is_not_a_generating_lane() {
-        // THE FREEZE. py:25650 searches the whole pane, so this frame reads as
-        // generating and every steering delivery refuses — forever, because the
-        // text is in the transcript and the transcript does not move while the
-        // lane is idle. The lane most likely to write that string is the one
-        // working on the status-detection code, which is the lane it hit.
         assert!(
             !pane_bar_says_generating(FROZEN_IDLE_PANE),
             "the lane was idle; its own prose must not read as a live turn"
         );
-        // The control: unscoped substring matching — the pre-fix predicate —
-        // DOES match this frame. Without this the test above could pass on a
-        // function that never returns true.
         assert!(
             FROZEN_IDLE_PANE.to_lowercase().contains("esc to interrupt"),
             "fixture must still contain the string, or it proves nothing"
@@ -9518,15 +9813,38 @@ mod steer_freeze_tests {
     fn a_status_bar_marker_is_still_a_generating_lane() {
         assert!(
             pane_bar_says_generating(REALLY_GENERATING_PANE),
-            "a bar-scoped check must still catch the real thing"
+            "no prompt visible + esc to interrupt on bar = generating"
         );
-        // And the inverse of 17c5a3c: a bypass bar CONTAINING the marker is
-        // active even though a ❯ is on screen, which `detect_claude_status`
-        // still gets wrong via its bottom-up ❯ fallback.
+        // NOT asserted against `detect_claude_status` directly: that function is
+        // under active repair by another lane and returned "idle", then "",
+        // then "active" for this frame within one evening. What this module
+        // needs is the COMPOSED property — that the gate refuses to call it a
+        // boundary — and that holds regardless of which way the scraper is
+        // currently leaning.
+        assert!(
+            !pane_is_at_boundary(REALLY_GENERATING_PANE),
+            "a bar-marked live turn is never a delivery boundary"
+        );
+    }
+
+    #[test]
+    fn an_empty_composer_does_not_make_a_marked_bar_idle() {
+        // Supersedes a peer's `idle_with_agents_is_not_generating`, which
+        // asserted the opposite. The fixture below IS the frame a lane shows
+        // while generating — measured live, essay in flight — so treating it as
+        // a boundary would type into a running turn. The genuinely ambiguous
+        // case (idle WITH background agents) is decided by the self-report,
+        // which `steer_decide` consults first; this pane fallback fails closed
+        // and the max-age deadline bounds the cost of being wrong.
+        assert!(
+            pane_bar_says_generating(IDLE_WITH_AGENTS_PANE),
+            "empty ❯ + esc to interrupt is what a GENERATING lane looks like"
+        );
+        assert!(!pane_is_at_boundary(IDLE_WITH_AGENTS_PANE));
+        // The cost of failing closed is bounded, not indefinite:
         assert_eq!(
-            detect_claude_status(REALLY_GENERATING_PANE),
-            "idle",
-            "documenting the known-wrong reading this helper exists to bypass"
+            steer_decide(None, Some(pane_is_at_boundary(IDLE_WITH_AGENTS_PANE)), 601.0, 600.0),
+            SteerDelivery::OverdueMidTurn
         );
     }
 
@@ -9547,5 +9865,127 @@ mod steer_freeze_tests {
         ] {
             assert!(!at_picker_text(plain), "queued row without an @: {plain:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AMUX-2642 — a lane that is never idle must not starve.
+//
+// Measured on the `amux` session, 2026-08-09: status `active` with a 6-second-old
+// tool-hook self-report — correctly active, genuinely working — and FIVE steering
+// messages queued 22:06..22:28, none delivered. amux-rust: ten, up to 229 minutes.
+// `steer_lane_at_boundary` returns true only on `idle`, so a lane that works
+// continuously has no boundary and its queue starves while the sender watches
+// nothing happen and concludes the lane is hung.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod steer_max_age_tests {
+    use super::*;
+
+    const MAX: f64 = 600.0;
+
+    #[test]
+    fn a_continuously_active_lane_still_receives_within_the_max_age() {
+        // THE REGRESSION TEST. The lane never reports idle — not once, at any
+        // age. Under the old gate (`return st == "idle"`) every one of these is
+        // "hold", which is the starvation. It must be delivered by the deadline.
+        for age in [0.0, 60.0, 599.0] {
+            assert_eq!(
+                steer_decide(Some("active"), None, age, MAX),
+                SteerDelivery::Hold,
+                "at {age}s a busy lane should still wait for its boundary"
+            );
+        }
+        for age in [600.0, 601.0, 1380.0 /* the amux specimen: 23 min */, 13740.0 /* amux-rust: 229 min */] {
+            assert_eq!(
+                steer_decide(Some("active"), None, age, MAX),
+                SteerDelivery::OverdueMidTurn,
+                "a message {age}s old must go into the running turn rather than wait forever"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_is_still_preferred_whenever_there_is_one() {
+        // The gate exists because the opposite failure was shipped first: a
+        // queued message delivered into a working turn ("i sent as a queue but
+        // it looks like it was sent directly even though this worker was still
+        // working"). An idle lane must never be reported as an overdue
+        // mid-turn delivery, however old the message is.
+        assert_eq!(steer_decide(Some("idle"), None, 0.0, MAX), SteerDelivery::AtBoundary);
+        assert_eq!(steer_decide(Some("idle"), None, 99_999.0, MAX), SteerDelivery::AtBoundary);
+        // A selector is `waiting`, not `idle`: still not a boundary. (The send
+        // path refuses a selector even when overdue — answering a pending tool
+        // is the user's, not amux's.)
+        assert_eq!(steer_decide(Some("waiting"), None, 10.0, MAX), SteerDelivery::Hold);
+    }
+
+    #[test]
+    fn a_hookless_lane_falls_back_to_the_pane_and_fails_closed() {
+        assert_eq!(steer_decide(None, Some(true), 0.0, MAX), SteerDelivery::AtBoundary);
+        assert_eq!(steer_decide(None, Some(false), 0.0, MAX), SteerDelivery::Hold);
+        // "cannot tell" (empty capture — a herdr lane mid-turn, by design) is
+        // NOT idle...
+        assert_eq!(steer_decide(None, None, 0.0, MAX), SteerDelivery::Hold);
+        // ...but it does not exempt the lane from the deadline either, or a
+        // hookless lane would starve exactly like the reported ones.
+        assert_eq!(steer_decide(None, None, MAX + 1.0, MAX), SteerDelivery::OverdueMidTurn);
+    }
+
+    #[test]
+    fn the_deadline_is_configurable_and_defaults_to_ten_minutes() {
+        assert_eq!(steer_max_age_s(), 600.0, "default must be 10 minutes unless AMUX_STEER_MAX_AGE_S is set");
+        // The warning threshold must be the SAME number the deliverer uses: a
+        // view that disagrees with its mechanism is worse than no view.
+        assert_eq!(steer_stall_warn_s(), steer_max_age_s());
+    }
+
+    #[test]
+    fn picker_shaped_text_takes_the_paste_path_at_any_length() {
+        // Three of amux's five starved messages carry an `@`. Typed mid-turn
+        // those are LOST (measured 1/1); pasted mid-turn they are accepted
+        // (measured 4/4). So the overdue delivery is only safe because
+        // picker-shaped text no longer goes through send-keys.
+        let short_at = "[04:39 PM] fix the logo @/Users/ethan/.amux/uploads/b7965e0b2a8f-image.png";
+        assert!(short_at.chars().count() < 400, "fixture must be under the length threshold");
+        assert!(at_picker_text(short_at), "…so ONLY the picker rule can route it to paste");
+        let short_plain = "make sure we have a scroll to the bottom thing";
+        assert!(!at_picker_text(short_plain));
+        assert!(at_picker_text("/compact"));
+    }
+}
+
+#[cfg(test)]
+mod gate_agreement_tests {
+    use super::*;
+
+    /// A bypass bar that CONTAINS "esc to interrupt" — a genuinely mid-turn
+    /// lane that `detect_claude_status` misreads as idle.
+    /// No spinner in frame (it has scrolled off, or the turn is between tool
+    /// calls) — only the bar says the turn is live. This is the frame the live
+    /// probe deadlocked on, not a constructed one.
+    const BUSY_BAR: &str = "  some transcript prose\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\u{a0}\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents\n";
+
+    #[test]
+    fn the_gate_and_the_send_path_agree_on_one_frame() {
+        // The deadlock: the gate said "boundary" (so no overdue delivery was
+        // allowed) while the send path said "generating" (so it refused). Both
+        // halves were individually defensible and the message never moved.
+        assert!(pane_bar_says_generating(BUSY_BAR), "the send path reads this as mid-turn");
+        assert_eq!(
+            detect_claude_status(BUSY_BAR),
+            "idle",
+            "…while detect_claude_status still reads it as idle — the disagreement"
+        );
+        assert!(
+            !pane_is_at_boundary(BUSY_BAR),
+            "the gate must resolve the disagreement the SAME way the send path does"
+        );
+        // …and therefore an old message on this lane becomes an overdue
+        // mid-turn delivery instead of being held forever.
+        assert_eq!(
+            steer_decide(None, Some(pane_is_at_boundary(BUSY_BAR)), 1400.0, 600.0),
+            SteerDelivery::OverdueMidTurn
+        );
     }
 }
