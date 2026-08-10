@@ -301,7 +301,85 @@ pub struct RunningBrowser {
     pub user_data_dir: PathBuf,
     pub cdp_port: u16,
     pub started_at: i64,
-    child: tokio::process::Child,
+    /// Always known. `child` is None for a browser ADOPTED after a server
+    /// restart — we did not spawn it, so we have no handle, but we can still
+    /// speak CDP to it and still kill it by pid.
+    pub pid: u32,
+    child: Option<tokio::process::Child>,
+}
+
+/// Where the handle survives a restart (AC-325).
+///
+/// The registry was in-process ONLY, so every server rebuild turned a live
+/// browser into "no amux-launched browser is running" while Chrome kept
+/// running — orphaned and unreachable at the same time. On a shared checkout
+/// where peers' compile loops restart this server constantly, that killed every
+/// browser sequence longer than a few seconds, which is every UI verification
+/// (start -> auth -> switch org -> navigate -> click -> read). Two sessions
+/// spent two days concluding the rig was flaky; it was being killed on a
+/// schedule set by other lanes.
+///
+/// This is AC-296 in rust: python's driver registry had the same in-memory
+/// assumption and was fixed by persisting the marker.
+fn running_state_path(home: &Path) -> PathBuf {
+    home.join("browser-running.json")
+}
+
+fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64) {
+    let v = serde_json::json!({
+        "profile": profile,
+        "user_data_dir": dir.to_string_lossy(),
+        "cdp_port": port,
+        "pid": pid,
+        "started_at": started,
+    });
+    let _ = std::fs::write(running_state_path(home), v.to_string());
+}
+
+fn clear_running(home: &Path) {
+    let _ = std::fs::remove_file(running_state_path(home));
+}
+
+/// Re-adopt a browser this server did not spawn, if one is still there.
+///
+/// Verified against the LIVE process before adopting: the pid must exist AND
+/// its CDP port must answer. A stale file must never resurrect a dead browser —
+/// that would replace an honest "not running" with a confident wrong handle,
+/// which is worse than the bug being fixed.
+pub async fn adopt_if_orphaned(home: &Path) -> bool {
+    if RUNNING.lock().expect("browser registry poisoned").is_some() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(running_state_path(home)) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
+    let port = v.get("cdp_port").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
+    let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+    if port == 0 || pid == 0 {
+        return false;
+    }
+    // Does CDP still answer? That is the only proof that matters — a live pid
+    // whose Chrome has wedged is not an adoptable browser.
+    if cdp_list(port).await.is_err() {
+        clear_running(home);
+        return false;
+    }
+    let profile = v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default").to_string();
+    let dir = v
+        .get("user_data_dir")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let started = v.get("started_at").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
+        profile,
+        user_data_dir: dir,
+        cdp_port: port,
+        started_at: started,
+        pid,
+        child: None,
+    });
+    tracing::info!(pid, port, "browser: adopted an orphan left by a previous server process");
+    true
 }
 
 pub static RUNNING: LazyLock<Mutex<Option<RunningBrowser>>> = LazyLock::new(|| Mutex::new(None));
@@ -459,13 +537,22 @@ pub async fn start(home: &Path, profile: &str, url: &str) -> anyhow::Result<Star
         user_data_dir: target.user_data_dir.display().to_string(),
         started_at,
     };
+    // `child.id()` is None only once the child has been reaped; a browser we
+    // just spawned always has one. Refusing here beats persisting pid 0, which
+    // `kill` would interpret as the whole process group.
+    let pid_num = pid.ok_or_else(|| anyhow::anyhow!("chrome spawned without a pid"))?;
+    let udd_for_state = target.user_data_dir.clone();
     *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
         profile: profile.to_string(),
         user_data_dir: target.user_data_dir,
         cdp_port: port,
         started_at,
-        child,
+        pid: pid_num,
+        child: Some(child),
     });
+    // Survive a server restart (AC-325). Written AFTER the handle is live so a
+    // file never claims a browser that failed to start.
+    persist_running(home, profile, &udd_for_state, port, pid_num, started_at);
     Ok(info)
 }
 
@@ -489,20 +576,45 @@ pub async fn stop(home: &Path) -> StopReport {
         return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
     };
 
-    if let Some(pid) = running.child.id() {
-        // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .await;
+    // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
+    let _ = tokio::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(running.pid.to_string())
+        .status()
+        .await;
+    match running.child.as_mut() {
+        Some(ch) => {
+            let graceful =
+                tokio::time::timeout(std::time::Duration::from_secs(8), ch.wait()).await;
+            if graceful.is_err() {
+                let _ = ch.kill().await; // last resort; may lose storage flush
+                let _ = ch.wait().await;
+            }
+        }
+        None => {
+            // ADOPTED: not our child, so we cannot wait() on it. Poll for exit
+            // by pid instead, keeping the same 8s TERM budget before SIGKILL —
+            // the flush window is the point, not the handle.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                let alive = tokio::process::Command::new("kill")
+                    .args(["-0", &running.pid.to_string()])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &running.pid.to_string()])
+                .status()
+                .await;
+        }
     }
-    let graceful =
-        tokio::time::timeout(std::time::Duration::from_secs(8), running.child.wait()).await;
-    if graceful.is_err() {
-        let _ = running.child.kill().await; // last resort; may lose storage flush
-        let _ = running.child.wait().await;
-    }
+    clear_running(home);
 
     let clean_exit = locks_present(&running.user_data_dir).is_empty();
     let locks_cleaned = if !clean_exit && is_amux_owned(home, &running.user_data_dir) {

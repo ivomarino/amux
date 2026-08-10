@@ -139,6 +139,11 @@ fn driver_err(e: chrome::DriverError) -> Response {
 
 /// Resolve session → page → connected CDP client, or the mapped error.
 async fn connect_session(session: &str, create_url: Option<&str>) -> Result<(chrome::DriverPage, chrome::CdpClient), Response> {
+    // A server restart leaves the browser running and the in-process handle
+    // empty (AC-325). Re-adopt lazily HERE, on the path every verb takes, so a
+    // sequence that spans a rebuild continues instead of reporting "no
+    // amux-launched browser is running" about a browser that is right there.
+    chrome::adopt_if_orphaned(&chrome::amux_home()).await;
     let page = chrome::resolve_page(session, create_url).await.map_err(driver_err)?;
     let cdp = chrome::CdpClient::connect(&page.ws_url)
         .await
