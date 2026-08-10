@@ -1612,6 +1612,29 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+// Turn a failed Response into the sentence the server actually wrote. Falls
+// back to the status code only when there is genuinely nothing to say (an
+// empty body, or a 405 from the router itself, which never has one — that is
+// the "route not registered" shape and deserves its own words rather than a
+// number nobody can act on).
+async function _apiErrText(r) {
+  let msg = '';
+  try {
+    const txt = await r.clone().text();
+    if (txt) {
+      try {
+        const j = JSON.parse(txt);
+        msg = j.error || j.message || j.detail || '';
+        // Gate refusals carry the exact command that WOULD work — that is the
+        // most actionable thing in the whole response; surface it.
+        if (msg && j.cli) msg += ' — try: ' + j.cli;
+      } catch (e) { msg = txt.slice(0, 200); }
+    }
+  } catch (e) { /* body already consumed or unreadable — status only */ }
+  if (!msg && r.status === 405) msg = 'this action is not supported by the server (405) — the endpoint is missing';
+  return msg ? (r.status + ': ' + msg) : ('Error: ' + r.status);
+}
+
 // apiCall — wraps mutation fetches; queues when offline or server unreachable
 async function apiCall(url, options) {
   if (!online) {
@@ -1623,7 +1646,14 @@ async function apiCall(url, options) {
     options.headers = _authHeaders(options.headers);
     const r = await fetch(url, options);
     if (!r.ok) {
-      showToast('Error: ' + r.status);
+      // SAY WHAT THE SERVER SAID. Every refusal on this API carries a real
+      // explanation in its body — "cannot archive pinned session — unpin
+      // first", "already holding doing", the gate checklist, the exact CLI to
+      // run — and all of it was thrown away for a bare "Error: 403". A status
+      // code with no sentence is indistinguishable from the click doing
+      // nothing, which is exactly how it was reported ("nothing happens if i
+      // delete or archive"; the worker WAS pinned and the server said so).
+      showToast(await _apiErrText(r));
       amuxTrack('api_error', { url: url.split('?')[0], status: r.status, method: options.method || 'GET' });
       return null;
     }
@@ -2280,19 +2310,9 @@ function _restoreCardFocus(focusedId, savedInputs) {
   if (d && inp.tagName === 'TEXTAREA') { inp.selectionStart = d.start; inp.selectionEnd = d.end; }
 }
 
-let _grpScopeHtml = '';    // last rendered group-scope HTML, so a re-render keeps it
-// The panel is an ACCORDION, not a dismissable card (Ethan: "make sure the
-// scope row thing is accordion (expand/contract) its right now an X which isnt
-// right"). The X called _selectGroup, which also DESELECTED the group — so the
-// only way to hide the panel was to lose the filter you were using. Collapsing
-// keeps the group selected and is remembered across renders and reloads.
-// HIDDEN BY DEFAULT (Ethan: "it keeps expanding the group section when I click
-// the tab. make it hidden by default."). Only an explicit stored '0' expands it,
-// so a fresh browser starts collapsed instead of unfolding under the pills every
-// time the Workers tab is opened.
-let _grpCollapsed = (function() {
-  try { return localStorage.getItem('amux_grp_collapsed') !== '0'; } catch (e) { return true; }
-})();
+// _grpScopeHtml, _grpCollapsed removed — scope strip on the Workers tab is gone
+// (Ethan: "get rid of this and global we can do group scopes on the group tab").
+// Group scopes live in the Groups tab via the same _scopeLoad.
 // At-a-glance group summary in the panel HEADER, visible collapsed or not
 // (Ethan, with a screenshot of the empty collapsed bar: "you can put some kind
 // of summary of the workers in the group, like # of workers across each status,
@@ -2313,7 +2333,7 @@ function _cardDoingCount(name) {
 }
 function _grpMembers(g) {
   const all = (sessions || []).filter(s => !s.archived);
-  return g === _GLOBAL_SCOPE ? all : all.filter(s => (s.tags || []).includes(g));
+  return all.filter(s => (s.tags || []).includes(g));
 }
 function _grpSummary(g) {
   const m = _grpMembers(g);
@@ -2351,42 +2371,34 @@ async function _grpSchedFetch(g) {
     const n = (d || []).filter(s => s.enabled && names.has(s.session)).length;
     const prev = _grpSchedCache[g];
     _grpSchedCache[g] = { n, ts: Date.now() };
-    // Fold into the template via a re-render only when the NUMBER changed —
-    // rendering unconditionally would repaint the whole list for a cache tick.
     if (!prev || prev.n !== n) {
-      const strip = document.getElementById('grp-scope-strip');
-      if (strip) strip._want = '';
       render();
     }
   } catch (e) {}
 }
-function _grpSetCollapsed(v) {
-  _grpCollapsed = !!v;
-  try { localStorage.setItem('amux_grp_collapsed', _grpCollapsed ? '1' : '0'); } catch (e) {}
-  const strip = document.getElementById('grp-scope-strip');
-  if (strip) strip._want = '';   // force the guarded re-render to repaint
-}
-function _grpAccToggle() {
-  const expanding = _grpCollapsed;
-  _grpSetCollapsed(!_grpCollapsed);
-  render();
-  // Entrance only, applied AFTER render re-created the node (animating the old
-  // node is animating a corpse — render() replaces it). Collapse stays instant:
-  // the user asked to hide it, delay there is friction not information.
-  if (expanding) {
-    const b = document.querySelector('.grp-scope-body');
-    if (b) _anim(b, { opacity: [0, 1], transform: ['translateY(-5px)', 'translateY(0)'] });
-  }
-}
 
 function render() {
-  // Skip render if a menu or edit overlay is open to prevent DOM clobbering
-  if (openMenu || editState || document.getElementById('edit-overlay').classList.contains('active')) return;
+  // THE PEEK HEADER UPDATES FIRST, ahead of the card-clobbering guard below.
+  //
+  // It used to sit AFTER that guard, so an open card menu / edit overlay froze
+  // the peek's status badge for as long as the menu stayed open — and the badge
+  // then reported whatever the session was doing when the guard first tripped.
+  // That is how the peek can say IDLE while the worker card behind it says
+  // WORKING: both read the same `s.status`, but only one of them was still
+  // being repainted. A stale status is worse than a missing one, because it
+  // looks authoritative.
+  //
+  // The guard exists to stop innerHTML writes from clobbering an open menu
+  // inside `#cards`. The peek header is a different subtree with no menu in it,
+  // so it was never what the guard was protecting.
   updatePeekStatus();
   if (peekSession) {
     _steeringUpdateBadge();
     if (_peekTab === 'steering') _steeringRender();
   }
+  // Skip the CARD LIST render if a menu or edit overlay is open, to prevent
+  // DOM clobbering.
+  if (openMenu || editState || document.getElementById('edit-overlay').classList.contains('active')) return;
   const el = document.getElementById('cards');
   // Skip re-render while user has focus inside any card input/textarea — prevents cursor reset and value loss
   const _active = document.activeElement;
@@ -2402,10 +2414,18 @@ function render() {
   const tagEl = document.getElementById('tag-filters');
   const allTags = [...new Set(sessions.filter(s => !s.archived).flatMap(s => s.tags || []))].sort();
   if (activeTag && !allTags.includes(activeTag)) activeTag = null;
+  // Pills FILTER the worker list. Nothing more.
+  //
+  // The "\u25c9 Global" pill and the group-scope band that used to sit under this
+  // bar are gone (Ethan: "get rid of this - since we can put this group scoping
+  // functionality in the group tab contents"). They made the pill row do two
+  // unrelated jobs at once: filtering the list, and opening a scope editor \u2014
+  // so clicking a group both narrowed the workers AND pushed a panel between
+  // the pills and the cards. Scope belongs with the group it configures, and
+  // the Groups tab already renders it (_renderGroupsTab / _scopeLoad, the same
+  // derivation), so this is a removal, not a reimplementation.
   if (allTags.length) {
-    tagEl.innerHTML =
-      `<span class="tag-filter scope-global${_grpOpen === '\u2609global' ? ' active' : ''}" title="What every worker inherits" onclick="_selectGlobalScope()">&#9673; Global</span>`
-      + allTags.map(t =>
+    tagEl.innerHTML = allTags.map(t =>
       `<span class="tag-filter${activeTag === t ? ' active' : ''}" onclick="toggleTagFilter('${escJs(t)}')">${esc(t)}</span>`
     ).join('');
   } else {
@@ -2420,28 +2440,7 @@ function render() {
   // _renderGroupsTab self-guards on activeView, so this is free off-tab.
   _renderGroupsTab();
   const stripEl = document.getElementById('grp-scope-strip');
-  if (stripEl) {
-    if (_grpOpen) {
-      const gid = escJs(_grpOpen);
-      // A header that is ALWAYS rendered, collapsed or not. The first cut put
-      // only a floated button here and hid the body — so collapsing produced an
-      // EMPTY bordered box with the Expand button escaping below it, because a
-      // float has nothing to contain it once its sibling is display:none. An
-      // accordion has to keep its own handle visible; that is the whole control.
-      const glabel = (_grpOpen === _GLOBAL_SCOPE) ? 'Global' : _grpOpen;
-      const want = `<div class="grp-scope-panel" id="grp-scope-${gid}" onclick="event.stopPropagation();">`
-        + `<div class="grp-scope-head">`
-        +   `<span class="grp-scope-title">${esc(glabel)}<span class="grp-scope-sub"> · scope</span></span>`
-        +   _grpSummary(_grpOpen)
-        +   `<button class="grp-scope-acc" title="${_grpCollapsed ? 'Expand' : 'Collapse'}" onclick="event.stopPropagation();_grpAccToggle()">${_grpCollapsed ? '▸ Expand' : '▾ Collapse'}</button>`
-        + `</div>`
-        + `<div class="grp-scope-body" id="grp-scope-body-${gid}"${_grpCollapsed ? ' style="display:none;"' : ''}>${_grpScopeHtml || 'Loading group scope&hellip;'}</div></div>`;
-      // Only touch the DOM when the markup actually changes: an unconditional
-      // innerHTML write on every render would wipe a scroll position and
-      // interrupt a tap mid-gesture.
-      if (stripEl._want !== want) { stripEl.innerHTML = want; stripEl._want = want; }
-    } else if (stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
-  }
+  if (stripEl && stripEl.innerHTML) { stripEl.innerHTML = ''; stripEl._want = ''; }
   const _nonArchivedCount = sessions.filter(s => !s.archived).length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_initialLoad) {
@@ -2617,7 +2616,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
         ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
         ${effort ? `<span class="badge effort" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Reasoning effort — click to change">${esc(effort)}</span>` : ''}
-        ${(s.tags||[]).map(g => `<span class="grp-chip" title="Group ${esc(g)} — what this group scopes" onclick="event.stopPropagation();toggleGroupScope('${escJs(g)}')">${esc(g)}</span>`).join('')}
+        ${(s.tags||[]).map(g => `<span class="grp-chip" title="Filter by group ${esc(g)}" onclick="event.stopPropagation();toggleTagFilter('${escJs(g)}')">${esc(g)}</span>`).join('')}
         ${model ? `<span class="badge model card-model-inline" onclick="event.stopPropagation();editField('${s.name}','model','${esc(model)}','${esc(provider)}')" title="Change model">${esc(model)}</span>` : ''}
       </div>` : ''}
       ${!s.running ? `<div style="padding:6px 0 2px;" onclick="event.stopPropagation()">
@@ -2759,7 +2758,6 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
   // just re-created the buttons. Correct-by-construction beats a post-pass that
   // any early return can bypass.
   try { _updateSendSplit(); } catch(e) {}
-  try { _grpScopeRehydrate(); } catch(e) {}
 }
 
 
@@ -4221,10 +4219,19 @@ async function toggleAutoContinue(session) { return toggleYolo(session); }
 
 async function togglePin(session) {
   closeAllMenus();
-  await apiCall(API + '/api/sessions/' + session + '/config', {
+  // Paint the flip NOW, like toggleYolo already does. The PATCH lands in
+  // ~35ms but the pin icon only moved after the next fetchSessions —
+  // measured 959ms and 2698ms against the live fleet, which is long enough
+  // to read as the menu item having done nothing. The refetch below is still
+  // the source of truth and corrects this if the server disagrees.
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.pinned : null;
+  if (s) { s.pinned = !s.pinned; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ toggle_pin: true })
   });
+  if (!r && s && was !== null) { s.pinned = was; lastSessionsJSON = ''; render(); }
   await fetchSessions();
 }
 
@@ -4288,10 +4295,25 @@ async function shareSession(session) {
   }
 }
 
+// Both of these take REAL time on a running worker — the server captures the
+// whole scrollback to the log, stops the agent and kills the tmux session
+// before it answers (measured: 2.0-2.5s on an idle throwaway, more on a lane
+// with a long history). Until the toast landed there was no feedback at all,
+// so the honest reading of the UI was "the click did nothing". Mark the card
+// busy the instant it is clicked; the state clears on the next render.
+function _cardBusy(session, label) {
+  const card = document.querySelector('.card[data-session="' + CSS.escape(session) + '"]');
+  if (card) { card.classList.add('card-busy'); card.setAttribute('data-busy', label); }
+  showToast(label + ' ' + session + '…');
+  return () => { if (card) { card.classList.remove('card-busy'); card.removeAttribute('data-busy'); } };
+}
+
 async function deleteSession(session) {
   closeAllMenus();
   if (!await showConfirm('Delete worker "' + session + '"?', 'Delete', true)) return;
+  const done = _cardBusy(session, 'Deleting');
   const r = await apiCall(API + '/api/sessions/' + session + '/delete', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  done();
   if (r) showToast('Worker "' + session + '" deleted');
   expanded.delete(session);
   await fetchSessions();
@@ -4299,7 +4321,9 @@ async function deleteSession(session) {
 
 async function archiveSession(session) {
   closeAllMenus();
+  const done = _cardBusy(session, 'Archiving');
   const r = await apiCall(API + '/api/sessions/' + session + '/archive', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  done();
   if (r) showToast(session + ' archived');
   await fetchSessions();
 }
@@ -4755,27 +4779,6 @@ async function loadPeekTranscript(showLoading) {
 // so the shell change is provably behaviour-preserving before a second caller
 // exists — the alternative is discovering the coupling from a group panel that
 // renders subtly differently, which is how three message renderers happened.
-let _grpOpen = null;   // which group's scope panel is expanded in the worker list
-
-// Ethan: "when I click a group in the session list page I should have a new
-// thing that opens or that is expandable, right below it, and indicates the
-// different configuration that I can scope."
-//
-// It renders through _scopeLoad({level:'group'}) — the SAME function the peek
-// Scope tab uses. That is the whole point of threading the scope through first
-// (AMUX-2362): a group panel written separately would drift from the worker
-// one, which is how three message renderers happened.
-// Re-hydrate an open group panel after the worker list re-renders. render()
-// runs on SSE updates and polls, and it rebuilds the panel node from the
-// template — so without this the panel would revert to "Loading group scope…"
-// and sit there, which reads as a hung fetch rather than a wiped node.
-function _grpScopeRehydrate() {
-  if (!_grpOpen) return;
-  const el = document.getElementById('grp-scope-body-' + _grpOpen);
-  if (el && /Loading group scope/.test(el.textContent || '')) {
-    _scopeLoad({ level: 'group', name: _grpOpen }, el.id);
-  }
-}
 
 // ── Groups tab (AMUX-2568, successor to the AMUX-2537 overview band) ────────
 // Every group at once, with the summary that already existed per-group and the
@@ -4830,7 +4833,6 @@ function _renderGroupsTab() {
         + '<div class="grp-ov-links">'
         +   '<span class="grp-ov-link" onclick="event.stopPropagation();switchView(\'sessions\');toggleTagFilter(\'' + gj + '\')">workers</span>'
         +   '<span class="grp-ov-link" onclick="event.stopPropagation();_grpOpenBoard(\'' + gj + '\')">board</span>'
-        +   '<span class="grp-ov-link" onclick="event.stopPropagation();switchView(\'sessions\');toggleGroupScope(\'' + gj + '\')">scope</span>'
         + '</div>';
     }
     return '<div class="grp-ov-row grp-tab-row" onclick="_grpTabToggle(\'' + gj + '\')">'
@@ -4855,7 +4857,6 @@ function _grpOpenBoard(g) {
     _bfSyncHash(); renderBoard();
   }, 60);
 }
-function toggleGroupScope(g) { _selectGroup(g); }
 
 let _scopeRowOpen = {};   // capability rows are CONTRACTED by default
 
@@ -4879,8 +4880,7 @@ function _scopeRowToggle(key) {
 // the page with its own filter control SET, so what you see is the page you
 // know, scoped, and you can widen it from there.
 function _grpGoto(g, where) {
-  const isGlobal = (g === _GLOBAL_SCOPE);
-  const label = isGlobal ? '' : g;
+  const label = g || '';
   if (where === 'messages') {
     switchView('messages');
     // Group -> its members, via the session filter the page already has. The
@@ -5092,8 +5092,8 @@ async function _scopeEditSave() {
     _scopeEditDirty = false;
     msg.textContent = 'Saved'; msg.style.color = 'var(--green)';
     showToast(key + ' saved at ' + (lvl === 'global' ? 'global' : lvl + ' ' + name));
-    const host = document.getElementById('grp-scope-body-' + (lvl === 'global' ? _GLOBAL_SCOPE : name));
-    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name }, host ? host.id : undefined);
+    _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
+               name ? 'grp-scope-body-' + name : undefined);
   } catch (e) {
     msg.textContent = 'Save failed: ' + e.message; msg.style.color = '#f85149';
   }
@@ -5121,9 +5121,8 @@ async function _scopeSave(lvl, name, key, elId) {
     if (msg) { msg.textContent = 'Saved · ' + (d.value && d.value.bytes != null ? d.value.bytes + ' bytes' : 'ok'); msg.style.color = 'var(--green)'; }
     // Re-read so the tile's supplying-layer badge reflects the write, which is
     // the card's acceptance criterion — not just "the POST returned 200".
-    const host = document.getElementById('grp-scope-body-' + (lvl === 'global' ? _GLOBAL_SCOPE : name));
     _scopeLoad(lvl === 'global' ? { level: 'global' } : { level: lvl, name: name },
-               host ? host.id : undefined);
+               name ? 'grp-scope-body-' + name : undefined);
   } catch (e) {
     if (msg) { msg.textContent = 'save failed: ' + e.message; msg.style.color = '#f85149'; }
   }
@@ -5271,7 +5270,7 @@ async function _scopeLoad(scope, targetId) {
       + '</span>'
       + (lvl === 'group' || lvl === 'global'
           ? (() => {
-              const _g = escJs(lvl === 'global' ? _GLOBAL_SCOPE : w);
+              const _g = escJs(w);
               // Go to the real page, not the panel's miniature of it.
               const _b = (k, t) => '<button class="btn" style="font-size:0.7rem;min-height:32px;padding:4px 9px;flex:0 0 auto;"'
                 + ' onclick="event.stopPropagation();_grpGoto(\'' + _g + '\',\'' + k + '\')">' + t + ' \u2197</button>';
@@ -5282,7 +5281,6 @@ async function _scopeLoad(scope, targetId) {
       + '</div>';
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
     dst.innerHTML = h;
-    if (targetId && targetId.indexOf('grp-scope-body-') === 0) _grpScopeHtml = h;
   } catch (e) {
     const dst = document.getElementById(targetId || 'peek-scope-body') || el;
     dst.textContent = 'Could not load scope: ' + e.message;
@@ -6243,8 +6241,15 @@ async function _peekToggleSchedule(id, val) {
   _peekLoadSchedules();
 }
 async function _peekRunSchedule(id) {
-  await apiCall(API + '/api/schedules/' + id + '/run', { method: 'POST' });
-  showToast('Schedule triggered');
+  // "Schedule triggered" was toasted unconditionally, including when the call
+  // returned null — a green message over an action that may not have happened,
+  // which is the same defect as the main Run button's "Ran · no output"
+  // (AMUX-2647). Same verdict renderer as runSchedule(), so the peek panel and
+  // the scheduler view can never tell a user two different stories.
+  const r = await apiCall(API + '/api/schedules/' + id + '/run', { method: 'POST' });
+  if (!r) return; // apiCall already toasted the refusal or the offline queue
+  const d = await r.json().catch(() => ({}));
+  showToast(_schedRunToast(d));
   _peekLoadSchedules();
 }
 async function _peekDeleteSchedule(id) {
@@ -6662,7 +6667,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.553';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.557';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7003,6 +7008,7 @@ function openPeek(name, opts) {
   refreshPeek(true, true).finally(() => refreshPeek());
   _schedulePeekPoll();
   setTimeout(_peekFitPane, 350);   // fit the pane to this viewer's width
+  _peekLeaseStart();               // AMUX-2634: hold the pane only while read
   _updateSendSplit();   // sync the Send/Queue button label to the current mode
   _savePeekState();
 }
@@ -7069,6 +7075,7 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _peekLeaseStop();   // AMUX-2634: stop holding the worker's pane at our width
   // Reset peek notes
   // Fold the fullscreen composer (if open) back into the input, and close menus,
   // so the draft below captures whatever was being typed.
@@ -7650,8 +7657,28 @@ function ansiToHtml(text) {
     if (n < 232) { const i=n-16,b=i%6,g=Math.floor(i/6)%6,r=Math.floor(i/36),v=x=>x?55+x*40:0; return `rgb(${v(r)},${v(g)},${v(b)})`; }
     const v=8+(n-232)*10; return `rgb(${v},${v},${v})`;
   };
+  // ── OSC-8 hyperlinks (AMUX-2636) ────────────────────────────────────
+  // Wire form: ESC ] 8 ; <params> ; <URL> ST   LABEL   ESC ] 8 ; ; ST
+  // 5 of 50 live sessions emit these (Claude Code links a file:// target
+  // behind a RELATIVE label). The generic OSC strip immediately below deletes
+  // the whole intro, so the URL was DISCARDED while the label survived — the
+  // link rendered as plain text that looks clickable and does nothing.
+  //
+  // The URL cannot simply be left inline: it would then flow through
+  // linkChunk's own linkifier and be rendered a second time, as visible text.
+  // So each URL is parked in a side table and the stream carries only its
+  // INDEX between private-use sentinels (U+E000..U+E002). Private-use points
+  // are the right carrier because they pass through eh() untouched (they are
+  // not & < >) and cannot occur in real terminal output.
+  const _osc8 = [];
+  const _osc8Text = text
+    // Open: params may be empty; the URL must be NON-empty, which is what
+    // distinguishes an open from the `ESC]8;;ST` close below.
+    .replace(/\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]+)(?:\x07|\x1b\\)/g,
+             (_m, url) => '\uE000' + (_osc8.push(url) - 1) + '\uE001')
+    .replace(/\x1b\]8;[^;\x07\x1b]*;(?:\x07|\x1b\\)/g, '\uE002');
   // Strip non-SGR sequences, preserve \x1b[...m (SGR color codes)
-  let t = text
+  let t = _osc8Text
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'')        // OSC sequences
     .replace(/\x1b[()][A-Z0-9]/g,'')                          // charset selection
     .replace(/\x1b[\x20-\x2f]*[\x40-\x5a\x5c-\x7e]/g,'')     // other C1 (excl [ = 0x5b)
@@ -7728,7 +7755,59 @@ function ansiToHtml(text) {
       out+=linkChunk(p);
     }
   }
-  return out+closeSpan();
+  return _osc8Resolve(out+closeSpan(), _osc8);
+}
+
+// Turn the parked OSC-8 sentinels into real anchors (AMUX-2636).
+//
+// Split out from ansiToHtml so the href policy is one readable place. Two
+// refusals are deliberate:
+//
+//  * ONLY http/https/file are linked. A terminal can emit any scheme it likes
+//    and this href lands in the DOM, so `javascript:`, `data:` and friends are
+//    an injection surface. An unknown scheme keeps the LABEL as plain text —
+//    exactly what the terminal itself shows — rather than guessing.
+//  * A label that ALREADY contains an anchor is not wrapped. linkChunk may
+//    have linkified a URL inside the label, and nested <a> is invalid HTML;
+//    the inner link already points somewhere sane.
+//
+// The href is escaped for QUOTES as well as angle brackets: eh() handles
+// & < > only, and a URL containing a double quote would otherwise break out
+// of the attribute.
+function _osc8Resolve(html, urls) {
+  if (!urls || !urls.length) return html;
+  const href = u => {
+    // Localhost URLs go through the same port-proxy rewrite as every other
+    // link in the peek, so an OSC-8 link works from a phone or the cloud.
+    const s = rewriteLocalhostUrls(String(u == null ? '' : u).trim());
+    if (!/^(?:https?|file):\/\//i.test(s)) return null;
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  };
+  // A label routinely CROSSES an SGR boundary (the live specimen has a colour
+  // change between the link text and the OSC-8 close), so the label HTML looks
+  // like `<span A>text</span><span B>`. Wrapping that in one anchor emits
+  // `<span><a></span><span></a>` — mis-nested. The browser does not reject it:
+  // the adoption-agency algorithm silently CLOSES the anchor at `</span>` and
+  // RE-OPENS a clone in the next span, so the specimen produced TWO anchors
+  // (measured in the real DOM: one correct, one empty), and with the colour
+  // change one character later the clone swallows the following text INTO the
+  // link. So wrap each text RUN between span tags separately: several adjacent
+  // anchors to one href are visually and behaviourally identical, and balanced.
+  const wrap = (label, h) => label
+    .split(/(<\/?span[^>]*>)/)
+    .map(seg => (!seg || /^<\/?span/i.test(seg)) ? seg
+      : '<a href="' + h + '" target="_blank" rel="noopener noreferrer">' + seg + '</a>')
+    .join('');
+  return html
+    .replace(/\uE000(\d+)\uE001([\s\S]*?)\uE002/g, (_m, idx, label) => {
+      const h = href(urls[+idx]);
+      if (!h || /<a\s/i.test(label)) return label;
+      return wrap(label, h);
+    })
+    // Unpaired sentinels: peek captures a rolling window, so a link routinely
+    // straddles the top of the buffer. Never leak the carrier glyphs.
+    .replace(/\uE000\d+\uE001|\uE002/g, '');
 }
 
 function linkifyOutput(text) {
@@ -7965,6 +8044,29 @@ async function _peekFitPane() {
       setTimeout(refreshPeek, 450);            // give Claude a beat to reflow
     }
   } catch (e) {}
+}
+// ── Viewer lease (AMUX-2634) ──
+// `/resize` pins the worker's tmux window to THIS reader's width, and tmux
+// makes that pin permanent (`window-size manual`). The server therefore
+// restores the pane once the viewer lease goes stale; this heartbeat is what
+// says "still reading". It is not an optimisation — without it a peek left
+// open longer than the lease gets re-widened under the reader.
+//
+// Sending on a timer rather than at close is the whole point: a backgrounded
+// phone, a killed tab or a dropped connection never runs a teardown, and those
+// are exactly the cases that used to leave a worker stuck at 50 columns
+// forever. A lease expires on its own; a close handler has to be reached.
+let _peekLeaseTimer = null;
+function _peekLeaseStop() { if (_peekLeaseTimer) { clearInterval(_peekLeaseTimer); _peekLeaseTimer = null; } }
+function _peekLeaseStart() {
+  _peekLeaseStop();
+  _peekLeaseTimer = setInterval(() => {
+    if (!peekSession) { _peekLeaseStop(); return; }
+    // Clear the skip-guard so the POST actually goes out; the server answers
+    // "already sized" and nothing repaints.
+    _peekSizeSent = { session: null, cols: 0 };
+    _peekFitPane();
+  }, 30000);   // server lease is 75s — tolerates one missed beat
 }
 let _peekFitTimer = null;
 window.addEventListener('resize', () => {
@@ -10423,6 +10525,59 @@ function _msgQueued(e) {
   if (e && typeof e === 'object' && typeof e.queued === 'boolean') return e.queued;
   return (typeof e === 'string' ? '' : (e.type || '')).toLowerCase() === 'steering';
 }
+
+/// The delivery chip: how this message actually reached the worker.
+///
+/// Shown for EVERY kind, not just human. A session or scheduled message that
+/// sat on the steering queue for two hours was previously indistinguishable
+/// from one delivered instantly — the badge showed its origin instead, so the
+/// one fact about delivery was the one fact missing.
+///
+/// Prefers the RECORDED `delivery` column (migration 0014) over the inference
+/// from `type`. Rows written before 0014 have no recorded value and render as
+/// the inference, visibly marked as inferred rather than silently presented as
+/// fact — "not recorded" is not "direct".
+function _msgDeliveryChip(e) {
+  if (!e || typeof e === 'string') return '';
+  const rec = (e.delivery || '').toLowerCase();
+  const wait = Number(e.queue_wait_ms) || 0;
+  // A queue wait worth reporting. Sub-second waits are the normal
+  // busy->boundary hop and saying "0s" about them is noise.
+  const waitTxt = wait > 1500 ? ' ' + _fmtDur(wait) : '';
+  let label, color, bg, title;
+  if (rec === 'fallback') {
+    // The degraded path: no origin stamp, no audit row, arrival unverified.
+    // Deliberately the loudest chip on the row — a message that arrived this
+    // way must never read as an audited one.
+    label = 'fallback'; color = '#f85149'; bg = 'rgba(248,81,73,0.16)';
+    title = 'Delivered by raw keystroke injection — NOT origin-stamped, not acknowledged, arrival unverified';
+  } else if (rec === 'queued' || (!rec && _msgQueued(e))) {
+    label = 'queued' + waitTxt; color = '#d29922'; bg = 'rgba(210,153,34,0.16)';
+    title = wait > 1500
+      ? 'Parked on the steering queue and delivered at a later turn boundary, after ' + _fmtDur(wait)
+      : 'Parked on the steering queue, delivered at the next turn boundary';
+  } else if (rec === 'direct') {
+    label = 'direct'; color = '#3fb950'; bg = 'rgba(63,185,80,0.14)';
+    title = 'Handed to a live session at the moment it was sent';
+  } else {
+    // Pre-0014 row: inferred, and SAID to be inferred.
+    label = 'direct?'; color = 'var(--dim)'; bg = 'rgba(139,148,158,0.12)';
+    title = 'Delivery path not recorded for this message (predates delivery metadata) — inferred from its type';
+  }
+  return '<span title="' + title + '" style="display:inline-block;font-size:0.66rem;font-weight:600;'
+       + 'padding:1px 6px;border-radius:3px;background:' + bg + ';color:' + color + ';margin-right:6px;">'
+       + label + '</span>';
+}
+
+/// Compact duration for the queue wait ("2h 6m", "45s").
+function _fmtDur(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '');
+}
 const _MSG_KIND = {
   human:    { label: 'Human',     color: '#58a6ff', bg: 'rgba(88,166,255,0.14)' },
   session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
@@ -10560,12 +10715,12 @@ function _cmdHistItemHTML(e, ctx) {
   // For a human message the origin is you, so instead we surface the delivery
   // path — "Human · queued" vs plain "Human".
   const originTxt = kind === 'human'
-    ? (_msgQueued(e) ? ' &middot; queued' : ' &middot; direct')
+    ? ''   // delivery chip below carries direct/queued for every kind now
     : (origin ? ' &middot; ' + origin.replace(/&/g,'&amp;').replace(/</g,'&lt;').slice(0,32) : '');
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
-  const meta = tag + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  const meta = tag + _msgDeliveryChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
@@ -11548,49 +11703,10 @@ function cardSlashAcHighlight(name) {
 
 // ── Search clear helpers ──
 function toggleTagFilter(tag) {
-  _selectGroup(tag);
-}
-
-// Select a group: filter the list to it AND show what it scopes. Entered from
-// the tag pills or from a group chip on a worker card — both land here, so the
-// two cannot drift into doing different things.
-const _GLOBAL_SCOPE = '\u2609global';   // sentinel: cannot collide with a real group name
-
-// Global scope panel, rendered by the same _scopeLoad and into the same slot as
-// a group's. Deliberately does NOT touch activeTag — global is not a filter over
-// the worker list, it is the layer every worker inherits, and filtering the list
-// to "global" would mean nothing.
-function _selectGlobalScope() {
-  const closing = (_grpOpen === _GLOBAL_SCOPE);
-  _grpScopeHtml = '';
-  _grpOpen = closing ? null : _GLOBAL_SCOPE;
-  if (_grpOpen) _grpSchedFetch(_grpOpen);
+  activeTag = (activeTag === tag) ? '' : tag;
   render();
-  if (_grpOpen) {
-    const el = document.getElementById('grp-scope-body-' + _GLOBAL_SCOPE);
-    if (el) _scopeLoad({ level: 'global' }, el.id);
-  }
 }
 
-function _selectGroup(g) {
-  const closing = (activeTag === g && _grpOpen === g);
-  activeTag = closing ? '' : g;
-  if (_grpOpen !== g) _grpScopeHtml = '';    // never show the previous group's data
-  _grpOpen = closing ? null : g;
-  if (!_grpOpen) _grpScopeHtml = '';
-  if (_grpOpen) _grpSchedFetch(_grpOpen);   // summary's async half, cached 60s
-  // Deliberately does NOT force-expand. That was my over-correction to "I cant
-  // use the group scope stuff": the real cause was AMUX-2406, where a collapsed
-  // panel rendered as an empty box with NO visible handle. With the header fixed
-  // the collapsed state is usable — it says "<group> · scope  ▸ Expand" — so
-  // auto-expanding only made the section unfold under the pills on every tab
-  // click. The stored preference is respected instead.
-  render();
-  if (_grpOpen) {
-    const el = document.getElementById('grp-scope-body-' + _grpOpen);
-    if (el) _scopeLoad({ level: 'group', name: _grpOpen }, el.id);
-  }
-}
 function toggleTagGroup(tag) {
   _tagGroupCollapsed[tag] = !_tagGroupCollapsed[tag];
   localStorage.setItem('amux_status_collapsed', JSON.stringify(_tagGroupCollapsed));
@@ -17184,6 +17300,54 @@ async function fetchSchedulerRuns() {
   }
 }
 
+// WHAT A RUN DOT MEANS (AMUX-2647). Before the delivery verdict existed there
+// were two states — `ok` and everything-else-is-red — and every rust run row
+// said `ok`, including the ones that delivered nothing at all. Mapping the new
+// statuses back onto green/red would rebuild exactly that: a green dot over a
+// command that never reached a session is the bug, rendered.
+//
+// `unknown` is the honest cell for the ~20k rows written before the verdict
+// column existed (and for any future status this function has not been taught).
+// It is NOT green: defaulting an unrecorded value to success is how the old
+// history lied in the first place.
+// The Run-now toast, from the server's own verdict.
+//
+// This is the line Ethan saw: "Ran · no output", green, over a run-now that
+// delivered nothing — the endpoint returned `{"ok":true,"status":"ok","note":""}`
+// while its own comment admitted the runtime had no session delivery. The
+// client was not wrong; it faithfully rendered a lie. So the toast now says
+// which of the four things happened, and NEVER says "Ran" for a command that
+// has not landed. `queued` is called out as pending on purpose: a user who
+// reads "queued" and waits is correct, and one who reads "Ran" and waits is
+// the one who presses the button three more times.
+function _schedRunToast(d) {
+  const note = String(d.note || '').split('\n')[0].slice(0, 90);
+  const tail = note ? ' · ' + note : '';
+  switch (String(d.status || '')) {
+    case 'delivered': return 'Delivered to ' + (d.session || 'the worker') +
+      (d.submission === 'unverified' ? ' (submission unverified)' : '') + tail;
+    case 'queued':    return 'Queued · lands at the worker’s next turn boundary';
+    case 'refused':   return 'Not delivered' + (tail || ' · refused');
+    case 'skipped':   return 'Skipped' + tail;
+    case 'error':     return 'Failed' + (tail || ' · delivery failed');
+    // Shell schedules: `ok` genuinely means the command ran to completion, and
+    // "no output" is a real, common answer for them (`exit 0 [noop] quiet`).
+    case 'ok':        return 'Ran' + (note ? ' · ' + note : ' · no output');
+    default:          return 'Ran · ' + (d.status || 'unknown outcome') + tail;
+  }
+}
+
+function _schedRunDotClass(r) {
+  switch (String(r.status || '')) {
+    case 'ok': case 'delivered': return 'ok';
+    case 'done': return 'done';
+    case 'queued': return 'queued';
+    case 'refused': case 'skipped': return 'warn';
+    case 'error': return 'err';
+    default: return 'unknown';
+  }
+}
+
 // Why a run happened. Only NON-cron sources get a chip: a cron fire is the
 // expected case, and chipping every row would bury the one row that explains an
 // off-cadence fire. Silence means "the schedule came due" (AMUX-1998).
@@ -17290,9 +17454,16 @@ function renderScheduler(opts) {
       const recLabel = s.schedule_expr || (s.sched_type === 'once' ? 'once' : (s.recurrence || 'recurring'));
       const runs = runMap[s.id] || [];
       const dots = runs.map(r => {
-        const cls = r.status === 'ok' ? 'ok' : r.status === 'done' ? 'done' : 'err';
-        const title = esc(r.status + ' · ' + new Date(r.ran_at * 1000).toLocaleTimeString());
-        return `<span class="sched-run-dot ${cls}" title="${title}"></span>`;
+        const cls = _schedRunDotClass(r);
+        // The tooltip is where "it ran" stops being the whole story: the run
+        // row now carries WHICH path the command took and what Claude Code
+        // said about the submission, and burying that in the DB would be the
+        // same failure as not recording it (ethos rule 4).
+        const bits = [r.status, new Date(r.ran_at * 1000).toLocaleTimeString()];
+        if (r.delivery && r.delivery !== r.status) bits.push('via ' + r.delivery);
+        if (r.submission) bits.push(r.submission);
+        if (r.note) bits.push(String(r.note).split('\n')[0].slice(0, 120));
+        return `<span class="sched-run-dot ${cls}" title="${esc(bits.join(' · '))}"></span>`;
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
       const sessLink = s.session
@@ -17488,13 +17659,7 @@ async function runScheduleNow(id) {
       await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
       renderScheduler();
       _peekRefreshSchedIfActive();
-      if (typeof showToast === 'function') {
-        const st = d.status || 'ok';
-        const note = (d.note || '').split('\n')[0].slice(0, 90);
-        showToast(st === 'ok' ? ('Ran' + (note ? ' \u00b7 ' + note : ' \u00b7 no output'))
-                              : (st === 'skipped' ? ('Skipped \u00b7 ' + note)
-                                                  : ('Failed \u00b7 ' + (note || st))));
-      }
+      if (typeof showToast === 'function') showToast(_schedRunToast(d));
     } else if (typeof showToast === 'function') {
       // apiCall returns null for BOTH "queued while offline" and "refused".
       // Calling a queued run a failure would be its own wrong-message bug —
@@ -20012,8 +20177,17 @@ async function addBoardItem(title, desc, status, worker, groups, due, ownerType,
   }
 }
 
+// OPTIMISTIC, BUT REVERSIBLE. Both of these paint the change locally before
+// the server has agreed to it — which is right, it is what makes the board
+// feel instant. What was missing is the other half: when the server REFUSES
+// (a gate 409, a 405 on an unregistered route, a 403), nothing put the card
+// back, so the UI kept asserting a state the server had rejected until the
+// next poll silently undid it. "Tons of board items are not moving" is what
+// that looks like from the outside: the card moves, the card comes back, and
+// no one ever sees the reason the server gave.
 async function updateBoardItem(id, changes) {
   const idx = boardItems.findIndex(i => i.id === id);
+  const prev = idx >= 0 ? { ...boardItems[idx] } : null;
   if (idx >= 0) { boardItems[idx] = { ...boardItems[idx], ...changes, updated: Math.floor(Date.now() / 1000) }; }
   saveBoardCache();
   renderBoard();
@@ -20027,14 +20201,34 @@ async function updateBoardItem(id, changes) {
     if (idx2 >= 0) boardItems[idx2] = updated;
     saveBoardCache();
     renderBoard();
+  } else if (prev) {
+    // Refused (apiCall has already shown the server's own words). Undo the
+    // optimistic paint NOW rather than leaving a lie on screen until the next
+    // fetchBoard.
+    const idx3 = boardItems.findIndex(i => i.id === id);
+    if (idx3 >= 0) boardItems[idx3] = prev;
+    saveBoardCache();
+    renderBoard();
   }
 }
 
 async function deleteBoardItem(id) {
+  const prev = boardItems.find(i => i.id === id);
+  const prevIdx = boardItems.findIndex(i => i.id === id);
   boardItems = boardItems.filter(i => i.id !== id);
   saveBoardCache();
   renderBoard();
-  await apiCall(API + '/api/board/' + id, { method: 'DELETE' });
+  const r = await apiCall(API + '/api/board/' + id, { method: 'DELETE' });
+  if (!r && prev) {
+    // The card is still on the server. Put it back where it was instead of
+    // letting the user believe it is gone (it reappears on the next refresh
+    // either way — this just stops the UI lying in the meantime).
+    if (!boardItems.some(i => i.id === id)) {
+      boardItems.splice(prevIdx >= 0 ? prevIdx : boardItems.length, 0, prev);
+    }
+    saveBoardCache();
+    renderBoard();
+  }
 }
 
 // ── Board status GATES (confirm-on-move checklists) ──
