@@ -32,7 +32,7 @@ Ethos rule 2: spend the model on JUDGING the numbers, never on producing them.
 The raw `/api/logs` queries in steps 3-5 and below remain the deep-dive
 fallback when a finding needs row-level inspection.
 
-## The five sweeps, in order
+## The six sweeps, in order
 
 1. **Errors: one call.** `GET /api/logs/analyze?since_h=24`
    Pre-grouped error rows (status >= 400) by (status, method, family,
@@ -146,6 +146,36 @@ fallback when a finding needs row-level inspection.
 
    Before filing, confirm the worker has *any* card here. If it does not, the
    honest finding is "cannot evaluate from this board", not a violation.
+
+6. **Status truth: does the card agree with the pane?** (AMUX-2646)
+   `GET /api/health/invariants` (detail: `GET /api/debug/invariants`) — read the
+   `status.agrees_with_pane` results. A `fail`
+   names a lane whose card says `idle` while its pane is unambiguously mid-turn,
+   with the report's state/age/source/origin in the evidence blob.
+
+   This sweep exists because the incident it is named for was caught by a human
+   looking at a terminal, and nothing else in amux could have caught it: a
+   fabricated `idle` self-report (`source: stop-hook-test`, written onto a live
+   working lane) outranked every other signal, and an `idle` report does not
+   decay for 24h. There was no query that would have shown it — the report store
+   was healthy, the derivation was healthy, the pane was healthy, and only the
+   SEAM between them was wrong.
+
+   Read the direction of the check before acting on it. Only `idle`-over-a-
+   working-pane is a contradiction; `active` over a quiet pane is normal (a long
+   tool call, a subagent) and is deliberately not flagged. If it ever starts
+   firing on many lanes at once, suspect the DETECTOR (a Claude Code UI change),
+   not the fleet — confirm against one pane by eye before filing per-lane cards.
+
+   Same check, read-only, without the server:
+   ```
+   CARGO_TARGET_DIR=/tmp/amux-status-target cargo test -p amux-server \
+     sessions_legacy::status_truth::live_fleet -- --ignored --nocapture
+   ```
+   It prints the fleet size, how many lanes painted inside the probe window, how
+   many of those are mid-turn, the disagreement count, and the full status
+   histogram. Read the histogram too: a disagreement count of 0 is also what a
+   fleet that has flipped entirely to `active` would report.
 
 Also skim `GET /api/logs/raw?lines=500` for `sources:"server_log"` lines matching
 ERROR/WARN — the tracing tail carries failures that never became a request row.

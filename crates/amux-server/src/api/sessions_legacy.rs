@@ -104,6 +104,42 @@ fn env_secs(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// The whole-fleet pane snapshot, shared by every reader inside the TTL.
+///
+/// A process global rather than a field on `AppState`: `FleetSignals::load` is
+/// a free function called from three places that do not share a handle, and
+/// threading one through would be a wider change to files other lanes are
+/// editing. The value is a pure cache — dropping it costs one re-capture and
+/// changes no verdict.
+#[allow(clippy::type_complexity)]
+fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, BTreeMap<String, String>)>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
+}
+
+/// One `tmux list-sessions` line -> (name, last-painted, created).
+///
+/// Pulled out of `load` so the ACTIVITY RULE is testable without a tmux
+/// server: it is the rule that was silently wrong for the whole fleet, and a
+/// test that re-types the parse inline would have agreed with whatever it was
+/// re-typing. Returns `None` for a line that does not carry at least a name.
+fn parse_list_sessions_line(l: &str) -> Option<(&str, Option<i64>, Option<i64>)> {
+    let mut it = l.split(':');
+    let name = it.next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let (a, c, w) = (it.next(), it.next(), it.next());
+    // max(session_activity, window_activity) — see `FleetSignals::activity`.
+    let last_paint: Option<i64> = a
+        .and_then(|x| x.parse().ok())
+        .into_iter()
+        .chain(w.and_then(|x| x.parse::<i64>().ok()))
+        .max();
+    Some((name, last_paint, c.and_then(|x| x.parse().ok())))
+}
+
 /// Signals the derivation reads, loaded once per request and shared with the
 /// board's `stale` computation (`active_python_sessions`) so the two can
 /// never disagree about who is working.
@@ -205,20 +241,14 @@ impl FleetSignals {
         }
         if let Ok(o) = tmux_out {
             for l in String::from_utf8_lossy(&o.stdout).lines() {
-                let mut it = l.split(':');
-                let (Some(n), a, c, w) = (it.next(), it.next(), it.next(), it.next()) else {
+                let Some((n, a, c)) = parse_list_sessions_line(l) else {
                     continue;
                 };
                 running.insert(n.to_string());
-                let a: Option<i64> = a
-                    .and_then(|x| x.parse().ok())
-                    .into_iter()
-                    .chain(w.and_then(|x| x.parse::<i64>().ok()))
-                    .max();
                 if let Some(ts) = a {
                     activity.insert(n.to_string(), ts);
                 }
-                if let Some(ts) = c.and_then(|x| x.parse().ok()) {
+                if let Some(ts) = c {
                     created.insert(n.to_string(), ts);
                 }
             }
@@ -380,11 +410,26 @@ impl FleetSignals {
     /// Capture the panes that could contradict a report.
     ///
     /// Only lanes that painted inside the contradiction window — typically a
-    /// handful of a 60-lane fleet (measured: 4 of 63 on 2026-08-09), so the
-    /// board's `stale` computation can afford this on every request. A lane
+    /// handful of a 60-lane fleet (measured: 4 of 63 on 2026-08-09). A lane
     /// that has not painted cannot be mid-turn: Claude Code repaints its
     /// spinner roughly six times a second.
+    ///
+    /// Behind a 2s cache, because the typical case is not the one that hurts.
+    /// Measured on this box: 4 painting lanes cost 44ms, but a fleet-wide
+    /// broadcast puts all 63 lanes in the candidate set and costs 473ms — and
+    /// this runs on the board's `stale` computation, which the dashboard polls.
+    /// A TTL two orders of magnitude below the contradiction window cannot
+    /// change a verdict, and it makes the board and the session list read the
+    /// SAME frame rather than two captures 20ms apart.
     pub fn capture_panes(&mut self) {
+        let ttl = env_secs("AMUX_PANE_CACHE_TTL_S", 2.0);
+        let cache = pane_cache();
+        if let Ok(c) = cache.lock() {
+            if self.now - c.0 < ttl {
+                self.panes = c.1.clone();
+                return;
+            }
+        }
         let names: Vec<String> = self
             .running
             .iter()
@@ -412,6 +457,12 @@ impl FleetSignals {
                     self.panes.insert(n, raw);
                 }
             }
+        }
+        // Store even an EMPTY result: "nothing was painting" is an answer, and
+        // a cache that only remembers hits re-probes hardest exactly when the
+        // fleet is quiet and there is nothing to find.
+        if let Ok(mut c) = pane_cache().lock() {
+            *c = (self.now, self.panes.clone());
         }
     }
 
@@ -1482,12 +1533,20 @@ mod tests {
 //     was actually mislabelled (`amux-rust`) had NO such bar; its only mark
 //     was a live spinner. A suite built on the first frame alone would have
 //     been green against the specimen it exists for.
-//   * an "idle with background agents" frame with `esc to interrupt` on the
-//     bar, per a comment in `pane_bar_says_generating` claiming the two cases
-//     are byte-identical. Measured across 4 live lanes, they are not: this
-//     Claude Code build prints `esc to interrupt` only while the MAIN turn is
-//     generating, and an idle lane with agents shows `· ← 2 agents` alone.
-//     Had that claim been true, the override below would have been unsafe.
+//   * an "idle with background agents" frame carrying `esc to interrupt` on
+//     the bar — the shape of the theory `pane_bar_says_generating` records
+//     itself REJECTING ("empty ❯ + esc to interrupt = idle with background
+//     agents"). Whether that frame exists decides whether the override below
+//     is safe at all, and it had never been measured either way. It was here:
+//     across four live lanes, this Claude Code build prints `esc to interrupt`
+//     only while the MAIN turn is generating — an idle lane with two agents
+//     shows `⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents` and
+//     a completed-turn marker (`✻ Churned for 2m 57s`). So the bar is a sound
+//     work signal, and the rejection in that function was right for a reason
+//     nobody had confirmed. IDLE_WITH_AGENTS below is the real frame; if a
+//     future Claude Code starts painting `esc to interrupt` for background
+//     agents, that test goes red and this override needs rethinking, which is
+//     the whole point of keeping the frame rather than a paraphrase of it.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod status_truth {
@@ -1929,13 +1988,30 @@ Claude usage limit reached. Your limit will reset at 3pm.
                 ));
             }
         }
+        // The whole registry, not only the probed lanes: a status histogram is
+        // how a REGRESSION in the other direction shows up (everything flipping
+        // to active), which a disagreement count of 0 would happily hide.
+        let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(amux_home().join("sessions")) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("env") {
+                    continue;
+                }
+                let Some(n) = p.file_stem().and_then(|x| x.to_str()) else { continue };
+                let running = s.agent_running(&format!("amux-{n}"));
+                let st = s.derive_status(n, running);
+                *hist.entry(if st.is_empty() { "<blank>".into() } else { st }).or_default() += 1;
+            }
+        }
         println!(
             "live fleet: {} tmux sessions, {} painted inside the probe window, \
-             {} of those mid-turn, DISAGREEMENTS: {}",
+             {} of those mid-turn, DISAGREEMENTS: {}\n  status histogram: {:?}",
             s.running.len(),
             probed.len(),
             probed.iter().filter(|(_, w)| *w).count(),
-            bad.len()
+            bad.len(),
+            hist
         );
         for l in &bad {
             println!("{l}");
@@ -1949,18 +2025,22 @@ Claude usage limit reached. Your limit will reset at 3pm.
     /// permanent silence (measured: 60/63 lanes, one of them 34.5h stale).
     #[test]
     fn activity_is_the_max_of_session_and_window() {
-        // Shape of the real `list-sessions` line, with the values measured on
-        // `amux-rust` while it was mid-turn.
+        // The REAL line `amux-rust` produced while it was mid-turn, through
+        // the REAL parser. `session_activity` had not moved since the session
+        // was created 34.5h earlier; `window_activity` was current.
         let line = "amux-rust:1786206640:1786206640:1786330900";
-        let mut it = line.split(':');
-        let (Some(_n), a, _c, w) = (it.next(), it.next(), it.next(), it.next()) else {
-            panic!("format changed");
-        };
-        let got: Option<i64> = a
-            .and_then(|x| x.parse().ok())
-            .into_iter()
-            .chain(w.and_then(|x| x.parse::<i64>().ok()))
-            .max();
-        assert_eq!(got, Some(1_786_330_900), "window activity must win when it is newer");
+        assert_eq!(
+            parse_list_sessions_line(line),
+            Some(("amux-rust", Some(1_786_330_900), Some(1_786_206_640))),
+            "window activity must win when it is newer — this is the whole fleet's \
+             only liveness signal"
+        );
+        // The other direction still works, and a short line does not panic.
+        assert_eq!(
+            parse_list_sessions_line("amux-x:200:100:50"),
+            Some(("amux-x", Some(200), Some(100)))
+        );
+        assert_eq!(parse_list_sessions_line("amux-x:200"), Some(("amux-x", Some(200), None)));
+        assert_eq!(parse_list_sessions_line(""), None);
     }
 }

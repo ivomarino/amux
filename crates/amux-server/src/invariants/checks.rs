@@ -12,7 +12,7 @@
 //! this repo has shipped a green `if True:` fixture, a grep that could not
 //! match, and a spin-catcher that ranked sleeping threads, all of which "passed".
 
-use super::{InvariantResult, Status};
+use super::InvariantResult;
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -321,12 +321,95 @@ pub struct QueuedItem {
 }
 
 // ---------------------------------------------------------------------------
+// 4. Status truth: the card must agree with the pane.
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AMUX-2646): `amux-rust` showed `idle` on its card while its pane
+/// read `esc to interrupt`. Its self-report was a fabricated
+/// `{"state":"idle","source":"stop-hook-test"}` written by a hand-run hook
+/// test onto a live lane, and the derivation's asymmetric freshness rule says
+/// an `idle` report never decays — so nothing in the system could disagree
+/// with it. A human spotted it by looking at a terminal.
+///
+/// INVARIANT: a lane whose pane is unambiguously mid-turn is not reported
+/// `idle`. Two sources of truth — the derived card status and the physical
+/// pane — and this is the seam between them, which is precisely where no
+/// component health check ever looks: the report store was healthy, the
+/// derivation was healthy, the pane was healthy, and they disagreed.
+///
+/// This is the check that would have caught it in seconds. It is cheap enough
+/// to run on the monitor tick because the caller only probes lanes that
+/// painted recently — a lane that has not painted cannot be mid-turn.
+pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
+    const ID: &str = "status.agrees_with_pane";
+    let mut out = Vec::new();
+    for l in lanes {
+        // Only ONE direction is a contradiction. A card reading `active` over
+        // a quiet pane is not: a lane can be legitimately mid-turn with
+        // nothing painting (a long tool call, a subagent), and flagging it
+        // would fire constantly and train everyone to ignore this.
+        if l.pane_says_working && l.status == "idle" {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    "a lane whose pane is mid-turn is not reported idle",
+                    format!(
+                        "card={} while the pane shows work (report={} age={:.0}s source={})",
+                        l.status, l.report_state, l.report_age_s, l.report_source
+                    ),
+                )
+                .entity(&l.name)
+                .evidence(json!({
+                    "session": l.name,
+                    "card_status": l.status,
+                    "pane_says_working": true,
+                    "report_state": l.report_state,
+                    "report_age_s": l.report_age_s,
+                    "report_source": l.report_source,
+                    "report_origin": l.report_origin,
+                    "class": "report-outranks-physical-evidence",
+                    "incident": "AMUX-2646: a hand-run hook test wrote idle onto a live \
+                                 working lane; an idle report never decays, so nothing \
+                                 could contradict it",
+                })),
+            );
+        } else {
+            out.push(InvariantResult::pass(ID).entity(&l.name));
+        }
+    }
+    if out.is_empty() {
+        // No lane painted inside the probe window. That is a real answer on a
+        // quiet fleet, not a broken probe: the caller only enumerates lanes it
+        // could actually read.
+        out.push(InvariantResult::pass(ID));
+    }
+    out
+}
+
+/// One lane's two sources of truth, side by side.
+#[derive(Debug, Clone)]
+pub struct LaneTruth {
+    pub name: String,
+    /// What the card says (the derived status).
+    pub status: String,
+    /// What the pane says — computed with the SAME detectors the derivation
+    /// uses, so the check and the mechanism cannot disagree about what
+    /// "working" means.
+    pub pane_says_working: bool,
+    pub report_state: String,
+    pub report_age_s: f64,
+    pub report_source: String,
+    pub report_origin: String,
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod negative_controls {
     use super::*;
+    use crate::invariants::Status;
 
     fn mounted() -> Vec<(&'static str, &'static [&'static str])> {
         vec![
@@ -439,6 +522,61 @@ mod negative_controls {
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
+    }
+
+    /// NEGATIVE CONTROL, rebuilt from the incident's own artifact: the exact
+    /// row `amux-rust` had on 2026-08-09 — a card reading `idle` behind a
+    /// 1076-second-old `stop-hook-test` report, over a pane that was mid-turn.
+    #[test]
+    fn detects_the_card_that_said_idle_while_the_pane_was_working() {
+        let lanes = vec![LaneTruth {
+            name: "amux-rust".into(),
+            status: "idle".into(),
+            pane_says_working: true,
+            report_state: "idle".into(),
+            report_age_s: 1076.0,
+            report_source: "stop-hook-test".into(),
+            report_origin: String::new(),
+        }];
+        let rs = status_agrees_with_pane(&lanes);
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "must detect a card that contradicts its own pane"
+        );
+        assert_eq!(rs[0].entity_key, "amux-rust", "the failure must name the lane");
+    }
+
+    /// ...and must NOT fire in the other direction. A lane reported `active`
+    /// with a quiet pane is a long tool call or a subagent, which is normal —
+    /// a check that fires on normal operation is one people switch off.
+    #[test]
+    fn does_not_fire_on_an_active_card_over_a_quiet_pane() {
+        let lanes = vec![LaneTruth {
+            name: "amux".into(),
+            status: "active".into(),
+            pane_says_working: false,
+            report_state: "active".into(),
+            report_age_s: 4.0,
+            report_source: "tool-hook".into(),
+            report_origin: "amux".into(),
+        }];
+        assert!(status_agrees_with_pane(&lanes).iter().all(|r| r.status == Status::Pass));
+    }
+
+    /// The agreeing case must PASS rather than being unrepresentable — a check
+    /// whose only outcome is failure cannot tell health from silence.
+    #[test]
+    fn passes_when_the_card_and_the_pane_agree() {
+        let lanes = vec![LaneTruth {
+            name: "amux".into(),
+            status: "active".into(),
+            pane_says_working: true,
+            report_state: "active".into(),
+            report_age_s: 2.0,
+            report_source: "tool-hook".into(),
+            report_origin: "amux".into(),
+        }];
+        assert!(status_agrees_with_pane(&lanes).iter().all(|r| r.status == Status::Pass));
     }
 
     /// ...and must NOT fire for a deep queue behind a BUSY worker, which is

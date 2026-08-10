@@ -1944,3 +1944,81 @@ FIX: `scripts/git-hooks/amux-staged-guard` is now the tracked source (the previo
   equality — and probes the live endpoint so an unrouted server is reported where someone
   is already looking at hooks. Three distinct failure messages in the hook; fail-open
   stays, silence does not.
+
+---
+## The fleet's only physical liveness signal was a tmux field that never moves
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (Claude Code in iTerm — not a fleet lane, hence no session stamp)
+CARD: AMUX-2662
+SYMPTOM: `derive_status` reads `#{session_activity}` as "when did this pane last paint".
+  On tmux 3.6a that field does not track pane output for a DETACHED session, and every
+  amux lane is detached. Measured: 60 of 63 live sessions had a `session_activity` more
+  than 60s older than their `window_activity`, and `amux-rust` — mid-turn, spinner
+  repainting ~6x/s — reported a `session_activity` that had not moved in 34.5 HOURS (it
+  was still exactly `session_created`). `#{window_activity}` was current for all of them.
+COST: Both consumers of physical liveness were silently inert for the whole fleet, for as
+  long as the field has been read. `now - act < 60 -> active` could never fire; the guard
+  demoting a stale `active` transition fired for EVERY session on EVERY request. So fleet
+  status was whatever the self-reports said and nothing else — which is the precondition
+  that let one fabricated `idle` report label a working lane idle for 1076s with nothing
+  able to disagree. The wrongness was invisible because a lane with working hooks looks
+  correct anyway: the dead signal only shows up when the reports are wrong, i.e. exactly
+  when you need it.
+FIX: `activity = max(session_activity, window_activity)`, parsed by a pure function
+  (`parse_list_sessions_line`) so the rule is testable without a tmux server — the first
+  version of that test re-typed the parse inline and passed against the bug. Uncommitted
+  in the shared checkout at time of writing.
+
+---
+## A read-only fleet probe returned "0 problems" while examining 0 lanes
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (Claude Code in iTerm — not a fleet lane, hence no session stamp)
+CARD: AMUX-2662
+SYMPTOM: The live card-vs-pane consistency check selects lanes to probe by "painted
+  recently". Run against the PRE-FIX derivation it printed: `63 tmux sessions, 0 painted
+  inside the probe window, 0 of those mid-turn, DISAGREEMENTS: 0`. A clean bill of health
+  computed over an empty candidate set, because the activity field it selects on never
+  moves (entry above). Post-fix the same command reports `5 painted, 2 of those mid-turn,
+  DISAGREEMENTS: 0` — the same verdict, now meaning something.
+COST: Nothing yet, because the discrepancy between the two runs was visible side by side.
+  The cost it WOULD have had is the whole point: a sweep step reporting 0 disagreements
+  daily, forever, over a candidate set that is structurally always empty. This is the
+  empty-grep trap with a denominator, and the denominator is the only thing that gives it
+  away.
+FIX: The check prints its denominators — fleet size, lanes probed, lanes confirmed
+  mid-turn — beside the disagreement count, plus the full status histogram, and the sweep
+  contract (`docs/rust-migration/log-sweep.md`, step 6) says to read them. A count of 0 is
+  only meaningful next to the number of things counted.
+
+---
+## A peer's commit shipped this run's in-flight work to origin, mid-edit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: (Claude Code in iTerm — not a fleet lane, hence no session stamp)
+CARD: AMUX-2663
+SYMPTOM: TWICE in ~40 minutes, by different peers. `e679bdb` ("fix(hygiene): five carded
+  defects") took an in-progress `/report` attribution change in `api/session_verbs.rs` and
+  a brand-new test file that had not yet passed — it was still 404ing on a missing rig
+  fixture at that moment. Then `3b24fcd` ("fix(build): main has not compiled since 22:43")
+  took the whole in-progress status derivation in `api/sessions_legacy.rs`, 495-line test
+  module included, mid-refinement. Both are on origin/main
+  (`git rev-list --count origin/main..main` = 0) before either was noticed.
+COST: Benign by luck — the swept-up code passes now. But this run was explicitly
+  instructed never to commit or push, and its work was pushed anyway, twice, once with a
+  red test. Also cost the confusion of `git status` no longer listing files that were
+  definitely modified minutes earlier.
+FIX: Not a rule ("remember to `git add` specific files" is the kind of rule that does not
+  run). Two things that would close it structurally: a pre-commit check that refuses a
+  commit touching files whose most recent writer was a different session — the
+  `Amux-Session` trailer machinery in `scripts/git-hooks/prepare-commit-msg` already makes
+  the writer knowable — or per-lane git worktrees, which the harness already supports.
+  CLAUDE.md's Deploy section documents the REBASE version of this hazard; this is the
+  `git add -A` version, and it needs the same warning.

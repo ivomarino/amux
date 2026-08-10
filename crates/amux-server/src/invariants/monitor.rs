@@ -55,7 +55,52 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 3. queue liveness: is anything queued in front of an IDLE target?
     out.extend(steering_queue_check(state).await);
 
+    // -- 4. status truth: does the card agree with the pane?
+    out.extend(status_pane_check(state));
+
     out
+}
+
+/// The derived card status against the physical pane, per lane (AMUX-2646).
+///
+/// Reads BOTH sides through `FleetSignals` — the same struct, the same
+/// capture, the same detectors the derivation itself uses. Re-deriving either
+/// side here would produce a check that can disagree with the mechanism it
+/// audits, which is the failure this whole module exists to catch.
+///
+/// Cost is bounded by `capture_panes`, which probes only lanes that painted
+/// inside the contradiction window: 4 of 63 on the fleet this was measured on.
+fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "status.agrees_with_pane";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    if signals.running.is_empty() {
+        // No tmux fleet is a real state (a fresh box), but it is also exactly
+        // what a failed `tmux list-sessions` looks like — and that has shipped
+        // here before, serving running=0 for 116 live cards. Do not call it a
+        // pass.
+        return vec![InvariantResult::unknown(ID, "no running tmux sessions visible")];
+    }
+    signals.capture_panes();
+    let lanes: Vec<checks::LaneTruth> = signals
+        .probed_lanes()
+        .into_iter()
+        .map(|(name, pane_says_working)| {
+            let rep = signals.reports.get(&name).cloned().unwrap_or(json!({}));
+            checks::LaneTruth {
+                status: signals.derive_status(&name, true),
+                pane_says_working,
+                report_state: rep["state"].as_str().unwrap_or("").into(),
+                report_age_s: signals.now - rep["ts"].as_f64().unwrap_or(signals.now),
+                report_source: rep["source"].as_str().unwrap_or("").into(),
+                report_origin: rep["origin"].as_str().unwrap_or("").into(),
+                name,
+            }
+        })
+        .collect();
+    checks::status_agrees_with_pane(&lanes)
 }
 
 /// The steering queue, joined against each target's reported state.
@@ -235,6 +280,33 @@ pub async fn run(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BINDING, not the check. `status_agrees_with_pane` has negative
+    /// controls of its own, but a pure check that `evaluate_all` never calls is
+    /// a check nobody runs — the "capability that exists but reaches nobody"
+    /// failure, one layer down. This asserts the wiring produces a verdict.
+    ///
+    /// Machine-independent by construction: on a box with a live tmux fleet it
+    /// returns one result per probed lane, on one without it returns a single
+    /// `Unknown`. What it may never do is return NOTHING, which is what a
+    /// silently-dropped binding looks like.
+    #[test]
+    fn the_status_pane_check_is_actually_wired_into_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let rs = status_pane_check(&state);
+        assert!(!rs.is_empty(), "the binding must always reach a verdict");
+        assert!(
+            rs.iter().all(|r| r.invariant_id == "status.agrees_with_pane"),
+            "wrong invariant id — the sweep contract greps for this exact string"
+        );
+    }
 
     /// The SPA extractor must find real call sites in the shipped bundle. If it
     /// returns nothing the census silently covers nothing — the empty-probe
