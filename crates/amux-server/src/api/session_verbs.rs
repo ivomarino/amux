@@ -1798,15 +1798,18 @@ const CMD_HIST_KEEP: i64 = 200;
 /// asserting a delivery path we did not observe is exactly the
 /// unknown-rendered-as-healthy bug.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// NOTE — there is deliberately no `Fallback` variant. The raw-tmux degradation
+// happens in the CLI, client-side, precisely WHEN THE SERVER IS UNREACHABLE, so
+// this recorder is structurally blind to it: if the server could record it,
+// there would have been no fallback. A variant nothing can construct is a
+// vocabulary entry pretending to be an observation (and clippy's
+// never-constructed warning is right to refuse it). Recording that path needs
+// the CLI to report it retroactively on reconnect — AMUX-2670.
 pub(crate) enum Delivery {
     /// Handed to a live session at the moment of the request.
     Direct,
     /// Parked on the steering queue, delivered at a later turn boundary.
     Queued,
-    /// Delivered by a degraded path (raw tmux keystrokes): NOT origin-stamped,
-    /// NOT acknowledged, arrival unverified. Recorded so a message that came
-    /// this way is never mistaken for an audited one.
-    Fallback,
 }
 
 impl Delivery {
@@ -1814,7 +1817,6 @@ impl Delivery {
         match self {
             Delivery::Direct => "direct",
             Delivery::Queued => "queued",
-            Delivery::Fallback => "fallback",
         }
     }
 }

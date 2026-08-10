@@ -27,6 +27,7 @@ pub mod history;
 pub mod invariants_api;
 pub mod journal;
 pub mod layout_presets;
+pub mod log_search;
 pub mod map;
 pub mod memories;
 pub mod metrics;
@@ -217,6 +218,7 @@ pub fn router(state: AppState) -> Router {
                 axum::Json(serde_json::json!({"ok": true}))
             }),
         )
+        .route("/api/log-search", axum::routing::get(log_search::search))
         .route(
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
