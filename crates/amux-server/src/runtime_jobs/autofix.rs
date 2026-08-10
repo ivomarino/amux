@@ -1725,6 +1725,72 @@ pub struct CiRun {
     pub failing_step: Option<String>,
 }
 
+/// A workflow whose redness means MERGED AND DEPLOYED HAVE DIVERGED.
+///
+/// Matched on the name because that is the only signal `gh run list` gives, and
+/// a repo-specific allowlist would be a second thing to keep in step with the
+/// workflows themselves. Deliberately narrow: a red test suite is bad and gets
+/// a card, but it does not mean shipped work is silently not reaching users.
+fn ci_is_deploy_workflow(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("deploy") || n.contains("release") || n.contains("publish")
+}
+
+/// Consecutive failures before a DEPLOY workflow escalates past a card.
+fn ci_deploy_alert_streak() -> i64 {
+    env_i64("AMUX_CI_DEPLOY_ALERT_STREAK", 10).max(2)
+}
+
+/// ...AND it must have been red this long. Both conditions, because they catch
+/// different mistakes: ten pushes in one busy hour is not three days of
+/// undeployed work, and one push a day for a week is.
+fn ci_deploy_alert_hours() -> f64 {
+    env_f64("AMUX_CI_DEPLOY_ALERT_H", 24.0).max(1.0)
+}
+
+/// Deploy workflows that have been red long enough and often enough that a
+/// board card has demonstrably not been enough.
+///
+/// Returns (repo, workflow, streak, hours_red, newest_url). Pure, so the bar can
+/// be tested against the real 2026-08-10 outage rather than a fixture.
+pub fn ci_deploy_escalations(runs: &[CiRun], now: f64) -> Vec<(String, String, i64, f64, String)> {
+    let mut groups: BTreeMap<(String, String), Vec<&CiRun>> = BTreeMap::new();
+    for r in runs {
+        if !ci_is_deploy_workflow(&r.workflow) || !r.on_default_branch {
+            continue;
+        }
+        if r.event == "pull_request" || r.event == "pull_request_target" || r.status != "completed" {
+            continue;
+        }
+        groups.entry((r.repo.clone(), r.workflow.clone())).or_default().push(r);
+    }
+    let mut out = Vec::new();
+    for ((repo, workflow), mut all) in groups {
+        all.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
+        let mut streak = 0i64;
+        let mut oldest_failure = now;
+        let mut newest_url = String::new();
+        for r in &all {
+            if ci_is_inconclusive(&r.conclusion) {
+                continue; // carries no evidence either way
+            }
+            if !ci_is_failure(&r.conclusion) {
+                break; // a green run ends the streak
+            }
+            if streak == 0 {
+                newest_url = r.url.clone();
+            }
+            streak += 1;
+            oldest_failure = oldest_failure.min(r.created_at);
+        }
+        let hours = ((now - oldest_failure) / 3600.0).max(0.0);
+        if streak >= ci_deploy_alert_streak() && hours >= ci_deploy_alert_hours() {
+            out.push((repo, workflow, streak, hours, newest_url));
+        }
+    }
+    out
+}
+
 /// Conclusions that mean "this run failed".
 fn ci_is_failure(c: &str) -> bool {
     matches!(c, "failure" | "timed_out" | "startup_failure")
@@ -2302,6 +2368,69 @@ pub async fn autofix_tick_with_ci(
             Ok(None) => rep.already_filed.push(f.signature.clone()),
             Err(e) => rep.errors.push(format!("{}: {e}", f.signature)),
         }
+    }
+
+    // ESCALATE A DEPLOY WORKFLOW PAST THE CARD (AMUX-2780).
+    //
+    // A card was not enough and we know it empirically: the cloud deploy has a
+    // card (32x consecutive) sitting unread in `todo` while the outage runs into
+    // its fourth day. "Merged" and "deployed" diverging is the one CI failure
+    // whose cost compounds silently — every commit after the first looks shipped
+    // and is not.
+    //
+    // Routed through the OWNER ALERT, which is Ethan's own configured channel
+    // set, so this does not decide how to reach him — he already did, and
+    // `urgent_alert_decision` supplies the 60s dedupe and the storm mute.
+    //
+    // TWO GUARDS AGAINST BECOMING THE NAG THIS REPO KEEPS FILING CARDS ABOUT:
+    //   - a HIGH bar, both conditions: >= AMUX_CI_DEPLOY_ALERT_STREAK failures
+    //     (10) AND >= AMUX_CI_DEPLOY_ALERT_H hours red (24). Ten pushes in one
+    //     busy hour is not three days of undeployed work; one push a day for a
+    //     week is, and only the pair catches both.
+    //   - ONE PER TICK, and a durable per-day idem. Turning this on is a
+    //     migration event, not a steady state: at the moment it ships, several
+    //     workflows are already past the bar, and "alert on everything newly
+    //     visible" is how the owner digest emitted 92 cards in one SMS. The cap
+    //     means the backlog discharges over hours, in priority order, instead of
+    //     as a burst.
+    for (repo, workflow, streak, hours, url) in ci_deploy_escalations(ci_runs, now) {
+        let day = (now / 86_400.0) as i64;
+        let idem = format!("ci-deploy-escalation:{repo}:{workflow}:{day}");
+        let already = {
+            match state.store.read() {
+                Ok(conn) => conn
+                    .query_row(
+                        "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                        rusqlite::params![idem],
+                        |_| Ok(()),
+                    )
+                    .is_ok(),
+                Err(_) => true, // cannot check means do not send
+            }
+        };
+        if already {
+            continue;
+        }
+        let msg = format!(
+            "DEPLOY RED {streak}x for {hours:.0}h — '{workflow}' ({repo}). Merged work is NOT \
+             reaching production; every commit since the first failure looks shipped and is not. \
+             Newest run: {url}"
+        );
+        crate::api::session_verbs::emit_event(
+            state,
+            "",
+            "ci.deploy_escalation",
+            Some(serde_json::json!({
+                "repo": repo, "workflow": workflow, "streak": streak,
+                "hours_red": hours as i64, "url": url, "message": msg,
+            })),
+            Some(idem),
+            "autofix",
+        )
+        .await;
+        rep.errors.push(format!("ESCALATED: {msg}"));
+        tracing::error!(repo = %repo, workflow = %workflow, streak, hours, "deploy red — escalated past the card");
+        break; // ONE per tick. See the cap note above.
     }
 
     match note_quiet_signatures(state, now, ci_runs).await {
@@ -3337,6 +3466,74 @@ mod tests {
     // -----------------------------------------------------------------------
     // FD pressure (AMUX-2812). The corpus is the 2026-08-10 EMFILE incident.
     // -----------------------------------------------------------------------
+
+    /// The corpus is the outage this card exists for: "Deploy to cloud.amux.io",
+    /// 32 consecutive failures since 2026-08-07 — a card was filed, sat unread
+    /// in `todo`, and the outage ran into its fourth day.
+    #[test]
+    fn a_multi_day_deploy_outage_escalates_past_the_card() {
+        let now = unix_now();
+        let runs: Vec<CiRun> = (0..32)
+            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 60.0 + i as f64 * 150.0))
+            .collect();
+        let esc = ci_deploy_escalations(&runs, now);
+        assert_eq!(esc.len(), 1, "the deploy outage must escalate");
+        assert_eq!(esc[0].2, 32, "streak");
+        assert!(esc[0].3 >= 24.0, "hours red: {}", esc[0].3);
+    }
+
+    /// BOTH conditions, because each alone is wrong in a different direction.
+    #[test]
+    fn a_busy_hour_is_not_a_multi_day_outage_and_a_slow_trickle_is() {
+        let now = unix_now();
+        // 12 failures inside one hour — over the streak bar, under the time bar.
+        let burst: Vec<CiRun> = (0..12)
+            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", i as f64 * 3.0))
+            .collect();
+        assert!(ci_deploy_escalations(&burst, now).is_empty(), "a burst is not an outage");
+        // 3 failures over a week — over the time bar, under the streak bar.
+        let trickle: Vec<CiRun> = (0..3)
+            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", i as f64 * 2880.0))
+            .collect();
+        assert!(ci_deploy_escalations(&trickle, now).is_empty(), "3 reds is a card, not an alarm");
+    }
+
+    #[test]
+    fn a_green_run_ends_the_streak_and_a_test_suite_is_never_a_deploy() {
+        let now = unix_now();
+        let mut runs: Vec<CiRun> = (0..30)
+            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 120.0 + i as f64 * 180.0))
+            .collect();
+        // A success NEWER than all of them: the deploy recovered.
+        runs.push(ci_run("Deploy to cloud.amux.io", 999, "success", 30.0));
+        assert!(ci_deploy_escalations(&runs, now).is_empty(), "a green run ends it");
+
+        // The narrowness that keeps this from becoming a general CI alarm: a red
+        // test suite is bad and gets a card, but shipped work is still shipping.
+        let tests: Vec<CiRun> = (0..40)
+            .map(|i| ci_run("rust", i, "failure", 60.0 + i as f64 * 180.0))
+            .collect();
+        assert!(ci_deploy_escalations(&tests, now).is_empty(), "'rust' is not a deploy workflow");
+        assert!(ci_is_deploy_workflow("Deploy to cloud.amux.io"));
+        assert!(ci_is_deploy_workflow("release-please"));
+        assert!(!ci_is_deploy_workflow("rust"));
+        assert!(!ci_is_deploy_workflow("checks"));
+    }
+
+    /// Cancelled runs carry no evidence and must not break the streak — the same
+    /// rule the card detector already applies, restated here because this is a
+    /// SECOND streak walker and two spellings drift.
+    #[test]
+    fn a_cancelled_run_mid_outage_does_not_reset_the_escalation() {
+        let now = unix_now();
+        let mut runs: Vec<CiRun> = (0..20)
+            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 120.0 + i as f64 * 180.0))
+            .collect();
+        runs.push(ci_run("Deploy to cloud.amux.io", 999, "cancelled", 60.0));
+        let esc = ci_deploy_escalations(&runs, now);
+        assert_eq!(esc.len(), 1, "a cancelled run must not look like a recovery");
+        assert_eq!(esc[0].2, 20, "and must not count toward the streak either");
+    }
 
     /// THE INCIDENT'S OWN NUMBERS: 220 descriptors against macOS's launchd
     /// default of 256. The convenient fixture would be a round "80% of 1000",
