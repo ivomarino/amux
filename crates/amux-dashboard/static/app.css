@@ -2044,7 +2044,9 @@
     margin-top: 8px; padding: 0 2px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .card-task-name .tn-label { font-weight: 400; color: var(--dim); margin-right: 4px; }
+  /* .tn-label removed with the "Task:" prefix (Ethan, 2026-08-10): the line
+     under the worker name is obviously the task, and the label cost a third of
+     a narrow phone row to say so. */
   .card-preview.task-stale, .card-task-name.task-stale { opacity: 0.6; }
   .task-stale-badge { color: #f0a020; font-weight: 600; font-size: 0.72rem; white-space: nowrap; }
 
