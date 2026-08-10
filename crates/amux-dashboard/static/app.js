@@ -28670,5 +28670,3 @@ async function _jrnlSaveConfig() {
   document.getElementById('jrnl-config-overlay')?.remove();
   _jrnlRenderEditor();
 }
-
-// REBUILD-PROBE-1786338364
