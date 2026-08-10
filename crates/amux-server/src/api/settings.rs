@@ -499,16 +499,49 @@ pub(crate) mod test_env {
 
     pub static LOCK: Mutex<()> = Mutex::new(());
 
+    /// Keys that leak from the REAL machine into a temp-home test.
+    ///
+    /// `ServerConfig::load` exports server.env into the PROCESS env
+    /// (config.rs — deliberate, it is the python setdefault parity that made
+    /// server.env flags actually work). But `effective_env` falls back to the
+    /// process env when a key is absent from the home's file, so once ANY test
+    /// loads the real ~/.amux, that machine's values are visible to every later
+    /// test — whatever home they set.
+    ///
+    /// That made `owner_alert_respects_channel_config` fail roughly 1 run in 3
+    /// under `cargo test --workspace`: it asserts "no channels configured", and
+    /// found the developer's real AMUX_OWNER_PHONE, so the alert went out over
+    /// sms. Order-dependent, hence intermittent, hence read as "flaky test"
+    /// rather than "the test can see the machine".
+    ///
+    /// A temp home must mean a clean slate. Cleared here rather than in each
+    /// test because the guard already holds LOCK, so this is the one place the
+    /// mutation is race-free. Restored on drop.
+    const LEAKY_KEYS: &[&str] = &["AMUX_OWNER_PHONE"];
+
     pub struct HomeGuard {
         prev: Option<String>,
+        prev_leaky: Vec<(&'static str, Option<String>)>,
         _g: MutexGuard<'static, ()>,
     }
 
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_leaky: Vec<(&'static str, Option<String>)> = LEAKY_KEYS
+            .iter()
+            .map(|k| {
+                let was = std::env::var(*k).ok();
+                std::env::remove_var(k);
+                (*k, was)
+            })
+            .collect();
         let prev = std::env::var("AMUX_HOME").ok();
         std::env::set_var("AMUX_HOME", path);
-        HomeGuard { prev, _g: g }
+        HomeGuard {
+            prev,
+            prev_leaky,
+            _g: g,
+        }
     }
 
     impl Drop for HomeGuard {
@@ -516,6 +549,12 @@ pub(crate) mod test_env {
             match &self.prev {
                 Some(v) => std::env::set_var("AMUX_HOME", v),
                 None => std::env::remove_var("AMUX_HOME"),
+            }
+            for (k, was) in &self.prev_leaky {
+                match was {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }
@@ -737,8 +776,33 @@ mod tests {
         assert_eq!(v, json!({ "enabled": true }));
 
         // env: masked GET, allow-listed PATCH.
+        //
+        // This endpoint reports the PROCESS environment, not just the temp
+        // home's server.env — deliberately, since that is what a worker would
+        // actually receive. So a bare `assert_eq!(.., "")` is not a statement
+        // about the code, it is a statement about whoever ran the test: it
+        // passed in CI (no OPENAI_API_KEY) and failed on a dev machine that had
+        // one exported, which reads as "main is red" when nothing is broken.
+        //
+        // Assert the real contract instead — unset reads empty, set reads
+        // MASKED and never leaks the value — and branch on the ambient env
+        // rather than mutating it, because `set_var` is process-global and this
+        // suite runs threaded (the alerts tests already race on exactly that).
         let (_, v) = send(&app, "GET", "/api/settings/env", None).await;
-        assert_eq!(v["OPENAI_API_KEY"], json!(""));
+        match std::env::var("OPENAI_API_KEY") {
+            Err(_) => assert_eq!(v["OPENAI_API_KEY"], json!("")),
+            Ok(real) => {
+                let shown = v["OPENAI_API_KEY"].as_str().unwrap_or_default();
+                assert!(
+                    shown.starts_with('*'),
+                    "a configured key must come back masked, got {shown:?}"
+                );
+                assert!(
+                    !shown.contains(&real),
+                    "the masked form must never contain the real value"
+                );
+            }
+        }
         let (st, v) = send(
             &app,
             "PATCH",

@@ -2079,7 +2079,15 @@ mod tests {
         assert_eq!(g["sample"]["error_body"], "{\"error\": \"not found\"}");
 
         let g = find(404, "GET", "/api/board/{id}");
-        assert_eq!(g["routed_methods"], json!(["GET", "PATCH"]), "a real route whose handler 404'd");
+        // Same stale expectation as in debug_routes below: DELETE really is
+        // routed here (board.rs:58). The point of this assertion is that a 404
+        // at a path WITH routed methods is the handler's own not-found, not an
+        // unrouted path — which the DELETE makes no less true.
+        assert_eq!(
+            g["routed_methods"],
+            json!(["GET", "PATCH", "DELETE"]),
+            "a real route whose handler 404'd"
+        );
 
         // The verdicts: one per 405 group, each landing in its honest cell.
         let verdicts: Vec<&str> =
@@ -2164,7 +2172,16 @@ mod tests {
         let find = |p: &str| routes.iter().find(|r| r["path"] == p).unwrap();
         assert_eq!(find("/api/board/{id}")["owner"], "native");
         assert_eq!(find("/api/board/{id}")["family"], "/api/board");
-        assert_eq!(find("/api/board/{id}")["methods"], json!(["GET", "PATCH"]));
+        // DELETE is genuinely routed — board.rs:58 is
+        // `get(get_item).patch(patch_item).delete(delete_item)` — so the
+        // ROUTE_TABLE row is right and it was this EXPECTATION that went stale
+        // when delete landed. Fixed the assertion, not the table: the table is
+        // what /api/debug/routes serves, and editing it to match a stale test
+        // would have made the endpoint lie about a method it really answers.
+        assert_eq!(
+            find("/api/board/{id}")["methods"],
+            json!(["GET", "PATCH", "DELETE"])
+        );
         // Owner derives from PROXIED_FAMILIES. The registry is EMPTY since
         // the /api/scope cutover (the last python-owned family went native),
         // so every row reads native today; the derivation stays registry-
