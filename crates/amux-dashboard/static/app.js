@@ -23,6 +23,41 @@ if (_authToken) {
   };
 }
 
+// ── A 200 is not proof the edit was applied (AMUX-2673, after AC-323) ──
+//
+// The API names unapplied request fields in `ignored_fields` (AC-263). Nothing
+// read it: 0 of 47 mutation call sites, which is how `amux board progress`
+// reported writes it never made for weeks.
+//
+// Wrapping fetch ONCE covers all 145 mutating raw-fetch sites in this file AND
+// every one written later. The alternative — routing those 145 through
+// apiCall() — was rejected: apiCall queues offline ops, returns null on error
+// and toasts on !ok, so converting call sites would change behaviour at 145
+// places to buy a check that belongs at the transport. Same idiom as the auth
+// wrapper directly above, so this is not a new pattern in the file.
+//
+// Unconditional (the auth wrapper is gated on a token; a dropped field is worth
+// knowing about either way). Never blocks and never throws into the caller: the
+// body is CLONED, the check is fire-and-forget, and every failure path is
+// swallowed — a mutation must not break because its watchdog did.
+(function installIgnoredFieldsWatch() {
+  const _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    const p = _origFetch.call(this, input, init);
+    try {
+      const m = ((init && init.method) ||
+                 (input instanceof Request ? input.method : '') || 'GET').toUpperCase();
+      if (m !== 'GET' && m !== 'HEAD') {
+        const url = typeof input === 'string' ? input
+                  : (input instanceof Request ? input.url : '');
+        p.then(r => { if (r && r.ok) _warnIgnoredFields(r, url, { method: m }); })
+         .catch(() => {});
+      }
+    } catch (_) { /* never let the watch affect the request */ }
+    return p;
+  };
+})();
+
 // ── Theme ──
 function _applyTheme(light) {
   document.body.classList.toggle('light', light);
@@ -1646,10 +1681,10 @@ async function _apiErrText(r) {
 // Fire-and-forget on a CLONE so the caller still owns the body, and only for
 // mutations — a GET has no fields to ignore.
 //
-// COVERAGE IS PARTIAL AND DELIBERATELY NOT CLAIMED OTHERWISE: this catches the
-// 61 sites that go through apiCall. Most PATCHes in this file use raw fetch and
-// are still blind — see the follow-up card. Routing them through here is the
-// actual close of the class.
+// Called from the fetch wrapper at the top of this file, so coverage is every
+// mutation the page makes — the 61 apiCall sites, the 145 raw-fetch ones, and
+// anything added later. (This started as an apiCall-only check covering 1 of 32
+// PATCHes; AMUX-2673 moved it to the transport, which is where it belonged.)
 function _warnIgnoredFields(r, url, options) {
   const m = ((options && options.method) || 'GET').toUpperCase();
   if (m === 'GET' || m === 'HEAD') return;
@@ -1684,7 +1719,9 @@ async function apiCall(url, options) {
       return null;
     }
     consecutiveFailures = 0;
-    _warnIgnoredFields(r, url, options);
+    // No _warnIgnoredFields call here: apiCall goes through fetch, which the
+    // watch at the top of this file already wraps. Calling it here too would
+    // toast twice for every apiCall mutation.
     return r;
   } catch(e) {
     // Server unreachable despite having internet — queue and mark offline
@@ -6694,7 +6731,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.560';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.561';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
