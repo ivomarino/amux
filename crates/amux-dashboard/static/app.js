@@ -6667,7 +6667,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.557';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.558';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14692,6 +14692,12 @@ document.getElementById('peek-body').addEventListener('scroll', function() {
     _hideScrollLockBadge(this);
   } else {
     _peekScrollLocked = true;
+    _showScrollLockBadge(this, () => {
+      _peekScrollLocked = false;
+      applyPeekSearch(false, false);
+      this.scrollTop = this.scrollHeight;
+      _hideScrollLockBadge(this);
+    });
   }
 }, {passive: true});
 // Force URLs in peek output to open in the system browser (PWA desktop + mobile).
