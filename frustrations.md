@@ -2242,3 +2242,140 @@ COST: Beyond the noisy sweep: this is what an autofix loop would have spent lane
 FIX: `send_failure_status()` classifies the outcome (409/404/400/501, 500 only for
   unhandled), used by send + archive/wake/reset, with a `fix` hint in the body. Uncommitted
   in the working tree at time of writing; see the autofix handoff report.
+
+## The per-agent CARGO_TARGET_DIR convention has no GC — 37 caches filled the disk
+AREA: environment
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux (subagent — legacy-port migration)
+CARD: AMUX-2754
+SYMPTOM: `cargo build -p amux-server` died with `failed to write ...: No space left on
+  device (os error 28)`. The root volume had **609Mi free of 1.8Ti**. `du` on /tmp found
+  **445GB across 37 `/tmp/amux-*-target` directories** — one per agent task, 15GB at the
+  top end, 33 of them last written the previous day. Every task brief in this repo hands
+  the agent its own `CARGO_TARGET_DIR=/tmp/amux-<task>-target`, and nothing ever removes
+  one. The convention that keeps concurrent agents from contending is also, unmodified, a
+  disk-fill schedule: ~12GB per rust task, times however many tasks the fleet runs.
+COST: My gate (cargo test + clippy) was unrunnable. Worse than my task: the amux SQLite DB
+  and `~/.amux/logs` are on this volume, so the whole fleet was one write from failure with
+  no warning anywhere — `/health` reports `store:"ok"` and says nothing about the disk
+  underneath it. I could not clean up safely either: the dir names are TASK-scoped, not
+  session-scoped, so "does a live session own this cache?" is unanswerable — my own dir
+  (`amux-port-target`) looks orphaned by every test I could write. Escalated to the owner
+  because deciding which 445GB of other agents' caches to destroy is not an agent's call
+  (ethos rule 8).
+FIX: Two halves, neither done. (1) `/health` should report free space on the volume holding
+  `~/.amux`, so disk pressure is visible where every session already looks instead of
+  arriving as a build error in whoever happens to compile next. (2) The convention needs a
+  reaper: either name the dir after `$AMUX_SESSION` (so ownership is decidable and a
+  session reuses one cache across tasks instead of minting one per task), or a scheduler
+  entry that removes `/tmp/amux-*-target` untouched for >24h. Naming it after the session
+  is the better half — it makes the cleanup question answerable at all, which is the part
+  that blocked me.
+
+---
+## The scheduler's Skip button answered 405 with an EMPTY body, so the dashboard toasted its own guess
+AREA: scheduler
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux (sched2 lane)
+CARD: AMUX-2679
+SYMPTOM: `POST /api/schedules/<id>/skip` — the call the dashboard has made since the
+  Python days — was never routed in the Rust API. Against the live server it returns
+  `HTTP 405` with a zero-byte body, and `skipSchedule()` read `d.error || 'Could not
+  skip'`, so the user got a bare "Could not skip" with no reason at any layer. A
+  routing gap therefore presented as a broken SCHEDULE, which is where anyone would
+  look first.
+COST: the button was dead for the whole cutover with nothing in any log — the failure
+  is pure absence, same shape as `run_scheduler` having zero call sites (AMUX-2647).
+  The generic toast is what made it expensive: it named the wrong subsystem.
+FIX: routed `POST /{id}/skip` -> `skip_next` with python's semantics, and moved
+  `skipSchedule()` onto `apiCall` so the server's own sentence is what gets shown
+  instead of a client-side guess.
+
+---
+## A client-side fallback string outranked the server's reason, and only for THIS control
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux (sched2 lane)
+CARD: AMUX-2679
+SYMPTOM: every other schedule control goes through `apiCall`, which toasts
+  `_apiErrText(r)` — the server's real refusal text. `skipSchedule()` alone used a
+  bare `fetch` and `showToast(d.error || 'Could not skip')`. When a response has no
+  JSON `error` key (405, 404-from-router, any HTML error page) the `||` silently swaps
+  in a sentence the client invented, and it reads exactly like a server verdict.
+COST: this is the second time in a week a schedules control has shown a confident
+  message over an action that did not happen (AMUX-2647's "Ran · no output" was the
+  first). Both were one call site that had drifted off the shared wrapper.
+FIX: use `apiCall` everywhere; a hand-rolled `fetch` in this dashboard loses BOTH the
+  auth header and the outcome text. Worth a lint: `fetch(API +` outside `apiCall` for
+  a mutating method is the pattern to ban.
+
+---
+## Seven schedule fields the editor wrote and the server read NOWHERE
+AREA: scheduler
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux (sched2 lane)
+CARD: AMUX-2680
+SYMPTOM: `watch`, `watch_timeout`, `done_pattern`, `done_action`, `trigger_on`,
+  `trigger_cooldown`, `trigger_sessions` were accepted by POST/PATCH, stored, and
+  returned — and grepped to zero readers across `crates/`. The editor's entire
+  "Trigger" mode and the Loop mode's "Stop when output matches" box saved cleanly and
+  did nothing. The row round-trips unchanged, so a 200 is indistinguishable from a
+  working feature.
+COST: nothing measurable yet, and that is the point — 0 of 113 live schedules set any
+  of them, so the defect was invisible precisely because nobody had reached for it.
+  The next person to try would have written a stop pattern, watched a loop run
+  forever, and debugged their regex.
+FIX: refuse the five ARMING fields at the write path with a 400 that names them and
+  points at `POST /api/sessions/<n>/report`; declare all seven on read via
+  `x-amux-unhonoured-fields`; delete the controls. Not ported, because the watcher was
+  a regex over `tmux capture-pane` guessing whether a model had finished.
+
+---
+## The schedule audit trail is routed, implemented, and reachable from no control
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux (sched2 lane)
+CARD: AMUX-2755
+SYMPTOM: `GET /api/schedules/audit` works and is good — it is the only way to answer
+  "who disabled this schedule / why did it not run at 9". Zero of the twelve
+  `/api/schedules` call sites in `app.js` hit it. Its own discoverability mechanism is
+  a response HEADER (`x-amux-audit`), which a dashboard user never sees.
+COST: none yet this session; logged because AMUX-2416 already established that an
+  audit nobody can find is the same failure as no audit, and this is that shape again
+  one endpoint over.
+FIX: an "audit" affordance on the schedule card's expanded view, reusing the existing
+  endpoint. Small; carded rather than folded into an unrelated change.
+
+---
+## A peer's `git add` swept my UNCOMMITTED work into their commit and pushed half of it
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux (sched2 lane)
+CARD: AMUX-2757
+SYMPTOM: mid-task, `git diff` stopped showing my `scheduler.rs` and `app.js` edits.
+  They were not lost — commit `9a91945` (another lane's autofix work) had staged them
+  with a broad `git add` and pushed. So `pub fn skip_next_run` and the dashboard's
+  rewritten Skip button are on `origin/main` right now, while the `api/schedules.rs`
+  half that MOUNTS the route is still uncommitted: a function upstream with zero call
+  sites, which is the exact ethos-rule-1 shape the work was fixing.
+COST: no work lost, but ~10 minutes establishing what was where, and a genuinely
+  misleading upstream state — the dead controls are gone from the UI while the API
+  still silently accepts the dead fields, so the defect is now invisible from the
+  dashboard rather than fixed. Anyone reading origin/main would call it done.
+FIX: CLAUDE.md's Deploy section documents this hazard in the OTHER direction (your
+  unpushed commit riding out on a peer's push). The mirror case deserves the same
+  billing: on a shared checkout `git add -A` / `git commit -a` stages other lanes'
+  live edits, and a lane cannot tell from its own session that it happened. Stage by
+  explicit path, and check `git status` for files you did not touch before committing.

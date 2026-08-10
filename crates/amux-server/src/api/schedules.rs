@@ -26,8 +26,9 @@ use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use crate::runtime_jobs::scheduler::{
     self, fmt_minute, get_schedule, insert_audit, insert_schedule, legacy_next_run,
-    list_schedules, mint_schedule_id, record_run, soft_delete_schedule, update_schedule,
-    Deliverer, DurableSchedule, LiveDeliverer, RunOutcome, ScheduleExpr, AUDIT_FIELDS,
+    list_schedules, mint_schedule_id, record_run, skip_next_run, soft_delete_schedule,
+    update_schedule, Deliverer, DurableSchedule, LiveDeliverer, RunOutcome, ScheduleExpr,
+    AUDIT_FIELDS,
 };
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Path, Query, State};
@@ -50,6 +51,128 @@ pub fn routes() -> Router<AppState> {
             get(get_one).patch(patch).delete(delete_schedule),
         )
         .route("/{id}/run", post(run_now))
+        .route("/{id}/skip", post(skip_next))
+}
+
+// ---- the fields this server does NOT honour (AMUX-2680) -------------------
+
+/// Columns the `schedules` table carries, the editor used to write, and
+/// NOTHING in this server reads.
+///
+/// Python ran a watcher thread (`_watch_schedule_response`) that polled a
+/// session's pane for `done_pattern` and applied `done_action`, plus an
+/// event-trigger drain (`_drain_and_fire_sched_events`) that fired schedules
+/// on `session_idle`/`board` instead of a clock. Neither was ported, and the
+/// write path kept accepting all seven fields — so the dashboard's Trigger
+/// mode and "stop when output matches" box wrote rows that could never do
+/// anything. That is the silent-absence class: the same defect as
+/// `run_scheduler` having zero call sites, one layer out.
+///
+/// # Why the watcher was NOT ported
+///
+/// Measured before deciding (`~/.amux/amux.db`, 2026-08-10): **0 of 113 live
+/// schedules** set any of these. Every row that ever did — 9 of them — is
+/// deleted, and 4 were test fixtures (`__pwtest_loop`, `__pwtest2`,
+/// `__evt_test__`, `__evt_scope_test__`). Stronger still, the feature never
+/// fired under PYTHON either: `_run_schedule` writes a `schedule_runs` row on
+/// every fire and `_watch_schedule_response` writes one on every match, and
+/// across **20,618 run rows there are zero** with source `watch` or
+/// `trigger:*`; across 531 `schedule_audit` rows, zero from
+/// `watch-autodisable`/`watch-done-command`. Nobody is losing a capability
+/// they had.
+///
+/// And the watcher half should not come back as written. `done_action` was
+/// `disable` (stop nagging), `notify` (a Web Push broadcast to an EMPTY
+/// `push_subscriptions` table — an alert that reached nobody), or
+/// `command:<text>` (send one more line). Regex-matching a rendered terminal
+/// pane to guess whether a model finished is D1's terminal-scraping in its
+/// purest form: it cannot improve when the model improves, and it breaks when
+/// a string changes. The model already reports its own completion through the
+/// Stop hook. A loop that stops when the worker SAYS it is done is worth
+/// building on `POST /api/sessions/<n>/report`, not on `tmux capture-pane`.
+///
+/// The event-trigger half is different and is worth building — dispatching
+/// real work at the moment a lane goes idle compounds with model quality —
+/// but it is a runtime job with a durable dedupe key and a named consumer,
+/// not seven columns and a checkbox. Carded as AMUX-2756 rather than
+/// half-ported.
+pub const UNHONOURED_FIELDS: [&str; 7] = [
+    "watch",
+    "watch_timeout",
+    "done_pattern",
+    "done_action",
+    "trigger_on",
+    "trigger_cooldown",
+    "trigger_sessions",
+];
+
+/// [`UNHONOURED_FIELDS`] as a header value. A header needs a `&'static str`,
+/// so this is written out rather than joined at runtime — and
+/// `unhonoured_header_lists_every_unhonoured_field` fails the build if the two
+/// ever disagree, because a declaration that silently drops a field is the
+/// same silent absence it exists to announce.
+const UNHONOURED_FIELDS_HEADER: &str =
+    "not implemented (stored, never read; AMUX-2680): watch, watch_timeout, done_pattern, \
+     done_action, trigger_on, trigger_cooldown, trigger_sessions";
+
+/// The subset of [`UNHONOURED_FIELDS`] that ARM a dead feature, and the value
+/// that means "not armed".
+///
+/// `watch_timeout` and `trigger_cooldown` are parameters, not switches: they
+/// cannot make anything happen on their own, so refusing them would 400 an
+/// edit of a legacy row carrying stale residue (SCHED-8 still holds
+/// `watch_timeout=300` with `watch=0`) while closing no false promise. The
+/// five below are the ones whose acceptance would tell a caller that a
+/// behaviour is now armed. All seven are declared on read.
+fn armed_unhonoured(body: &ScheduleBody) -> Vec<&'static str> {
+    let set = |v: &Option<String>| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    let mut out = Vec::new();
+    if body.watch.unwrap_or(0) != 0 {
+        out.push("watch");
+    }
+    if set(&body.done_pattern) {
+        out.push("done_pattern");
+    }
+    // "disable" is the inert default the editor sends on every save.
+    if body.done_action.as_deref().map(str::trim).is_some_and(|s| !s.is_empty() && s != "disable") {
+        out.push("done_action");
+    }
+    if set(&body.trigger_on) {
+        out.push("trigger_on");
+    }
+    if set(&body.trigger_sessions) {
+        out.push("trigger_sessions");
+    }
+    out
+}
+
+/// 400 for a write that tries to arm a behaviour this server does not have.
+///
+/// Refusing rather than accepting-and-ignoring, because the caller cannot tell
+/// those apart from a 200: python's contract said these fields did something,
+/// the column still exists, and the row round-trips unchanged. A stored value
+/// nobody reads reads exactly like a working feature.
+fn unhonoured_refusal(fields: &[&'static str]) -> Response {
+    err(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": format!(
+                "this server does not implement {} — refusing rather than storing a value \
+                 nothing reads",
+                fields.join(", ")
+            ),
+            "unhonoured": fields,
+            "unhonoured_all": UNHONOURED_FIELDS,
+            "why": "the pane-polling watcher (watch/done_pattern/done_action) and the \
+                    event-trigger loop (trigger_on/trigger_sessions) were not ported from the \
+                    Python server; the columns survive so old rows still load",
+            "instead": "for a loop that stops when the work is done, have the worker report it \
+                        (POST /api/sessions/<name>/report) or disable the schedule from the \
+                        session — a regex over a rendered terminal pane cannot see what the \
+                        model knows",
+            "card": "AMUX-2680",
+        }),
+    )
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -220,7 +343,14 @@ pub async fn list(State(state): State<AppState>, Query(p): Query<ListParams>) ->
             // Point at the audit from the payload people actually read
             // (AMUX-2416: the trail existed, nobody found it).
             (
-                [("x-amux-audit", "/api/schedules/audit?id=<SCHED-N>&limit=100")],
+                [
+                    ("x-amux-audit", "/api/schedules/audit?id=<SCHED-N>&limit=100"),
+                    // Declared on the payload people READ, not only on the
+                    // write that gets refused (ethos rule 4): every row here
+                    // still carries these columns, and a value in a column is
+                    // indistinguishable from a working feature otherwise.
+                    ("x-amux-unhonoured-fields", UNHONOURED_FIELDS_HEADER),
+                ],
                 Json(Value::Array(out)),
             )
                 .into_response()
@@ -240,7 +370,10 @@ pub async fn get_one(State(state): State<AppState>, Path(id): Path<String>) -> R
     })
     .await;
     match joined {
-        Ok(Ok(Some(s))) => Json(s.to_json()).into_response(),
+        Ok(Ok(Some(s))) => {
+            ([("x-amux-unhonoured-fields", UNHONOURED_FIELDS_HEADER)], Json(s.to_json()))
+                .into_response()
+        }
         Ok(Ok(None)) => not_found(),
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
@@ -307,6 +440,11 @@ pub async fn create(
         Some(t) if !t.is_empty() => t.to_string(),
         _ => return err(StatusCode::BAD_REQUEST, json!({ "error": "title is required" })),
     };
+    // Refuse to arm a behaviour this server does not have (AMUX-2680).
+    let dead = armed_unhonoured(&body);
+    if !dead.is_empty() {
+        return unhonoured_refusal(&dead);
+    }
     let by = mutation_by(&headers, body.by.as_deref());
     let now = Local::now();
     let now_ts = chrono::Utc::now().timestamp();
@@ -416,6 +554,12 @@ pub async fn patch(
         if let Err(perr) = ScheduleExpr::parse(e) {
             return bad_expr(e, &perr);
         }
+    }
+    // Same gate as create (AMUX-2680) — a PATCH is how the editor armed these
+    // on an existing row, so guarding only create would leave the hole open.
+    let dead = armed_unhonoured(&body);
+    if !dead.is_empty() {
+        return unhonoured_refusal(&dead);
     }
     let by = mutation_by(&headers, body.by.as_deref());
     let now = Local::now();
@@ -566,6 +710,123 @@ pub async fn delete_schedule(
             Some(Outcome::Already) => Json(json!({ "deleted": id, "already": true })).into_response(),
             Some(Outcome::NotFound) => not_found(),
             None => internal("delete produced no outcome"),
+        },
+        Err(e) => internal(e),
+    }
+}
+
+// ---- POST /api/schedules/{id}/skip ----------------------------------------
+
+/// Skip the schedule's PENDING occurrence and resume the cadence (AMUX-2679).
+///
+/// The dashboard has called this since the Python days; the Rust router never
+/// had the route, so the Skip button 404'd — and `skipSchedule()` renders
+/// `d.error || 'Could not skip'`, so it reported a wrong reason rather than
+/// nothing, which is why it read as a broken schedule instead of a missing
+/// endpoint.
+///
+/// Semantics are python's, confirmed against `_skip_next_run` and not against
+/// the button's label: `next_run` advances to the occurrence AFTER the one
+/// currently armed. Nothing else moves — no run row (nothing ran), no
+/// `last_run`, no `run_count`, and `enabled` is untouched, so the schedule
+/// resumes on its own at the following occurrence.
+///
+/// The response says WHICH occurrence was dropped as well as where the
+/// schedule landed. Python returned only `{"ok":true,"next_run":...}`, so the
+/// toast could say where you ended up but never what you gave up — and for a
+/// cadence like `every 15m` those are the same string to the eye.
+pub async fn skip_next(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let by = mutation_by(&headers, None);
+
+    enum Outcome {
+        NotFound,
+        Once,
+        NoNext(String),
+        Skipped(Value),
+    }
+    let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
+    let slot_w = slot.clone();
+    let id_w = id.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            // Read INSIDE the write transaction: the fire loop advances
+            // `next_run` on the same row, and a skip computed from a row read
+            // outside the lock could drop an occurrence that had already
+            // fired — silently double-skipping.
+            let Some(mut s) = get_schedule(conn, &id_w)? else {
+                return finish(&slot_w, Outcome::NotFound, no_write());
+            };
+            if s.is_deleted() {
+                return finish(&slot_w, Outcome::NotFound, no_write());
+            }
+            // Python's guard: a one-shot has no "next occurrence" to resume
+            // to, so skipping it would mean deleting it under another name.
+            if s.str_field("sched_type") == "once" {
+                return finish(&slot_w, Outcome::Once, no_write());
+            }
+            let skipped = s.str_field("next_run").to_string();
+            let Some(new_next) = skip_next_run(&s) else {
+                return finish(&slot_w, Outcome::NoNext(skipped), no_write());
+            };
+            let now_ts = chrono::Utc::now().timestamp();
+            s.set("next_run", json!(new_next));
+            s.set("updated", json!(now_ts));
+            update_schedule(conn, &s)?;
+            // Python skipped unattributed. Moving a fire time is exactly the
+            // mutation AMUX-1812 was about ("why did this not run at 9?"), so
+            // it leaves the same by_who trail as a PATCH.
+            insert_audit(conn, s.id(), "next_run", &skipped, &new_next, "api-skip", &by)?;
+            let body = json!({
+                "ok": true,
+                "id": s.id(),
+                "title": s.str_field("title"),
+                // WHAT WAS GIVEN UP, and where it resumes.
+                "skipped": skipped,
+                "next_run": new_next,
+                "schedule_expr": s.schedule_expr(),
+                "enabled": s.i64_field("enabled", 0),
+            });
+            let events = vec![ev(s.id(), MutationKind::Updated)];
+            finish(&slot_w, Outcome::Skipped(body), WriteOutcome { applied: true, events })
+        })
+        .await;
+    match write {
+        Ok(_) => match slot.lock().expect("slot").take() {
+            Some(Outcome::Skipped(v)) => Json(v).into_response(),
+            Some(Outcome::NotFound) => not_found(),
+            Some(Outcome::Once) => err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "only recurring schedules can be skipped",
+                    "detail": "a one-shot has no following occurrence to resume to — \
+                               disable or delete it instead",
+                }),
+            ),
+            // Say WHICH string could not be advanced and what the row holds.
+            // "could not compute the next occurrence" alone (python's whole
+            // body) cannot distinguish a blank next_run from an expression the
+            // parser does not know, and those need different fixes.
+            Some(Outcome::NoNext(cur)) => err(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": "could not compute the next occurrence",
+                    "next_run": cur,
+                    "detail": if cur.trim().is_empty() {
+                        "this schedule has no armed next_run to skip — enable it, or PATCH a \
+                         schedule_expr so one is computed"
+                    } else {
+                        "next_run is set but neither schedule_expr nor recurrence yields a \
+                         following occurrence — PATCH a schedule_expr (GET \
+                         /api/schedules/<id> shows what the row holds)"
+                    },
+                }),
+            ),
+            None => internal("skip produced no outcome"),
         },
         Err(e) => internal(e),
     }
@@ -1186,5 +1447,210 @@ mod tests {
             audit.as_array().unwrap()[0]["by_who"],
             json!("real-session (claimed impostor)")
         );
+    }
+
+    // ---- AMUX-2679: the Skip button --------------------------------------
+
+    /// THE incident: the dashboard has POSTed `/skip` since the Python days
+    /// and the Rust router had no such route, so every press 404'd. Fails
+    /// against the pre-fix router, where this assertion sees 404.
+    ///
+    /// A 404 is also what a MISSING SCHEDULE returns, which is why this test
+    /// asserts on the 200 body and not merely on "not 404" — the discriminator
+    /// has to be that the occurrence actually moved.
+    #[tokio::test]
+    async fn skip_route_exists_and_advances_exactly_one_occurrence() {
+        let (app, _dir) = app();
+        let (st, created) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({ "title": "daily thing", "schedule_expr": "daily at 09:00" })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        let armed = created["next_run"].as_str().unwrap().to_string();
+
+        let (st, body) =
+            send(&app, "POST", &format!("/api/schedules/{id}/skip"), None, &SES).await;
+        assert_eq!(st, StatusCode::OK, "the Skip route must be mounted: {body}");
+        // Names WHAT WAS GIVEN UP as well as where it resumes — a toast that
+        // can only say "next in 15m" is unfalsifiable on a 15m cadence.
+        assert_eq!(body["skipped"], json!(armed), "the response must name the dropped occurrence");
+        assert_eq!(
+            body["next_run"].as_str().unwrap(),
+            scheduler::skip_next_run(&DurableSchedule::from_map(
+                created.as_object().unwrap().clone()
+            ))
+            .unwrap(),
+            "exactly one occurrence, computed from the ARMED next_run"
+        );
+        assert_ne!(body["next_run"], json!(armed));
+        // The row really moved — not just the response.
+        let (_, row) = send(&app, "GET", &format!("/api/schedules/{id}"), None, &[]).await;
+        assert_eq!(row["next_run"], body["next_run"]);
+        // Skip does not fire, disable, or count as a run.
+        assert_eq!(row["enabled"], json!(1));
+        assert_eq!(row["run_count"], json!(0));
+        assert!(row["last_run"].is_null(), "skip must not bump last_run — nothing ran");
+        let (_, runs) = send(&app, "GET", "/api/schedules/runs", None, &[]).await;
+        assert!(runs.as_array().unwrap().is_empty(), "skip must not write a run row: {runs}");
+
+        // Attributed (python left this mutation unattributed — AMUX-1812).
+        let (_, audit) =
+            send(&app, "GET", &format!("/api/schedules/audit?id={id}&field=next_run"), None, &[])
+                .await;
+        let a = &audit.as_array().unwrap()[0];
+        assert_eq!(a["source"], json!("api-skip"));
+        assert_eq!(a["by_who"], json!("tester-session"));
+        assert_eq!(a["old_value"], json!(armed));
+        assert_eq!(a["new_value"], body["next_run"]);
+    }
+
+    #[tokio::test]
+    async fn skip_refuses_a_one_shot_and_a_missing_schedule() {
+        let (app, _dir) = app();
+        // Python's guard: a one-shot has no following occurrence, so skipping
+        // it would be deleting it under another name.
+        let (st, created) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({ "title": "one shot", "sched_type": "once", "run_at": "2026-08-10T09:00" })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        let (st, body) =
+            send(&app, "POST", &format!("/api/schedules/{id}/skip"), None, &SES).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], json!("only recurring schedules can be skipped"));
+        assert!(body["detail"].is_string(), "a refusal must name the way out");
+
+        let (st, _) = send(&app, "POST", "/api/schedules/SCHED-9999/skip", None, &SES).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    // ---- AMUX-2680: fields this server does not honour --------------------
+
+    /// The refusal must fire on the values the DASHBOARD used to send, not on
+    /// a convenient synthetic one. The old save payload is reproduced verbatim
+    /// from `saveSchedModal` (loop mode with a stop pattern, and trigger mode)
+    /// so a check that passes here could not have passed pre-fix.
+    #[tokio::test]
+    async fn arming_an_unimplemented_field_is_refused_on_create_and_patch() {
+        let (app, _dir) = app();
+        // The editor's loop-with-stop-pattern payload.
+        let loop_with_stop = json!({
+            "title": "t", "worker": "alpha", "kind": "tmux", "command": "go",
+            "sched_type": "recurring", "recurrence": null, "run_at": "",
+            "schedule_expr": "every 30m",
+            "watch": 1, "done_pattern": "all done", "done_action": "disable",
+            "watch_timeout": 120, "trigger_on": "", "trigger_cooldown": 120,
+            "trigger_sessions": "", "by": "dashboard"
+        });
+        let (st, body) =
+            send(&app, "POST", "/api/schedules", Some(loop_with_stop), &SES).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        let dead: Vec<&str> =
+            body["unhonoured"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(dead, vec!["watch", "done_pattern"]);
+        assert_eq!(body["card"], json!("AMUX-2680"));
+        assert!(body["instead"].is_string(), "a refusal must point somewhere real");
+
+        // The editor's trigger-mode payload.
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({
+                "title": "t", "worker": "alpha", "command": "go",
+                "trigger_on": "session_idle", "trigger_cooldown": 120,
+                "trigger_sessions": "backend, ts-gke", "by": "dashboard"
+            })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["unhonoured"], json!(["trigger_on", "trigger_sessions"]));
+
+        // PATCH is the OTHER way the editor armed these — guarding only
+        // create would leave the hole open on every existing row.
+        let (st, created) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({ "title": "t", "schedule_expr": "every 1h" })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        for arming in [
+            json!({ "watch": 1 }),
+            json!({ "done_pattern": "done" }),
+            json!({ "done_action": "notify" }),
+            json!({ "trigger_on": "board" }),
+            json!({ "trigger_sessions": "alpha" }),
+        ] {
+            let (st, body) =
+                send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(arming.clone()), &SES)
+                    .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "PATCH {arming} must be refused: {body}");
+        }
+    }
+
+    /// The inert values are the ones the dashboard sends on EVERY save,
+    /// including from routine and once mode. If those tripped the gate the
+    /// whole editor would 400 — a refusal that cannot be satisfied honestly is
+    /// worse than the silence it replaced (ethos rule 3).
+    #[tokio::test]
+    async fn inert_values_for_those_fields_still_save() {
+        let (app, _dir) = app();
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({
+                "title": "t", "worker": "alpha", "kind": "tmux", "command": "go",
+                "sched_type": "recurring", "recurrence": null, "run_at": "",
+                "schedule_expr": "daily at 9am",
+                "watch": 0, "done_pattern": null, "done_action": "disable",
+                "watch_timeout": 300, "trigger_on": "", "trigger_cooldown": 120,
+                "trigger_sessions": "", "by": "dashboard"
+            })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        // watch_timeout=300 is real residue on a live row (SCHED-8). It is a
+        // parameter, not a switch — inert while watch=0 — so refusing it would
+        // 400 an edit of that row while closing no false promise.
+        let id = body["id"].as_str().unwrap().to_string();
+        let (st, _) = send(
+            &app,
+            "PATCH",
+            &format!("/api/schedules/{id}"),
+            Some(json!({ "watch_timeout": 300, "trigger_cooldown": 600 })),
+            &SES,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    /// The declaration and the list cannot drift. A header that silently drops
+    /// a field is the same silent absence it exists to announce.
+    #[test]
+    fn unhonoured_header_lists_every_unhonoured_field() {
+        for f in UNHONOURED_FIELDS {
+            assert!(
+                UNHONOURED_FIELDS_HEADER.contains(f),
+                "'{f}' is unhonoured but the declared header never says so"
+            );
+        }
+        assert!(UNHONOURED_FIELDS_HEADER.contains("AMUX-2680"));
     }
 }
