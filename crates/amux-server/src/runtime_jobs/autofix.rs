@@ -932,6 +932,26 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
 /// and `resolved_at`. We file only the ones still open AND seen at least
 /// `min_occurrences` times: a flapping invariant is noise, and one card per
 /// flap is how a board stops being read.
+/// One row of `_amux_invariant_incident`:
+/// (invariant_id, entity_key, status, first_seen, last_seen, occurrences, expected, observed).
+type InvRow = (String, String, String, f64, f64, i64, String, String);
+
+/// How many distinct entities one invariant must be failing for before it is
+/// filed as a SINGLE rollup card instead of one card per entity.
+///
+/// 4 is deliberately low. The failure this guards against is not "slightly too
+/// many cards", it is a board that stops being readable: one invariant produced
+/// 64 cards, 36% of every open item, each quoting the same occurrence count.
+/// Three related entities is a coincidence worth three cards; four is a
+/// pattern, and a pattern is one piece of work.
+fn invariant_rollup_at() -> usize {
+    std::env::var("AMUX_INVARIANT_ROLLUP_AT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(4)
+}
+
 pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -958,7 +978,78 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
     }) else {
         return (out, suppressed);
     };
-    for (id, entity, _status, first, last, occ, expected, observed) in rows.flatten() {
+    // FAN-IN BEFORE FAN-OUT (AMUX-2814). One invariant breaching across many
+    // entities is ONE fact, and filing it per-entity turned a single breach
+    // into 64 cards — 36% of every open card on the board, all quoting the same
+    // 1857 occurrences, differing only in which route they named. That is ethos
+    // rule 5: at volume it stops being a set of tasks and becomes a log, and a
+    // board that cannot be read is a board nobody reads, including for the
+    // cards that DO discriminate.
+    //
+    // So: group the rows by invariant first. Below `INVARIANT_ROLLUP_AT`
+    // distinct entities, per-entity cards are right — they are individually
+    // actionable and the entity is the useful title. At or above it, the entity
+    // list is a SYMPTOM of one systemic fault and belongs in one card's
+    // evidence, where it can be read in a single pass.
+    let mut by_invariant: BTreeMap<String, Vec<InvRow>> = BTreeMap::new();
+    for r in rows.flatten() {
+        by_invariant.entry(r.0.clone()).or_default().push(r);
+    }
+    let rollup_at = invariant_rollup_at();
+    let mut flat: Vec<InvRow> = Vec::new();
+    for (id, mut group) in by_invariant {
+        // Only entities that clear the flap threshold count toward the rollup —
+        // otherwise a noisy invariant could roll itself up on rows that would
+        // each have been suppressed anyway.
+        let filing: Vec<&InvRow> = group.iter().filter(|r| r.5 >= min_occ).collect();
+        if filing.len() < rollup_at {
+            flat.append(&mut group);
+            continue;
+        }
+        let entities: Vec<String> = filing
+            .iter()
+            .map(|r| if r.1.is_empty() { "fleet".to_string() } else { r.1.clone() })
+            .collect();
+        let worst = filing.iter().max_by_key(|r| r.5).unwrap();
+        let first_seen = filing.iter().map(|r| r.3).fold(f64::MAX, f64::min);
+        let last_seen = filing.iter().map(|r| r.4).fold(0.0f64, f64::max);
+        let n = entities.len();
+        out.push(Finding {
+            kind: DetectorKind::InvariantBreach,
+            // Keyed on the INVARIANT, not an entity — so the rollup dedupes
+            // against itself as entities come and go, rather than re-filing
+            // every time the set changes by one.
+            signature: format!("invariant|{id}|ROLLUP"),
+            title: format!("invariant {id} failing across {n} entities — one fault, not {n} tasks"),
+            evidence: vec![
+                ("verdict".into(), format!(
+                    "`{id}` is failing for {n} different entities and has not self-healed. Filed                      as ONE card on purpose: {n} per-entity cards would all carry the same cause                      and the same fix, and would bury every other card on the board. Fix the                      invariant, not the entities — if some entities are legitimately exempt, the                      invariant's scope is what is wrong."
+                )),
+                ("entities".into(), format!("\n  {}", entities.join("\n  "))),
+                ("worst_entity".into(), format!(
+                    "{} ({}x)",
+                    if worst.1.is_empty() { "fleet" } else { &worst.1 },
+                    worst.5
+                )),
+                ("expected".into(), truncate(&worst.6, 500)),
+                ("observed".into(), truncate(&worst.7, 500)),
+                ("first_seen".into(), rl::local_when(first_seen)),
+                ("last_seen".into(), rl::local_when(last_seen)),
+                ("rollup_threshold".into(), format!(
+                    "{rollup_at} distinct entities (AMUX_INVARIANT_ROLLUP_AT)"
+                )),
+            ],
+            recheck: format!(
+                "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
+                 print([r for r in json.load(sys.stdin).get('results',[]) if r.get('id')=='{id}'])\""
+            ),
+            owner: None,
+            count: filing.len() as u64,
+            last_ts: last_seen.max(now - 1.0),
+        });
+    }
+
+    for (id, entity, _status, first, last, occ, expected, observed) in flat {
         let sig_entity = if entity.is_empty() { "fleet".to_string() } else { entity.clone() };
         let signature = format!("invariant|{id}|{sig_entity}");
         if occ < min_occ {
@@ -3228,6 +3319,90 @@ mod tests {
     #[test]
     fn the_ceiling_wins_over_the_rate_when_both_trigger() {
         assert_eq!(fd_trigger(0.95, 0.9, 0.7, 0.2), Some("near-limit"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant rollup (AMUX-2814). Corpus: the live board on 2026-08-10, where
+    // `route.callers_have_routes` had produced 64 cards — one per route, all
+    // quoting the same 1857 occurrences, 36% of every open item.
+    // -----------------------------------------------------------------------
+
+    fn inv_row(id: &str, entity: &str, occ: i64) -> InvRow {
+        (id.into(), entity.into(), "fail".into(), 1000.0, 2000.0, occ, "expected".into(), "observed".into())
+    }
+
+    /// Drives `detect_invariants` through a real SQLite table, because the
+    /// grouping happens between the query and the Finding — a test that called
+    /// a pure helper would skip the part that broke.
+    fn invariant_findings(rows: &[InvRow]) -> Vec<Finding> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
+             status TEXT, first_seen REAL, last_seen REAL, occurrences INTEGER, \
+             resolved_at REAL, expected TEXT, observed TEXT);",
+        )
+        .unwrap();
+        for r in rows {
+            conn.execute(
+                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8)",
+                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7],
+            )
+            .unwrap();
+        }
+        detect_invariants(&conn, 9999.0).0
+    }
+
+    #[test]
+    fn one_invariant_failing_across_many_entities_is_one_card_not_many() {
+        // The real shape: 64 routes, one invariant, same occurrence count.
+        let rows: Vec<_> = (0..64)
+            .map(|i| inv_row("route.callers_have_routes", &format!("GET /api/thing{i}"), 1857))
+            .collect();
+        let f = invariant_findings(&rows);
+        assert_eq!(f.len(), 1, "64 entities of ONE invariant must produce ONE card, got {}", f.len());
+        assert!(f[0].signature.ends_with("|ROLLUP"), "keyed on the invariant, not an entity");
+        assert!(f[0].title.contains("64 entities"), "the count belongs in the title: {}", f[0].title);
+        // The entity list must SURVIVE into the card — rolling up must not
+        // destroy the information the 64 cards carried, or this trades an
+        // unreadable board for an unactionable one.
+        let ev: String = f[0].evidence.iter().map(|(k, v)| format!("{k}{v}")).collect();
+        assert!(ev.contains("GET /api/thing0") && ev.contains("GET /api/thing63"),
+                "every entity must still be named in the evidence");
+    }
+
+    #[test]
+    fn a_few_entities_still_get_their_own_cards() {
+        // Below the threshold, per-entity is right: each is individually
+        // actionable and the entity is the useful title. A rollup that fired at
+        // 2 would hide ordinary work behind a summary.
+        let rows = vec![
+            inv_row("some.invariant", "entity-a", 50),
+            inv_row("some.invariant", "entity-b", 50),
+        ];
+        assert_eq!(invariant_findings(&rows).len(), 2);
+    }
+
+    #[test]
+    fn distinct_invariants_never_roll_up_together() {
+        // Grouping is by invariant. Five different invariants failing once each
+        // is five faults, not one — collapsing them would be the same defect
+        // pointed the other way.
+        let rows: Vec<_> = (0..5).map(|i| inv_row(&format!("inv.{i}"), "same-entity", 99)).collect();
+        assert_eq!(invariant_findings(&rows).len(), 5);
+    }
+
+    /// The flap threshold still governs: entities below `min_occurrences` must
+    /// not be able to push an invariant over the rollup line, or a noisy
+    /// invariant would roll itself up out of rows that were each suppressed.
+    #[test]
+    fn suppressed_entities_do_not_count_toward_the_rollup() {
+        let mut rows: Vec<_> = (0..10)
+            .map(|i| inv_row("noisy.invariant", &format!("e{i}"), 1))
+            .collect();
+        rows.push(inv_row("noisy.invariant", "real", 500));
+        let f = invariant_findings(&rows);
+        assert_eq!(f.len(), 1, "only the one entity above the flap threshold files");
+        assert!(!f[0].signature.ends_with("|ROLLUP"), "one real breach is a per-entity card, not a rollup");
     }
 
     /// The measurement path must work on THIS machine, or the pure logic above
