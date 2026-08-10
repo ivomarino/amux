@@ -518,14 +518,21 @@ pub async fn supervise_once(
     Ok(())
 }
 
+/// Supervision cadence. pub so lib.rs registers the interval this loop
+/// actually sleeps with `runtime_jobs::registry`, not a copy of the number —
+/// a displayed interval that disagrees with the sleep is how a healthy job
+/// reads as stalled.
+pub const SUPERVISE_SECS: u64 = 2;
+
 /// The supervisor loop: watch for workers with live sessions, keep one
 /// processor per worker. Runs forever; cycle errors are logged, never fatal.
 pub async fn run_event_processors(store: SharedStore, protocol: Arc<dyn AgentProtocol>) {
     let mut procs: BTreeMap<WorkerId, tokio::task::JoinHandle<()>> = BTreeMap::new();
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(SUPERVISE_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::EVENT_PROCESSORS);
         if let Err(e) = supervise_once(&store, &protocol, &mut procs).await {
             tracing::warn!(error = %e, "event-processor supervision cycle failed");
         }

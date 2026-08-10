@@ -520,8 +520,17 @@ fn launch_markers() -> &'static regex::Regex {
 
 /// py:5405 _strip_launch_noise — cut through amux's relaunch scaffolding.
 fn strip_launch_noise(text: &str) -> String {
+    // This cheap pre-filter must not be able to disagree with
+    // `launch_markers()`, which is the regex that actually decides what gets
+    // cut. It could: the marker set matches `claude --resume`, but the filter
+    // did not, so a RESUMED pane — whose launch line carries `--resume` and
+    // (before AMUX-2612) no `--name` — returned here unstripped and handed the
+    // whole boot command line to every state/model heuristic downstream. Both
+    // existing fixtures happened to contain `--name`, so nothing could fail on
+    // it. `--resume` is listed here for the same reason it is listed there.
     if text.is_empty()
         || (!text.contains("--name")
+            && !text.contains("--resume")
             && !text.contains("Resume this session with")
             && !text.contains("shell is now zsh"))
     {
@@ -946,6 +955,81 @@ pub(crate) fn iter_jsonl_tail(path: &Path, max_bytes: u64) -> Vec<Value> {
     lines.filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
 }
 
+/// The `--resume`/`--name` flags for a claude launch (AMUX-2612).
+///
+/// Pure so the decision is testable: the branch it came from needs a session
+/// env, a meta file and a transcript on disk to reach, which is why the
+/// original defect had no test that could fail on it.
+///
+/// **`--name` rides along with `--resume`.** Dropping it was not a python port
+/// regression — python's `session_flag` was either/or too — but it leaves a
+/// renamed session's harness pinned to the name it was BORN with, forever,
+/// because every subsequent start takes the resume branch. Live specimen:
+/// session `amux` resumes conv 1dd2cd21, whose transcript carries
+/// `customTitle: 'amux-rust'` on all 923 name records out to line 20748 — the
+/// name it had before the rename. The rename cascade migrates env, meta, tmux
+/// and every DB reference; the one thing it cannot reach is the running
+/// harness's own idea of its name, and this is where that converges.
+///
+/// Measured, not assumed: `claude -p --resume <id> --name X` exits 0, does NOT
+/// fork a new conversation, and APPENDS a fresh `customTitle: X` record to the
+/// existing transcript. Line 0 keeps the original name for the life of the
+/// file, which is why the reader half ([`transcript_display_name`]) must take
+/// the LAST record and not the first — either half alone is inert.
+fn claude_session_flag(name: &str, conv_id: &str, resumable: bool) -> String {
+    if resumable && !conv_id.is_empty() {
+        format!("--resume {conv_id} --name {}", sh_quote(name))
+    } else {
+        format!("--name {}", sh_quote(name))
+    }
+}
+
+/// The display name a transcript CURRENTLY carries — the last `customTitle` /
+/// `sessionName` record in the file, not the first (AMUX-2612).
+///
+/// A Claude transcript is append-only and `--name` writes a NEW record rather
+/// than rewriting line 0, so the first line holds the name the conversation
+/// was BORN with for the life of the file. Reading it was a silent staleness
+/// bug with no expiry: session `amux` was renamed from `amux-rust` and its
+/// transcript's line 0 still says 'amux-rust' 20,748 lines later. Anything
+/// resolving a session by title therefore matched the dead name and could
+/// never match the live one — and, worse, made the `--name` re-pin on the
+/// resume path invisible, so fixing only the writer half would have looked
+/// like it did nothing.
+///
+/// Bounded on purpose: the tail read is capped, and the first line is the
+/// fallback when the cap contains no name record (a short or long-silent
+/// transcript), so this is never more expensive than the scan it replaces by
+/// more than one tail read.
+fn transcript_display_name(jf: &Path) -> Option<String> {
+    const NAME_TAIL_BYTES: u64 = 256 * 1024;
+    let pick = |rec: &Value| -> Option<String> {
+        for k in ["customTitle", "sessionName"] {
+            if let Some(s) = rec.get(k).and_then(Value::as_str) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    };
+    // Latest wins: iterate the tail forward and keep the last hit.
+    let mut latest = None;
+    for rec in iter_jsonl_tail(jf, NAME_TAIL_BYTES) {
+        if let Some(n) = pick(&rec) {
+            latest = Some(n);
+        }
+    }
+    if latest.is_some() {
+        return latest;
+    }
+    use std::io::BufRead;
+    let f = std::fs::File::open(jf).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(f).read_line(&mut first).ok()?;
+    pick(&serde_json::from_str::<Value>(&first).ok()?)
+}
+
 /// Newest JSONL for a session (py:5590 _session_jsonl_path_uncached): meta
 /// conv-id first, then title match, then the single unclaimed candidate.
 pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
@@ -983,21 +1067,18 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     if files.len() == 1 {
         return Some(files[0].1.clone());
     }
-    for (_, jf) in &files {
-        use std::io::BufRead;
-        let Ok(f) = std::fs::File::open(jf) else { continue };
-        let mut first = String::new();
-        if std::io::BufReader::new(f).read_line(&mut first).is_err() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<Value>(&first) {
-            if rec["customTitle"] == json!(name) || rec["sessionName"] == json!(name) {
-                return Some(jf.clone());
-            }
-        }
-    }
     // Exclude conversations claimed by SIBLING sessions; only a single
     // unclaimed candidate may be returned (shared-workdir bleed guard).
+    //
+    // Hoisted above the title match (AMUX-2612): it used to guard only the
+    // single-unclaimed fallback below, so a session could still be handed a
+    // conversation another session's meta EXPLICITLY claims, purely because a
+    // stale display name matched. That is the reported incident — session
+    // `amux` renamed from `amux-rust`, its live transcript still titled
+    // 'amux-rust', so a lane by that name would resolve to `amux`'s own
+    // conversation and every file `amux` edited was reported as "also edited
+    // by amux-rust" on a clean self-authored commit. A name is a label; a meta
+    // claim is a decision, and the decision outranks the label.
     let mut owned = std::collections::BTreeSet::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         for e in rd.flatten() {
@@ -1013,6 +1094,14 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
             if !ocid.is_empty() {
                 owned.insert(ocid);
             }
+        }
+    }
+    for (_, jf) in &files {
+        if jf.file_stem().and_then(|s| s.to_str()).map(|s| owned.contains(s)).unwrap_or(false) {
+            continue;
+        }
+        if transcript_display_name(jf).as_deref() == Some(name) {
+            return Some(jf.clone());
         }
     }
     let unclaimed: Vec<&PathBuf> = files
@@ -1719,6 +1808,11 @@ fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // created by Python's schema block lacks it. Add-if-missing, ignore
     // "duplicate column".
     let _ = conn.execute("ALTER TABLE steering_queue ADD COLUMN guard TEXT", []);
+    // WHO SENT IT (AMUX-2785). A stalled queue's one actionable notification is
+    // to the SENDER — they hold the false belief ("I sent it") and they are the
+    // only party who can act — and until now the row did not record who that
+    // was, so the stall warning had nobody to tell and went to a log instead.
+    let _ = conn.execute("ALTER TABLE steering_queue ADD COLUMN sender TEXT NOT NULL DEFAULT ''", []);
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN origin TEXT NOT NULL DEFAULT ''", []);
     Ok(())
 }
@@ -1736,11 +1830,16 @@ fn now_i64() -> i64 {
 /// py:7593 _emit_event — append-only, idempotent on `idem`, never fails the
 /// caller.
 pub(crate) async fn emit_event(state: &AppState, session: &str, etype: &str, data: Option<Value>, idem: Option<String>, source: &str) {
+    emit_event_store(&state.store, session, etype, data, idem, source).await
+}
+
+/// [`emit_event`] addressed by store — see [`steer_enqueue_store`] for why
+/// both variants exist rather than a second copy of the write.
+pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &str, etype: &str, data: Option<Value>, idem: Option<String>, source: &str) {
     let session = session.to_string();
     let etype = etype.to_string();
     let source = source.to_string();
-    let _ = state
-        .store
+    let _ = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
             conn.execute(
@@ -1912,14 +2011,45 @@ pub(crate) async fn cmd_hist_record_full(
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
 /// Dedup-on-enqueue: identical text (or same guard) replaces, never stacks.
-pub(crate) async fn steer_enqueue(state: &AppState, name: &str, text: &str, guard: &str) -> String {
+///
+/// `sender` is the origin lane (the server-verified `X-Amux-Session` stamp) or
+/// "" for an automated producer, which the `guard` already identifies. It is
+/// recorded so a stalled queue can tell the one party who is holding a false
+/// belief about it — see [`lane_block_reason`] and `warn_on_stalled_lanes`.
+pub(crate) async fn steer_enqueue(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+) -> String {
+    steer_enqueue_store(&state.store, name, text, guard, sender).await
+}
+
+/// The same enqueue, addressed by STORE rather than by `AppState`.
+///
+/// Both this and [`emit_event`] only ever needed the store; the `AppState`
+/// parameter is what kept background producers — the orchestrator, which holds
+/// a `SharedStore` and no `AppState` — from reaching the one delivery path.
+/// The alternative was a second enqueue sitting next to this one, and two
+/// spellings of "queue a message for a lane" is precisely the duplication that
+/// then has to be kept in step forever (CLAUDE.md's primitives rule; ethos D6
+/// on what one duplicated seam already costs). One implementation, two
+/// addressing modes.
+pub(crate) async fn steer_enqueue_store(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+) -> String {
     let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
     let id = msg_id.clone();
     let session = name.to_string();
     let text_s = text.to_string();
     let guard_s = guard.to_string();
-    let _ = state
-        .store
+    let sender_s = sender.to_string();
+    let _ = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
             conn.execute(
@@ -1927,20 +2057,21 @@ pub(crate) async fn steer_enqueue(state: &AppState, name: &str, text: &str, guar
                 rusqlite::params![session, text_s, guard_s],
             )?;
             conn.execute(
-                "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard) VALUES(?,?,?,?,?)",
+                "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard, sender) VALUES(?,?,?,?,?,?)",
                 rusqlite::params![
                     id,
                     session,
                     text_s,
                     now_f64(),
-                    if guard_s.is_empty() { None } else { Some(guard_s.clone()) }
+                    if guard_s.is_empty() { None } else { Some(guard_s.clone()) },
+                    sender_s
                 ],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
-    emit_event(
-        state,
+    emit_event_store(
+        store,
         name,
         "message.queued",
         Some(json!({"chars": text.chars().count(), "preview": chars_truncate(text, 120), "guard": if guard.is_empty() { Value::Null } else { json!(guard) }})),
@@ -2984,7 +3115,10 @@ pub(crate) async fn deliver_automated(
             "automated send lost the boundary race — parking on the steering queue"
         );
     }
-    let queue_id = steer_enqueue(state, name, text, guard).await;
+    // No sender lane: this is an automated producer, and `guard` already names
+    // which one. An empty sender means the stall notice has no lane to tell —
+    // which is the truth, rather than a guess that would misattribute it.
+    let queue_id = steer_enqueue(state, name, text, guard, "").await;
     AutoDelivery {
         message: format!("queued (steering) — delivers to '{name}' at its next turn boundary"),
         submitted: None,
@@ -3147,7 +3281,7 @@ async fn send_text_inner(
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
-        steer_enqueue(state, name, &text, "").await;
+        steer_enqueue(state, name, &text, "", "").await;
         return (true, "queued (steering) — session at a selector, delivers when it resolves".into());
     }
     if waiting && from_steering {
@@ -3624,16 +3758,15 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     let mut session_flag = String::new();
     if !skip_conv_id && provider == "claude" {
         let conv_id = meta_str(&meta, "cc_conversation_id");
+        let mut resumable = false;
         if !conv_id.is_empty() && uuid_re.is_match(&conv_id) {
             let conv_file =
                 claude_home().join("projects").join(project_name(&work_dir)).join(format!("{conv_id}.jsonl"));
             if conv_file.exists() {
-                session_flag = format!("--resume {conv_id}");
+                resumable = true;
             }
         }
-        if session_flag.is_empty() {
-            session_flag = format!("--name {}", sh_quote(name));
-        }
+        session_flag = claude_session_flag(name, &conv_id, resumable);
     }
     let defaults = EnvFile::load(&home().join("defaults.env"));
     let default_flags = defaults.get_or("CC_DEFAULT_FLAGS", "").to_string();
@@ -5482,7 +5615,10 @@ fn hdr_worker(headers: &HeaderMap) -> String {
 // reported state and falls back to the scrape for hookless lanes, and
 // `send_text_inner` already dispatches herdr via `herdr_send` — so delivery is
 // backend-agnostic by construction rather than by a per-backend branch here.
-const STEER_TICK_SECS: u64 = 5;
+// pub so lib.rs registers this loop's REAL cadence with runtime_jobs::registry
+// rather than a copy of it — a displayed interval that can disagree with the
+// sleep is how a healthy job reads as stalled (or worse, the reverse).
+pub const STEER_TICK_SECS: u64 = 5;
 
 /// Is this lane at a turn boundary — i.e. may a queued message be delivered NOW?
 ///
@@ -5505,6 +5641,79 @@ pub(crate) enum SteerDelivery {
     OverdueMidTurn,
     /// Not now.
     Hold,
+}
+
+/// WHY A LANE CANNOT RECEIVE AT ALL — as distinct from being merely BUSY.
+///
+/// AMUX-2785. To a sender these two look identical (silence) and they are
+/// nothing alike. "Busy" resolves on its own: the lane reaches a boundary, or
+/// the `AMUX_STEER_MAX_AGE_S` deadline forces the message in mid-turn. "Not
+/// running" and "no env file" resolve NEVER — no deadline can rescue a lane
+/// that cannot receive, which is precisely what AMUX-2642 did not anticipate
+/// when it added the deadline. Three lanes sat 4-15h in that state
+/// (`amux-agent` no-env-file, `amux-rust-execution` not-running,
+/// `mixpeek-orchestrator` not-running) while every sender believed the message
+/// had landed, because the send response says "queued for next turn boundary"
+/// for both cases.
+///
+/// Pure, so the regression corpus is those three real lanes rather than a
+/// convenient fixture; [`lane_block_reason`] is the I/O wrapper.
+pub(crate) fn lane_block_reason_from(
+    env_exists: bool,
+    archived: bool,
+    running: bool,
+) -> Option<&'static str> {
+    if !env_exists {
+        return Some("no-env-file");
+    }
+    if archived {
+        return Some("archived");
+    }
+    if !running {
+        return Some("not-running");
+    }
+    None
+}
+
+/// [`lane_block_reason_from`] against the real filesystem and tmux.
+///
+/// ONE predicate, shared by the drain loop, the point of send, the queue
+/// listing and the debug endpoint. It exists because those disagreed: the drain
+/// loop asked the question inline and the SEND PATH DID NOT ASK IT AT ALL, so
+/// the response promised delivery the loop would never make. That is the
+/// ethos-1 view/predicate split — a view must share the predicate of the
+/// mechanism it claims to describe, and a send response is a view of the
+/// delivery loop.
+pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
+    let env_exists = env_path(name).exists();
+    let archived = env_exists && parse_env(name).get("CC_ARCHIVED") == Some("1");
+    // Don't pay a tmux query for a lane already known unreachable.
+    let running = env_exists && !archived && is_running(name).await;
+    lane_block_reason_from(env_exists, archived, running)
+}
+
+/// The sentence a sender gets. It states what will HAPPEN, not merely what is
+/// wrong: "queued" on its own is the string that manufactured the false belief,
+/// and replacing it with a bare reason code would leave the sender to guess
+/// whether waiting helps. For these reasons it does not.
+pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
+    match reason {
+        "no-env-file" => format!(
+            "NOT DELIVERABLE — '{name}' has no session env file, so it is not a registered worker. \
+             The message is stored, but it is not waiting for a turn boundary and no deadline will \
+             force it through. Check the name, or create the worker."
+        ),
+        "archived" => format!(
+            "NOT DELIVERABLE — '{name}' is archived. The message is stored, but nothing wakes an \
+             archived lane; un-archiving it is a human's call."
+        ),
+        "not-running" => format!(
+            "NOT DELIVERABLE — '{name}' is not running. The message is stored, but the delivery loop \
+             skips stopped lanes, so it waits for the lane to be STARTED, not for it to be free. \
+             No deadline will force it through."
+        ),
+        other => format!("NOT DELIVERABLE — '{name}': {other}."),
+    }
 }
 
 /// How long a queued message may wait for an idle boundary before it is
@@ -5665,17 +5874,19 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
         }
-        if !env_path(&session).exists() {
-            skip(&session, &id, "no-env-file");
-            continue; // the expiry sweep owns dead lanes, not this loop
-        }
-        // Per-lane preconditions are evaluated once, not per row.
-        if !checked_lane.insert(session.clone()) {
-            // Already passed the lane gates this tick; fall through to the send.
-        } else if !is_running(&session).await {
-            skip(&session, &id, "not-running");
-            delivered_lanes.insert(session.clone()); // stop walking a dead lane
-            continue; // stopped lane: its nudge stays pending, per python
+        // Per-lane preconditions are evaluated once, not per row — via the SAME
+        // predicate the send path and the queue listing use, so a lane can never
+        // be told "queued, delivers at the next boundary" by one and skipped as
+        // unreachable by the other (AMUX-2785).
+        if checked_lane.insert(session.clone()) {
+            if let Some(reason) = lane_block_reason(&session).await {
+                skip(&session, &id, reason);
+                // No row on this lane can go, and unlike "busy" nothing about
+                // this resolves by waiting — so stop walking the lane. Its rows
+                // stay pending (per python); the expiry sweep owns dead lanes.
+                delivered_lanes.insert(session.clone());
+                continue;
+            }
         }
         // THE TURN-BOUNDARY GATE. This has to live HERE, in the caller.
         // `from_steering` inside send_text_inner only refuses on a selector, or
@@ -5797,20 +6008,21 @@ fn steer_stall_warn_s() -> f64 {
 }
 
 async fn warn_on_stalled_lanes(state: &AppState) {
-    let rows: Vec<(String, f64, i64)> = {
+    let rows: Vec<(String, f64, i64, String)> = {
         let Ok(conn) = state.store.read() else { return };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT session, MIN(queued_at), COUNT(*) FROM steering_queue GROUP BY session",
+            "SELECT session, MIN(queued_at), COUNT(*), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
+             FROM steering_queue GROUP BY session",
         ) else {
             return;
         };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map(|it| it.flatten().collect())
             .unwrap_or_default()
     };
     let now = now_f64();
     let skips = steer_skips().lock().unwrap().clone();
-    for (session, oldest, count) in rows {
+    for (session, oldest, count, senders) in rows {
         let age = now - oldest;
         if age < steer_stall_warn_s() {
             continue;
@@ -5826,6 +6038,67 @@ async fn warn_on_stalled_lanes(state: &AppState) {
             reason = %reason,
             "steering queue STALLED — messages are not reaching this lane"
         );
+
+        // ETHOS RULE 4, which is the whole of this card: "when this goes wrong,
+        // what will someone see — and will they see it WHERE THEY ALREADY
+        // LOOK?" A `tracing::warn!` is neither. Nothing reached the sender, who
+        // is the one party holding a false belief ("I sent it") and the only one
+        // who can act on it; the reporter of the original incident concluded
+        // "the amux session is stuck", which is the wrong diagnosis this silence
+        // produces.
+        //
+        // So the stall becomes a durable event on the LANE (where anyone
+        // debugging that lane looks) and on each SENDER (where the belief
+        // lives). It carries the SKIP REASON, because `not-running` and
+        // `no-env-file` are actionable and completely different from `busy` —
+        // collapsing them to "queued" is what made this invisible.
+        let blocked = lane_block_reason(&session).await;
+        // Dedupe per lane per CONDITION per hour. A permanent idem would fire
+        // once and stay silent if the lane recovered and re-stalled; no idem at
+        // all fires every tick, which is the nag AC-310 was filed about.
+        let bucket = (now / 3600.0) as i64;
+        let cond = blocked.unwrap_or("busy-past-deadline");
+        let detail = match blocked {
+            Some(r) => block_reason_explain(r, &session),
+            None => format!(
+                "'{session}' is reachable but has not reached a turn boundary — {count} message(s) \
+                 waiting, oldest {}m. It should have been forced through mid-turn by now; the last \
+                 refusal was: {reason}.",
+                (age / 60.0) as i64
+            ),
+        };
+        let payload = json!({
+            "lane": session,
+            "queued": count,
+            "oldest_age_s": age as i64,
+            "deliverable": blocked.is_none(),
+            "blocked_reason": blocked,
+            "last_skip_reason": reason,
+            "detail": detail,
+        });
+        emit_event(
+            state,
+            &session,
+            "steering.stalled",
+            Some(payload.clone()),
+            Some(format!("steer-stalled:{session}:{cond}:{bucket}")),
+            "steering",
+        )
+        .await;
+        for sender in senders.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if sender == session {
+                continue; // already told, above
+            }
+            emit_event(
+                state,
+                sender,
+                "steering.undelivered",
+                Some(payload.clone()),
+                Some(format!("steer-undelivered:{sender}:{session}:{cond}:{bucket}")),
+                "steering",
+            )
+            .await;
+        }
     }
 }
 
@@ -5834,40 +6107,48 @@ async fn warn_on_stalled_lanes(state: &AppState) {
 /// the outside: the tick logged only successes, so a lane that had refused
 /// every 5 seconds for four hours looked exactly like a lane with nothing to do.
 async fn steering_debug(State(state): State<AppState>) -> Response {
-    let rows: Vec<(String, f64, i64)> = {
+    let rows: Vec<(String, f64, i64, String)> = {
         let Ok(conn) = state.store.read() else {
             return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "store unavailable"}));
         };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT session, MIN(queued_at), COUNT(*) FROM steering_queue GROUP BY session",
+            "SELECT session, MIN(queued_at), COUNT(*), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
+             FROM steering_queue GROUP BY session",
         ) else {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "query failed"}));
         };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map(|it| it.flatten().collect())
             .unwrap_or_default()
     };
     let now = now_f64();
     let skips = steer_skips().lock().unwrap().clone();
-    let lanes: Vec<Value> = rows
-        .into_iter()
-        .map(|(session, oldest, count)| {
-            let (last_id, reason, at) = skips
-                .get(&session)
-                .cloned()
-                .unwrap_or_else(|| (String::new(), String::new(), 0.0));
-            json!({
-                "session": session,
-                "queued": count,
-                "oldest_age_s": (now - oldest) as i64,
-                "stalled": now - oldest >= steer_stall_warn_s(),
-                "overdue": now - oldest >= steer_max_age_s(),
-                "last_skip_id": last_id,
-                "last_skip_reason": reason,
-                "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
-            })
-        })
-        .collect();
+    let mut lanes: Vec<Value> = Vec::new();
+    for (session, oldest, count, senders) in rows {
+        let (last_id, reason, at) = skips
+            .get(&session)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new(), 0.0));
+        // LIVE, not remembered. `last_skip_reason` is in-memory and empty after
+        // a restart — which is exactly when someone is most likely to be
+        // reading this endpoint — so it could report a 15-hour stall with no
+        // reason at all. This one is computed on the spot from the same
+        // predicate the deliverer uses.
+        let blocked = lane_block_reason(&session).await;
+        lanes.push(json!({
+            "session": session,
+            "queued": count,
+            "oldest_age_s": (now - oldest) as i64,
+            "stalled": now - oldest >= steer_stall_warn_s(),
+            "overdue": now - oldest >= steer_max_age_s(),
+            "deliverable": blocked.is_none(),
+            "blocked_reason": blocked,
+            "senders": senders.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+            "last_skip_id": last_id,
+            "last_skip_reason": reason,
+            "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
+        }));
+    }
     j200(json!({
         "lanes": lanes,
         "stall_warn_s": steer_stall_warn_s(),
@@ -6055,12 +6336,17 @@ pub async fn pipe_reconcile_tick() -> usize {
     rearmed
 }
 
-/// Background driver. 60s: a lost pipe is a durable condition, not a race, and
-/// this shells out per unpiped pane — polling it hard would cost more than the
-/// logging it restores.
+/// 60s: a lost pipe is a durable condition, not a race, and this shells out
+/// per unpiped pane — polling it hard would cost more than the logging it
+/// restores. Named (and pub) so lib.rs registers the cadence it actually
+/// sleeps, not a second copy of the number.
+pub const PIPE_RECONCILE_SECS: u64 = 60;
+
+/// Background driver.
 pub async fn pipe_reconcile_loop() {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(PIPE_RECONCILE_SECS)).await;
+        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::PIPE_RECONCILE);
         if let Err(e) = tokio::spawn(pipe_reconcile_tick()).await {
             tracing::error!(error = %e, "pipe reconcile tick panicked");
         }
@@ -6071,6 +6357,7 @@ pub async fn pipe_reconcile_loop() {
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(STEER_TICK_SECS)).await;
+        crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::STEER_DELIVER);
         // A panic in one tick must not kill delivery for the whole fleet.
         let st = state.clone();
         if let Err(e) = tokio::spawn(async move { steer_deliver_tick(&st).await }).await {
@@ -6511,9 +6798,9 @@ async fn get_dispatch(
                 }
                 return j200(json!(out));
             }
-            let mut out = vec![];
+            let mut out: Vec<Value> = vec![];
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT id, text, queued_at, COALESCE(guard,'') FROM steering_queue \
+                "SELECT id, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue \
                  WHERE session=? ORDER BY queued_at ASC",
             ) {
                 if let Ok(rows) = stmt.query_map([name], |r| {
@@ -6522,10 +6809,28 @@ async fn get_dispatch(
                         "text": r.get::<_, String>(1)?,
                         "queued_at": r.get::<_, f64>(2)?,
                         "guard": r.get::<_, String>(3)?,
+                        "sender": r.get::<_, String>(4)?,
                     }))
                 }) {
                     out = rows.flatten().collect();
                 }
+            }
+            drop(conn);
+            // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
+            // shows only text and a timestamp cannot answer the one question a
+            // sender staring at it has — "is this coming, or is it stuck?" —
+            // and the caller cannot compute it, because whether the lane can
+            // receive at all is not in the row. Same predicate as the drain
+            // loop, so the list cannot claim what the loop will not do.
+            let blocked = lane_block_reason(name).await;
+            let max_age = steer_max_age_s();
+            let now = now_f64();
+            for row in out.iter_mut() {
+                let age = now - row["queued_at"].as_f64().unwrap_or(now);
+                row["age_s"] = json!(age as i64);
+                row["overdue"] = json!(age >= max_age);
+                row["deliverable"] = json!(blocked.is_none());
+                row["blocked_reason"] = json!(blocked);
             }
             j200(json!(out))
         }
@@ -6874,14 +7179,34 @@ async fn steer_mutate(
                 );
             }
         }
-        let msg_id = steer_enqueue(state, name, &text, "").await;
+        // THE POINT OF SEND is where the sender's belief is formed, so it is the
+        // only place a correction is free (AMUX-2785). This handler used to
+        // answer "queued for next turn boundary" unconditionally — for a lane
+        // that was merely busy (true) and for one that was stopped or not a
+        // worker at all (false, and false for as long as anyone cared to wait:
+        // 15 hours, in the incident this card was cut from).
+        let blocked = lane_block_reason(name).await;
+        let msg_id = steer_enqueue(state, name, &text, "", &hdr_worker(headers)).await;
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
             cmd_hist_record(state, name, &text, "user", email).await;
             // Autotask/labelling: Python's model-call feature — gap named in
             // the module doc.
         }
-        return j200(json!({"ok": true, "id": msg_id, "message": "queued for next turn boundary"}));
+        return j200(json!({
+            "ok": true,
+            "id": msg_id,
+            // `ok` stays true and the row is still stored: a stopped lane is
+            // routinely started minutes later, and dropping the message would
+            // trade a false promise for real data loss. What changes is that the
+            // response stops CLAIMING a boundary is coming.
+            "deliverable": blocked.is_none(),
+            "blocked_reason": blocked,
+            "message": match blocked {
+                None => format!("queued — delivers to '{name}' at its next turn boundary"),
+                Some(r) => block_reason_explain(r, name),
+            },
+        }));
     }
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
 }
@@ -9491,6 +9816,80 @@ mod tests {
         assert!(!at_resume_picker("Enter to select"));
     }
 
+    // ---- AMUX-2612: session identity survives a resume --------------------
+    #[test]
+    fn resume_carries_the_session_name() {
+        // The defect: resume produced ONLY `--resume <id>`, so a renamed
+        // session's harness kept its birth name forever.
+        let f = claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true);
+        assert!(f.contains("--resume 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2"), "{f}");
+        assert!(f.contains("--name amux"), "resume dropped the session name: {f}");
+        // Fresh start is unchanged: --name only, never a bare/empty --resume.
+        let fresh = claude_session_flag("amux", "", false);
+        assert_eq!(fresh, "--name amux");
+        // A stale conv id (file gone) must not smuggle --resume in.
+        let stale = claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", false);
+        assert_eq!(stale, "--name amux", "unresumable id must fall back to fresh: {stale}");
+        // Names are quoted, not interpolated raw.
+        assert!(claude_session_flag("a b", "x", false).contains("--name 'a b'"));
+
+        // ...and it SURVIVES the splice. Testing the flag string alone would
+        // not catch build_claude_cmd's dedupe eating it, which is the same
+        // class of bug as the duplicate-model incident below.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let cmd = build_claude_cmd(
+            &EnvFile::default(),
+            "--model claude-fable-5 --dangerously-skip-permissions",
+            "",
+            &claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true),
+            "",
+        );
+        assert!(cmd.contains("--resume 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2"), "{cmd}");
+        assert!(cmd.contains("--name amux"), "the splice dropped the name: {cmd}");
+        assert_eq!(cmd.matches("--name").count(), 1, "duplicated --name: {cmd}");
+        assert_eq!(cmd.matches("--resume").count(), 1, "duplicated --resume: {cmd}");
+    }
+
+    #[test]
+    fn transcript_display_name_takes_the_latest_record_not_the_first() {
+        // A claude transcript is append-only: `--name` writes a NEW record and
+        // line 0 keeps the birth name for the life of the file. Reading line 0
+        // is what made the writer-side fix invisible.
+        let dir = tempfile::tempdir().unwrap();
+        let jf = dir.path().join("conv.jsonl");
+        std::fs::write(
+            &jf,
+            "{\"customTitle\":\"amux-rust\",\"type\":\"summary\"}\n\
+             {\"type\":\"user\"}\n\
+             {\"customTitle\":\"amux-rust\",\"type\":\"assistant\"}\n\
+             {\"customTitle\":\"amux\",\"type\":\"assistant\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_display_name(&jf).as_deref(),
+            Some("amux"),
+            "the RENAMED name must win; line 0 is the dead one"
+        );
+
+        // Fallback: no name record inside the tail window still resolves from
+        // line 0, so a short or long-silent transcript is not made nameless.
+        let only_first = dir.path().join("first.jsonl");
+        std::fs::write(&only_first, "{\"customTitle\":\"solo\"}\n{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(transcript_display_name(&only_first).as_deref(), Some("solo"));
+
+        // sessionName is honoured alongside customTitle (both are matched by
+        // the resolver this feeds).
+        let alt = dir.path().join("alt.jsonl");
+        std::fs::write(&alt, "{\"sessionName\":\"viaSessionName\"}\n").unwrap();
+        assert_eq!(transcript_display_name(&alt).as_deref(), Some("viaSessionName"));
+
+        // No name anywhere is None, not "".
+        let none = dir.path().join("none.jsonl");
+        std::fs::write(&none, "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(transcript_display_name(&none), None);
+    }
+
     #[test]
     fn peek_text_utils_hold_their_contracts() {
         assert_eq!(collapse_blank_runs("a\n\n\n\nb"), "a\n\nb");
@@ -9499,6 +9898,16 @@ mod tests {
         // All-scaffolding frame returns unchanged, never blanks the peek.
         let only_noise = "claude --resume abc --name s";
         assert_eq!(strip_launch_noise(only_noise), only_noise);
+        // AMUX-2612: a RESUMED pane's launch line carries --resume and (before
+        // this card) no --name. Both fixtures above contain "--name", so the
+        // pre-filter's missing --resume arm could not fail on either — the
+        // whole boot command line reached the state heuristics unstripped.
+        let resumed = "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; cd /x; claude --model sonnet --dangerously-skip-permissions --resume 0a1b2c3d\nreal content";
+        assert_eq!(
+            strip_launch_noise(resumed),
+            "real content",
+            "resume-shaped launch noise must be stripped like the --name shape"
+        );
         assert_eq!(
             strip_scroll_pill("before Jump to bottom (click) ↓ after"),
             "before after"
@@ -10838,6 +11247,71 @@ mod steer_max_age_tests {
         // The warning threshold must be the SAME number the deliverer uses: a
         // view that disagrees with its mechanism is worse than no view.
         assert_eq!(steer_stall_warn_s(), steer_max_age_s());
+    }
+
+    /// THE REGRESSION CORPUS IS THE INCIDENT (AMUX-2785), not a fixture built
+    /// for convenience: the three lanes that were actually stalled on
+    /// 2026-08-10, in the states they were actually in. The convenient fixture
+    /// here would be a lane that is simply busy — and it is convenient
+    /// *precisely because* it lacks the property that made the incident, which
+    /// is a lane that can never receive at all.
+    #[test]
+    fn the_three_stalled_lanes_are_distinguished_from_a_merely_busy_one() {
+        // amux-agent — 15.2h queued, skip reason `no-env-file`.
+        assert_eq!(
+            lane_block_reason_from(false, false, false),
+            Some("no-env-file"),
+            "amux-agent: a lane with no env file is not a worker, and no deadline reaches it"
+        );
+        // amux-rust-execution — 4.3h queued, and mixpeek-orchestrator at 15.2h.
+        assert_eq!(
+            lane_block_reason_from(true, false, false),
+            Some("not-running"),
+            "amux-rust-execution / mixpeek-orchestrator: a stopped lane waits to be STARTED, \
+             not to be free"
+        );
+        // The lane that IS merely busy — amux-cloud and mixpeek-finances were in
+        // exactly this state at the same moment, and they are the reason the
+        // other three were invisible: all five reported the same "queued".
+        assert_eq!(
+            lane_block_reason_from(true, false, true),
+            None,
+            "a running, unarchived lane is deliverable — busy is not blocked, and conflating \
+             the two is the whole defect"
+        );
+        // Archived is its own answer rather than being collapsed into
+        // `not-running`: un-archiving is a human's call (ethos rule 8), so the
+        // sender needs to be told which of the two they are looking at.
+        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
+        assert_eq!(
+            lane_block_reason_from(true, true, true),
+            Some("archived"),
+            "an archived lane that still has a live pane is still refused — the send path \
+             refuses archived, so the queue must not promise otherwise"
+        );
+    }
+
+    /// The reason code is the actionable half, so it must survive into the text
+    /// a human reads. A message that says only "queued" is what produced the
+    /// original wrong diagnosis ("i think the amux session is stuck").
+    #[test]
+    fn the_sender_is_told_what_will_happen_not_just_what_is_wrong() {
+        for reason in ["no-env-file", "not-running", "archived"] {
+            let s = block_reason_explain(reason, "amux-agent");
+            assert!(
+                s.contains("NOT DELIVERABLE"),
+                "{reason}: the sender must not read this as a normal queue: {s}"
+            );
+            assert!(s.contains("amux-agent"), "{reason}: must name the lane: {s}");
+        }
+        // The two that resolve NEVER must say so — this is the distinction the
+        // deadline cannot make, and the sender's only cue to act.
+        assert!(block_reason_explain("not-running", "x").contains("STARTED"));
+        assert!(block_reason_explain("no-env-file", "x").contains("not waiting for a turn boundary"));
+        // An unknown reason still produces a truthful sentence rather than a
+        // panic or an empty string: the reason vocabulary is the drain loop's,
+        // and it will grow.
+        assert!(block_reason_explain("wat", "x").contains("NOT DELIVERABLE"));
     }
 
     #[test]

@@ -59,6 +59,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// you conclude "only these three callers" from a truncated list.
 const MAX_CLIENTS: usize = 200;
 
+/// Distinct paths remembered per caller. `last_path` alone cannot tell two
+/// callers wearing the same user-agent apart, and on this port they were:
+/// `curl/8.7.1` is BOTH the Claude Code report hooks and every agent's own
+/// `curl $AMUX_URL/api/...`, while `Python-urllib` is BOTH the git pre-commit
+/// guard and the PreToolUse Bash guard. Draining the port means fixing callers
+/// one at a time and watching the number fall, and a tally that collapses four
+/// callers into two rows cannot show which fix worked (ethos rule 4 — the
+/// instrument must be able to express the discriminator). Capped, with the
+/// drop count reported, for the same reason [`MAX_CLIENTS`] is.
+const MAX_PATHS_PER_CLIENT: usize = 24;
+
 /// One distinct caller of the legacy port.
 #[derive(Clone, Debug, Default)]
 pub struct ClientTally {
@@ -66,7 +77,21 @@ pub struct ClientTally {
     pub first_seen: u64,
     pub last_seen: u64,
     pub last_path: String,
+    /// path -> hits. See [`MAX_PATHS_PER_CLIENT`].
+    pub paths: BTreeMap<String, u64>,
+    pub paths_dropped: u64,
 }
+
+/// Marker inserted into the request extensions by [`count`], so a handler can
+/// tell that THIS request arrived on the retired socket.
+///
+/// The dashboard shell is the one response that has to care: a client that
+/// loaded the SPA from the legacy origin keeps every relative `/api/...` fetch
+/// on that origin forever, so the shell is the only place a browser-side
+/// migration can be offered. Everything else must stay byte-identical between
+/// the two listeners — sessions are depending on it.
+#[derive(Clone, Copy, Debug)]
+pub struct OnLegacyListener(pub u16);
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -112,7 +137,7 @@ pub fn arm(port: u16) {
 /// Middleware for the LEGACY listener only. Counts the request, tags who sent
 /// it, and passes it through unchanged — the legacy port must stay
 /// byte-identical to the primary one, since sessions are depending on it.
-pub async fn count(req: Request, next: Next) -> Response {
+pub async fn count(mut req: Request, next: Next) -> Response {
     let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -128,26 +153,112 @@ pub async fn count(req: Request, next: Next) -> Response {
         .collect::<String>();
     let path = req.uri().path().to_string();
 
-    if let Ok(mut s) = state().lock() {
-        let t = now();
-        s.hits_total += 1;
-        s.hour_hits += 1;
-        s.last_hit = t;
-        let key = format!("{ip} {ua}");
-        if let Some(e) = s.clients.get_mut(&key) {
-            e.count += 1;
-            e.last_seen = t;
-            e.last_path = path;
-        } else if s.clients.len() < MAX_CLIENTS {
-            s.clients.insert(
-                key,
-                ClientTally { count: 1, first_seen: t, last_seen: t, last_path: path },
-            );
-        } else {
-            s.clients_dropped += 1;
-        }
-    }
+    let port = record(&ip, &ua, &path);
+    // Tell the SHELL handler it is answering on the retired socket. Only the
+    // dashboard document acts on this; the API surface stays identical. Set
+    // outside the lock so a poisoned counter cannot silently disable the
+    // migration — the two failures are unrelated and must not be coupled.
+    req.extensions_mut()
+        .insert(OnLegacyListener(if port == 0 { crate::config::DEFAULT_PORT } else { port }));
     next.run(req).await
+}
+
+/// The whole tally, extracted from [`count`] so the test drives THIS and not a
+/// hand-written imitation of it. The previous test poked `state()` directly and
+/// so could not have caught a bug in the accounting itself — it asserted about
+/// numbers it had written by hand (ethos rule 7: test the shipped code path).
+///
+/// Returns the armed legacy port, or 0 when the bind is not enabled.
+fn record(ip: &str, ua: &str, path: &str) -> u16 {
+    let Ok(mut s) = state().lock() else { return 0 };
+    let t = now();
+    s.hits_total += 1;
+    s.hour_hits += 1;
+    s.last_hit = t;
+    let port = s.port;
+    let key = format!("{ip} {ua}");
+    // Decide admission BEFORE taking the entry: `get_mut(..) else entry(..)`
+    // borrows `s.clients` across both arms and does not compile.
+    let admit = s.clients.contains_key(&key) || s.clients.len() < MAX_CLIENTS;
+    if !admit {
+        s.clients_dropped += 1;
+        return port;
+    }
+    let e = s.clients.entry(key).or_insert(ClientTally { first_seen: t, ..Default::default() });
+    e.count += 1;
+    e.last_seen = t;
+    e.last_path = path.to_string();
+    if let Some(c) = e.paths.get_mut(path) {
+        *c += 1;
+    } else if e.paths.len() < MAX_PATHS_PER_CLIENT {
+        e.paths.insert(path.to_string(), 1);
+    } else {
+        e.paths_dropped += 1;
+    }
+    port
+}
+
+/// The canonical port this server answers on — the one every client should be
+/// using. Read from the same place [`crate::config`] reads it, so there is one
+/// definition of "where amux is" and not a second literal to keep in step.
+pub fn canonical_port() -> u16 {
+    std::env::var("AMUX_RS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::config::DEFAULT_PORT)
+}
+
+/// Publish where this server actually is, into `<amux_home>/endpoint.json`.
+///
+/// # Why a file, and why the server writes it
+///
+/// The legacy bind exists because ~55 live `claude` processes carry
+/// `AMUX_URL=https://localhost:8822` in their PROCESS env, which cannot be
+/// rotated without killing them. Every hook those processes spawn — the report
+/// hooks, the PreToolUse git guard, the pre-commit staged-guard — inherits that
+/// stale value, so "fix the hook's DEFAULT" (`${AMUX_URL:-…8824}`) changes
+/// nothing at all: the default only fires when the variable is UNSET, and it
+/// never is. That fix was shipped and was inert for all 55 (ethos rule 1 — the
+/// capability existed and reached nobody).
+///
+/// A one-shot hook has exactly one way to notice its inherited URL is stale:
+/// ask something on the machine that knows better. This file is that. The
+/// SERVER writes it because the server is the only party that knows both ports
+/// without guessing, and because it must stay true in the cloud image too,
+/// where the numbers are reversed (`AMUX_RS_PORT=8822` there) — a hook with a
+/// hardcoded `8822 -> 8824` rewrite would break that deployment, while a hook
+/// that reads this file is correct in both. Single codebase, no build flags.
+///
+/// The consumer rule is deliberately narrow, and is documented here because
+/// this file is its contract: **if your URL is `localhost:<legacy_port>`, use
+/// `canonical_url` instead.** Not "always prefer canonical" — a session
+/// pointing at a dev instance on another port, or at a remote amux, is making a
+/// deliberate choice and must be left alone.
+pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Option<u16>) {
+    let body = serde_json::json!({
+        "canonical_url": format!("https://localhost:{canonical}"),
+        "canonical_port": canonical,
+        "legacy_port": legacy,
+        "pid": std::process::id(),
+        "written_at": now(),
+        "consumer_rule": "if your AMUX_URL is https://localhost:<legacy_port>, use canonical_url",
+    });
+    let path = amux_home.join("endpoint.json");
+    // Write-then-rename: a hook reading this file mid-write must never see a
+    // truncated JSON document and fall back to the stale env, which is the
+    // exact failure it is here to prevent.
+    let tmp = amux_home.join("endpoint.json.tmp");
+    let ok = std::fs::write(&tmp, format!("{body}\n"))
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .is_ok();
+    if ok {
+        tracing::info!(?path, canonical, ?legacy, "published endpoint.json (stale-URL self-heal)");
+    } else {
+        // Loud: silently failing here turns every hook's self-heal off with no
+        // trace, and the symptom (traffic on the retired port) looks identical
+        // to nobody having fixed the hooks at all.
+        tracing::warn!(?path, "could not publish endpoint.json — hooks cannot self-heal a stale AMUX_URL");
+    }
 }
 
 /// Snapshot for the debug surface / the reporter, as JSON.
@@ -161,6 +272,12 @@ pub fn snapshot() -> serde_json::Value {
         .iter()
         .map(|(k, v)| {
             let (ip, ua) = k.split_once(' ').unwrap_or((k.as_str(), "-"));
+            // Loudest path first, for the same reason clients are sorted that
+            // way: this list is read to decide WHICH caller wearing this
+            // user-agent to go and fix next.
+            let mut paths: Vec<_> =
+                v.paths.iter().map(|(p, c)| serde_json::json!({"path": p, "count": c})).collect();
+            paths.sort_by_key(|p| std::cmp::Reverse(p["count"].as_u64().unwrap_or(0)));
             serde_json::json!({
                 "ip": ip,
                 "user_agent": ua,
@@ -168,6 +285,8 @@ pub fn snapshot() -> serde_json::Value {
                 "first_seen": v.first_seen,
                 "last_seen": v.last_seen,
                 "last_path": v.last_path,
+                "paths": paths,
+                "paths_dropped": v.paths_dropped,
             })
         })
         .collect();
@@ -202,52 +321,85 @@ pub async fn debug() -> axum::Json<serde_json::Value> {
     axum::Json(snapshot())
 }
 
-/// Hourly ticker. WARN while the legacy port is still being used (with who is
-/// using it, so the line is actionable on its own), INFO when it is not —
-/// because ZERO is the signal the retirement is waiting for, and a reporter
-/// that goes silent on zero cannot be distinguished from a reporter that died.
+/// One hour's worth of accounting, as decided rather than as logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HourReport {
+    pub port: u16,
+    pub hits_last_hour: u64,
+    pub hits_this_uptime: u64,
+    /// Top callers, loudest first: `("<ip> <ua>", count)`.
+    pub top: Vec<(String, u64)>,
+    pub clients_dropped: u64,
+    pub uptime_secs: u64,
+    /// WARN vs INFO. `true` means the bind still cannot be dropped.
+    pub still_in_use: bool,
+}
+
+/// Close the hour: snapshot it, reset the per-hour counter, decide the verdict.
+///
+/// Split out of the timer loop on purpose. A decision buried inside
+/// `loop { interval.tick().await; … }` can only be tested by waiting an hour,
+/// which means in practice it is not tested at all — and the thing most worth
+/// pinning here is that ZERO still produces a report (see [`run_reporter`]).
+///
+/// `None` = the bind is not enabled, so there is nothing to say.
+pub fn take_hour() -> Option<HourReport> {
+    let mut s = state().lock().ok()?;
+    if s.port == 0 {
+        return None;
+    }
+    let mut top: Vec<(String, u64)> = s.clients.iter().map(|(k, v)| (k.clone(), v.count)).collect();
+    top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    top.truncate(5);
+    let hits_last_hour = s.hour_hits;
+    s.hour_hits = 0;
+    s.hour_started = now();
+    Some(HourReport {
+        port: s.port,
+        hits_last_hour,
+        hits_this_uptime: s.hits_total,
+        top,
+        clients_dropped: s.clients_dropped,
+        uptime_secs: now().saturating_sub(s.started_at),
+        still_in_use: hits_last_hour > 0,
+    })
+}
+
+/// Hourly ticker. WARN while the legacy port is still being used (naming who is
+/// using it, so the line is actionable without opening the API), INFO when it is
+/// not — because ZERO is the signal the retirement is waiting for, and a
+/// reporter that goes silent on zero cannot be told apart from a reporter that
+/// died.
 pub async fn run_reporter() {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     tick.tick().await; // fires immediately; skip the t=0 tick
     loop {
         tick.tick().await;
-        let (port, hour_hits, total, top, dropped, elapsed_h) = {
-            let Ok(mut s) = state().lock() else { continue };
-            if s.port == 0 {
-                continue; // bind not enabled — nothing to report
-            }
-            let mut top: Vec<(String, u64)> =
-                s.clients.iter().map(|(k, v)| (k.clone(), v.count)).collect();
-            top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-            top.truncate(5);
-            let hour_hits = s.hour_hits;
-            s.hour_hits = 0;
-            s.hour_started = now();
-            let elapsed_h = now().saturating_sub(s.started_at) as f64 / 3600.0;
-            (s.port, hour_hits, s.hits_total, top, s.clients_dropped, elapsed_h)
-        };
-        if hour_hits == 0 {
-            tracing::info!(
-                port,
-                hits_last_hour = 0,
-                hits_this_uptime = total,
-                uptime_hours = format!("{elapsed_h:.1}"),
-                "legacy port idle — retire when this stays 0 for 7d (GET /api/debug/legacy-port)"
-            );
-        } else {
-            let callers = top
+        let Some(r) = take_hour() else { continue };
+        let uptime_hours = format!("{:.1}", r.uptime_secs as f64 / 3600.0);
+        if r.still_in_use {
+            let callers = r
+                .top
                 .iter()
                 .map(|(k, c)| format!("{k} x{c}"))
                 .collect::<Vec<_>>()
                 .join("; ");
             tracing::warn!(
-                port,
-                hits_last_hour = hour_hits,
-                hits_this_uptime = total,
-                uptime_hours = format!("{elapsed_h:.1}"),
-                clients_dropped = dropped,
+                port = r.port,
+                hits_last_hour = r.hits_last_hour,
+                hits_this_uptime = r.hits_this_uptime,
+                uptime_hours,
+                clients_dropped = r.clients_dropped,
                 %callers,
                 "legacy port STILL IN USE — bind cannot be dropped yet"
+            );
+        } else {
+            tracing::info!(
+                port = r.port,
+                hits_last_hour = 0,
+                hits_this_uptime = r.hits_this_uptime,
+                uptime_hours,
+                "legacy port idle — retire when this stays 0 for 7d (GET /api/debug/legacy-port)"
             );
         }
     }
@@ -257,13 +409,27 @@ pub async fn run_reporter() {
 mod tests {
     use super::*;
 
-    /// The bind being enabled with zero traffic is the state the retirement is
-    /// waiting for; it must not render the same as the bind being off, or the
-    /// number the owner reads cannot distinguish "safe to drop" from "already
-    /// dropped, nothing measured".
+    /// ONE test, not several, on purpose.
+    ///
+    /// This module's counter is a process-global `OnceLock<Mutex<_>>` — which is
+    /// correct for the thing it measures (one process, one legacy listener) and
+    /// poison for tests, because cargo runs them as THREADS IN ONE PROCESS in
+    /// nondeterministic order. Split across two `#[test]` fns, the "fresh state
+    /// reads as disabled" assertion passed or failed depending on whether the
+    /// sibling's `arm()` happened to run first: green on the first run, red on
+    /// the next, with nothing changed. That exact shape is already in
+    /// frustrations.md (env-mutating tests racing each other), and the fix that
+    /// actually holds is not `--test-threads=1` — a flag no one passes — but
+    /// keeping the sequence that shares the state inside a single test.
+    ///
+    /// The order below IS the assertion: never-armed, then armed-and-idle, then
+    /// traffic, then the window reset.
     #[test]
-    fn armed_and_idle_is_distinguishable_from_disabled() {
-        // Fresh state (default) = never armed.
+    fn counter_lifecycle_disabled_then_armed_then_traffic_then_reset() {
+        // (1) Never armed. The bind being enabled with zero traffic is the state
+        // the retirement waits for; it must not render the same as the bind
+        // being OFF, or the field the owner reads cannot distinguish "safe to
+        // drop" from "already dropped, nothing was ever measured".
         let off = snapshot();
         assert_eq!(off["enabled"], false, "unarmed must report enabled:false");
         assert_eq!(off["port"], 0);
@@ -280,5 +446,81 @@ mod tests {
             on["ready_to_retire"], false,
             "a fresh window must never read as ready to retire"
         );
+
+        // (3) The hourly report must fire on ZERO, not only on traffic. This is
+        // the whole design: silence is the signal the retirement waits for, so a
+        // reporter that only speaks when something happened cannot be told apart
+        // from one that died — and "no WARN lines lately" would read as progress
+        // when it might be a dead task.
+        //
+        // Idle hour: reported, and flagged as NOT in use.
+        let idle = take_hour().expect("armed bind must produce a report");
+        assert_eq!(idle.port, 8822);
+        assert_eq!(idle.hits_last_hour, 0);
+        assert!(
+            !idle.still_in_use,
+            "a zero hour must not be flagged as in-use"
+        );
+
+        // Now drive the REAL accounting the middleware uses (`record`), not a
+        // hand-written imitation of it.
+        //
+        // The two callers below wear the SAME user-agent and hit DIFFERENT
+        // paths, because that is the case the tally could not express and the
+        // drain depends on: on this machine `curl/8.7.1` is both the Claude
+        // Code report hooks (`/api/sessions/*/report`) and every agent's own
+        // ad-hoc `curl $AMUX_URL/...`. Fixing only the hooks must show up as
+        // one path going quiet while the other does not — with a single
+        // `last_path` field that is invisible, so "did my fix work?" was
+        // unanswerable from what this module kept.
+        assert_eq!(record("127.0.0.1", "curl/8", "/api/sessions/a/report"), 8822);
+        record("127.0.0.1", "curl/8", "/api/sessions/a/report");
+        record("127.0.0.1", "curl/8", "/api/board");
+        let busy = take_hour().expect("still armed");
+        assert_eq!(busy.hits_last_hour, 3);
+        assert!(busy.still_in_use, "a non-zero hour must be flagged in-use");
+        assert_eq!(
+            busy.top.first().map(|(k, c)| (k.as_str(), *c)),
+            Some(("127.0.0.1 curl/8", 3)),
+            "the WARN line must be able to name the caller"
+        );
+
+        // THE DISCRIMINATOR. One client row, two callers, and the snapshot has
+        // to separate them by path. This assertion fails on the pre-change
+        // module (there was no `paths` key at all), which is what makes it a
+        // check rather than decoration.
+        let snap = snapshot();
+        let row = snap["clients"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["user_agent"] == "curl/8"))
+            .expect("the curl caller must appear in the snapshot")
+            .clone();
+        let paths: Vec<(String, u64)> = row["paths"]
+            .as_array()
+            .expect("per-client path histogram")
+            .iter()
+            .map(|p| (p["path"].as_str().unwrap_or("").to_string(), p["count"].as_u64().unwrap_or(0)))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![("/api/sessions/a/report".to_string(), 2), ("/api/board".to_string(), 1)],
+            "paths must be split per caller and sorted loudest-first — one row \
+             collapsing both callers is the state that made the drain unmeasurable"
+        );
+        assert_eq!(row["paths_dropped"], 0);
+
+        // The window RESET is what makes "last hour" mean last hour; without it
+        // the count would only ever climb and every hour after the first would
+        // read as in-use forever.
+        let after = take_hour().expect("still armed");
+        assert_eq!(
+            after.hits_last_hour, 0,
+            "take_hour must reset the per-hour counter"
+        );
+        assert_eq!(
+            after.hits_this_uptime, 3,
+            "the uptime total must NOT reset — only the hour window does"
+        );
+        assert!(!after.still_in_use);
     }
 }

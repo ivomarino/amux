@@ -1237,6 +1237,7 @@ impl LiveDeliverer {
             &owner,
             &text,
             &format!("sched:{}", sched.id()),
+            "",
         )
         .await;
     }
@@ -1658,6 +1659,10 @@ pub async fn run_scheduler(
     );
     loop {
         tick.tick().await;
+        // The loop with ZERO call sites (AMUX-2647) now says so itself:
+        // /api/system-jobs shows this tick's age, and a firing loop that
+        // stopped reads as STALLED instead of as a quiet fleet.
+        super::registry::tick(super::registry::ids::SCHEDULER);
         let mut attempt = 0u32;
         loop {
             match scheduler_tick(&store, enabled, policy, &mut shadow_seen, deliverer.as_ref()).await {
