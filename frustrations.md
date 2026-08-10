@@ -2062,3 +2062,82 @@ FIX: The commit body already names the card ids in a machine-readable form. Noth
   was there and unread, which is the same shape as AC-323's ignored_fields. Note
   the honest limit: a named card is not proof of completion, so this should
   SURFACE candidates for a human/agent check, never auto-close (ethos rule 8).
+
+---
+## `run_scheduler` had zero call sites, so arming AMUX_RS_SCHEDULER=1 started nothing
+AREA: scheduler
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux-rust (AMUX-2647 lane)
+CARD: AMUX-2647
+SYMPTOM: `grep -rn run_scheduler crates/` returned the definition, two doc mentions and
+  its own re-export — and no caller. The loop was documented, gated, tested and never
+  spawned. The live evidence: the last `cron` run row on the fleet is 19:41:11, the
+  minute the python server stopped, and six enabled schedules were overdue by up to
+  3h09m with nothing in any log saying so. Nothing errored, because the failure is pure
+  absence — there is no log line for a loop that was never started.
+COST: every schedule on the fleet was dead from the python cutover until this was found
+  (~3h20m at discovery), including the frustrations sweep and the MVS reliability
+  monitors. The gate made it worse than a plain omission: the owner ARMED
+  `AMUX_RS_SCHEDULER=1` believing that turned firing on, so the one action that looked
+  like the fix confirmed a capability that did not exist.
+FIX: spawned in lib.rs alongside the other runtime jobs (ghost_rescue, board_drive,
+  pane_size), which is where a reader looks for "what loops run". Same class as
+  AMUX-2637 (the board drive loop, also left unspawned by the cutover) — that is two
+  instances, so the general fix is a boot-time assertion that every documented runtime
+  job has a live task, not a third careful reading of lib.rs.
+
+---
+## Run-now recorded `status:"ok"` for a delivery it knew it had not performed
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux-rust (AMUX-2647 lane)
+CARD: AMUX-2647
+SYMPTOM: `POST /api/schedules/<id>/run` answered `{"ok":true,"ran":"<title>","status":"ok","note":""}`
+  and wrote a `schedule_runs` row with `status='ok'`, note `manual run recorded by rust
+  scheduler`. The endpoint's own comment said "the run row records the trigger, not a
+  delivery". The dashboard rendered exactly what it was told: a green `Ran · no output`.
+  Two such rows sit at 22:56:38 and 22:57:11 — the owner pressing the button twice.
+COST: the owner's report ("i clicked run now it says ran, no output") and the whole
+  investigation behind it. Worse, the run history was unusable as evidence for the
+  outage above: 161 rows in 24h all reading `ok` is what a healthy fleet looks like, so
+  the one instrument that could have shown schedules were dead asserted they were fine.
+FIX: `RunOutcome` is now a type whose only `ok`-producing variant is `ShellOk`, which
+  can only be built from a finished subprocess — a tmux schedule that was not delivered
+  has no representable way to become `ok`. `schedule_runs` carries `delivery` and
+  `submission` (migration 0015) and the response says which of delivered/queued/refused/
+  error happened. The lesson that generalises: the honest comment was already written,
+  next to the code that contradicted it, and nobody diffed the two. A comment admitting
+  a lie does not stop the lie being recorded — only a type can.
+
+---
+## A peer's `git add` swept my uncommitted migration into their commit and it applied to the live DB
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-rust (AMUX-2647 lane)
+CARD: AMUX-2647
+SYMPTOM: I wrote `migrations/0015_schedule_run_delivery.sql` and registered it in
+  `migrate.rs`, uncommitted, under an explicit instruction never to commit. Commit
+  4d76ff3 ("feat: universal FTS5 search …") picked up my `migrate.rs` edit; the .sql
+  file was still untracked, so a clean checkout could not compile (`include_str!`
+  resolves at build time), and 6689a74 then tracked my file to repair the dangling
+  reference. The auto-builder shipped it and the live server applied 0015 to
+  `~/.amux/amux.db` at 03:22:43 — schema I authored, live, hours before the code that
+  writes those columns exists anywhere but my working tree.
+COST: no damage — the columns are additive and NULL reads as "not recorded" — but the
+  live DB now has two columns nothing populates, and neither author chose that. The
+  deploy path is committed-HEAD-only *precisely* so half-finished work cannot ship;
+  a broad `git add` in a shared checkout defeats it, and the second author was doing
+  the right thing (repairing a dangling reference) with no way to know the file was
+  mid-flight. The existing rule covers the direction "check what you are pushing that
+  is not yours"; this is the mirror, and no check catches it.
+FIX: the pre-commit guard should refuse a `git add` that stages files no lane has
+  claimed — or, cheaper, `prepare-commit-msg` already stamps `Amux-Session`, so warn
+  when a commit's file set spans more than one lane's recent edits. Until then: write
+  new files outside the repo until the change is ready, which is what I should have
+  done here.

@@ -6343,7 +6343,7 @@ async function _peekRunSchedule(id) {
   // "Schedule triggered" was toasted unconditionally, including when the call
   // returned null — a green message over an action that may not have happened,
   // which is the same defect as the main Run button's "Ran · no output"
-  // (AMUX-2647). Same verdict renderer as runSchedule(), so the peek panel and
+  // (AMUX-2647). Same verdict renderer as runScheduleNow(), so the peek panel and
   // the scheduler view can never tell a user two different stories.
   const r = await apiCall(API + '/api/schedules/' + id + '/run', { method: 'POST' });
   if (!r) return; // apiCall already toasted the refusal or the offline queue
@@ -17489,15 +17489,23 @@ function _schedRunToast(d) {
   }
 }
 
-function _schedRunDotClass(r) {
-  switch (String(r.status || '')) {
-    case 'ok': case 'delivered': return 'ok';
-    case 'done': return 'done';
-    case 'queued': return 'queued';
-    case 'refused': case 'skipped': return 'warn';
-    case 'error': return 'err';
-    default: return 'unknown';
-  }
+// ONE decision table for both renderings of a run's status — the dot on the
+// card and the word in the runs list. They were separate before, and the list's
+// version read `status === 'ok' ? green : red`, so every new verdict would have
+// been painted as a failure while the dot painted it correctly. A view that
+// disagrees with its sibling is the same defect as a view that disagrees with
+// the mechanism (ethos rule 1).
+const _SCHED_RUN_TONE = {
+  ok: 'ok', delivered: 'ok', done: 'done', queued: 'queued',
+  refused: 'warn', skipped: 'warn', error: 'err',
+};
+function _schedRunTone(status) { return _SCHED_RUN_TONE[String(status || '')] || 'unknown'; }
+function _schedRunDotClass(r) { return _schedRunTone(r.status); }
+function _schedRunColor(status) {
+  return {
+    ok: 'var(--green,#4ade80)', done: 'var(--accent)', queued: 'var(--accent)',
+    warn: 'var(--yellow,#fbbf24)', err: 'var(--red)', unknown: 'var(--dim)',
+  }[_schedRunTone(status)];
 }
 
 // Why a run happened. Only NON-cron sources get a chip: a cron fire is the
@@ -17770,13 +17778,19 @@ function renderScheduler(opts) {
     runsEl.innerHTML = runsScoped.slice(0, 30).map(r => {
       const timeStr = r.ran_at ? relTime(r.ran_at) : '?';
       const fullDate = r.ran_at ? new Date(r.ran_at * 1000).toLocaleString() : '';
-      const okColor = r.status === 'ok' ? 'var(--green,#4ade80)' : r.status === 'done' ? 'var(--accent)' : 'var(--red)';
+      const okColor = _schedRunColor(r.status);
+      // The submission verdict, only where it ADDS something. `confirmed` is
+      // the expected case for a delivered run and chipping it everywhere would
+      // bury `unverified` — the one that means "the keys landed and Claude Code
+      // may never have taken the message" (AMUX-2629).
+      const subChip = (r.submission && r.submission !== 'confirmed' && r.submission !== 'deferred')
+        ? `<span style="color:var(--yellow,#fbbf24);flex-shrink:0;font-size:0.65rem;" title="submission verdict">${esc(r.submission)}</span>` : '';
       return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:0.75rem;min-width:0;">
-        <span style="color:${okColor};font-weight:600;min-width:28px;flex-shrink:0;">${esc(r.status)}</span>
+        <span style="color:${okColor};font-weight:600;min-width:52px;flex-shrink:0;">${esc(r.status)}</span>
         <span style="color:var(--dim);white-space:nowrap;flex-shrink:0;" title="${esc(fullDate)}">${esc(timeStr)}</span>
-        ${_schedRunSrcChip(r.source)}
+        ${_schedRunSrcChip(r.source)}${subChip}
         <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${esc(r.title || r.schedule_id)}</span>
-        ${r.note ? `<span style="color:var(--red);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0;" title="${esc(r.note)}">${esc(r.note)}</span>` : ''}
+        ${r.note ? `<span style="color:${okColor};max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0;" title="${esc(r.note)}">${esc(r.note)}</span>` : ''}
       </div>`;
     }).join('');
   }

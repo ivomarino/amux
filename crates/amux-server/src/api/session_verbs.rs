@@ -2261,6 +2261,129 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     }
 }
 
+/// The stable prefix of every background-conversation refusal. Callers (and
+/// [`send_failure_status`]) key on THIS, not on the whole sentence, so the
+/// actionable tail can be reworded without silently reclassifying the refusal
+/// back to a 500.
+pub(crate) const BG_VIEW_REFUSAL_PREFIX: &str =
+    "session is in the background-conversation view";
+
+/// Policy knob for the background-manager guard, owned by the human exactly
+/// like D2's `rate_limit_action`: `collapse` (default — press esc, verify,
+/// deliver) or `refuse` (detect and leave the view for a person). Default is
+/// opt-OUT because a fleet whose lanes go unreachable is the failure ethos
+/// rule 1 is about; anything unrecognised means the default.
+fn bg_view_collapse_enabled() -> bool {
+    !matches!(
+        std::env::var("AMUX_BG_VIEW_ACTION").unwrap_or_default().trim(),
+        "refuse" | "off" | "0"
+    )
+}
+
+/// The refusal text, naming WHICH of the three honest states we are in — the
+/// caller cannot act on "it is in the background view" alone, because the next
+/// step differs: wait (mid-turn), look at the pane (esc did not work), or
+/// change the pref. Every variant keeps [`BG_VIEW_REFUSAL_PREFIX`].
+fn bg_view_refusal(generating: bool) -> String {
+    let tail = if !bg_view_collapse_enabled() {
+        " — press esc or enter in the pane to collapse it \
+         (auto-collapse is off: AMUX_BG_VIEW_ACTION=refuse)"
+    } else if generating {
+        " — the lane is mid-turn, so amux did not press esc (it would interrupt the run); \
+         retry at the next turn boundary or press esc in the pane"
+    } else {
+        " — amux pressed esc and the view did not collapse; press esc or enter in the pane"
+    };
+    format!(
+        "{BG_VIEW_REFUSAL_PREFIX} (its composer starts a new task, not a message to this \
+         session){tail}"
+    )
+}
+
+/// The HTTP status a `(false, msg)` outcome from the session-verb path
+/// deserves, plus a static next step for the SPA to render.
+///
+/// **A 500 must mean "amux broke".** Everything below is amux working
+/// correctly and DECLINING, and shipping a refusal as 500 is not cosmetic:
+/// 15 of the 19 errors in the 6h window before this was written were one
+/// refusal (the background-conversation guard) wearing a 500, and
+/// `runtime_jobs::autofix` files a board card for every distinct 5xx
+/// signature — so a miscoded refusal spends a lane's whole turn on a non-bug.
+/// 409 is this repo's idiom for "declined, and here is the way out" (the board
+/// gates answer 409 with a `cli:` hint); the hint here is that field.
+///
+/// Derived from the outcome string for the same reason [`submit_verdict_of`]
+/// is — `send_text` hands `(bool, String)` to a long list of callers and
+/// widening that signature would touch every one of them — and it pays the
+/// same price for drift. That price is covered by
+/// `every_send_failure_literal_is_classified`, which extracts every
+/// `(false, "…")` literal in THIS FILE at compile time and fails if one of
+/// them is neither a known refusal nor a known hard failure. A new refusal
+/// added later cannot silently land in the 500 bucket.
+pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str>) {
+    let m = msg.trim();
+    // --- 404: the target does not exist.
+    if m.starts_with("session '") && m.ends_with("not found") {
+        return (StatusCode::NOT_FOUND, Some("GET /api/sessions lists the live lanes"));
+    }
+    // --- 400: the request itself is malformed. Retrying verbatim cannot work.
+    if m == "invalid session name" {
+        return (StatusCode::BAD_REQUEST, Some("session names are letters, digits, '.', '_' and '-'"));
+    }
+    if m.starts_with("key '") && m.ends_with("not in allowed set") {
+        return (StatusCode::BAD_REQUEST, Some("the allowed keys are named in the message"));
+    }
+    // --- 501: honest degradation. The capability is ABSENT, not broken — the
+    //     same shape as /api/email/search on an unconnected account, which is
+    //     deliberately not a bug and deliberately not filed by the autofix.
+    if m.starts_with("iTerm2-backed sessions are not supported") {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Some("this lane is iTerm2-backed; use a tmux- or herdr-backed lane"),
+        );
+    }
+    // --- 409: amux declined because of the lane's CURRENT state. Every one of
+    //     these names the state and a way out, and every one becomes deliverable
+    //     on its own without anybody fixing amux.
+    let conflict: &[(&str, &str)] = &[
+        ("not running", "POST /api/sessions/<name>/start, or send again to auto-wake it"),
+        ("session is in resume picker", "choose a conversation in the pane, or send the Escape key"),
+        (
+            BG_VIEW_REFUSAL_PREFIX,
+            "the text was NOT delivered; retry once the pane leaves the background-conversation view",
+        ),
+        ("session at a selector", "a prompt is open in the pane — answer it, then retry"),
+        ("session started generating", "retry at the next turn boundary, or POST with deliver_now"),
+        ("session is blocked", "remove the lane from ~/.amux/blocked-sessions.txt"),
+        ("session is archived", "POST /api/sessions/<name>/wake first"),
+        ("terminal client attached", "a terminal client owns the size — detach it, or resize there"),
+        ("no agents panel on screen", "open the agents panel in the pane (left arrow) first"),
+        ("could not enter agent select mode", "the pane did not enter select mode — retry"),
+        ("agent panel closed mid-navigation", "the panel closed under the navigation — retry"),
+    ];
+    for (needle, hint) in conflict {
+        if m.starts_with(needle) {
+            return (StatusCode::CONFLICT, Some(hint));
+        }
+    }
+    // --- 500: unhandled. tmux/keys/fs actually failed. THIS is what the
+    //     autofix watcher should be spending lanes on.
+    (StatusCode::INTERNAL_SERVER_ERROR, None)
+}
+
+/// A verb's `(ok, msg)` rendered as its HTTP answer, classified by
+/// [`send_failure_status`]. Shared by `archive`/`wake`/`reset` so they cannot
+/// disagree with `send` about what "session is blocked" costs — all three used
+/// to answer a flat 500 for every failure, refusals included.
+fn verb_resp(ok: bool, msg: String) -> Response {
+    let (code, fix) = if ok { (StatusCode::OK, None) } else { send_failure_status(&msg) };
+    let mut body = json!({"ok": ok, "message": msg});
+    if let Some(fix) = fix {
+        body["fix"] = json!(fix);
+    }
+    jresp(code, body)
+}
+
 /// Durable submission evidence (py:25373 `_jsonl_user_msg_since`): true if
 /// `text` already landed in the session's conversation JSONL as a user message
 /// stamped AFTER `since`.
@@ -2883,22 +3006,55 @@ async fn send_text_inner(
         let last_started = meta.get("last_started").and_then(|v| v.as_i64()).unwrap_or(0);
         now_i64() - last_started < 20
     };
-    let out_st = tmux_capture(name, 15).await;
+    let mut out_st = tmux_capture(name, 15).await;
     if !out_st.is_empty() && at_resume_picker(&strip_ansi(&out_st)) {
         return (false, "session is in resume picker".into());
     }
     // The background-conversation manager (opened with `←`) draws its OWN
     // composer over the lane, and it starts a NEW task rather than messaging
-    // this session — so typing here silently addresses the wrong thing. Same
-    // shape as the resume-picker guard above: refuse, and name the key that
-    // clears it, rather than pressing something on the user's behalf.
+    // this session — so typing here silently addresses the wrong thing.
+    //
+    // COLLAPSE, VERIFY, THEN DELIVER (AMUX-2681). The original guard refused
+    // and named the key. That is safe but UNACTIONABLE: the only actor who can
+    // press esc is a human at the pane, and the entire point of a lane is that
+    // nobody is at the pane. Measured cost of the pure refusal, from
+    // `_amux_request_log`: the `amux` lane sat unreachable for 5.04h across 12
+    // sends from 3 distinct clients (2026-08-10 06:35:49 -> 11:37:58) with
+    // steering queued behind it and 22 todo cards untouched.
+    //
+    // ESCAPE IS THE ONLY KEY PRESSED. The footer also offers `enter` (opens the
+    // SELECTED row — a DIFFERENT conversation if the cursor has moved) and
+    // `ctrl+x` (deletes all). Escape returns to this conversation, and on an
+    // idle lane with an empty composer it is a no-op. That no-op is what makes
+    // it safe when the DETECTOR is wrong, which it demonstrably is: AMUX-2680
+    // had the headline matching a lane's own prose for 6.6h, and tmux rewrap
+    // can still land that phrase at a line start.
+    //
+    // ...but the no-op holds ONLY while the lane is idle. Escape mid-turn
+    // INTERRUPTS Claude Code, so pressing it on a false positive would upgrade
+    // "unreachable" to "work destroyed" — the detector paying its cost in the
+    // same resource as the fault (ethos rule 7). So the keypress is gated on
+    // the frame NOT reading active, and a generating lane is refused instead.
+    //
+    // THE VERDICT IS A POSITIVE RE-READ, NEVER A TIMER: after the keypress we
+    // re-capture and require `composer_state` to have LEFT BackgroundManager.
+    // If it has not, we refuse exactly as before — so this can only ever add a
+    // delivery that used to fail, never lose one that used to work.
     if !out_st.is_empty() && composer_state(&out_st) == ComposerState::BackgroundManager {
-        return (
-            false,
-            "session is in the background-conversation view (its composer starts a new task, \
-             not a message to this session) — press esc or enter in the pane to collapse it"
-                .into(),
-        );
+        let generating = detect_claude_status(&out_st) == "active";
+        let mut collapsed = false;
+        if bg_view_collapse_enabled() && !generating {
+            send_key(name, "Escape").await;
+            sleep_ms(400).await;
+            let re = tmux_capture(name, 15).await;
+            if !re.is_empty() && composer_state(&re) != ComposerState::BackgroundManager {
+                collapsed = true;
+                out_st = re;
+            }
+        }
+        if !collapsed {
+            return (false, bg_view_refusal(generating));
+        }
     }
     let mut needs_wake = false;
     if !out_st.is_empty() && at_shell_prompt(&strip_ansi(&out_st)) {
@@ -6906,24 +7062,15 @@ async fn post_dispatch(
                 return jresp(StatusCode::FORBIDDEN, json!({"error": "cannot archive pinned session — unpin first"}));
             }
             let (ok, msg) = archive_session(state, name).await;
-            jresp(
-                if ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR },
-                json!({"ok": ok, "message": msg}),
-            )
+            verb_resp(ok, msg)
         }
         "wake" => {
             let (ok, msg) = wake_session(state, name).await;
-            jresp(
-                if ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR },
-                json!({"ok": ok, "message": msg}),
-            )
+            verb_resp(ok, msg)
         }
         "reset" => {
             let (ok, msg) = reset_session(state, name).await;
-            jresp(
-                if ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR },
-                json!({"ok": ok, "message": msg}),
-            )
+            verb_resp(ok, msg)
         }
         "commit-report" => {
             // Attach the commit to the in-flight card (py:76233-76246). The
@@ -7166,14 +7313,20 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     } else if !msg_id.is_empty() {
         send_dedup_forget(state, name, &msg_id).await;
     }
-    let code = if ok {
-        StatusCode::OK
-    } else if msg == "not running" {
-        StatusCode::CONFLICT
+    // A REFUSAL IS NOT A SERVER ERROR (AMUX-2681). This used to be
+    // `if msg == "not running" { 409 } else { 500 }`, so every other honest
+    // decline — resume picker, selector, mid-turn, archived, blocked, and the
+    // background-conversation view — shipped as 500. `fix` is the next step,
+    // so the SPA can render an action instead of a stack-trace shape.
+    let (code, fix) = if ok {
+        (StatusCode::OK, None)
     } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+        send_failure_status(&msg)
     };
     let mut resp = json!({"ok": ok, "message": msg});
+    if let Some(fix) = fix {
+        resp["fix"] = json!(fix);
+    }
     if ok && msg.contains("at a selector") {
         resp["held_at_selector"] = json!(true);
     }
@@ -10656,5 +10809,213 @@ mod pipe_reconcile_tests {
     fn an_already_piped_pane_is_left_alone() {
         assert!(!should_rearm_pipe(1, 1));
         assert!(!should_rearm_pipe(1, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AMUX-2681 — a refusal is not a server error.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod refusal_status_tests {
+    use super::*;
+
+    /// THE incident, pinned: 15 of the 19 errors in the 6h window on
+    /// 2026-08-10 were this one refusal shipping as HTTP 500 — `amux`
+    /// unreachable 5.04h across 12 sends from 3 distinct clients, and the
+    /// dashboard showing a server error for a lane amux had correctly
+    /// declined to type into. Fails against the pre-fix code, which mapped
+    /// everything except the literal "not running" to 500.
+    #[test]
+    fn background_conversation_refusal_is_409_not_500() {
+        for generating in [true, false] {
+            let msg = bg_view_refusal(generating);
+            let (code, fix) = send_failure_status(&msg);
+            assert_eq!(code, StatusCode::CONFLICT, "refusal must be 409: {msg}");
+            assert!(fix.is_some(), "a refusal must name a next step: {msg}");
+            assert!(
+                msg.starts_with(BG_VIEW_REFUSAL_PREFIX),
+                "every variant keeps the classified prefix: {msg}"
+            );
+        }
+        // The two variants must be DISTINGUISHABLE — "wait for the boundary"
+        // and "go look at the pane" are different next steps, and a caller
+        // that cannot tell them apart cannot act on either.
+        assert_ne!(bg_view_refusal(true), bg_view_refusal(false));
+    }
+
+    /// Every other honest decline that used to wear a 500.
+    #[test]
+    fn state_refusals_are_conflicts() {
+        for msg in [
+            "not running",
+            "session is in resume picker",
+            "session at a selector — retry at next idle boundary",
+            "session started generating — retry at next turn boundary",
+            "session is blocked; remove it from blocked-sessions.txt first",
+            "session is archived; wake it first",
+            "terminal client attached — its size wins",
+            "no agents panel on screen",
+        ] {
+            let (code, fix) = send_failure_status(msg);
+            assert_eq!(code, StatusCode::CONFLICT, "{msg}");
+            assert!(fix.is_some(), "{msg} must carry a next step");
+        }
+    }
+
+    /// The non-409 cells, so "everything became a 409" cannot pass either.
+    #[test]
+    fn not_found_bad_request_and_absent_capability_keep_their_own_codes() {
+        assert_eq!(send_failure_status("session 'nope' not found").0, StatusCode::NOT_FOUND);
+        assert_eq!(send_failure_status("invalid session name").0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            send_failure_status("key 'Fkey' not in allowed set").0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send_failure_status("iTerm2-backed sessions are not supported by the rust origin yet").0,
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+
+    /// A 500 must still be reachable. If the classifier swallowed everything,
+    /// the autofix watcher would go blind — which is the same defect in the
+    /// other direction.
+    #[test]
+    fn real_failures_are_still_500() {
+        for msg in [
+            "send-keys failed",
+            "paste-buffer failed",
+            "could not stage paste buffer",
+            "tmux not found or timed out",
+            "Claude failed to start",
+            "could not write session env",
+            "auto-wake failed: tmux refused",
+            "herdr prompt failed",
+        ] {
+            let (code, fix) = send_failure_status(msg);
+            assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{msg}");
+            assert!(fix.is_none(), "an unhandled failure has no honest next step: {msg}");
+        }
+    }
+
+    /// The drift check, and the reason deriving from a string is affordable.
+    ///
+    /// Extracts every `(false, "…")` literal from THIS FILE at compile time
+    /// and requires each to be classified deliberately — as a refusal (never
+    /// 5xx) or as a hard failure (500). A refusal added later cannot land in
+    /// the default 500 bucket unnoticed, which is exactly how the
+    /// background-conversation guard became 14 of the night's 19 errors: it
+    /// was written correctly and inherited a status code nobody chose.
+    ///
+    /// This is the check that CAN fail: it is built from the shipped source,
+    /// not from a paraphrase of it, so it also fails if someone reworders an
+    /// existing literal out from under the classifier.
+    #[test]
+    fn every_send_failure_literal_is_classified() {
+        const SRC: &str = include_str!("session_verbs.rs");
+        // Built by concat! so this marker never appears literally in this
+        // file — otherwise the scan would find its own needle.
+        let marker = concat!("(false", ", \"");
+        // Literals that MUST classify as a hard failure. Everything else the
+        // scan finds must be a refusal (non-5xx). Both lists are explicit:
+        // "I did not think about it" is not a state this test has.
+        // 501, and NOT a bug: the capability is absent, not broken. Kept in
+        // its own list because the autofix watcher must never file these —
+        // same class as /api/email/search on an unconnected account.
+        let degraded: &[&str] = &["iTerm2-backed sessions are not supported by the rust origin yet"];
+        let hard: &[&str] = &[
+            "herdr prompt failed",
+            "could not stage paste buffer",
+            "paste-buffer failed",
+            "send-keys failed",
+            "timeout sending keys",
+            "tmux not found or timed out",
+            "Claude failed to start",
+            "could not write session env",
+        ];
+        let mut found = 0usize;
+        let mut at = 0usize;
+        while let Some(i) = SRC[at..].find(marker) {
+            let hit = at + i;
+            at = hit + marker.len();
+            // SKIP COMMENTS. The first run of this test failed on the doc
+            // comment above, which quotes its own needle — the "positional
+            // match landed on the fix's own comment" failure, self-inflicted
+            // within minutes of writing the rule down. That comment is left in
+            // place deliberately: it is the fixture proving this skip works.
+            let line_start = SRC[..hit].rfind('\n').map_or(0, |n| n + 1);
+            if SRC[line_start..hit].trim_start().starts_with("//") {
+                continue;
+            }
+            let rest = &SRC[at..];
+            // Read to the closing quote, honouring \" and \\ escapes.
+            let bytes = rest.as_bytes();
+            let mut j = 0usize;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b'"' => break,
+                    _ => j += 1,
+                }
+            }
+            if j >= bytes.len() {
+                continue;
+            }
+            let raw = &rest[..j];
+            // Rust's `\`-at-end-of-line continuation eats the newline and the
+            // following indentation; reproduce that so a wrapped literal
+            // compares equal to the runtime string.
+            let mut lit = String::new();
+            let mut it = raw.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    match it.peek() {
+                        Some('\n') => {
+                            it.next();
+                            while it.peek().is_some_and(|c| c.is_whitespace()) {
+                                it.next();
+                            }
+                        }
+                        Some('"') => {
+                            it.next();
+                            lit.push('"');
+                        }
+                        Some('\\') => {
+                            it.next();
+                            lit.push('\\');
+                        }
+                        _ => lit.push(c),
+                    }
+                } else {
+                    lit.push(c);
+                }
+            }
+            if lit.trim().is_empty() {
+                continue;
+            }
+            found += 1;
+            let (code, _) = send_failure_status(&lit);
+            if degraded.contains(&lit.as_str()) {
+                assert_eq!(code, StatusCode::NOT_IMPLEMENTED, "absent capability: {lit:?}");
+            } else if hard.contains(&lit.as_str()) {
+                assert_eq!(
+                    code,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "listed as a hard failure but classified {code}: {lit:?}"
+                );
+            } else {
+                assert!(
+                    !code.is_server_error(),
+                    "UNCLASSIFIED session-verb outcome {lit:?} falls through to {code}. \
+                     Classify it: add a refusal arm to send_failure_status (with a next \
+                     step), or add the literal to this test's `hard` list if a 500 is \
+                     genuinely correct."
+                );
+            }
+        }
+        // The scan itself must have found something — an extraction bug that
+        // matched nothing would pass every assertion above in silence.
+        assert!(found >= 15, "literal scan found only {found} outcomes — extraction is broken");
     }
 }
