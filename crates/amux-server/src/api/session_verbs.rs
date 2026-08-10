@@ -746,6 +746,57 @@ fn at_shell_prompt(clean_output: &str) -> bool {
 }
 
 /// py:18479 _detect_claude_status → 'active' | 'waiting' | 'idle' | ''.
+/// Is this pane sitting on Claude Code's RATE-LIMIT menu?
+///
+/// ```text
+/// What do you want to do?
+/// > 1. Stop and wait for limit to reset
+///   2. Switch to usage credits
+///   3. Switch to Team plan
+/// ```
+///
+/// THE DISTINCTION THIS EXISTS TO DRAW (AMUX-2820). `detect_claude_status`
+/// returns "waiting" for this menu and for an AskUserQuestion picker alike, and
+/// everything downstream then refuses to type — correctly for the second and
+/// catastrophically for the first:
+///
+///   - An AskUserQuestion picker is A QUESTION FOR THE USER. Typing into it, or
+///     the picker-closing Escape, REJECTS a pending tool call. It must wait, and
+///     the deadline must not override it (the 2026-07-15 kill).
+///   - A rate-limit menu is INFRASTRUCTURE. Nobody is being asked anything a
+///     model or a human needs to weigh; option 1 is "wait", which is what the
+///     lane would do anyway. amux owns this one (ethos D2 — the POLICY is the
+///     human's, set once via `rate_limit_action`, not a decision per occurrence).
+///
+/// Conflating them is a PERMANENT DEADLOCK, observed live on mvs-infra
+/// 2026-08-10: two of Ethan's messages queued 400s+ behind a menu that nothing
+/// would ever answer, because the send path parked on the selector and no other
+/// code path dismisses one. Pressing Enter in the dashboard just queued another
+/// message behind the same menu.
+///
+/// Matched on all three option lines plus the question, not on any one of them:
+/// "Stop and wait for limit to reset" alone could appear in a transcript being
+/// discussed, and this decides whether amux presses a key.
+pub(crate) fn is_rate_limit_menu(raw: &str) -> bool {
+    let clean = strip_ansi(raw).to_lowercase();
+    clean.contains("what do you want to do?")
+        && clean.contains("stop and wait for limit to reset")
+        && clean.contains("switch to usage credits")
+}
+
+/// The policy for what amux does with a rate-limit menu (ethos D2).
+///
+/// `wait` (default) presses 1. `off` leaves the menu for a human and reports it.
+/// Deliberately a POLICY set once, not a prompt per occurrence: a human pressing
+/// 1 on sixty lanes is not a workflow, and the answer is the same every time.
+pub(crate) fn rate_limit_action() -> String {
+    std::env::var("AMUX_RATE_LIMIT_ACTION")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "wait".into())
+}
+
 pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if raw_output.is_empty() {
         return String::new();
@@ -3272,12 +3323,43 @@ async fn send_text_inner(
             return (true, "no suggestion found".into());
         }
     }
-    let (mut generating, waiting) = if hook_confirmed_idle {
+    let (mut generating, mut waiting) = if hook_confirmed_idle {
         (false, false)
     } else {
         let status = detect_claude_status(&tmux_capture(name, 12).await);
         (status == "active", status == "waiting")
     };
+    // A RATE-LIMIT MENU IS NOT A QUESTION FOR THE USER — answer it and carry on
+    // (AMUX-2820). Without this the lane deadlocks: the send parks on the
+    // selector, nothing else dismisses a menu, and every later send queues
+    // behind the same one. Live specimen: mvs-infra held two messages for 400s+
+    // and pressing Enter in the dashboard only added a third.
+    if waiting && rate_limit_action() != "off" {
+        let pane = tmux_capture(name, 30).await;
+        if is_rate_limit_menu(&pane) {
+            // Enter selects the highlighted default, option 1 "stop and wait".
+            // NOT 2 or 3 — those spend money, and choosing to spend is a human's
+            // call however cheap it looks from here (ethos rule 8).
+            let (ok, msg) = send_keys_op(name, "Enter").await;
+            tracing::warn!(
+                session = %name, ok, detail = %msg,
+                "answered the rate-limit menu with 'stop and wait' — amux owns this prompt (D2)"
+            );
+            emit_event(
+                state,
+                name,
+                "session.rate_limit_answered",
+                Some(json!({"choice": "stop-and-wait", "ok": ok, "detail": msg})),
+                None,
+                "rate-limit",
+            )
+            .await;
+            if ok {
+                // The menu is gone; this send is no longer facing a selector.
+                waiting = false;
+            }
+        }
+    }
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
@@ -11264,6 +11346,60 @@ mod steer_max_age_tests {
         // ...but it does not exempt the lane from the deadline either, or a
         // hookless lane would starve exactly like the reported ones.
         assert_eq!(steer_decide(None, None, MAX + 1.0, MAX), SteerDelivery::OverdueMidTurn);
+    }
+
+    /// THE DISTINCTION, IN BOTH DIRECTIONS. Getting it wrong one way deadlocks a
+    /// lane forever; getting it wrong the other way re-enables the 2026-07-15
+    /// AskUserQuestion kill, where typing at a picker REJECTS a pending tool.
+    #[test]
+    fn a_rate_limit_menu_is_answered_but_a_real_question_is_never_touched() {
+        // The live pane from mvs-infra, 2026-08-10.
+        let limit_menu = "\
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+
+   Enter to confirm · Esc to cancel";
+        assert!(is_rate_limit_menu(limit_menu), "the live specimen must match");
+        // It is still a selector to the status detector — that is the point:
+        // both classifications are true, and only this one licenses a keypress.
+        assert_eq!(detect_claude_status(limit_menu), "waiting");
+
+        // AN ACTUAL QUESTION FOR THE USER. Same shape, same "Enter to confirm",
+        // and amux must NOT press anything: the answer is the user's and the
+        // picker-closing Escape would reject the pending tool.
+        let ask = "\
+   Which database should I migrate?
+
+   ❯ 1. production
+     2. staging
+     3. Cancel
+
+   Enter to confirm · Esc to cancel";
+        assert!(!is_rate_limit_menu(ask), "an AskUserQuestion must never be auto-answered");
+        assert_eq!(detect_claude_status(ask), "waiting");
+
+        // A near miss that must not fire: the phrase quoted in ordinary output,
+        // e.g. a transcript being discussed. This decides whether amux presses a
+        // key, so one matching line is not enough.
+        let prose = "I hit the limit and chose 'Stop and wait for limit to reset' yesterday.";
+        assert!(!is_rate_limit_menu(prose));
+
+        // Case and ANSI must not defeat it — the real pane is full of colour.
+        let ansi = "\x1b[1m   What do you want to do?\x1b[0m\n ❯ 1. STOP AND WAIT FOR LIMIT TO RESET\n 2. Switch to Usage Credits";
+        assert!(is_rate_limit_menu(ansi));
+    }
+
+    /// The policy is the human's, set once (D2). Default is `wait` — press 1 —
+    /// because a human pressing 1 on sixty lanes is not a workflow and the
+    /// answer is the same every time.
+    #[test]
+    fn the_rate_limit_policy_defaults_to_wait_and_can_be_turned_off() {
+        assert_eq!(rate_limit_action(), "wait");
+        // `off` is the honest opt-out: detect it, report it, touch nothing.
+        assert_ne!("off", rate_limit_action(), "default must not be off");
     }
 
     #[test]
