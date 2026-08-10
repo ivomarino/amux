@@ -7186,6 +7186,31 @@ async fn steer_mutate(
         // worker at all (false, and false for as long as anyone cared to wait:
         // 15 hours, in the incident this card was cut from).
         let blocked = lane_block_reason(name).await;
+        // ARCHIVED IS REFUSED, NOT QUEUED (AMUX-2796). The other blocked
+        // reasons are temporary — a stopped lane is routinely started minutes
+        // later, so storing the message and telling the truth about it beats
+        // dropping it. `archived` is not temporary: nothing wakes an archived
+        // lane, un-archiving is a human's call (ethos rule 8), and the row
+        // becomes immortal. Two were sitting ~16h old when this was found, each
+        // regenerating stall warnings, autofix cards and `steering.stalled`
+        // events that could never clear.
+        //
+        // `auto_deliver` has always refused archived lanes; this path queued
+        // them. Two spellings of one rule, and the queue got the wrong one.
+        if blocked == Some("archived") {
+            return jresp(
+                StatusCode::CONFLICT,
+                json!({
+                    "ok": false,
+                    "error": block_reason_explain("archived", name),
+                    "blocked_reason": "archived",
+                    "deliverable": false,
+                    "hint": "Un-archive the worker first if this message should reach it — \
+                             that is a human's call, not something a send should do implicitly. \
+                             Nothing was queued, so nothing will sit undelivered.",
+                }),
+            );
+        }
         let msg_id = steer_enqueue(state, name, &text, "", &hdr_worker(headers)).await;
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -11294,6 +11319,27 @@ mod steer_max_age_tests {
     /// The reason code is the actionable half, so it must survive into the text
     /// a human reads. A message that says only "queued" is what produced the
     /// original wrong diagnosis ("i think the amux session is stuck").
+    /// AMUX-2796: the two blocked reasons that look alike and are not.
+    /// `not-running` is temporary — store the message, tell the truth about it.
+    /// `archived` is permanent without a human, so storing it manufactures
+    /// immortal mail: two rows were ~16h old, each regenerating stall warnings
+    /// and autofix cards that could never clear.
+    #[test]
+    fn archived_is_the_one_blocked_reason_that_must_not_be_queued() {
+        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, true), Some("archived"));
+        // The refusal has to publish what to do, or the sender hand-rolls
+        // something worse to get past it (the AMUX-2325 shape).
+        let msg = block_reason_explain("archived", "old-lane");
+        assert!(msg.contains("archived") && msg.contains("old-lane"), "{msg}");
+        assert!(msg.contains("human"), "un-archiving is a human's call: {msg}");
+        // The temporary ones must NOT share the refusal path — dropping a
+        // message to a lane that starts two minutes later is real data loss.
+        for r in ["not-running", "no-env-file"] {
+            assert_ne!(r, "archived", "only archived is refused at send");
+        }
+    }
+
     #[test]
     fn the_sender_is_told_what_will_happen_not_just_what_is_wrong() {
         for reason in ["no-env-file", "not-running", "archived"] {

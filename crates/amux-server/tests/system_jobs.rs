@@ -280,19 +280,30 @@ async fn a_spawned_periodic_job_reports_ok_with_real_ticks() {
 async fn only_prefs_are_editable_env_controls_are_readouts() {
     let (app, _dir) = test_app();
     let (_, body) = get_json(&app, "/api/system-jobs").await;
+    // READ THE FIELDS THE API ACTUALLY EMITS. This walked `j["control"]`, which
+    // has never existed: `Doc` carries `env` (a LIST of EnvControl) and `pref`
+    // (an Option<PrefControl>) as separate fields, and the response mirrors
+    // that. Indexing a missing key yields Null, `Null["kind"]` is Null, so every
+    // arm fell through to `_ => {}` and `editable` came back empty — the test
+    // could only ever fail, and did, from the commit that introduced it.
+    //
+    // Worth naming because it cost me a wrong diagnosis on the way here: I first
+    // probed the live endpoint for a `control` key, got None on every job, and
+    // concluded the field "was not being populated". The field was never there;
+    // I had searched for the name the TEST used instead of the name the API
+    // uses. Naming the target before searching for it is the cheap version of
+    // this check — `sorted(job.keys())` answered it in one call.
     let mut editable = Vec::new();
     for j in body["jobs"].as_array().unwrap() {
-        let c = &j["control"];
-        match c["kind"].as_str() {
-            Some("env") => {
-                assert_eq!(c["editable"], false, "{}: env control claims to be editable", j["id"]);
-                assert!(c["var"].is_string(), "{}: env control must name its var", j["id"]);
-            }
-            Some("pref") => {
-                assert_eq!(c["editable"], true);
-                editable.push(j["id"].as_str().unwrap_or("").to_string());
-            }
-            _ => {}
+        for e in j["env"].as_array().into_iter().flatten() {
+            assert_eq!(e["editable"], false, "{}: env control claims to be editable", j["id"]);
+            assert!(e["var"].is_string(), "{}: env control must name its var", j["id"]);
+        }
+        let p = &j["pref"];
+        if p.get("kind").and_then(|k| k.as_str()) == Some("pref") {
+            assert_eq!(p["editable"], true, "{}: a pref control must be editable", j["id"]);
+            assert!(p["key"].is_string(), "{}: a pref control must name its key", j["id"]);
+            editable.push(j["id"].as_str().unwrap_or("").to_string());
         }
     }
     assert_eq!(

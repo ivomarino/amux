@@ -102,10 +102,24 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
     assert!(!proxied, "/api/scope must be NATIVE");
     let v: Value = serde_json::from_slice(body.as_bytes()).unwrap();
     assert_eq!(v["level"], "global");
+    // ASSERT THE KEYS, NOT THE COUNT. This was `Some(5)` with the message "all
+    // five capabilities reported", and adding the `skin` descriptor turned it
+    // red with `left: Some(6) right: Some(5)` — a diff that says a number
+    // changed and nothing about WHICH capability appeared or vanished. A count
+    // also cannot distinguish "skin was added" from "gates was dropped and
+    // something else added", which is the failure worth catching: `/api/scope`
+    // is the uniform per-scope contract, so a capability silently disappearing
+    // from it is a feature going missing fleet-wide.
+    let keys: Vec<&str> = v["capabilities"]
+        .as_array()
+        .expect("capabilities must be an array")
+        .iter()
+        .map(|c| c["key"].as_str().unwrap_or("<missing key>"))
+        .collect();
     assert_eq!(
-        v["capabilities"].as_array().map(|a| a.len()),
-        Some(5),
-        "all five capabilities reported: {body}"
+        keys,
+        vec!["memory", "rules", "env", "gates", "skin", "status_mode"],
+        "the scope contract's capabilities, in publication order: {body}"
     );
     // The hermetic fleet (w1: alpha, beta) shows through the global read.
     assert_eq!(v["groups"], serde_json::json!(["alpha", "beta"]));

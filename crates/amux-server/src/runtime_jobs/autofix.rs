@@ -883,17 +883,53 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
     // (b) A steering queue that is not draining.
     let stale_s = steering_stale_min() * 60.0;
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT session, COUNT(*), MIN(queued_at) FROM steering_queue GROUP BY session",
+        "SELECT session, COUNT(*), MIN(queued_at), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
+         FROM steering_queue GROUP BY session",
     ) {
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         });
         if let Ok(rows) = rows {
-            for (session, n, oldest) in rows.flatten() {
+            for (session, n, oldest, senders) in rows.flatten() {
                 let age = now - oldest;
                 if age < stale_s {
                     continue;
                 }
+                // ROUTE TO THE SENDER, NEVER THE STALLED LANE (AMUX-2796).
+                //
+                // This used to set `owner: Some(session)` — the lane whose queue
+                // is stuck. Live proof of why that is wrong: AA-1 was assigned to
+                // `amux-agent`, a lane with NO ENV FILE. It cannot receive a
+                // message, cannot be woken, and cannot work a board card. The
+                // notice landed in exactly the silence it was reporting.
+                //
+                // The card's own verdict text names the injured party in the
+                // same breath — "every one of these was reported to its SENDER
+                // as accepted" — and then addressed the card away from them.
+                //
+                // `steering_queue.sender` (AMUX-2785) carries the
+                // server-verified X-Amux-Session stamp, so the right owner is
+                // now knowable. Empty sender means an automated producer
+                // (commit-nudge / board-drive / sched:<id>), whose owner is
+                // whoever owns that producer — not the dead lane. Several
+                // distinct senders means no single owner, so it stays
+                // unassigned with all of them named: UNASSIGNED BEATS
+                // MISASSIGNED, because an unassigned card gets triaged while a
+                // misassigned one is somebody else's problem forever.
+                let senders: Vec<&str> = senders
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty() && *x != session)
+                    .collect();
+                let owner = match senders.as_slice() {
+                    [one] => Some((*one).to_string()),
+                    _ => None,
+                };
                 out.push(Finding {
                     kind: DetectorKind::SilentSubsystem,
                     signature: format!("silent|steering|{session}"),
@@ -908,13 +944,40 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
                         ("queued".into(), n.to_string()),
                         ("oldest_queued_at".into(), rl::local_when(oldest)),
                         ("threshold_min".into(), format!("{:.0}", steering_stale_min())),
+                        // Say WHY this card is not addressed to the stalled lane,
+                        // or the next reader "corrects" it straight back — the
+                        // lane's name is in the title and assigning it there
+                        // looks obviously right until you notice the lane cannot
+                        // receive anything, which is the whole defect.
+                        ("senders".into(), if senders.is_empty() {
+                            format!(
+                                "none recorded — these were queued by an automated producer \
+                                 (commit-nudge / board-drive / sched:<id>), or before senders were \
+                                 tracked. Deliberately UNASSIGNED rather than assigned to \
+                                 '{session}': that lane may be unable to receive anything, which is \
+                                 what this card reports."
+                            )
+                        } else {
+                            format!(
+                                "{} — this card is addressed to the SENDER, never to '{session}'. \
+                                 The sender holds the false belief (\"I sent it\") and is the only \
+                                 party who can act; the stalled lane may be unable to receive a \
+                                 message at all, in which case a card assigned to it lands in the \
+                                 same silence it reports.",
+                                senders.join(", ")
+                            )
+                        }),
+                        ("is_the_lane_reachable".into(),
+                         "GET /api/debug/steering reports `blocked_reason` per lane live — \
+                          no-env-file / not-running / archived are each actionable and completely \
+                          different from merely busy. Read it before assuming the lane is hung."
+                            .to_string()),
                     ],
                     recheck: format!(
-                        "sqlite3 ~/.amux/amux.db \"SELECT id, datetime(queued_at,'unixepoch',\
-                         'localtime'), substr(text,1,80) FROM steering_queue WHERE \
-                         session='{session}' ORDER BY queued_at;\""
+                        "curl -sk \"$AMUX_URL/api/debug/steering\" | python3 -c \"import json,sys; \
+                         print([l for l in json.load(sys.stdin)['lanes'] if l['session']=='{session}'])\""
                     ),
-                    owner: Some(session),
+                    owner,
                     count: n as u64,
                     last_ts: now,
                 });
