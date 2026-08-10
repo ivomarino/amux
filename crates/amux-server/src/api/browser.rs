@@ -161,12 +161,19 @@ struct StartBody {
     profile: String,
     #[serde(default)]
     url: String,
+    /// Same resolution as every driver verb. `start` needs it for the reason
+    /// AC-336 exists: the tab Chrome opens for `url` has to be OWNED by the
+    /// caller, or a peer adopts it.
+    #[serde(default)]
+    session: Option<String>,
 }
 
-async fn start(body: Option<Json<StartBody>>) -> Response {
+// `HeaderMap` before `Json` — axum requires the body extractor last.
+async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     let Json(body) = body.unwrap_or_default();
     let home = chrome::amux_home();
-    match chrome::start(&home, &body.profile, &body.url).await {
+    let session = resolve_session(body.session.as_deref(), &headers);
+    match chrome::start(&home, &body.profile, &body.url, &session).await {
         Ok(info) => {
             let mut v = serde_json::to_value(&info).unwrap_or_else(|_| json!({}));
             v["ok"] = json!(true);
@@ -236,9 +243,11 @@ struct CreateBody {
     name: String,
     #[serde(default)]
     url: String,
+    #[serde(default)]
+    session: Option<String>,
 }
 
-async fn profile_create(Json(body): Json<CreateBody>) -> Response {
+async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Response {
     let name = body.name.trim().to_string();
     if name.is_empty()
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -264,7 +273,8 @@ async fn profile_create(Json(body): Json<CreateBody>) -> Response {
     let mut launched = false;
     let mut launch_error = Value::Null;
     if !body.url.trim().is_empty() {
-        match chrome::start(&home, &name, body.url.trim()).await {
+        let session = resolve_session(body.session.as_deref(), &headers);
+        match chrome::start(&home, &name, body.url.trim(), &session).await {
             Ok(_) => launched = true,
             Err(e) => launch_error = json!(e.to_string()),
         }
