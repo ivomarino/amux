@@ -2621,6 +2621,21 @@ class Handler(BaseHTTPRequestHandler):
             # not belong to so the UI can tell "mine" from "god mode", and
             # is_personal stays keyed to the user's OWN id so a customer's org is
             # never mislabelled as theirs.
+            # ORDERING IS LOAD-BEARING FOR ADMINS, in a way it never was for a
+            # normal user with two or three orgs. Widening the list turned a
+            # 1-row switcher into a 62-row one, and `ORDER BY created_at` put
+            # the three customer environments at positions ~55-60, below 59
+            # auto-created personal workspaces named by signup email. Every one
+            # of those is a real org, so hiding them would be deciding for the
+            # human what god mode may see; ordering them is not. Nothing is
+            # filtered out — the customer envs are simply first.
+            #
+            # `o.id = o.owner_id` is exactly the personal-org test the rest of
+            # this file uses (see `return user_id  # personal org`): a personal
+            # org's id IS its owner's user id. It holds precisely here — 3 rows
+            # with id != owner_id, and they are the 3 demo envs, nothing else.
+            # So the sort is: my own workspace, then real named workspaces
+            # oldest-first, then everybody's personal orgs.
             if is_admin:
                 rows = db.execute(
                     "SELECT o.id, o.name, o.slug, o.owner_id, o.plan, "
@@ -2628,8 +2643,8 @@ class Handler(BaseHTTPRequestHandler):
                     "FROM orgs o "
                     "LEFT JOIN org_memberships m "
                     "       ON m.org_id = o.id AND m.user_id = ? "
-                    "ORDER BY o.created_at",
-                    (user_id,)
+                    "ORDER BY (o.id != ?), (o.id = o.owner_id), o.created_at",
+                    (user_id, user_id)
                 ).fetchall()
             else:
                 rows = db.execute(
