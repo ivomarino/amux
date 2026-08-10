@@ -70,7 +70,8 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "quarantined": count(&conn, "SELECT COUNT(*) FROM issues WHERE deleted IS NULL AND status = 'quarantined'"),
         },
         "leases": {
-            "live": count(&conn, "SELECT COUNT(*) FROM _amux_leases"),
+            "live": count(&conn, "SELECT COUNT(*) FROM _amux_leases WHERE expires_at > datetime('now')"),
+            "total": count(&conn, "SELECT COUNT(*) FROM _amux_leases"),
         },
         "turns_recorded": count(&conn, "SELECT COUNT(*) FROM _amux_turns"),
         "events_journal": count(&conn, "SELECT COUNT(*) FROM _amux_state_events"),
