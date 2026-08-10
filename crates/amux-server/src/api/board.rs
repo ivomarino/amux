@@ -1151,7 +1151,10 @@ const PATCH_WRITABLE: [&str; 17] = [
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
-const PATCH_CONTROL: [&str; 7] = [
+/// `desc_append` modifies how `desc` is written rather than naming a column,
+/// so it is control, not writable — but it MUST be listed, or it lands in
+/// `ignored_fields` and the append silently does nothing (AC-323).
+const PATCH_CONTROL: [&str; 8] = [
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -1159,6 +1162,7 @@ const PATCH_CONTROL: [&str; 7] = [
     "reason",
     "authorized_by",
     "override_doing",
+    "desc_append",
 ];
 
 enum PatchOut {
@@ -1358,7 +1362,42 @@ pub async fn patch_item(
                     changed.push("title".into());
                 }
             }
-            if let Some(d) = body_str(&map, "desc") {
+            // `desc_append` appends instead of the destructive replace (Python
+            // parity, amux-server.py:69887). The cutover dropped it, so every
+            // `amux board progress` since has printed "progress noted" and
+            // written NOTHING — AC-323, and the sanctioned way CLAUDE.md tells
+            // sessions to record an outcome before a gate transition.
+            //
+            // Python's own comment records the harsher version of this bug: the
+            // field was accepted, ignored, and the destructive replace ran
+            // anyway — ~20 silent wipes in one day, nine cards rebuilt from
+            // /history. Both natural shapes work, so the obvious guess is right:
+            //   {desc_append: "text"}             -> old + "\n" + text
+            //   {desc: "text", desc_append: true} -> old + "\n" + text
+            //   {desc_append: false}              -> plain replace semantics
+            let desc_effective: Option<String> = match map.get("desc_append") {
+                None | Some(Value::Bool(false)) => body_str(&map, "desc"),
+                Some(v) => {
+                    let text = match v {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Bool(true) => body_str(&map, "desc"),
+                        _ => None,
+                    };
+                    match text {
+                        Some(t) if !t.is_empty() => {
+                            let old = next.desc.trim_end();
+                            Some(if old.is_empty() {
+                                t.trim().to_string()
+                            } else {
+                                format!("{old}\n{t}").trim().to_string()
+                            })
+                        }
+                        // Empty/non-string append is a no-op, NOT a wipe.
+                        _ => body_str(&map, "desc"),
+                    }
+                }
+            };
+            if let Some(d) = desc_effective {
                 if d != next.desc {
                     next.desc = d;
                     changed.push("desc".into());

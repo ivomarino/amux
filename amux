@@ -1672,7 +1672,30 @@ Supported:  amux board progress $id --stdin <<'EOF'   (heredoc; backticks stay l
         -H 'Content-Type: application/json' \
         -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
         -d "{\"desc_append\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$msg")}" \
-        "$AMUX_API/api/board/$id" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'],'— progress noted')" 2>/dev/null
+        "$AMUX_API/api/board/$id" | python3 -c "
+import sys, json
+# CONFIRM AT THE FIELD, NOT AT THE RESPONSE SHAPE (AC-323). This printed
+# 'progress noted' whenever the reply merely CONTAINED an id — so when the
+# rust cutover dropped desc_append, every progress note for weeks was
+# reported written and was not. The server names unapplied fields in
+# ignored_fields precisely so a caller can tell; not reading it is what
+# turned a recoverable server gap into a silent one.
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('progress NOT recorded: server sent no JSON', file=sys.stderr); sys.exit(1)
+if d.get('error') or d.get('blocked'):
+    print('progress NOT recorded: %s' % (d.get('error') or 'blocked'), file=sys.stderr); sys.exit(1)
+ign = d.get('ignored_fields') or []
+if 'desc_append' in ign:
+    print('progress NOT recorded: this server ignored desc_append (AC-323).\n'
+          '  Your text was NOT saved. Do not retry with {\"desc\":...} — that REPLACES\n'
+          '  the card body and destroys whatever is there (MC-1219).', file=sys.stderr)
+    sys.exit(1)
+if 'id' not in d:
+    print('progress NOT recorded: unexpected response %s' % str(d)[:200], file=sys.stderr); sys.exit(1)
+print(d['id'], '— progress noted')
+"
       # Check if task has a gh: tag — if so, post comment to GH issue
       local task_json
       # Point read (AMUX-2223). This pulled the ENTIRE board — 4.7MB across

@@ -1234,3 +1234,85 @@ async fn a_user_column_with_a_gate_enforces_it() {
         "the ack must be recorded on the card: {v}"
     );
 }
+
+// AC-323: `desc_append` must APPEND, and must never be reported ignored.
+//
+// The cutover dropped the field. The server correctly listed it in
+// `ignored_fields`, but `amux board progress` only checked that the reply had
+// an `id`, so it printed "progress noted" and wrote nothing — for weeks, on the
+// verb CLAUDE.md tells sessions to use to record an outcome BEFORE a gate
+// transition. Two outcome records were lost to it in the session that found it.
+//
+// Python's own comment (amux-server.py:69887) records the harsher earlier form:
+// accepted, ignored, and the destructive replace ran anyway — ~20 silent wipes
+// in one day. Hence the wipe assertions below, not just the append ones.
+#[tokio::test]
+async fn desc_append_appends_and_is_never_reported_ignored() {
+    let (app, _dir) = app();
+    let v = create(&app, json!({ "title": "Outcome", "desc": "original body" })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // {desc_append: "text"} -> old + "\n" + text
+    let (_, _, r) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc_append": "first note" })),
+    )
+    .await;
+    let ignored = r["ignored_fields"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !ignored.iter().any(|f| f == "desc_append"),
+        "desc_append must be honoured, not reported ignored; got {ignored:?}"
+    );
+
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(
+        d["desc"].as_str().unwrap(),
+        "original body\nfirst note",
+        "append must PRESERVE the prior body"
+    );
+
+    // {desc: "text", desc_append: true} -> the same append
+    send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc": "second note", "desc_append": true })),
+    )
+    .await;
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(
+        d["desc"].as_str().unwrap(),
+        "original body\nfirst note\nsecond note"
+    );
+
+    // An empty append is a NO-OP, never a wipe. This is the assertion that
+    // would have caught the ~20 silent wipes: the dangerous failure is not
+    // "append did nothing", it is "append replaced".
+    send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc_append": "" })),
+    )
+    .await;
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(
+        d["desc"].as_str().unwrap(),
+        "original body\nfirst note\nsecond note",
+        "an empty append must not erase the body"
+    );
+
+    // {desc_append: false} is an explicit opt-OUT: plain replace semantics.
+    // Without this the escape from append-mode would not exist.
+    send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc": "replaced", "desc_append": false })),
+    )
+    .await;
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["desc"].as_str().unwrap(), "replaced");
+}
