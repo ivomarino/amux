@@ -1823,7 +1823,7 @@ impl Delivery {
 
 /// py:8676 _cmd_hist_record — Messages history, origin-tagged, pruned.
 async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &str, origin: &str) {
-    cmd_hist_record_full(state, session, text, ctype, origin, Some(Delivery::Direct), None).await
+    cmd_hist_record_full(state, session, text, ctype, origin, DeliveryMeta::direct()).await
 }
 
 /// A scheduled command that was DELIVERED (py parity: origin = the schedule's
@@ -1836,21 +1836,46 @@ pub(crate) async fn cmd_hist_record_schedule(
     text: &str,
     origin: &str,
 ) {
-    cmd_hist_record_full(state, session, text, "schedule", origin, Some(Delivery::Direct), None).await
+    cmd_hist_record_full(state, session, text, "schedule", origin, DeliveryMeta::direct()).await
 }
 
 /// The full recorder. `queued_at` is the moment the message entered the
 /// steering queue (`None` for anything not queued), so the wait a message
 /// endured is answerable from the row the Messages tab already reads instead of
 /// requiring a join against `steering_history` that nothing performs.
+/// How a message reached a lane, and whether it was ever seen to submit.
+///
+/// One value rather than three parameters: they are written together, read
+/// together, and are meaningless apart — `queued_at` without `delivery` cannot
+/// say what it timed. (It also keeps the recorder under clippy's argument
+/// limit, which is the same argument stated as a lint.)
+#[derive(Default, Clone, Copy)]
+pub(crate) struct DeliveryMeta<'a> {
+    pub delivery: Option<Delivery>,
+    pub queued_at_ms: Option<i64>,
+    /// AMUX-2643. None means "not verified", NEVER "failed" — the queued path
+    /// has submitted nothing yet, and the deliverer stamps a verdict when it
+    /// lands. Inventing one here would be the mislabelling 0014 exists to end.
+    pub submit_verdict: Option<&'a str>,
+}
+
+impl DeliveryMeta<'_> {
+    /// A send handed straight to a live lane, with nothing to verify.
+    pub(crate) fn direct() -> Self {
+        DeliveryMeta {
+            delivery: Some(Delivery::Direct),
+            ..Default::default()
+        }
+    }
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
     text: &str,
     ctype: &str,
     origin: &str,
-    delivery: Option<Delivery>,
-    queued_at_ms: Option<i64>,
+    meta: DeliveryMeta<'_>,
 ) {
     if session.is_empty() || text.is_empty() {
         return;
@@ -1859,18 +1884,20 @@ pub(crate) async fn cmd_hist_record_full(
     let text = redact_secrets(text);
     let ctype = ctype.to_string();
     let origin: String = origin.chars().take(80).collect();
-    let delivery = delivery.map(|d| d.as_str().to_string());
+    let delivery = meta.delivery.map(|d| d.as_str().to_string());
+    let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
+    let queued_at_ms = meta.queued_at_ms;
     let now_ms = now_i64() * 1000;
     let _ = state
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at) \
-                 VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict) \
+                 VALUES (?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
-                    delivery, queued_at_ms, now_ms
+                    delivery, queued_at_ms, now_ms, submit_verdict
                 ],
             )?;
             conn.execute(
@@ -2306,6 +2333,43 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
 /// The (ok, message) a send reports for a given verdict. Pure, so the contract
 /// "a message we could not confirm is NEVER reported as sent" is asserted
 /// directly instead of inferred from a live pane.
+/// The durable submission verdict for a send, derived from the outcome string
+/// `send_outcome` produced (AMUX-2643).
+///
+/// Derived from the message rather than threaded as a value because
+/// `send_text` returns `(bool, String)` to a long list of callers, and widening
+/// that signature to carry a third field would touch every one of them for a
+/// column. The cost of deriving is drift: someone edits an outcome string and
+/// the mapping silently starts returning None. That is paid for by
+/// `every_send_outcome_maps_to_a_verdict`, which enumerates every
+/// (Submission, generating, retried) combination through `send_outcome` and
+/// fails if any of them stops classifying — so the strings and this function
+/// cannot separate without a red test.
+///
+/// Returns None only for inputs that are not send outcomes at all (the steering
+/// deliverer, schedules). None means "not verified", never "failed".
+pub(crate) fn submit_verdict_of(msg: &str) -> Option<&'static str> {
+    let m = msg.trim();
+    if m.starts_with("not submitted") {
+        return Some("stuck");
+    }
+    // Order matters: a retry that SUCCEEDED is still a success, but it must not
+    // be smoothed into a clean send — the dropped Enter is the countable signal
+    // that this lane's keystroke path is failing.
+    if m.contains("on retry") {
+        return Some("retried");
+    }
+    if m.contains("could not be verified") || m == "unverified" {
+        return Some("unverified");
+    }
+    if m.starts_with("sent") {
+        return Some("confirmed");
+    }
+    // "queued (steering) — ..." and friends: nothing was submitted yet, so
+    // there is no verdict to record. The deliverer stamps one when it lands.
+    None
+}
+
 pub(crate) fn send_outcome(sub: Submission, generating: bool, retried: bool) -> (bool, String) {
     match sub {
         Submission::Confirmed if generating && retried => {
@@ -7063,11 +7127,20 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         // A queued message's wait starts now; the deliverer stamps
         // delivered_at when it actually lands.
         let q_at = if deliv == Delivery::Queued { Some(now_i64() * 1000) } else { None };
+        // Same source of truth as `deliv`: the send's own outcome, recorded
+        // rather than re-inferred later. `verify_submitted` already computed
+        // this and `send_outcome` already said it — until now the response was
+        // the only place it existed, read once by the caller and then gone.
+        let meta = DeliveryMeta {
+            delivery: Some(deliv),
+            queued_at_ms: q_at,
+            submit_verdict: submit_verdict_of(&msg),
+        };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record_full(state, name, &orig_text, "user", email, Some(deliv), q_at).await;
+            cmd_hist_record_full(state, name, &orig_text, "user", email, meta).await;
         } else if !origin.is_empty() && origin != name {
-            cmd_hist_record_full(state, name, &orig_text, "session", &origin, Some(deliv), q_at).await;
+            cmd_hist_record_full(state, name, &orig_text, "session", &origin, meta).await;
         }
     } else if !msg_id.is_empty() {
         send_dedup_forget(state, name, &msg_id).await;
@@ -9882,6 +9955,55 @@ mod submission_gate_tests {
     /// A cold Claude Code that has not painted its composer yet.
     fn frame_no_ui() -> String {
         "Loading\u{2026}\n\n".into()
+    }
+
+    // DRIFT GUARD (AMUX-2643). `submit_verdict_of` reads the outcome STRING, so
+    // an innocuous wording change could silently stop classifying and every
+    // later message would record a NULL verdict — a metadata column quietly
+    // going blank, which nothing else would notice. Enumerate every
+    // (Submission, generating, retried) combination through the real
+    // send_outcome and assert each one still lands on a verdict.
+    #[test]
+    fn every_send_outcome_maps_to_a_verdict() {
+        let mut seen: std::collections::BTreeSet<&'static str> = Default::default();
+        for sub in [Submission::Confirmed, Submission::Stuck, Submission::Unverified] {
+            for generating in [false, true] {
+                for retried in [false, true] {
+                    let (ok, msg) = send_outcome(sub, generating, retried);
+                    let verdict = submit_verdict_of(&msg).unwrap_or_else(|| {
+                        panic!(
+                            "send_outcome({sub:?}, generating={generating}, retried={retried}) \
+                             produced {msg:?}, which submit_verdict_of does not classify — \
+                             the outcome strings and the classifier have drifted apart"
+                        )
+                    });
+                    seen.insert(verdict);
+                    // A verdict must never contradict the send's own ok flag.
+                    if verdict == "stuck" {
+                        assert!(!ok, "a stuck send must not report ok: {msg:?}");
+                    }
+                    if verdict == "confirmed" || verdict == "retried" {
+                        assert!(ok, "a submitted send must report ok: {msg:?}");
+                    }
+                }
+            }
+        }
+        // All four are reachable — otherwise a value exists only in the schema
+        // comment and nothing can ever produce it.
+        assert_eq!(
+            seen.iter().copied().collect::<Vec<_>>(),
+            vec!["confirmed", "retried", "stuck", "unverified"],
+            "every documented verdict must be reachable from a real send"
+        );
+    }
+
+    #[test]
+    fn a_queued_send_has_no_verdict_yet_rather_than_a_false_one() {
+        // The queued path has submitted nothing at this point. Recording
+        // "confirmed" here would be the exact mislabelling this metadata exists
+        // to end; NULL is the honest value until the deliverer stamps one.
+        assert_eq!(submit_verdict_of("queued (steering) — will deliver at the next boundary"), None);
+        assert_eq!(submit_verdict_of(""), None);
     }
 
     #[test]

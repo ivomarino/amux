@@ -6731,7 +6731,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.561';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.562';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10633,6 +10633,37 @@ function _msgDeliveryChip(e) {
        + label + '</span>';
 }
 
+// The SUBMISSION verdict (AMUX-2643, migration 0016) — a different fact from
+// the delivery chip beside it. Delivery says how the text reached the lane;
+// this says whether Claude Code was ever observed to SUBMIT it. AMUX-2629 is
+// the case that needs both: keystrokes land, the TUI never turns them into a
+// message, and the API answered 200 {"ok":true} — 13 lanes held unsubmitted
+// text for hours and the message list could not say so.
+//
+// NULL renders as NOTHING, never as a verdict. Most rows predate the column or
+// come from paths that do not verify (the steering deliverer, schedules), and
+// showing "unverified" on those would turn "we did not look" into "we looked
+// and could not confirm" — inventing a fact, which is the mislabelling this
+// metadata exists to end.
+function _msgSubmitChip(e) {
+  if (!e || typeof e === 'string') return '';
+  const v = (e.submit_verdict || '').toLowerCase();
+  if (!v) return '';
+  const spec = {
+    confirmed:  null,   // the happy path is silent; a chip on every row is noise
+    retried:    { label: 'retried',    color: '#d29922', bg: 'rgba(210,153,34,0.16)',
+                  title: 'Submitted, but only after a dropped Enter was re-sent — the keystroke path is failing on this lane' },
+    stuck:      { label: 'NOT SENT',   color: '#f85149', bg: 'rgba(248,81,73,0.18)',
+                  title: 'Text was still sitting in the composer — this message was never submitted' },
+    unverified: { label: 'unverified', color: 'var(--dim)', bg: 'rgba(139,148,158,0.12)',
+                  title: 'Keys were delivered but submission could not be confirmed (no input box drawn, or the capture failed)' },
+  }[v];
+  if (!spec) return '';
+  return '<span title="' + spec.title + '" style="display:inline-block;font-size:0.66rem;font-weight:600;'
+       + 'padding:1px 6px;border-radius:3px;background:' + spec.bg + ';color:' + spec.color + ';margin-right:6px;">'
+       + spec.label + '</span>';
+}
+
 /// Compact duration for the queue wait ("2h 6m", "45s").
 function _fmtDur(ms) {
   const s = Math.round(ms / 1000);
@@ -10784,7 +10815,7 @@ function _cmdHistItemHTML(e, ctx) {
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
-  const meta = tag + _msgDeliveryChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;

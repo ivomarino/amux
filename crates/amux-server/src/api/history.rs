@@ -297,7 +297,14 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             where_cl.push(format!("({})", ors.join(" OR ")));
         }
         let mut sql =
-            String::from("SELECT id, text, type, session, ts, origin, card_id FROM cmd_history");
+            String::from(
+            // delivery/queued_at/delivered_at are migration 0014. They are
+            // NULL on the 12.4k pre-existing rows and must reach the client AS
+            // NULL — the UI distinguishes "not recorded" from "direct", and
+            // coalescing here would assert a delivery path nobody observed.
+            "SELECT id, text, type, session, ts, origin, card_id, \
+             delivery, queued_at, delivered_at, submit_verdict FROM cmd_history",
+        );
         if !where_cl.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_cl.join(" AND "));
@@ -312,6 +319,18 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             let mtype = d.get("type").and_then(Value::as_str).unwrap_or("").to_string();
             d["kind"] = json!(msg_kind(&mtype));
             d["queued"] = json!(msg_is_queued(&mtype));
+            // `delivery` is the RECORDED fact; `queued` above is the inference
+            // from `type`. Both are sent: the inference keeps every historical
+            // row classifiable, the recorded value is authoritative when
+            // present, and the client prefers it. Where they disagree on a NEW
+            // row that is a contradiction worth seeing, not one to smooth over.
+            if let Some(q) = d.get("queued_at").and_then(Value::as_i64) {
+                if let Some(dl) = d.get("delivered_at").and_then(Value::as_i64) {
+                    if dl > q {
+                        d["queue_wait_ms"] = json!(dl - q);
+                    }
+                }
+            }
         }
         Ok(Value::Array(rows))
     })
