@@ -370,7 +370,7 @@ fn is_prompt_line(s: &str) -> bool {
 }
 
 fn is_dingbat_lead(s: &str) -> bool {
-    matches!(s.chars().next(), Some(c) if ('\u{2700}'..='\u{27bf}').contains(&c))
+    matches!(s.chars().next(), Some(c) if ('\u{2700}'..='\u{27bf}').contains(&c) || c == '\u{b7}')
 }
 
 // ---------------------------------------------------------------------------
@@ -606,10 +606,12 @@ fn claude_tui_state(clean: &str) -> TuiState {
     // Step 3: status bar secondary checks (py 18580-18589).
     if !status_bar.is_empty() {
         // "esc to interrupt" on the status bar means a turn is actively
-        // running — it only appears during generation, not at the idle
-        // prompt. This must be checked BEFORE the bypass_on fallthrough
-        // to Idle (the bar can contain both "bypass permissions on" AND
-        // "esc to interrupt" simultaneously).
+        // running. This is checked BEFORE the bypass_on fallthrough to Idle
+        // (the bar can contain both "bypass permissions on" AND "esc to
+        // interrupt" simultaneously). Claude Code always draws the empty
+        // composer (❯) during generation, so the prompt is NOT a
+        // discriminator — use the hook report (hook_confirmed_idle in
+        // send_text_inner) for that distinction.
         if status_bar.contains("esc to interrupt") {
             return TuiState::Active;
         }
@@ -1448,6 +1450,28 @@ Running 1 shell command · 5s…
     fn angle_quote_spinner_is_active() {
         // claude-fable-5 uses « as its spinner prefix instead of a dingbat.
         let frame = "« Quantumizing… (10s · ↓ 84 tokens)\n\n⏵⏵ bypass permissions on";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+    }
+
+    #[test]
+    fn middle_dot_spinner_frame_is_active() {
+        // AR-133: Claude Code cycles spinner glyphs including · (U+00B7),
+        // which is outside the U+2700-27BF dingbat range. Measured: the
+        // glyph appears in ~1/6 of frames.
+        let frame = "\u{b7} Thinking\u{2026}\n\n\u{23f5}\u{23f5} bypass permissions on";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+    }
+
+    #[test]
+    fn esc_to_interrupt_without_prompt_is_active() {
+        // No spinner visible, no prompt visible, but "esc to interrupt" on
+        // the bar — the spinner scrolled off. This is genuinely active.
+        let frame = "\
+  some output text
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents";
         let st = claude_tui_state(frame);
         assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
     }
