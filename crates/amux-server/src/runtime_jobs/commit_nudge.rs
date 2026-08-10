@@ -112,6 +112,235 @@ pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
     Some(msg)
 }
 
+
+// ---------------------------------------------------------------------------
+// The firing path
+// ---------------------------------------------------------------------------
+
+use crate::api::AppState;
+use serde_json::{json, Value};
+
+/// Once per session per UTC day. Python's own audit found 87 nudges/day against
+/// 75 human sends — each one a full-context turn into a cold-cache idle session,
+/// the single largest automated token stream. A reminder that arrives twelve
+/// times is not a reminder.
+fn cap_key(session: &str, now: f64) -> String {
+    let day = (now / 86_400.0).floor() as i64;
+    format!("commit_nudge:{session}:{day}")
+}
+
+/// `git status --porcelain` under `dir`, as repo-relative paths.
+///
+/// Supplies the LIST only. Whose they are is the guard's answer, never this
+/// function's — see the module docs for what re-deriving it cost.
+async fn dirty_paths(dir: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .await;
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            // "XY path" or "XY old -> new"; take the destination.
+            let rest = l.get(3..)?.trim();
+            Some(rest.rsplit(" -> ").next().unwrap_or(rest).trim_matches('"').to_string())
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Ownership for `paths`, from the staged-guard ITSELF — called as a function,
+/// not reimplemented.
+///
+/// This is the card's requirement made literal: one implementation of "whose is
+/// this", with two consumers. Two implementations diverge and each looks correct
+/// alone, which is exactly how the guard said MINE=0 while the nudge said 11
+/// files were mine, at the same moment about the same files.
+async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Option<Ownership> {
+    let body = json!({ "dir": dir, "session": session, "paths": paths });
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(v) = axum::http::HeaderValue::from_str(session) {
+        headers.insert("x-amux-session", v);
+    }
+    let (status, axum::Json(v)) = crate::api::git_guard::staged_guard(
+        headers,
+        axum::body::Bytes::from(body.to_string()),
+    )
+    .await;
+    if !status.is_success() || v.get("ok").and_then(Value::as_bool) != Some(true) {
+        // Attribution unavailable. Return None and stay SILENT rather than
+        // nudging without it — python kept the old over-nudging behaviour here
+        // and that is the failure mode, not the safe default.
+        return None;
+    }
+    let pairs = |k: &str| -> Vec<(String, String)> {
+        v.get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| {
+                        Some((
+                            f.get("path")?.as_str()?.to_string(),
+                            f.get("owner").and_then(Value::as_str).unwrap_or("?").to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Some(Ownership {
+        foreign: pairs("foreign"),
+        shared: pairs("shared"),
+        unclaimed: v
+            .get("unclaimed")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| {
+                        f.get("path").and_then(Value::as_str).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// One sweep: nudge idle lanes that have uncommitted work OF THEIR OWN.
+///
+/// Delivery is `steer_enqueue`, never a direct send — the existing loop applies
+/// the turn-boundary gate, so a nudge cannot land mid-turn (the AMUX-2642 rule
+/// this repo already paid for once).
+pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) -> usize {
+    let mut sent = 0usize;
+    for (session, dir) in lanes {
+        if session.is_empty() || dir.is_empty() {
+            continue;
+        }
+        let dirty = dirty_paths(dir).await;
+        if dirty.is_empty() {
+            continue;
+        }
+        let Some(own) = ownership_from_guard(session, dir, &dirty).await else {
+            continue;
+        };
+        let Some(msg) = build(dir, &dirty, &own) else { continue };
+
+        // Cap AFTER deciding there is something to say, so a suppressed-by-cap
+        // day does not also consume the "nothing to say" path.
+        let key = cap_key(session, now);
+        let already = state
+            .store
+            .read()
+            .ok()
+            .and_then(|c| {
+                c.query_row("SELECT 1 FROM prefs WHERE key=?1", rusqlite::params![key], |_| Ok(()))
+                    .ok()
+            })
+            .is_some();
+        if already {
+            continue;
+        }
+        let k2 = key.clone();
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO prefs (key, value) VALUES (?1, '1') \
+                     ON CONFLICT(key) DO NOTHING",
+                    rusqlite::params![k2],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge").await;
+        sent += 1;
+    }
+    sent
+}
+
+/// Spawn the sweep. LEVEL-triggered like board_drive's pickup, for the reason
+/// stated there: this process re-execs on every deploy, so an edge-triggered
+/// "went idle" is lost and an already-idle lane waits for a transition that
+/// never comes.
+pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let every = std::env::var("AMUX_COMMIT_NUDGE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(600);
+        // 0 disables. The knob is here because a nudge loop is exactly the kind
+        // of automation that should be switchable off by config rather than by
+        // a code change (D4's lesson about policy living in constants).
+        if every == 0 {
+            tracing::info!("commit-nudge: disabled (AMUX_COMMIT_NUDGE_SECS=0)");
+            return;
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+            let lanes = idle_lanes_with_dirs(&state);
+            if lanes.is_empty() {
+                continue;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let n = nudge_tick(&state, &lanes, now).await;
+            if n > 0 {
+                tracing::info!(nudged = n, lanes = lanes.len(), "commit-nudge swept");
+            }
+        }
+    })
+}
+
+/// Lanes that are IDLE and have a working directory.
+///
+/// Idle comes from the session's own report (`prefs.session_reports`, the D1
+/// exit) rather than from a pane scrape — nudging a lane mid-turn is the thing
+/// the steering boundary exists to prevent, and asking the harness is cheaper
+/// and more truthful than inferring.
+fn idle_lanes_with_dirs(state: &AppState) -> Vec<(String, String)> {
+    let reports: Value = state
+        .store
+        .read()
+        .ok()
+        .and_then(|c| {
+            c.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+        })
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let home = crate::api::groups::amux_home();
+    let Ok(rd) = std::fs::read_dir(home.join("sessions")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        if reports.get(name).and_then(|r| r["state"].as_str()) != Some("idle") {
+            continue;
+        }
+        let env = crate::config::parse_env_file(&p);
+        if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
+            continue;
+        }
+        if let Some(dir) = env.get("CC_DIR").filter(|d| !d.is_empty()) {
+            out.push((name.to_string(), dir.clone()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

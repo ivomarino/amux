@@ -240,6 +240,29 @@ async fn async_main() {
     // repair at boot, then holds the line on a 20s sweep against an
     // expiring viewer lease.
     drop(runtime_jobs::pane_size::spawn());
+    // The idle uncommitted-work nudge (AMUX-2638). Ownership comes from the
+    // staged-guard, never from the dirty tree — see the module docs for the
+    // three sweeps that rule exists to prevent.
+    drop(runtime_jobs::commit_nudge::spawn(state.clone()));
+
+    // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
+    // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
+    // sites, so setting the gate armed a loop nobody started. Nothing errored,
+    // because the failure is pure absence: the last cron fire on this fleet was
+    // 19:41, the moment the python server stopped, and six schedules were
+    // silently overdue by the time anyone looked. A capability that never
+    // reaches the runtime does not exist (ethos rule 1).
+    //
+    // Shadow mode still runs: it journals what it WOULD have fired, and that
+    // journal is the only evidence that the loop is alive at all when firing is
+    // off. Delivery goes through `LiveDeliverer` — the one implementation, and
+    // the same send path a human's message takes.
+    {
+        let firing = runtime_jobs::firing_enabled();
+        let deliverer: std::sync::Arc<dyn runtime_jobs::scheduler::Deliverer> =
+            std::sync::Arc::new(runtime_jobs::scheduler::LiveDeliverer::new(state.clone()));
+        tokio::spawn(runtime_jobs::run_scheduler(store.clone(), firing, deliverer));
+    }
 
     let app = api::router(state);
 
