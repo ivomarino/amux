@@ -1521,3 +1521,166 @@ FIX: Fixed in board_drive.rs `drive_lane`: the backlog counts are computed BEFOR
   gate and attached to every trace row, whatever stopped the lane. General form: when a
   trace has both a "why" and a "how much", the "how much" must not be computed on the
   happy path only.
+
+## SUPERSEDES the "13 lanes holding stuck text" entry above — they were empty; the reader was wrong
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2629)
+CARD: AMUX-2629
+SYMPTOM: I reported 13 live lanes "holding composer text with no matching user message in their
+transcript" and flagged that the ghost-rescue prefix guard would rescue none of them. Both halves
+were built on a false reading. All 13 composers were EMPTY. What they held was Claude Code's DIM
+suggestion — `\x1b[2m` — and `_pending_input` (py:25349, ported faithfully) strips ANSI before
+reading the ❯ line, which makes a suggestion and real typed input the same string. Two other
+sessions then spent time on it: one pressed Enter, C-m and Escape+Enter on those lanes and reported
+that none worked (correct — there was nothing to submit), and reasoned toward a
+background-conversation-manager theory; another read the "← 2 agents" marker as the common cause. It
+is on every lane, including a brand-new claude in an empty directory that accepted Enter 20/20 times.
+COST: three sessions' time chasing an artifact, one wrong hypothesis published, and the next step
+queued up was submitting 13 stale instructions into live lanes — which would have been the real
+damage. My own entry above is what made it look corroborated.
+FIX: `composer_state()` in api/session_verbs.rs — the dim attribute decides, and callers must pass
+the RAW `capture-pane -e` output. `pending_input` is DELETED rather than fixed: a function that can
+be called with a stripped frame re-creates the bug silently, so there is now exactly one way to read
+the composer and it cannot be handed the wrong input. The lesson generalises past this bug: when a
+probe's output is the same for two states, the fault is the probe, and "strip the ANSI first" throws
+away the only bit that distinguished them.
+
+## A lane froze its own steering queue for four hours by writing the words "esc to interrupt"
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: (agent, AMUX-2629)
+CARD: AMUX-2629
+SYMPTOM: amux-rust held 10 steering messages for up to 229 minutes while every gate passed — env
+file present, tmux alive, self-report `idle` 198s old, composer empty, status bar `⏵⏵ bypass
+permissions on (shift+tab to cycle) · ← 2 agents`. The refusal came from send_text's active-signal
+re-check, which is `"esc to interrupt" in tmux_capture(name, 12)` (py:25650) — an UNSCOPED substring
+match over the whole pane. Lines 26-27 of that pane were the lane's own prose about a status-detection
+fix: `Workers with "bypass permissions on" + "esc to interrupt" on the status bar were misdetected as
+IDLE`. So the lane most likely to write that string is the lane that works on the scraper, and it
+blocked itself. Compounding it, the tick took ONE row per lane oldest-first and moved to the next
+LANE on refusal, so one undeliverable row froze all ten.
+COST: four hours of a lane not receiving the owner's instructions, while the owner asked twice why
+workers were not moving. Finding it needed a hand-written DB read plus a pane capture, because the
+tick logged only successes — a skip left no trace anywhere. A peer independently reached a different
+root cause (the @-picker guard) from the same symptoms; it was not that, and fixing only the @ path
+would have left the lane frozen.
+FIX: three parts. (1) `pane_bar_says_generating()` scopes the marker to the bottom 3 non-blank lines,
+so prose cannot be a status. (2) The tick and the reactive deliverer now walk to the lane's NEXT row
+on a refusal instead of abandoning the lane — one bad row can no longer freeze a queue. (3) Every
+skip is logged with its reason, a lane whose oldest row exceeds 20 minutes is announced at WARN, and
+`GET /api/debug/steering` exposes per-lane depth, oldest age and last refusal reason. Reproduced
+end-to-end on a throwaway lane put into the same state: pre-fix predicate = 0 deliveries in 10 ticks;
+bar-scoped predicate = both rows delivered, @-mention included.
+
+---
+## Six SPA-consumed API families 404 in production and nothing anywhere says so
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-rust (RR-0130/0131 cutover sweeps)
+CARD: AR-114, AR-115, AR-116, AR-118, AR-119, AR-120
+SYMPTOM: The RR-0130/0131 live-data sweeps compared what the SPA READS against what the
+  rust server SERVES. Six families the shipped dashboard calls answer 404 on the live
+  server, and every one exists nowhere in `crates/`: `/api/channels/{a}/{b}/messages`
+  (the DM drawer, polled every 2500ms), `/api/log-search`, `/api/memory/global`,
+  `/api/observability`, `/api/review/week`, `/api/review/digest`. A seventh,
+  `/api/metrics`, answers 200 with a completely different document than the SPA reads
+  (`{board,events_journal,leases,queues,...}` vs the expected `data.sessions[]` +
+  `data.system` + `data.server`), and the SPA calls `s.cpu_percent.toFixed()` on it
+  unguarded. Nothing errored at cutover, no check went red, and the boundary registry
+  (`/api/debug/boundary`) reports `proxied: []` — i.e. "everything is native" — because
+  a family nobody implemented is not a family anybody proxied.
+COST: These shipped broken at the python retirement and were still broken hours later;
+  they were found only because someone diffed SPA call sites against live routes by
+  hand. `/api/observability` is the entire Cost view, so 387,524 `token_ledger` rows
+  have had no reader since cutover. Same failure shape as AMUX-2637 (board drive) and
+  AMUX-2629 (submission): python-only capability, unported, invisible because absence
+  does not raise.
+FIX: The missing instrument is the one that would have caught all seven at once — a
+  check that walks the SPA's own fetch call sites and asserts each resolves to a mounted
+  route. `ROUTE_TABLE` already proves the reverse direction (claimed routes are routed);
+  nothing proves the SPA's demands are met. `/api/debug/boundary` should report families
+  the SPA calls that resolve to neither native nor proxied, so "unported" is a state the
+  registry can express instead of one that reads as clean.
+
+---
+## Two rust call sites defer work to "while the Python server runs" — python is retired
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-rust (RR-0131b sweep)
+CARD: AR-117
+SYMPTOM: `api/session_verbs.rs:5910` says `_write_claude_memory (symlink into
+  ~/.claude/projects) is not ported — Python owns the memory composition during
+  coexistence`, and `api/scope.rs:41` says `While the Python server runs (the migration
+  soak) its next compose picks the edit up; the gap closes with the memory-compose port,
+  not here.` Both are honest, well-written deviations — and both were made void the
+  moment python was shut down. A worker memory write now updates
+  `~/.amux/memory/<name>.md` and never composes `~/.claude/projects/<proj>/memory/
+  MEMORY.md`. RR-0131b's own acceptance line ("MEMORY.md regenerated from migrated
+  entries") cannot pass.
+COST: Silent divergence between the memory a session edits and the memory Claude Code
+  loads, for an unknown number of edits since cutover. Found only by grepping comments
+  during a sweep; no test, no check and no doc references either site.
+FIX: Deviations whose mitigation is "the other server covers it" need to be enumerable.
+  A `GRACE:`-style marker (or a `python_covers_this` const the retirement checklist
+  greps) would have turned python's shutdown into a list of exactly what stopped being
+  covered, instead of a discovery process. RR-0154's shutdown criteria should include
+  that grep.
+
+---
+## The gate-blocked 409 tells every agent to GET a route that does not exist
+AREA: gates
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux-rust (RR-0150 restart suite)
+CARD: AR-123
+SYMPTOM: Every gate_blocked 409 from `/api/board/<id>` carries
+  `how_to_ack.contract: "GET /api/board/contract"` (`api/board.rs:1175` and `:1664`).
+  `GET /api/board/contract` returns 404 `{"error":"item not found","id":"contract"}` on
+  both a fresh build and the live server — it is being matched by the `/api/board/{id}`
+  route as an item id. Hit it while making the restart suite move a card `todo -> doing`.
+COST: Small on its own — the 409 also carries `gate` and `gate_ack`, so the escape is
+  walkable without the contract. But it is ethos rule 6's exact shape: the one documented
+  route out of a gate is the one action that leaves the sanctioned path, and it is the
+  instruction amux itself prints. AMUX-2325 is the same defect one layer up.
+FIX: Mount `/api/board/contract` ahead of `/api/board/{id}`, or delete the claim from
+  both 409 bodies. Whichever — the test is that following the error message literally
+  has to work.
+
+---
+## A worker whose pane died at launch reports `running: true` / `idle`
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux (cloud rust image, AMUX-2619)
+CARD: AMUX-2644
+SYMPTOM: Started a worker in the new cloud container. `GET /api/workers/<id>` returned
+  `{"status":"idle","running":true,"state":{"state":"idle"}}` — a healthy-looking lane.
+  `peek` showed what had actually happened: `--dangerously-skip-permissions cannot be
+  used with root/sudo privileges for security reasons` … `Pane is dead (status 1)`.
+  The tmux SESSION still exists after the pane dies (`remain-on-exit on`), so "the
+  session is there" is true and "the agent is running" is false, and the status field
+  reports the first while reading like the second.
+COST: This is the single blocking defect of the cloud rust cutover — every agent lane in
+  every workspace would have died at launch — and the worker list said nothing was wrong.
+  It was found only because I peeked at a lane I had no reason to suspect. On the live
+  host the same failure would present as "the fleet is idle", which is the one shape
+  nobody investigates. `idle` is also what a correctly-waiting lane reports, so no
+  amount of watching the status column can distinguish them.
+FIX: `idle` must not be reachable when the pane is dead. tmux already knows
+  (`#{pane_dead}` / `#{pane_dead_status}` are one `display-message` away, and the peek
+  text carries `Pane is dead (status N)`), so this is a state the detector can express
+  and currently does not. A `dead` state — or at minimum `running:false` — with the exit
+  status attached. Related: the browser failure in the same container named its symptom
+  (`CDP never answered within 12s`) and not its cause; both are the ethos rule 4 shape,
+  where the diagnosis is impossible from what the instrument reports.
