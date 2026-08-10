@@ -30,16 +30,16 @@
 # Blocking commits on a server hiccup would be worse, so fail-open stays; what
 # changes is that a failure now SAYS SO, loudly, with the reason. A guard that
 # cannot report its own absence is indistinguishable from a guard that passed.
-import json, os, ssl, subprocess, sys, urllib.error, urllib.request
+import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 3' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 4' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 3
+GUARD_VERSION = 4
 
 
 def amux_base_url():
@@ -85,6 +85,71 @@ def amux_base_url():
     return url or "https://localhost:8824"
 
 
+# ---------------------------------------------------------------------------
+# THE UNENFORCED LEDGER (AMUX-2807).
+#
+# This guard FAILS OPEN, which is the right default — failing closed would brick
+# every lane whenever the server bounces, and the server bounces on every commit
+# that touches crates/ (the builder installs a new binary and the running server
+# self-adopts). But a bypass that leaves no trace is the ethos-6 defect: the one
+# escape from the whole protection is the one action with no record, while the
+# message says "OFF for this commit" and then forgets.
+#
+# So every NOT-ENFORCED outcome is appended here, on the LOCAL disk, deliberately
+# not via the server — the server being unreachable is the commonest reason we
+# are in this path at all. A dependency you cannot reach cannot be your audit log.
+UNENFORCED_LOG = os.path.join(
+    os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),
+    "staged-guard-unenforced.jsonl")
+
+
+def record_unenforced(reason, sess, paths):
+    """Append one unguarded commit. Never raises: an audit failure must not
+    become a commit failure."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        with open(UNENFORCED_LOG, "a") as fh:
+            fh.write(json.dumps({
+                "ts": time.time(), "session": sess, "reason": reason,
+                "paths": len(paths), "head_before": head,
+                "guard_version": GUARD_VERSION,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def report_unenforced_backlog(w, sess):
+    """Surface the ledger WHERE THE READER ALREADY IS — on the next commit whose
+    guard actually ran. A count in a file nobody opens is the same failure as no
+    count (ethos rule 4, second layer: the blindness just moves). Entries are
+    marked reported so this announces a backlog once, not forever."""
+    try:
+        if not os.path.exists(UNENFORCED_LOG):
+            return
+        with open(UNENFORCED_LOG) as fh:
+            rows = [json.loads(l) for l in fh if l.strip()]
+        new = [r for r in rows if not r.get("reported")]
+        if not new:
+            return
+        oldest = min(r.get("ts", 0) for r in new)
+        mine = sum(1 for r in new if r.get("session") == sess)
+        w("\namux staged-guard: %d COMMIT(S) LANDED UNGUARDED since %s (%d by you, %s).\n"
+          "  Sweep protection was off for those — a peer's work could be in them and nothing compared it.\n"
+          "  %s\n"
+          "  Reasons: %s\n"
+          % (len(new), time.strftime("%Y-%m-%d %H:%M", time.localtime(oldest)), mine, sess,
+             UNENFORCED_LOG,
+             ", ".join(sorted({(r.get("reason") or "?")[:60] for r in new}))))
+        for r in rows:
+            r["reported"] = True
+        with open(UNENFORCED_LOG, "w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
     # AMUX_VERIFIED_SOLO is the HONEST half of the same exit (AF-26). Both skip the
@@ -110,6 +175,7 @@ def main():
         # guard never got as far as asking, which is not the same as "clean".
         w("amux staged-guard: SKIPPED — could not read the staged set (%r). "
           "Cross-session sweep protection is OFF for this commit.\n" % (e,))
+        record_unenforced("staged-set-unreadable: %r" % (e,), sess, [])
         return 0
 
     url = amux_base_url() + "/api/git/staged-guard"
@@ -125,9 +191,49 @@ def main():
     # between "start the server", "your server is too old / the route is gone",
     # and "the server is broken" — a reader who is told only "it failed" cannot
     # act, and a reader who is told nothing does not know to.
+    # RETRY A CONNECTION FAILURE, ONCE-PLUS. A single 5s attempt is brittle
+    # against a dependency that THIS WORKFLOW restarts: committing to crates/
+    # makes the builder install a new binary and the running server self-adopt,
+    # so the very next lane's commit can arrive mid-bounce. amux-cloud lost two
+    # consecutive commits' protection to timeouts (AMUX-2807).
+    #
+    # Only connection-level failures are retried. An HTTP error is a DEFINITIVE
+    # answer — a 404 means the route is gone and no amount of waiting fixes it,
+    # and retrying it would just triple the delay before the same message.
+    raw = None
+    last_err = None
+    t0 = time.time()
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                raw = r.read().decode()
+            break
+        except urllib.error.HTTPError:
+            # Definitive — re-raised below so the existing per-code messages,
+            # which tell the reader how to ACT on each, stay the only place
+            # those are written.
+            raw = None
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.5)
+    if raw is None and last_err is not None:
+        # Report the MEASURED elapsed, not a guess at it: a connection refused
+        # instantly and a connection that timed out three times are ~3s and ~18s,
+        # and telling the reader which one they had is the difference between
+        # "the server is down" and "the server is wedged or the network is".
+        w("\namux staged-guard: NOT ENFORCED — could not reach the amux server at %s "
+          "after 3 attempts over %.1fs (%r).\n"
+          "  Cross-session sweep protection is OFF for this commit — RECORDED in %s\n"
+          % (url, time.time() - t0, last_err, UNENFORCED_LOG))
+        record_unenforced("unreachable after %.1fs: %r" % (time.time() - t0, last_err), sess, paths)
+        return 0
     try:
-        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-            raw = r.read().decode()
+        if raw is None:
+            with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                raw = r.read().decode()
     except urllib.error.HTTPError as e:
         detail = ""
         try:
@@ -146,6 +252,7 @@ def main():
             w("\namux staged-guard: NOT ENFORCED — the server errored (HTTP %d) %s\n"
               "  Cross-session sweep protection is OFF for this commit.\n"
               % (e.code, detail))
+        record_unenforced("http-%d" % e.code, sess, paths)
         return 0
     except Exception as e:
         w("\namux staged-guard: NOT ENFORCED — could not reach the amux server at %s (%r).\n"
@@ -156,14 +263,21 @@ def main():
     except Exception:
         w("\namux staged-guard: NOT ENFORCED — the server answered non-JSON (%r).\n"
           "  Cross-session sweep protection is OFF for this commit.\n" % (raw[:200],))
+        record_unenforced("non-json", sess, paths)
         return 0
     if not isinstance(d, dict):
         w("\namux staged-guard: NOT ENFORCED — unexpected response shape.\n")
+        record_unenforced("bad-shape", sess, paths)
         return 0
 
     # UNDECIDED is not ALL-CLEAR. The server says so explicitly because the two
     # are byte-identical otherwise: empty foreign/shared/unclaimed lists (ethos
     # rule 4 — a wrong answer must be detectable from what you keep).
+    # The guard reached the server, so this is the moment the reader is looking
+    # at its output — the only moment a backlog of unguarded commits will be
+    # read. Announced before the verdict so it is not lost under a long report.
+    report_unenforced_backlog(w, sess)
+
     if d.get("undecided"):
         w("\namux staged-guard: COULD NOT DECIDE — %s\n"
           "  The empty verdict below is NOT a clean bill of health; nothing was compared.\n"
