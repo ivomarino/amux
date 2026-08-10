@@ -137,26 +137,56 @@ jobs:
           ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Gateway env — admin emails and the container hop scheme (idempotent)
+      - name: Gateway env — admin emails (idempotent, safe on every deploy)
         run: |
-          # CONTAINER_SCHEME is the rust cutover switch: the rust server always
-          # serves TLS and answers plain HTTP with a 301 to https://localhost:8822,
-          # which from the host points at the host and not at any container. A
-          # gateway left on `http` serves the Starting page forever and looks
-          # like a container fault. Written here so the gateway and the image
-          # cross over in the same deploy.
           ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
             set -e
             touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env
             grep -q "^ADMIN_EMAILS=" /etc/amux/gateway.env || echo "ADMIN_EMAILS=ethan@mixpeek.com,esteininger21@gmail.com" >> /etc/amux/gateway.env
             grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "hello@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=hello@amux.io,/" /etc/amux/gateway.env
             grep "^ADMIN_EMAILS=" /etc/amux/gateway.env | grep -q "qa-godmode@amux.io" || sed -i "s/^ADMIN_EMAILS=/ADMIN_EMAILS=qa-godmode@amux.io,/" /etc/amux/gateway.env
+            echo "admin emails now: $(grep ^ADMIN_EMAILS= /etc/amux/gateway.env)"
+            echo "container hop (unchanged by this step): $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env || echo "<unset — http>")"'
+
+      # ---------------------------------------------------------------------
+      # THE HOP SCHEME IS HALF OF A CUTOVER, SO IT IS GATED LIKE THE OTHER HALF.
+      #
+      # AMUX-2809. This used to run on EVERY deploy with no `if:` while the
+      # container recreate below is gated to `workflow_dispatch && recreate ==
+      # 'yes'`, and line ~264 passes `--no-recreate ON PURPOSE`. So the two
+      # halves of one cutover were independently gated and only one of them was
+      # unconditional. The step's own comment claimed "the gateway and the image
+      # cross over in the same deploy" — they did not: the image only reaches a
+      # container on recreate=yes.
+      #
+      # Worst path was the automatic one. `paths:` includes `crates/**`,
+      # `Cargo.toml`, `Cargo.lock` and `cloud/**`, so a routine push — by any
+      # lane, touching any of those — fired this workflow, skipped the recreate
+      # by its own condition, and flipped the scheme anyway. Nobody chose that;
+      # the trigger did.
+      #
+      # Measured on the live host 2026-08-10, a control pair on the same port of
+      # a running amux-user container:
+      #     docker inspect .Config.Cmd -> [python amux-server.py 8822 --no-tls]
+      #     http://127.0.0.1:9059/api/health  -> 404  (answered — plain HTTP)
+      #     https://127.0.0.1:9059/api/health -> 000  (connection failed)
+      # Pointing the gateway at https:// against those breaks every workspace
+      # hop for all 6 live customers.
+      #
+      # Not-setting it is the safe state: the gateway defaults to http and logs
+      # "container hop: http:// (cert verification n/a)".
+      # ---------------------------------------------------------------------
+      - name: Gateway env — container hop scheme (ONLY with a real recreate)
+        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            set -e
+            touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env
             grep -v "^CONTAINER_SCHEME=" /etc/amux/gateway.env > /etc/amux/.ge.tmp || true
             mv /etc/amux/.ge.tmp /etc/amux/gateway.env
             chmod 600 /etc/amux/gateway.env
             echo "CONTAINER_SCHEME=https" >> /etc/amux/gateway.env
-            echo "admin emails now: $(grep ^ADMIN_EMAILS= /etc/amux/gateway.env)"
-            echo "container hop:    $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env)"'
+            echo "container hop: $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env)"'
 
       - name: Sync gateway secrets from repo secrets (host-only, never in a container)
         run: |
