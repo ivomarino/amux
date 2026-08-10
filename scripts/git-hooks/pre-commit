@@ -132,6 +132,59 @@ echo "Security scan passed."
 # The Python predecessor's ast.parse + inline-<script> extraction lived here
 # until 2026-08-09; the client is real static files now and the server is Rust.
 
+STAGED_RS=$(echo "$STAGED" | grep -E '^crates/.*\.rs$' || true)
+
+# ── 2a. A staged `mod X;` whose X is UNTRACKED (AMUX-2777) ────────────────────
+#
+# THIS IS THE ONE `cargo check` STRUCTURALLY CANNOT CATCH. The module file is
+# present in MY working tree, so my build is green and stays green; the breakage
+# appears only in a checkout that does not have the untracked file — i.e. in
+# everyone else's, after I push. Five times in one night, per the card.
+#
+# The check is deliberately about TRACKEDNESS, not existence: `test -f` passes
+# for exactly the file that is about to be missing for everybody else.
+if [ -n "$STAGED_RS" ]; then
+  MISSING_MODS=""
+  for f in $STAGED_RS; do
+    dir=$(dirname "$f")
+    base=$(basename "$f" .rs)
+    # `mod x;` in foo.rs resolves against foo/, except for the crate roots and
+    # mod.rs, which resolve against their own directory.
+    case "$base" in
+      lib|main|mod) moddir="$dir" ;;
+      *)            moddir="$dir/$base" ;;
+    esac
+    # Declarations only: `mod x;` / `pub mod x;` / `pub(crate) mod x;` ending in
+    # a semicolon. `mod tests { ... }` is inline and has no file.
+    for m in $(grep -oE '^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?mod[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*;' "$f" 2>/dev/null \
+               | sed -E 's/.*mod[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*;/\1/'); do
+      cand1="$moddir/$m.rs"
+      cand2="$moddir/$m/mod.rs"
+      target=""
+      [ -e "$cand1" ] && target="$cand1"
+      [ -z "$target" ] && [ -e "$cand2" ] && target="$cand2"
+      if [ -z "$target" ]; then
+        continue   # declared but absent here too — cargo check will say so
+      fi
+      # Tracked in HEAD, or staged in THIS commit: either way it ships.
+      if git ls-files --error-unmatch "$target" >/dev/null 2>&1; then continue; fi
+      if git diff --cached --name-only | grep -qxF "$target"; then continue; fi
+      MISSING_MODS="$MISSING_MODS\n  $f declares 'mod $m;' -> $target is UNTRACKED"
+    done
+  done
+  if [ -n "$MISSING_MODS" ]; then
+    printf 'BLOCKED: a staged file declares a module whose file is not tracked.%b\n' "$MISSING_MODS"
+    echo ""
+    echo "Your build is green because the file exists HERE. It will not exist in any"
+    echo "other checkout, so this commit breaks the workspace for every other lane the"
+    echo "moment it lands — and cargo check cannot see that from inside your tree."
+    echo ""
+    echo "Stage the module file too:   git add <the path(s) above>"
+    echo "Or drop the declaration if it was not meant to ship yet."
+    exit 1
+  fi
+fi
+
 if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
   echo "Checking Rust (cargo check --workspace --all-targets)..."
   # --all-targets IS THE POINT, not a flourish (AMUX-2807).
