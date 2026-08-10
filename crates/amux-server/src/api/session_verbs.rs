@@ -44,6 +44,7 @@ use super::AppState;
 use crate::api::fs::{body_str, parse_body, parse_qs, qs_get};
 use crate::api::sessions_legacy::strip_ansi;
 use crate::backend::tmux::{pane_target, session_target};
+use amux_core::provider::ProviderCapabilities;
 use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -1491,19 +1492,26 @@ fn dedupe_default_flags(default_flags: &str, overrides: &[&str]) -> String {
     out
 }
 
-fn extract_model_from_flags(flags: &str) -> String {
+/// The value carried by `--name` in a flags string; `--name v` and `--name=v`
+/// both. Empty when the flag is absent or the flags do not parse.
+fn flag_value(flags: &str, name: &str) -> String {
     let Ok(tokens) = split_flags(flags) else { return String::new() };
+    let eq = format!("{name}=");
     let mut i = 0;
     while i < tokens.len() {
-        if tokens[i] == "--model" && i + 1 < tokens.len() {
+        if tokens[i] == name && i + 1 < tokens.len() {
             return tokens[i + 1].clone();
         }
-        if let Some(v) = tokens[i].strip_prefix("--model=") {
+        if let Some(v) = tokens[i].strip_prefix(&eq) {
             return v.to_string();
         }
         i += 1;
     }
     String::new()
+}
+
+fn extract_model_from_flags(flags: &str) -> String {
+    flag_value(flags, "--model")
 }
 
 const MODEL_ID_MAX_LEN: usize = 100;
@@ -3882,6 +3890,62 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     delivered
 }
 
+/// Deliver the oldest queued steering message for ONE specific session.
+/// Called reactively when a session reports "idle" — the report IS the turn
+/// boundary, so there is no need to re-check `steer_lane_at_boundary` (the
+/// caller just wrote "idle" into session_reports). This closes the race where
+/// the 5s poll missed a < 1s idle window between turns: 9 messages sat queued
+/// for over 2 hours while the session processed direct user input.
+pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool {
+    let session_s = session.to_string();
+    let oldest: Option<(String, String)> = state
+        .store
+        .read()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT id, text FROM steering_queue WHERE session=?1 ORDER BY queued_at ASC LIMIT 1",
+                [&session_s],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+        });
+    let Some((id, text)) = oldest else { return false };
+    if !env_path(session).exists() {
+        return false;
+    }
+    if !is_running(session).await {
+        return false;
+    }
+    let (ok, msg) = send_text_inner(state, session, &text, false, true).await;
+    if !ok {
+        return false;
+    }
+    let (id2, sess2, text2) = (id.clone(), session_s.clone(), text.clone());
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            ensure_fleet_tables(conn)?;
+            let queued_at: f64 = conn
+                .query_row(
+                    "SELECT queued_at FROM steering_queue WHERE id=?",
+                    [&id2],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| now_f64());
+            conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
+                 VALUES(?,?,?,?,?)",
+                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64()],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    tracing::info!(session = %session, id = %id, detail = %msg, "steering delivered (reactive)");
+    true
+}
+
 /// Background driver. Spawned from lib.rs; ticks every STEER_TICK_SECS.
 pub async fn steer_deliver_loop(state: AppState) {
     loop {
@@ -5379,7 +5443,21 @@ async fn report_post(state: &AppState, name: &str, body: &Value) -> Response {
                 .unwrap_or_else(|| "unknown".into());
             j200(json!({"ok": true, "state": prev, "note": "heartbeat ignored — no active turn to refresh"}))
         }
-        Ok(_) => j200(json!({"ok": true, "state": st})),
+        Ok(_) => {
+            // REACTIVE STEERING DELIVERY: if the session just went idle and has
+            // queued steering, deliver the oldest one NOW rather than waiting up
+            // to 5s for the poll tick. The report IS the turn boundary — the
+            // caller just proved it by reporting "idle". A 5s poll missed a <1s
+            // idle window between turns for 2+ hours (9 messages, AMUX-2617).
+            if st == "idle" {
+                let st_clone = state.clone();
+                let name_clone = name.to_string();
+                tokio::spawn(async move {
+                    steer_deliver_for_session(&st_clone, &name_clone).await;
+                });
+            }
+            j200(json!({"ok": true, "state": st}))
+        }
         Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
     }
 }
@@ -5707,6 +5785,401 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Hot model switching (AMUX-2617)
+// ---------------------------------------------------------------------------
+//
+// A model/effort change on a LIVE claude session is delivered as an in-session
+// `/model <id>` slash command instead of a restart. The conversation, its
+// context, and the loaded logs all survive — which is the whole ask: Ethan
+// switched models inside Claude Code mid-conversation and "didn't have to
+// re-load all logs and stuff".
+//
+// Why this had to be built rather than turned on: the capability was DECLARED
+// and never reached a session (ethos rule 1). provider/claude.rs has answered
+// `hot_model_switch: true` since RR-0043, and amux-core's
+// classify_config_change returns `NextTurn` for a same-provider model change
+// on a provider with that capability — but every fleet model change still went
+// through restart_for_swap (graceful /exit, kill tmux, relaunch --resume),
+// paying a restart, a resume, and the whole boot choreography.
+//
+// SYNTAX, verified against Claude Code v2.1.226 in a throwaway tmux pane on
+// 2026-08-09 (transcript on the card) — not read off a doc:
+//   /model sonnet                    -> "Set model to Sonnet 5 and saved as
+//                                       your default for new sessions"
+//   /model claude-haiku-4-5-20251001 -> full dated ids are accepted
+//   /model claude-opus-5[1m]         -> "Set model to Opus 5 (1M context)…"
+//   /effort high                     -> "Set effort level to high (saved as
+//                                       your default for new sessions): …"
+//   /model definitely-not-a-model    -> "Model 'definitely-not-a-model' not
+//                                       found"
+// So the SPA's picker VALUES (crates/amux-dashboard/static/app.js: `opus`,
+// `claude-opus-5[1m]`, `claude-haiku-4-5-20251001`, …) go through verbatim and
+// no id-mapping table is needed. One would be a second place to keep in step
+// with a list amux does not own, and it would silently mistranslate every id
+// added after it was written.
+//
+// The rejection line matters as much as the ack: it is what makes a bad id
+// VISIBLE, so a hot switch that the agent refuses falls back to a restart and
+// says so, instead of leaving the config and the agent disagreeing about which
+// model is running (ethos rule 4).
+//
+// `/model` with NO argument opens an interactive picker ("Enter to set as
+// default · s to use this session only"). amux does not drive it: a
+// keystroke-driven picker is exactly the terminal-driving D1 exists to retire,
+// and it cannot express an arbitrary model id anyway. A change BACK to the
+// provider default (empty value) therefore keeps the restart path.
+//
+// KNOWN SIDE EFFECT, accepted and named rather than discovered later: the
+// argument form of `/model` also writes `model` into ~/.claude/settings.json
+// ("saved as your default for new sessions"); the picker's `s` key is the only
+// session-scoped alternative and it cannot take an arbitrary id. This is inert
+// for the fleet because every amux claude launch passes an explicit --model
+// (the session's CC_FLAGS, or CC_DEFAULT_FLAGS when it has none — see
+// dedupe_default_flags), which overrides the global default. It does change
+// the default for a bare `claude` a human starts by hand.
+
+/// What Claude Code prints when a slash config command lands.
+const CC_MODEL_ACK: &str = "Set model to ";
+const CC_EFFORT_ACK: &str = "Set effort level to ";
+/// …and when it refuses the id ("Model 'x' not found").
+const CC_SLASH_REJECT: &str = "not found";
+/// How far below the echoed command the answer may sit. Claude renders it on
+/// the very next line (`  ⎿  Set model to …`); the slack absorbs a wrap.
+const SLASH_ACK_WINDOW: usize = 6;
+/// The slash command is handled locally by the CLI, so the ack renders in well
+/// under a second. Poll instead of sleeping a fixed budget so a loaded machine
+/// does not turn a working switch into a restart.
+const HOT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How a model/effort change reaches a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapMode {
+    /// Delivered to the running agent — conversation kept, no restart.
+    Hot,
+    /// Stop + relaunch with --resume: the pre-AMUX-2617 behaviour, still the
+    /// fallback for everything the hot path cannot do honestly.
+    Restart,
+    /// Nothing is running, so rewriting the env file IS the whole change.
+    EnvOnly,
+}
+
+impl SwapMode {
+    /// The wire tag the SPA toasts on.
+    fn tag(self) -> &'static str {
+        match self {
+            SwapMode::Hot => "hot",
+            SwapMode::Restart => "restart",
+            SwapMode::EnvOnly => "env_only",
+        }
+    }
+}
+
+/// Pick the weakest mode that honestly applies the change. Pure, so the choice
+/// is unit-testable without tmux, a provider process, or a live session.
+///
+/// `expressible` = "this change can be stated as a slash command with an
+/// argument" — false for a reset to the provider default (see the module note
+/// on the argument-less picker).
+fn plan_config_swap(
+    provider: &str,
+    caps: &ProviderCapabilities,
+    running: bool,
+    expressible: bool,
+) -> SwapMode {
+    if !running {
+        return SwapMode::EnvOnly;
+    }
+    // `provider == "claude"` is NOT redundant with the capability. The
+    // capability says "this provider can change model without a restart"; the
+    // provider check says "and amux knows the syntax to ask it to". An adapter
+    // can legitimately set the flag before anyone has taught session_verbs its
+    // slash command, and over-restarting is the honest fallback for a
+    // capability nobody has wired a delivery path for.
+    if caps.hot_model_switch && provider == "claude" && expressible {
+        SwapMode::Hot
+    } else {
+        SwapMode::Restart
+    }
+}
+
+/// What the agent did about one delivered slash config command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HotOutcome {
+    /// Acknowledged in the agent's own UI.
+    Applied,
+    /// Accepted but parked on the steering queue — it lands at the next turn
+    /// boundary. NOT a failure: restarting a mid-turn session to apply a model
+    /// change is precisely the cost this feature removes, and `NextTurn` is
+    /// what amux-core classifies this change as anyway.
+    Queued,
+    /// Not delivered, or delivered and refused. The caller MUST fall back to
+    /// the restart path and say that it did.
+    Failed(String),
+}
+
+/// Count "`cmd` was echoed and answered with `marker`" pairs in a pane.
+///
+/// Anchored on the ECHOED command, not on a bare substring search for the ack:
+/// a pane still showing an earlier "Set model to …" would match a bare search
+/// forever, and a filter that matches everything returns a confident wrong
+/// answer rather than silence (ethos rule 7). The shape being matched is what
+/// Claude Code actually renders:
+///     ❯ /model sonnet
+///       ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+fn slash_answer_count(pane: &str, cmd: &str, marker: &str) -> usize {
+    let clean = strip_ansi(pane);
+    let lines: Vec<&str> = clean.lines().collect();
+    let mut hits = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if !l.contains(cmd) {
+            continue;
+        }
+        if lines
+            .iter()
+            .skip(i + 1)
+            .take(SLASH_ACK_WINDOW)
+            .any(|c| c.contains(marker))
+        {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// The rejection line for `cmd`, if the pane shows one.
+fn slash_reject_line(pane: &str, cmd: &str) -> Option<String> {
+    let clean = strip_ansi(pane);
+    let lines: Vec<&str> = clean.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        if !l.contains(cmd) {
+            continue;
+        }
+        if let Some(c) = lines
+            .iter()
+            .skip(i + 1)
+            .take(SLASH_ACK_WINDOW)
+            .find(|c| c.contains(CC_SLASH_REJECT))
+        {
+            return Some(c.trim().trim_start_matches(['⎿', '│', ' ']).trim().to_string());
+        }
+    }
+    None
+}
+
+/// Read the pane's verdict on a slash config command, comparing AFTER against
+/// BEFORE so a stale ack left on screen by an earlier switch cannot be
+/// mistaken for this one. `None` = no verdict yet, keep polling.
+///
+/// The comparison is deliberately asymmetric: a scrolled-off older pair can
+/// hide a real ack (count stays level -> `None` -> an unnecessary restart),
+/// but nothing can manufacture one. False negatives cost a restart; a false
+/// positive would leave the agent on the old model while amux reported
+/// success, which is the failure this whole path exists to avoid.
+fn slash_verdict(before: &str, after: &str, cmd: &str, ack: &str) -> Option<HotOutcome> {
+    if slash_answer_count(after, cmd, ack) > slash_answer_count(before, cmd, ack) {
+        return Some(HotOutcome::Applied);
+    }
+    if slash_answer_count(after, cmd, CC_SLASH_REJECT)
+        > slash_answer_count(before, cmd, CC_SLASH_REJECT)
+    {
+        return Some(HotOutcome::Failed(
+            slash_reject_line(after, cmd).unwrap_or_else(|| "rejected by the agent".into()),
+        ));
+    }
+    None
+}
+
+/// Deliver one slash config command to a live session and report what the
+/// agent did about it.
+///
+/// Delivery goes through `send_text` — the SAME choreography the send verb
+/// uses (resume-picker guard, status-gated Escape discipline with the 1.3s
+/// double-Escape rule, C-u clear, the @/slash picker close before Enter,
+/// steering enqueue at a selector) — never hand-rolled send-keys. Every one of
+/// those guards was paid for by an incident; a second, thinner copy of the
+/// choreography here would rediscover all of them.
+async fn deliver_hot_config(state: &AppState, name: &str, cmd: &str, ack: &str) -> HotOutcome {
+    let before = tmux_capture(name, 40).await;
+    let (sent, msg) = send_text(state, name, cmd, true).await;
+    if !sent {
+        return HotOutcome::Failed(msg);
+    }
+    // send_text says exactly "sent" only when the keys landed and Enter was
+    // pressed against a live prompt. Every other success string ("queued
+    // (steering) …", "sent (auto-woke)", "sent (waiting for in-flight boot)")
+    // means delivery is deferred, so there is nothing to confirm yet — and
+    // claiming a verdict we cannot see is what rule 4 forbids.
+    if msg != "sent" {
+        return HotOutcome::Queued;
+    }
+    let deadline = std::time::Instant::now() + HOT_ACK_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        sleep_ms(250).await;
+        let after = tmux_capture(name, 40).await;
+        if let Some(v) = slash_verdict(&before, &after, cmd, ack) {
+            return v;
+        }
+    }
+    HotOutcome::Failed(format!(
+        "no acknowledgement in the pane within {}s",
+        HOT_ACK_TIMEOUT.as_secs()
+    ))
+}
+
+/// The verdict on a whole change once every slash command has been delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HotFold {
+    /// Every command was acknowledged by the agent.
+    AllApplied,
+    /// Nothing failed, but at least one command is parked for the next turn.
+    SomeQueued,
+    /// At least one command did not land. Carries the reason so the caller can
+    /// report WHY it fell back, not merely that it did.
+    Failed(String),
+}
+
+/// Fold per-command outcomes. Failure dominates queued, which dominates
+/// applied — a change is only "live" when all of it is.
+fn fold_hot_outcomes(outcomes: &[HotOutcome]) -> HotFold {
+    if let Some(HotOutcome::Failed(why)) = outcomes
+        .iter()
+        .find(|o| matches!(o, HotOutcome::Failed(_)))
+    {
+        return HotFold::Failed(why.clone());
+    }
+    if outcomes.contains(&HotOutcome::Queued) {
+        return HotFold::SomeQueued;
+    }
+    HotFold::AllApplied
+}
+
+/// THE fallback rule, as one pure function the delivery path actually calls:
+/// a hot switch that did not land becomes a restart. Never a silent stay on
+/// the old model, and never a "hot" report for a switch nobody confirmed.
+fn mode_after_delivery(fold: &HotFold) -> SwapMode {
+    match fold {
+        HotFold::Failed(_) => SwapMode::Restart,
+        HotFold::AllApplied | HotFold::SomeQueued => SwapMode::Hot,
+    }
+}
+
+/// The restart path, with the scrollback capture that makes it survivable.
+/// Only ever called when a restart actually happens: `capture_log_tail_for_reload`
+/// stops the pane pipe as a side effect, which would be a real harm on a hot
+/// switch that never restarts anything.
+async fn restart_with_log_reload(
+    state: &AppState,
+    name: &str,
+    provider: &str,
+    reason: &str,
+) -> bool {
+    if capture_log_tail_for_reload(name, reason).await {
+        mark_pending_log_reload(name, reason);
+    }
+    restart_for_swap(state, name, provider).await
+}
+
+/// What a config change did, in the shape the API reports it.
+struct SwapReport {
+    mode: SwapMode,
+    /// Is the RUNNING agent on the new config now? False for a change parked
+    /// on the steering queue, for a failed restart, and for `EnvOnly` (there
+    /// is no agent; the next start picks it up).
+    applied: bool,
+    /// Appended to the human message so the response says what happened
+    /// instead of leaving the caller to infer it.
+    note: &'static str,
+    /// Set when the hot path was tried and did not land — the fallback must
+    /// leave a trace, not just a different outcome (ethos rule 6).
+    hot_error: Option<String>,
+}
+
+/// Apply a model/effort change whose new CC_FLAGS are already on disk: hot
+/// when the provider can take it, restart otherwise, restart as the fallback
+/// when the hot delivery does not land.
+///
+/// `cmds` are the slash commands (with the ack each one prints), in the order
+/// they must be delivered. An EMPTY list means nothing has to reach the agent.
+/// `expressible` is false when any part of the change has no argument form.
+async fn apply_live_config_change(
+    state: &AppState,
+    name: &str,
+    provider: &str,
+    running: bool,
+    cmds: &[(String, &'static str)],
+    expressible: bool,
+    reason: &str,
+) -> SwapReport {
+    let caps = super::workers::provider_caps(provider);
+    let mode = plan_config_swap(provider, &caps, running, expressible && !cmds.is_empty());
+    match mode {
+        SwapMode::EnvOnly => SwapReport {
+            mode,
+            applied: false,
+            note: "",
+            hot_error: None,
+        },
+        SwapMode::Hot => {
+            let mut outcomes = Vec::with_capacity(cmds.len());
+            for (cmd, ack) in cmds {
+                let o = deliver_hot_config(state, name, cmd, ack).await;
+                let failed = matches!(o, HotOutcome::Failed(_));
+                outcomes.push(o);
+                if failed {
+                    // Stop delivering: the agent's config and the env file
+                    // already disagree, and a second command layered on top of
+                    // an unknown state only widens the gap.
+                    break;
+                }
+            }
+            let fold = fold_hot_outcomes(&outcomes);
+            match mode_after_delivery(&fold) {
+                SwapMode::Restart => {
+                    let why = match fold {
+                        HotFold::Failed(w) => w,
+                        _ => String::new(),
+                    };
+                    let restarted = restart_with_log_reload(state, name, provider, reason).await;
+                    SwapReport {
+                        mode: SwapMode::Restart,
+                        applied: restarted,
+                        note: if restarted {
+                            " (live switch failed; session restarted to apply it, log reload queued)"
+                        } else {
+                            " (live switch failed AND the restart failed — the session may still be on the old model)"
+                        },
+                        hot_error: Some(why),
+                    }
+                }
+                _ => SwapReport {
+                    mode: SwapMode::Hot,
+                    applied: matches!(fold, HotFold::AllApplied),
+                    note: if matches!(fold, HotFold::AllApplied) {
+                        " (switched live — conversation kept, no restart)"
+                    } else {
+                        " (session is mid-turn — queued, applies at the next turn boundary; no restart)"
+                    },
+                    hot_error: None,
+                },
+            }
+        }
+        SwapMode::Restart => {
+            let restarted = restart_with_log_reload(state, name, provider, reason).await;
+            SwapReport {
+                mode,
+                applied: restarted,
+                note: if restarted {
+                    " (session restarted; log reload queued)"
+                } else {
+                    " (restart failed)"
+                },
+                hot_error: None,
+            }
+        }
+    }
+}
+
 async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     if !body.is_object() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "payload must be a JSON object"}));
@@ -5783,6 +6256,7 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating the model")}));
             }
         };
+        let old_effort = flag_value(cfg.get_or("CC_FLAGS", ""), "--effort");
         let mut flags = if model_val.is_empty() {
             flags_no_model
         } else if flags_no_model.is_empty() {
@@ -5790,6 +6264,12 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
         } else {
             format!("--model {model_val} {flags_no_model}")
         };
+        // The slash commands this change needs the LIVE agent to run, in
+        // delivery order. `expressible` goes false the moment any part of the
+        // change is a reset-to-default, which has no argument form.
+        let mut cmds: Vec<(String, &'static str)> = Vec::new();
+        let mut expressible = !model_val.is_empty();
+        cmds.push((format!("/model {model_val}"), CC_MODEL_ACK));
         if let Some(ev) = body.get("effort") {
             let effort_val = match validate_effort(ev) {
                 Ok(v) => v,
@@ -5801,21 +6281,48 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
                     return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating effort")}));
                 }
             };
+            // The SPA always sends `effort` alongside `model` (app.js
+            // `payload.effort = _effortVal`), usually re-stating the value the
+            // session already carries. Asking the agent to re-apply the effort
+            // it is already on would add a second delivery — and a second way
+            // to fail — for no change at all; worse, an UNCHANGED empty effort
+            // would make the whole change inexpressible and force a restart on
+            // every model swap from the picker.
+            if effort_val != old_effort {
+                if effort_val.is_empty() {
+                    expressible = false;
+                } else {
+                    cmds.push((format!("/effort {effort_val}"), CC_EFFORT_ACK));
+                }
+            }
         }
         cfg.set("CC_FLAGS", &flags);
         let current_provider = provider_of(&cfg);
         let was_running = is_running(name).await;
         // Python also clears its in-memory credit-limit flag here (AF-14) —
         // process state this origin does not hold.
-        if capture_log_tail_for_reload(name, "model swap").await {
-            mark_pending_log_reload(name, "model swap");
-        }
+        // The env rewrite is the DURABLE half and happens either way: whatever
+        // the live agent does, the next cold start must come up on the new
+        // model. Log-tail capture moved into restart_with_log_reload — it is
+        // only meaningful when a restart actually discards the scrollback.
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
-        let restarted = if was_running { restart_for_swap(state, name, &current_provider).await } else { false };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
-        return j200(json!({"ok": true, "message": format!("model set to {model_val}{suffix}")}));
+        let rep = apply_live_config_change(
+            state, name, &current_provider, was_running, &cmds, expressible, "model swap",
+        )
+        .await;
+        let mut out = json!({
+            "ok": true,
+            "applied": rep.applied,
+            "mode": rep.mode.tag(),
+            "model": model_val,
+            "message": format!("model set to {model_val}{}", rep.note),
+        });
+        if let Some(e) = rep.hot_error {
+            out["hot_error"] = json!(e);
+        }
+        return j200(out);
     }
 
     // Change effort only (py:76570).
@@ -5833,16 +6340,35 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
         cfg.set("CC_FLAGS", &flags);
         let current_provider = provider_of(&cfg);
         let was_running = is_running(name).await;
-        if capture_log_tail_for_reload(name, "effort change").await {
-            mark_pending_log_reload(name, "effort change");
-        }
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
-        let restarted = if was_running { restart_for_swap(state, name, &current_provider).await } else { false };
-        let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
+        // `/effort <level>` is hot on the same slash surface as `/model`
+        // (verified 2026-08-09: "Set effort level to high (saved as your
+        // default for new sessions)"), so an effort change costs no restart
+        // either. Reset-to-default has no argument form, so it does.
+        let cmds: Vec<(String, &'static str)> = if effort_val.is_empty() {
+            Vec::new()
+        } else {
+            vec![(format!("/effort {effort_val}"), CC_EFFORT_ACK)]
+        };
+        let rep = apply_live_config_change(
+            state, name, &current_provider, was_running, &cmds, !effort_val.is_empty(),
+            "effort change",
+        )
+        .await;
         let shown = if effort_val.is_empty() { "default".to_string() } else { effort_val };
-        return j200(json!({"ok": true, "message": format!("effort set to {shown}{suffix}")}));
+        let mut out = json!({
+            "ok": true,
+            "applied": rep.applied,
+            "mode": rep.mode.tag(),
+            "effort": shown,
+            "message": format!("effort set to {shown}{}", rep.note),
+        });
+        if let Some(e) = rep.hot_error {
+            out["hot_error"] = json!(e);
+        }
+        return j200(out);
     }
 
     // Toggle YOLO (py:76608).
@@ -6841,6 +7367,199 @@ mod steer_boundary_tests {
         assert!(
             !steer_lane_at_boundary(&state, "no-such-lane-xyz").await,
             "a lane with neither a report nor a readable pane must fail CLOSED"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hot_model_switch_tests {
+    //! AMUX-2617. Every assertion below pins a decision the SHIPPED path makes
+    //! — `plan_config_swap`, `slash_verdict` and `mode_after_delivery` are the
+    //! functions config_patch calls, not paraphrases of them (ethos rule 7).
+    use super::*;
+
+    /// Capabilities come from the REAL registry, so this test fails if the
+    /// claude adapter ever stops claiming the capability — the point of
+    /// consulting the registry instead of hardcoding a matrix here.
+    #[test]
+    fn hot_path_for_a_running_claude_session() {
+        let caps = crate::api::workers::provider_caps("claude");
+        assert!(caps.hot_model_switch, "claude adapter must claim the capability");
+        assert_eq!(
+            plan_config_swap("claude", &caps, true, true),
+            SwapMode::Hot,
+            "a running claude session with an expressible model change switches live"
+        );
+    }
+
+    #[test]
+    fn restart_path_for_a_provider_without_the_capability() {
+        for p in ["gemini", "codex"] {
+            let caps = crate::api::workers::provider_caps(p);
+            assert!(!caps.hot_model_switch, "{p} does not advertise a hot switch");
+            assert_eq!(
+                plan_config_swap(p, &caps, true, true),
+                SwapMode::Restart,
+                "{p} must keep the restart path"
+            );
+        }
+        // A provider the registry has never heard of gets the conservative
+        // all-false default, which must also mean restart.
+        let unknown = crate::api::workers::provider_caps("some-future-cli");
+        assert_eq!(plan_config_swap("some-future-cli", &unknown, true, true), SwapMode::Restart);
+        // And a provider that claims the capability while amux does not know
+        // its slash syntax still restarts — the capability is necessary, not
+        // sufficient.
+        let claims = ProviderCapabilities { hot_model_switch: true, ..Default::default() };
+        assert_eq!(plan_config_swap("gemini", &claims, true, true), SwapMode::Restart);
+    }
+
+    #[test]
+    fn not_running_is_env_only_and_default_reset_restarts() {
+        let caps = crate::api::workers::provider_caps("claude");
+        assert_eq!(
+            plan_config_swap("claude", &caps, false, true),
+            SwapMode::EnvOnly,
+            "a stopped session is an env rewrite and nothing else"
+        );
+        // "Default" (empty model/effort) has no slash argument form, so it is
+        // not expressible and keeps the restart.
+        assert_eq!(plan_config_swap("claude", &caps, true, false), SwapMode::Restart);
+    }
+
+    #[test]
+    fn restart_is_the_fallback_when_delivery_fails() {
+        assert_eq!(
+            mode_after_delivery(&HotFold::Failed("no acknowledgement".into())),
+            SwapMode::Restart,
+            "a hot switch that did not land MUST fall back to a restart"
+        );
+        assert_eq!(mode_after_delivery(&HotFold::AllApplied), SwapMode::Hot);
+        assert_eq!(mode_after_delivery(&HotFold::SomeQueued), SwapMode::Hot);
+
+        // Failure dominates: a model command that landed does not excuse an
+        // effort command that did not.
+        let mixed = [
+            HotOutcome::Applied,
+            HotOutcome::Failed("Model 'nope' not found".into()),
+        ];
+        assert_eq!(
+            fold_hot_outcomes(&mixed),
+            HotFold::Failed("Model 'nope' not found".into())
+        );
+        assert_eq!(
+            fold_hot_outcomes(&[HotOutcome::Applied, HotOutcome::Queued]),
+            HotFold::SomeQueued
+        );
+        assert_eq!(
+            fold_hot_outcomes(&[HotOutcome::Applied, HotOutcome::Applied]),
+            HotFold::AllApplied
+        );
+    }
+
+    /// The pane strings are the REAL ones captured from Claude Code v2.1.226
+    /// on 2026-08-09 — a synthetic paraphrase would certify a parser against a
+    /// shape the CLI does not emit.
+    #[test]
+    fn pane_verdict_reads_the_real_claude_output() {
+        let before = "❯ hello\n  ⎿  hi\n";
+        let after = "❯ hello\n  ⎿  hi\n❯ /model sonnet\n  ⎿  Set model to Sonnet 5 and saved as your default for new sessions\n";
+        assert_eq!(
+            slash_verdict(before, after, "/model sonnet", CC_MODEL_ACK),
+            Some(HotOutcome::Applied)
+        );
+
+        let rejected = "❯ /model definitely-not-a-model\n  ⎿  Model 'definitely-not-a-model' not found\n";
+        match slash_verdict(before, rejected, "/model definitely-not-a-model", CC_MODEL_ACK) {
+            Some(HotOutcome::Failed(why)) => assert!(why.contains("not found"), "{why}"),
+            other => panic!("a rejected id must fall back, got {other:?}"),
+        }
+
+        let effort_after = "❯ /effort high\n  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation\n";
+        assert_eq!(
+            slash_verdict(before, effort_after, "/effort high", CC_EFFORT_ACK),
+            Some(HotOutcome::Applied)
+        );
+    }
+
+    /// The false-positive guard, which is the whole reason the verdict is a
+    /// BEFORE/AFTER comparison: a pane that already shows the ack from an
+    /// earlier identical switch must not certify a delivery that never
+    /// happened. A false negative here costs one restart; a false positive
+    /// would report a switch that did not occur.
+    #[test]
+    fn a_stale_ack_left_on_screen_is_not_a_verdict() {
+        let pane = "❯ /model sonnet\n  ⎿  Set model to Sonnet 5 and saved as your default for new sessions\n❯ do some work\n";
+        assert_eq!(
+            slash_verdict(pane, pane, "/model sonnet", CC_MODEL_ACK),
+            None,
+            "an unchanged pane is no evidence at all"
+        );
+        // Bare-substring matching would have said Applied here; anchoring on
+        // the echo of THIS command is what keeps it honest.
+        assert_eq!(slash_answer_count(pane, "/model opus", CC_MODEL_ACK), 0);
+        // Nothing rendered yet -> keep polling, do not conclude.
+        assert_eq!(slash_verdict("", "❯ /model opus\n", "/model opus", CC_MODEL_ACK), None);
+    }
+
+    /// The ack must be tied to its own echo, so a command whose answer is out
+    /// of the window does not borrow the neighbouring command's ack.
+    #[test]
+    fn the_ack_window_is_anchored_per_command() {
+        let pane = "❯ /model opus\n1\n2\n3\n4\n5\n6\n7\n  ⎿  Set model to Opus 5\n";
+        assert_eq!(
+            slash_answer_count(pane, "/model opus", CC_MODEL_ACK),
+            0,
+            "an answer {SLASH_ACK_WINDOW}+ lines away is not this command's answer"
+        );
+    }
+
+    /// A model id the SPA can produce must survive the round trip into a
+    /// slash command unchanged — no mapping table, verified against the real
+    /// CLI (see the module note). `[1m]` is the shape that would break a
+    /// naive sanitizer.
+    #[test]
+    fn spa_picker_values_pass_through_verbatim() {
+        for id in [
+            "opus",
+            "sonnet",
+            "haiku",
+            "claude-opus-5[1m]",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6[1m]",
+        ] {
+            assert_eq!(
+                validate_model_name(&json!(id)).unwrap(),
+                id,
+                "the SPA picker value {id} must survive validation untouched"
+            );
+            let cmd = format!("/model {id}");
+            let pane = format!("❯ {cmd}\n  ⎿  Set model to Something\n");
+            assert_eq!(slash_verdict("", &pane, &cmd, CC_MODEL_ACK), Some(HotOutcome::Applied));
+        }
+    }
+
+    /// Delivery failure is reported, not swallowed: `send_text` refuses a
+    /// session with no env file ("not running"), and that must arrive as
+    /// `Failed` so the caller restarts rather than reporting a hot switch.
+    #[tokio::test]
+    async fn a_refused_delivery_is_a_failure_not_a_hot_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let out = deliver_hot_config(&state, "amux-no-such-session-2617", "/model sonnet", CC_MODEL_ACK).await;
+        match out {
+            HotOutcome::Failed(_) => {}
+            other => panic!("a session that cannot receive the command must fail, got {other:?}"),
+        }
+        assert_eq!(
+            mode_after_delivery(&fold_hot_outcomes(&[out])),
+            SwapMode::Restart
         );
     }
 }
