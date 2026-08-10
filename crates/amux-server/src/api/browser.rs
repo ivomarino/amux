@@ -222,7 +222,8 @@ async fn profiles(Query(q): Query<ProfilesQuery>) -> Response {
             Ok(l) => l,
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
         };
-    Json(json!({ "profiles": list, "backends": ["native"] })).into_response()
+    let chrome_profiles = chrome::list_chrome_profiles();
+    Json(json!({ "profiles": list, "backends": ["native"], "chrome_profiles": chrome_profiles })).into_response()
 }
 
 #[derive(Deserialize)]

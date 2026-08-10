@@ -61,6 +61,30 @@ pub fn chrome_user_data_dir() -> PathBuf {
     }
 }
 
+/// Chrome user profiles from `Local State` → `profile.info_cache`.
+/// Returns directory names ("Default", "Profile 11", …) sorted.
+pub fn list_chrome_profiles() -> Vec<String> {
+    let local_state = chrome_user_data_dir().join("Local State");
+    let data = match std::fs::read_to_string(&local_state) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let Some(cache) = parsed
+        .get("profile")
+        .and_then(|p| p.get("info_cache"))
+        .and_then(|c| c.as_object())
+    else {
+        return vec![];
+    };
+    let mut names: Vec<String> = cache.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 /// Python `_bu_profile_dir`: where a profile name lives on disk. Pure in its
 /// inputs so tests can drive it hermetically.
 pub fn resolve_profile_dir(home: &Path, chrome_dir: &Path, name: &str) -> PathBuf {
