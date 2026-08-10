@@ -503,6 +503,7 @@ fn api_error_state(clean: &str) -> Option<(String, usize, String)> {
 // Claude TUI state (py 18479-18624, minus the server-side hysteresis)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum TuiState {
     Active,
     Waiting { reason: &'static str, detail: String },
@@ -538,6 +539,12 @@ fn claude_tui_state(clean: &str) -> TuiState {
             return TuiState::Active;
         }
         if s.starts_with("Running…") || RE_READING_FILES.is_match(s) {
+            return TuiState::Active;
+        }
+        // claude-fable-5 uses a non-dingbat prefix for its spinner
+        // ("« Quantumizing…"). U+00AB/U+00BB are outside the dingbat
+        // range but serve the same role.
+        if s.contains('…') && matches!(s.chars().next(), Some('«' | '»')) {
             return TuiState::Active;
         }
     }
@@ -598,6 +605,14 @@ fn claude_tui_state(clean: &str) -> TuiState {
 
     // Step 3: status bar secondary checks (py 18580-18589).
     if !status_bar.is_empty() {
+        // "esc to interrupt" on the status bar means a turn is actively
+        // running — it only appears during generation, not at the idle
+        // prompt. This must be checked BEFORE the bypass_on fallthrough
+        // to Idle (the bar can contain both "bypass permissions on" AND
+        // "esc to interrupt" simultaneously).
+        if status_bar.contains("esc to interrupt") {
+            return TuiState::Active;
+        }
         let bypass_on = status_bar.contains("bypass permissions on");
         if !bypass_on && RE_TOOL_APPROVAL_BAR.is_match(&status_bar) {
             return waiting("permission_prompt", &status_bar);
@@ -1402,6 +1417,39 @@ gemini-2.5-pro";
     fn codex_idle_prompt() {
         let ev = adapter("codex").scan(FX_CODEX_IDLE);
         assert_eq!(waiting_reasons(&ev), vec!["idle_prompt"], "{ev:?}");
+    }
+
+    // -- Status detection regressions ----------------------------------------
+
+    #[test]
+    fn bypass_on_with_esc_to_interrupt_is_active() {
+        // The status bar can contain both "bypass permissions on" AND
+        // "esc to interrupt" simultaneously — the latter wins because
+        // it only appears during active generation. Reported as IDLE
+        // while a worker was visibly generating with 2 subagents.
+        let frame = "\
+Running 1 shell command · 5s…
+  └ $ curl -sk \"$AMUX_URL/api/board\" | python3 -c \"
+    import json,sys
+    i=[x for x in json.load(sys.stdin) if x['id']=='BACKE-3045'][0]
+    print('status:',i['status'],'| type:',i.get('type'))
+    \" 2>&1 | head -60
+
+« Quantumizing… (10s · ↓ 84 tokens)
+
+                                                                        backend
+
+⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 2 agents                /rc failed";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+    }
+
+    #[test]
+    fn angle_quote_spinner_is_active() {
+        // claude-fable-5 uses « as its spinner prefix instead of a dingbat.
+        let frame = "« Quantumizing… (10s · ↓ 84 tokens)\n\n⏵⏵ bypass permissions on";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
     }
 
     // -- Ollama --------------------------------------------------------------
