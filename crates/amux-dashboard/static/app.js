@@ -6667,7 +6667,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.558';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.559';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28670,3 +28670,5 @@ async function _jrnlSaveConfig() {
   document.getElementById('jrnl-config-overlay')?.remove();
   _jrnlRenderEditor();
 }
+
+// REBUILD-PROBE-1786338364
