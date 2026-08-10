@@ -134,11 +134,23 @@ jobs:
         run: bash scripts/perf-ci.sh measured.json
       - name: Show the measurement
         run: cat measured.json
-      - name: Compare against docs/perf-baseline.json
-        # Thresholds live in scripts/perf-compare.py, stated per metric with
-        # the plan line each traces to. A breach prints the number, the
-        # baseline, the delta and the threshold, then exits non-zero.
-        run: python3 scripts/perf-compare.py --measured measured.json --record-missing --json-out perf-report.json
+      - name: Compare against the CI baseline
+        # NOT docs/perf-baseline.json. That file was measured on a developer's
+        # macOS box against the 640k-row LIVE database; this job measures a
+        # 12k-doc synthetic corpus on a shared Linux runner. Comparing them
+        # produces a red gate on day one for a reason no code change can fix
+        # (measured: board_avg_ms 79 vs 28 = +182%, rss 164 vs 66 = +148%) —
+        # and a gate that cries wolf on its first run is a gate that gets
+        # ignored on its hundredth.
+        #
+        # docs/perf-baseline-ci.json does NOT exist yet, on purpose. The first
+        # nightly records every metric and gates none of them EXCEPT the
+        # absolute ceilings from the plan (dashboard <500ms, health <50ms,
+        # board <200ms, search <50ms, RSS <200MB), which are targets rather
+        # than deltas and therefore hold with no baseline at all. Commit the
+        # uploaded measured.json as docs/perf-baseline-ci.json to start gating
+        # the deltas too.
+        run: python3 scripts/perf-compare.py --measured measured.json --baseline docs/perf-baseline-ci.json --record-missing --json-out perf-report.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -50,6 +50,47 @@ enum Cmd {
     },
     /// Server health.
     Health,
+    /// Universal search across cards, messages, memories, workers, journal
+    /// and schedules (RR-0110).
+    Search {
+        /// Query text. Ordinary typing: two words means AND, "quoted phrases"
+        /// stay phrases, punctuation is literal.
+        query: Option<String>,
+        /// Restrict to entity types, comma-separated
+        /// (task,message,memory,worker,journal,schedule).
+        #[arg(long)]
+        types: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Index health: per-type index counts vs the live tables.
+        #[arg(long)]
+        status: bool,
+        /// Rebuild the index from the source tables and print the counts.
+        #[arg(long)]
+        reindex: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Why did this happen? Provenance over the durable trails (RR-0109).
+    ///
+    /// `amux-rs why task AMUX-42` · `why worker backend` · `why command cmd_…`
+    /// `why schedule SCHED-108` · `why session my-lane` · `why integration gmail`
+    /// `why window --since 2026-08-09T10:00:00Z`
+    Why {
+        /// task | worker | command | schedule | session | integration | window
+        kind: String,
+        /// The entity id/name. Omitted for `window`.
+        id: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Print the raw JSON (every field, including per-source predicates).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -184,6 +225,12 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
         Cmd::Board { cmd } => board(cmd, c),
         Cmd::Workers { cmd } => workers(cmd, c),
         Cmd::Schedules { cmd } => schedules(cmd, c),
+        Cmd::Search { query, types, limit, status, reindex, json } => {
+            search(query.as_deref(), types.as_deref(), *limit, *status, *reindex, *json, c)
+        }
+        Cmd::Why { kind, id, since, until, limit, json } => {
+            why(kind, id.as_deref(), since.as_deref(), until.as_deref(), *limit, *json, c)
+        }
         Cmd::Send { worker, text } => {
             let body_text = match text {
                 Some(t) => t.clone(),
@@ -376,4 +423,253 @@ fn schedules(cmd: &SchedCmd, c: &Client) -> anyhow::Result<i32> {
             }
         }
     }
+}
+
+/// Print a line, stopping the command cleanly when the reader has gone away.
+///
+/// `println!` PANICS on EPIPE (Rust ignores SIGPIPE, so the write returns
+/// `BrokenPipe` and the macro unwraps it), which means `amux-rs why schedule
+/// SCHED-30 | head` exits **101 with a panic message** instead of 0 — measured
+/// on a real schedule with 220 output lines. A CLI that appears to crash when
+/// you pipe it into `head` teaches you not to trust its other exit codes,
+/// which is the opposite of what the `why` verdict codes are for.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let mut h = std::io::stdout().lock();
+        if writeln!(h, $($arg)*).is_err() {
+            // Reader closed the pipe: that is a normal end, not a failure.
+            return Ok(0);
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// RR-0110 — search
+// ---------------------------------------------------------------------------
+
+/// Minimal percent-encoding for a query-string VALUE. Everything that is not
+/// unreserved gets escaped, so a query containing `&`, `#`, `+` or a space
+/// reaches the server as typed. (Getting this wrong is silent: `a&b` would
+/// arrive as a stray parameter and the search would quietly run on `a`.)
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search(
+    query: Option<&str>,
+    types: Option<&str>,
+    limit: usize,
+    status: bool,
+    reindex: bool,
+    as_json: bool,
+    c: &Client,
+) -> anyhow::Result<i32> {
+    if reindex {
+        let (code, v) = c.send_json(reqwest::Method::POST, "/api/search/reindex", json!({}))?;
+        if !(200..300).contains(&code) {
+            eprintln!("reindex failed ({code}): {v}");
+            return Ok(3);
+        }
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    if status {
+        let v = c.get("/api/search/status")?;
+        if as_json {
+            outln!("{}", serde_json::to_string_pretty(&v)?);
+            return Ok(0);
+        }
+        let consistent = v["consistent"].as_bool().unwrap_or(false);
+        outln!(
+            "index: {} docs, {} fts rows — {}",
+            v["docs_total"], v["fts_rows"],
+            if consistent { "consistent" } else { "DRIFTED" }
+        );
+        for f in v["families"].as_array().cloned().unwrap_or_default() {
+            outln!(
+                "  {:<10} indexed={:<7} live={:<7} {}",
+                f["type"].as_str().unwrap_or("?"),
+                f["indexed"],
+                f["live"],
+                if f["consistent"].as_bool().unwrap_or(false) { "ok" } else { "MISMATCH" }
+            );
+        }
+        // A drifted index is a failure the caller should be able to branch on,
+        // not a line of output they have to read.
+        return Ok(if consistent { 0 } else { 4 });
+    }
+
+    let Some(q) = query else {
+        eprintln!("usage: amux-rs search <query> [--types t1,t2] [--limit N] | --status | --reindex");
+        return Ok(2);
+    };
+    let mut path = format!("/api/search?q={}&limit={limit}", urlencode(q));
+    if let Some(t) = types {
+        path.push_str(&format!("&types={}", urlencode(t)));
+    }
+    let v = c.get(&path)?;
+    if as_json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    let hits = v["hits"].as_array().cloned().unwrap_or_default();
+    let total = v["total"].as_i64().unwrap_or(0);
+    let capped = v["total_capped"].as_bool().unwrap_or(false);
+    outln!(
+        "{} hit(s){} in {}ms",
+        total,
+        if capped { "+ (count capped)" } else { "" },
+        v["took_ms"].as_u64().unwrap_or(0)
+    );
+    for h in &hits {
+        outln!(
+            "{:<9} {:<22} {}",
+            h["type"].as_str().unwrap_or("?"),
+            h["id"].as_str().unwrap_or("?"),
+            h["title"].as_str().unwrap_or("")
+        );
+        // The snippet arrives HTML-escaped with <mark> around matches; a
+        // terminal wants neither, so unwrap both here rather than asking the
+        // server for a second rendering of the same text.
+        let snip = h["snippet"]
+            .as_str()
+            .unwrap_or("")
+            .replace("<mark>", "[")
+            .replace("</mark>", "]")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+            .replace('\n', " ");
+        if !snip.trim().is_empty() {
+            outln!("          {snip}");
+        }
+    }
+    if hits.is_empty() {
+        // "No results" from a healthy index and "no results" from an index
+        // that stopped being maintained look identical, so say which one.
+        let st = c.get("/api/search/status")?;
+        if !st["consistent"].as_bool().unwrap_or(false) {
+            eprintln!(
+                "warning: the search index is DRIFTED from the source tables — this empty result may not mean 'no matches'. Run `amux-rs search --status` for the per-type counts."
+            );
+            return Ok(4);
+        }
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// RR-0109 — why
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn why(
+    kind: &str,
+    id: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+    as_json: bool,
+    c: &Client,
+) -> anyhow::Result<i32> {
+    // The CLI does NO correlation of its own: it asks the server the same
+    // question the dashboard would and prints the answer. Two implementations
+    // of the same joins is two places for the story to be wrong.
+    let path = if kind == "window" {
+        let mut p = format!("/api/why?limit={limit}");
+        if let Some(s) = since {
+            p.push_str(&format!("&since={}", urlencode(s)));
+        }
+        if let Some(u) = until {
+            p.push_str(&format!("&until={}", urlencode(u)));
+        }
+        p
+    } else {
+        let Some(id) = id else {
+            eprintln!("usage: amux-rs why <task|worker|command|schedule|session|integration> <id>");
+            eprintln!("       amux-rs why window [--since T] [--until T]");
+            return Ok(2);
+        };
+        format!("/api/why/{kind}/{}", urlencode(id))
+    };
+    let v = c.get(&path)?;
+    if as_json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    if let Some(err) = v["error"].as_str() {
+        eprintln!("error: {err}");
+        if let Some(kinds) = v["kinds"].as_array() {
+            eprintln!("kinds: {}", kinds.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        return Ok(2);
+    }
+
+    let verdict = v["verdict"].as_str().unwrap_or("?");
+    outln!("subject: {}", serde_json::to_string(&v["subject"])?);
+    outln!("verdict: {verdict} — {}", v["verdict_reason"].as_str().unwrap_or(""));
+    outln!();
+
+    outln!("timeline:");
+    for e in v["timeline"].as_array().cloned().unwrap_or_default() {
+        let at = e["at"].as_str().unwrap_or("(no recorded time)");
+        let actor = e["actor"].as_str().map(|a| format!(" [{a}]")).unwrap_or_default();
+        let src = &e["source"];
+        // Every line carries its table, which is the difference between a
+        // story and a checkable claim.
+        // 33 = the widest RFC3339 this server emits
+        // ("2026-08-10T01:47:07.483327+00:00" is 32). Narrower and the
+        // columns shear on exactly the rows with sub-second precision, which
+        // are the ones you are reading when two events share a second.
+        outln!(
+            "  {:<33}{:<14}{}{}  <- {}",
+            at,
+            e["kind"].as_str().unwrap_or("?"),
+            e["summary"].as_str().unwrap_or(""),
+            actor,
+            serde_json::to_string(src)?
+        );
+    }
+
+    outln!("\nsources consulted (including the ones that found nothing):");
+    for s in v["sources"].as_array().cloned().unwrap_or_default() {
+        outln!(
+            "  {:<24} rows={:<6} total={:<6} {}",
+            s["table"].as_str().unwrap_or("?"),
+            s["rows"],
+            s["rows_total"],
+            s["query"].as_str().unwrap_or("")
+        );
+        if let Some(note) = s["note"].as_str() {
+            outln!("      note: {note}");
+        }
+    }
+
+    let gaps = v["gaps"].as_array().cloned().unwrap_or_default();
+    if !gaps.is_empty() {
+        outln!("\nwhat this CANNOT tell you:");
+        for g in &gaps {
+            outln!("  - {}", g.as_str().unwrap_or(""));
+        }
+    }
+    // Exit codes are the machine-readable verdict: 0 explained, 5 partial,
+    // 6 cannot_tell. A script must not have to parse prose to learn that the
+    // answer was "I do not know".
+    Ok(match verdict {
+        "explained" => 0,
+        "partial" => 5,
+        _ => 6,
+    })
 }

@@ -19,6 +19,7 @@ pub mod email;
 pub mod file_viewer;
 pub mod files;
 pub mod fs;
+pub mod git_guard;
 pub mod gmail_auth;
 pub mod groups;
 pub mod health;
@@ -112,7 +113,14 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/email", email::routes())
         .nest("/api/cal-events", calendar::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
-        .route("/api/sessions", axum::routing::get(sessions_legacy::list_sessions_legacy))
+        // POST creates a FLEET worker (an env file), which is a different
+        // substrate from POST /api/workers (a `workers` table row) — the
+        // cutover moved GET and left the SPA's create dialog 405ing.
+        .route(
+            "/api/sessions",
+            axum::routing::get(sessions_legacy::list_sessions_legacy)
+                .post(sessions_legacy::create_session_legacy),
+        )
         // Per-name session verbs — NATIVE (AMUX-2598): peek/send/config/
         // start/stop/resize/duplicate/clone/steer/share/… answer from the
         // fleet substrate (env files + tmux + shared DB), api/session_verbs.rs.
@@ -194,6 +202,12 @@ pub fn router(state: AppState) -> Router {
         // path, so all three failed silently: no branch badges, per-worker
         // gates rendering as deleted, and an unactionable red offline banner.
         .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
+        // The shared-checkout staged-guard's endpoint. UNROUTED since the
+        // rust cutover — 405, ~1,147 calls/hour, and the installed
+        // .git/hooks/amux-staged-guard swallowed every one of them
+        // (`except Exception: return 0`), so every commit on every shared
+        // checkout has been unguarded and SILENT about it. See api/git_guard.rs.
+        .route("/api/git/staged-guard", axum::routing::post(git_guard::staged_guard))
         .route(
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
