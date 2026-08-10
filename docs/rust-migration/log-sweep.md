@@ -74,10 +74,42 @@ fallback when a finding needs row-level inspection.
    loopback caller failing auth repeatedly (a broken token on a lane).
 
 5. **Worker traffic with no board trace.** Collect distinct `worker` values from
-   `GET /api/logs?since=$SINCE&limit=2000`; cross-check `GET /api/board` for cards
-   with that session updated in the window. Finding = a worker generating real
-   API traffic whose board shows nothing in `doing`/updated — silent work
-   (task-ledger rule violation), or a runaway loop hammering the API.
+   `GET /api/logs?since=$SINCE&limit=2000`, keeping only rows whose `method` is
+   POST/PATCH/PUT/DELETE; cross-check
+   `GET /api/board?done_limit=100000` for cards with that session
+   updated in the window. Finding = a worker doing MUTATING work whose board
+   shows nothing in `doing`/updated — silent work (task-ledger rule violation),
+   or a runaway loop hammering the API.
+
+   Three qualifications, each from a false positive this rule produced on
+   2026-08-09 (AF-34). It accused a peer, and the accusation is the expensive
+   kind — you cannot un-say "you are working off-ledger":
+
+   - **Mutating methods only.** `amux-homepage` was flagged on 105 requests with
+     0 cards. All 105 were `GET/POST /api/sessions` — 103 GETs, every one a 200:
+     polling and messaging, not work. Reading the board and peeking at lanes is
+     not silent work, and under the old wording every idle observer looked guilty.
+   - **No cards on this board at all = UNKNOWN, not silent.** Boards are
+     per-instance. `amux-homepage`'s card (AH-70) is not on this board; it was
+     `verified` on their own instance the same day. A worker with zero cards here
+     is unmeasurable from here, and "unmeasurable" must not render as "violating".
+     Same cross-instance root as AF-28 (`CARD:` ids are not one namespace).
+   - **The board GET must be uncapped — but do NOT add `&archived=1`.**
+     Plain `GET /api/board` caps done items (1,441 of 4,689 when measured), so the
+     cross-check silently misses cards and invents silence; a related audit
+     reported 48 missing cards that way when the real number was 1. `done_limit`
+     alone fixes it: that response is already the union (4,766 rows).
+     `archived` is a FILTER, not an include-flag — `archived=1` returns ONLY
+     archived cards (2,553 rows, zero belonging to an active lane), which makes
+     the cross-check worse than the bug it was meant to fix. This is written down
+     because the first draft of THIS fix added `&archived=1` "to be thorough" and
+     its own control caught it: the author's lane came back with 0 cards while
+     holding 36. Adding a filter and removing one are each wrong half the time
+     (ethos rule 1) — copy the predicate from something that works, do not
+     re-derive it from what sounds careful.
+
+   Before filing, confirm the worker has *any* card here. If it does not, the
+   honest finding is "cannot evaluate from this board", not a violation.
 
 Also skim `GET /api/logs/raw?lines=500` for `sources:"server_log"` lines matching
 ERROR/WARN — the tracing tail carries failures that never became a request row.
