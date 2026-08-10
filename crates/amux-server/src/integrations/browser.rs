@@ -1159,12 +1159,46 @@ pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     let _ = c.eval(CAPTURE_JS, 10).await;
-    let landed = c
-        .eval("location.href", 10)
+    // WHERE WE LANDED IS A TARGET FACT, NOT A PAGE FACT (AC-324).
+    //
+    // A cross-origin navigation SWAPS the renderer process, which invalidates
+    // the execution context this CdpClient is bound to. `location.href` then
+    // evaluates in the dead pre-swap context and returns the OLD url — for a
+    // navigation that had briefly shown Chrome's error page, that is
+    // `chrome-error://chromewebdata/`, so a page that loaded perfectly reports
+    // nav_failed.
+    //
+    // Measured on cloud.amux.io: amux said `nav_failed: true, landed:
+    // chrome-error://` while the tab read `https://cloud.amux.io/` at +0s, +3s
+    // and +8s. That false verdict blocked all god-mode UI verification of
+    // prospect envs and sent two sessions chasing DNS, certificates and a
+    // "poisoned" browser profile — none of which were involved.
+    //
+    // `Page.getNavigationHistory` is answered by the BROWSER about the target,
+    // not by a script inside a renderer that may no longer exist, so it
+    // survives the swap. The eval stays as a fallback for the case where the
+    // history call is unavailable.
+    let landed = match c
+        .call("Page.getNavigationHistory", json!({}), std::time::Duration::from_secs(10))
         .await
         .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
+        .and_then(|v| {
+            let idx = v.get("currentIndex")?.as_i64()?;
+            let entries = v.get("entries")?.as_array()?;
+            entries
+                .get(idx as usize)?
+                .get("url")?
+                .as_str()
+                .map(str::to_string)
+        }) {
+        Some(u) if !u.is_empty() => u,
+        _ => c
+            .eval("location.href", 10)
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+    };
     let mut out = json!({ "ok": true, "url": landed, "ready_state": ready });
     // Landing check (Python `_bu_landing_check`): an open that cannot fail
     // sends the caller to debug the wrong layer — every later verb would run
