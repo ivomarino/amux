@@ -2635,3 +2635,99 @@ FIX: Same as the three entries above — this is not fixable by being careful, b
   per-session worktrees so `git add -A` is scoped by construction. Until then, treat
   "my change is uncommitted" as "my change may ship under someone else's message at a
   time I do not choose" (CLAUDE.md already says this; the entry is the evidence).
+
+## The shared cargo target dir served a stale rlib, so `cargo test` blamed three innocent files
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: claude (AMUX-2619/2780 lane)
+CARD: AMUX-2799
+SYMPTOM: With the now-mandated `CARGO_TARGET_DIR=~/.amux/rust-build-target` (e188b0e, "ONE
+  shared cargo target"), `cargo test -p amux-server` reported, in sequence, three DIFFERENT
+  compile errors in files I had never touched: `unresolved import
+  amux_server::runtime_jobs::registry`, `cannot find function title_needs_self_description
+  in module amux_core::board`, and a `migrate.rs` precondition panic naming the shared
+  target path. All three sources were byte-correct — I verified `pub mod registry;` with
+  `od -c`. The actual cause: the cached `libamux_server-*.rlib` was built from an older
+  tree. `strings` on it showed 6108 hits for `runtime_jobs..autofix` and ZERO for
+  `registry` and `storage`, the two newest modules, while the same rlib's own crate
+  compiled fine and lib.rs line 210 uses `runtime_jobs::registry`. Cargo's mtime
+  fingerprint never noticed, because mod.rs (13:24) was older than the rlib (14:27).
+COST: ~40 minutes, and three wrong conclusions I came close to reporting — twice I
+  concluded "another lane's uncommitted work has broken main" and started to write it up,
+  and once I concluded a committed test was broken under the mandated target dir. Every one
+  of those would have sent a peer to debug correct code. `cargo clean -p amux-server`
+  removed 48,516 files / 28.9GiB and fixed it for one invocation before it recurred;
+  `touch crates/amux-server/src/runtime_jobs/mod.rs` is what actually forced the rebuild.
+FIX: The failure mode is specific and cheap to detect: an rlib that does not export a
+  module its own crate source declares. A preflight in the test gate — compare `pub mod`
+  lines in each `mod.rs` against the built rlib, or simply `cargo build -p amux-server --lib`
+  and fail loudly if it is a no-op while sources are newer — would turn 40 minutes of
+  blaming peers into one line of output. Until then the recipe is: when `cargo test` names
+  a symbol you can see in the source with your own eyes, suspect the ARTIFACT before the
+  code, and `touch` the `mod.rs` that declares it. Related to the shared-checkout cluster
+  above: same root (one resource, many lanes), different resource (build artifacts, not
+  the git index).
+
+## `cargo check --workspace` in the pre-commit hook cannot tell MY broken change from a PEER's
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2777
+SYMPTOM: The shared checkout broke the workspace FOUR times in ~40 minutes from at least three
+  lanes: a `steer_enqueue` arity change mid-refactor (mine), `DetectorKind::CiFailure` non-exhaustive
+  match, `note_quiet_signatures` arity, and `amux_core::board::title_needs_self_description` missing
+  for orchestrator/runtime.rs:1288. Every one of them blocked EVERY lane's commits, because the hook
+  checks the WORKING TREE — which on a shared checkout contains everyone's in-flight edits, not the
+  change being committed.
+COST: amux-cloud's AC-335 bounced twice on other lanes' compile errors. I lost ~25 minutes to two
+  breaks that were not mine, and inflicted one on them. The gate's verdict carries no information
+  about the commit it is gating.
+FIX: check the STAGED state, not the working tree — `git write-tree` + `git archive` into a temp dir
+  is read-only w.r.t. the shared checkout, so it is safe to do under other lanes' edits. Cost is a
+  colder build per commit, which is the trade to price. Anything short of this keeps conflating
+  "your change is broken" with "someone else is mid-sentence".
+
+## `cargo test` was green while `cargo check` was green — and the compiled binary lacked my tests
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2777
+SYMPTOM: `cargo test -p amux-server --lib the_three_stalled_lanes` printed
+  `test result: ok. 0 passed; 0 failed; 752 filtered out` — twice, after a 31s build, with the same
+  binary hash. The tests were on disk (grep confirmed), in a plain `#[cfg(test)]` module whose OTHER
+  five tests were listed by `--list`. The full run minutes earlier reported 781 passed / 787 total;
+  `--list` then reported 751. The artifact was stale under heavy shared-CARGO_TARGET_DIR contention.
+COST: ~15 minutes, and it is the LOUD-WRONG probe shape: it exits 0 and says `ok`. A filter that
+  matches nothing is indistinguishable from a suite that passes, so the natural next move is to
+  believe the code is fine. Had I been verifying someone else's fix I would have reported it working.
+FIX: `0 passed AND 0 filtered-in` should never render as `ok` — but that is upstream. Locally: when
+  a name filter matches zero tests, treat it as a FAILED probe and re-run against `--list` before
+  concluding anything. Same family as the empty-grep rule in ethos.md rule 7.
+
+## A peer's `commit -a` swept my uncommitted work into their commit — twice, in both directions
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2807
+SYMPTOM: My entire AMUX-2785 steering fix landed inside 70dc3a8 "fix(build): commit registry + the
+  visibility changes its callers on main already reference" — a commit I did not write. I found out
+  only because `git status --short` came back EMPTY on four files I had edited minutes earlier, which
+  reads as "my work is gone" before it reads as "someone committed it". Symmetrically, amux-cloud's
+  AC-335 board_store fix went out inside my e188b0e storage commit. The staged-guard was DOWN for
+  both ("NOT ENFORCED — could not reach the amux server", 8822 then 8824, timing out).
+COST: No code lost either time, but each of us had to verify piece-by-piece that our own work had
+  landed intact rather than partially. Commit messages now describe work they do not contain, so the
+  archaeology is wrong for anyone who reads git log later — including the `Amux-Session` trailer,
+  which attributes my change to a commit stamped for a different piece of work.
+FIX: two halves. (1) The staged-guard must not fail open silently — AMUX-2807; if it cannot reach the
+  server, the unguarded commit should at least be COUNTED durably, or the guard is decoration exactly
+  when it matters. (2) `commit -a` on a shared checkout is the hazard itself; the guard should refuse
+  it, not merely warn, when the staged set spans files the committing session never touched.
