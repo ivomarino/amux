@@ -1786,28 +1786,35 @@ cmd_serve() {
     case "$_a" in
       -h|--help|help)
         cat <<EOF
-${BOLD}amux serve${RESET} - start the web dashboard (HTTPS by default)
+${BOLD}amux serve${RESET} - start the web dashboard (Rust server, HTTPS)
 
 ${BOLD}Usage:${RESET}
-  amux serve [port] [--bind host[,host,...]] [--no-tls]
+  amux serve [port]
 
 ${BOLD}Args:${RESET}
-  port                  TCP port to listen on (default: 8822). Cert helper uses port+1.
-  --bind host[,host..]  Comma-separated list of interface IPs to bind. Default: 0.0.0.0
-                        (every interface). Pass 127.0.0.1 to restrict to loopback,
-                        or e.g. 127.0.0.1,172.17.0.1 for loopback + docker0.
-  --no-tls              Serve plain HTTP instead of HTTPS (offline mode/PWA needs HTTPS).
+  port                  TCP port to listen on. Optional; exported as AMUX_RS_PORT.
+                        Default 8823; the installed launchd service uses 8824.
+
+${BOLD}Environment:${RESET}
+  AMUX_RS_PORT          Port to listen on (a positional port just sets this).
+  AMUX_RS_LEGACY_PORT   Additionally answer the legacy fleet port (8822) with the
+                        same router/TLS/auth, so sessions holding the baked-in
+                        AMUX_URL=https://localhost:8822 keep working. Set in
+                        ~/.amux/server.env.
 
 ${BOLD}Examples:${RESET}
   amux serve
-  amux serve 8822
-  amux serve 8822 --bind 127.0.0.1
-  amux serve 8822 --bind 127.0.0.1,172.17.0.1
-  amux serve 9000 --no-tls
+  amux serve 8824
 
-${BOLD}Security note:${RESET} the default 0.0.0.0 bind exposes the dashboard on every
-network interface this host is connected to (including public Wi-Fi LANs and
-public IPs). Use --bind to restrict, or layer a firewall rule on top.
+${BOLD}Note:${RESET} \`--bind\` and \`--no-tls\` are GONE. They were Python-server flags;
+the Rust server takes no argv, always binds 0.0.0.0, and always serves HTTPS
+(plain HTTP is redirected). Passing them now exits with an error rather than
+being silently ignored. Normally you do not run this by hand at all — the
+launchd agent com.amux.server-rs owns the process.
+
+${BOLD}Security note:${RESET} the 0.0.0.0 bind exposes the dashboard on every network
+interface this host is connected to (including public Wi-Fi LANs and public IPs).
+Layer a firewall rule, or use Tailscale, for anything beyond localhost.
 EOF
         return 0
         ;;
@@ -1829,6 +1836,8 @@ EOF
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
+${DIM}Legacy bash CLI: an HTTP client of the Rust server, kept until \`amux-rs\` reaches
+verb parity. New verbs land in amux-rs (crates/amux-cli).${RESET}
 
 ${BOLD}Worker management:${RESET}
   amux register <name> [flags]   Register a worker with Claude Code flags
@@ -1862,7 +1871,9 @@ ${BOLD}Dashboard:${RESET}
   amux                           Interactive dashboard (optimized for phone)
 
 ${BOLD}Web Dashboard:${RESET}
-  amux serve [port] [--bind host[,host,...]]  Start web dashboard (default: 8822, all interfaces)
+  amux serve [port]              Start the Rust server (normally launchd's job;
+                                 default 8823, installed service 8824, also
+                                 answers legacy 8822)
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues

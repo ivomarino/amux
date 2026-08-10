@@ -30,6 +30,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 CI treats warnings as errors. Integration tests marked `#[ignore]` (the live-model goldens in `golden_live.rs`/`golden_remaining.rs`) spend real agent tokens and are run manually.
 
+While iterating, `cargo check --workspace` is the fast syntax/type gate. If several agents or checkouts share this machine, point `CARGO_TARGET_DIR` at a scratch dir (e.g. `/tmp/amux-target`) so parallel builds don't thrash one lock.
+
+### Editing the dashboard SPA
+
+The SPA is real static files under `crates/amux-dashboard/static/` — no build step, no framework. Two rules:
+
+- **Bump `APP_VER` (`static/app.js`) and `CACHE` (`static/sw.js`) together.** Miss either and a browser holding the cached script never receives your fix — the change is live on the server and invisible to every existing client.
+- Syntax-check with `node --check crates/amux-dashboard/static/app.js`. A PostToolUse hook (`.claude/check-and-commit.sh`) does this automatically on agent edits; `node --check` proves the file *parses*, not that every function it calls exists, so still exercise the UI path you touched.
+
+### Shared checkout: check what you are shipping
+
+⚠ Several agent sessions may commit into the same working tree. **Any push of `main` ships every unpushed commit, not just yours** — and a peer's commit can sweep up your in-flight working-tree changes. Before pushing:
+
+```bash
+git fetch origin
+git rev-list --count origin/main..main    # how many commits am I about to ship?
+git log --oneline origin/main..main       # whose are they?
+```
+
+If commits you did not write are listed, confirm with their author before pushing. Re-read a shared file immediately before editing it.
+
 ## Project layout
 
 | Path | What |

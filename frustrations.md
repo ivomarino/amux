@@ -1138,3 +1138,29 @@ COST: ~30 minutes of incident reconstruction chasing a phantom second actor, bec
   artifacts (env header, session log markers, session_events).
 FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
   WHOLE handler future; a restart choreography should be a visibly long row.
+
+## `amux serve --help` documented two flags that the same command now refuses
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: amux (python-removal doc sweep subagent)
+CARD: AMUX-2621 (sibling umbrella for python-era doc drift; no dedicated card — this
+  session was scoped to file edits and did not create one)
+SYMPTOM: `cmd_serve` was retargeted from the deleted `amux-server.py` to the Rust
+  binary, which takes NO argv, so it gained `die "amux serve takes only an optional
+  port now"`. Its `--help` block was left untouched and still advertised
+  `--bind host[,host,...]` and `--no-tls`, with four worked examples using them
+  (`amux serve 8822 --bind 127.0.0.1`). Every one of those examples now exits 1.
+  The top-level `amux --help` carried the same dead `[--bind ...]` spelling plus the
+  pre-cutover default port (8822, which is now the LEGACY compat port, not the default).
+COST: no incident yet — caught during the doc sweep. The trap it was set to spring:
+  the sanctioned instruction and the failure are the same action (ethos rule 7's
+  sharpest variant, AMUX-2140), so a session following `--help` literally gets an
+  error and no way to tell "I typed it wrong" from "the help is stale".
+FIX: help rewritten to the Rust reality — positional port only, mapped onto
+  AMUX_RS_PORT, AMUX_RS_LEGACY_PORT documented, and an explicit note that `--bind`
+  and `--no-tls` are GONE (Python-server flags; the binary always binds 0.0.0.0 and
+  always serves HTTPS) so the removal reads as deliberate rather than as a bug.
+  Generalisable: when a verb is retargeted to a new backend, its `--help` is part of
+  the verb — retarget both or the command starts lying.

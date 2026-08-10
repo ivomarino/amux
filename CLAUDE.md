@@ -1,6 +1,15 @@
 # amux
 
-Single-file project: everything lives in `amux-server.py` (Python server + inline HTML/CSS/JS dashboard).
+A **Rust workspace** (`crates/amux-core`, `amux-server`, `amux-cli`, `amux-dashboard`)
+serving a static SPA. One binary answers **both** ports: 8824 (native) and the legacy
+fleet port 8822 (`AMUX_RS_LEGACY_PORT` — every running session has
+`AMUX_URL=https://localhost:8822` baked into its process env). Same `pid`, same
+`build` hash on both; `curl -sk https://localhost:8822/health` proves it.
+
+The Python predecessor (`amux-server.py`, single file, inline dashboard) was **deleted
+at commit 792ce1f** (2026-08-09). Git history has it. Nothing here should assume it
+exists — if you find an instruction that does, that instruction is stale and fixing it
+is in scope.
 
 ## The ethos — read before building anything
 
@@ -110,8 +119,8 @@ somebody can pick up.
 
 ## Structure
 
-amux is a **Rust workspace**. The Python predecessor (`amux-server.py`) was removed
-2026-08-09 — git history has it; do not resurrect it or add anything that depends on it.
+Do not resurrect the Python server (see the top of this file) or add anything that
+depends on it.
 
 - `crates/amux-server` — the server (axum): API in `src/api/`, SQLite layer in
   `src/db/`, SQL migrations in `migrations/`, orchestration in `src/runtime_jobs/`
@@ -225,6 +234,27 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   `CACHE` version (`crates/amux-dashboard/static/sw.js`) bumped together**, or a
   browser holding the cached script never receives the fix.
 
+## Observability — ask the server, do not grep for it
+
+Every `/api` request is recorded in a structured request log, and the server will
+answer diagnostic questions directly. **Reach for these before writing a grep.** The
+lesson is this repo's own, from 2026-08-09: diagnosing a 405 by hand — grepping
+`mod.rs` and every module to work out which methods were mounted where — cost roughly
+10x what one call to `/api/logs/analyze` cost, because the endpoint had already
+computed the answer and stated the verdict in a sentence.
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/logs/analyze?since_h=24` | Every error (status ≥ 400) grouped by (status, method, family, normalized target). For 404/405 it annotates `routed_methods` and `nearest_routes` and writes a plain `verdicts` sentence per group — including the two cells people get wrong: a 405 at a path with NO route is the GET-only SPA catch-all answering a non-GET, and a 405 whose method IS routed means the rows predate the current build (re-run before filing). |
+| `GET /api/logs/stats?since_h=24` | Per-family traffic/latency/error rollup, `slow_outliers`, and `percentile_method` named in the response so nobody has to guess how p95 was computed. |
+| `GET /api/debug/routes` | The whole route table as JSON — "is X routed, with which methods" is a GET, not a grep across modules. |
+| `GET /api/debug/boundary` | Ownership per API family. **`proxied: []` is the live proof the Rust server answers everything** (49 native families as of this writing); a non-empty list means something still hops. |
+| `GET /api/debug/tmux` | Runs fleet discovery from INSIDE the server process and reports argv, exit status, output sizes, and the env that picks the socket. It exists because the launchd instance once served `running=0` for the whole fleet while the same binary in a login shell served 49, and no log line could say why. |
+
+Raw server tracing is at `~/.amux/logs/server-rs.log`; the dashboard's Logs tab is the
+same request log with a UI. If a failure was hard to diagnose because no endpoint could
+express it, that missing instrument is the bug worth fixing (ethos rule 4).
+
 ## Deploy
 
 ⚠ **BEFORE `git push origin main`: check what you are shipping that is not yours.** This is a
@@ -264,6 +294,13 @@ shared checkout they are staged to ship under someone else's push, at a time you
 session's unpushed commit was replayed onto origin by a peer's `git pull --rebase` on 2026-08-03 —
 a third party's push shipped a commit its author never pushed. You control neither *when* your work
 ships nor *whether* it does.
+
+**And a peer's commit can silently REVERT your uncommitted work.** On 2026-08-09 a peer's
+`git commit -a`-shaped commit swept another agent's staged file *deletions* into HEAD while
+several files that agent had rewritten in the working tree reverted to their old content — the
+rewrite of THIS file was lost that way and had to be redone. Re-read a shared file immediately
+before you edit it, and after a peer commits, `git diff HEAD` the files you were mid-way through:
+your edit is not safe merely because you made it.
 
 When the user says **"deploy"**, run the full pipeline:
 1. `git add` changed files

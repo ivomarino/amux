@@ -36,7 +36,7 @@ Open **https://localhost:8824**, accept the self-signed cert warning once, and a
 
 ## Which server is real?
 
-**The Rust server (`crates/amux-server`, port 8824).** That is what `./install.sh` installs, what the dashboard talks to, and where all new work lands. Every `/api` family answers natively; the live proof is `GET /api/debug/boundary`, which reports `proxied: []`. If you are reading code, start in `crates/`. The Python file at the repo root is the [legacy predecessor](#legacy-the-python-server) kept only for the migration soak.
+**The Rust server (`crates/amux-server`, port 8824).** That is what `./install.sh` installs, what the dashboard talks to, and where all new work lands. Every `/api` family answers natively; the live proof is `GET /api/debug/boundary`, which reports `proxied: []`. If you are reading code, start in `crates/` — it is the only server code in the tree. The same binary also answers the legacy port 8822, so there is no second server to reason about; the Python predecessor is [gone](#legacy-the-python-server).
 
 ## Architecture
 
@@ -124,7 +124,7 @@ Local-first. Auth is a bearer token minted at `~/.amux/auth_token` (localhost ca
 
 ## LEGACY: the Python server
 
-> The Python predecessor (`amux-server.py`) was **removed at this commit** — git history has it, and [docs/rust-migration/](docs/rust-migration/) records how the Rust server replaced it (the Rust binary now answers both 8824 and the legacy 8822).
+> The Python predecessor (`amux-server.py`) was **removed at commit `792ce1f`** (2026-08-09) — git history has it, and [docs/rust-migration/](docs/rust-migration/) records how the Rust server replaced it (the Rust binary now answers both 8824 and the legacy 8822).
 > `cloud/` still runs the last-built Python image pending its own Rust migration; do not build anything new on it.
 > Historical install channels that shipped Python (`pipx install amux`, Homebrew) are retired — install with `./install.sh`.
 
