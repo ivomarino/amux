@@ -48,6 +48,85 @@ fn prompt_for(text: &str) -> String {
     )
 }
 
+
+/// The local ollama endpoint, if one is running. `AMUX_OLLAMA_URL` overrides.
+fn ollama_url() -> String {
+    std::env::var("AMUX_OLLAMA_URL")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".into())
+}
+
+/// How long ollama should keep the weights resident. This is the whole
+/// difference between a 3s lookup and a 19s one; the default (5m) evicts the
+/// model between uses on a machine doing anything else.
+fn ollama_keep_alive() -> String {
+    std::env::var("AMUX_OLLAMA_KEEP_ALIVE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "30m".into())
+}
+
+/// SMALLEST model wins, because "fastest and cheapest" is what was asked for and
+/// size is the only proxy for it that ollama reports without running anything.
+/// Returns None when ollama is not running or has nothing pulled — both of which
+/// are ordinary, and neither of which should cost the caller more than the
+/// connect timeout.
+async fn smallest_local_model(client: &reqwest::Client) -> Option<String> {
+    let v: Value = client
+        .get(format!("{}/api/tags", ollama_url()))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let mut models: Vec<(u64, String)> = v["models"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| {
+            Some((
+                m["size"].as_u64().unwrap_or(u64::MAX),
+                m["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    models.sort();
+    models.into_iter().next().map(|(_, n)| n)
+}
+
+/// Ask a resident local model. Returns (model, answer) or None to fall through
+/// to the CLI — never an error, because "no local model" is not a failure of the
+/// lookup, it is a machine without one.
+async fn try_local_model(prompt: &str) -> Option<(String, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S))
+        .build()
+        .ok()?;
+    let model = smallest_local_model(&client).await?;
+    let v: Value = client
+        .post(format!("{}/api/generate", ollama_url()))
+        .json(&json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "keep_alive": ollama_keep_alive(),
+        }))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let answer = v["response"].as_str()?.trim().to_string();
+    if answer.is_empty() {
+        return None; // fall through rather than serve an empty explanation
+    }
+    Some((model, answer))
+}
+
 pub async fn lookup(
     State(_state): State<AppState>,
     Json(body): Json<Value>,
@@ -68,6 +147,38 @@ pub async fn lookup(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "missing text"})),
         );
+    }
+
+    // FASTEST, CHEAPEST, ON THIS MACHINE (Ethan, 2026-08-10) — try a LOCAL
+    // model first.
+    //
+    // MEASURED on this machine, same trivial prompt, rather than assumed:
+    //     claude -p, default model      7.4s / 9.5s / 20.3s   (spawn + network)
+    //     claude -p --model haiku       8.1s / 15.1s / 24.5s
+    //     claude -p --model fable       20.2s
+    //     ollama, model cold            19.1s   (weights loading from disk)
+    //     ollama, model resident        2.8s / 3.0s / 3.4s
+    //
+    // The spread WITHIN one claude model (7.4s to 24.5s) is larger than the
+    // spread between models, so the CLI's cost is process boot and network, not
+    // inference — switching `--model` alone would not have fixed the "Looking
+    // up..." hang, and would have looked like a fix. A resident local model
+    // answers in ~3s and costs nothing per call.
+    //
+    // `keep_alive` is what makes that true: without it the model is evicted and
+    // every lookup pays the 19s cold load, which is worse than the CLI.
+    //
+    // Ordering, and it is deliberate: an explicit `AMUX_HELPER_MODEL` still wins
+    // over everything (D3 — the one knob stays authoritative, so this is a
+    // better DEFAULT, not a new pin). A machine with no ollama, or an ollama
+    // with no models pulled, falls through to the CLI exactly as before.
+    if std::env::var("AMUX_HELPER_MODEL").map(|m| m.trim().is_empty()).unwrap_or(true) {
+        if let Some((model, answer)) = try_local_model(&prompt_for(&text)).await {
+            return (
+                StatusCode::OK,
+                Json(json!({"text": answer, "model": model, "via": "ollama"})),
+            );
+        }
     }
 
     let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
