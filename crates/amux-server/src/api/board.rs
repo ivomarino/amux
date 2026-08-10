@@ -751,6 +751,10 @@ pub struct ListParams {
     pub done_limit: Option<i64>,
     #[serde(default)]
     pub slim: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 fn truthy(v: Option<&str>) -> bool {
@@ -825,8 +829,19 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
         Err(e) => return internal(e),
     };
     let (kept, term_total, term_kept) = bs::cap_terminal(rows, done_limit);
+    let total = kept.len();
     let now = now_secs();
-    let items: Vec<Value> = kept
+
+    let offset = p.offset.unwrap_or(0);
+    let page: &[bs::IssueRow] = if offset >= kept.len() {
+        &[]
+    } else if let Some(lim) = p.limit {
+        &kept[offset..(offset + lim).min(kept.len())]
+    } else {
+        &kept[offset..]
+    };
+
+    let items: Vec<Value> = page
         .iter()
         .map(|r| list_body(r, slim, is_stale(r, now, &working)))
         .collect();
@@ -849,6 +864,9 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
         "x-amux-terminal-returned",
         term_kept.to_string(),
     );
+    put(&mut headers, "x-amux-total", total.to_string());
+    put(&mut headers, "x-amux-offset", offset.to_string());
+    put(&mut headers, "x-amux-returned", items.len().to_string());
     (StatusCode::OK, headers, Json(Value::Array(items))).into_response()
 }
 
