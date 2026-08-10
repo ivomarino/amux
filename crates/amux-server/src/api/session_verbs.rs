@@ -4005,7 +4005,10 @@ async fn resize_pane(name: &str, cols: i64, rows: i64) -> (bool, String) {
     // "already sized" path too — a reader sitting still at one width is still a
     // reader, and refreshing only on CHANGE would yank the pane back under them.
     crate::runtime_jobs::pane_size::note_resize(&tmux_name(name));
-    let cols = cols.clamp(50, 300);
+    // Never shrink below spawn width: a narrow peek must not degrade the worker.
+    // The SPA has overflow-x:auto so the viewer scrolls instead.
+    let spawn_cols = crate::runtime_jobs::pane_size::configured_cols() as i64;
+    let cols = cols.clamp(spawn_cols, 300);
     let rows = rows.clamp(20, 100);
     let stq = st(name);
     if let Some(o) = tmux(&["list-clients", "-t", &stq, "-F", "#{client_name}"]).await {
