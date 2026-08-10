@@ -342,7 +342,7 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await;
-        crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge").await;
+        crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge", "").await;
         sent += 1;
     }
     sent
@@ -367,6 +367,13 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
         }
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+            // One call so the tick and the cadence it was paced at cannot be
+            // recorded separately — `every` is resolved in here, so this is
+            // the only place that knows it. Surfaces on /api/system-jobs.
+            super::registry::tick_every(
+                super::registry::ids::COMMIT_NUDGE,
+                std::time::Duration::from_secs(every),
+            );
             let lanes = idle_lanes_with_dirs(&state);
             if lanes.is_empty() {
                 continue;

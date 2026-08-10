@@ -274,7 +274,7 @@ impl Fleet for LiveFleet {
         crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
     }
     async fn deliver(&self, lane: &str, text: &str) {
-        crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive").await;
+        crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive", "").await;
     }
 }
 
