@@ -2379,3 +2379,33 @@ FIX: CLAUDE.md's Deploy section documents this hazard in the OTHER direction (yo
   billing: on a shared checkout `git add -A` / `git commit -a` stages other lanes'
   live edits, and a lane cannot tell from its own session that it happened. Stage by
   explicit path, and check `git status` for files you did not touch before committing.
+
+## The shared-checkout sweep shipped a BROKEN BUILD, because the swept work included a new untracked file
+AREA: git
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux (subagent — legacy-port migration)
+CARD: AMUX-2769
+SYMPTOM: Not a new frustration — see the four existing entries on `git add` sweeping a peer's
+  uncommitted hunk (AMUX-2443, now `done`, plus lines 117 / 292 / 548). This is a DISTINCT
+  consequence worth its own row. My in-flight edits to `lib.rs`, `config.rs`,
+  `session_verbs.rs`, `api/mod.rs` and `api/request_log.rs` were swept into 9a91945 and
+  4ac14b9 by another lane — but the module those edits CALL, `legacy_port.rs`, was a NEW
+  file and therefore untracked, so `git add <tracked paths>` could not pick it up. main was
+  left referencing a module that did not exist: unbuildable for 3 minutes until c3f5e0f
+  ("commit legacy_port + canonical_port, whose callers were already on main") patched it.
+  Both commits are already pushed to origin.
+COST: Small here (a peer noticed and fixed it in 3 minutes, and their commit message shows
+  they diagnosed it correctly). The reason to log it is that it inverts the usual
+  mitigation: the standing advice for the sweep is "stage narrowly, by path", and staging
+  narrowly is EXACTLY what produced an unbuildable main. A sweep that takes everything
+  would at least have been self-consistent. It also means my work reached origin without
+  me, while I was under an explicit instruction not to commit or push — so "I did not
+  push" is not the same as "my work did not ship".
+FIX: The existing guard checks for a peer's modified files in the index. It should also
+  refuse when the staged set REFERENCES an untracked file in the same crate (a `mod X;` or
+  `crate::X` naming a path that is untracked) — cheap to detect and it is the difference
+  between shipping a peer's diff and shipping a build break. Cheaper interim: make the
+  auto-build service's failure page name the untracked file, since "cannot find module
+  legacy_port" is currently only visible to whoever next compiles.

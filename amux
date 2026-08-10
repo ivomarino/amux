@@ -3,9 +3,18 @@
 # Usage: amux [command] [args...]
 #
 # LEGACY CLIENT, pending amux-rs verb parity: this bash CLI is an HTTP client
-# of the Rust server (which answers both 8822 and 8824) — it is NOT part of the
-# removed Python server, and the fleet's muscle memory (amux send/board/alert)
-# runs through it. Keep it working until crates/amux-cli covers every verb.
+# of the Rust server — it is NOT part of the removed Python server, and the
+# fleet's muscle memory (amux send/board/alert) runs through it. Keep it working
+# until crates/amux-cli covers every verb.
+#
+# It talks to 8824, the canonical port (AMUX_RS_PORT, what install.sh sets).
+# 8822 is the RETIRED address, answered only by a countdown bind for pre-cutover
+# processes — see crates/amux-server/src/legacy_port.rs. Do not point anything
+# new at it. Override with AMUX_API for a non-default server.
+#
+# This file is symlinked from ~/.local/bin/amux and re-read on every invocation,
+# so editing the default here moves the whole fleet's bash-CLI traffic at once,
+# with no restart — which is why it is the cheapest lever in the migration.
 
 set -euo pipefail
 
@@ -165,7 +174,7 @@ need_herdr() {
 
 _start_via_api() {
   local name="$1"
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local resp
   resp=$(curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/sessions/$name/start" 2>/dev/null) || resp=""
@@ -190,7 +199,7 @@ PYEOF
 
 _stop_via_api() {
   local name="$1"
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local resp
   resp=$(curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/sessions/$name/stop" 2>/dev/null) || resp=""
@@ -754,7 +763,7 @@ cmd_send() {
 _send_via_api() {
   local name="$1" text="$2" nb="${3:-}"
   local tname; tname=$(tmux_name "$name")
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local body resp rc
   body=$(MSG="$text" NB="$nb" python3 -c "
 import json, os
@@ -1158,7 +1167,7 @@ Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--r
       # mixpeek-frustrations suggested rather than by it being reported.
     curl -sk -X PATCH -H 'Content-Type: application/json' \
       -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$_obody" \
-      "${AMUX_API:-https://localhost:8822}/api/board/$id" \
+      "${AMUX_API:-https://localhost:8824}/api/board/$id" \
     | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
@@ -1195,7 +1204,7 @@ print(json.dumps(b))' ${checked[@]+"${checked[@]}"})
     -H 'Content-Type: application/json' \
     -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
     -d "$body" \
-    "${AMUX_API:-https://localhost:8822}/api/board/$id"
+    "${AMUX_API:-https://localhost:8824}/api/board/$id"
 }
 
 # Outcome-based exit for board mutations (AMUX-2140): the CLI used to report
@@ -1289,7 +1298,7 @@ sys.exit(1)' "${1:-}" "${2:-}" "${3:-}"
 }
 
 cmd_board() {
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local subcmd="${1:-help}"; shift 2>/dev/null || true
 
   case "$subcmd" in
@@ -1847,10 +1856,12 @@ ${BOLD}Args:${RESET}
 
 ${BOLD}Environment:${RESET}
   AMUX_RS_PORT          Port to listen on (a positional port just sets this).
-  AMUX_RS_LEGACY_PORT   Additionally answer the legacy fleet port (8822) with the
-                        same router/TLS/auth, so sessions holding the baked-in
-                        AMUX_URL=https://localhost:8822 keep working. Set in
-                        ~/.amux/server.env.
+  AMUX_RS_LEGACY_PORT   Additionally answer the RETIRED port (8822) with the
+                        same router/TLS/auth, so pre-cutover sessions holding a
+                        baked-in AMUX_URL=https://localhost:8822 keep working.
+                        Set in ~/.amux/server.env. Being retired: check
+                        GET /api/debug/legacy-port for who still calls it, and
+                        drop the var when that reads zero for 7 days.
 
 ${BOLD}Examples:${RESET}
   amux serve
@@ -1899,7 +1910,7 @@ cmd_config() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     export)
-      curl -sk "${AMUX_API:-https://localhost:8822}/api/config/export" \
+      curl -sk "${AMUX_API:-https://localhost:8824}/api/config/export" \
       | python3 -c '
 import sys, json, yaml
 d = json.load(sys.stdin)
@@ -1920,7 +1931,7 @@ if not isinstance(doc, dict):
 print(json.dumps(doc))
 ' "$f") || die "could not parse $f as YAML"
       curl -sk -X PUT -H 'Content-Type: application/json' -d "$body" \
-        "${AMUX_API:-https://localhost:8822}/api/config/apply" \
+        "${AMUX_API:-https://localhost:8824}/api/config/apply" \
       | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
@@ -1939,7 +1950,7 @@ sys.exit(1 if errs else 0)
     skin)
       # What a given worker actually renders with, after the layer merge.
       local w="${1:-}"
-      curl -sk "${AMUX_API:-https://localhost:8822}/api/skin?worker=${w}" \
+      curl -sk "${AMUX_API:-https://localhost:8824}/api/skin?worker=${w}" \
       | python3 -c '
 import sys, json, yaml
 d = json.load(sys.stdin)
@@ -2002,8 +2013,8 @@ ${BOLD}Dashboard:${RESET}
 
 ${BOLD}Web Dashboard:${RESET}
   amux serve [port]              Start the Rust server (normally launchd's job;
-                                 default 8823, installed service 8824, also
-                                 answers legacy 8822)
+                                 installed service 8824, bare default 8823;
+                                 also answers retired 8822 while it is bound)
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
@@ -2054,7 +2065,7 @@ EOF
 }
 
 cmd_tunnel() {
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local subcmd="${1:-status}"; shift 2>/dev/null || true
 
   case "$subcmd" in
@@ -2150,7 +2161,7 @@ cmd_alert() {
   esac
   # Urgent owner alert — USE SPARINGLY. Fires an in-app push + iMessage to the
   # amux owner (Ethan). For anything a session needs the owner to see NOW.
-  local AMUX_API="${AMUX_API:-https://localhost:8822}"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local msg="${1:-}"
   [[ -n "$msg" ]] || die "Usage: amux alert \"<message>\" [reason]
 This is a FIRE ALARM — only for things that need the owner immediately

@@ -130,14 +130,23 @@ RUN chmod 0755 /usr/local/bin/amux-server-rs /usr/local/bin/amux-rs /usr/local/b
 WORKDIR /app
 ENV HOME=/root
 
-# 8822, not the rust default 8823 or the installer's 8824, and this is load
-# bearing in two places at once:
-#   1. the gateway proxies 127.0.0.1:<host_port> -> :8822 in the container, and
-#   2. the server injects `AMUX_URL=https://localhost:8822` into every tmux lane
-#      it starts (session_verbs.rs:3270) with that port HARDCODED. Move the
-#      listener and every agent in the workspace gets an AMUX_URL pointing at
-#      nothing, which fails as "amux board did nothing" rather than as a port
-#      mismatch.
+# 8822, not the rust default 8823 or the installer's 8824. One reason now, not
+# two: the gateway proxies 127.0.0.1:<host_port> -> :8822 in the container, so
+# this must match cloud/docker/docker-compose.template.yml and gateway.py.
+#
+# The SECOND reason is gone as of 2026-08-10, and the fix is worth knowing about
+# because it is what freed this line: the server used to inject
+# `AMUX_URL=https://localhost:8822` into every tmux lane with the port HARDCODED
+# (session_verbs.rs), so moving this listener silently pointed every agent in the
+# workspace at nothing — a failure that surfaced as "amux board did nothing"
+# rather than as a port mismatch. It now derives the injected URL from
+# `config::canonical_port()`, i.e. from THIS variable. So the container can be
+# moved to any port by changing this line plus the two proxy targets, and lanes
+# follow automatically.
+#
+# NOTE: the container's 8822 is unrelated to the LOCAL install's retired 8822
+# (crates/amux-server/src/legacy_port.rs). Same number, different deployment;
+# nothing here is affected by that retirement.
 ENV AMUX_RS_PORT=8822
 
 # WITHOUT THIS, EVERY AGENT LANE IN EVERY WORKSPACE DIES AT LAUNCH.

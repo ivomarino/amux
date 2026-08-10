@@ -3,10 +3,9 @@
 **Every /api family is RUST-NATIVE. Zero families proxy to Python (AMUX-2608:
 `/api/scope` was the last row; its native port emptied `PROXIED_FAMILIES`).**
 
-Two servers still run on this machine during the migration soak: **Rust**
-(`crates/amux-server`, :8824) answers everything natively; **Python**
-(`amux-server.py`, :8822) is the deprecated predecessor kept alive until the
-cutover-runbook gates retire it. The code twin of this file is the registry in
+One server runs on this machine: **Rust** (`crates/amux-server`, **:8824**),
+which answers everything natively. The Python predecessor (`amux-server.py`) was
+deleted at 792ce1f; nothing proxies anywhere. The code twin of this file is the registry in
 `crates/amux-server/src/api/py_proxy.rs` (`PROXIED_FAMILIES` — **empty, and
 asserted empty** by `tests/proxy_composition.rs` — plus `NATIVE_FAMILIES`),
 served live at **`GET /api/debug/boundary`**, which now reports `proxied: []`.
@@ -100,7 +99,7 @@ Rules (the mechanism outlives its last row on purpose):
   (`tests/fixtures/boundary/live_recorded.json`, GET-only capture) against the native
   handlers — hermetic, runs in CI.
 - Live oracle: `tests/boundary_live_oracle.rs` (`--ignored`) runs identical GETs
-  against :8822 and the native router; 2026-08-09 run post-AMUX-2608: **51 paths
+  against the then-live Python server on :8822 and the native router; 2026-08-09 run post-AMUX-2608: **51 paths
   agreed, 0 diffs** (fs list/read/search, ls, autocomplete, groups both spellings,
   all 14 live group configs, 3 scoped callers, and `/api/scope`: global read,
   4 validation shapes, all 14 group-level reads against live-seeded
@@ -118,3 +117,78 @@ Rules (the mechanism outlives its last row on purpose):
 - Composition: `tests/proxy_composition.rs` pins proxied families to the proxy
   (honest 502 on dead python), native families to no-proxy-stamp, and the registry
   to the mounts.
+
+---
+
+## The legacy port 8822 — retirement, and the number that decides it
+
+**8824 is the address.** `install.sh` sets `AMUX_RS_PORT=8824`; the launchd agent,
+both CLIs, the dashboard's localhost preset, the scripts, the e2e configs, this
+repo's docs and the fleet's agent instructions all point there.
+
+The same binary ALSO answers **8822**, gated on `AMUX_RS_LEGACY_PORT` in
+`~/.amux/server.env` — same router, same TLS, same auth. It exists for exactly one
+reason, and it is not a feature:
+
+> ~60 fleet sessions were started before the cutover and carry
+> `AMUX_URL=https://localhost:8822` in their **process env**. A live process's
+> environment cannot be rotated. Drop the bind and every one of them starts
+> failing its board/API calls at once.
+
+The population only shrinks as those sessions restart naturally. Newly-spawned
+sessions are already correct: `session_verbs.rs` now derives the injected
+`AMUX_URL` from `config::canonical_port()` (the port this server actually answers
+on) instead of the old hardcoded literal — which is also what let the cloud image
+stop being pinned to 8822 by a local constant.
+
+### How to know when it can go
+
+Two instruments, both live, because "has the fleet rotated yet?" was previously a
+guess and a wrong guess is either a legacy port kept forever or 60 broken sessions
+(ethos rule 4):
+
+```bash
+curl -sk $AMUX_URL/api/debug/legacy-port
+```
+
+reports `hits_total` for the current uptime, `last_hit`, and a `clients` array
+naming every IP + user-agent that has called the legacy port, loudest first — so
+a non-zero count is immediately actionable rather than just discouraging. The
+count is taken by a middleware LAYER on the legacy listener, not from the `Host`
+header, so a hit means the request physically arrived on that socket.
+
+The server also logs **once per hour**: `WARN` naming the top callers while
+anything is still arriving, `INFO` saying zero when nothing is. Zero is logged
+deliberately — a reporter that goes quiet on zero cannot be told apart from a
+reporter that died.
+
+```bash
+grep 'legacy port' ~/.amux/logs/server-rs.log | grep WARN | tail
+```
+
+### EXIT CONDITION
+
+Drop the bind when **both** hold:
+
+1. `hits_total == 0` with `window.hours_elapsed >= 168` (**7 days** of continuous
+   uptime). Seven days, not one hour: a parked session can be silent for days and
+   then take a single turn. Note the window **resets on restart**, and this server
+   re-execs on every install — check `window.started_at` before trusting it.
+2. `clients` is empty — nothing seen at all, as distinct from "a known caller went
+   quiet".
+
+`ready_to_retire` in the payload computes exactly this, so it is one field to read
+rather than three to reason about.
+
+Then, in one change:
+
+- remove `AMUX_RS_LEGACY_PORT=8822` from `~/.amux/server.env`
+- delete the legacy bind block in `crates/amux-server/src/lib.rs`
+- delete `crates/amux-server/src/legacy_port.rs`, its route in `api/mod.rs` and its
+  `ROUTE_TABLE` row in `api/request_log.rs`
+- drop the `legacy-port` allowlist entries in
+  `crates/amux-server/tests/legacy_port_guard.rs` (the guard that keeps a hardcoded
+  `localhost:8822` from reappearing stays)
+
+Until then: **do not point anything new at 8822**, and do not drop the bind on the
+assumption the fleet has rotated. Read the counter.

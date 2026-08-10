@@ -80,10 +80,12 @@ from urllib.parse import urlparse
 IS_MACOS = sys.platform == "darwin"
 IS_DOCKER = Path("/.dockerenv").exists()
 
-# The rust server binds BOTH 8824 (AMUX_RS_PORT) and 8822 (the port the fleet and
-# every client still use) from one process — verified live: pid 8831 held both.
-# Probing 8824 is therefore sufficient, and it is the port the launchd agent
-# actually configures, so it is the honest thing to health-check.
+# The rust server binds BOTH 8824 (AMUX_RS_PORT) and the retired 8822 from one
+# process — verified live: pid 8831 held both. Probing 8824 is therefore
+# sufficient, and it is the port the launchd agent actually configures and the
+# only address anything new should use, so it is the honest thing to
+# health-check. (8822's bind is a countdown for pre-cutover processes; see
+# docs/rust-migration/server-boundary.md.)
 AMUX_PORT = int(os.environ.get("AMUX_RS_PORT", os.environ.get("AMUX_PORT", 8824)))
 _SCHEME = "https" if IS_MACOS else "http"
 HEALTH_URL = os.environ.get("WATCHDOG_HEALTH_URL", f"{_SCHEME}://localhost:{AMUX_PORT}/health")

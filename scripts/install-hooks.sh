@@ -54,7 +54,7 @@ fi
 # fails open and (before 2026-08-09) said nothing: POST /api/git/staged-guard
 # answered 405 for the whole rust cutover, ~1,147 calls an hour, every one
 # swallowed. Report it here, where someone is already looking at hooks.
-URL="${AMUX_URL:-https://localhost:8822}/api/git/staged-guard"
+URL="${AMUX_URL:-https://localhost:8824}/api/git/staged-guard"
 code=$(curl -sk -o /dev/null -w '%{http_code}' -m 3 -X POST \
         -H 'Content-Type: application/json' -d '{}' "$URL" 2>/dev/null || echo 000)
 case "$code" in

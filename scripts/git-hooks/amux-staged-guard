@@ -62,7 +62,7 @@ def main():
           "Cross-session sweep protection is OFF for this commit.\n" % (e,))
         return 0
 
-    url = os.environ.get("AMUX_URL", "https://localhost:8822").rstrip("/") \
+    url = os.environ.get("AMUX_URL", "https://localhost:8824").rstrip("/") \
         + "/api/git/staged-guard"
     body = json.dumps({"session": sess, "dir": top, "paths": paths,
                        "op": "commit", "guard_version": GUARD_VERSION}).encode()

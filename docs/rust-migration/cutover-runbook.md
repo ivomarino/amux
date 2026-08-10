@@ -1,5 +1,11 @@
 # Cutover Runbook — Python → Rust (Phase 11)
 
+> **HISTORICAL (the cutover happened at 792ce1f, 2026-08-09).** Ports below are
+> as they were during the cutover. Today the address is **8824**; 8822 survives
+> only as a compatibility bind for pre-cutover processes and is being retired —
+> see [server-boundary.md § The legacy port 8822](server-boundary.md#the-legacy-port-8822--retirement-and-the-number-that-decides-it)
+> for the exit condition. Do not take a port from this file as current.
+
 The strangler-fig sequence for moving `amux-server.py` (port 8822) to
 `amux-server` (Rust). Every step is reversible until step 6; the DB file is
 bilingual by construction (additive-only migrations, proven by the

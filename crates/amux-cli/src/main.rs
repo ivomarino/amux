@@ -245,7 +245,16 @@ fn restore_default_sigpipe() {}
 /// Note this is the CLIENT's default and deliberately differs from the SERVER's
 /// `DEFAULT_PORT` (8823), which stays put so a dev `cargo run -p amux-server`
 /// binds a free port instead of colliding with the running service.
-const DEFAULT_CLIENT_URL: &str = "https://localhost:8822";
+///
+/// 8824, not 8822 (2026-08-10): 8824 is what `install.sh` sets
+/// (`AMUX_RS_PORT`, the launchd agent's port) and therefore the port a working
+/// install answers on. 8822 is the RETIRED address, kept alive only by a
+/// countdown bind for pre-cutover processes whose env cannot be rotated
+/// (`amux_server::legacy_port`). A client default pointing at a port scheduled
+/// for deletion is a connection error with a date on it — and per the incident
+/// above, a connection error from the CLIENT's own misconfiguration reads as
+/// the server being down.
+const DEFAULT_CLIENT_URL: &str = "https://localhost:8824";
 
 fn resolve_url(explicit: Option<String>) -> String {
     [explicit, std::env::var("AMUX_URL").ok()]

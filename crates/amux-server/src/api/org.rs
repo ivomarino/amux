@@ -8,8 +8,9 @@
 //!   the first time anyone asks about it.
 //! - Invite URLs are built from the REQUEST's `Host` header +
 //!   `X-Forwarded-Proto` (https only when the gateway says https, http
-//!   otherwise, default host `localhost:8822`) — byte-identical to Python's
-//!   `f"{scheme}://{host}/invite/{token}"`.
+//!   otherwise, default host `localhost:<canonical port>`) — Python's shape
+//!   `f"{scheme}://{host}/invite/{token}"`, with the fallback host derived
+//!   from this server's own port instead of Python's 8822 literal.
 //! - Tokens are `secrets.token_urlsafe(24)`-shaped (24 CSPRNG bytes,
 //!   base64url, no padding — 32 chars); invites expire in 7 days; the
 //!   invites list hides used AND expired rows.
@@ -71,12 +72,16 @@ fn token_urlsafe(nbytes: usize) -> String {
 }
 
 /// Python: `scheme = "https" if X-Forwarded-Proto == "https" else "http"`,
-/// host from the Host header (default "localhost:8822").
+/// host from the Host header. The fallback host is this server's OWN port
+/// (`config::canonical_port()`), not Python's 8822 literal — an invite link is
+/// mailed to a person and outlives the process, so minting it against the
+/// retired address hands out a URL with an expiry date on it.
 fn base_url(headers: &HeaderMap) -> String {
+    let fallback = format!("localhost:{}", crate::config::canonical_port());
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:8822");
+        .unwrap_or(&fallback);
     let scheme = if headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -480,7 +485,10 @@ mod tests {
         // Default host/scheme when the headers are absent.
         let (_, inv2) = send(&app, "GET", "/api/org/invites", None, &[]).await;
         let url = inv2[0]["url"].as_str().unwrap();
-        assert!(url.starts_with("http://localhost:8822/invite/"), "{url}");
+        // Derived, not literal: the fallback follows this server's own port,
+        // so hardcoding one here would pin the test to a deployment.
+        let want = format!("http://localhost:{}/invite/", crate::config::canonical_port());
+        assert!(url.starts_with(&want), "{url} should start with {want}");
     }
 
     #[tokio::test]

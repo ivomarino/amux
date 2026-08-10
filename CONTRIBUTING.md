@@ -6,7 +6,7 @@ Thanks for your interest in amux! The product is a Rust workspace (`crates/`) se
 
 **All new work lands in the Rust server** (`crates/amux-server`, port 8824). If a family of endpoints exists, it answers natively there; the ownership map is [docs/rust-migration/server-boundary.md](docs/rust-migration/server-boundary.md), cross-checked by tests and served live at `GET /api/debug/boundary`.
 
-> **Legacy:** the Python predecessor (`amux-server.py`) has been removed — git history has it, and the Rust server answers the legacy 8822 port as well as 8824. Only `cloud/` still runs the last-built Python image, pending its own Rust migration; do not build anything new on it.
+> **Legacy:** the Python predecessor (`amux-server.py`) has been removed — git history has it, and the Rust server answers 8824, plus the retired 8822 via a compatibility bind that is being removed (`GET /api/debug/legacy-port`). Only `cloud/` still runs the last-built Python image, pending its own Rust migration; do not build anything new on it.
 
 ## Local development
 

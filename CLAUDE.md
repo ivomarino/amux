@@ -1,10 +1,20 @@
 # amux
 
 A **Rust workspace** (`crates/amux-core`, `amux-server`, `amux-cli`, `amux-dashboard`)
-serving a static SPA. One binary answers **both** ports: 8824 (native) and the legacy
-fleet port 8822 (`AMUX_RS_LEGACY_PORT` — every running session has
-`AMUX_URL=https://localhost:8822` baked into its process env). Same `pid`, same
-`build` hash on both; `curl -sk https://localhost:8822/health` proves it.
+serving a static SPA. **The address is 8824** (`AMUX_RS_PORT`, what `./install.sh`
+sets) — use it everywhere.
+
+The same binary also answers **8822**, the RETIRED port, via a compatibility bind
+(`AMUX_RS_LEGACY_PORT`) that exists for one reason: sessions started before the
+cutover have `AMUX_URL=https://localhost:8822` in their PROCESS env, and a live
+process's env cannot be rotated. Same `pid`, same `build` hash on both;
+`curl -sk https://localhost:8824/health` and `:8822/health` prove it.
+
+That bind is a countdown, not an address. Do not point anything new at 8822, and
+do not drop the bind on a hunch: `GET /api/debug/legacy-port` reports how many
+requests still arrive there and from which clients, and the server logs an hourly
+WARN naming them. Exit condition (zero hits for 7 days) is in
+`crates/amux-server/src/legacy_port.rs` and docs/rust-migration/server-boundary.md.
 
 The Python predecessor (`amux-server.py`, single file, inline dashboard) was **deleted
 at commit 792ce1f** (2026-08-09). Git history has it. Nothing here should assume it
@@ -189,8 +199,8 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   ships.** `com.amux.server-rs-builder` (`scripts/rust-auto-build.sh`, every 60s)
   rebuilds when the last commit touching `crates/`/`Cargo.*` moves, installs
   `~/.local/bin/amux-server-rs`, and the running server self-adopts (exits for launchd
-  to relaunch). The same binary answers **both ports**: 8824 (native) and the legacy
-  fleet port 8822 (`AMUX_URL`). To see a change live, commit it, then confirm it took:
+  to relaunch). The same binary also answers the retired 8822 (see the top of this
+  file). To see a change live, commit it, then confirm it took:
   ```bash
   # wait for the builder cycle (or force it: bash scripts/rust-auto-build.sh)
   curl -sk https://localhost:8824/health   # `build` hash must move, `server":"amux-rust"`
@@ -323,7 +333,10 @@ When the user says **"deploy"**, run the full pipeline:
   that a laptop does not lives in `cloud/docker/Dockerfile` as env or as a
   binary on PATH — `IS_SANDBOX=1` (Claude Code refuses `--dangerously-skip-permissions`
   as root, and only the deployment knows it is an isolated single-tenant
-  container), `AMUX_RS_PORT=8822`, and a chromium shim carrying the flags a
+  container), `AMUX_RS_PORT` (8822 in the cloud image — the container's own
+  choice, not the retired local address; the server now derives the `AMUX_URL` it
+  injects into lanes from this var rather than a literal), and a chromium shim
+  carrying the flags a
   display-less container needs. If you find yourself wanting `if container`, the
   answer is one of those three shapes.
 - `cloud/docker/amux-server.py` is a dead artifact of the retired python image.
@@ -388,4 +401,4 @@ node skills/chrome-cdp/scripts/cdp.mjs nav <target> <url>
 
 Requires Chrome remote debugging enabled (`chrome://inspect/#remote-debugging`) and Node.js 22+.
 
-Claude Code, the amux server, and Chrome all run on the same desktop machine. Use `https://localhost:8822` (or 8824 — same Rust server) for amux dashboard URLs.
+Claude Code, the amux server, and Chrome all run on the same desktop machine. Use `https://localhost:8824` for amux dashboard URLs (not 8822 — that address is retired).

@@ -7,6 +7,17 @@
 //! exactly like the server being down, so the CLI's own misconfiguration reads as
 //! a server fault (it cost a wrong diagnosis on AMUX-2653).
 //!
+//! It then moved 8822 -> 8824 (2026-08-10): 8822 is the RETIRED address, alive
+//! only via a countdown bind for pre-cutover processes, so defaulting there was
+//! the same bug with a later expiry date. 8824 is what install.sh configures.
+//!
+//! HONEST LIMIT of the two `err.is_empty() ||` assertions below: on a machine
+//! where the server is up, `health` succeeds and stderr is empty, so they pass
+//! without testing the port. That is deliberate (they must not fail in CI, where
+//! nothing is listening) but it means they are not the guard against the default
+//! regressing. `crates/amux-server/tests/legacy_port_guard.rs` is — it reads the
+//! constant out of the source and fails on the literal, listening or not.
+//!
 //! End-to-end rather than unit, because the bug was in the wiring — `resolve_url`
 //! could be perfect and the arg still bound to the wrong default.
 
@@ -31,18 +42,25 @@ fn health_stderr(env: &[(&str, Option<&str>)]) -> String {
 }
 
 #[test]
-fn bare_invocation_no_longer_targets_the_dead_8823() {
+fn bare_invocation_targets_neither_retired_port() {
     let err = health_stderr(&[]);
     assert!(
         !err.contains(":8823"),
-        "bare invocation must not target the retired port; stderr: {err}"
+        "bare invocation must not target the dead dev port; stderr: {err}"
     );
-    // It should be TRYING 8822. Asserting on the attempted URL keeps this
+    // 8822 is the retired legacy address. Defaulting there works today and
+    // stops working the day the countdown bind is dropped, which is precisely
+    // the class of failure this test exists to prevent.
+    assert!(
+        !err.contains(":8822"),
+        "bare invocation must not target the RETIRED legacy port; stderr: {err}"
+    );
+    // It should be TRYING 8824. Asserting on the attempted URL keeps this
     // meaningful whether or not a server happens to be up on this machine —
     // otherwise the test would pass for the wrong reason in CI.
     assert!(
-        err.is_empty() || err.contains(":8822"),
-        "expected the default to be :8822; stderr: {err}"
+        err.is_empty() || err.contains(":8824"),
+        "expected the default to be :8824; stderr: {err}"
     );
 }
 
@@ -75,7 +93,7 @@ fn an_empty_env_value_falls_through_instead_of_targeting_nothing() {
     // produce a request to "" (which fails with a useless parse error).
     let err = health_stderr(&[("AMUX_URL", Some(""))]);
     assert!(
-        err.is_empty() || err.contains(":8822"),
+        err.is_empty() || err.contains(":8824"),
         "empty AMUX_URL must fall through to the default; stderr: {err}"
     );
 }

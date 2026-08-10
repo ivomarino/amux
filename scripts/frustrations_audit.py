@@ -64,7 +64,7 @@ def parse(text):
 
 
 def fetch_board():
-    base = os.environ.get("AMUX_URL", "https://localhost:8822")
+    base = os.environ.get("AMUX_URL", "https://localhost:8824")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE

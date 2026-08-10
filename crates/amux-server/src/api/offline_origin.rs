@@ -2,7 +2,7 @@
 //! service worker.
 //!
 //! A browser refuses to fetch `/sw.js` over a self-signed certificate, so amux
-//! reached at `https://localhost:8822` or a raw LAN IP can never cache anything
+//! reached at `https://localhost:8824` or a raw LAN IP can never cache anything
 //! and goes BLANK offline; the same server at its Tailscale hostname carries a
 //! real certificate and works fully. The client cannot determine this itself —
 //! only the server knows which cert it is actually serving — so it asks.
@@ -59,15 +59,17 @@ fn trusted_ts_hostname() -> Option<String> {
 
 /// The port a browser should use for the good origin.
 ///
-/// `AMUX_RS_LEGACY_PORT` (8822 here) is the port every client and every fleet
-/// session actually has baked in, so it is the one worth telling someone to
-/// re-add to their home screen; fall back to the primary port when the legacy
-/// takeover is not configured.
+/// The CANONICAL port (`AMUX_RS_PORT`), never the legacy one. This used to
+/// prefer `AMUX_RS_LEGACY_PORT` on the reasoning that 8822 was what every
+/// client already had baked in — true at the time, and exactly backwards for
+/// the thing this endpoint produces: a URL a human is told to **re-add to
+/// their home screen**. That is a bookmark, it outlives the process that
+/// generated it, and 8822 is a retired address whose compatibility bind is
+/// being removed (see `crate::legacy_port`). Handing out a soon-dead origin as
+/// the permanent one is the one output where "what everyone currently uses"
+/// is the wrong answer.
 fn self_port() -> u16 {
-    std::env::var("AMUX_RS_LEGACY_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or_else(|| crate::config::ServerConfig::from_process_env().port)
+    crate::config::canonical_port()
 }
 
 pub async fn offline_origin(headers: HeaderMap) -> Json<Value> {

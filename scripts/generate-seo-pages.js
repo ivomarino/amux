@@ -282,7 +282,7 @@ amux (Agent Multiplexer) is a Python + tmux tool that runs multiple Claude Code 
 
 \`\`\`bash
 git clone https://github.com/mixpeek/amux && cd amux
-python3 amux-server.py  # opens dashboard at https://localhost:8822
+./install.sh && amux serve  # opens dashboard at https://localhost:8824
 \`\`\`
 
 ## Documentation

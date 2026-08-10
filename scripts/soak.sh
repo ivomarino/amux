@@ -68,7 +68,7 @@
 
 set -uo pipefail
 
-URL="${AMUX_SOAK_URL:-https://localhost:8822}"
+URL="${AMUX_SOAK_URL:-https://localhost:8824}"
 INTERVAL=60
 OUT="${AMUX_SOAK_OUT:-$HOME/.amux/soak.jsonl}"
 DURATION=0

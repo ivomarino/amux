@@ -576,12 +576,12 @@ test('settings_connections_add_remove', async ({ page }, testInfo) => {
   await expect(page.locator('#add-conn-form')).toBeVisible();
   // Preset fills name+url exactly as a user tapping it.
   await page.locator('#add-conn-form button', { hasText: 'localhost' }).click();
-  await expect(page.locator('#add-conn-url')).toHaveValue('https://localhost:8822');
+  await expect(page.locator('#add-conn-url')).toHaveValue('https://localhost:8824');
   await page.locator('#add-conn-form').getByRole('button', { name: 'Add', exact: true }).click();
 
   const list = page.locator('#settings-connections-list');
   await expect(list).toContainText('Local');
-  await expect(list).toContainText('https://localhost:8822');
+  await expect(list).toContainText('https://localhost:8824');
 
   await settle(page);
   await openSettings(page);
