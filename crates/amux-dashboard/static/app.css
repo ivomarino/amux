@@ -407,6 +407,19 @@
   .board-edit-box.sched-cmd-max { height:92dvh !important; }
   .board-edit-box.sched-cmd-max #sched-command-section { min-height:0; }
   .board-edit-box.sched-cmd-max .sched-modal-footer { max-height:190px; }
+  /* Scheduler action row. Pinned in both of this modal's two layouts:
+     flex-shrink:0 for the desktop capped flex column, position:sticky for the
+     mobile block-scroll layout (max-width:600px turns the box into the
+     scroller). Without this the row was the last child of a 112px scroller
+     and laid out below the fold — the "zoom out to reach Save" report. */
+  .sched-modal-foot {
+    flex-shrink: 0; position: sticky; bottom: 0; z-index: 3;
+    display: flex; gap: 8px; justify-content: flex-end;
+    padding: 10px 16px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    background: var(--card); border-top: 1px solid var(--border);
+  }
+  @media (max-width: 600px) { .sched-modal-foot .btn { min-height: 44px; } }
   .badge.auto-continue { background: rgba(98,160,234,0.2); color: #62a0ea; }
   .badge.model { background: rgba(57,210,192,0.2); color: var(--cyan); }
   .badge.effort { background: rgba(192,132,252,0.18); color: #c084fc; cursor: pointer; }
@@ -460,7 +473,7 @@
   .chip-remove-btn { display: none; }
   .chip-drag-handle { display: none; }
   .chip-picker-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: flex; align-items: center; justify-content: center; }
-  .chip-picker { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 340px; max-height: 70vh; display: flex; flex-direction: column; overflow: hidden; }
+  .chip-picker { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: 340px; max-height: 70dvh; display: flex; flex-direction: column; overflow: hidden; }
   .chip-picker-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
   .chip-picker-header input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; color: var(--text); font-size: 0.85rem; outline: none; }
   .chip-picker-header input:focus { border-color: var(--accent); }
@@ -484,7 +497,7 @@
   @media (max-width: 600px) { .amux-audio-bar { padding: 6px 10px; padding-bottom: max(6px, env(safe-area-inset-bottom)); } .amux-audio-bar .ab-progress { flex: 1; } }
 
   .tts-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: flex; align-items: center; justify-content: center; }
-  .tts-dialog { background: var(--card); border: 1px solid var(--border); border-radius: 14px; width: 420px; max-width: 92vw; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+  .tts-dialog { background: var(--card); border: 1px solid var(--border); border-radius: 14px; width: 420px; max-width: 92vw; max-height: 80dvh; display: flex; flex-direction: column; overflow: hidden; }
   .tts-header { padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
   .tts-header h3 { font-size: 0.95rem; font-weight: 600; color: var(--text); margin: 0; }
   .tts-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
@@ -564,6 +577,72 @@
   .modal-body input[type=date].input, .modal-body input[type=time].input { width: auto; flex: 1; min-width: 0; }
   .modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); flex-shrink: 0; }
   .modal-footer .btn.danger { color: var(--red); border-color: var(--red); }
+
+  /* ── Shared modal layout: the action row is ALWAYS reachable ──────────────
+     THE BUG CLASS: a dialog taller than the viewport whose action row is the
+     last child of a scrolling box. The box scrolls, so Save is *technically*
+     reachable — but it starts BELOW the fold, and on a short viewport the user
+     sees a form with no buttons and reaches for browser zoom. That is the
+     reported symptom, on the scheduler editor: "I have to zoom out to scroll
+     down to see the bottom."
+
+     Measured before this rule (Save button bottom edge vs viewport height):
+       1280x720   sched-overlay 753 / 720
+       390x844    sched-overlay 868 / 844
+       1280x600   board-edit 620/600 · gate-confirm 618/600 · sched 576/600
+       844x390    create 396/390 · about 350/390 · map-pin 383/390
+     Six dialogs, one shape — so this is one rule, not six patches.
+
+     dvh, NOT vh: iOS Safari sizes vh to the toolbar-HIDDEN viewport, so a
+     vh-capped modal puts its footer underneath the toolbar. That is this same
+     bug in its mobile form, and it is invisible on desktop.
+
+     position:sticky rather than a flex body/footer split, because these
+     dialogs hand-roll their markup as a flat list of fields with the buttons
+     last. A flex split needs a wrapper element around everything above the
+     footer — i.e. a markup edit inside every dialog, including the ones
+     app.js builds as template literals with no static markup to edit. sticky
+     needs no wrapper, so one rule reaches all of them.
+
+     --modal-pad is each box's own padding; the footer bleeds out by that much
+     so content scrolling underneath does not show through beside it. */
+  .edit-box       { --modal-pad: 20px; }
+  .board-edit-box { --modal-pad: 16px; }
+  .map-modal-box  { --modal-pad: 20px; }
+  .queue-box      { --modal-pad: 20px; }
+  .amux-modal     { --modal-pad: 18px; }
+
+  /* Generic box for dialogs built in app.js (they have no shared class of
+     their own). Pairs with .amux-modal-foot on the button row. */
+  .amux-modal {
+    max-height: min(90dvh, calc(100dvh - 24px));
+    overflow-y: auto; overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .edit-box .edit-actions,
+  .board-edit-box .board-edit-actions,
+  .map-modal-box .map-modal-actions,
+  .queue-box .queue-actions,
+  .amux-modal .amux-modal-foot {
+    position: sticky; bottom: 0; z-index: 3; flex-shrink: 0;
+    background: var(--card);
+    border-top: 1px solid var(--border);
+    margin: 12px calc(-1 * var(--modal-pad)) calc(-1 * var(--modal-pad));
+    padding: 10px var(--modal-pad);
+    /* iPhone PWA: clear the home indicator (.claude/rules/css-mobile.md) */
+    padding-bottom: max(var(--modal-pad), env(safe-area-inset-bottom));
+  }
+  /* .amux-modal-foot is a bare marker class on app.js-built dialogs, so it
+     supplies its own row layout; the static classes above already have theirs. */
+  .amux-modal .amux-modal-foot { display: flex; gap: 8px; align-items: center; }
+  /* Buttons stay tappable at 44px on mobile even when the row is pinned. */
+  @media (max-width: 600px) {
+    .edit-box .edit-actions .btn,
+    .board-edit-box .board-edit-actions button,
+    .map-modal-box .map-modal-actions .btn,
+    .queue-box .queue-actions .btn,
+    .amux-modal .amux-modal-foot .btn { min-height: 44px; }
+  }
   .overlay-header {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 8px; flex-shrink: 0;
@@ -2472,7 +2551,7 @@
   .queue-overlay.active { display: flex; }
   .queue-box {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px; width: 100%; max-width: 420px; max-height: 70vh; overflow-y: auto;
+    padding: 20px; width: 100%; max-width: 420px; max-height: min(70dvh, calc(100dvh - 32px)); overflow-y: auto;
   }
   .queue-box h3 { font-size: 1rem; margin-bottom: 14px; }
   .queue-item {
@@ -2866,7 +2945,7 @@
     display: flex; align-items: center; justify-content: center; padding: 16px;
     padding-bottom: calc(16px + env(safe-area-inset-bottom)); backdrop-filter: blur(3px); }
   .focus-card { background: var(--card); border: 1px solid var(--line-2, var(--border));
-    border-radius: 16px; width: 100%; max-width: 560px; max-height: 88vh; display: flex;
+    border-radius: 16px; width: 100%; max-width: 560px; max-height: 88dvh; display: flex;
     flex-direction: column; box-shadow: 0 24px 64px rgba(0,0,0,0.5); overflow: hidden; }
   .focus-head { display: flex; align-items: center; justify-content: space-between;
     padding: 12px 16px; border-bottom: 1px solid var(--border); }
@@ -4346,7 +4425,7 @@
   .map-coords { font-size: 0.71rem; color: var(--dim); font-family: monospace; margin-left: auto; }
   .map-drop-btn.dropping { background: var(--accent) !important; color: #fff !important; border-color: transparent !important; }
   .map-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9100; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; }
-  .map-modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: 360px; max-width: 100%; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: 90vh; overflow-y: auto; }
+  .map-modal-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: 360px; max-width: 100%; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); max-height: min(90dvh, calc(100dvh - 32px)); overflow-y: auto; }
   .map-modal-title { font-weight: 600; font-size: 0.95rem; margin-bottom: 2px; }
   .map-modal-input { width: 100%; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 0.85rem; outline: none; font-family: inherit; box-sizing: border-box; }
   .map-modal-input:focus { border-color: var(--accent); }
@@ -4699,4 +4778,102 @@
   opacity: 0.55;
   font-size: 0.78em;
   font-variant-numeric: tabular-nums;
+}
+
+/* ── System jobs (AMUX-2703) ─────────────────────────────────────────────────
+   amux's OWN background loops, rendered below the user's schedules in the
+   Scheduler tab. Two things this styling has to get right, both for the same
+   reason (three loops were dead for hours and nothing said so):
+
+   1. The section must not read as more schedules. Hence the rule above it, the
+      distinct heading, and the flatter card — a user glancing at the tab must
+      never mistake machinery for something they created and can delete.
+   2. A stalled job must be impossible to read as a healthy one at a glance.
+      Colour is NOT the only channel: `.sysjob.bad` also gets a left bar, a
+      tinted background and an uppercase status word, so it survives a
+      colour-blind reader, a greyscale screenshot and a phone in sunlight. */
+.sysjob-section {
+  border-top: 2px solid var(--border);
+  margin-top: 6px;
+  padding: 12px 12px 4px;
+}
+.sysjob-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sysjob-head-title {
+  font-size: 0.68rem; font-weight: 700; color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.sysjob-head-sub { font-size: 0.72rem; color: var(--dim); flex: 1; min-width: 0; }
+.sysjob-head-count { font-size: 0.68rem; color: var(--dim); }
+.sysjob-alarm { color: var(--red); font-weight: 700; }
+.sysjob-head-note {
+  font-size: 0.66rem; color: var(--dim); margin: 3px 0 8px; line-height: 1.45;
+}
+#system-jobs-list { display: flex; flex-direction: column; gap: 5px; }
+
+.sysjob {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: var(--card);
+}
+.sysjob.ok   { border-left-color: var(--green); }
+.sysjob.warn { border-left-color: var(--yellow); }
+.sysjob.idle { border-left-color: var(--border); opacity: 0.72; }
+.sysjob.bad  { border-left-color: var(--red); background: rgba(248,81,73,0.09); }
+
+.sysjob-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sysjob-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--dim); }
+.sysjob-dot.ok { background: var(--green); }
+.sysjob-dot.warn { background: var(--yellow); }
+.sysjob-dot.bad { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.sysjob-name { font-weight: 600; font-size: 0.83rem; }
+.sysjob-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.62rem; color: var(--dim);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0 4px;
+}
+.sysjob-status {
+  margin-left: auto; font-size: 0.63rem; font-weight: 700;
+  letter-spacing: 0.04em; color: var(--dim); white-space: nowrap;
+}
+.sysjob-status.ok { color: var(--green); }
+.sysjob-status.warn { color: var(--yellow); }
+.sysjob-status.bad { color: var(--red); }
+.sysjob-purpose { font-size: 0.71rem; color: var(--text); opacity: 0.82; margin: 3px 0 4px; line-height: 1.4; }
+.sysjob-purpose.dim { color: var(--yellow); opacity: 1; }
+.sysjob-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 0.66rem; color: var(--dim); font-variant-numeric: tabular-nums;
+}
+.sysjob-meta:empty { display: none; }
+.sysjob-budget { color: var(--red); }
+.sysjob-inflight { color: var(--yellow); }
+.sysjob-outcome {
+  font-size: 0.68rem; color: var(--dim); margin: 4px 0 3px;
+  padding-left: 7px; border-left: 2px solid var(--border);
+}
+.sysjob-env {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.62rem; color: var(--dim);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 44x44 touch target on mobile without a 44px-tall row on desktop: the label
+   is the hit area and the padding does the work (css-mobile rule). */
+.sysjob-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; padding: 4px 2px; min-height: 28px; }
+.sysjob-toggle input { width: auto; accent-color: var(--accent); }
+.sysjob-toggle span { font-size: 0.64rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sysjob-env.off { border-color: var(--yellow); color: var(--yellow); }
+.sysjob-detail { font-size: 0.64rem; color: var(--accent); text-decoration: none; }
+.sysjob-empty { font-size: 0.72rem; color: var(--dim); padding: 6px 0; }
+
+@media (max-width: 600px) {
+  .sysjob-section { padding: 10px 10px 4px; }
+  /* 390px: the status word must stay on the title row and never wrap under
+     the id, or the one signal that matters lands below the fold of the card. */
+  .sysjob-status { margin-left: auto; }
+  .sysjob-id { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; }
+  .sysjob-toggle { min-height: 44px; }
+  .sysjob-detail { min-height: 44px; display: inline-flex; align-items: center; }
 }

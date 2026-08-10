@@ -583,6 +583,18 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
   </div>
   <div id="scheduler-list" style="padding:10px 12px;display:flex;flex-direction:column;gap:6px;overflow-y:auto;"></div>
+  <!-- SYSTEM JOBS (AMUX-2703) — amux's own background loops, below the user's
+       schedules and visually separated from them. They are NOT schedules:
+       no run-now, no edit, no delete. See runtime_jobs/registry.rs. -->
+  <div class="sysjob-section">
+    <div class="sysjob-head">
+      <span class="sysjob-head-title">System</span>
+      <span class="sysjob-head-sub">amux&rsquo;s own background jobs</span>
+      <span class="sysjob-head-count" id="system-jobs-count"></span>
+    </div>
+    <div class="sysjob-head-note">Internal plumbing, not schedules &mdash; amux runs these and you cannot edit or delete them. A job whose last tick is far past its interval reads as <b>STALLED</b>.</div>
+    <div id="system-jobs-list"></div>
+  </div>
   <details id="sched-runs-details" style="border-top:1px solid var(--border);padding:0 12px 10px;">
     <summary style="cursor:pointer;font-size:0.78rem;font-weight:600;color:var(--dim);padding:8px 0 4px;list-style:none;display:flex;align-items:center;gap:5px;">
       <span style="font-size:0.6rem;transition:transform 0.15s;display:inline-block;" id="sched-runs-arrow">▶</span> Recent Runs
@@ -1535,7 +1547,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <!-- Command: the primary editing area — grows with the viewport, drag-resizable -->
-    <div id="sched-command-section" style="flex:1 1 auto;display:flex;flex-direction:column;padding:10px 16px;min-height:clamp(220px, 44dvh, 540px);overflow:hidden;">
+    <div id="sched-command-section" style="flex:1 1 auto;display:flex;flex-direction:column;padding:10px 16px;min-height:clamp(140px, 40dvh, 540px);overflow:hidden;">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-shrink:0;gap:8px;">
         <label class="field-label" id="sched-command-label" style="margin-bottom:0;">Command</label>
         <div style="display:flex;align-items:center;gap:8px;">
@@ -1600,11 +1612,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <!-- The hidden sched-watch / sched-watch-timeout carriers were here.
            They existed only to keep two dead columns in the save payload. -->
-      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
-        <button class="btn" onclick="closeSchedModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="saveSchedModal()" id="sched-save-btn">Save</button>
-      </div>
-    </div><!-- /footer -->
+    </div><!-- /schedule panels (scrollable) -->
+    <!-- Action row — PINNED, and a SIBLING of the scrolling panel region
+         rather than its last child. As a child it scrolled out of view: at
+         1280x720 the panel region is squeezed to 112px with 189px of content,
+         so Save laid out at y=713 on a 720px viewport and the only way to
+         reach it was to zoom the browser out. That is the reported bug.
+         flex-shrink:0 holds it on desktop, where the box is a capped flex
+         column; position:sticky holds it on mobile, where the box itself is
+         the scroller (see the max-width:600px block). -->
+    <div class="sched-modal-foot">
+      <button class="btn" onclick="closeSchedModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveSchedModal()" id="sched-save-btn">Save</button>
+    </div>
   </div>
 </div>
 
@@ -1805,7 +1825,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 
 <!-- Connect iTerm2 pane modal -->
 <div id="iterm2-connect-overlay" class="edit-overlay" onclick="if(event.target===this)closeConnectIterm2()">
-  <div class="edit-box" style="min-width:400px;max-width:560px;">
+  <!-- min-width was a flat 400px, i.e. wider than a 390px phone: the box hung
+       10px off the right edge. min() keeps the desktop width but lets it shrink. -->
+  <div class="edit-box" style="min-width:min(400px, 100%);max-width:560px;">
     <h3>&#x1F5A5; Connect iTerm2 pane</h3>
     <p style="font-size:0.82rem;color:var(--dim);margin:0 0 12px;">Pick an open iTerm2 pane to watch and send messages to from amux.</p>
     <div id="iterm2-pane-list" style="max-height:300px;overflow-y:auto;margin-bottom:14px;display:flex;flex-direction:column;gap:6px;">
@@ -2289,7 +2311,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div class="queue-box">
     <h3>Offline Queue</h3>
     <div id="queue-list"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
+    <div class="queue-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
       <button class="btn danger" onclick="clearQueue()">Clear queue</button>
       <button class="btn primary" onclick="forceRetry()">Retry now</button>
       <button class="btn" onclick="closeQueueModal()">Close</button>
@@ -2368,7 +2390,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <div id="debug-info" style="font-size:0.7rem;font-family:monospace;color:var(--dim);line-height:1.6;"></div>
     </div>
-    <div style="display:flex;gap:8px;justify-content:center;margin-top:14px;">
+    <div class="queue-actions" style="display:flex;gap:8px;justify-content:center;margin-top:14px;">
       <button class="btn" onclick="document.getElementById('about-overlay').classList.remove('active')">Close</button>
     </div>
   </div>

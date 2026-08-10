@@ -204,6 +204,7 @@ impl Runtime {
         let mut tick_n: u64 = 0;
         loop {
             interval.tick().await;
+            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::ORCH_RUNTIME);
             tick_n += 1;
             let heartbeat = tick_n.is_multiple_of(self.heartbeat_every.max(1));
             if let Err(e) = self.tick_once(heartbeat).await {
@@ -1279,8 +1280,21 @@ impl Runtime {
         let Some(title) = amux_core::board::title_from_prompt(body) else {
             return Ok(()); // steering, not a task
         };
+        // AMUX-2604: a prompt is spoken INTO a context capture cannot see, so
+        // "This should be one row" mints a card no one can dispatch later. The
+        // check is COMPUTED here (never a model call — ethos rule 2) and the
+        // REWRITE is asked of the worker at its next turn boundary, because
+        // the worker is the only party that ever held the missing referent.
+        let needs_self_desc = amux_core::board::title_needs_self_description(&title);
         let wid = worker.to_string();
         let body = body.to_string();
+        // Carries (card id, session name) out of the writer so the nudge can
+        // be addressed AFTER the card exists — the consequence hangs off the
+        // write that already happens, with a named consumer and a durable
+        // dedupe key, rather than a new bus (CLAUDE.md's recorded decision).
+        let minted: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let minted_w = minted.clone();
         self.store
             .write_async(move |conn| {
                 let Some(wrow) = crate::db::queries::get_worker(conn, &wid)? else {
@@ -1316,7 +1330,7 @@ impl Runtime {
                         // `todo` mint was re-dispatched by the planner,
                         // double-running every direct prompt.
                         status: "doing".into(),
-                        session: Some(name),
+                        session: Some(name.clone()),
                         item_type: "code".into(),
                         creator: "amux".into(),
                         owner_type: "agent".into(),
@@ -1326,7 +1340,17 @@ impl Runtime {
                         shepherd: None,
                         gate: vec![],
                         depends_on: vec![],
-                        tags: vec![],
+                        // The tag is the durable half of the flag: the steer
+                        // below is delivered once and consumed, but a card
+                        // whose title was never repaired stays findable by
+                        // anyone querying the board (`needs-self-description`)
+                        // — a nudge with no residue is a nudge that silently
+                        // did not happen (ethos rule 4).
+                        tags: if needs_self_desc.is_some() {
+                            vec!["needs-self-description".to_string()]
+                        } else {
+                            vec![]
+                        },
                     },
                     now.timestamp(),
                 )?;
@@ -1336,6 +1360,14 @@ impl Runtime {
                     &stamp,
                     "capture: session prompt",
                 ));
+                if let Some(reason) = needs_self_desc {
+                    row.log = Some(crate::db::board_store::append_log(
+                        row.log.as_deref(),
+                        &stamp,
+                        &format!("capture: title needs self-description — {reason}"),
+                    ));
+                    *minted_w.lock().unwrap() = Some((row.id.clone(), name));
+                }
                 crate::db::board_store::save_patched(conn, &row)?;
                 // notified is deliberately outside save_patched's SET list
                 // (a Python-owned column); set it here so the assignment
@@ -1356,6 +1388,43 @@ impl Runtime {
                 })
             })
             .await?;
+
+        // The consequence, hung off the write that already happened and
+        // addressed to a NAMED consumer: the worker that received the prompt.
+        //
+        // Delivery is `steer_enqueue`, the existing path, never a direct send
+        // — the steering loop applies the turn-boundary gate, so this cannot
+        // land mid-turn, and it arrives exactly when the worker has finished
+        // the prompt and therefore HOLDS the context the capture lacked.
+        //
+        // Asked once, not every turn: the enqueue is fired from the MINT, which
+        // happens once per card, and the guard key is the card id — so even a
+        // duplicate mint replaces the queued row instead of stacking a second
+        // copy (steer_enqueue dedupes on `guard`).
+        let minted = minted.lock().unwrap().take();
+        if let Some((card_id, session)) = minted {
+            let reason = needs_self_desc.unwrap_or("it has no referent outside this conversation");
+            let msg = format!(
+                "Board card {card_id} was captured from your last prompt, and its title \
+                 cannot be dispatched by anyone who was not in this conversation: {reason}.\n\n\
+                 You have the context the capture never had. Rewrite the title (and the body \
+                 if it needs it) so the card stands alone — name the thing, where it lives, \
+                 and what \"done\" means:\n\n  \
+                 amux board retitle {card_id} --stdin <<'EOF'\n  \
+                 <a title that names its own subject>\n  EOF\n\n\
+                 If the prompt was steering rather than a task, discard the card instead \
+                 (`amux board status {card_id} discarded`) — a card that should not exist is \
+                 the honest answer too."
+            );
+            crate::api::session_verbs::steer_enqueue_store(
+                &self.store,
+                &session,
+                &msg,
+                &format!("self-describe:{card_id}"),
+                "",
+            )
+            .await;
+        }
         Ok(())
     }
 }
@@ -2082,6 +2151,105 @@ mod adherence_tests {
             matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { .. }]),
             "exactly ONE delivery ever reaches the worker: {:?}",
             protocol.calls()
+        );
+    }
+
+    /// AMUX-2604: a deictic prompt still mints its ledger card — but the card
+    /// is TAGGED, its log says why, and the worker that received the prompt is
+    /// asked, at its next turn boundary, to rewrite the title self-contained.
+    ///
+    /// The nudge goes through the existing steering queue rather than a second
+    /// delivery path, and its guard is the card id so it is asked ONCE.
+    #[tokio::test]
+    async fn a_deictic_prompt_flags_its_card_and_asks_the_worker_to_rewrite_it() {
+        let store = store();
+        let w = seed_worker(&store, 7, "alpha");
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
+
+        let msg = MessageId::from_ulid(ulid::Ulid::new());
+        seed_message(&store, &msg, "this should be one row");
+        enqueue_deliver(&store, &w, &msg, "cap-2604");
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+
+        let (id, title, tags, log): (String, String, String, String) = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT i.id, i.title, COALESCE(GROUP_CONCAT(t.tag),''), COALESCE(i.log,'') \
+                 FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id GROUP BY i.id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the card is still minted — flagged, not suppressed");
+        assert_eq!(title, "This should be one row");
+        assert!(tags.contains("needs-self-description"), "durable flag missing: {tags}");
+        assert!(log.contains("needs self-description"), "the log must say WHY: {log}");
+
+        // The ask is queued for the worker, keyed to the card, once.
+        let (n, session, guard, text): (i64, String, String, String) = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(session),''), COALESCE(MAX(guard),''), \
+                 COALESCE(MAX(text),'') FROM steering_queue",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "exactly one ask");
+        assert_eq!(session, "alpha", "addressed to the worker that got the prompt");
+        assert_eq!(guard, format!("self-describe:{id}"), "dedupe key is the card");
+        assert!(text.contains(&id), "the ask must name the card: {text}");
+        // It must name a SANCTIONED next step, not leave the worker to
+        // hand-roll a PATCH (which is how attribution gets lost).
+        assert!(text.contains("amux board retitle"), "no walkable next step: {text}");
+
+        // A SECOND capture for the same card cannot stack a second ask — the
+        // guard replaces. (A worker is asked once, not every turn.)
+        let m2 = MessageId::from_ulid(ulid::Ulid::new());
+        seed_message(&store, &m2, "this should be one row");
+        enqueue_deliver(&store, &w, &m2, "cap-2604b");
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM steering_queue WHERE guard LIKE 'self-describe:%'"),
+            1,
+            "the ask stacked — a worker must be asked once, not every turn"
+        );
+    }
+
+    /// The other direction, which is the one that decides whether this is a
+    /// feature or a nag: a self-contained prompt is flagged with NOTHING and
+    /// the worker is not interrupted at all.
+    #[tokio::test]
+    async fn a_self_contained_prompt_is_not_flagged_and_sends_no_nudge() {
+        let store = store();
+        let w = seed_worker(&store, 8, "alpha");
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
+
+        let msg = MessageId::from_ulid(ulid::Ulid::new());
+        seed_message(&store, &msg, "please fix the flaky auth test. It only fails on CI.");
+        enqueue_deliver(&store, &w, &msg, "cap-2604c");
+        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+
+        let tags: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(GROUP_CONCAT(t.tag),'') FROM issues i \
+                 LEFT JOIN issue_tags t ON t.issue_id = i.id GROUP BY i.id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!tags.contains("needs-self-description"), "false positive: {tags}");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM steering_queue"),
+            0,
+            "a dispatchable title must not interrupt the worker"
         );
     }
 

@@ -1,4 +1,108 @@
 // ── block 1 (amux-server.py lines 35246-59333) — main dashboard client
+// ── Legacy-origin self-migration (must run before anything starts polling) ──
+//
+// THE PROBLEM THIS SOLVES, precisely. The server answers a retired port (8822)
+// as well as the canonical one (8824), purely so ~55 pre-cutover `claude`
+// processes — whose env cannot be rotated — keep working. Every other caller
+// was moved by editing a config and restarting something. The iPhone PWA
+// cannot be: it was INSTALLED from `https://localhost:8822`, so the install is
+// a bookmark to that ORIGIN, every `/api/...` it fetches is relative to it, and
+// there is no process to restart. It was the single loudest caller on the
+// retired port (~3,200 req/h, more than every hook combined).
+//
+// WHAT DOES NOT WORK, so nobody re-tries it:
+//   - The manifest. `start_url`/`scope` must be same-origin as the manifest,
+//     and a different PORT is a different origin, so a manifest served on 8822
+//     that points at 8824 is invalid — browsers ignore it and fall back to the
+//     document URL. It cannot move an install across ports, and it cannot stop
+//     a fresh "Add to Home Screen" from anchoring to whatever origin the page
+//     was opened on. (The redirect below is what stops that.)
+//   - A 301/302 on the document. It moves the CURRENT view, but the installed
+//     app's recorded start_url is unchanged, so the next launch is back on
+//     8822. Worse, in iOS standalone mode a navigation to a different origin is
+//     out of scope and iOS hands it to Safari — so an auto-redirect would eject
+//     the user from their app on every launch and STILL not migrate it.
+//
+// So: redirect in a normal TAB (this genuinely self-heals bookmarks and open
+// tabs), and in an installed app show the one thing that can actually fix it —
+// a message telling the human to re-add the icon, which is the only step no
+// code can perform. Being honest that a human step remains beats an animation
+// that looks like it migrated something.
+(function _amuxLegacyOriginMigrate() {
+  try {
+    const legacy = window._AMUX_LEGACY_PORT | 0;
+    const canonical = window._AMUX_CANONICAL_PORT | 0;
+    // 0 on the canonical listener. The signal comes from WHICH SOCKET served
+    // this document (server-side), never from the URL bar or a Host header, so
+    // a client already on the right port can never be told to migrate to
+    // itself — a loop the user could not exit.
+    if (!legacy || !canonical || legacy === canonical) return;
+    const target = location.protocol + '//' + location.hostname + ':' + canonical +
+                   location.pathname + location.search + location.hash;
+    const origin = location.protocol + '//' + location.hostname + ':' + canonical;
+    const standalone = !!(navigator.standalone ||
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+
+    if (!standalone) {
+      // A tab or a plain bookmark: move it, and it stays moved. Probe first —
+      // the canonical port carries its own self-signed cert exception (a
+      // different origin has a SEPARATE exception), and on a LAN or tailscale
+      // host it may not even be reachable. Redirecting into a dead origin would
+      // strand a working client, which is strictly worse than the retired port
+      // it is on. `no-cors` is enough: we need "did the connection succeed",
+      // not the body.
+      fetch(origin + '/health', { mode: 'no-cors', cache: 'no-store' })
+        .then(() => { location.replace(target); })
+        .catch(() => { _amuxLegacyBanner(target, canonical, false); });
+      return;
+    }
+    // Installed app. Do not navigate — see above.
+    _amuxLegacyBanner(target, canonical, true);
+  } catch (e) {}
+
+  function _amuxLegacyBanner(target, canonical, standalone) {
+    const show = () => {
+      if (!document.body || document.getElementById('amux-legacy-migrate')) return;
+      const bar = document.createElement('div');
+      bar.id = 'amux-legacy-migrate';
+      // Inline styles on purpose: this must render even if app.css failed, and
+      // it must not depend on a class that a later refactor could rename away.
+      // env(safe-area-inset-top) so it clears the iOS status bar in standalone.
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:100000;' +
+        'padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 12px;' +
+        'background:#7c2d12;color:#fff;font:500 13px/1.45 -apple-system,system-ui,sans-serif;' +
+        'box-shadow:0 2px 12px rgba(0,0,0,.4);';
+      const msg = standalone
+        ? 'This app is pinned to amux’s <b>retired address</b> (port ' + (window._AMUX_LEGACY_PORT | 0) + '). ' +
+          'Re-adding it is the only way to move it: open <b>' + target.replace(/\/$/, '') + '</b> in Safari, ' +
+          'accept the certificate, then <b>Share → Add to Home Screen</b> and delete the old icon.'
+        : 'amux moved to port ' + canonical + '. This page is on the retired address and could not reach the new one ' +
+          '— you may need to accept its certificate once.';
+      bar.innerHTML = '<div style="max-width:720px;margin:0 auto;display:flex;gap:12px;align-items:flex-start;">' +
+        '<div style="flex:1;">' + msg + '</div></div>';
+      const actions = document.createElement('div');
+      actions.style.cssText = 'max-width:720px;margin:8px auto 0;display:flex;gap:8px;';
+      const go = document.createElement('button');
+      go.textContent = 'Open ' + canonical;
+      // 44px min touch target (mobile rule).
+      go.style.cssText = 'min-height:44px;padding:0 16px;border-radius:8px;border:0;' +
+        'background:#fff;color:#7c2d12;font-weight:600;font-size:13px;cursor:pointer;';
+      // Always available even when the probe failed: the user can click through
+      // a certificate warning, a background fetch cannot.
+      go.onclick = () => { location.href = target; };
+      const dismiss = document.createElement('button');
+      dismiss.textContent = 'Later';
+      dismiss.style.cssText = 'min-height:44px;padding:0 16px;border-radius:8px;' +
+        'border:1px solid rgba(255,255,255,.4);background:transparent;color:#fff;font-size:13px;cursor:pointer;';
+      dismiss.onclick = () => bar.remove();
+      actions.appendChild(go);
+      actions.appendChild(dismiss);
+      bar.appendChild(actions);
+      document.body.appendChild(bar);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+  }
+})();
 // ── Auth token injection (must be first — before any fetch calls) ──
 const _authToken = window._AMUX_AUTH_TOKEN || '';
 function _authHeaders(headers) {
@@ -207,7 +311,7 @@ function _showUpgradeModal(d) {
   wrap.id = 'upgrade-modal';
   wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(5,5,10,0.88);display:flex;align-items:center;justify-content:center;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));';
   wrap.innerHTML =
-    '<div style="background:#14142a;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90vh;overflow-y:auto;">' +
+    '<div style="background:#14142a;border:1px solid #3a3a5c;border-radius:14px;max-width:440px;width:100%;padding:26px 22px;text-align:center;max-height:90dvh;overflow-y:auto;">' +
       '<div style="font-size:1.15rem;font-weight:700;margin-bottom:6px;">' +
         (isBudget ? 'Your trial budget is used up' : 'Your trial has ended') + '</div>' +
       (isBudget && spent ? '<div style="color:#f0b429;font-size:1.05rem;font-weight:600;margin-bottom:10px;">$' + spent + ' of $' + budget + ' used</div>' : '') +
@@ -620,7 +724,7 @@ function showConnHistory() {
   modal.id = 'conn-hist-modal';
   modal.style.cssText = 'position:fixed;inset:0;z-index:2200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);padding:16px;';
   modal.onclick = e => { if (e.target === modal) modal.remove(); };
-  modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80vh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
+  modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80dvh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
     + '<span style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
     + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Disconnections from this device (this browser)</div>'
@@ -6796,7 +6900,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.569';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.572';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9032,7 +9136,7 @@ function _showSteerPrompt(text) {
     const bg = document.createElement('div');
     bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:400;display:flex;align-items:center;justify-content:center;';
     const box = document.createElement('div');
-    box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:400px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,0.4);';
+    box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:400px;width:90%;box-shadow:0 12px 40px rgba(0,0,0,0.4);max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;';
     box.innerHTML = `<div style="font-weight:600;margin-bottom:8px;">Worker is working</div>
       <div style="font-size:0.85rem;color:var(--dim);margin-bottom:12px;">This worker is actively running. How should your message be delivered?</div>
       <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:0.82rem;margin-bottom:16px;max-height:60px;overflow:hidden;word-break:break-word;">${text.length > 120 ? text.slice(0,120) + '…' : text}</div>
@@ -14964,7 +15068,7 @@ function _peekShowLookupModal(query, result, loading) {
     modal = document.createElement('div');
     modal.id = 'peek-lookup-modal';
     modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;';
-    modal.innerHTML = '<div style="background:#1a1a2e;border:1px solid #444;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;padding:20px;box-shadow:0 24px 64px rgba(0,0,0,0.6);color:#e8e8e8;position:relative;"><button id="peek-lookup-close" style="position:absolute;top:10px;right:12px;background:none;border:none;color:#aaa;font-size:1.1rem;cursor:pointer;">&#x2715;</button><div style="font-size:0.7rem;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">Looking up</div><div id="peek-lookup-query" style="font-family:monospace;font-size:0.85rem;background:#111;padding:8px 12px;border-radius:6px;margin-bottom:14px;word-break:break-word;max-height:120px;overflow:auto;"></div><div style="font-size:0.7rem;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">Explanation</div><div id="peek-lookup-result" style="font-size:0.92rem;line-height:1.55;white-space:pre-wrap;"></div></div>';
+    modal.innerHTML = '<div style="background:#1a1a2e;border:1px solid #444;border-radius:12px;max-width:560px;width:100%;max-height:80dvh;overflow:auto;padding:20px;box-shadow:0 24px 64px rgba(0,0,0,0.6);color:#e8e8e8;position:relative;"><button id="peek-lookup-close" style="position:absolute;top:10px;right:12px;background:none;border:none;color:#aaa;font-size:1.1rem;cursor:pointer;">&#x2715;</button><div style="font-size:0.7rem;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">Looking up</div><div id="peek-lookup-query" style="font-family:monospace;font-size:0.85rem;background:#111;padding:8px 12px;border-radius:6px;margin-bottom:14px;word-break:break-word;max-height:120px;overflow:auto;"></div><div style="font-size:0.7rem;color:#888;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">Explanation</div><div id="peek-lookup-result" style="font-size:0.92rem;line-height:1.55;white-space:pre-wrap;"></div></div>';
     document.body.appendChild(modal);
     modal.querySelector('#peek-lookup-close').onclick = () => { modal.style.display = 'none'; };
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
@@ -15198,6 +15302,55 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault(); peekQuickKeys('C-x'); return;
     }
   }
+});
+
+// ── Escape closes the topmost modal, whatever it is ───────────────────────
+// The handler above knows five overlay ids BY NAME and hard-returns unless
+// peek is open, so it can never reach a dialog app.js appends to <body>: 12
+// of those 14 dialogs had no Escape at all. An unreachable footer plus no
+// Escape is a trap, so this is the generic backstop.
+//
+// It CLICKS the dialog's own cancel control rather than removing the node.
+// Several of these dialogs are promises (_gateConfirm, _showSteerPrompt) and
+// ripping the backdrop out of the DOM would leave the caller awaiting a
+// promise that can never settle — a hang instead of a cancel. Clicking Cancel
+// runs the dialog's own cleanup path, which means a dialog added LATER gets
+// Escape for free with no registration to remember.
+//
+// Runs only when the handler above did not already preventDefault, so the
+// five ids it owns keep their specific close functions.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || e.defaultPrevented) return;
+  // Overlays with a dedicated handler, or deliberately not dismissable
+  // (upgrade/apikey are gates their authors chose to make sticky — rule 8:
+  // do not quietly overturn someone else's decision).
+  const OWNED = ['peek-overlay', 'wt-overlay', 'video-overlay', 'teleprompter-overlay',
+                 'upgrade-modal', 'apikey-setup-modal'];
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let best = null, bestZ = -1;
+  for (const el of document.body.children) {
+    if (OWNED.indexOf(el.id) !== -1) continue;
+    const cs = getComputedStyle(el);
+    if (cs.position !== 'fixed' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+    if (parseFloat(cs.opacity || '1') < 0.05) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < vw - 4 || r.height < vh - 4) continue;   // must be a full backdrop
+    const z = parseInt(cs.zIndex, 10) || 0;
+    if (z >= bestZ) { bestZ = z; best = el; }              // ties: later in DOM wins
+  }
+  if (!best) return;
+  const CANCEL = /^(cancel|close|dismiss|not now|later)$/i;
+  const btn = Array.prototype.slice.call(best.querySelectorAll('button, .btn')).find((b) => {
+    const cs = getComputedStyle(b);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' &&
+           CANCEL.test((b.textContent || '').trim());
+  });
+  e.preventDefault();
+  if (btn) { btn.click(); return; }
+  if (best.classList.contains('active')) { best.classList.remove('active'); return; }
+  if (best.classList.contains('open')) { best.classList.remove('open'); return; }
+  if (!best.id) { best.remove(); return; }                 // anonymous, no cancel
+  best.style.display = 'none';
 });
 
 // ═══════ LAYOUT MODES (list / grid) ═══════
@@ -16026,9 +16179,16 @@ function switchView(view) {
     if (_sseFallback && !boardTimer) boardTimer = setInterval(fetchBoard, 5000);
   } else if (view === 'scheduler') {
     Promise.all([fetchSchedules(), fetchSchedulerRuns()]).then(() => renderScheduler());
+    // amux's own background jobs live under the user's schedules. Fetched
+    // separately because they are a separate thing (see renderSystemJobs), and
+    // refreshed on a timer because a frozen age is the exact failure the
+    // section exists to prevent.
+    fetchSystemJobs().then(renderSystemJobs);
+    _startSysJobsTimer();
   } else {
     if (boardTimer) { clearInterval(boardTimer); boardTimer = null; }
   }
+  if (view !== 'scheduler') _stopSysJobsTimer();
 }
 
 // ── Habits tab ───────────────────────────────────────────────────────────────
@@ -17826,6 +17986,173 @@ function renderScheduler(opts) {
       </div>`;
     }).join('');
   }
+}
+
+// ── System jobs (AMUX-2703) ──────────────────────────────────────────────────
+//
+// amux's OWN background loops, rendered BELOW the user's schedules and clearly
+// separated from them. They are not schedules and are deliberately not editable
+// here: no run-now, no edit, no delete. See runtime_jobs/registry.rs — folding
+// internal ticks into the user's schedule list would put machinery in a list
+// the user can neither own nor delete.
+//
+// The reason this section exists at all: on 2026-08-10 three of these loops
+// were dead or had never been spawned, for hours, and nothing anywhere said so
+// — a loop that is not running and a loop with nothing to do produce identical
+// evidence. So the ONE thing this view must do well is make a stalled job
+// impossible to read as a healthy one.
+let _systemJobs = null;
+let _sysJobsTimer = null;
+
+async function fetchSystemJobs() {
+  try {
+    const r = await fetch(API + '/api/system-jobs');
+    if (r.ok) _systemJobs = await r.json();
+  } catch (e) { /* keep the last payload; the ages will visibly age out */ }
+}
+
+// Seconds -> a compact age. relTime() bottoms out at "<1m", which is useless
+// here: most of these jobs tick every few seconds, so "<1m" would render a
+// healthy 2s tick and a suspicious 55s tick identically.
+function _sysAge(s) {
+  if (s == null) return '—';
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60 ? (s % 60) + 's' : '');
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + (Math.floor(s / 60) % 60) + 'm';
+  return Math.floor(s / 86400) + 'd ' + (Math.floor(s / 3600) % 24) + 'h';
+}
+
+function _sysInterval(s) {
+  // A registered job with no interval is one whose cadence is only knowable
+  // from inside its own loop (it reads an env var after it starts). Saying
+  // "event-driven" there would be a guess; saying nothing would read as a
+  // missing field.
+  if (s == null) return 'cadence unknown';
+  if (s < 60) return 'every ' + Math.round(s) + 's';
+  if (s < 3600) return 'every ' + Math.round(s / 60) + 'm';
+  return 'every ' + (Math.round(s / 360) / 10) + 'h';
+}
+
+// What each verdict MEANS, in the words the server uses. `alive` is
+// deliberately not green: it says the task is running and that nobody measured
+// its ticks, which is a weaker claim than "ok" and must not look like one.
+const _SYSJOB_STATUS = {
+  ok:          { cls: 'ok',    label: 'running',  hint: 'ticking within its budget' },
+  alive:       { cls: 'warn',  label: 'alive',    hint: 'task is running; its ticks are not instrumented, so freshness is unknown' },
+  starting:    { cls: 'idle',  label: 'starting', hint: 'spawned, first tick not in yet' },
+  disabled:    { cls: 'idle',  label: 'off',      hint: 'switched off by configuration' },
+  stalled:     { cls: 'bad',   label: 'STALLED',  hint: 'last tick is far older than this job’s interval' },
+  hung:        { cls: 'bad',   label: 'HUNG',     hint: 'a tick started and never finished' },
+  dead:        { cls: 'bad',   label: 'DEAD',     hint: 'the task exited — it panicked or was aborted' },
+  not_spawned: { cls: 'bad',   label: 'NOT RUNNING', hint: 'nothing started this job — the failure that cost hours' },
+};
+
+function renderSystemJobs() {
+  const el = document.getElementById('system-jobs-list');
+  if (!el) return;
+  const head = document.getElementById('system-jobs-count');
+  if (!_systemJobs || !Array.isArray(_systemJobs.jobs)) {
+    el.innerHTML = `<div class="sysjob-empty">Could not read /api/system-jobs.</div>`;
+    if (head) head.textContent = '';
+    return;
+  }
+  const jobs = _systemJobs.jobs.slice();
+  const bad = jobs.filter(j => ['stalled', 'hung', 'dead', 'not_spawned'].includes(j.status));
+  if (head) {
+    head.innerHTML = bad.length
+      ? `<span class="sysjob-alarm">${bad.length} need${bad.length === 1 ? 's' : ''} attention</span>`
+      : `<span>${jobs.length} healthy</span>`;
+  }
+  // Broken first — the whole point of the section is that a dead loop is not
+  // something you have to scroll for.
+  const rank = j => (['stalled','hung','dead','not_spawned'].includes(j.status) ? 0
+                   : j.status === 'alive' ? 1 : j.status === 'disabled' ? 3 : 2);
+  jobs.sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
+
+  el.innerHTML = jobs.map(j => {
+    const st = _SYSJOB_STATUS[j.status] || { cls: 'idle', label: j.status || '?', hint: '' };
+    // A CONTROL, or a READOUT — never a switch that does nothing. Env vars are
+    // read at startup, so a checkbox over one would lie about taking effect;
+    // they render as the var and its live value, which is what you actually
+    // need in order to change it (in ~/.amux/server.env, then restart).
+    const pf = j.pref;
+    const toggle = (pf && pf.editable)
+      ? `<label class="sysjob-toggle" title="${esc(pf.effect || '')}">
+          <input type="checkbox" ${pf.on ? 'checked' : ''}
+            onchange="_sysJobToggle('${esc(pf.key)}', this.checked)">
+          <span>${esc(pf.key)}</span></label>`
+      : '';
+    const envs = (j.env || []).map(c =>
+      `<code class="sysjob-env${c.off_now ? ' off' : ''}" title="${esc((c.effect || '') + ' — ' + (c.note || ''))}">${esc(c.var)}=${c.value == null ? '(unset)' : esc(String(c.value))}</code>`
+    ).join('');
+    const ctl = toggle + envs;
+    const tick = j.last_tick_at
+      ? `<span title="last tick">✓ ${_sysAge(j.last_tick_age_s)} ago</span>`
+      : (j.spawned ? `<span title="no tick recorded yet">no tick yet</span>` : '');
+    const budget = (j.stale_after_s != null && ['stalled','hung'].includes(j.status))
+      ? `<span class="sysjob-budget">budget ${_sysAge(j.stale_after_s)}</span>` : '';
+    return `<div class="sysjob ${st.cls}">
+      <div class="sysjob-top">
+        <span class="sysjob-dot ${st.cls}"></span>
+        <span class="sysjob-name">${esc(j.name || j.id)}</span>
+        <code class="sysjob-id">${esc(j.id)}</code>
+        <span class="sysjob-status ${st.cls}" title="${esc(st.hint)}">${st.label}</span>
+      </div>
+      ${j.purpose ? `<div class="sysjob-purpose">${esc(j.purpose)}</div>`
+                  : `<div class="sysjob-purpose dim">Undocumented job — it is running, but no one has written down what it does.</div>`}
+      <div class="sysjob-meta">
+        <span>${esc(_sysInterval(j.interval_s))}</span>
+        ${tick}${budget}
+        ${j.ticks ? `<span title="ticks since this server started">×${j.ticks}</span>` : ''}
+        ${j.last_tick_ms != null ? `<span title="last tick duration">${Math.round(j.last_tick_ms)}ms</span>` : ''}
+        ${j.in_flight ? `<span class="sysjob-inflight">tick in flight</span>` : ''}
+      </div>
+      ${j.outcome ? `<div class="sysjob-outcome">${esc(j.outcome)}</div>` : ''}
+      <div class="sysjob-meta">
+        ${ctl}
+        ${j.detail ? `<a class="sysjob-detail" href="${esc(j.detail)}" target="_blank" rel="noopener">${esc(j.detail)}</a>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// The ONE live switch here, and it writes the SAME prefs row the Settings
+// panel's own checkbox writes — two controls over one fact that can disagree
+// is worse than one control, so the other one is updated in place too.
+async function _sysJobToggle(key, on) {
+  try {
+    await fetch(API + '/api/prefs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: key, value: on ? '1' : '0' })
+    });
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Could not write ' + key);
+    return;
+  }
+  if (key === 'autofix_enabled') {
+    const cb = document.getElementById('autofix-checkbox');
+    if (cb) cb.checked = on;
+    if (typeof showToast === 'function') {
+      showToast(on ? 'Autofix on — breakage becomes a board card'
+                   : 'Autofix off — still detecting, not filing');
+    }
+  }
+  await fetchSystemJobs();
+  renderSystemJobs();
+}
+
+// Ages are the whole signal, so they must not freeze on a tab left open: a
+// stalled job that renders "4s ago" forever is exactly the lie this section
+// exists to end. Cleared on every other view (see switchView).
+function _startSysJobsTimer() {
+  if (_sysJobsTimer) return;
+  _sysJobsTimer = setInterval(() => {
+    fetchSystemJobs().then(renderSystemJobs);
+  }, 15000);
+}
+function _stopSysJobsTimer() {
+  if (_sysJobsTimer) { clearInterval(_sysJobsTimer); _sysJobsTimer = null; }
 }
 
 // The peek Schedules tab shares these handlers with the homepage, so re-render it
@@ -20548,7 +20875,8 @@ async function _gateConfirm(item, targetStatusId) {
     const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const rows = gate.map((g,i) => '<label style="display:flex;gap:9px;align-items:flex-start;padding:7px 4px;cursor:pointer;font-size:0.9rem;color:var(--text);"><input type="checkbox" class="_gate-chk" data-i="'+i+'" style="width:auto;margin-top:2px;accent-color:var(--accent);"><span>'+esc(g)+'</span></label>').join('');
     const box = document.createElement('div');
-    box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:440px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);max-height:88vh;overflow:auto;';
+    box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:440px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
+    box.className = 'amux-modal';   // dvh cap + sticky action row
     box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Move to '+esc(label)+'</div>'
       + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:10px;">Confirm this card meets the gate for '+esc(label)+':</div>'
       // Say which layer set these criteria, and say it LOUDLY when we could not
@@ -20559,7 +20887,7 @@ async function _gateConfirm(item, targetStatusId) {
           ? '<div style="font-size:0.75rem;color:var(--warn,#e0a33e);border:1px solid var(--warn,#e0a33e);border-radius:7px;padding:7px 9px;margin-bottom:10px;">Offline — these are the column defaults, not the criteria the server will enforce for this card&rsquo;s type. The move may still be refused.</div>'
           : (_res.source ? '<div style="font-size:0.72rem;color:var(--dim);margin:-6px 0 10px;">criteria from: '+esc(_res.source)+'</div>' : ''))
       + '<div id="_gate-list" style="margin-bottom:14px;">'+rows+'</div>'
-      + '<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;">'
+      + '<div class="amux-modal-foot" style="display:flex;gap:8px;justify-content:space-between;align-items:center;">'
       + '<span id="_gate-count" style="font-size:0.75rem;color:var(--dim);"></span>'
       + '<div style="display:flex;gap:8px;"><button class="btn" id="_gate-cancel">Cancel</button><button class="btn primary" id="_gate-ok">Move</button></div></div>';
     bg.appendChild(box); document.body.appendChild(bg);
@@ -20586,11 +20914,12 @@ function editStatusGate(statusId) {
   const bg = document.createElement('div');
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
-  box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);max-height:88vh;overflow:auto;';
+  box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
+  box.className = 'amux-modal';   // dvh cap + sticky action row
   box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Gate checklist — '+esc(label)+'</div>'
     + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:10px;">One criterion per line. Shown as a confirm checklist when a card is moved into '+esc(label)+'. Individual cards can override this default.</div>'
     + '<textarea id="_gate-edit-ta" style="width:100%;min-height:150px;box-sizing:border-box;font-family:inherit;font-size:0.9rem;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);resize:vertical;"></textarea>'
-    + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;"><button class="btn" id="_gate-edit-cancel">Cancel</button><button class="btn primary" id="_gate-edit-save">Save</button></div>';
+    + '<div class="amux-modal-foot" style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;"><button class="btn" id="_gate-edit-cancel">Cancel</button><button class="btn primary" id="_gate-edit-save">Save</button></div>';
   bg.appendChild(box); document.body.appendChild(bg);
   const ta = box.querySelector('#_gate-edit-ta');
   ta.value = cur.join('\n');
@@ -20626,12 +20955,13 @@ function editSessionGate(worker, statusId) {
   const bg = document.createElement('div');
   bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;';
   const box = document.createElement('div');
-  box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);max-height:88vh;overflow:auto;';
+  box.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;max-width:460px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.45);';
+  box.className = 'amux-modal';   // dvh cap + sticky action row
   box.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">Worker gate — '+esc(label)+'</div>'
     + '<div style="font-size:0.8rem;color:var(--dim);margin-bottom:4px;">For worker <b>'+esc(worker)+'</b> only. Overrides the global default gate for '+esc(label)+' on this worker\'s cards.</div>'
     + '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:10px;">One criterion per line. '+(hasOverride ? 'This worker has a custom gate.' : 'Currently inheriting the global default (shown below to tweak).')+'</div>'
     + '<textarea id="_sgate-edit-ta" style="width:100%;min-height:150px;box-sizing:border-box;font-family:inherit;font-size:0.9rem;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);resize:vertical;"></textarea>'
-    + '<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:14px;">'
+    + '<div class="amux-modal-foot" style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:14px;">'
     + '<button class="btn" id="_sgate-edit-reset" title="Delete this worker override and inherit the global default"'+(hasOverride ? '' : ' style="visibility:hidden;"')+'>Reset to default</button>'
     + '<div style="display:flex;gap:8px;"><button class="btn" id="_sgate-edit-cancel">Cancel</button><button class="btn primary" id="_sgate-edit-save">Save</button></div></div>';
   bg.appendChild(box); document.body.appendChild(bg);
@@ -20688,10 +21018,30 @@ function moveBoardItem(id, newStatus, newPos, gateAck) {
 }
 
 async function clearDone() {
+  // The optimistic hide is the reason AMUX-2630 stayed invisible for so long:
+  // the cards vanished, the POST 405'd, and they came back on the next refresh
+  // with nothing ever said. So the hide is now UNDONE on failure, and success
+  // reports the server's own count rather than a silent disappearance.
+  const cleared = boardItems.filter(i => i.status === 'done');
+  if (!cleared.length) { showToast('No done cards to clear'); return; }
   boardItems = boardItems.filter(i => i.status !== 'done');
   saveBoardCache();
   renderBoard();
-  await apiCall(API + '/api/board/clear-done', { method: 'POST' });
+  const r = await apiCall(API + '/api/board/clear-done', { method: 'POST' });
+  if (!r) {
+    // apiCall already toasted the server's reason; put the cards back rather
+    // than leave the board asserting a clear that did not happen. Restoring
+    // locally (not refetching) on purpose: the server state is unchanged, so
+    // fetchBoard's ETag would answer 304 and leave the lie in place.
+    boardItems = boardItems.concat(cleared);
+    saveBoardCache();
+    renderBoard();
+    return;
+  }
+  let n = cleared.length;
+  try { const d = await r.json(); if (typeof d.archived === 'number') n = d.archived; } catch (e) {}
+  showToast(n ? 'Archived ' + n + ' done card' + (n === 1 ? '' : 's') + ' — still under Archived'
+              : 'Nothing to clear');
 }
 
 function addBoardStatus() {
@@ -21297,14 +21647,15 @@ async function _renderIcalBody(box) {
   html += '<a href="/api/calendar.ics" download="amux.ics" class="btn" style="font-size:0.8rem;">Download .ics</a>';
   html += '</div></div>';
 
-  box.innerHTML = html + '<button onclick="this.closest(\'[data-ical-modal]\').remove()" class="btn" style="margin-top:0.9rem;font-size:0.8rem;">Close</button>';
+  box.innerHTML = html + '<div class="amux-modal-foot" style="justify-content:flex-end;"><button onclick="this.closest(\'[data-ical-modal]\').remove()" class="btn" style="font-size:0.8rem;">Close</button></div>';
 }
 function showIcalInfo() {
   const modal = document.createElement('div');
   modal.style.cssText = 'position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);';
   const box = document.createElement('div');
   box.setAttribute('data-ical-box', '1');
-  box.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1.4rem;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4);max-height:85vh;overflow:auto;';
+  box.className = 'amux-modal';
+  box.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1.4rem;max-width:440px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4);--modal-pad:1.4rem;';
   box.innerHTML = '<p style="color:var(--dim);font-size:0.85rem;margin:0;">Loading…</p>';
   modal.setAttribute('data-ical-modal', '1');
   modal.appendChild(box);
@@ -24102,7 +24453,7 @@ async function openTeamInvite() {
   // Show modal with copyable link
   const modal = document.createElement('div');
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
-  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;">
+  modal.innerHTML = `<div style="background:var(--bg2,#1a1a1a);border:1px solid var(--border,#333);border-radius:12px;padding:28px;max-width:480px;width:90%;box-sizing:border-box;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">
     <h3 style="margin:0 0 8px;font-size:1rem;">Invite to workspace</h3>
     <p style="color:var(--dim);font-size:0.82rem;margin:0 0 14px;">Share this link. It expires in 7 days.</p>
     <div style="display:flex;gap:8px;">
@@ -28911,7 +29262,7 @@ function _jrnlShowConfig() {
   const overlay = document.createElement('div');
   overlay.id = 'jrnl-config-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;">' +
+  overlay.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw;max-height:min(90dvh,calc(100dvh - 24px));overflow-y:auto;overscroll-behavior:contain;">' +
     '<h3 style="margin:0 0 16px;font-size:0.95rem;">Journal Prompts</h3>' +
     '<p style="font-size:0.75rem;color:var(--dim);margin:0 0 12px;">Configure up to 3 optional prompts shown when creating entries.</p>' +
     '<label style="font-size:0.72rem;color:var(--dim);">Prompt 1</label>' +

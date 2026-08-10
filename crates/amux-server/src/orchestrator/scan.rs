@@ -155,6 +155,7 @@ impl ScanLoop {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::SCAN);
             match self.scan_once().await {
                 Ok(r) if !r.scanned.is_empty() || !r.capture_failures.is_empty() => {
                     tracing::debug!(

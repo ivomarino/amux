@@ -388,6 +388,7 @@ impl Bootstrap {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            crate::runtime_jobs::registry::tick(crate::runtime_jobs::registry::ids::BOOTSTRAP);
             match self.pass_once().await {
                 Ok(r) if !r.is_empty() => {
                     tracing::info!(report = %serde_json::to_string(&r).unwrap_or_default(),
