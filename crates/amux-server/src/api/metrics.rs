@@ -66,6 +66,7 @@ fn resolve_bin(name: &str) -> &str {
         "hostname" => "/bin/hostname",
         "df" => "/bin/df",
         "ps" => "/bin/ps",
+        "pgrep" => "/usr/bin/pgrep",
         "tmux" => {
             if std::path::Path::new("/usr/local/bin/tmux").exists() {
                 "/usr/local/bin/tmux"
@@ -267,10 +268,19 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
             s["memory_file_kb"] = json!((meta.len() as f64 / 1024.0 * 10.0).round() / 10.0);
         }
 
-        // Process stats via ps
+        // Process stats: find all descendant PIDs then ps them
         if active {
             if let Some(pane_pid) = tmux_pids.get(&tmux_name) {
-                if let Some(ps_out) = cmd_output("ps", &["-o", "pid=,rss=,pcpu=", "-g", &pane_pid.to_string()]) {
+                let mut all_pids = vec![*pane_pid];
+                collect_descendants(*pane_pid, &mut all_pids);
+                let pid_list = all_pids
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if let Some(ps_out) =
+                    cmd_output("ps", &["-o", "pid=,rss=,pcpu=", "-p", &pid_list])
+                {
                     let mut pids = Vec::new();
                     let mut total_rss = 0u64;
                     let mut total_cpu = 0.0f64;
@@ -294,6 +304,17 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
         sessions.push(s);
     }
     sessions
+}
+
+fn collect_descendants(pid: u64, out: &mut Vec<u64>) {
+    if let Some(pgrep_out) = cmd_output("pgrep", &["-P", &pid.to_string()]) {
+        for line in pgrep_out.lines() {
+            if let Ok(child) = line.trim().parse::<u64>() {
+                out.push(child);
+                collect_descendants(child, out);
+            }
+        }
+    }
 }
 
 fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
