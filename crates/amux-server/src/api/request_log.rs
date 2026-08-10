@@ -922,6 +922,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
     // -- logs (this module)
     RouteEntry { path: "/api/logs", methods: &["GET"] },
+    // Ported in d177625. Missing from this table meant /api/debug/routes
+    // reported it NOT MOUNTED while the handler was answering — the instrument
+    // CLAUDE.md tells people to consult instead of grepping, lying about the
+    // very route that was just added.
+    RouteEntry { path: "/api/lookup", methods: &["POST"] },
+    RouteEntry { path: "/api/board/themes", methods: &["GET"] },
+    RouteEntry { path: "/api/board/commit-mentions", methods: &["GET"] },
     RouteEntry { path: "/api/logs/raw", methods: &["GET"] },
     RouteEntry { path: "/api/logs/analyze", methods: &["GET"] },
     RouteEntry { path: "/api/logs/stats", methods: &["GET"] },
@@ -1953,11 +1960,15 @@ mod tests {
         // Unrouted paths: conservative collapse — words stay, ids fold.
         assert_eq!(normalize_target("/api/sessions-graph"), "/api/sessions-graph");
         assert_eq!(normalize_target("/api/stripe/status"), "/api/stripe/status");
-        assert_eq!(normalize_target("/api/lookup"), "/api/lookup");
+        assert_eq!(normalize_target("/api/sessions-graph"), "/api/sessions-graph");
         assert_eq!(normalize_target("/api/foo/AMUX-9"), "/api/foo/{id}");
 
         assert_eq!(routed_methods_at("/api/board/statuses/review"), vec!["PATCH", "DELETE"]);
-        assert_eq!(routed_methods_at("/api/lookup"), Vec::<&str>::new());
+        // Re-pointed from /api/lookup, which became ROUTED in d177625. A
+        // fixture that names a real unrouted path is worth keeping accurate
+        // rather than deleting — this cell is the "no route at all" case, and
+        // it needs a path that genuinely has none.
+        assert_eq!(routed_methods_at("/api/sessions-graph"), Vec::<&str>::new());
         assert_eq!(routed_methods_at("/api/scope"), vec!["*"]);
         // No POST at /{gid}/file even though /{gid}/{action} routes POST —
         // the best (static) match wins, exactly as axum dispatches.
@@ -2041,7 +2052,7 @@ mod tests {
         // Cell 2 (the classic): PUT on a path that routes GET, POST.
         seed(&store, now - 40.0, "PUT", "/api/board", 405, 1.0, "lane-a", "native", None).await;
         // Cell 3 (the catch-all trap): POST on a path with NO route.
-        seed(&store, now - 30.0, "POST", "/api/lookup", 405, 1.0, "", "native", None).await;
+        seed(&store, now - 30.0, "POST", "/api/sessions-graph", 405, 1.0, "", "native", None).await;
         // 404s: one unrouted path (gets nearest_routes), one routed path
         // whose HANDLER 404'd (routed_methods shows it is a real route).
         seed(&store, now - 20.0, "GET", "/api/sessions-graph", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
@@ -2112,7 +2123,10 @@ mod tests {
         assert!(cell1.contains("PATCH, DELETE"), "{cell1}");
         let cell2 = vd("PUT /api/board:");
         assert!(cell2.contains("not routed; routed there: GET, POST"), "{cell2}");
-        let cell3 = vd("POST /api/lookup");
+        // Re-pointed from /api/lookup (routed in d177625) to a path that is
+        // still genuinely unrouted, so this cell keeps testing what it names:
+        // a 405 where NO route exists is the GET-only SPA catch-all.
+        let cell3 = vd("POST /api/sessions-graph");
         assert!(cell3.contains("no route exists at this path"), "{cell3}");
         assert!(cell3.contains("GET-only"), "{cell3}");
     }
