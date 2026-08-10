@@ -2267,7 +2267,7 @@ function updatePeekStatus() {
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
   let badge = '';
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>';
+  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _liveWorkLine(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting">needs input</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
@@ -2635,7 +2635,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' + _liveWorkLine(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -2977,6 +2977,41 @@ function _fmtResetTime(epoch) {
 // surfaced). A clock needs no pattern, so the NEXT unrecognized gate still shows
 // up here. Suppressed when a limit badge already names the cause.
 const _STALL_MINS = 15;
+// "working" with nothing behind it is indistinguishable from wedged.
+//
+// Ethan, 01:54: "this worker says working but is not doing anything." It WAS
+// working — the pane read `· Shenaniganing… (2m 6s · ↓ 5.4k tokens)` at that
+// moment. The problem is that the card could not say so: the badge derives from
+// s.status alone, and every other field that might corroborate it is empty
+// fleet-wide (active_model 0/48, tokens 0/48, task_updated 0/48 — all hardcoded
+// empty in sessions_legacy.rs because the python scanner held them in memory
+// and the port refused to invent them). The preview that DOES carry the
+// evidence only rendered on an EXPANDED card.
+//
+// So this surfaces the evidence that is already on the wire, at the badge,
+// where the question is actually asked. Nothing new is computed or inferred —
+// if the harness is not drawing a progress line, this shows nothing rather than
+// manufacturing reassurance.
+function _liveWorkLine(s) {
+  if (!s || s.status !== 'active') return '';
+  const lines = (s.preview_lines && s.preview_lines.length)
+    ? s.preview_lines
+    : String(s.preview || '').split('\n');
+  // Claude Code's progress line: "· Verb… (2m 6s · ↓ 5.4k tokens)". Match on the
+  // elapsed/token parenthetical rather than the verb — the verb is random.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = String(lines[i]).trim();
+    if (/\((?:[\d.]+[smh]\s|\d+m\s\d+s)/.test(l) || /tokens\)/.test(l) || /esc to interrupt/i.test(l)) {
+      // Claude Code cycles spinner glyphs (·, ✽, ✳, …), so strip ANY leading
+      // non-letter rather than a list that goes stale on the next glyph.
+      const txt = l.replace(/^[^\p{L}\p{N}]+/u, '').slice(0, 60);
+      if (txt) return '<span class="live-work" title="Live from the worker\'s terminal — this is what it is doing right now">'
+                  + esc(txt) + '</span>';
+    }
+  }
+  return '';
+}
+
 function _stalledFor(s) {
   if (!s.waiting_since || s.credit_limited || s.rate_limited_until) return '';
   const mins = Math.floor((Date.now() / 1000 - s.waiting_since) / 60);
@@ -6731,7 +6766,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.562';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.563';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

@@ -4670,3 +4670,21 @@
     .jrnl-gallery { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
   }
 
+
+/* The live progress line beside the "working" badge (AMUX-2676). Muted and
+   monospace so it reads as machine output, not a label — it is the worker's own
+   terminal line, quoted. Truncates rather than wrapping: on a phone the badge
+   row must stay one line. */
+.live-work {
+  display: inline-block;
+  margin-left: 6px;
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.66rem;
+  color: var(--dim);
+}
+@media (max-width: 600px) { .live-work { max-width: 38vw; } }
