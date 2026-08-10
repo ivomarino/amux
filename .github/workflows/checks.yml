@@ -46,3 +46,25 @@ jobs:
             fi
           done
           [ "$fail" -eq 0 ] && echo "secret scan clean" || exit 1
+
+      # frustrations.md structural integrity (AF-28). NOT a reintroduction of the
+      # Python-era pytest gate removed above — this validates a committed MARKDOWN
+      # file's contract, is language-agnostic like the secret scan, and exists
+      # because the check that used to run it was deleted with tests/ on the same
+      # day the utility it runs was deliberately KEPT. A script nobody runs is
+      # decoration (ethos rule 1), and this one already caught a real defect on its
+      # first run: an entry using `FIX-NOTE:` where the contract says `FIX:`, which
+      # `grep '^FIX:'` silently skipped.
+      #
+      # Exit codes are load-bearing: 0 clean, 1 real problems, 2 board unreachable.
+      # 2 is EXPECTED in CI (no localhost board) and must not fail the build — the
+      # structural half still ran and is what we are gating on. Only 1 fails, so a
+      # green run here means "every entry has its required fields", never "the
+      # board agreed", which CI cannot check and should not claim.
+      - name: frustrations.md structure (AF-28)
+        run: |
+          set -uo pipefail
+          python3 scripts/frustrations_audit.py
+          rc=$?
+          if [ "$rc" = "1" ]; then exit 1; fi
+          exit 0
