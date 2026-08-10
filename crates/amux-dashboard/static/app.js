@@ -6654,7 +6654,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.548';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.549';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10510,6 +10510,28 @@ function _msgNorm(x) {
 // surface keeps its own CSS. Everything a reader SEES (badge, origin, card chip,
 // timestamp, highlighting, actions) is now defined once, because three
 // hand-maintained copies is what made them diverge.
+// Which messages the user has COLLAPSED. Deliberately in-memory and
+// collapse-keyed (not expand-keyed), so the default for anything unknown —
+// every message on every fresh load — is EXPANDED, per Ethan. Persisting this
+// would mean a reload could hide content the user never chose to hide.
+const _msgCollapsed = new Set();
+
+/// Toggle one message's body. Mutates the DOM in place rather than re-rendering
+/// the list: a re-render rebuilds every row, loses scroll position and drops
+/// any in-flight text selection, which makes collapsing feel like a navigation.
+function _msgToggleCollapse(btn, key, ev) {
+  if (ev) ev.stopPropagation();          // the row itself inserts into the composer
+  const row = btn.closest('[data-msg-key]');
+  if (!row) return;
+  const body = row.querySelector('.msg-body');
+  if (!body) return;
+  const nowCollapsed = body.classList.toggle('collapsed');
+  if (nowCollapsed) _msgCollapsed.add(key); else _msgCollapsed.delete(key);
+  btn.innerHTML = nowCollapsed ? '&#9656;' : '&#9662;';
+  btn.setAttribute('aria-expanded', String(!nowCollapsed));
+  btn.title = nowCollapsed ? 'Expand message' : 'Collapse message';
+}
+
 function _cmdHistItemHTML(e, ctx) {
   ctx = ctx || _msgCtxPeek();
   const _pk = ctx.key(e), _psel = ctx.sel.has(_pk);
@@ -10541,7 +10563,15 @@ function _cmdHistItemHTML(e, ctx) {
   const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
   const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
   const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
-  return `<div class="${ctx.rowClass||''}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend"><div style="flex:1;min-width:0;white-space:pre-wrap;word-break:break-word;line-height:1.45;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}${_hlSearch(_linkifyCardIds(safe), _mq)}</div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
+  // A MATCHING message is force-expanded while a search is active, even if the
+  // user collapsed it earlier. Otherwise the search highlights the term inside
+  // a clamped body and the hit is invisible — a result you cannot see is not a
+  // result. The collapse preference is remembered, not discarded: clearing the
+  // search restores it on the next render.
+  const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
+  const _collapsed = _msgCollapsed.has(_pk) && !_matches;
+  const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
