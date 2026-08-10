@@ -44,8 +44,13 @@ pub struct Ownership {
     pub foreign: Vec<(String, String)>, // (path, owner)
     /// Both edited it. Contested, not forbidden.
     pub shared: Vec<(String, String)>, // (path, other owner)
-    /// Nobody's edit record claims it.
+    /// Nobody's edit record claims it. NOT "yours" — see [`build`].
     pub unclaimed: Vec<String>,
+    /// The guard could not decide.
+    pub undecided: Vec<String>,
+    /// The guard is partially blind (a cotenant has no transcript), so an
+    /// empty `foreign` does NOT clear their files.
+    pub partial: Option<String>,
 }
 
 /// The nudge, or None when there is nothing honest to say.
@@ -56,16 +61,56 @@ pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
     if dirty.is_empty() {
         return None;
     }
+    // MINE means POSITIVELY ATTRIBUTED TO ME, never "not proven to be someone
+    // else's" (AMUX-2638, reopened by Ethan 2026-08-10).
+    //
+    // The first port filtered out `foreign` and treated everything else as
+    // mine. That is the same bug in a subtler dress: it told Ethan to "commit
+    // completed work now" about CLAUDE.md, which he had never touched — the
+    // guard classified it `unclaimed`, meaning NO session has an edit record
+    // for it, and specifically he had no claim. Near-certainly a peer's
+    // in-flight edit (last commit to that file was amux-homepage doing exactly
+    // that work).
+    //
+    // "Not attributable to a peer" is not evidence that it is yours. Only a
+    // positive claim is.
     let foreign_paths: BTreeSet<&str> = own.foreign.iter().map(|(p, _)| p.as_str()).collect();
+    let unknown_paths: BTreeSet<&str> = own
+        .unclaimed
+        .iter()
+        .map(String::as_str)
+        .chain(own.undecided.iter().map(String::as_str))
+        .collect();
 
-    // MINE = dirty MINUS foreign. Not "dirty", which is the bug this port
-    // exists to not reintroduce.
-    let mine: Vec<&String> = dirty.iter().filter(|p| !foreign_paths.contains(p.as_str())).collect();
+    let mine: Vec<&String> = dirty
+        .iter()
+        .filter(|p| !foreign_paths.contains(p.as_str()) && !unknown_paths.contains(p.as_str()))
+        .collect();
+    let unknown: Vec<&String> =
+        dirty.iter().filter(|p| unknown_paths.contains(p.as_str())).collect();
+
     if mine.is_empty() {
-        // Every dirty file belongs to someone else. Telling this session to
-        // "commit completed work" here is precisely the instruction that swept
-        // three peers' work in one day.
-        return None;
+        // Nothing is positively yours. Saying "commit completed work now" here
+        // is the instruction that cost this checkout three sweeps in two days.
+        // But silence is also wrong when the tree is dirty and nobody can say
+        // whose it is — so report the uncertainty AS uncertainty.
+        if unknown.is_empty() {
+            return None;
+        }
+        let n = unknown.len();
+        let list: String = unknown.iter().take(10).map(|f| format!("  {f}\n")).collect();
+        let mut m = format!(
+            "You went idle with {n} uncommitted change(s) under {dir} whose OWNERSHIP IS \
+             UNKNOWN — no session has an edit record for {}:\n{list}\n\
+             Do NOT assume {} yours. `git add -A` here would commit whatever a peer is \
+             mid-edit on. Check `git diff` and stage only what you recognise as your work.",
+            if n == 1 { "it" } else { "them" },
+            if n == 1 { "it is" } else { "they are" },
+        );
+        if let Some(why) = &own.partial {
+            m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
+        }
+        return Some(m);
     }
 
     let n = mine.len();
@@ -84,6 +129,17 @@ pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
          Don't leave the working tree dirty."
     );
 
+    if !unknown.is_empty() {
+        let list: Vec<&str> = unknown.iter().take(4).map(|s| s.as_str()).collect();
+        msg.push_str(&format!(
+            "\n\nOWNERSHIP UNKNOWN — {} also dirty, with no edit record from any session. \
+             Not counted above and not necessarily yours; check before staging.",
+            list.join(", ")
+        ));
+    }
+    if let Some(why) = &own.partial {
+        msg.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
+    }
     if !own.shared.is_empty() {
         let who: BTreeSet<&str> = own.shared.iter().map(|(_, w)| w.as_str()).collect();
         let paths: Vec<&str> = own.shared.iter().take(4).map(|(p, _)| p.as_str()).collect();
@@ -192,20 +248,50 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
             })
             .unwrap_or_default()
     };
-    Some(Ownership {
-        foreign: pairs("foreign"),
-        shared: pairs("shared"),
-        unclaimed: v
-            .get("unclaimed")
+    // "I cannot tell" is a first-class answer here, and the reason this fix is
+    // possible now: the guard reports when a cotenant has no transcript, so an
+    // empty `foreign` does NOT clear their files.
+    // `degraded` is an ARRAY of sentences on the live server, not a string —
+    // an `as_str()` read silently dropped it, which would have shipped this fix
+    // with its own disclosure permanently off. Handle both shapes.
+    let partial = v
+        .get("degraded")
+        .and_then(|d| match d {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Array(a) if !a.is_empty() => {
+                let joined: Vec<String> =
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                (!joined.is_empty()).then(|| joined.join("; "))
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            v.get("reason")
+                .and_then(Value::as_str)
+                .filter(|s| s.to_lowercase().contains("partial") || s.to_lowercase().contains("invisible"))
+                .map(str::to_string)
+        });
+    let plain = |k: &str| -> Vec<String> {
+        v.get(k)
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
                     .filter_map(|f| {
-                        f.get("path").and_then(Value::as_str).map(str::to_string)
+                        f.get("path")
+                            .and_then(Value::as_str)
+                            .or_else(|| f.as_str())
+                            .map(str::to_string)
                     })
                     .collect()
             })
-            .unwrap_or_default(),
+            .unwrap_or_default()
+    };
+    Some(Ownership {
+        foreign: pairs("foreign"),
+        shared: pairs("shared"),
+        undecided: plain("undecided"),
+        partial,
+        unclaimed: plain("unclaimed"),
     })
 }
 
@@ -420,15 +506,50 @@ mod tests {
         assert!(msg.contains("git add -p"), "per-hunk is the actionable advice: {msg}");
     }
 
-    /// Unclaimed files are still MINE to consider: nobody's edit record claims
-    /// them, which is not the same as someone else owning them. Treating
-    /// unclaimed as foreign would silence a session that genuinely has work.
+    /// THE REOPEN (Ethan, 2026-08-10). This test previously asserted the
+    /// OPPOSITE — that unclaimed counts as mine — and that wrong belief is
+    /// exactly what shipped: the nudge told him to "commit completed work now"
+    /// about CLAUDE.md, a file he had never touched, which the guard classified
+    /// `unclaimed`.
+    ///
+    /// "No session has an edit record for it" is not "it is yours". Only a
+    /// POSITIVE claim is. The honest output is the uncertainty itself.
     #[test]
-    fn unclaimed_files_still_count_as_work_to_commit() {
-        let dirty = s(&["orphan.rs"]);
-        let own = Ownership { unclaimed: s(&["orphan.rs"]), ..Default::default() };
-        let msg = build("/repo", &dirty, &own).expect("unclaimed is not foreign");
-        assert!(msg.contains("1 uncommitted change(s)"), "{msg}");
+    fn an_unclaimed_file_is_reported_as_unknown_never_as_yours() {
+        let dirty = s(&["CLAUDE.md"]);
+        let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &own).expect("a dirty tree is still worth reporting");
+        assert!(msg.contains("OWNERSHIP IS UNKNOWN"), "{msg}");
+        assert!(
+            !msg.contains("Commit completed work"),
+            "must NOT instruct a commit of work that is not provably yours: {msg}"
+        );
+        assert!(msg.contains("git add -A"), "name the command that would sweep it: {msg}");
+    }
+
+    /// Unknowns alongside real work: the count must cover MINE only, and the
+    /// unknown must be disclosed rather than folded in.
+    #[test]
+    fn unknown_files_are_disclosed_but_not_counted_as_mine() {
+        let dirty = s(&["mine.rs", "CLAUDE.md"]);
+        let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &own).unwrap();
+        assert!(msg.contains("1 uncommitted change(s)"), "count MINE only: {msg}");
+        assert!(msg.contains("OWNERSHIP UNKNOWN") && msg.contains("CLAUDE.md"), "{msg}");
+    }
+
+    /// A blind guard must say so. An empty `foreign` from a partially-blind
+    /// scan does NOT clear a peer's files, and the nudge has to pass that on.
+    #[test]
+    fn partial_attribution_is_disclosed() {
+        let dirty = s(&["mine.rs"]);
+        let own = Ownership {
+            partial: Some("no transcript for cotenant amux-helper".into()),
+            ..Default::default()
+        };
+        let msg = build("/repo", &dirty, &own).unwrap();
+        assert!(msg.contains("ATTRIBUTION IS PARTIAL"), "{msg}");
+        assert!(msg.contains("amux-helper"), "name who is invisible: {msg}");
     }
 
     #[test]
