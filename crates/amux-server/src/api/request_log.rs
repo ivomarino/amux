@@ -821,6 +821,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
@@ -1054,13 +1055,13 @@ pub fn normalize_target(path: &str) -> String {
 
 /// The methods actually mounted where `path` dispatches (`["*"]` = any), or
 /// empty when no route claims the path at all.
-fn routed_methods_at(path: &str) -> Vec<&'static str> {
+pub(crate) fn routed_methods_at(path: &str) -> Vec<&'static str> {
     best_route(path).map(|e| e.methods.to_vec()).unwrap_or_default()
 }
 
 /// Up to `n` sibling routes by shared prefix — the "did you mean" list for
 /// 404s. Only prefixes extending past "/api/" count as kinship.
-fn nearest_routes(path: &str, n: usize) -> Vec<&'static str> {
+pub(crate) fn nearest_routes(path: &str, n: usize) -> Vec<&'static str> {
     let common = |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     let mut scored: Vec<(usize, &'static str)> = ROUTE_TABLE
         .iter()
@@ -1091,7 +1092,7 @@ fn since_h_of(q: &HashMap<String, String>) -> f64 {
         .clamp(0.01, 24.0 * 365.0)
 }
 
-fn local_when(ts: f64) -> String {
+pub(crate) fn local_when(ts: f64) -> String {
     chrono::Local
         .timestamp_opt(ts as i64, 0)
         .single()
@@ -1103,7 +1104,7 @@ fn local_when(ts: f64) -> String {
 /// caller sent X-Amux-Session, else the socket IP. On an all-localhost box
 /// the IP collapses to one value, so the session header is the discriminator
 /// worth having (and its absence is itself a finding — see AMUX-1812).
-fn client_identity(session: &str, ip: &str) -> String {
+pub(crate) fn client_identity(session: &str, ip: &str) -> String {
     if !session.is_empty() {
         format!("session:{session}")
     } else if !ip.is_empty() {
@@ -1274,7 +1275,7 @@ async fn analyze(
 /// from grep + handler-reading. Three cells, one per honest state:
 /// unrouted path (the catch-all trap), wrong method on a real path (the
 /// classic), and method-now-routed (the build moved since the rows).
-fn verdict_405(method: &str, target: &str, routed: &[&str], raw_path: &str) -> String {
+pub(crate) fn verdict_405(method: &str, target: &str, routed: &[&str], raw_path: &str) -> String {
     if routed.is_empty() {
         let near = nearest_routes(raw_path, 3);
         let near = if near.is_empty() { String::from("none") } else { near.join(", ") };
@@ -1298,7 +1299,7 @@ fn verdict_405(method: &str, target: &str, routed: &[&str], raw_path: &str) -> S
 /// Nearest-rank percentile over an ASCENDING-sorted slice: the value at
 /// 1-based rank ceil(q*n). Always an actually-observed latency — never an
 /// interpolation — so p50/p95 can be grepped back to real rows.
-fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
+pub(crate) fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }

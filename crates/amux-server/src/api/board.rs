@@ -55,6 +55,8 @@ pub fn routes() -> Router<AppState> {
         // BEFORE the request, so the card vanished, the server kept it, and it
         // came back on the next poll. That is the reported "tons of board
         // items are not moving" (AMUX board sweep, 2026-08-09).
+        // Before the /{id} wildcard, or "clear-done" is swallowed as an id.
+        .route("/clear-done", post(clear_done))
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
@@ -1277,6 +1279,42 @@ fn gate_409(
         "kind": "gate_blocked",
         "why_blocked": wb,
     })
+}
+
+/// `POST /api/board/clear-done` — the dashboard's "Clear done" button.
+///
+/// It was never routed on rust (AMUX-2630): the SPA optimistically hid the done
+/// cards, POSTed, got a 405 from the GET-only catch-all, and the cards came
+/// back on the next refresh. A button that appears to work and silently does
+/// nothing is worse than a missing one.
+///
+/// ARCHIVES, never deletes. The cards are the user's record of what happened,
+/// and "clear from my board" is a view operation — `archived=1` removes them
+/// from every default view while leaving them recoverable. Deleting user
+/// content as the side effect of a tidy-up button is the ethos-rule-8 failure.
+pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (_, actor) = actor_from_headers(&headers);
+    let res = state
+        .store
+        .write_async(move |conn| {
+            let n = conn.execute(
+                "UPDATE issues SET archived = 1, updated = strftime('%s','now') \
+                 WHERE status = 'done' AND COALESCE(archived,0) = 0 AND deleted IS NULL",
+                [],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        })
+        .await;
+    match res {
+        Ok(_) => {
+            tracing::info!(actor = %actor, "board: cleared done cards (archived)");
+            (StatusCode::OK, Json(json!({"ok": true, "archived": true}))).into_response()
+        }
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": format!("clear-done failed: {e}")}),
+        ),
+    }
 }
 
 pub async fn patch_item(
