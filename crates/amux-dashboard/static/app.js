@@ -1636,6 +1636,32 @@ async function _apiErrText(r) {
 }
 
 // apiCall — wraps mutation fetches; queues when offline or server unreachable
+// A 200 does not mean the server APPLIED what you sent (AC-323). The API names
+// unapplied request fields in `ignored_fields` (AC-263) precisely so a caller
+// can tell — and until now nothing read it: 1 of 47 mutation call sites across
+// the CLI and this file. That is how `amux board progress` reported a write it
+// never made, for weeks, on the verb sessions are told to use to record an
+// outcome. A mechanism nobody consumes is the same failure as no mechanism.
+//
+// Fire-and-forget on a CLONE so the caller still owns the body, and only for
+// mutations — a GET has no fields to ignore.
+//
+// COVERAGE IS PARTIAL AND DELIBERATELY NOT CLAIMED OTHERWISE: this catches the
+// 61 sites that go through apiCall. Most PATCHes in this file use raw fetch and
+// are still blind — see the follow-up card. Routing them through here is the
+// actual close of the class.
+function _warnIgnoredFields(r, url, options) {
+  const m = ((options && options.method) || 'GET').toUpperCase();
+  if (m === 'GET' || m === 'HEAD') return;
+  r.clone().json().then(d => {
+    const ign = d && d.ignored_fields;
+    if (Array.isArray(ign) && ign.length) {
+      showToast('Not saved: server ignored ' + ign.join(', '));
+      amuxTrack('ignored_fields', { url: url.split('?')[0], method: m, fields: ign.join(',') });
+    }
+  }).catch(() => {});   // non-JSON body is normal; never break the caller
+}
+
 async function apiCall(url, options) {
   if (!online) {
     _queueOp(url, options);
@@ -1658,6 +1684,7 @@ async function apiCall(url, options) {
       return null;
     }
     consecutiveFailures = 0;
+    _warnIgnoredFields(r, url, options);
     return r;
   } catch(e) {
     // Server unreachable despite having internet — queue and mark offline
@@ -6667,7 +6694,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.559';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.560';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
