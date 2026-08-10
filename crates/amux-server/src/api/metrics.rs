@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
+use std::path::PathBuf;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -45,6 +46,272 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
 }
 
+// ---- system metrics (shell-command based, matching Python's non-psutil fallback) ----
+
+fn cmd_output(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn collect_system_metrics() -> serde_json::Value {
+    let hostname = cmd_output("hostname", &[]).unwrap_or_default().trim().to_string();
+    let mut sys = serde_json::Map::new();
+    sys.insert("hostname".into(), json!(hostname));
+    sys.insert("psutil".into(), json!(false));
+
+    // Load average
+    if let Some(sysctl_out) = cmd_output("sysctl", &["-n", "vm.loadavg"]) {
+        // Format: "{ 1.23 4.56 7.89 }"
+        let nums: Vec<f64> = sysctl_out
+            .trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace())
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f64>().ok())
+            .map(|v| (v * 100.0).round() / 100.0)
+            .collect();
+        if !nums.is_empty() {
+            sys.insert("load_avg".into(), json!(nums));
+        }
+    }
+    // CPU count
+    if let Some(ncpu_s) = cmd_output("sysctl", &["-n", "hw.logicalcpu"]) {
+        if let Ok(n) = ncpu_s.trim().parse::<u64>() {
+            sys.insert("cpu_count".into(), json!(n));
+        }
+    }
+
+    // RAM via sysctl + vm_stat (macOS)
+    if cfg!(target_os = "macos") {
+        if let (Some(memsize_s), Some(vmstat_s)) = (
+            cmd_output("sysctl", &["-n", "hw.memsize"]),
+            cmd_output("vm_stat", &[]),
+        ) {
+            if let Ok(total_bytes) = memsize_s.trim().parse::<u64>() {
+                let page_size: u64 = cmd_output("sysctl", &["-n", "hw.pagesize"])
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(16384);
+                let mut pages = std::collections::HashMap::new();
+                for line in vmstat_s.lines() {
+                    if let Some(rest) = line.strip_prefix("Pages ") {
+                        if let Some((key, val)) = rest.split_once(':') {
+                            if let Ok(n) = val.trim().trim_end_matches('.').parse::<u64>() {
+                                pages.insert(key.trim().to_string(), n * page_size);
+                            }
+                        }
+                    }
+                }
+                let free = pages.get("free").unwrap_or(&0)
+                    + pages.get("speculative").unwrap_or(&0);
+                let used = total_bytes.saturating_sub(free);
+                sys.insert(
+                    "ram_total_mb".into(),
+                    json!((total_bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0),
+                );
+                sys.insert(
+                    "ram_used_mb".into(),
+                    json!((used as f64 / 1_048_576.0 * 10.0).round() / 10.0),
+                );
+                sys.insert(
+                    "ram_percent".into(),
+                    json!(if total_bytes > 0 {
+                        (used as f64 / total_bytes as f64 * 1000.0).round() / 10.0
+                    } else {
+                        0.0
+                    }),
+                );
+            }
+        }
+        // Swap
+        if let Some(swap_s) = cmd_output("sysctl", &["-n", "vm.swapusage"]) {
+            fn parse_mb(s: &str) -> Option<f64> {
+                s.trim().strip_suffix('M').and_then(|n| n.trim().parse().ok())
+            }
+            let parts: Vec<&str> = swap_s.split("  ").collect();
+            let mut total_mb = 0.0f64;
+            let mut used_mb = 0.0f64;
+            for part in &parts {
+                if let Some(rest) = part.trim().strip_prefix("total = ") {
+                    total_mb = parse_mb(rest).unwrap_or(0.0);
+                } else if let Some(rest) = part.trim().strip_prefix("used = ") {
+                    used_mb = parse_mb(rest).unwrap_or(0.0);
+                }
+            }
+            sys.insert("swap_total_mb".into(), json!((total_mb * 10.0).round() / 10.0));
+            sys.insert("swap_used_mb".into(), json!((used_mb * 10.0).round() / 10.0));
+        }
+        // Uptime
+        if let Some(bt) = cmd_output("sysctl", &["-n", "kern.boottime"]) {
+            if let Some(sec_str) = bt.split("sec = ").nth(1).and_then(|s| s.split(',').next()) {
+                if let Ok(boot_sec) = sec_str.trim().parse::<i64>() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    sys.insert("uptime_seconds".into(), json!(now - boot_sec));
+                }
+            }
+        }
+    }
+
+    // Disk via df
+    if let Some(df_s) = cmd_output("df", &["-k", "/"]) {
+        if let Some(last_line) = df_s.lines().last() {
+            let parts: Vec<&str> = last_line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                if let (Ok(tk), Ok(uk)) = (
+                    parts[1].parse::<u64>(),
+                    parts[2].parse::<u64>(),
+                ) {
+                    sys.insert(
+                        "disk_total_gb".into(),
+                        json!((tk as f64 / 1_048_576.0 * 10.0).round() / 10.0),
+                    );
+                    sys.insert(
+                        "disk_used_gb".into(),
+                        json!((uk as f64 / 1_048_576.0 * 10.0).round() / 10.0),
+                    );
+                    sys.insert(
+                        "disk_percent".into(),
+                        json!(if tk > 0 {
+                            (uk as f64 / tk as f64 * 1000.0).round() / 10.0
+                        } else {
+                            0.0
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    serde_json::Value::Object(sys)
+}
+
+fn sessions_dir() -> PathBuf {
+    let home = std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+    });
+    home.join("sessions")
+}
+
+fn memory_dir() -> PathBuf {
+    let home = std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+    });
+    home.join("memory")
+}
+
+fn collect_session_metrics() -> Vec<serde_json::Value> {
+    let sdir = sessions_dir();
+    let mdir = memory_dir();
+    let entries = match std::fs::read_dir(&sdir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    // Discover tmux sessions + pane PIDs
+    let tmux_pids = tmux_session_pids();
+
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = fname.strip_suffix(".env") else { continue };
+        if name.contains(".meta") {
+            continue;
+        }
+        // Check archived
+        let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        if content.lines().any(|l| l.trim() == "CC_ARCHIVED=1") {
+            continue;
+        }
+
+        let tmux_name = format!("amux-{name}");
+        let active = tmux_pids.contains_key(&tmux_name);
+        let mut s = json!({
+            "name": name,
+            "pids": [],
+            "cpu_percent": 0.0,
+            "rss_mb": 0.0,
+            "memory_file_kb": 0.0,
+            "tokens_today": 0,
+            "last_active": null,
+            "active": active,
+        });
+
+        // Memory file size
+        let mem_file = mdir.join(format!("{name}.md"));
+        if let Ok(meta) = std::fs::metadata(&mem_file) {
+            s["memory_file_kb"] = json!((meta.len() as f64 / 1024.0 * 10.0).round() / 10.0);
+        }
+
+        // Process stats via ps
+        if active {
+            if let Some(pane_pid) = tmux_pids.get(&tmux_name) {
+                if let Some(ps_out) = cmd_output("ps", &["-o", "pid=,rss=,pcpu=", "-g", &pane_pid.to_string()]) {
+                    let mut pids = Vec::new();
+                    let mut total_rss = 0u64;
+                    let mut total_cpu = 0.0f64;
+                    for line in ps_out.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            if let Ok(pid) = parts[0].parse::<u64>() {
+                                pids.push(pid);
+                            }
+                            total_rss += parts[1].parse::<u64>().unwrap_or(0);
+                            total_cpu += parts[2].parse::<f64>().unwrap_or(0.0);
+                        }
+                    }
+                    s["pids"] = json!(pids);
+                    s["rss_mb"] = json!((total_rss as f64 / 1024.0 * 10.0).round() / 10.0);
+                    s["cpu_percent"] = json!((total_cpu * 10.0).round() / 10.0);
+                }
+            }
+        }
+
+        sessions.push(s);
+    }
+    sessions
+}
+
+fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
+    let mut map = std::collections::HashMap::new();
+    let Some(out) = cmd_output(
+        "tmux",
+        &["list-sessions", "-F", "#{session_name} #{session_id}"],
+    ) else {
+        return map;
+    };
+    for line in out.lines() {
+        let name = line.split_whitespace().next().unwrap_or("").to_string();
+        if !name.starts_with("amux-") {
+            continue;
+        }
+        // Get pane PID for this session
+        if let Some(pane_out) = cmd_output(
+            "tmux",
+            &["list-panes", "-t", &format!("={name}"), "-F", "#{pane_pid}"],
+        ) {
+            if let Some(pid_s) = pane_out.lines().next() {
+                if let Ok(pid) = pid_s.trim().parse::<u64>() {
+                    map.insert(name, pid);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn collect_server_metrics(started: std::time::Instant) -> serde_json::Value {
+    json!({
+        "pid": std::process::id(),
+        "uptime_seconds": started.elapsed().as_secs(),
+        "thread_count": cmd_output("ps", &["-M", "-p", &std::process::id().to_string()])
+            .map(|s| s.lines().count().saturating_sub(1))
+            .unwrap_or(0),
+    })
+}
+
 async fn metrics(State(state): State<AppState>) -> Response {
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -52,7 +319,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
     };
     // -1 = "query failed", never silently 0: a metric that cannot be read
     // must not report an empty queue (ethos rule 7).
-    let body = json!({
+    let mut body = json!({
         "rev": state.store.current_rev().map(|r| r.0).unwrap_or(0),
         "uptime_s": state.started.elapsed().as_secs(),
         "workers": {
@@ -76,6 +343,22 @@ async fn metrics(State(state): State<AppState>) -> Response {
         "turns_recorded": count(&conn, "SELECT COUNT(*) FROM _amux_turns"),
         "events_journal": count(&conn, "SELECT COUNT(*) FROM _amux_state_events"),
     });
+    // System/session/server metrics — shell commands run off the runtime
+    let started = state.started;
+    match tokio::task::spawn_blocking(move || {
+        (collect_system_metrics(), collect_session_metrics(), collect_server_metrics(started))
+    })
+    .await
+    {
+        Ok((sys, sess, srv)) => {
+            body["system"] = sys;
+            body["sessions"] = json!(sess);
+            body["server"] = srv;
+        }
+        Err(e) => {
+            tracing::warn!("system metrics collection failed: {e}");
+        }
+    }
     Json(body).into_response()
 }
 
