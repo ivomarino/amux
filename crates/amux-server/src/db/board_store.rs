@@ -776,6 +776,23 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
     Ok(get_issue(conn, &id)?.expect("row just inserted"))
 }
 
+/// SOFT-delete a card: stamp `deleted` so every query in this module (all of
+/// which filter `deleted IS NULL`) stops returning it. Python's DELETE
+/// /api/board/{id} does exactly this, and the row stays for forensics.
+/// Returns false when the id does not resolve to a live row.
+///
+/// This is the one write that legitimately touches `deleted` — [`save_patched`]
+/// deliberately excludes it (see its note), which is why the delete path needs
+/// its own statement rather than a patched row.
+pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let now = Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE issues SET deleted = ?2, updated = ?2 WHERE id = ?1 AND deleted IS NULL",
+        params![id, now],
+    )?;
+    Ok(n > 0)
+}
+
 /// Write back a patched row. Only columns this API models are touched —
 /// `creator`, `created`, `notified`, `gcal_event_id` and `deleted` are
 /// deliberately NOT in the SET list so a Rust write can never corrupt a
