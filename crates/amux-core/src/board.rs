@@ -1226,6 +1226,47 @@ pub fn title_needs_self_description(title: &str) -> Option<&'static str> {
     None
 }
 
+/// Is `verified` a MEANINGFUL tier for this item type, or make-work?
+///
+/// AMUX-2816 / AMUX-2782. `verified` means one thing in this repo: confirmed
+/// working end-to-end IN PRODUCTION — CI green, deployed, exercised, no
+/// regressions. That is a real and expensive claim about `code`, and about the
+/// types that change a running system.
+///
+/// For a `doc`, a `chore`, an `investigation` or a `research` finding there is
+/// no production to confirm anything in. Their verified gate reads "Outcome
+/// confirmed to still hold", which is a RE-READ of a card somebody already
+/// closed — precisely the shape of make-work that produced 294 advance
+/// nudges/day against 25 human prompts before the `done` tier was removed.
+///
+/// THE MEASUREMENT THIS DECIDES. Verification collapsed from 256/day to 2/day
+/// when the advance loop stopped selecting `done`, leaving 1,153 unarchived
+/// done cards. The tempting fix is to drive all 1,153 toward `verified`. Most of
+/// them should never go there: a doc is finished when it is written, and asking
+/// a lane to re-confirm it is spending a turn to learn nothing.
+///
+/// So this narrows the target BEFORE anything is built to chase it. Whatever
+/// eventually drives done -> verified must read this, or it will nag lanes about
+/// cards that were already done in every sense that matters.
+///
+/// `done` stays terminal for everything else. That is not a demotion; it is the
+/// honest end state, and saying so stops the board implying a tier nothing
+/// reaches.
+pub fn verified_is_meaningful(item_type: ItemType) -> bool {
+    match item_type {
+        // Changes a running system: there is a production to confirm in.
+        ItemType::Code | ItemType::Ops | ItemType::Blocker | ItemType::Tripwire => true,
+        // Nothing ships, so nothing can be confirmed in prod. `done` is the end.
+        ItemType::Doc
+        | ItemType::Chore
+        | ItemType::Investigation
+        | ItemType::Research
+        | ItemType::Escalation
+        | ItemType::Watch => false,
+    }
+}
+
+
 #[cfg(test)]
 mod capture_tests {
     use super::*;
@@ -1972,7 +2013,32 @@ mod self_description_tests {
 
     /// The card's own examples, plus the shapes the amux-rust queue actually
     /// filled up with.
+        /// The narrowing decision (AMUX-2816), pinned so nobody widens it back by
+    /// accident. The measurement behind it: verification went 256/day -> 2/day
+    /// leaving 1,153 unverified done cards, and most of those should never reach
+    /// `verified` at all.
     #[test]
+    fn verified_is_only_meaningful_where_there_is_a_production_to_confirm_in() {
+        // Ships something a user runs: the 4-part prod gate is a real claim.
+        for t in [ItemType::Code, ItemType::Ops, ItemType::Blocker, ItemType::Tripwire] {
+            assert!(verified_is_meaningful(t), "{t:?} changes a running system");
+        }
+        // Ships nothing. Their verified gate is "outcome confirmed to still
+        // hold" — a re-read of a closed card, which costs a lane's turn to learn
+        // nothing. `done` is the honest end state.
+        for t in [
+            ItemType::Doc,
+            ItemType::Chore,
+            ItemType::Investigation,
+            ItemType::Research,
+            ItemType::Escalation,
+            ItemType::Watch,
+        ] {
+            assert!(!verified_is_meaningful(t), "{t:?} has no prod to confirm in");
+        }
+    }
+
+#[test]
     fn deictic_titles_are_flagged() {
         for s in [
             "This should be one row",
