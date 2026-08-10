@@ -2086,3 +2086,28 @@ FIX: Capture stderr to a FILE and leave stdout on the pipe
   a known-broken and a known-fixed artifact, the probe is the candidate before the
   conclusion is. This is the "loud wrong probe" from ethos rule 7 — it answered,
   and its answer was agreeable.
+
+## `amux board progress` printed "progress noted" and wrote nothing, for weeks
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux-rust
+CARD: AC-323
+SYMPTOM: Wrote an outcome note to AMUX-2653, then to AMUX-2672. Both printed
+  "AMUX-xxxx — progress noted", exit 0. Re-reading the cards minutes later:
+  AMUX-2653 still showed only its original 209-char text and AMUX-2672's desc was
+  empty. The rust cutover dropped `desc_append`; the server correctly named it in
+  `ignored_fields`, but the CLI only checked that the reply contained an `id` and
+  hid the rest behind `2>/dev/null`.
+COST: Two outcome records lost outright, and every progress note fleet-wide since
+  the cutover — silently. Worse than the lost text: this is the verb CLAUDE.md
+  tells sessions to use to record an outcome BEFORE a gate transition, precisely
+  because a gate-blocked PATCH discards the desc. So the sanctioned mitigation for
+  losing your outcome text WAS losing your outcome text.
+FIX: d0b2150 — server implements desc_append at python parity; CLI confirms at the
+  FIELD (reads ignored_fields, exits 1, names the destructive {"desc":...} retry
+  it must not reach for). The general shape is ethos rule 6: the mechanism that
+  would have made this visible already existed and was unread. `ignored_fields`
+  is only worth having if callers are made to look at it — consider whether any
+  other caller in the tree ignores it too.
