@@ -1041,12 +1041,39 @@ pub fn select_advance(
 
     // NO `done` TIER (py:13460, Ethan 2026-08-08: "we shouldnt be sending
     // commands to idle workers that genuinely have no more work"). `done` was
-    // briefly selected here so something drove done->verified; the daily
-    // verification sweep took that job and does it better — one batched message
-    // once a day — while this loop re-woke lanes per card, per cooldown: 294
-    // advance nudges/day against 25 human prompts, 46% repeats, each wake
+    // briefly selected here so something drove done->verified. Removing it was
+    // right on its own terms: this loop re-woke lanes per card, per cooldown —
+    // 294 advance nudges/day against 25 human prompts, 46% repeats, each wake
     // replaying a 400-600k context. A lane whose only remaining cards are `done`
     // has nothing IN FLIGHT.
+    //
+    // THE HANDOFF NAMED HERE DOES NOT EXIST (AMUX-2782). This comment used to
+    // say "the daily verification sweep took that job and does it better — one
+    // batched message once a day". There is no such sweep. Searched: every
+    // `jobs::spawn_loop` registration in lib.rs (board-drive, autofix,
+    // commit-nudge, ghost-rescue, pipe-reconcile, invariants-monitor,
+    // event-processors, orchestrator-runtime, scan, bootstrap, self-adopt,
+    // legacy-port); all 114 schedules, where the only ENABLED sweeps are LOG
+    // sweeps (SCHED-329, SCHED-331 — docs/rust-migration/log-sweep.md, a
+    // different contract that the name collides with) and the amux lane's own
+    // SCHED-276 board-triage entry is enabled=0; and the whole repo, where the
+    // sole hit for "verification sweep" was THIS COMMENT citing itself.
+    //
+    // The claim is deleted rather than kept, per ethos rule 6: implement the
+    // promise or delete it — an unimplemented handoff that reads as implemented
+    // is what stopped anyone checking for three days.
+    //
+    // MEASURED CONSEQUENCE, cards reaching `verified` per day:
+    //     08-07: 256   08-08: 121 (tier removed)   08-09: 38   08-10: 2
+    // against 1,153 unarchived `done` cards, 876 of them older than a day. The
+    // count is a last-touch proxy (`updated`; only 29 rows carry
+    // `last_verified_at`), which INFLATES recent days rather than deflating
+    // them, so the collapse is a floor, not an artefact.
+    //
+    // DO NOT FIX THIS BY RE-ADDING THE TIER — that was removed with a
+    // measurement and the owner's words behind it. What replaces it is an open
+    // design question that pairs with AMUX-2466's NEEDS-YOU on whether
+    // fleet-wide `verified` is the right gate at all.
     //
     // CANDIDATES, not LIMIT 1 (py:13439, AMUX-2498). Taking the single
     // highest-priority card meant an exhausted per-card budget silenced every
