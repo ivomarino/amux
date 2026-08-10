@@ -8907,7 +8907,7 @@ consistent with their dependencies.
   Verify: Implementation, Integration tests
   Status: TODO
 
-- [ ] RR-0135 — Proxy removal: all routes native, Python stops <!-- open -->
+- [x] RR-0135 — Proxy removal: all routes native, Python stops <!-- verified 2026-08-09: PROXIED_FAMILIES == [] (py_proxy.rs), tests/proxy_composition.rs asserts the table stays empty, GET /api/debug/boundary serves proxied:[]; python service booted out + disabled, amux-server.py deleted at 792ce1f -->
   Phase: 11
   Depends on: RR-0134, all Phase 1-10 items
   Invariant: —
@@ -8956,7 +8956,7 @@ consistent with their dependencies.
   Verify: Data verification, Integration tests, Browser verification, Offline behavior
   Status: TODO
 
-- [ ] RR-0139 — Production cutover <!-- open -->
+- [x] RR-0139 — Production cutover <!-- verified 2026-08-09: rust serves BOTH 8824 and legacy 8822 (AMUX_RS_LEGACY_PORT — the fleet's baked-in AMUX_URL cannot be rotated in live processes); same build hash on both ports; 116 sessions kept working with zero restarts; AMUX_RS_SCHEDULER=1 armed before the stop so 111 schedules kept firing -->
   Phase: 11
   Depends on: RR-0135, RR-0138
   Invariant: 45
@@ -8966,7 +8966,7 @@ consistent with their dependencies.
   Verify: Data verification, Integration tests, Browser verification
   Status: TODO
 
-- [ ] RR-0140 — Post-cutover verification <!-- open -->
+- [ ] RR-0140 — Post-cutover verification <!-- PARTIAL 2026-08-09: read paths verified live (sessions/board/peek/groups/schedules/logs/files/uploads/browser/dictation/usage-shape). NOT verified: the WRITE-side operational loop — board auto-pickup + advance nudges were python-only and were NOT ported (AMUX-2637: the board stopped moving for every worker), and message submission was unverified (AMUX-2629, fixed; 9 of 13 stuck lanes still holding text at last check). Post-cutover verification is not honestly complete until both are green. -->
   Phase: 11
   Depends on: RR-0139
   Invariant: 7, 45
@@ -9115,7 +9115,7 @@ consistent with their dependencies.
   Verify: Data verification
   Status: TODO
 
-- [ ] RR-0154 — Python shutdown criteria <!-- open -->
+- [ ] RR-0154 — Python shutdown criteria <!-- DEVIATION 2026-08-09: python was shut down on owner directive BEFORE the criteria (RR-0130/0131 sweeps, RR-0150 restart suite, RR-0152 soak) were satisfied. Named honestly rather than back-dated: the two regressions found afterwards (board drive, submission verification) are exactly what those gates existed to catch. The remaining gates now run against a live rust-only fleet instead of a coexisting one. -->
   Phase: 11
   Depends on: RR-0140, RR-0153
   Invariant: 45
@@ -9153,7 +9153,26 @@ evidence that it works.**
 Reconciled against the code (crates/, e2e/, scripts/, .github/workflows/, docs/rust-migration/).
 Every `[x]` above carries a file citation; `partial` names what exists and what is missing.
 
-**Totals (203 items): 94 done · 51 partial · 42 open · 16 superseded.**
+**Totals (203 items): 96 done · 52 partial · 39 open · 16 superseded.**
+
+**Update — 2026-08-09 late (post-cutover).** RR-0135 and RR-0139 are DONE:
+the proxy registry is empty and test-pinned, python is stopped, disabled and
+deleted, and rust answers both ports. RR-0154 carries a NAMED DEVIATION —
+python was shut down on owner directive before its criteria were met. That is
+not a bookkeeping detail: within hours the shutdown surfaced two regressions
+those very gates existed to catch, both of which were invisible rather than
+loud —
+(1) the board→worker drive (auto-pickup + advance/rot nudges) was python-only
+and unported, so every worker stopped receiving cards while nothing errored
+(AMUX-2637);
+(2) message submission was asserted, never verified, so sends landed in an
+input box and were reported as delivered (AMUX-2629 — fixed; the ported
+`_verify_submitted` now refuses to claim success it cannot evidence).
+The honest reading: the MIGRATION is complete, the OPERATIONAL LOOP is not.
+RR-0140 stays open until both are green in production, and the remaining
+gates (RR-0130/0131 sweeps, RR-0150 restart suite, RR-0152 soak) now run
+against a live rust-only fleet rather than a coexisting one — a harder test
+than the plan assumed, and the one that matters.
 (39 previously checked — all spot-checked sound, none flipped — plus 55 newly verified.)
 
 **(a) Genuinely open, needed before cutover** (AMUX-2598: 8824 exclusively rust + herdr + opencode; runbook docs/rust-migration/cutover-runbook.md):
