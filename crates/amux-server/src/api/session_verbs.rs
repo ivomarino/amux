@@ -11690,6 +11690,44 @@ mod steer_max_age_tests {
         assert!(!answers_visible_picker("1", ""));
     }
 
+    /// AMUX-2834: which selectors mean "a human must act". Both are pickers to
+    /// detect_claude_status; only one of them is anybody's problem.
+    #[test]
+    fn a_real_question_flags_input_required_but_a_rate_limit_menu_does_not() {
+        let ask = "\
+   Which database should I migrate?
+
+   ❯ 1. production
+     2. staging
+     3. Cancel
+
+   Enter to confirm · Esc to cancel";
+        let limit = "\
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+
+   Enter to confirm · Esc to cancel";
+
+        // The sweep's predicate, verbatim: a selector that is NOT the rate-limit
+        // menu is a human's to answer.
+        let flags = |p: &str| !is_rate_limit_menu(p) && detect_claude_status(p) == "waiting";
+
+        assert!(flags(ask), "an AskUserQuestion blocks on a human and must read `needs input`");
+        assert!(!flags(limit), "amux answers the rate-limit menu itself — flagging it would ask a \
+                                human for something nobody needs to decide");
+
+        // A working lane is not waiting for anyone, so it must never be flagged —
+        // this is the assertion that keeps `needs input` meaningful. A badge that
+        // fires on a busy fleet is one nobody reads.
+        let busy = "⏺ Running…\n  ⏵⏵ bypass permissions on · esc to interrupt";
+        assert!(!flags(busy));
+        let idle = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!flags(idle));
+    }
+
     /// THE DISTINCTION, IN BOTH DIRECTIONS. Getting it wrong one way deadlocks a
     /// lane forever; getting it wrong the other way re-enables the 2026-07-15
     /// AskUserQuestion kill, where typing at a picker REJECTS a pending tool.
