@@ -2198,7 +2198,28 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     let clean = strip_ansi(raw_frame);
     // The manager view owns the keyboard: its own status bar says so. Positive
     // match on the chrome Claude Code prints, not on a timer or an absence.
-    if clean.contains("Your conversation moved to the background")
+    //
+    // THE HEADLINE MUST START A LINE (AMUX-2680). A bare `contains` matched the
+    // phrase anywhere in the frame — including a lane's own PROSE ABOUT the
+    // feature. On 2026-08-10 the `amux` lane investigated the agents panel
+    // (AMUX-2635), quoted the headline twice in its written report, and locked
+    // itself out: every send returned 500 "press esc or enter in the pane to
+    // collapse it" for 6.6 hours, 4 steering messages queued undelivered, and
+    // Escape could not clear it because the text was ordinary scrollback, not a
+    // modal. Both quotes were mid-sentence (`... opened 'Your conversation moved
+    // to the background - 4 awaiting input' = the`); the real view prints the
+    // headline as its own line. That one positional constraint separates them.
+    //
+    // Keep the two-marker alternative below: it is the manager's footer chrome
+    // and is what makes this robust if the headline is ever reworded. Do NOT
+    // relax this back to a bare contains — any session that merely DISCUSSES
+    // background conversations becomes unreachable, which is the D1 hazard
+    // (scraping rendered UI as the control plane) with a self-referential twist:
+    // the lane investigating the feature is the one it silences.
+    let headline_own_line = clean
+        .lines()
+        .any(|l| l.trim_start().starts_with("Your conversation moved to the background"));
+    if headline_own_line
         || (clean.contains("enter to collapse") && clean.contains("ctrl+x to delete all"))
     {
         return ComposerState::BackgroundManager;
