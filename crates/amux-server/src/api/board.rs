@@ -1175,6 +1175,16 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
 
 /// Keys PATCH writes. Everything else lands in `ignored_fields` (reported,
 /// never silently dropped — AC-263).
+/// Truncate for a HISTORY LINE, on chars not bytes (a multi-byte title must not
+/// panic the writer) and with an ellipsis so a truncated value never reads as
+/// the whole value.
+fn chars_truncate_log(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(n).collect::<String>())
+}
+
 const PATCH_WRITABLE: [&str; 18] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2235,6 +2245,81 @@ pub async fn patch_item(
                     },
                     no_write(),
                 );
+            }
+
+            // THE CARD IS THE SOURCE OF TRUTH FOR ITS OWN HISTORY (Ethan,
+            // 2026-08-10: "make sure that board tasks maintain as the source of
+            // truth (updates, history, changes, etc.) all go into that board
+            // task as history — this should be amux wide").
+            //
+            // Only `status` was ever logged. The other seventeen writable fields
+            // changed SILENTLY: a card could be retyped, reassigned, re-scoped,
+            // un-archived, have its gate rewritten or its whole description
+            // replaced, and the card itself would carry no trace of any of it.
+            // The rev counter moved, which tells you SOMETHING happened and
+            // nothing about what — and rev is not on the card a human reads.
+            //
+            // So every accepted change now leaves a line naming the actor and
+            // the fields. Deliberately ONE line per PATCH rather than one per
+            // field: a PATCH is the atomic unit a caller performed, and
+            // splitting it would make an ordinary two-field edit read like two
+            // separate decisions.
+            //
+            // VALUES ARE SUMMARISED, NOT COPIED. `desc` can be thousands of
+            // characters and this log is read in a UI panel; a history that
+            // reproduces every description in full stops being readable, which
+            // is the ethos-5 failure (at volume it becomes a log nobody reads).
+            // Short scalars are shown because for `type`, `session` and
+            // `reviewer` the VALUE is the decision.
+            {
+                let noisy: std::collections::HashSet<&str> =
+                    ["status", "pos", "last_verified_at"].into_iter().collect();
+                let mut parts: Vec<String> = Vec::new();
+                for f in changed.iter().filter(|f| !noisy.contains(f.as_str())) {
+                    let part = match f.as_str() {
+                        // The two free-text fields: report the SHAPE of the
+                        // edit, since the new value is already on the card and
+                        // the useful fact is that it moved and by how much.
+                        "desc" => {
+                            let before = row.desc.chars().count() as i64;
+                            let after = next.desc.chars().count() as i64;
+                            let delta = after - before;
+                            if delta > 0 {
+                                format!("desc +{delta} chars")
+                            } else if delta < 0 {
+                                format!("desc {delta} chars")
+                            } else {
+                                "desc rewritten".to_string()
+                            }
+                        }
+                        "title" => format!("title -> {}", chars_truncate_log(&next.title, 60)),
+                        "type" => format!("type -> {}", next.item_type),
+                        "session" => format!(
+                            "session -> {}",
+                            next.session.as_deref().unwrap_or("(unassigned)")
+                        ),
+                        "reviewer" => format!(
+                            "reviewer -> {}",
+                            next.reviewer.as_deref().unwrap_or("(none)")
+                        ),
+                        "owner_type" => format!("owner_type -> {}", next.owner_type),
+                        "archived" => {
+                            if next.archived == 1 { "ARCHIVED".into() } else { "restored".into() }
+                        }
+                        "pinned" => {
+                            if next.pinned == 1 { "pinned".into() } else { "unpinned".into() }
+                        }
+                        other => other.to_string(),
+                    };
+                    parts.push(part);
+                }
+                if !parts.is_empty() {
+                    next.log = Some(bs::append_log(
+                        next.log.as_deref(),
+                        &hhmm(),
+                        &format!("{actor_name}: {}", parts.join(", ")),
+                    ));
+                }
             }
 
             // Writes bump rev (the Python counter) AND version (the Rust one).
