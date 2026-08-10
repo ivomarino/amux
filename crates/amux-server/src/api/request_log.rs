@@ -1933,16 +1933,35 @@ mod tests {
         assert_eq!(v["events"][0]["worker"], "w1");
         assert_eq!(v["events"][0]["target"], "/api/sessions/w1/peek");
 
-        // A category python COULD send that this origin has no events for:
-        // honestly empty, python's shape.
+        // `category=board` SELECTS board-family rows. This assertion used to
+        // demand an EMPTY array, which pinned the bug Ethan reported ("these
+        // tabs in the logs dont work"): the handler short-circuited every
+        // non-http category to empty, and the test certified it. The seeded row
+        // above is a /api/board request, so the honest expectation is that the
+        // Board tab finds it.
         let (_, body) = hit(
             &api,
             HttpRequest::builder().uri("/api/logs?category=board").body(Body::empty()).unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["events"], json!([]));
-        assert_eq!(v["count"], 0);
+        let evs = v["events"].as_array().expect("events array");
+        assert!(!evs.is_empty(), "the Board tab must find a /api/board request: {v}");
+        assert!(
+            evs.iter().all(|e| e["family"] == "/api/board"),
+            "the Board tab must show ONLY board-family rows: {v}"
+        );
+        assert_eq!(evs[0]["category"], "board", "the row's own stamp must agree with the tab");
+
+        // A category with no matching traffic is still honestly empty — the
+        // half of the old assertion that was always right.
+        let (_, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs?category=memory").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["events"], json!([]), "no memory traffic seeded, so no rows");
     }
 
     #[tokio::test]
