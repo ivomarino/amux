@@ -1152,7 +1152,8 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             let board = doing.get(&name);
             let board_updated = board.map(|(_, _, u)| *u).unwrap_or(0);
             let board_fresh = board.is_some() && now - board_updated <= 86400;
-            let summary = load_meta(&name)["task_summary"]
+            let meta = load_meta(&name);
+            let summary = meta["task_summary"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
@@ -1170,7 +1171,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
             v["task_source"] = json!(tsrc);
             v["task_board_id"] =
                 json!(if tsrc == "board" { board.map(|(i, _, _)| i.clone()).unwrap_or_default() } else { String::new() });
-            v["task_updated"] = json!(if board.is_some() { board_updated } else { 0 });
+            // A summary-sourced task now carries its own stamp (AMUX-2676);
+            // it is 0 only for tasks written before that existed, and 0 still
+            // means "unknown" rather than "just now" — the client must not
+            // render an age it does not have.
+            v["task_updated"] = json!(match tsrc {
+                "board" => board_updated,
+                "summary" => meta["task_summary_ts"].as_i64().unwrap_or(0),
+                _ => 0,
+            });
             v["task_board_age"] = json!(
                 if board.is_some() && board_updated != 0 && !board_fresh {
                     (now - board_updated).max(0)

@@ -8602,7 +8602,23 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
 
     // Task label override (py:76662).
     if let Some(ts) = body.get("task_summary") {
-        update_meta(name, &[("task_summary", json!(ts.as_str().unwrap_or("").trim()))]);
+        // Stamp WHEN, not just what (AMUX-2676). The card renders task_name
+        // regardless of source, but task_updated was only set for BOARD-sourced
+        // tasks — so a summary task showed a label with no age and no way to
+        // tell it was stale. Ethan's card read "Review Recent Work" during
+        // hours of unrelated work and looked authoritative.
+        //
+        // The meta file's mtime is NOT a substitute: unrelated writes
+        // (last_send on every inbound message) rewrite the file, so mtime would
+        // report a stale task as fresh — a confidently wrong answer, which is
+        // worse than the missing one.
+        update_meta(
+            name,
+            &[
+                ("task_summary", json!(ts.as_str().unwrap_or("").trim())),
+                ("task_summary_ts", json!(now_i64())),
+            ],
+        );
         return j200(json!({"ok": true, "message": "task label updated"}));
     }
 
