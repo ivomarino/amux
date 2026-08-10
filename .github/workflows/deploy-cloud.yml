@@ -154,6 +154,26 @@ jobs:
           chmod 600 ~/.ssh/amux_cloud
           ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+          # PRINT WHICH KEY WE OFFER. A fingerprint is not secret; the key is, and
+          # is never echoed. This exists because "Permission denied (publickey)"
+          # names neither the key offered nor the keys accepted, so the failure is
+          # undiagnosable from the log alone — ethos rule 4, the instrument could
+          # not express the discriminator.
+          #
+          # It cost a wrong close on 2026-08-10. The CI key was missing from the
+          # host's authorized_keys, a key was appended, `ssh -i ~/.ssh/amux_cloud`
+          # was verified working, and the deploy was reported fixed. CI kept
+          # failing with the identical error, because the key verified by hand was
+          # not the key in secrets.CLOUD_SSH_KEY. Verifying from the producer's
+          # vantage instead of the consumer's is what made a wrong answer look
+          # right: the host now authorizes SHA256:ei2CDWoAPls9LOrHnWBT+qPQYPXwgqEOhbia9G9nI6s,
+          # and whether that is the secret's key was exactly the unanswerable part.
+          #
+          # With this line the fix is mechanical: compare the fingerprint below
+          # against `ssh-keygen -lf` over the host's authorized_keys, then either
+          # authorize this key or replace the secret. No guessing which end is wrong.
+          ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
+            echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
 
       - name: Gateway env — admin emails (idempotent, safe on every deploy)
         run: |
@@ -368,6 +388,26 @@ jobs:
           chmod 600 ~/.ssh/amux_cloud
           ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+          # PRINT WHICH KEY WE OFFER. A fingerprint is not secret; the key is, and
+          # is never echoed. This exists because "Permission denied (publickey)"
+          # names neither the key offered nor the keys accepted, so the failure is
+          # undiagnosable from the log alone — ethos rule 4, the instrument could
+          # not express the discriminator.
+          #
+          # It cost a wrong close on 2026-08-10. The CI key was missing from the
+          # host's authorized_keys, a key was appended, `ssh -i ~/.ssh/amux_cloud`
+          # was verified working, and the deploy was reported fixed. CI kept
+          # failing with the identical error, because the key verified by hand was
+          # not the key in secrets.CLOUD_SSH_KEY. Verifying from the producer's
+          # vantage instead of the consumer's is what made a wrong answer look
+          # right: the host now authorizes SHA256:ei2CDWoAPls9LOrHnWBT+qPQYPXwgqEOhbia9G9nI6s,
+          # and whether that is the secret's key was exactly the unanswerable part.
+          #
+          # With this line the fix is mechanical: compare the fingerprint below
+          # against `ssh-keygen -lf` over the host's authorized_keys, then either
+          # authorize this key or replace the secret. No guessing which end is wrong.
+          ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
+            echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
 
       - name: Recreate running workspaces and prove the new server answers
         run: |
