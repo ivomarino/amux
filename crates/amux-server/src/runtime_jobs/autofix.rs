@@ -147,8 +147,6 @@ fn quiet_h() -> f64 {
     env_f64("AMUX_AUTOFIX_QUIET_H", 24.0).max(1.0)
 }
 
-/// Signature substrings that never file. Environmental causes with no code
-/// fix: put them here rather than teaching a detector to lie about them.
 // --- CI detector knobs (AMUX-2780) ------------------------------------------
 
 /// Repos to watch, `owner/name`, comma-separated. Defaults to amux's own repo:
@@ -195,6 +193,8 @@ fn ci_cmd_timeout_s() -> u64 {
     env_i64("AMUX_CI_TIMEOUT_S", 20).clamp(2, 120) as u64
 }
 
+/// Signature substrings that never file. Environmental causes with no code
+/// fix: put them here rather than teaching a detector to lie about them.
 fn ignore_list() -> Vec<String> {
     env_str("AMUX_AUTOFIX_IGNORE")
         .split(',')
@@ -1817,15 +1817,43 @@ fn already_filed(conn: &Connection, signature: &str) -> bool {
 /// Returns the report rather than logging it, so the debug surface shows
 /// exactly what the tick decided — including the suppressions, which are the
 /// half that is normally invisible.
+/// The tick WITHOUT any CI input. **Reaches no network.**
+///
+/// This is the entry point for anything that is not the periodic job — tests,
+/// one-shot invocations, anything holding a synthetic database. The CI detector
+/// reads GitHub, and a function that quietly makes an HTTP request because you
+/// asked it to look at a temp-dir SQLite file is a trap: it made a sibling
+/// integration test file four cards about the REAL repo's CI into its fixture
+/// database and fail on a count of 5-vs-1. The fetch belongs to the loop that
+/// polls, not to the function everyone calls.
 pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixReport {
+    autofix_tick_with_ci(state, home, &[], Vec::new()).await
+}
+
+/// The tick, given whatever CI runs the caller fetched.
+///
+/// `ci_runs` empty with `ci_sup` empty means "nobody looked", and that is
+/// recorded as a suppression rather than passing for "CI is fine" — the same
+/// rule the fetch itself follows when `gh` is missing.
+pub async fn autofix_tick_with_ci(
+    state: &AppState,
+    home: &std::path::Path,
+    ci_runs: &[CiRun],
+    ci_sup: Vec<Suppressed>,
+) -> AutofixReport {
     let t0 = std::time::Instant::now();
     let now = unix_now();
     let mut rep = AutofixReport { at: now, ..Default::default() };
 
-    // BEFORE the store lock, on purpose: this is a network call, and holding
-    // the SQLite read lock across GitHub's latency would stall every request on
-    // the server behind a detector.
-    let (ci_runs, ci_sup) = fetch_ci_runs(now).await;
+    let mut ci_sup = ci_sup;
+    if ci_runs.is_empty() && ci_sup.is_empty() {
+        ci_sup.push(sup(
+            DetectorKind::CiFailure,
+            "ci|<no input>",
+            "this tick was invoked without a CI fetch, so the CI detector read nothing — \
+             absence of findings here is absence of DATA, not evidence that CI is green",
+        ));
+    }
 
     let (findings, suppressed, on) = {
         let conn = match state.store.read() {
@@ -1849,7 +1877,7 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
                 DetectorKind::DiskPressure => detect_disk(now, home),
-                DetectorKind::CiFailure => ci_findings(&ci_runs, now),
+                DetectorKind::CiFailure => ci_findings(ci_runs, now),
             };
             findings.extend(f);
             suppressed.extend(s);
@@ -1896,7 +1924,7 @@ pub async fn autofix_tick(state: &AppState, home: &std::path::Path) -> AutofixRe
         }
     }
 
-    match note_quiet_signatures(state, now, &ci_runs).await {
+    match note_quiet_signatures(state, now, ci_runs).await {
         Ok(v) => rep.quiet_noted = v,
         Err(e) => rep.errors.push(format!("quiet sweep: {e}")),
     }
@@ -2139,7 +2167,13 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
         let state = state.clone();
         let home = home.clone();
         async move {
-            let r = autofix_tick(&state, &home).await;
+            // The ONE place that reaches the network. Fetched here, before the
+            // tick, so the tick never touches the store lock and GitHub in the
+            // same breath — and so no other caller of `autofix_tick` inherits
+            // an HTTP request it did not ask for. Cached behind
+            // `AMUX_CI_POLL_MIN`, so a 120s tick is not 720 API calls a day.
+            let (ci_runs, ci_sup) = fetch_ci_runs(unix_now()).await;
+            let r = autofix_tick_with_ci(&state, &home, &ci_runs, ci_sup).await;
             if !r.filed.is_empty() || !r.errors.is_empty() {
                 tracing::info!(
                     filed = r.filed.len(),
@@ -2263,14 +2297,6 @@ mod tests {
     use std::sync::Arc;
 
     fn state() -> (AppState, tempfile::TempDir) {
-        // NO TEST MAY TOUCH GITHUB. The CI detector shells out to `gh` inside
-        // `autofix_tick`; seeding its cache with an empty, fresh result makes
-        // `fetch_ci_runs` short-circuit, so every existing test stays offline
-        // and deterministic. The CI tests below deliberately do NOT go through
-        // the tick — they drive the pure decision and the real filing path
-        // directly, which is the only way to assert on a 31-failure streak
-        // without a network and without inventing one.
-        *ci_cache().write().unwrap() = Some((unix_now(), Vec::new(), Vec::new()));
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
         (
@@ -2841,6 +2867,36 @@ mod tests {
         assert!(
             s.iter().any(|x| x.reason.contains("AMUX_CI_MIN_FAILURES")),
             "a sub-threshold streak must name the threshold that held it back: {s:?}"
+        );
+    }
+
+    /// `autofix_tick` must not reach the network. Written against the artifact
+    /// of a real regression: when the CI fetch lived inside the tick, a sibling
+    /// integration test that logged seven 5xx rows into a TEMP database came
+    /// back with five cards, four of them about mixpeek/amux's live CI, and
+    /// failed on `left: 5, right: 1`. Any caller holding a synthetic database
+    /// would have inherited the same surprise.
+    ///
+    /// The two assertions flip together the moment the fetch moves back in:
+    /// live runs would put `ci` signatures in `signatures_seen`, and the
+    /// "nobody looked" suppression would disappear.
+    #[tokio::test]
+    async fn the_plain_tick_does_not_reach_github() {
+        let (st, _d) = state();
+        let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+        assert!(
+            !r.signatures_seen.iter().any(|(k, _)| k == "ci"),
+            "autofix_tick fetched live CI: {:?}",
+            r.signatures_seen
+        );
+        assert!(r.filed.is_empty(), "a temp DB and no traffic must file nothing: {:?}", r.filed);
+        // …and the absence is REPORTED, not silent: "no findings" and "nobody
+        // looked" are different facts and the debug surface must tell them
+        // apart (ethos rule 4).
+        assert!(
+            r.suppressed.iter().any(|(k, _, why)| k == "ci" && why.contains("absence of DATA")),
+            "a tick with no CI input must say so rather than imply CI is green: {:?}",
+            r.suppressed
         );
     }
 

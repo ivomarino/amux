@@ -61,10 +61,21 @@ jobs:
       # structural half still ran and is what we are gating on. Only 1 fails, so a
       # green run here means "every entry has its required fields", never "the
       # board agreed", which CI cannot check and should not claim.
+      # The `|| rc=$?` is LOAD-BEARING, not style. GitHub runs this with
+      # `shell: bash -e {0}`, and `set -uo pipefail` does NOT clear `-e` — so
+      # the previous form (`python3 …` on its own line, then `rc=$?`) aborted
+      # the whole step the instant the script exited non-zero, and `rc` was
+      # never read. Every exit code became a failure, including the 2 that the
+      # comment above explicitly says must not fail the build. That made
+      # `checks` — the ONLY required status check on main — red on every push
+      # for reasons unrelated to what it gates, which is how a required check
+      # becomes something people bypass by reflex. A command inside a `||` list
+      # is exempt from `-e`, so this reads the code instead of dying on it.
       - name: frustrations.md structure (AF-28)
         run: |
           set -uo pipefail
-          python3 scripts/frustrations_audit.py
-          rc=$?
+          rc=0
+          python3 scripts/frustrations_audit.py || rc=$?
+          echo "frustrations_audit exit=$rc (0 clean, 1 real problems, 2 board unreachable)"
           if [ "$rc" = "1" ]; then exit 1; fi
           exit 0
