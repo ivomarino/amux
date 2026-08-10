@@ -14,7 +14,7 @@
 //  4  Offline storage-limit select             POST /api/prefs offline_cache_mb   TESTED
 //  5  Offline scrollback-limit select          POST /api/prefs offline_cache_cap  TESTED
 //  6  Device name input                        localStorage amux_device_name TESTED (client-side by design)
-//  7  Subscription usage meter                 GET /api/usage                FIXME — needs porting (py:71557)
+//  7  Subscription usage meter                 GET /api/usage                TESTED (ported in api/usage.rs)
 //  8  Auto-compact toggle                      POST /api/prefs auto_compact_enabled  TESTED
 //  9  Auto-resume-dialog toggle                POST /api/prefs auto_resume_summary   TESTED
 // 10  Auto-file-as-task toggle                 POST /api/prefs board_autotask        TESTED
@@ -676,16 +676,77 @@ test('settings_cloud_only_sections_stay_hidden', async ({ page }, testInfo) => {
 // The probe test at the bottom fails loudly when any of these gets ported.
 // ============================================================================
 
-test('settings_usage_meter', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'missing-endpoint',
-    description:
-      'control: Subscription usage meter (#settings-usage-body) → GET /api/usage — no route in ' +
-      'crates/amux-server/src/api/mod.rs; Python serves it (amux-server.py:71557) → NEEDS PORTING. ' +
-      'Degraded UI today: the SPA-shell fallback answers 200 text/html, r.json() throws, panel shows ' +
-      '"Could not load usage".',
-  });
-  test.fixme(true, 'GET /api/usage not implemented in the Rust server (needs porting)');
+// Promoted from a fixme on 2026-08-09: /api/usage is ported (api/usage.rs) and
+// the probe below fired exactly as designed.
+//
+// This test is deliberately HOST-CONDITIONAL, and that is not a weakness. The
+// meter's content depends on a real macOS keychain credential and a live call
+// to api.anthropic.com, so asserting "bars are rendered" unconditionally would
+// be a check that fails on CI for a reason that has nothing to do with the
+// code. Instead it asserts the UI AGREES WITH THE WIRE — whichever branch the
+// host is in — and, on the degraded branch, that the reason is one of the
+// DISCRIMINATED causes rather than the old catch-all sentence that collapsed
+// no-token / expired / rate-limited into one useless string.
+test('settings_usage_meter', async ({ page, request }) => {
+  await settle(page);
+  const token = await appToken(page);
+
+  const res = await request.get('/api/usage', { headers: authHeaders(token) });
+  expect(res.headers()['content-type'] || '').toContain('application/json');
+  const wire = await res.json();
+
+  // Cache metadata travels on every response: a reading whose age you cannot
+  // ask for is a reading you cannot trust (the meter is cached by design).
+  expect(typeof wire.cache_age_s, 'usage response must state its own age').toBe('number');
+  expect(typeof wire.cache_ttl_s).toBe('number');
+
+  await openSettings(page);
+  const body = page.locator('#settings-usage-body');
+  await expect(body).toBeVisible();
+  // loadUsage() is async — wait for it to leave the placeholder.
+  await expect(body).not.toHaveText(/Loading/, { timeout: 15_000 });
+  const text = (await body.innerText()).trim();
+
+  // Whatever the host's state, the panel must never show the client-side
+  // parse-failure message: that is what an unported endpoint produced.
+  expect(text, 'the SPA could not parse /api/usage').not.toMatch(/Could not load usage/i);
+
+  if (wire.available) {
+    const limits = (wire.limits || []).filter((l: any) => typeof l.percent === 'number');
+    expect(limits.length, 'available:true with no numeric limits is a shape regression').toBeGreaterThan(0);
+    // One rendered row per limit, each with a bar and a "% left" readout.
+    await expect(body.locator('> div')).toHaveCount(limits.length);
+    expect(await body.locator('div[style*="width:"]').count()).toBeGreaterThanOrEqual(limits.length);
+    expect(text).toMatch(/%\s*left/);
+    expect(text).not.toMatch(/unavailable on this host/i);
+    // Per-model rows are why the endpoint passes Anthropic's body through
+    // instead of normalizing it: scope.model.display_name has no
+    // representation in a normalized usage window.
+    for (const l of limits) {
+      const model = l.scope?.model?.display_name;
+      if (model) expect(text).toContain(model);
+    }
+  } else {
+    // Honest degradation — but it must say WHICH failure, with a stable
+    // machine tag beside the sentence.
+    expect(wire.cause, 'a degraded usage response must name its cause').toBeTruthy();
+    expect(
+      ['no_token', 'expired_token', 'token_rejected', 'rate_limited', 'probe_failed', 'unexpected_shape'],
+      `unknown degraded cause "${wire.cause}"`,
+    ).toContain(wire.cause);
+    expect(
+      wire.reason,
+      'the collapsed catch-all reason is the defect this endpoint was fixed for',
+    ).not.toMatch(/no token, expired token, or probe failed/i);
+    // The reason reaches the user, not just the wire.
+    expect(text).toContain(String(wire.reason));
+    // Nothing invented on a degraded path.
+    expect(wire.limits, 'degraded responses must not carry limits').toBeUndefined();
+  }
+
+  // No credential material may ever reach the client on any branch.
+  const wireText = JSON.stringify(wire);
+  expect(wireText).not.toMatch(/sk-ant|Bearer /);
 });
 
 test('settings_alerts_config', async ({}, testInfo) => {
@@ -841,7 +902,9 @@ test('settings_missing_endpoint_probe', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
   const MISSING: Array<{ path: string; fixme: string }> = [
-    { path: '/api/usage', fixme: 'settings_usage_meter' },
+    // /api/usage left this list on 2026-08-09: it was already ported, this
+    // probe was firing as designed, and its fixme is now the real
+    // settings_usage_meter UI test above.
     { path: '/api/alert/config', fixme: 'settings_alerts_config' },
     { path: '/api/alert/owner', fixme: 'settings_send_test_alert' },
     // /api/org was on this list until 2026-08-09, when org.rs landed in the

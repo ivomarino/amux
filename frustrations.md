@@ -1442,3 +1442,30 @@ COST: two minutes and a wrong first impression that the CLI was broken. The real
   lines above, for `--outcome`.
 FIX: escaped the backticks to match the neighbouring lines (and restored the text the
   substitution had been eating). Verified: stderr is now empty and the line renders in full.
+
+## Usage meter said "no token" while the token was fine and Anthropic was rate-limiting
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-09
+SESSION: rust-usage
+CARD: RU-1 (follow-on SPA label gap); this entry's own fix is in api/usage.rs
+SYMPTOM: Settings showed "Claude subscription usage unavailable on this host (no
+  token, expired token, or probe failed)" — one string for four different causes.
+  The keychain credential was present and unexpired the whole time; the real cause
+  was HTTP 429 from api.anthropic.com, intermittent on a host running ~95 Claude
+  Code processes against one account. Two servers on this box disagreed 20s apart:
+  one served real limits, the other served the same "unavailable" sentence.
+COST: The meter read as a broken install for as long as it was dark, and the one
+  message could not distinguish "log in again" (user action) from "wait, it clears
+  itself" (no action). The endpoint's own #[ignore]'d live test was GREEN throughout,
+  because it only iterated `usage.windows` — zero windows iterates zero times, so a
+  totally failed probe asserted nothing (ethos rule 7, the vacuous-check shape).
+FIX: Fixed. The probe is now discriminating (provider/claude.rs `UsageProbe`:
+  NoToken / Expired / Http(code) / Transport / BadShape) and api/usage.rs turns each
+  into its own reason plus a stable `cause` tag, with the HTTP status included. The
+  live test now asserts the discriminator (a host WITH a credential must never report
+  NoToken) instead of iterating a possibly-empty vec. Because the 429 is intermittent,
+  a good reading is also kept and re-served for AMUX_USAGE_STALE_S (default 600s)
+  marked `stale: true` with the live failure in `stale_reason`, so the meter stops
+  flickering dark.

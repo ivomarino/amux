@@ -12,6 +12,30 @@
 //! [`ProviderUsage::unknown`]. The adapter records what Anthropic reported
 //! (utilization percentages) in the unit it was reported in; it never
 //! converts a percentage into invented token counts.
+//!
+//! That collapse is right for CAPACITY ROUTING (which can only act on a
+//! number it has) and wrong for a human staring at the Settings meter, so the
+//! probe itself is factored out as [`probe_usage_raw`] and returns a
+//! DISCRIMINATING [`UsageProbe`]. Two consumers, one probe:
+//!
+//! - [`ProviderAdapter::usage`] maps `Ok(body)` to windows and every other
+//!   variant to `unknown` — Invariant 20 unchanged;
+//! - `api/usage.rs` turns each variant into its own reason string and passes
+//!   `Ok(body)` through verbatim, because the SPA reads provider-specific
+//!   fields (`limits[].scope.model.display_name`, `limits[].group`) that the
+//!   normalized `UsageWindow` deliberately discards.
+//!
+//! Why that split matters: this endpoint answered HTTP 429 during
+//! development (2026-08-09, a host running ~95 Claude Code processes), and a
+//! rate-limited probe is indistinguishable from a missing credential once
+//! both have collapsed to "unknown" — which is exactly how a transient,
+//! self-healing condition read as a broken install (ethos rule 4).
+//!
+//! SECRET DISCIPLINE: the token is read, put in one `Authorization` header,
+//! and dropped. It is never logged, never returned, and no [`UsageProbe`]
+//! variant can carry it — failures carry a status code or a fixed transport
+//! word, never a response body or a `reqwest::Error`'s `Display` (which
+//! renders the request URL).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -63,35 +87,13 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     async fn usage(&self) -> ProviderUsage {
-        let unknown = ProviderUsage::unknown(self.id());
-        let Some(token) = oauth_token().await else {
-            return unknown;
-        };
-        // Expired token: the probe must not guess whether Anthropic would
-        // still answer; the Python probe reports unavailable here too.
-        if token.expires_at_ms > 0
-            && chrono::Utc::now().timestamp_millis() > token.expires_at_ms
-        {
-            return unknown;
+        // Invariant 20: routing can only act on numbers, so every
+        // discriminated failure collapses to `unknown` HERE. The distinctions
+        // survive for the human-facing endpoint, which calls the same probe.
+        match probe_usage_raw().await {
+            UsageProbe::Ok(body) => ProviderUsage::new(self.id(), map_usage_response(&body)),
+            _ => ProviderUsage::unknown(self.id()),
         }
-        let Ok(client) = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() else {
-            return unknown;
-        };
-        let resp = client
-            .get(USAGE_URL)
-            .header("Authorization", format!("Bearer {}", token.access_token))
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await;
-        let Ok(resp) = resp else { return unknown };
-        if !resp.status().is_success() {
-            return unknown;
-        }
-        let Ok(body) = resp.json::<serde_json::Value>().await else {
-            return unknown;
-        };
-        ProviderUsage::new(self.id(), map_usage_response(&body))
     }
 
     async fn models(&self) -> Vec<String> {
@@ -126,6 +128,78 @@ impl ProviderAdapter for ClaudeAdapter {
                 "--dangerously-skip-permissions".into(),
             ],
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The probe (read-only) — one implementation, two consumers
+// ---------------------------------------------------------------------------
+
+/// The outcome of ONE read-only probe of the OAuth usage endpoint.
+///
+/// Each variant is a distinct cause with a distinct remedy, which is the
+/// entire reason this type exists: collapsing them lost the difference
+/// between "you are not logged in" (fix your install) and "HTTP 429" (wait,
+/// it heals itself), and the Settings meter showed the former for both.
+///
+/// No variant can carry the token or a response body. `Http` carries the
+/// status code only; `Transport` carries a fixed word from a closed set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageProbe {
+    /// 2xx with a JSON body — passed through exactly as Anthropic sent it.
+    Ok(serde_json::Value),
+    /// No credential in the keychain, and none at `~/.claude/.credentials.json`.
+    NoToken,
+    /// A credential exists but `expiresAt` is in the past. Any `claude`
+    /// command refreshes it; the probe deliberately does not (read-only).
+    Expired,
+    /// Anthropic answered non-2xx. Status code only.
+    Http(u16),
+    /// The request never completed: timeout, DNS, TLS, offline.
+    Transport(&'static str),
+    /// 2xx, but the body was not JSON we could read.
+    BadShape,
+}
+
+/// One read-only GET of the subscription usage endpoint, with the cause of
+/// any failure preserved. Port of Python's `_fetch_claude_usage`, minus the
+/// shaping (callers shape) — same URL, same three headers, same
+/// keychain-then-file credential order, same expiry check.
+pub async fn probe_usage_raw() -> UsageProbe {
+    let Some(token) = oauth_token().await else {
+        return UsageProbe::NoToken;
+    };
+    // Python: `if exp and now_ms > exp`. A credential that did not say when
+    // it expires (0) is treated as live — absence of a claim is not a claim.
+    if token.expires_at_ms > 0 && chrono::Utc::now().timestamp_millis() > token.expires_at_ms {
+        return UsageProbe::Expired;
+    }
+    let Ok(client) = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() else {
+        return UsageProbe::Transport("client");
+    };
+    let resp = client
+        .get(USAGE_URL)
+        .header("Authorization", format!("Bearer {}", token.access_token))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        // Classify by predicate, never by the error's Display: a reqwest
+        // error renders the request URL, and the closed set keeps any future
+        // change to that rendering from reaching a user-visible string.
+        Err(e) if e.is_timeout() => return UsageProbe::Transport("timeout"),
+        Err(e) if e.is_connect() => return UsageProbe::Transport("connect"),
+        Err(_) => return UsageProbe::Transport("request"),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return UsageProbe::Http(status.as_u16());
+    }
+    match resp.json::<serde_json::Value>().await {
+        Ok(body) => UsageProbe::Ok(body),
+        Err(_) => UsageProbe::BadShape,
     }
 }
 
@@ -458,18 +532,48 @@ mod tests {
     /// Real read-only probe against api.anthropic.com using this host's
     /// credentials. #[ignore] because CI has no keychain and no token; run
     /// manually with: cargo test -p amux-server provider -- --ignored
+    ///
+    /// This test used to assert only over `usage.windows`, which is vacuous
+    /// when the probe fails: zero windows iterates zero times, so it passed
+    /// green for the entire period the meter was dark. It now asserts the
+    /// DISCRIMINATOR — a host that has a credential must never report
+    /// `NoToken` — which is the specific claim the old version could not make.
     #[tokio::test]
     #[ignore]
     async fn live_usage_probe_is_honest() {
-        let usage = ClaudeAdapter::new().usage().await;
-        assert_eq!(usage.provider, ClaudeAdapter::provider_id());
-        // Whatever happened — token found or not, HTTP ok or not — the
-        // result is either real reported windows or a clean unknown; never
-        // numbers under Unknown confidence.
-        for w in &usage.windows {
-            assert_eq!(w.confidence, UsageConfidence::Exact);
-            assert_eq!(w.provenance, UsageProvenance::Api);
-            assert!(w.used.is_some() && w.limit == Some(100));
+        let probe = probe_usage_raw().await;
+        // The cause, never the credential.
+        let tag = match &probe {
+            UsageProbe::Ok(_) => "ok".to_string(),
+            UsageProbe::NoToken => "no_token".into(),
+            UsageProbe::Expired => "expired".into(),
+            UsageProbe::Http(c) => format!("http_{c}"),
+            UsageProbe::Transport(w) => format!("transport_{w}"),
+            UsageProbe::BadShape => "bad_shape".into(),
+        };
+        eprintln!("live probe outcome: {tag}");
+
+        // The assertion that would have caught the original defect: if this
+        // host HAS a credential, "no token" is a lie.
+        if oauth_token().await.is_some() {
+            assert!(
+                !matches!(probe, UsageProbe::NoToken),
+                "a credential exists but the probe reported NoToken"
+            );
+        }
+        if let UsageProbe::Ok(body) = &probe {
+            let windows = map_usage_response(body);
+            // A 2xx body that maps to nothing means the response shape moved
+            // under us — the failure mode a pass-through endpoint hides.
+            assert!(
+                !windows.is_empty(),
+                "2xx body produced no windows: response shape drift"
+            );
+            for w in &windows {
+                assert_eq!(w.confidence, UsageConfidence::Exact);
+                assert_eq!(w.provenance, UsageProvenance::Api);
+                assert!(w.used.is_some() && w.limit == Some(100));
+            }
         }
         // Full conformance, network included, belongs here and only here.
         super::super::conformance(&ClaudeAdapter::new()).await;
