@@ -2111,3 +2111,27 @@ FIX: d0b2150 — server implements desc_append at python parity; CLI confirms at
   would have made this visible already existed and was unread. `ignored_fields`
   is only worth having if callers are made to look at it — consider whether any
   other caller in the tree ignores it too.
+
+## Five finished cards sat in `todo` and kept being auto-picked
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-10
+SESSION: amux-rust
+CARD: AMUX-2674
+SYMPTOM: Auto-pickup handed me AMUX-2672 with "32 more queued". Five of those 32
+  (AMUX-2599, 2609, 2618, 2634, 2636) were all fixed by ONE commit — e679bdb, whose
+  subject literally reads "five carded defects — watchdog, the 404 trio, OSC-8,
+  pane shrink, custom columns" and whose body names each card id. Their descs
+  already said "DONE" and named a single remaining step (`git add`), which a later
+  commit had done. Nothing moved the cards.
+COST: The queue overstated real work by ~16% and auto-pickup kept offering finished
+  cards, each costing a full scope-and-decide cycle to rediscover. Worse for
+  anyone reading the board to see what is left: five defects looked open that were
+  live in production.
+FIX: The commit body already names the card ids in a machine-readable form. Nothing
+  reads them. A commit trailer or body scan that flags "card named in a merged
+  commit but still in todo" would have surfaced all five in one query — the data
+  was there and unread, which is the same shape as AC-323's ignored_fields. Note
+  the honest limit: a named card is not proof of completion, so this should
+  SURFACE candidates for a human/agent check, never auto-close (ethos rule 8).
