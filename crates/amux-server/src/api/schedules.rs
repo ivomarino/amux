@@ -26,8 +26,8 @@ use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use crate::runtime_jobs::scheduler::{
     self, fmt_minute, get_schedule, insert_audit, insert_schedule, legacy_next_run,
-    list_schedules, mint_schedule_id, record_manual_run, soft_delete_schedule, update_schedule,
-    DurableSchedule, ScheduleExpr, AUDIT_FIELDS,
+    list_schedules, mint_schedule_id, record_run, soft_delete_schedule, update_schedule,
+    Deliverer, DurableSchedule, LiveDeliverer, RunOutcome, ScheduleExpr, AUDIT_FIELDS,
 };
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Path, Query, State};
@@ -593,54 +593,85 @@ pub async fn run_now(
     // No body is parsed on purpose (Python parity): a claimed `by` from a
     // body this endpoint never reads would be fabricated attribution.
     let by = mutation_by(&headers, None);
-    enum Outcome {
-        NotFound,
-        Ran { title: String },
-    }
-    let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
-    let slot_w = slot.clone();
-    let id_w = id.clone();
+    let source = format!("manual:{by}");
+
+    // READ the row first, then DELIVER outside any write lock, then RECORD what
+    // delivery did. The old shape did the opposite — one write transaction that
+    // recorded `status:"ok"` and returned `{"ok":true,"ran":"<title>"}` while
+    // its own comment admitted nothing had been delivered. Ethan pressed Run
+    // now, got a green "Ran", and no command reached the session (AMUX-2647).
+    let store = state.store.clone();
+    let id_r = id.clone();
+    let sched = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(get_schedule(&conn, &id_r)?)
+    })
+    .await
+    {
+        Ok(Ok(Some(s))) if !s.is_deleted() => s,
+        Ok(Ok(_)) => return not_found(),
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+
+    let deliverer = LiveDeliverer::new(state.clone());
+    let outcome = deliverer.deliver(&sched, &source).await;
+
+    let title = sched.str_field("title").to_string();
+    let sid = sched.id().to_string();
+    let (o_rec, o_resp) = (outcome.clone(), outcome);
+    let src = source.clone();
     let write = state
         .store
         .write_async(move |conn| {
-            let Some(s) = get_schedule(conn, &id_w)? else {
-                return finish(&slot_w, Outcome::NotFound, no_write());
-            };
-            if s.is_deleted() {
-                return finish(&slot_w, Outcome::NotFound, no_write());
-            }
-            // Honest note: the Rust runtime has no session delivery until
-            // RR-0041 — the run row records the trigger, not a delivery.
-            record_manual_run(conn, s.id(), &by, Some("manual run recorded by rust scheduler"))?;
+            record_run(conn, &sid, &o_rec, &src)?;
             let events = vec![
-                ev(s.id(), MutationKind::Updated),
+                ev(&sid, MutationKind::Updated),
                 PendingEvent {
                     entity_type: EntityType::Other("schedule_manual_run".into()),
-                    entity_id: s.id().to_string(),
+                    entity_id: sid.clone(),
                     mutation: MutationKind::StatusChanged {
                         from: by.clone(),
-                        to: "fired".into(),
+                        // The event carries the VERDICT, not the bare fact that
+                        // a button was pressed — a listener that saw "fired" for
+                        // a refused delivery is the same lie one layer out.
+                        to: o_rec.status().to_string(),
                     },
                     payload: None,
                 },
             ];
-            finish(
-                &slot_w,
-                Outcome::Ran { title: s.str_field("title").to_string() },
-                WriteOutcome { applied: true, events },
-            )
+            Ok(WriteOutcome { applied: true, events })
         })
         .await;
-    match write {
-        Ok(_) => match slot.lock().expect("slot").take() {
-            Some(Outcome::Ran { title }) => {
-                Json(json!({ "ok": true, "ran": title, "status": "ok", "note": "" })).into_response()
-            }
-            Some(Outcome::NotFound) => not_found(),
-            None => internal("run produced no outcome"),
-        },
-        Err(e) => internal(e),
+    if let Err(e) = write {
+        return internal(e);
     }
+
+    // SAY WHAT HAPPENED. The dashboard toasts `status`/`note` verbatim, so an
+    // empty note here is what rendered as "Ran · no output" over a dead action.
+    let mut body = json!({
+        // `ok` is the field a caller must read, and it is FALSE for a refusal
+        // and for a failed delivery. The HTTP code stays 200 on purpose: the
+        // request was processed and a run row exists — this is a verdict, not a
+        // rejected request — and a 4xx here routes the dashboard into a generic
+        // "the server did not accept it" toast that throws away the one thing
+        // worth showing, which is WHY nothing was delivered.
+        "ok": o_resp.landed() || matches!(o_resp, RunOutcome::Queued { .. }),
+        "ran": title,
+        "status": o_resp.status(),
+        "note": o_resp.note().unwrap_or_default(),
+        "delivery": o_resp.delivery(),
+        "submission": o_resp.submission(),
+        "session": sched.str_field("session"),
+        "kind": sched.str_field("kind"),
+        "source": source,
+    });
+    if let RunOutcome::Queued { queue_id, .. } = &o_resp {
+        // The handle on a message that has not landed yet — without it "queued"
+        // is a word with nothing behind it.
+        body["queue_id"] = json!(queue_id);
+    }
+    Json(body).into_response()
 }
 
 // ---- GET /api/schedules/runs ----------------------------------------------
@@ -653,7 +684,8 @@ pub async fn recent_runs(State(state): State<AppState>) -> Response {
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = store.read()?;
         let mut stmt = conn.prepare(
-            "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, sr.source, s.title
+            "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, sr.source,
+                    sr.delivery, sr.submission, s.title
              FROM schedule_runs sr LEFT JOIN schedules s ON s.id = sr.schedule_id
              ORDER BY sr.ran_at DESC LIMIT 50",
         )?;
@@ -665,7 +697,12 @@ pub async fn recent_runs(State(state): State<AppState>) -> Response {
                 "status": r.get::<_, String>(3)?,
                 "note": r.get::<_, Option<String>>(4)?,
                 "source": r.get::<_, String>(5)?,
-                "title": r.get::<_, Option<String>>(6)?,
+                // NULL on every row written before 0015 — "not recorded", NOT
+                // "delivered". The UI must render the difference, never default
+                // it (AMUX-2647).
+                "delivery": r.get::<_, Option<String>>(6)?,
+                "submission": r.get::<_, Option<String>>(7)?,
+                "title": r.get::<_, Option<String>>(8)?,
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1059,17 +1096,40 @@ mod tests {
         // Write run rows the way the two fire paths do (manual + cron-rs).
         {
             let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
-            record_manual_run(&conn, &id, "tester-session", Some("run-now")).unwrap();
-            scheduler::insert_run(&conn, &id, chrono::Utc::now().timestamp() + 1, "ok", None, "cron-rs")
-                .unwrap();
+            record_run(
+                &conn,
+                &id,
+                &RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() },
+                "manual:tester-session",
+            )
+            .unwrap();
+            scheduler::insert_run(
+                &conn,
+                &id,
+                chrono::Utc::now().timestamp() + 1,
+                &RunOutcome::Queued { queue_id: "steer-1".into(), detail: "queued (steering)".into() },
+                "cron-rs",
+                None,
+            )
+            .unwrap();
         }
         let (st, runs) = send(&app, "GET", "/api/schedules/runs", None, &[]).await;
         assert_eq!(st, StatusCode::OK);
-        let sources: Vec<&str> =
-            runs.as_array().unwrap().iter().map(|r| r["source"].as_str().unwrap()).collect();
+        let rows = runs.as_array().unwrap();
+        let sources: Vec<&str> = rows.iter().map(|r| r["source"].as_str().unwrap()).collect();
         assert!(sources.contains(&"cron-rs"), "{sources:?}");
         assert!(sources.contains(&"manual:tester-session"), "{sources:?}");
-        assert_eq!(runs.as_array().unwrap()[0]["title"], json!("t"));
+        assert_eq!(rows[0]["title"], json!("t"));
+        // The delivery verdict reaches the CONSUMER, not just the column
+        // (ethos rule 4): the runs list is where a human looks, so `queued`
+        // must be visibly different from `delivered` here.
+        let cron = rows.iter().find(|r| r["source"] == json!("cron-rs")).unwrap();
+        assert_eq!(cron["status"], json!("queued"));
+        assert_eq!(cron["delivery"], json!("queued"));
+        assert_eq!(cron["submission"], json!("deferred"));
+        let manual = rows.iter().find(|r| r["source"] == json!("manual:tester-session")).unwrap();
+        assert_eq!(manual["status"], json!("delivered"));
+        assert_eq!(manual["submission"], json!("confirmed"));
     }
 
     #[tokio::test]

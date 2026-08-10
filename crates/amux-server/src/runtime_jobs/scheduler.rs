@@ -75,6 +75,122 @@ pub fn firing_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The run verdict (AMUX-2647)
+// ---------------------------------------------------------------------------
+
+/// WHAT A FIRE ACTUALLY DID.
+///
+/// `schedule_runs.status` was a free `&str` and both rust fire paths passed the
+/// literal `"ok"` — run-now included, which delivered nothing whatsoever and
+/// said so in its own comment while writing the success row anyway. Ethan
+/// pressed Run now, the dashboard toasted "Ran · no output", and the command
+/// never reached the session (ethos rule 6: an audit trail that asserts what it
+/// cannot evidence).
+///
+/// Making the outcome a TYPE is what closes that, rather than a rule asking the
+/// next author to pass the right string: the only variant that yields status
+/// `"ok"` is [`RunOutcome::ShellOk`], and it can only be built from a finished
+/// subprocess. A tmux schedule that was not delivered has no representable way
+/// to become `ok`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The command reached the session and Claude Code's own artifacts confirm
+    /// it was submitted. `submission` is `verify_submitted`'s verdict, carried
+    /// verbatim so "confirmed" and "unverified" stay distinguishable.
+    Delivered { submission: String, detail: String },
+    /// Parked on the steering queue; it lands at the target's next turn
+    /// boundary (or mid-turn once it passes `AMUX_STEER_MAX_AGE_S`). Pending,
+    /// not done — and the queue row id is how anyone follows it.
+    Queued { queue_id: String, detail: String },
+    /// The send path declined and nothing is pending: archived target, no such
+    /// session, a resume picker, an auto-wake that failed.
+    Refused { reason: String },
+    /// Delivery was attempted and failed.
+    Failed { reason: String },
+    /// A `kind=shell` command ran to completion.
+    ShellOk { note: Option<String> },
+    /// A `kind=shell` command failed (non-zero exit, or an exit_actions alert).
+    ShellError { note: String },
+}
+
+impl RunOutcome {
+    /// The `schedule_runs.status` word. `"ok"` is reachable from exactly one
+    /// variant — see the type docs.
+    pub fn status(&self) -> &'static str {
+        match self {
+            RunOutcome::Delivered { .. } => "delivered",
+            RunOutcome::Queued { .. } => "queued",
+            RunOutcome::Refused { .. } => "refused",
+            RunOutcome::Failed { .. } | RunOutcome::ShellError { .. } => "error",
+            RunOutcome::ShellOk { .. } => "ok",
+        }
+    }
+
+    /// WHICH path the command took. Distinct from `status` on purpose: a run
+    /// can be `error` for a shell exit code or for a failed keystroke delivery,
+    /// and those are not the same incident.
+    pub fn delivery(&self) -> &'static str {
+        match self {
+            RunOutcome::Delivered { .. } => "direct",
+            RunOutcome::Queued { .. } => "queued",
+            RunOutcome::Refused { .. } => "refused",
+            RunOutcome::Failed { .. } => "failed",
+            RunOutcome::ShellOk { .. } | RunOutcome::ShellError { .. } => "shell",
+        }
+    }
+
+    /// `verify_submitted`'s verdict, for the paths that have one. `None` is a
+    /// real answer (shell runs never submit anything to a session) and must not
+    /// be rendered as a confident value.
+    pub fn submission(&self) -> Option<&str> {
+        match self {
+            RunOutcome::Delivered { submission, .. } => Some(submission),
+            RunOutcome::Queued { .. } => Some("deferred"),
+            RunOutcome::Refused { .. } | RunOutcome::Failed { .. } => Some("not_submitted"),
+            RunOutcome::ShellOk { .. } | RunOutcome::ShellError { .. } => None,
+        }
+    }
+
+    /// The human-readable note stored on the row and shown in the run history
+    /// and the run-now toast. Never empty for a non-delivery: "it did not
+    /// happen" without a reason is what sent Ethan pressing the button again.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            RunOutcome::Delivered { detail, .. } | RunOutcome::Queued { detail, .. } => {
+                Some(detail.clone()).filter(|s| !s.is_empty())
+            }
+            RunOutcome::Refused { reason } => Some(format!("refused: {reason}")),
+            RunOutcome::Failed { reason } => Some(format!("delivery failed: {reason}")),
+            RunOutcome::ShellOk { note } => note.clone(),
+            RunOutcome::ShellError { note } => Some(note.clone()),
+        }
+    }
+
+    /// Did the command actually reach its destination? `Queued` is deliberately
+    /// FALSE here — it is pending, and a caller that treats pending as done is
+    /// the bug this type exists to prevent.
+    pub fn landed(&self) -> bool {
+        matches!(self, RunOutcome::Delivered { .. } | RunOutcome::ShellOk { .. })
+    }
+}
+
+/// How the scheduler delivers a schedule's command.
+///
+/// A trait rather than a direct call into `api::session_verbs` for one reason:
+/// the gate that matters — "a refused delivery cannot be recorded as ok" — has
+/// to be testable, and it cannot be tested against a real tmux fleet. The ONE
+/// production implementation is [`LiveDeliverer`], which routes through the
+/// same send path a human's message takes.
+#[async_trait::async_trait]
+pub trait Deliverer: Send + Sync {
+    /// `source` is the run's provenance (`cron-rs`, `manual:<who>`) — the
+    /// delivered text is prefixed with WHY for anything off-cadence, so a
+    /// session can tell a run-now from the 9am fire in its own terminal rather
+    /// than by polling an endpoint (AMUX-1998).
+    async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome;
+}
+
+// ---------------------------------------------------------------------------
 // RR-0059: expression parser
 // ---------------------------------------------------------------------------
 
@@ -777,36 +893,61 @@ pub fn insert_audit(
 }
 
 /// Record a run into `schedule_runs` WITH its source (ethos rule 4: a
-/// manual tap and a cron fire must never be byte-identical rows).
+/// manual tap and a cron fire must never be byte-identical rows) and its
+/// DELIVERY VERDICT (AMUX-2647: an `ok` row for a command that never left the
+/// server is the same failure one layer down).
+///
+/// Takes a [`RunOutcome`] and not a status string on purpose — see that type.
+/// `extra_note` is the occurrence-level annotation (catch-up / skip overflow),
+/// joined ahead of the outcome's own note so both survive.
 pub fn insert_run(
     conn: &Connection,
     schedule_id: &str,
     ran_at: i64,
-    status: &str,
-    note: Option<&str>,
+    outcome: &RunOutcome,
     source: &str,
+    extra_note: Option<&str>,
 ) -> rusqlite::Result<()> {
     // char-safe 64-cap, matching Python's `source[:64]`.
     let source: String = source.chars().take(64).collect();
+    let note: Option<String> = match (extra_note.filter(|s| !s.is_empty()), outcome.note()) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, b) => b,
+    }
+    .map(|s| s.chars().take(500).collect());
     conn.execute(
-        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![schedule_id, ran_at, status, note, source],
+        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery, submission)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            schedule_id,
+            ran_at,
+            outcome.status(),
+            note,
+            source,
+            outcome.delivery(),
+            outcome.submission()
+        ],
     )?;
     Ok(())
 }
 
-/// Record a manual (run-now) fire: run row with `manual:<who>` source,
-/// run_count bump, last_run/updated — Python's run-now writes, minus the
-/// tmux delivery (see api/schedules.rs run_now for why that is honest).
-pub fn record_manual_run(
+/// Record a fire against the schedule row: run history + `run_count` +
+/// `last_run`. Used by run-now; the cron path folds the same writes into its
+/// claim/record transactions.
+///
+/// `last_run` is bumped for ANY outcome, including a refusal — it means "the
+/// scheduler last acted on this row", and leaving it stale after a refused fire
+/// would make a broken schedule look untouched. What the run DID is in the run
+/// row, which is where a reader who cares must look.
+pub fn record_run(
     conn: &Connection,
     schedule_id: &str,
-    by_who: &str,
-    note: Option<&str>,
+    outcome: &RunOutcome,
+    source: &str,
 ) -> rusqlite::Result<()> {
     let now_ts = chrono::Utc::now().timestamp();
-    insert_run(conn, schedule_id, now_ts, "ok", note, &format!("manual:{by_who}"))?;
+    insert_run(conn, schedule_id, now_ts, outcome, source, None)?;
     conn.execute(
         "UPDATE schedules SET run_count = COALESCE(run_count,0) + 1, last_run=?1, updated=?1
          WHERE id=?2",
@@ -898,6 +1039,218 @@ fn weekday_from_mon0(n: u32) -> Option<Weekday> {
 }
 
 // ---------------------------------------------------------------------------
+// The production deliverer (AMUX-2647)
+// ---------------------------------------------------------------------------
+
+/// How long a `kind=shell` command may run before it is killed. Python's
+/// `subprocess.run(..., timeout=600)`.
+const SHELL_TIMEOUT_S: u64 = 600;
+
+/// Delivers through the REAL send path.
+///
+/// Two kinds, one type: `kind=shell` runs the command as a subprocess and
+/// `kind=tmux` (everything else, and the default) hands it to the target
+/// session via [`crate::api::session_verbs::deliver_automated`]. Neither branch
+/// can produce a status the other could — a shell exit code is not a delivery
+/// verdict and vice versa — which is the point of returning [`RunOutcome`]
+/// rather than a bool.
+pub struct LiveDeliverer {
+    state: crate::api::AppState,
+}
+
+impl LiveDeliverer {
+    pub fn new(state: crate::api::AppState) -> Self {
+        LiveDeliverer { state }
+    }
+
+    /// Python's `_run_schedule` shell branch: run it, then map the exit code
+    /// through `exit_actions`. An unmapped non-zero exit is an error; a mapped
+    /// `noop`/`log` is not, and the ACTION is stamped into the note — an
+    /// alert-dispatched run that reads identically to a generic failure is why
+    /// mvs-infra concluded dispatch was bypassed when it had run (rule 4).
+    async fn run_shell(&self, sched: &DurableSchedule) -> RunOutcome {
+        let command = sched.str_field("command").to_string();
+        if command.trim().is_empty() {
+            return RunOutcome::Refused { reason: "shell schedule has no command".into() };
+        }
+        let actions: Map<String, Value> = serde_json::from_str::<Value>(sched.str_field("exit_actions"))
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+
+        let run_once = |cmd: String| async move {
+            let fut = tokio::process::Command::new("/bin/bash")
+                .arg("-c")
+                .arg(cmd)
+                .output();
+            match tokio::time::timeout(std::time::Duration::from_secs(SHELL_TIMEOUT_S), fut).await {
+                Ok(Ok(o)) => Ok((
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )),
+                Ok(Err(e)) => Err(format!("could not spawn /bin/bash: {e}")),
+                Err(_) => Err(format!("timed out after {SHELL_TIMEOUT_S}s")),
+            }
+        };
+
+        let (mut code, mut stdout, mut stderr) = match run_once(command.clone()).await {
+            Ok(t) => t,
+            Err(e) => return RunOutcome::Failed { reason: e },
+        };
+        let mut act = actions.get(&code.to_string()).and_then(Value::as_str).unwrap_or("").to_string();
+        if act == "retry_once_then_alert" && code != 0 {
+            match run_once(command).await {
+                Ok(t) => {
+                    (code, stdout, stderr) = t;
+                    act = if code != 0 { "alert".into() } else { "noop".into() };
+                }
+                Err(e) => return RunOutcome::Failed { reason: e },
+            }
+        }
+        let reason = |s: usize| -> String {
+            let raw = if !stderr.trim().is_empty() { &stderr } else { &stdout };
+            let raw = if raw.trim().is_empty() { format!("exit {code}") } else { raw.clone() };
+            raw.chars().take(s).collect()
+        };
+        if act == "alert" || (act.is_empty() && code != 0 && !actions.is_empty()) {
+            let why = reason(400);
+            self.wake_owner(sched, code, &why).await;
+            return RunOutcome::ShellError {
+                note: format!("exit {code} [{}] {why}", if act.is_empty() { "alert-default" } else { &act }),
+            };
+        }
+        if act == "noop" || act == "log" || (!actions.is_empty() && code == 0) {
+            let body: String = stdout.chars().take(400).collect();
+            return RunOutcome::ShellOk {
+                note: Some(format!("exit {code} [{}] {body}", if act.is_empty() { "ok" } else { &act })),
+            };
+        }
+        if code != 0 {
+            return RunOutcome::ShellError { note: reason(480) };
+        }
+        RunOutcome::ShellOk {
+            note: Some(stdout.chars().take(480).collect::<String>()).filter(|s| !s.trim().is_empty()),
+        }
+    }
+
+    /// Tell the owning lane its schedule failed, through the steering queue.
+    ///
+    /// Python called `_push_alert` here, which writes an SSE blip and a Web Push
+    /// broadcast — and `push_subscriptions` is empty on this deployment, so the
+    /// action named "alert" alerted nobody: mvs-infra logged five exit-1 runs
+    /// and zero wakes. The steering queue is the one channel that provably
+    /// reaches a session, and it lands at a turn boundary.
+    async fn wake_owner(&self, sched: &DurableSchedule, code: i32, why: &str) {
+        let owner = sched.str_field("session").trim().to_string();
+        if owner.is_empty() || !crate::api::session_verbs::is_running(&owner).await {
+            tracing::warn!(
+                schedule = %sched.id(), code,
+                "schedule alert has no reachable owning lane — nobody was told"
+            );
+            return;
+        }
+        let text = format!(
+            "[amux] SCHEDULE FAILED — '{}' ({}) exited {code}.\n\n{why}\n\nThis is the `alert` exit \
+             action on your schedule. Investigate, fix, or change the schedule's exit_actions if a \
+             non-zero exit is expected here. If this is noise, say so on a card rather than \
+             silencing it quietly — a schedule that alerts on a normal exit trains you to ignore \
+             the channel.",
+            sched.str_field("title"),
+            sched.id()
+        );
+        crate::api::session_verbs::steer_enqueue(
+            &self.state,
+            &owner,
+            &text,
+            &format!("sched:{}", sched.id()),
+        )
+        .await;
+    }
+}
+
+/// The text a session actually receives.
+///
+/// An off-cadence fire is prefixed with WHY, in the delivered text itself.
+/// Recording it only on the run row was not enough: a session lives in its
+/// terminal, and there a manual tap is byte-identical to the 9am cron fire, so
+/// "read the tag" means "poll an endpoint you have no reason to poll"
+/// (AMUX-1998). Cron fires are left untouched — they are the overwhelming
+/// majority and nothing about them is ambiguous.
+pub fn delivered_text(command: &str, source: &str) -> String {
+    if source.is_empty() || source == "cron" || source == "cron-rs" {
+        return command.to_string();
+    }
+    let why = if let Some(who) = source.strip_prefix("manual:") {
+        format!(
+            "[amux] Run-now, triggered by {} just now — NOT the scheduled fire. Treat this as an \
+             active ask for a fresh look, not a duplicate to decline.",
+            if who.is_empty() { "someone" } else { who }
+        )
+    } else {
+        format!("[amux] Off-cadence fire ({source}) — not the scheduled cron fire.")
+    };
+    format!("{why}\n\n{command}")
+}
+
+#[async_trait::async_trait]
+impl Deliverer for LiveDeliverer {
+    async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
+        if sched.str_field("kind") == "shell" {
+            return self.run_shell(sched).await;
+        }
+        let command = sched.str_field("command").trim().to_string();
+        if command.is_empty() {
+            // Not an error and not a success: there is nothing to deliver, and
+            // a row claiming otherwise is the whole defect (rule 3 — the honest
+            // exit has to exist).
+            return RunOutcome::Refused { reason: "schedule has no command to deliver".into() };
+        }
+        let session = sched.str_field("session").to_string();
+        let text = delivered_text(&command, source);
+        let d = crate::api::session_verbs::deliver_automated(
+            &self.state,
+            &session,
+            &text,
+            &format!("sched:{}", sched.id()),
+        )
+        .await;
+        if d.refused {
+            return RunOutcome::Refused { reason: d.message };
+        }
+        if let Some(queue_id) = d.queue_id {
+            return RunOutcome::Queued { queue_id, detail: d.message };
+        }
+        // `ok` is not "delivered" — read the SUBMISSION verdict. `Some(false)`
+        // is the AMUX-2629 specimen: the keys landed and Claude Code never took
+        // the message, which the old code would have written down as `ok`.
+        match d.submitted {
+            Some(false) => RunOutcome::Failed { reason: d.message },
+            _ => {
+                // Record it in Messages history so a peek shows scheduled
+                // commands distinctly, origin = the schedule's title.
+                let origin = {
+                    let t = sched.str_field("title");
+                    let t = if t.is_empty() { sched.id() } else { t };
+                    if source == "cron-rs" { t.to_string() } else { format!("{t} [{source}]") }
+                };
+                crate::api::session_verbs::cmd_hist_record_schedule(
+                    &self.state,
+                    &session,
+                    &text,
+                    &origin,
+                )
+                .await;
+                RunOutcome::Delivered {
+                    submission: d.submission.to_string(),
+                    detail: d.message,
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The shadow/firing loop
 // ---------------------------------------------------------------------------
 
@@ -924,6 +1277,7 @@ pub async fn scheduler_tick(
     firing: bool,
     policy: MissedRunPolicy,
     shadow_seen: &mut HashMap<String, String>,
+    deliverer: &dyn Deliverer,
 ) -> anyhow::Result<TickReport> {
     let now = Local::now();
     let now_str = fmt_minute(now);
@@ -984,7 +1338,7 @@ pub async fn scheduler_tick(
         // FIRING mode: one write transaction PER schedule (the Python loop's
         // MO-3058 lesson: a shared batch turns one poison entry into missed
         // and double fires for everyone else).
-        match fire_one(store, &id, now, policy).await {
+        match fire_one(store, deliverer, &id, now, policy).await {
             Ok(true) => report.fired += 1,
             Ok(false) => {} // raced: no longer due inside the txn
             Err(e) => {
@@ -1001,9 +1355,9 @@ pub async fn scheduler_tick(
                             conn,
                             &eid,
                             chrono::Utc::now().timestamp(),
-                            "error",
-                            Some(&emsg),
+                            &RunOutcome::Failed { reason: emsg.clone() },
                             "cron-rs",
+                            None,
                         )?;
                         conn.execute(
                             "UPDATE schedules SET next_run=?1, updated=?2 WHERE id=?3",
@@ -1018,18 +1372,41 @@ pub async fn scheduler_tick(
     Ok(report)
 }
 
-/// Fire one due schedule inside a single write transaction. Returns
-/// Ok(false) when the row was no longer due at write time (deleted,
-/// disabled, or its next_run moved — i.e. the OTHER scheduler got there
-/// first; skipping is the dual-scheduler-safe answer).
+/// What the claim transaction handed back: the row we won, and one note per
+/// occurrence it owes a run row for.
+struct Claim {
+    sched: DurableSchedule,
+    notes: Vec<Option<String>>,
+}
+
+/// Fire one due schedule: CLAIM the occurrence, DELIVER outside the write
+/// lock, then RECORD what delivery actually did. Returns Ok(false) when the
+/// row was no longer due at claim time (deleted, disabled, or its next_run
+/// moved — i.e. someone else got there first; skipping is the safe answer).
+///
+/// The three-phase shape is forced by the fix (AMUX-2647): delivery is tmux
+/// I/O that can block for seconds, and the old single-transaction fire could
+/// not perform it — which is precisely why it wrote `ok` for a fire that never
+/// left the server. Doing it inside the writer thread would instead hold the
+/// single write lock across every send on the fleet.
+///
+/// The failure window is deliberate and points the safe way: if the process
+/// dies between CLAIM and RECORD, the occurrence is consumed and its run row is
+/// missing — a fire that is unrecorded rather than one that fires twice. A
+/// missing row is visible (the run history has a hole against `run_count`); a
+/// double delivery is not undoable.
 async fn fire_one(
     store: &SharedStore,
+    deliverer: &dyn Deliverer,
     id: &str,
     now: DateTime<Local>,
     policy: MissedRunPolicy,
 ) -> anyhow::Result<bool> {
     let id = id.to_string();
     let now_str = fmt_minute(now);
+    let slot: std::sync::Arc<std::sync::Mutex<Option<Claim>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot_w = slot.clone();
     let reply = store
         .write_async(move |conn| {
             let Some(sched) = get_schedule(conn, &id)? else {
@@ -1067,9 +1444,10 @@ async fn fire_one(
                 if due.runs.is_empty() { &fallback } else { &due.runs };
 
             let mut events = Vec::new();
+            let mut notes = Vec::with_capacity(occurrences.len());
             for (i, occ) in occurrences.iter().enumerate() {
                 let is_catch_up = occurrences.len() > 1 && i + 1 < occurrences.len();
-                let note = if is_catch_up {
+                notes.push(if is_catch_up {
                     Some(format!("catch-up for missed occurrence {}", fmt_minute(*occ)))
                 } else if due.overflow > 0 {
                     Some(format!(
@@ -1080,10 +1458,7 @@ async fn fire_one(
                     ))
                 } else {
                     None
-                };
-                // Delivery honesty: the Rust runtime cannot send to a tmux
-                // session yet (RR-0041); a fire here is the durable record.
-                insert_run(conn, sched.id(), now_ts, "ok", note.as_deref(), "cron-rs")?;
+                });
             }
             conn.execute(
                 "UPDATE schedules SET run_count = COALESCE(run_count,0) + ?1 WHERE id=?2",
@@ -1143,16 +1518,60 @@ async fn fire_one(
                     payload: None,
                 });
             }
+            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes });
             Ok(WriteOutcome { applied: true, events })
         })
         .await?;
-    Ok(reply.applied)
+    if !reply.applied {
+        return Ok(false);
+    }
+    let Some(claim) = slot.lock().expect("claim slot poisoned").take() else {
+        // applied without a claim is not reachable, but a silent `true` here
+        // would be a fire nobody can account for.
+        anyhow::bail!("fire claimed a schedule but produced no claim record");
+    };
+
+    // ---- DELIVER (outside the write lock) ----
+    let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(claim.notes.len());
+    for _ in 0..claim.notes.len() {
+        outcomes.push(deliverer.deliver(&claim.sched, "cron-rs").await);
+    }
+
+    // ---- RECORD what actually happened ----
+    let sid = claim.sched.id().to_string();
+    let notes = claim.notes;
+    let landed = outcomes.iter().filter(|o| o.landed()).count();
+    let statuses: Vec<&'static str> = outcomes.iter().map(|o| o.status()).collect();
+    store
+        .write_async(move |conn| {
+            let now_ts = chrono::Utc::now().timestamp();
+            for (outcome, note) in outcomes.iter().zip(notes.iter()) {
+                insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await?;
+    if landed == 0 {
+        // Loud, because it is the AMUX-2647 shape: the schedule fired and the
+        // command did not reach anyone. It is on the run row too, but a fleet
+        // going quiet must be greppable in the log without opening the DB.
+        tracing::warn!(
+            schedule = %claim.sched.id(), title = %claim.sched.str_field("title"),
+            session = %claim.sched.str_field("session"), outcomes = ?statuses,
+            "schedule fired but nothing was delivered"
+        );
+    }
+    Ok(true)
 }
 
 /// The scheduler loop: ticks every [`SCHEDULER_TICK_SECS`]. `enabled=false`
 /// (the default deployment — see module docs) is shadow mode. Failed ticks
 /// retry per [`RetryPolicy`] before waiting for the next tick.
-pub async fn run_scheduler(store: SharedStore, enabled: bool) {
+pub async fn run_scheduler(
+    store: SharedStore,
+    enabled: bool,
+    deliverer: std::sync::Arc<dyn Deliverer>,
+) {
     let policy = missed_policy_from_env();
     let retry = RetryPolicy::default();
     let mut shadow_seen: HashMap<String, String> = HashMap::new();
@@ -1168,7 +1587,7 @@ pub async fn run_scheduler(store: SharedStore, enabled: bool) {
         tick.tick().await;
         let mut attempt = 0u32;
         loop {
-            match scheduler_tick(&store, enabled, policy, &mut shadow_seen).await {
+            match scheduler_tick(&store, enabled, policy, &mut shadow_seen, deliverer.as_ref()).await {
                 Ok(r) => {
                     if r.due > 0 {
                         tracing::info!(
@@ -1206,6 +1625,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("sched-test.db")).unwrap();
         (Arc::new(s), dir)
+    }
+
+    /// A deliverer that returns whatever verdict a test needs, and COUNTS its
+    /// calls — so "the loop fired" and "the command was delivered" are separate
+    /// assertions. Conflating those two is the bug (AMUX-2647): the old firing
+    /// path incremented `fired` and wrote `ok` while delivering nothing, and
+    /// every test passed.
+    struct StubDeliverer {
+        outcome: RunOutcome,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubDeliverer {
+        fn new(outcome: RunOutcome) -> Self {
+            StubDeliverer { outcome, calls: std::sync::atomic::AtomicUsize::new(0) }
+        }
+        fn confirmed() -> Self {
+            StubDeliverer::new(RunOutcome::Delivered {
+                submission: "confirmed".into(),
+                detail: "sent".into(),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Deliverer for StubDeliverer {
+        async fn deliver(&self, _sched: &DurableSchedule, _source: &str) -> RunOutcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.outcome.clone()
+        }
     }
 
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
@@ -1488,7 +1940,15 @@ mod tests {
             .write_async(|conn| {
                 let row = make_row("SCHED-77", "alpha", Some("every 1h"), "2026-08-10T09:00");
                 insert_schedule(conn, &row)?;
-                record_manual_run(conn, "SCHED-77", "tester", Some("run-now"))?;
+                record_run(
+                    conn,
+                    "SCHED-77",
+                    &RunOutcome::Delivered {
+                        submission: "confirmed".into(),
+                        detail: "sent".into(),
+                    },
+                    "manual:tester",
+                )?;
                 Ok(WriteOutcome { applied: true, events: vec![] })
             })
             .await
@@ -1519,11 +1979,11 @@ mod tests {
             .unwrap();
 
         let mut seen = HashMap::new();
-        let r1 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen).await.unwrap();
+        let r1 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
         assert_eq!(r1, TickReport { due: 1, shadowed: 1, ..Default::default() });
 
         // Second tick: same occurrence, deduped — one shadow event total.
-        let r2 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen).await.unwrap();
+        let r2 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
         assert_eq!(r2.deduped, 1);
         assert_eq!(r2.shadowed, 0);
 
@@ -1572,7 +2032,7 @@ mod tests {
             .unwrap();
 
         let mut seen = HashMap::new();
-        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen).await.unwrap();
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
         assert_eq!(r.due, 2);
         assert_eq!(r.fired, 2);
         assert_eq!(r.errors, 0);
@@ -1634,7 +2094,7 @@ mod tests {
             .await
             .unwrap();
         let mut seen = HashMap::new();
-        let r = scheduler_tick(&store, true, MissedRunPolicy::CatchUp, &mut seen).await.unwrap();
+        let r = scheduler_tick(&store, true, MissedRunPolicy::CatchUp, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
         assert_eq!(r.fired, 1);
         let conn = store.read().unwrap();
         let runs: i64 = conn
@@ -1650,5 +2110,172 @@ mod tests {
             )
             .unwrap();
         assert_eq!(catch_notes, 4); // all but the final occurrence are marked
+    }
+
+    // ---- AMUX-2647: a non-delivery can never be recorded as `ok` ----------
+
+    /// THE GATE. Rebuilt from the incident's own artifact: SCHED-331 fired
+    /// twice on 2026-08-09 (22:56:38 and 22:57:11), both rows read
+    /// `status='ok'`, `note='manual run recorded by rust scheduler'`, and
+    /// nothing was delivered to any session.
+    ///
+    /// Asserted at the TYPE and at the ROW, because either alone is theatre:
+    /// checking only the row would pass again the moment someone adds a
+    /// seventh variant that returns `"ok"`, and checking only the type would
+    /// miss a fire path that bypasses `insert_run`.
+    #[test]
+    fn no_undelivered_outcome_can_report_ok() {
+        let undelivered = [
+            RunOutcome::Refused { reason: "target 'x' is archived".into() },
+            RunOutcome::Failed { reason: "not submitted — text is sitting in the input box".into() },
+            RunOutcome::Queued { queue_id: "steer-1".into(), detail: "queued (steering)".into() },
+            RunOutcome::ShellError { note: "exit 1".into() },
+        ];
+        for o in &undelivered {
+            assert_ne!(o.status(), "ok", "{o:?} must not be recordable as ok");
+            assert!(!o.landed(), "{o:?} did not land anywhere");
+            assert!(o.note().is_some(), "{o:?} must carry a reason — silence is what sent Ethan pressing again");
+        }
+        // Queued is PENDING, and the trap is that it feels like success.
+        assert_eq!(RunOutcome::Queued { queue_id: "q".into(), detail: String::new() }.status(), "queued");
+        // The only two that may claim to have landed.
+        assert!(RunOutcome::Delivered { submission: "confirmed".into(), detail: String::new() }.landed());
+        assert!(RunOutcome::ShellOk { note: None }.landed());
+        // ...and only ShellOk yields the word `ok`, from a finished subprocess.
+        assert_eq!(RunOutcome::ShellOk { note: None }.status(), "ok");
+        assert_eq!(
+            RunOutcome::Delivered { submission: "confirmed".into(), detail: String::new() }.status(),
+            "delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_delivery_is_recorded_as_refused_not_ok() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-5", "archived-lane", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let stub = StubDeliverer::new(RunOutcome::Refused {
+            reason: "target 'archived-lane' is archived — not delivered, not woken".into(),
+        });
+        let mut seen = HashMap::new();
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        assert_eq!(r.fired, 1, "the occurrence was consumed");
+        assert_eq!(stub.calls(), 1, "delivery must actually be ATTEMPTED, not assumed");
+
+        let conn = store.read().unwrap();
+        let (status, note, delivery, submission): (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, note, delivery, submission FROM schedule_runs WHERE schedule_id='SCHED-5'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "refused", "a refused delivery must never read as ok");
+        assert_ne!(status, "ok");
+        assert!(note.unwrap().contains("archived"), "the row must carry WHY");
+        assert_eq!(delivery.as_deref(), Some("refused"));
+        assert_eq!(submission.as_deref(), Some("not_submitted"));
+        // The schedule still advanced — a refusal is not a wedge.
+        let next: String = conn
+            .query_row("SELECT next_run FROM schedules WHERE id='SCHED-5'", [], |r| r.get(0))
+            .unwrap();
+        assert!(next.as_str() > "2026-01", "a refused fire must still advance: {next}");
+    }
+
+    #[tokio::test]
+    async fn a_queued_delivery_records_the_queue_id_not_success() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-6", "busy-lane", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let stub = StubDeliverer::new(RunOutcome::Queued {
+            queue_id: "steer-1786000000000".into(),
+            detail: "queued (steering) — delivers to 'busy-lane' at its next turn boundary".into(),
+        });
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+
+        let conn = store.read().unwrap();
+        let (status, note, delivery): (String, String, String) = conn
+            .query_row(
+                "SELECT status, note, delivery FROM schedule_runs WHERE schedule_id='SCHED-6'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
+        assert_eq!(delivery, "queued");
+        assert!(note.contains("turn boundary"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_never_calls_the_deliverer() {
+        // The dual-scheduler guarantee, asserted at the thing that would
+        // actually double-deliver: not "no rows were written" but "nobody was
+        // sent anything".
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-7", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let stub = StubDeliverer::confirmed();
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        assert_eq!(stub.calls(), 0, "shadow mode must deliver NOTHING");
+    }
+
+    #[tokio::test]
+    async fn a_delivered_fire_records_the_submission_verdict() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-8", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        // The AMUX-2629 third state: keys landed, submission unverifiable. It
+        // is NOT `confirmed`, and the row has to say so.
+        let stub = StubDeliverer::new(RunOutcome::Delivered {
+            submission: "unverified".into(),
+            detail: "sent (keys delivered; submission could not be verified)".into(),
+        });
+        let mut seen = HashMap::new();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        let conn = store.read().unwrap();
+        let (status, submission): (String, String) = conn
+            .query_row(
+                "SELECT status, submission FROM schedule_runs WHERE schedule_id='SCHED-8'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "delivered");
+        assert_eq!(submission, "unverified", "a verdict of 'unverified' must survive to the row");
+    }
+
+    #[test]
+    fn off_cadence_fires_say_why_in_the_delivered_text() {
+        // AMUX-1998: in the session's own terminal a run-now must not be
+        // byte-identical to the 9am cron fire.
+        assert_eq!(delivered_text("do the thing", "cron-rs"), "do the thing");
+        assert_eq!(delivered_text("do the thing", "cron"), "do the thing");
+        let manual = delivered_text("do the thing", "manual:ethan");
+        assert!(manual.contains("Run-now, triggered by ethan"), "{manual}");
+        assert!(manual.ends_with("do the thing"), "{manual}");
+        let trig = delivered_text("do the thing", "trigger:board");
+        assert!(trig.contains("Off-cadence fire (trigger:board)"), "{trig}");
     }
 }
