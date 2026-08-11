@@ -265,7 +265,19 @@ fn scan_js_calls(js: &str, source: &str) -> Vec<checks::CallerPath> {
         // and drops the bleed.
         let fwd_raw = &js[clamp(end)..clamp(end + 200)];
         let fwd = fwd_raw.split(';').next().unwrap_or(fwd_raw);
-        let back = &js[clamp(start.saturating_sub(200))..clamp(start)];
+        // BOUNDED THE SAME WAY, and for the same reason. Bounding only forward
+        // left the bug alive by the other door: app.js:3826's plain GET picked
+        // up the `{method:'DELETE'}` from the DIFFERENT call six lines earlier
+        // and was still reported as `DELETE /api/layout-presets`. Take only the
+        // text after the previous `;` — the current statement.
+        //
+        // The shape this fallback was kept for (`const opts = {method:'PATCH'};
+        // fetch(url, opts)`) does not occur in app.js: the one indirect call
+        // (apiCall, :1842) passes a VARIABLE url, so this extractor — which
+        // scans for literal '/api/...' strings — never reaches it. The fallback
+        // was buying nothing and costing a phantom row.
+        let back_raw = &js[clamp(start.saturating_sub(200))..clamp(start)];
+        let back = back_raw.rsplit(';').next().unwrap_or(back_raw);
         let find_m = |hay: &str| {
             ["POST", "PATCH", "DELETE", "PUT"]
                 .iter()
@@ -413,3 +425,4 @@ mod tests {
         assert_eq!(calls[0].method, "POST", "a POST read as GET hides 405s");
     }
 }
+
