@@ -350,8 +350,16 @@ pub fn snapshot() -> serde_json::Value {
         "attributed_hits": attributed,
         "unattributed_hits": unattributed,
         "sessions_still_on_legacy": sessions,
+        // The wording is deliberately weaker than "this is a defect". Not every
+        // unattributed hit is one: a request that carries no X-Amux-Session —
+        // /health polls, the SPA shell, a browser — is unattributed even when
+        // it comes from a pre-cutover lane that merely needs restarting.
+        // Measured on the first live run of this very change: my own
+        // `curl https://localhost:8822/health` landed in the unattributed
+        // bucket. Claiming certainty the key cannot support is how a verdict
+        // stops being read.
         "verdict": if unattributed > 0 {
-            "BLOCKED: unattributed traffic on the retired port — that is code naming 8822, find it via the paths below and fix it"
+            "INVESTIGATE: traffic with no X-Amux-Session. Either code still naming 8822, or header-less requests (/health, the SPA shell) from a pre-cutover lane. Read `paths` — an /api/ path with no session is the defect shape; /health is not"
         } else if !sessions.is_empty() {
             "DRAINING: every hit is an attributed pre-cutover lane whose process env cannot be rotated; it clears when those lanes restart, not by waiting"
         } else {
@@ -590,7 +598,7 @@ mod tests {
         assert_eq!(snap["unattributed_hits"], 3);
         assert_eq!(snap["attributed_hits"], 0);
         assert!(
-            snap["verdict"].as_str().unwrap_or("").starts_with("BLOCKED"),
+            snap["verdict"].as_str().unwrap_or("").starts_with("INVESTIGATE"),
             "unattributed traffic must not read as merely draining"
         );
 
@@ -610,6 +618,6 @@ mod tests {
         );
         // Unattributed traffic still outranks: a defect is not cleared by a
         // lane that merely needs restarting.
-        assert!(snap["verdict"].as_str().unwrap_or("").starts_with("BLOCKED"));
+        assert!(snap["verdict"].as_str().unwrap_or("").starts_with("INVESTIGATE"));
     }
 }
