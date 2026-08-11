@@ -224,7 +224,7 @@
 
     <h2>How amux Works</h2>
     <p>amux runs on your machine or a cloud VM and manages a fleet of AI coding agents — Claude Code, Codex CLI, or Gemini CLI — all executing in the background inside tmux sessions. You define tasks on the shared kanban board, and agents pull tasks with atomic claiming so no two agents work on the same thing. A background watchdog monitors every session: it auto-compacts context overflow, auto-approves tool prompts (YOLO mode), restarts crashed sessions, and detects idle hangs.</p>
-    <p>You monitor everything from a web dashboard at <code>https://localhost:8822</code>, from the iOS app, or from your phone via the PWA. Agents work while you sleep, commute, or focus on other things. amux is not an editor and does not change how you write code — it only manages the background work agents do on your behalf.</p>
+    <p>You monitor everything from a web dashboard at <code>https://localhost:8824</code>, from the iOS app, or from your phone via the PWA. Agents work while you sleep, commute, or focus on other things. amux is not an editor and does not change how you write code — it only manages the background work agents do on your behalf.</p>
 
     <h2>Which Should You Use?</h2>
     <p>The question is usually not "Zed or amux" — it is "what am I trying to accomplish right now?" The two tools address completely different moments in the development workflow.</p>
@@ -294,7 +294,7 @@
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
       <a class="btn" href="/guides/ai-coding-agents-overnight/" style="margin-left:0.75rem;">Overnight agent guide →</a>
     </div>

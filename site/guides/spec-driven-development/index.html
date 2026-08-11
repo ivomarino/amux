@@ -374,7 +374,7 @@ done
 # Or via curl:
 curl -sk -X POST -H 'Content-Type: application/json' \
   -d '{"title":"add-cursor-pagination","desc":"...spec contents...","status":"todo"}' \
-  https://localhost:8822/api/board</code></pre>
+  https://localhost:8824/api/board</code></pre>
 
     <h3>Phase 3: Launch agents (5 minutes)</h3>
     <pre><code># Register 10 agents, each in its own worktree
@@ -552,7 +552,7 @@ amux board add "add-cursor-pagination" --desc "$(cat specs/add-cursor-pagination
     <div class="cta-box"><h3>Run specs across a fleet of parallel agents</h3><p>amux turns specs into board tasks, launches agents in isolated worktrees, handles atomic claiming, and auto-restarts crashes. Write 10 specs, wake up to 10 PRs.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # &rarr; https://localhost:8822</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # &rarr; https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
 
   </main>
   <footer class="sub-footer">

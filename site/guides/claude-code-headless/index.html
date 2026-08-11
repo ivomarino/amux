@@ -576,9 +576,9 @@ $ uvx amux serve</code></pre>
 
     <pre><code>$ amux register myproject --dir ~/Dev/myproject --yolo
 $ amux start worker-1 worker-2 worker-3
-$ amux serve  <span class="comment"># → https://localhost:8822</span></code></pre>
+$ amux serve  <span class="comment"># → https://localhost:8824</span></code></pre>
 
-    <p>Under the hood, <code>amux start</code> launches Claude Code (or Codex CLI, or Gemini CLI &mdash; your choice) in headless mode inside a tmux session per agent, with <code>--dangerously-skip-permissions</code> enabled by the <code>--yolo</code> project flag and cost-tracking auto-wired from the JSONL transcripts. The dashboard at <code>localhost:8822</code> shows live output, per-session cost, and a kanban board for task claiming &mdash; everything the supervision and cost sections of this guide described, already built.</p>
+    <p>Under the hood, <code>amux start</code> launches Claude Code (or Codex CLI, or Gemini CLI &mdash; your choice) in headless mode inside a tmux session per agent, with <code>--dangerously-skip-permissions</code> enabled by the <code>--yolo</code> project flag and cost-tracking auto-wired from the JSONL transcripts. The dashboard at <code>localhost:8824</code> shows live output, per-session cost, and a kanban board for task claiming &mdash; everything the supervision and cost sections of this guide described, already built.</p>
 
     <p><strong>Auto-answer resume dialog:</strong> amux ships with <code>auto_answer_resume_dialog</code> ON by default, so the <a href="#resume-dialog-pitfall">resume dialog trap</a> never blocks your overnight runs. No extra config needed.</p>
 

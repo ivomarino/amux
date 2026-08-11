@@ -228,7 +228,7 @@
     <p>Concrete example — a daily agent report pipeline:</p>
     <pre><code># amux: agents run all night, board issues accumulate
 # n8n: every morning at 9am
-GET https://localhost:8822/api/board?status=done&amp;since=yesterday
+GET https://localhost:8824/api/board?status=done&amp;since=yesterday
   → filter issues tagged "shipped"
   → post summary to Slack #dev-daily
   → create Notion page with full issue list</code></pre>

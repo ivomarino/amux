@@ -274,7 +274,7 @@ amux tunnel stop         # stop tunneling</code></pre>
     <ul>
       <li><strong>You already run amux.</strong> If you are using amux for AI agent orchestration, the tunnel is built in — no extra binary, no extra auth token, no separate process to manage.</li>
       <li><strong>You need a stable URL without paying for ngrok Pro.</strong> The amux tunnel URL does not change between restarts. This matters for webhooks, calendar feeds, OAuth redirect URIs, and any URL registered with an external service.</li>
-      <li><strong>You are exposing the amux dashboard itself.</strong> Run <code>amux tunnel start 8822</code> to make your dashboard reachable from your phone or a collaborator — the same URL every time, no reconfiguration.</li>
+      <li><strong>You are exposing the amux dashboard itself.</strong> Run <code>amux tunnel start 8824</code> to make your dashboard reachable from your phone or a collaborator — the same URL every time, no reconfiguration.</li>
       <li><strong>You want zero extra tooling.</strong> One command and the tunnel is live. No daemon, no config file, no separate terminal window running ngrok.</li>
     </ul>
 
@@ -326,11 +326,11 @@ amux tunnel stop         # stop tunneling</code></pre>
       <h3>Stable tunnel URL — built into your agent control plane</h3>
       <p>amux is an open-source control plane for AI agent teams. Tunnel, kanban, CRM, email, and browser automation — all in a single Python file. amux cloud adds a stable public URL that never changes between restarts.</p>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
-amux serve  # → https://localhost:8822
+amux serve  # → https://localhost:8824
 
 # Start tunnel (requires amux cloud subscription)
 export AMUX_TUNNEL_TOKEN=your_token   # ~/.amux/server.env
-amux tunnel start 8822               # expose the dashboard
+amux tunnel start 8824               # expose the dashboard
 amux tunnel url                      # → https://&lt;id&gt;.t.amux.io/</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
       <a class="btn" href="/pricing/" style="margin-left:0.75rem;">amux cloud pricing →</a>

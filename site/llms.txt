@@ -12,7 +12,7 @@ Install via Homebrew (`brew install mixpeek/amux/amux`), PyPI (`pipx install amu
 brew install mixpeek/amux/amux
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822
+amux serve  # → https://localhost:8824
 ```
 
 ## Key Features

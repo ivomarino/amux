@@ -91,7 +91,7 @@
     <p>amux is an open-source agent orchestration platform built around <code>amux-server.py</code> &mdash; a single Python file that runs a local HTTPS server, manages tmux sessions, and serves a web dashboard. It treats parallel agents as a fleet that needs to be monitored, recovered, coordinated, and controlled from anywhere.</p>
     <p>Key characteristics:</p>
     <ul>
-      <li>Web dashboard at <code>https://localhost:8822</code> with live session status, token spend, a send bar, and a kanban board</li>
+      <li>Web dashboard at <code>https://localhost:8824</code> with live session status, token spend, a send bar, and a kanban board</li>
       <li>Mobile PWA for managing the fleet from your phone, plus a native iOS app</li>
       <li>Self-healing watchdog: auto-restart crashed agents, auto-compact context overflow, detect stuck sessions, handle rate limits</li>
       <li>Built-in SQLite-backed kanban board with atomic task claiming &mdash; no external issue tracker required</li>
@@ -325,7 +325,7 @@ amux board add "Create invoice PDF generation" --session billing
 amux start --all
 
 # 3. Open the dashboard — monitor from any device
-amux serve  # → https://localhost:8822
+amux serve  # → https://localhost:8824
 
 # Now you can:
 #   - Watch all 5 agents working simultaneously
@@ -383,7 +383,7 @@ amux serve  # → https://localhost:8822
 
     <h2 id="dashboards">Dashboards &amp; Remote Access</h2>
     <p><strong>Symphony has a minimal status surface.</strong> An optional Phoenix LiveView dashboard shows agent states and a JSON API exposes <code>/api/v1/state</code> and per-issue status. This is observability, not control &mdash; you can see what agents are doing but you can't interact with them from the dashboard. No mobile support.</p>
-    <p><strong>amux has a full interactive dashboard.</strong> Open <code>https://localhost:8822</code> in any browser and see all sessions with live status, token spend, output scrollback, and a send bar for typing messages directly into any agent. The kanban board is drag-and-drop. The dashboard works as a PWA on your phone with native-app-like safe-area insets and touch targets.</p>
+    <p><strong>amux has a full interactive dashboard.</strong> Open <code>https://localhost:8824</code> in any browser and see all sessions with live status, token spend, output scrollback, and a send bar for typing messages directly into any agent. The kanban board is drag-and-drop. The dashboard works as a PWA on your phone with native-app-like safe-area insets and touch targets.</p>
     <p>With Tailscale, amux is accessible from anywhere on the internet without exposing ports. Start agents at your desk, check them from your phone at dinner, review results from your laptop in bed.</p>
 
     <h2 id="review">Code Review &amp; PR Handling</h2>
@@ -418,7 +418,7 @@ git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 # Start using it immediately
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
     <p>amux is a single Python file with no dependencies beyond Python 3 and tmux, both of which are pre-installed on most developer machines. No Elixir, no mise, no external API keys for the orchestrator itself. Deploy to a remote server with <code>scp amux-server.py your-server:</code>.</p>
 
     <h3>Maintenance commitment</h3>
@@ -507,7 +507,7 @@ amux serve</code></pre>
     <div class="cta-box" style="margin-top:3rem;"><h3>Try amux</h3><p>Run dozens of Claude Code agents in parallel with self-healing, mobile monitoring, token tracking, and a built-in task board. Python 3 + tmux. No Linear required. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">

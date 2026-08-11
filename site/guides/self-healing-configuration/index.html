@@ -101,7 +101,7 @@ amux register myproject --dir ~/Dev/myproject --yolo
 
 # Start the session and the amux server
 amux start myproject
-amux serve  # dashboard at https://localhost:8822</code></pre>
+amux serve  # dashboard at https://localhost:8824</code></pre>
 
     <p>The <code>--yolo</code> flag is per-session. You can run some sessions with it and others without, depending on how much you trust the project's CLAUDE.md constraints.</p>
 
@@ -124,7 +124,7 @@ WATCHDOG_POLL_INTERVAL=10</code></pre>
 
     <h3>Step 4 — Verify the watchdog is running</h3>
     <p>The amux dashboard shows watchdog status in the session detail view. You can also confirm via the API:</p>
-    <pre><code>curl -sk https://localhost:8822/api/sessions | python3 -c "
+    <pre><code>curl -sk https://localhost:8824/api/sessions | python3 -c "
 import json, sys
 sessions = json.load(sys.stdin)
 for s in sessions:
@@ -144,7 +144,7 @@ amux register fix-bugs --dir ~/Dev/app --yolo
 # Queue tasks via dashboard or API
 curl -sk -X POST -H 'Content-Type: application/json' \
   -d '{"title":"Implement OAuth flow","session":"feature-auth","status":"doing"}' \
-  https://localhost:8822/api/board
+  https://localhost:8824/api/board
 
 # Start all sessions
 amux start feature-auth
@@ -255,7 +255,7 @@ WantedBy=multi-user.target</code></pre>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
     </div>
   </main>

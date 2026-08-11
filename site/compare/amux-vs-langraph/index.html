@@ -262,7 +262,7 @@
 import requests, os
 
 def coding_node(state):
-    amux_url = os.getenv("AMUX_URL", "https://localhost:8822")
+    amux_url = os.getenv("AMUX_URL", "https://localhost:8824")
     task = state["current_task"]
     # issue task to amux session
     requests.post(
@@ -360,7 +360,7 @@ def coding_node(state):
       <p>amux is the open-source control plane for Claude Code, Codex, and Gemini CLI sessions — self-healing watchdog, kanban board, iOS app, and REST API for integration with LangGraph and other orchestrators. Single Python file, MIT licensed.</p>
       <pre><code>brew install mixpeek/amux/amux
 amux register myproject --dir ~/Dev/myproject --yolo
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub ★</a>
       <a class="btn" href="/guides/agent-to-agent-communication/" style="margin-left:0.75rem;">Agent coordination guide →</a>
     </div>

@@ -80,11 +80,11 @@ amux register myapp --dir ~/Dev/myapp --yolo
 
 # Add test generation tasks to the kanban board
 # (one per module — agents claim these atomically, no duplicates)
-curl -X POST https://localhost:8822/api/board \
+curl -X POST https://localhost:8824/api/board \
   -H 'Content-Type: application/json' \
   -d '{"title":"Generate unit tests for src/auth.py — cover happy path, invalid token, expired token"}'
 
-curl -X POST https://localhost:8822/api/board \
+curl -X POST https://localhost:8824/api/board \
   -H 'Content-Type: application/json' \
   -d '{"title":"Generate unit tests for src/billing.py — cover payment success, declined, refund"}'
 
@@ -94,7 +94,7 @@ for i in $(seq 1 10); do
 done
 
 # Monitor from the dashboard or iOS app
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
 
     <h2>Quality gates for generated tests</h2>
 
@@ -162,7 +162,7 @@ Report findings with file:line references."</code></pre>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
     </div>
   </main>

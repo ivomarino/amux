@@ -139,8 +139,8 @@
 pip install amux   # or: uvx amux serve (zero-install)
 # or: brew install mixpeek/amux/amux (macOS)
 
-amux serve --host 0.0.0.0 --port 8822
-# Dashboard accessible at https://your-server:8822 for your whole team</code></pre>
+amux serve --host 0.0.0.0 --port 8824
+# Dashboard accessible at https://your-server:8824 for your whole team</code></pre>
 
     <p>Because amux is a single Python file with no external dependencies, it passes most enterprise security review processes faster than SaaS tools: the full source is auditable, there is no third-party CDN, and you can pin a specific commit and diff upgrades before deploying. For environments that prohibit internet egress during code execution, amux can run fully air-gapped — agents use only locally installed CLI tools and your internal git remotes.</p>
 
@@ -195,7 +195,7 @@ amux board add "Write integration tests for PaymentProcessor class"
     </ul>
 
     <h2>Team dashboard: one view for all agent activity</h2>
-    <p>The amux web dashboard at <code>https://your-server:8822</code> is designed for team visibility. Multiple engineers can have it open simultaneously. Changes update in real time via SSE — when an agent claims a task, it appears as "doing" on everyone's board within about 2 seconds. When a session emits output, the live-tail view updates for anyone who has it open.</p>
+    <p>The amux web dashboard at <code>https://your-server:8824</code> is designed for team visibility. Multiple engineers can have it open simultaneously. Changes update in real time via SSE — when an agent claims a task, it appears as "doing" on everyone's board within about 2 seconds. When a session emits output, the live-tail view updates for anyone who has it open.</p>
 
     <p>Key team-facing views in the dashboard:</p>
     <ul>
@@ -279,7 +279,7 @@ amux board add "Write integration tests for PaymentProcessor class"
 pipx install amux
 
 # Zero-install alternative (no pip)
-uvx amux serve --host 0.0.0.0 --port 8822</code></pre>
+uvx amux serve --host 0.0.0.0 --port 8824</code></pre>
       </li>
       <li>
         <strong>Add org-wide CLAUDE.md to each repository.</strong> Start with your most important repo. The CLAUDE.md should encode standards that currently live only in team memory — things a new engineer would get wrong on their first PR. Commit and have it reviewed like any other change.
@@ -325,8 +325,8 @@ amux register infra-agents --dir /repos/infrastructure --yolo</code></pre>
       <h3>Deploy amux for your engineering team</h3>
       <p>Self-hosted, single Python file, zero external dependencies. Your code stays inside your network. Runs on any Linux server in under five minutes.</p>
       <pre><code>pip install amux
-amux serve --host 0.0.0.0 --port 8822
-# Dashboard at https://your-server:8822 for the whole team</code></pre>
+amux serve --host 0.0.0.0 --port 8824
+# Dashboard at https://your-server:8824 for the whole team</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">⭐ Star amux on GitHub</a>
       <a class="btn" href="/concierge/" style="margin-left:0.75rem;">Talk to us about team setup →</a>
     </div>

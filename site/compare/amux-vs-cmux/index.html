@@ -102,7 +102,7 @@
     <p>amux is an open-source control plane for running an AI engineering team from a single dashboard or your phone. It is built around <code>amux-server.py</code> &mdash; a single Python file that runs a local HTTPS server, manages tmux sessions, and serves a web dashboard. It treats parallel agents as a fleet that needs to be monitored, recovered, coordinated, and accessed from anywhere. As of July 2026, amux has 300 GitHub stars and is actively maintained.</p>
     <p>Key features:</p>
     <ul>
-      <li>Web dashboard at <code>https://localhost:8822</code> with live session status, token spend, and a send bar</li>
+      <li>Web dashboard at <code>https://localhost:8824</code> with live session status, token spend, and a send bar</li>
       <li>Native iOS app (<a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">App Store</a>) and mobile PWA for monitoring and controlling the fleet from anywhere</li>
       <li>Self-healing watchdog: auto-restart crashed agents, auto-compact context overflow, detect stuck sessions</li>
       <li>Auto-resume dialog: automatically handles the "resume session?" prompt for unattended runs</li>
@@ -152,7 +152,7 @@
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.6rem;">Web dashboard</td>
-          <td style="padding:0.6rem;color:var(--green);">Yes (https://localhost:8822)</td>
+          <td style="padding:0.6rem;color:var(--green);">Yes (https://localhost:8824)</td>
           <td style="padding:0.6rem;">No (desktop app only)</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
@@ -353,7 +353,7 @@ amux board add "Add search tests, target 85% coverage" --session search
 
 # Start all and open dashboard
 amux start --all
-amux serve  # → https://localhost:8822
+amux serve  # → https://localhost:8824
 
 # Monitor from any device: laptop, phone, tablet
 # Watchdog auto-restarts crashes, auto-compacts context overflows
@@ -366,7 +366,7 @@ amux serve  # → https://localhost:8822
 
     <h2 id="dashboards">Dashboards &amp; Remote Access</h2>
     <p><strong>cmux has no dashboard and no remote access.</strong> It is a desktop application. To see your agents, you look at the app on your Mac. To check agents remotely, you SSH into your machine and... you can't use cmux over SSH, because it's a GUI app. You could use the Unix socket API to query status programmatically, but there's no web interface.</p>
-    <p><strong>amux has a full web dashboard</strong> accessible from any browser on any device. Open <code>https://localhost:8822</code> (or your machine's IP/Tailscale address) and see:</p>
+    <p><strong>amux has a full web dashboard</strong> accessible from any browser on any device. Open <code>https://localhost:8824</code> (or your machine's IP/Tailscale address) and see:</p>
     <ul>
       <li>All sessions with live status (running, idle, crashed, stuck)</li>
       <li>Per-session token spend and cumulative cost</li>
@@ -546,7 +546,7 @@ uvx amux serve                     # Zero-install (no install needed)
 
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">

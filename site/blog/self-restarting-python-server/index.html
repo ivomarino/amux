@@ -69,7 +69,7 @@ sys.exit(0)</code></pre>
 <p>Problems:</p>
 
 <ul>
-<li><strong>Port conflict.</strong> The old process holds port 8822. The new process tries to bind it and gets <code>EADDRINUSE</code>. You need careful coordination — shut down the old server, wait for the OS to release the port, then start the new one. Or use SO_REUSEADDR/SO_REUSEPORT, which have their own edge cases.</li>
+<li><strong>Port conflict.</strong> The old process holds port 8824. The new process tries to bind it and gets <code>EADDRINUSE</code>. You need careful coordination — shut down the old server, wait for the OS to release the port, then start the new one. Or use SO_REUSEADDR/SO_REUSEPORT, which have their own edge cases.</li>
 <li><strong>Two processes.</strong> For a brief window, both are running. If the parent is managed by systemd/launchd, killing it might trigger a restart of the old code.</li>
 <li><strong>PID changes.</strong> Anything monitoring the process by PID (log aggregators, process managers, health checks) sees a new process, not a restart.</li>
 </ul>
@@ -137,12 +137,12 @@ def watch_and_restart(server):
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 if __name__ == "__main__":
-    server = HTTPServer(("", 8822), Handler)
+    server = HTTPServer(("", 8824), Handler)
     watcher = threading.Thread(
         target=watch_and_restart, args=(server,), daemon=True
     )
     watcher.start()
-    print("Serving on :8822")
+    print("Serving on :8824")
     server.serve_forever()</code></pre>
 
 <p>That's 50 lines for a self-reloading HTTP server. Let's walk through the important parts.</p>
@@ -275,7 +275,7 @@ for line in Path("~/.myapp/server.env").expanduser().read_text().splitlines():
 <div class="cta-box"><h3>Get started with amux</h3><p>Run dozens of Claude Code agents in parallel. Python 3 + tmux. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">
