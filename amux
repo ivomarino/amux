@@ -2120,6 +2120,127 @@ USAGE
 }
 
 
+# ── CRM ──────────────────────────────────────────────────────────────────────
+# AMUX-2932. Global ~/.claude/CLAUDE.md has documented `amux crm add` to every
+# session in every project for months; the verb did not exist and the HTTP API
+# behind it did not either (405, no route) until AMUX-2929 ported it.
+#
+# EVERY WRITE CARRIES X-Amux-Session. Python's version of this verb did NOT,
+# and that is the whole reason CLAUDE.md tells agents to prefer `amux <verb>`
+# over a hand-rolled curl: a raw curl is unattributed by construction. Adding
+# the verb without the header would have rebuilt the trap it exists to close.
+cmd_crm() {
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  # key=value pairs -> JSON, bare words -> the name. Done in python so a name
+  # with spaces, quotes or a `$` survives; building this JSON in bash is how
+  # you get a contact called `$(whoami)`.
+  _crm_json() {
+    python3 -c '
+import sys, json
+fields = {}; name = []
+for a in sys.argv[1:]:
+    if "=" in a and not a.startswith("="):
+        k, v = a.split("=", 1); fields[k] = v
+    else:
+        name.append(a)
+if name: fields["name"] = " ".join(name)
+print(json.dumps(fields))' "$@"
+  }
+  case "$sub" in
+    add)
+      [ $# -gt 0 ] || die "Usage: amux crm add \"Name\" [company=X] [email=Y] [role=Z] [phone=P]"
+      local json; json=$(_crm_json "$@")
+      curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("error"): print("error:", d["error"], file=sys.stderr); sys.exit(1)
+print(d.get("id", "?"), "created")'
+      ;;
+    update|set)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm update PPL-1 company=X email=Y"
+      shift 2>/dev/null || true
+      [ $# -gt 0 ] || die "amux crm update: nothing to set. Give key=value pairs."
+      local json; json=$(_crm_json "$@")
+      curl -sk -X PATCH -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts/$cid" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d.get("ok"): print("error:", d.get("error", "failed"), file=sys.stderr); sys.exit(1)
+print("updated")'
+      ;;
+    get|show)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm get PPL-1"
+      curl -sk "$AMUX_API/api/crm/contacts/$cid" | python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+if c.get("error"): print("error:", c["error"], file=sys.stderr); sys.exit(1)
+print(c.get("id"), "-", c.get("name"))
+for f in ("company", "role", "email", "phone", "linkedin", "twitter"):
+    if c.get(f): print("  %-9s %s" % (f + ":", c[f]))
+if c.get("tags"): print("  %-9s %s" % ("tags:", ", ".join(c["tags"])))
+if c.get("notes"): print("  %-9s %s" % ("notes:", c["notes"]))
+for i in c.get("interactions", [])[:5]:
+    print("  %s  %-6s %s" % (i.get("date", ""), i.get("type", ""), (i.get("notes") or "")[:60]))'
+      ;;
+    log)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm log PPL-1 \"what happened\" [follow_up_date=YYYY-MM-DD]"
+      shift 2>/dev/null || true
+      local json; json=$(python3 -c '
+import sys, json
+fields = {"type": "other"}; notes = []
+for a in sys.argv[1:]:
+    if "=" in a and not a.startswith("="):
+        k, v = a.split("=", 1); fields[k] = v
+    else:
+        notes.append(a)
+if notes: fields["notes"] = " ".join(notes)
+print(json.dumps(fields))' "$@")
+      curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts/$cid/interactions" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("error"): print("error:", d["error"], file=sys.stderr); sys.exit(1)
+print("logged", d.get("id", ""))'
+      ;;
+    followups|fu)
+      curl -sk "$AMUX_API/api/crm/followups" | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+if not items: print("No pending follow-ups"); sys.exit(0)
+for i in items:
+    print(i.get("follow_up_date", ""), i.get("name", ""), "-", i.get("follow_up_note", ""))'
+      ;;
+    list|ls|"")
+      curl -sk "$AMUX_API/api/crm/contacts$([ -n "${1:-}" ] && printf '?q=%s' "$1")" | python3 -c '
+import json, sys
+cs = json.load(sys.stdin)
+if not cs: print("No contacts"); sys.exit(0)
+for c in cs:
+    print("%-8s %-28s %s" % (c.get("id", ""), (c.get("name") or "")[:28], c.get("company", "")))'
+      ;;
+    help|--help|-h)
+      cat <<'EOH'
+amux crm — contacts, notes and follow-ups (HTTP: /api/crm/*)
+
+  amux crm list [query]                     List contacts (optional name/company/role search)
+  amux crm get PPL-1                        One contact with tags and recent interactions
+  amux crm add "Name" [company=X email=Y]   Create; extra key=value pairs set fields
+  amux crm update PPL-1 role=CTO            Update whitelisted fields
+  amux crm log PPL-1 "spoke re pricing" [follow_up_date=2026-09-01]
+  amux crm followups                        Pending follow-ups, soonest first
+
+Writes carry X-Amux-Session, so the audit trail names who made them.
+EOH
+      ;;
+    *) die "amux crm: unknown subcommand: $sub  (try: amux crm help)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -2161,6 +2282,14 @@ ${BOLD}Web Dashboard:${RESET}
   amux serve [port]              Start the Rust server (normally launchd's job;
                                  installed service 8824, bare default 8823;
                                  also answers retired 8822 while it is bound)
+
+${BOLD}CRM:${RESET}
+  amux crm list [query]          List contacts (search name/company/role)
+  amux crm get PPL-1             One contact, with tags and recent interactions
+  amux crm add "Name" [k=v ...]  Create a contact (company=, email=, role=, phone=)
+  amux crm update PPL-1 k=v      Update whitelisted fields
+  amux crm log PPL-1 "notes"     Log an interaction (follow_up_date=YYYY-MM-DD)
+  amux crm followups             Pending follow-ups, soonest first
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
@@ -2388,6 +2517,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     stop-all)         cmd_stop_all ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
+    crm)              shift; cmd_crm "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
     iac)              shift; cmd_config "$@" ;;
