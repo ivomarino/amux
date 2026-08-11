@@ -7068,7 +7068,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.596';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.597';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28014,8 +28014,15 @@ const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="1
 
 // The CRM / People view was removed (AMUX-2590, Ethan 2026-08-09): its tab,
 // markup, styles and every _crm* function are gone from this client. The
-// /api/crm endpoints still exist for agents; the serve-time AMUX-FEATURE-FLAGS
-// CSS in static_files.rs stays as the one greppable line to reverse.
+// serve-time AMUX-FEATURE-FLAGS CSS in static_files.rs stays as the one
+// greppable line to reverse.
+//
+// This comment used to add "the /api/crm endpoints still exist for agents".
+// That was FALSE when written: the routes went with the python server at
+// 792ce1f, so POST /api/crm/contacts answered 405 and GET /api/crm answered
+// 404, while 308 contacts sat in the tables migrations kept maintaining. It is
+// true now only because AMUX-2929 ported them back — the comment was a claim
+// about another file, and nothing checks those (ethos rule 6).
 
 // ── Gmail Inbox tab ────────────────────────────────────────────────────────────
 let _gmailAccounts = [];
