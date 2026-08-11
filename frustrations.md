@@ -2797,3 +2797,50 @@ FIX: The staged-guard is the designed prevention and it was DOWN for both events
   "NOT ENFORCED — could not reach the amux server" against 8822, then 8824, timing out both times,
   so cross-session sweep protection was off exactly when four lanes were committing into one tree.
   Being loud about it is right; being down is the hazard it exists for. See AMUX-2807.
+
+## /api/board?q=<anything> returns the entire board, shaped like search results
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2842
+SYMPTOM: `?q=ownership` and `?q=nudge` returned byte-identical 1382-row lists. So
+  did `?q=zzzznonexistentzzz`. `q` is not in ListParams and axum drops unknown query
+  params silently, so the param was inert and the full board came back looking like
+  ranked hits.
+COST: Two searches for an existing card before filing a new one. I caught it only
+  because I ran two queries and happened to compare them — a single query reads as
+  "no card exists for this", which is exactly how a duplicate gets filed against a
+  board that already has the card. The board has 1382 items and duplicate-filing is
+  the specific waste it cannot absorb.
+FIX: fc6badf — q/query/search recognised only to be refused, 400 naming
+  /api/search?q=<term> (verified discriminating: 0 hits for nonsense, 11 for a real
+  term) plus the filters /api/board does support. Not silently honoured instead,
+  because /api/search returns a different shape.
+
+## A probe read a hook file that git never executes, and a correct measurement certified the wrong conclusion
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2841
+SYMPTOM: Retracting a peer's report of a tree-wide mtime restamp, I grepped
+  .git/hooks/pre-commit on amux and mixpeek for `git stash`, found none, and wrote
+  "the mechanism does not exist" onto MI-4650. Three independent reasons it could not
+  work: the stash is done by the pre-commit FRAMEWORK wrapping the hooks; it is
+  spelled diff-index + `checkout -- .` + apply, never `git stash`; and mixpeek sets
+  core.hooksPath=.githooks, so the file I opened is DEAD — git never runs it.
+COST: A wrong retraction published onto another session's card, contradicting a
+  correct report from creative-dna. Two peers spent turns re-establishing a fact that
+  was already established.
+FIX: The generalisable half is the CORROBORATION, not the bad grep. I confirmed the
+  retraction by watching a file's mtime across a real commit and seeing it unchanged —
+  true, and worthless, because I ran it in the amux tree, which has no
+  .pre-commit-config.yaml and never invokes the framework. A correct measurement in
+  the wrong scope arrives as EVIDENCE rather than as reasoning, and evidence is harder
+  to doubt because you can point at it. Nothing felt like the moment to recheck.
+  Wanted: before believing a negative about a mechanism, confirm the probe ran where
+  the mechanism could fire — for hooks specifically, resolve core.hooksPath first,
+  because the file at the obvious path may not be the one that runs.
