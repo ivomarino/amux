@@ -298,10 +298,8 @@ async fn state_transitions_visible() {
     while start.elapsed() < Duration::from_secs(30) {
         let st = get_state(&c, w).await;
         seen.insert(st.clone());
-        if st == "idle" || st == "waiting" {
-            if seen.len() > 1 {
-                break;
-            }
+        if (st == "idle" || st == "waiting") && seen.len() > 1 {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
