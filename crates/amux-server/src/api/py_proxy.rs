@@ -162,6 +162,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/layout-presets", "tab layout presets save/load/delete (api/layout_presets.rs)"),
     ("/api/scope", "uniform per-capability scope read/write — memory/rules/env/gates/status_mode at global/group/worker, python storage shared byte-for-byte (api/scope.rs, AMUX-2608: the family whose cutover emptied PROXIED_FAMILIES)"),
     ("/api/mcp", "MCP registry — list/import/remove (AMUX-2871)"),
+    ("/api/sql", "SQL browser — schema/rows/query, read-only unless write:true"),
     ("/api/skills", "skills list + save/delete"),
     ("/api/slash-commands", "slash commands"),
     ("/api/map", "map + geocoding"),

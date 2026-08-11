@@ -53,6 +53,7 @@ pub mod sessions_legacy;
 pub mod settings;
 pub mod mcp;
 pub mod skills;
+pub mod sql;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -186,6 +187,7 @@ pub fn router(state: AppState) -> Router {
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())
+        .nest("/api/sql", sql::routes())
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
         .nest("/api/history", history::routes())
