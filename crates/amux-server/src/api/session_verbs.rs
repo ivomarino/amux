@@ -8765,6 +8765,20 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
     ))
 }
 
+/// The message id a send answers with (Ethan 2026-08-11: "we should have all
+/// messages with an idempotent id"). DERIVED from the caller's msg_id when
+/// one is supplied — not stored — so the original send and every deduped
+/// retry of it answer the SAME id with no lookup and no row to expire.
+/// Without a msg_id there is nothing to be idempotent against; the
+/// timestamp form at least remains unique.
+fn send_response_id(name: &str, msg_id: &str) -> String {
+    if msg_id.is_empty() {
+        format!("msg-{}-{}", name, (now_f64() * 1000.0) as i64)
+    } else {
+        format!("msg-{name}-{msg_id}")
+    }
+}
+
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
     // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
@@ -8796,7 +8810,14 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     let mut text = body_str(body, "text");
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if !msg_id.is_empty() && send_dedup_seen(state, name, &msg_id).await {
-        return j200(json!({"ok": true, "deduped": true, "message": "duplicate retry ignored (already delivered)"}));
+        // Same `id` as the original response — see send_response_id. A retry
+        // that answers with a DIFFERENT id (or none, as this arm did until
+        // 2026-08-11) breaks the caller's correlation exactly when it is
+        // retrying, which is the one moment idempotency is for.
+        return j200(json!({
+            "ok": true, "deduped": true, "id": send_response_id(name, &msg_id),
+            "message": "duplicate retry ignored (already delivered)"
+        }));
     }
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
@@ -8884,7 +8905,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     } else {
         send_failure_status(&msg)
     };
-    let send_id = format!("msg-{}-{}", name, (now_f64() * 1000.0) as i64);
+    let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
