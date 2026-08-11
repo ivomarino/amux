@@ -1,6 +1,12 @@
 #!/bin/bash
 # Install the repo's git hooks. Run once after cloning:  ./scripts/install-hooks.sh
 #
+#   prepare-commit-msg — stamps Amux-Session on every commit, `(human)` when
+#                        there is no session (AMUX-2567). Until 2026-08-11 this
+#                        hook was NOT installed by this script: it existed as a
+#                        hand-placed file in one checkout and nowhere else, so a
+#                        fresh clone produced untrailered commits that the push
+#                        guard must read as foreign.
 #   pre-commit         — secret scan + Rust/client-JS syntax, and the shim that
 #                        calls the staged-guard below
 #   amux-staged-guard  — cross-session sweep protection (AMUX-1730)
@@ -81,6 +87,24 @@ install_guard_only() {
     echo "  FAIL $target/.git/hooks/amux-staged-guard differs after install" >&2
     fail=1
   fi
+  # THE SESSION STAMP (AMUX-2567). Installed alongside the guard because the
+  # guard's attribution is only as good as the trailer: with no
+  # prepare-commit-msg, every commit in this checkout is untrailered, the push
+  # recipe in CLAUDE.md says to "treat as foreign", and a peer's ordinary work
+  # is indistinguishable from a hook-bypassing graft.
+  #
+  # It was NOT installed by this script before — it existed as a hand-placed
+  # file in one checkout's .git/hooks and nowhere else, so a fresh clone got
+  # silent non-attribution and looked fine. Unlike pre-commit (which we refuse
+  # to rewrite, because it is the repo owner's), prepare-commit-msg is entirely
+  # ours: nothing else claims it, so installing it is safe.
+  install -m 0755 "$SRC/scripts/git-hooks/prepare-commit-msg" "$target/.git/hooks/prepare-commit-msg"
+  if cmp -s "$SRC/scripts/git-hooks/prepare-commit-msg" "$target/.git/hooks/prepare-commit-msg"; then
+    echo "  ok   $target/.git/hooks/prepare-commit-msg matches the tracked source"
+  else
+    echo "  FAIL $target/.git/hooks/prepare-commit-msg differs after install" >&2
+    fail=1
+  fi
   # The shim is the whole chain: an installed guard nothing calls is a file, not
   # a guard. We do not write their pre-commit, so all we can do is check it and
   # hand over the exact lines — which is the honest move, not a silent no-op.
@@ -127,6 +151,7 @@ ROOT="$SRC"
 
 install -m 0755 "$ROOT/scripts/git-hooks/pre-commit" "$ROOT/.git/hooks/pre-commit"
 install -m 0755 "$ROOT/scripts/git-hooks/amux-staged-guard" "$ROOT/.git/hooks/amux-staged-guard"
+install -m 0755 "$ROOT/scripts/git-hooks/prepare-commit-msg" "$ROOT/.git/hooks/prepare-commit-msg"
 
 # Verify rather than announce (ethos #7): compare what landed against its source,
 # so a stale installed copy cannot hide behind a success message. That drift was
@@ -135,7 +160,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/amux-staged-guard" "$ROOT/.git/hooks/am
 # commits printed "Security scan passed" from a scanner that could match none of
 # them.
 fail=0
-for h in pre-commit amux-staged-guard; do
+for h in pre-commit amux-staged-guard prepare-commit-msg; do
   if cmp -s "$ROOT/scripts/git-hooks/$h" "$ROOT/.git/hooks/$h"; then
     echo "  ok   .git/hooks/$h matches scripts/git-hooks/$h"
   else
