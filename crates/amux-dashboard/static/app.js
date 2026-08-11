@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.580';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.581';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18994,7 +18994,13 @@ function _bqIs(item, val, ix) {
     case 'archived': return !!item.archived;
     case 'pinned':   return !!item.pinned;
     case 'overdue':  return !!item.due && (item.due * (item.due > 1e11 ? 0.001 : 1)) < Date.now() / 1000;
-    case 'folded':   return (((item.desc || '') + '\n' + (item.log || '')).match(/New task:/g) || []).length > 0;
+    // folded_n is the slim counterpart; under slim desc AND log are absent, so
+    // the local count is 0 for every card and `is:folded` would quietly select
+    // nothing — a filter that matches nothing looks identical to a board with
+    // no folded cards (AMUX-2840 consumer sweep).
+    case 'folded':   return item.folded_n !== undefined
+                            ? item.folded_n > 0
+                            : (((item.desc || '') + '\n' + (item.log || '')).match(/New task:/g) || []).length > 0;
     default:         return false;
   }
 }
@@ -19673,7 +19679,12 @@ function _issueRowHTML(item, opts) {
 
 function _renderBoardCard(item) {
   const groups = item.tags || [];
-  const firstLine = (item.desc || '').split('\n')[0].slice(0, 80);
+  // desc_head is the same first-line derivation, computed server-side, and it
+  // is ALL slim ships of the description. Without this the card preview goes
+  // blank for every card the moment the poll flips — the exact regression
+  // list_body's own doc records from the last slimming attempt.
+  const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
+                      .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
   // LIVE emphasis: this card is what its owning session is working on right now
   // (item in doing + that session's terminal is actively generating).
@@ -19697,7 +19708,7 @@ function _renderBoardCard(item) {
   // card with nothing highlighted and no visible reason for being in the
   // results. Same class as the peek-board wrong-query bug: the filter was
   // right and the feedback was missing.
-  if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
+  if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + (((item.desc !== undefined ? item.desc.length : (item.desc_len || 0)) > 80) ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
   if (boardViewMode !== 'worker' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
   if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + esc(item.shepherd) + '</span>';
@@ -20676,6 +20687,16 @@ async function _bdHydrate(id) {
     if (d && (d.value === '' || d.value === (full.desc || ''))) d.value = full.desc || '';
     const l = document.getElementById('bd-log');
     if (l && full.log !== undefined) l.textContent = full.log || '';
+    // RE-RENDER THE HISTORY TAB with the hydrated record. It was rendered at
+    // open time from the LIST item, and under slim that item carries no `log`
+    // — so the tab would show an empty history and a 0 count for every card,
+    // which reads as "nothing ever happened here" rather than as still
+    // loading. Same class as the blank desc, one surface over.
+    if (boardDetailId === id) {
+      const merged = idx >= 0 ? boardItems[idx] : full;
+      _bdRenderHistory(merged);
+      if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    }
     _bdHydrated = true;
   } catch (e) { /* leave unhydrated; the save guard covers it */ }
 }
@@ -22711,7 +22732,10 @@ function _cacheBoardJSON(j) {
         id: i.id, title: i.title, status: i.status, session: i.session,
         type: i.type, owner_type: i.owner_type, archived: i.archived,
         updated: i.updated, tags: i.tags, groups: i.groups,
-        desc_len: (i.desc || '').length,
+        // Prefer the SERVED desc_len: under slim there is no desc to measure,
+        // and recomputing would cache 0 for every card — which the save guard
+        // reads as "this card has no description" and would stop protecting.
+        desc_len: (i.desc_len !== undefined ? i.desc_len : (i.desc || '').length),
       })));
     } catch (e) { /* unparseable — fall back to storing what we were given */ }
     localStorage.setItem('amux_board_cache', slim);
