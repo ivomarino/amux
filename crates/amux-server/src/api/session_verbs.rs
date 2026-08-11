@@ -1323,26 +1323,6 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Text sitting under the composer's `❯`, or None when it is empty.
-///
-/// The composer is the LAST `❯` line of the frame — everything above it is
-/// conversation, where a quoted `❯` is a word, not a prompt (the same
-/// content-vs-chrome split as `pane_bar_says_generating`). Selector frames
-/// (`❯ 1. …`) are pickers, not composers, and are already handled by the
-/// input-required stamp — excluded here so one state never claims two names.
-pub(crate) fn composer_text(raw_output: &str) -> Option<String> {
-    let clean = strip_ansi(raw_output);
-    let line = clean.lines().rev().find(|l| l.trim_start().starts_with('\u{276f}'))?;
-    let t = line
-        .trim_start()
-        .trim_start_matches('\u{276f}')
-        .trim_matches(|c: char| c.is_whitespace() || c == '\u{a0}');
-    if t.is_empty() || t.starts_with("1.") {
-        return None;
-    }
-    Some(t.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Markdown → ANSI transcript renderer (py:5675-5957). Fail-safe: any panic
 // risk is avoided structurally; the table renderer clamps widths.
@@ -6942,34 +6922,42 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             }
         }
 
-        // STUCK COMPOSER (AMUX-2904, found live 2026-08-11 on three lanes at
-        // once). Text sits under `❯`, the main loop is idle, and nothing moves
-        // — because Claude Code queued the message behind background agents it
-        // still believes in. When those agents are PHANTOM (their transcripts
-        // went cold days ago: backend's Aug 9, mixpeek-homepage-claude's
-        // Jul 20), the message is hostage forever, Enter does not force it
-        // (verified by hand on backend), and only a restart clears it. The
-        // lane read `idle` throughout, which is how a typed command from Ethan
-        // sat invisible for days.
+        // STUCK COMPOSER (AMUX-2904). Genuinely TYPED text sits under `❯`
+        // while the main loop is idle and no background agent is live —
+        // an Enter that never landed, or a human's committed-but-unsubmitted
+        // command. The lane read `idle` throughout, which is how unsubmitted
+        // text sits invisible for hours: ghost-rescue presses Enter for
+        // amux-prefixed text, but deliberately leaves everything else alone
+        // (a false rescue submits a human's half-written thought), and until
+        // now "left alone" also meant "invisible". This stamp is the visible
+        // half: surface it as `waiting`, decide nothing.
         //
-        // Text in the composer while GENERATING or while agents are genuinely
-        // hot is the legitimate queue doing its job — it flushes at the next
-        // turn boundary, so it is not stamped. What is stamped is the state
-        // with no exit: text + idle main loop + zero live agents.
+        // MUST go through composer_state().typed(), never a stripped-ANSI
+        // read of the ❯ line: Claude Code paints a dim SUGGESTION in the
+        // empty composer, and attribute-blind reading of it is exactly the
+        // 2026-08-09 incident where 13 idle lanes were reported as holding
+        // stuck text ("push it", "continue with the queue", …) and three
+        // people pressed Enter on frames with nothing to submit. The
+        // composer_state_tests pin that discrimination; this caller inherits
+        // it. Text while GENERATING or while agents are hot is the legitimate
+        // queue doing its job and is not stamped.
         let agents_live = sub_activity
             .get(name)
             .is_some_and(|m| now_f64() - m < 180.0);
-        let stuck_now = !is_rate_limit_menu(&pane)
+        let typed_pending = (!is_rate_limit_menu(&pane)
             && !selector_now
             && !pane_bar_says_generating(&pane)
             && detect_claude_status(&pane) != "active"
-            && !agents_live
-            && composer_text(&pane).is_some();
+            && !agents_live)
+            .then(|| composer_state(&pane).typed().map(|t| t.to_string()))
+            .flatten();
+        let stuck_now = typed_pending.is_some();
         let meta_now = load_meta(name);
         let stuck_was = meta_now["composer_stuck_since"].as_i64().unwrap_or(0) > 0;
         if stuck_now != stuck_was {
-            let preview = composer_text(&pane)
-                .map(|t| chars_truncate(&t, 120))
+            let preview = typed_pending
+                .as_deref()
+                .map(|t| chars_truncate(t, 120))
                 .unwrap_or_default();
             update_meta(
                 name,

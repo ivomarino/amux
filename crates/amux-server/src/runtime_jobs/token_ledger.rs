@@ -104,26 +104,19 @@ fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 
         / 1_000_000.0
 }
 
-/// py:17969 — the owning amux session, read from the conversation's FIRST
-/// record. `None`/"" means an ad-hoc conversation amux does not own; those
-/// still count toward fleet totals under an empty session.
+/// py:17969 — the owning amux session. "" means an ad-hoc conversation amux
+/// does not own; those still count toward fleet totals under an empty session.
+///
+/// Resolves through `conversation_owner` (meta claim, then LAST title record —
+/// AMUX-2612), not the first line: a renamed lane's transcript keeps its birth
+/// name on line 0 forever, and reading it here charged every token the `amux`
+/// lane spent to `amux-rust`, a session that no longer exists. Rows indexed
+/// before 2026-08-11 may still carry the dead name; the fix is forward.
 fn jsonl_owner_title(path: &Path) -> String {
-    let Ok(f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let mut line = String::new();
-    if BufReader::new(f).read_line(&mut line).is_err() {
-        return String::new();
-    }
-    let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return String::new();
-    };
-    rec.get("customTitle")
-        .or_else(|| rec.get("sessionName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    crate::api::session_verbs::conversation_owner(
+        path,
+        &crate::api::session_verbs::conversation_claims(),
+    )
 }
 
 struct Turn {
@@ -668,11 +661,17 @@ mod tests {
         assert_eq!(ledger(&st).await.len(), 2);
     }
 
+    /// The LAST title record wins, not the first (AMUX-2612): `--name` on a
+    /// resume APPENDS a fresh record, so the first line holds the name the
+    /// conversation was born with forever. This test used to pin the opposite
+    /// — which is exactly the semantic that charged the renamed `amux` lane's
+    /// tokens to `amux-rust` for a month.
     #[test]
-    fn owner_comes_from_the_first_record_and_is_empty_for_ad_hoc_conversations() {
+    fn owner_comes_from_the_last_title_record_and_is_empty_for_ad_hoc_conversations() {
         let dir = tempfile::tempdir().unwrap();
         let named = dir.path().join("a.jsonl");
-        std::fs::write(&named, "{\"customTitle\":\"amux\"}\n{\"customTitle\":\"other\"}\n").unwrap();
+        std::fs::write(&named, "{\"customTitle\":\"amux-rust\"}\n{\"customTitle\":\"amux\"}\n")
+            .unwrap();
         assert_eq!(jsonl_owner_title(&named), "amux");
 
         let anon = dir.path().join("b.jsonl");

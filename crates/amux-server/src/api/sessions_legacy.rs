@@ -662,16 +662,36 @@ impl FleetSignals {
 /// lane -> newest subagent-transcript mtime, in ONE pass over
 /// `~/.claude/projects/<proj>/<conversation>/subagents/`.
 ///
-/// The owning lane is the parent conversation's `customTitle` — the SAME
-/// resolution the token-ledger indexer and the /subagents endpoint use, not a
-/// fourth spelling of it. Measured 21ms for 1844 transcripts across 69
-/// conversations, so it is affordable once per fleet pass; per-lane it would
-/// not be.
-fn scan_subagent_activity() -> BTreeMap<String, f64> {
-    use std::io::BufRead;
+/// The owning lane resolves through `session_verbs::conversation_owner` —
+/// meta claim first, LAST title record second — the same resolution the
+/// token-ledger indexer and the /subagents endpoint use, not a fourth
+/// spelling of it. The first cut here read the parent's FIRST line, which
+/// reintroduced the staleness AMUX-2612 fixed: the `amux` lane's conversation
+/// is still titled 'amux-rust' on line 0, so its agents were attributed to a
+/// lane that no longer exists and `amux` itself read as having none.
+///
+/// Only conversations with subagent activity in the last hour resolve an
+/// owner — every consumer asks about minutes, and the title fallback is a
+/// bounded tail read that is not worth paying for July's transcripts.
+///
+/// TTL-cached: FleetSignals::load runs per /api/sessions request AND the
+/// stuck-composer sweep reads the same map; the underlying answer cannot
+/// change faster than agents write, so 10s of staleness is free.
+pub(crate) fn scan_subagent_activity() -> BTreeMap<String, f64> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = (f64, BTreeMap<String, f64>);
+    static C: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let now = chrono::Utc::now().timestamp() as f64;
+    let cache = C.get_or_init(|| Mutex::new((0.0, BTreeMap::new())));
+    if let Ok(g) = cache.lock() {
+        if now - g.0 < 10.0 {
+            return g.1.clone();
+        }
+    }
     let projects = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".claude/projects");
     let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    let claims = crate::api::session_verbs::conversation_claims();
     let Ok(projs) = std::fs::read_dir(&projects) else { return out };
     for proj in projs.flatten() {
         let Ok(entries) = std::fs::read_dir(proj.path()) else { continue };
@@ -696,24 +716,10 @@ fn scan_subagent_activity() -> BTreeMap<String, f64> {
                     newest = newest.max(m.as_secs_f64());
                 }
             }
-            if newest <= 0.0 {
+            if newest <= 0.0 || now - newest > 3600.0 {
                 continue;
             }
-            // Only open the parent's first line once we know there is activity
-            // worth attributing — most conversations have no subagents at all.
-            let Ok(fh) = std::fs::File::open(&conv) else { continue };
-            let mut line = String::new();
-            if std::io::BufReader::new(fh).read_line(&mut line).is_err() {
-                continue;
-            }
-            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            let owner = rec
-                .get("customTitle")
-                .or_else(|| rec.get("sessionName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let owner = crate::api::session_verbs::conversation_owner(&conv, &claims);
             if owner.is_empty() {
                 continue;
             }
@@ -722,6 +728,9 @@ fn scan_subagent_activity() -> BTreeMap<String, f64> {
                 *slot = newest;
             }
         }
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = (now, out.clone());
     }
     out
 }
@@ -1207,8 +1216,27 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         {
             status = "waiting".to_string();
         }
+        // STUCK COMPOSER (AMUX-2904): genuinely TYPED text sits under `❯`
+        // with no live turn and no live agents — an Enter that never landed,
+        // or a human's committed-but-unsubmitted command. Same shape as the
+        // picker above: blocked on a human, the opposite of idle. The sweep
+        // stamps it (through composer_state's dim-vs-typed discrimination —
+        // NOT a stripped read of the ❯ line, which is the 2026-08-09
+        // 13-lane false positive); here it becomes the state the fleet list
+        // shows. Ghost-rescue auto-submits the amux-prefixed subset; this
+        // surfaces the rest instead of deciding for a human.
+        if is_running && status != "active" && meta["composer_stuck_since"].as_i64().unwrap_or(0) > 0
+        {
+            status = "waiting".to_string();
+        }
         out.push(json!({
             "archived": archived,
+            // Why a `waiting` lane is waiting, and proof a lane is genuinely
+            // busy: the dashboard renders both — a status with no visible
+            // reason is a status nobody can act on (ethos rule 4).
+            "composer_stuck_since": meta["composer_stuck_since"].as_i64().unwrap_or(0),
+            "composer_preview": meta["composer_preview"].as_str().unwrap_or(""),
+            "agents_working": signals.subagents_working(&name),
             // The lightning button's state derives from THIS field in the
             // SPA (isYolo checks flags for the provider's skip-permissions
             // flag) — a card without flags renders the wrong YOLO badge

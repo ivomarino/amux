@@ -2450,8 +2450,25 @@ function _waitingLabel(s) {
   const wr = s.waiting_reason || '';
   if (wr === 'permission_prompt') return 'permission prompt';
   if (wr === 'rate_limit') return 'rate limited';
+  // Unsubmitted text is sitting in the composer with no live turn or agents
+  // (AMUX-2904) — a message queued behind phantom background tasks, or an
+  // Enter that never landed. Named distinctly from a generic "needs input"
+  // because the remedy is different: look at the composer, not a picker.
+  if (s.composer_stuck_since) return 'unsubmitted text';
   if (wr === 'user_input') return 'needs input';
   return 'needs input';
+}
+// Tooltip for a waiting badge: the stuck composer text, when that is the reason.
+function _waitingTitle(s) {
+  return s.composer_stuck_since && s.composer_preview
+    ? ' title="In composer: ' + esc(s.composer_preview) + '"' : '';
+}
+// "working · N agents"-style suffix: background agents actively writing their
+// transcripts (server-verified from subagent JSONL mtimes, not the status bar).
+function _agentsChip(s) {
+  return s.agents_working
+    ? '<span class="status-badge active" style="margin-left:4px;" title="Background agents are actively writing their transcripts">⚙ agents</span>'
+    : '';
 }
 
 // ═══════ RENDERING ═══════
@@ -2461,8 +2478,8 @@ function updatePeekStatus() {
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
   let badge = '';
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _liveWorkLine(s);
-  else if (s.status === 'waiting') badge = '<span class="status-badge waiting">' + _waitingLabel(s) + '</span>';
+  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s) + _liveWorkLine(s);
+  else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -2844,8 +2861,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
-          ${s.status === 'waiting' ? `<span class="status-badge waiting">${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+          ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
@@ -6979,7 +6996,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.593';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.594';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
