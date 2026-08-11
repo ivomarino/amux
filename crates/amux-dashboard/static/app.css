@@ -1875,7 +1875,8 @@
      bare-number row, and if the larger number (total is always >= doing) were
      the brighter one it would read as the more urgent figure. Doing is what
      wants attention. */
-  .meta-count .mc-total { color: var(--text); font-weight: 600; }
+  .meta-count .mc-active { color: var(--green, #4ade80); font-weight: 700; }
+  .meta-count .mc-total { color: var(--dim); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
   /* ── Dictation: compact recording popup (above the composer) ── */
@@ -3380,6 +3381,11 @@
     -webkit-tap-highlight-color: transparent; }
   .col-gate-btn:hover, .col-gate-btn:active { opacity: 1; color: var(--accent); border-color: var(--border); }
   .col-gate-btn.has-gate { color: var(--accent); opacity: 0.95; }
+  .col-terminal-chip {
+    font-size: 0.58rem; padding: 1px 5px; border-radius: 8px;
+    background: rgba(139,148,158,0.15); color: var(--dim); white-space: nowrap;
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+  }
   @media (max-width: 600px) { .col-gate-btn { font-size: 0.9rem; padding: 5px 8px; } }
   /* Entry criteria shown ON the column (AMUX-2313) — deliberately always
      visible, not behind the Gate button. Kept visually quiet so it reads as

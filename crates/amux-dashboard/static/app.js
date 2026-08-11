@@ -2589,12 +2589,14 @@ function _cardDoingCount(name) {
   });
   return n;
 }
-/** Total live board items owned by a worker, any status (Ethan, 2026-08-11).
- *
- * Shares the deleted/archived/session predicate with _cardDoingCount above and
- * differs ONLY in dropping the status filter, so "doing" can never exceed
- * "total" — a view must share the predicate of the thing it describes, and two
- * hand-written filters over the same list drift the moment either changes. */
+const _TERMINAL_STATUSES = new Set(['verified', 'discarded']);
+function _cardBoardActive(name) {
+  let n = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && c.session === name && !_TERMINAL_STATUSES.has(c.status)) n++;
+  });
+  return n;
+}
 function _cardBoardTotal(name) {
   let n = 0;
   (boardItems || []).forEach(c => {
@@ -2858,18 +2860,15 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
                holds. Successor to the counts row 09aa88e removed — this is
                the two-figure version of it. */
             const d = _cardDoingCount(s.name);
+            const active = _cardBoardActive(s.name);
             const tot = _cardBoardTotal(s.name);
             const parts = [];
             if (s.sched_on || s.sched_off) {
               parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
-            /* Total board items, any status. Same bare-number treatment as the
-               other two. Shown whenever the worker owns any, INCLUDING when
-               `doing` is 0 — a lane with 40 queued items and none in progress is
-               exactly the case worth seeing, and the doing-only row read as
-               empty for it. */
-            if (tot) parts.push(`<span class="mc-total">${tot}</span> items`);
+            if (active) parts.push(`<span class="mc-active">${active}</span> active`);
+            if (tot && tot !== active) parts.push(`<span class="mc-total">${tot}</span> total`);
             return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
@@ -6980,7 +6979,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.592';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.593';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16146,7 +16145,7 @@ async function _ensureArchived() {
   })();
   return _archivedLoading;
 }
-let boardStatuses = [{id:'backlog',label:'Backlog'},{id:'todo',label:'To Do'},{id:'doing',label:'In Progress'},{id:'review',label:'In Review'},{id:'done',label:'Done'},{id:'verified',label:'Verified'},{id:'discarded',label:'Discarded'}];
+let boardStatuses = [{id:'backlog',label:'Backlog'},{id:'todo',label:'To Do'},{id:'doing',label:'In Progress'},{id:'review',label:'In Review'},{id:'done',label:'Done'},{id:'verified',label:'Verified',terminal:true},{id:'discarded',label:'Discarded',terminal:true}];
 // Per-session gate overrides: { session: { status: [items] } }. Layer between the
 // global status default and the per-card override.
 let sessionGates = {};
@@ -20109,6 +20108,9 @@ function _renderBoardColumnsInto(host, items, scope) {
       html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
     }
     html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
+    if (stObj.terminal) {
+      html += '<span class="col-terminal-chip" title="Terminal state — cards here are finished">terminal</span>';
+    }
     if (stObj.stray) {
       html += '<span class="col-stray-flag" title="Cards carry the status &quot;' + esc(st)
         + '&quot; but the board has no column for it. They used to display as To Do. '

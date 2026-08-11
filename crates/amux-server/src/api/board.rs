@@ -138,7 +138,8 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
                     .and_then(|g| serde_json::from_str(g).ok())
                     .unwrap_or_else(|| json!([]));
                 let mode = mode.filter(|m| !m.is_empty()).unwrap_or_else(|| "implicit".into());
-                out.push(json!({ "id": id, "label": label, "mode": mode, "gate": gate }));
+                let terminal = matches!(id.as_str(), "verified" | "discarded");
+                out.push(json!({ "id": id, "label": label, "mode": mode, "gate": gate, "terminal": terminal }));
             }
         }
     }
@@ -147,7 +148,10 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
         // mode/gate keys on defaults — the SPA tolerates their absence.
         out = DEFAULTS
             .iter()
-            .map(|(id, label)| json!({ "id": id, "label": label }))
+            .map(|(id, label)| {
+                let terminal = matches!(*id, "verified" | "discarded");
+                json!({ "id": id, "label": label, "terminal": terminal })
+            })
             .collect();
     }
     Json(Value::Array(out)).into_response()
