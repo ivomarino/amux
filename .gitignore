@@ -42,3 +42,8 @@ amux.db-*
 # Rust build artifacts
 /target
 /test-results
+# Playwright writes its output relative to e2e/ (testDir is '.'), so the
+# repo-root pattern above never matched it — a failed e2e run left
+# e2e/test-results/ untracked and one `git add -A` from being committed.
+e2e/test-results/
+e2e/playwright-report/
