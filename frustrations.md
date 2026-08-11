@@ -3066,7 +3066,7 @@ FIX: The staged-guard already detects the cotenant case and prints the reconcile
 ## The e2e harness compiles the shared WORKING TREE, so a peer mid-edit fails my run
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-11
 SESSION: amux
 CARD: AMUX-2924
@@ -3077,7 +3077,11 @@ SYMPTOM: `npx playwright test settings.spec.ts` died with "Process from config.w
 COST: A few minutes, but the failure mode is the dangerous one: a red e2e run whose cause is
   a stranger's half-saved file looks exactly like a red e2e run caused by my own change. On
   a slower day that is a wrong conclusion published against innocent code.
-FIX: playwright.config.ts runs `cargo run -p amux-server` against the working tree. The
+FIX: FIXED in 7624877 — e2e/serve-head.sh builds a stable HEAD worktree, names any
+  uncommitted rust changes it is excluding (playwright's webServer.stdout defaults to
+  'ignore', so the notice had to be piped or it would have been swallowed), offers
+  AMUX_E2E_WORKING_TREE=1 to opt back in, and falls back to the tree rather than failing
+  to start. Original reasoning: playwright.config.ts ran `cargo run -p amux-server` against the working tree. The
   builder deploys COMMITTED HEAD, and committed source is what ships (CLAUDE.md), so the
   harness should build from HEAD too — a detached worktree like scripts/rust-auto-build.sh
   already uses. That also makes an e2e result mean something reproducible.
