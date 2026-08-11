@@ -3030,3 +3030,39 @@ FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
   the one this file keeps recording: a command whose success message describes a
   smaller action than its name implies. Same class as `amux board claim` exiting
   0 without claiming (AMUX-2140).
+
+## SUPERSEDES the entry above: the needsyou STATUS was the dead end, not the tag
+AREA: board
+SEVERITY: cost-hours
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2879
+SYMPTOM: I filed the entry above backwards. Tracing it properly: "blocked on a
+  human" has TWO spellings and the readers are split across them. The STATUS
+  `needsyou` is what EXCLUDES a card (auto-pickup takes `status='todo'`, the
+  advance path takes `status IN ('doing','review')`). The TAG `needs:you` is
+  what SURFACES it — `is:needsyou` and Focus mode, the 3-day re-nag (which JOINs
+  issue_tags), and board_drive's "the human owes the answer, not the lane"
+  branch. So a card parked by the DOCUMENTED transition — core's
+  `Doing -> NeedsYou`, "stuck on the user, with the exact question" — landed
+  where nothing hands it out AND nothing brings it back. `amux board needsyou`
+  writing the tag was correct all along; the sanctioned status was the trap.
+COST: 23 of 38 open needsyou cards (61%) were invisible to the view Ethan
+  triages from, across six sessions — including four SLA breaches aged 127-194h,
+  two spend decisions and a credential-purge decision. Unmeasurable in hours;
+  the cost is asks that sat for days because taking the documented exit is what
+  buried them. Plus my own wrong entry above, which would have sent the next
+  session to "fix" the one part that worked.
+FIX: e4e77f6 + c5368e4. The status now stamps the tag on entry (both the PATCH
+  transition and the CREATE path) and clears it on exit; the re-nag matches
+  either spelling; `is:needsyou` reads the status directly. Live: re-nag reach
+  75 -> 88, view 79 -> 102, 0 lost in both.
+  The generalisable half is NOT "check your premise". It is that I diagnosed
+  from the COMMAND's behaviour instead of from the consumers, so I found the
+  asymmetry and guessed its direction. Asking "who reads this field?" before
+  "which writer is wrong?" would have inverted the answer in one grep. A peer
+  had already made the same misread from the same side (AC-222) and fixed the
+  printer; the printer fix landed and the belief did not, which is why the
+  second session repeated the detour to a raw PATCH rather than inheriting the
+  conclusion.
