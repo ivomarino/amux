@@ -271,6 +271,51 @@ pub fn conversations_are_not_shared(pairs: &[(String, String)]) -> Vec<Invariant
     out
 }
 
+/// A card's reviewer must not be the lane that owns it (AMUX-2563).
+///
+/// The card asked for the SOPHISTICATED version of this — stamp assignments
+/// with a conversation id and refuse a review authored from the same transcript
+/// — on the theory that two differently-named lanes could share one
+/// conversation. Measured 2026-08-11: 99 conversation ids in use, ZERO shared,
+/// so that hazard has no live instances (`conversations_are_not_shared` above
+/// is what keeps it that way).
+///
+/// The COARSE version does: 4 live cards carry `reviewer == session`. A lane
+/// listed as its own reviewer is self-review by name alone, and no conversation
+/// id is needed to see it. Building the fine-grained guard while this went
+/// unchecked would have been a guard on the case that does not happen, next to
+/// an open door on the case that does.
+///
+/// Reports rather than refuses: existing assignments belong to whoever made
+/// them (ethos rule 8), and a check that surfaces four cards is what lets a
+/// human decide, where a retroactive sweep would decide for them.
+pub fn reviewer_is_independent(cards: &[(String, String, String)]) -> Vec<InvariantResult> {
+    const ID: &str = "board.reviewer_is_independent";
+    let mut out = Vec::new();
+    for (id, session, reviewer) in cards {
+        let (s, r) = (session.trim(), reviewer.trim());
+        if r.is_empty() {
+            continue; // no reviewer assigned — nothing to be independent of
+        }
+        if s.is_empty() {
+            continue; // unowned card; independence is undefined, not violated
+        }
+        if s.eq_ignore_ascii_case(r) {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    format!("{id}: reviewer differs from the owning lane"),
+                    format!("both are {s} — the lane would be reviewing its own work"),
+                )
+                .entity(id),
+            );
+        } else {
+            out.push(InvariantResult::pass(ID).entity(id));
+        }
+    }
+    out
+}
+
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
     const ID: &str = "config.env_reaches_process";
     let mut out = Vec::new();
@@ -524,6 +569,26 @@ mod negative_controls {
              bug the spec names as the thing it should have caught"
         );
     }
+
+    #[test]
+    fn detects_a_lane_listed_as_its_own_reviewer() {
+        let cards = vec![
+            ("A-1".into(), "amux".into(), "amux".into()),          // violation
+            ("A-2".into(), "amux".into(), "AMUX".into()),          // same, case-folded
+            ("A-3".into(), "amux".into(), "creative-dna".into()),  // fine
+            ("A-4".into(), "amux".into(), "".into()),              // no reviewer: skipped
+            ("A-5".into(), "".into(), "amux".into()),              // unowned: skipped
+        ];
+        let out = reviewer_is_independent(&cards);
+        let failed: Vec<&str> = out
+            .iter()
+            .filter(|r| r.status != crate::invariants::Status::Pass)
+            .map(|r| r.entity_key.as_str())
+            .collect();
+        assert_eq!(failed, vec!["A-1", "A-2"], "self-review, including case-folded");
+        assert_eq!(out.len(), 3, "cards with no reviewer or no owner are not judged");
+    }
+
 
     /// ...and must PASS once the canonical spelling is mounted, or it is a
     /// check that always fires, which is the same as no check.
