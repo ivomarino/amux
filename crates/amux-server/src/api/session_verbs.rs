@@ -890,6 +890,18 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if clean.contains("\u{276f} 1.") || (clean.contains("\u{2502} \u{276f} 1.") ) {
         return "waiting".into();
     }
+    // CODEX spells its selector cursor `›` (U+203A), not `❯` (U+276F) — found
+    // live 2026-08-11 (AMUX-2913): a codex lane parked on its trust-directory
+    // picker read `idle`, the exact needs-input-invisible failure AMUX-2834
+    // fixed for Claude Code. Requires the footer hint alongside the cursor so
+    // prose that merely QUOTES a numbered list cannot read as a picker (the
+    // AMUX-2642 self-block class).
+    let lower = clean.to_lowercase();
+    if clean.contains("\u{203a} 1.")
+        && (lower.contains("press enter to continue") || lower.contains("enter to select"))
+    {
+        return "waiting".into();
+    }
     if clean.contains('\u{276f}') {
         return "idle".into();
     }
@@ -11245,6 +11257,22 @@ mod tests {
         // Resume picker needs the ⌕ search glyph.
         assert!(at_resume_picker("Resume Session \u{2315}\nEnter to select"));
         assert!(!at_resume_picker("Enter to select"));
+    }
+
+    /// Codex's trust-directory picker, byte shape captured live 2026-08-11
+    /// (AMUX-2913): selector cursor is `›` (U+203A), not Claude's `❯`, so a
+    /// lane blocked on it read `idle` — needs-input invisible, the AMUX-2834
+    /// class on a second provider. The control half: prose QUOTING a numbered
+    /// list with the same cursor but no footer hint must not read as waiting
+    /// (the AMUX-2642 self-block class).
+    #[test]
+    fn a_codex_picker_is_waiting_not_idle() {
+        let trust = "> You are in /Users/ethan/Dev/board-exp3\n\
+             Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.\n\
+             \u{203a} 1. Yes, continue\n  2. No, quit\n  Press enter to continue";
+        assert_eq!(detect_claude_status(trust), "waiting");
+        let quoted = "the doc says codex renders \u{203a} 1. Yes, continue as its cursor";
+        assert_ne!(detect_claude_status(quoted), "waiting");
     }
 
     // ---- AMUX-2612: session identity survives a resume --------------------

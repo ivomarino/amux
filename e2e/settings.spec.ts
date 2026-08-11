@@ -349,6 +349,19 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
 });
 
 test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
+  // The only test in this file that calls settle() TWICE — it asserts the key
+  // survives a reload, so it pays the SPA's full boot cost (goto + bootstrap +
+  // walkthrough dismissal) twice where every sibling pays it once. On the 30s
+  // file-wide default that fits locally (measured: whole file, both projects,
+  // 1.7m) and does NOT fit on a CI runner, where 92 tests take 6.5m. It failed
+  // on five consecutive rust.yml runs — always this test, always as
+  // "Test timeout of 30000ms exceeded" surfacing at the longest await rather
+  // than as an assertion failure, which is the signature of a budget that is
+  // too small rather than a product defect.
+  //
+  // Sized to the work, not padded past a flake: same precedent as
+  // golden.spec.ts's heavy scenarios, which declare 120s.
+  test.setTimeout(60_000);
   await settle(page);
   const token = await appToken(page);
 
