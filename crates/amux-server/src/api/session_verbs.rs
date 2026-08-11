@@ -8573,7 +8573,38 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
     };
     // Captured BEFORE the writer closure moves `tokens_opt` — the compaction
     // check below runs after the write and would otherwise borrow a moved value.
-    let used_tokens: Option<u64> = body.get("tokens").and_then(tokens_used);
+    // FALL BACK TO THE TRANSCRIPT when the report body carries no tokens.
+    //
+    // This is the line that decided AMUX-2829. The whole auto-compact chain was
+    // live and correct — pref on, compaction_action implemented, thresholds
+    // tested — and it never fired once, because its ONE input came from a
+    // report body that no lane sends. Measured: 292 report POSTs, 0 carrying
+    // tokens; every real lane still runs the predecessor hook, whose body is
+    // {state, source}, and hook config is loaded at session start so no edit on
+    // disk can change that for a running process.
+    //
+    // Populating /api/sessions from the transcript (the sibling fix) makes the
+    // DASHBOARD honest and does nothing for the trigger — the badge and the
+    // decision read different inputs. That split is exactly the "producer with
+    // no consumer" shape this repo keeps finding, so the fallback belongs on
+    // both or the fix is cosmetic.
+    //
+    // AND THE REPORTED VALUE IS SANITY-CHECKED AGAINST THE WINDOW, because a
+    // wrong token count here does not produce a wrong badge, it produces a
+    // FORCED COMPACTION of a healthy lane — a lossy, user-visible action taken
+    // on bad evidence. Found while wiring this: the stored report for my own
+    // session said 3,156,510 tokens while its transcript said 217,359. Whatever
+    // produced the first, a "current context" larger than the whole window is
+    // not a context size, and feeding it to context_pct_remaining yields 0%
+    // remaining and ForceCompact. So an over-window report is treated as
+    // UNKNOWN and the transcript answers instead; if neither is plausible,
+    // nothing fires, which is the correct default for a destructive action.
+    let used_tokens: Option<u64> = body
+        .get("tokens")
+        .and_then(tokens_used)
+        .filter(|t| *t <= context_window())
+        .or_else(|| transcript_evidence(name).1)
+        .filter(|t| *t <= context_window());
     let tokens_opt: Option<Value> = body.get("tokens").and_then(|t| {
         let get = |k: &str| t.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
         let (i, o) = (get("input"), get("output"));
@@ -11933,6 +11964,10 @@ mod steer_max_age_tests {
         let w = 1_000_000u64;
 
         // Percent REMAINING, not used — the policy is keyed on headroom.
+        // An over-window "current context" is not a context size. Before the
+        // filter, a report of 3.15M against a 1M window read as 0% remaining
+        // and force-compacted a lane sitting at ~22%.
+        assert_eq!(context_pct_remaining(3_156_510, w), 0, "over-window reads as empty — why it must be rejected upstream");
         assert_eq!(context_pct_remaining(0, w), 100);
         assert_eq!(context_pct_remaining(700_000, w), 30);
         assert_eq!(context_pct_remaining(850_000, w), 15);
