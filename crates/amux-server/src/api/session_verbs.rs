@@ -10426,7 +10426,25 @@ async fn apply_live_config_change(
     }
 }
 
+/// Every config write drops the cached session list (AMUX-2926).
+///
+/// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
+/// dozen places — one per field — so invalidating inside it would mean adding
+/// the same line to each, and the next field added would silently not get it.
+/// One choke point cannot be missed.
+///
+/// Deliberately unconditional, including on the error paths. A 400 usually
+/// means nothing was written, but "usually" is doing load-bearing work there:
+/// several branches write one field and then reject a second. Clearing a cache
+/// that did not need clearing costs one rebuild; NOT clearing one that did is
+/// the bug this fixes.
 async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+    let out = config_patch_inner(state, name, body).await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    out
+}
+
+async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Response {
     if !body.is_object() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "payload must be a JSON object"}));
     }
@@ -10731,8 +10749,18 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
         return j200(json!({"ok": true, "message": "branch updated"}));
     }
 
-    // Tags (py:76685). Python invalidates its sessions cache here; this
-    // origin computes the list per request, so the write IS the refresh.
+    // Tags (py:76685). Python invalidates its sessions cache here, and so do
+    // we now — see config_patch's wrapper.
+    //
+    // This comment used to say the opposite: "this origin computes the list per
+    // request, so the write IS the refresh". That was TRUE when written and was
+    // falsified by a LATER commit (7ca14b5, a 2s cache on GET /api/sessions)
+    // which had no reason to look here. Nothing broke loudly — the list just
+    // served the pre-write value for up to 2s, while the group-isolation gate
+    // read the new tags immediately, so the two disagreed about the same fact
+    // (AMUX-2926). A comment asserting the ABSENCE of a mechanism elsewhere is
+    // a claim that ages badly; this one is now pointed at the wrapper that
+    // makes it true instead.
     //
     // ACCEPT AN ARRAY, WHICH IS WHAT THE DASHBOARD SENDS. This was
     // `tv.as_str().unwrap_or("")`: on the `{"tags":["amux"]}` the client

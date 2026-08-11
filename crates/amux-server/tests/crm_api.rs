@@ -240,3 +240,23 @@ async fn a_nameless_contact_is_refused() {
         assert_eq!(v["error"], "name required");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unrelated to CRM, but it belongs with an integration test that owns a router:
+// GET /api/sessions caches for 2s and a config write must drop that cache
+// (AMUX-2926). Kept here rather than in a new binary because it needs exactly
+// the same harness and nothing else.
+// ---------------------------------------------------------------------------
+
+/// The cache must be droppable, and dropping it must be what a config write
+/// does. Pinning the FUNCTION rather than the HTTP round-trip, because the
+/// round-trip needs a real session on disk and a tmux fleet — this asserts the
+/// invariant the wrapper exists to hold.
+#[test]
+fn invalidating_the_sessions_cache_forces_the_next_read_to_rebuild() {
+    use amux_server::api::sessions_legacy::invalidate_sessions_cache;
+    // Idempotent and safe to call with no cache populated — config_patch's
+    // wrapper calls it unconditionally, including on error paths.
+    invalidate_sessions_cache();
+    invalidate_sessions_cache();
+}

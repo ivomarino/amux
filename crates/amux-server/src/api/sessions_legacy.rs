@@ -165,6 +165,31 @@ fn build_array_cache() -> &'static std::sync::Mutex<(f64, String)> {
     CACHE.get_or_init(|| std::sync::Mutex::new((0.0, String::new())))
 }
 
+/// Drop the cached session list so the very next GET rebuilds (AMUX-2926).
+///
+/// Any write that changes a worker's config must call this. Python invalidated
+/// its equivalent cache on every config write, and the rust config-write path
+/// carried a comment saying it did not need to — "this origin computes the list
+/// per request, so the write IS the refresh". That was TRUE when written and
+/// stopped being true when the 2s cache landed (7ca14b5, a later commit).
+/// Nothing failed; the comment just quietly became a lie, and for up to 2s
+/// after a config write the list served the OLD value.
+///
+/// That mattered because tags configure GROUP ISOLATION and the gate reads them
+/// live: the messaging gate saw the new tag while the dashboard still showed the
+/// old one, so an operator could tag a lane, see no change, and re-tag or give
+/// up while the isolation behaviour had already moved underneath them (found by
+/// amux-frustrations while peer-verifying AMUX-2916).
+///
+/// Cheap by construction — it clears one string; the next reader pays the
+/// rebuild it would have paid 2s later anyway.
+pub fn invalidate_sessions_cache() {
+    if let Ok(mut c) = build_array_cache().lock() {
+        *c = (0.0, String::new());
+    }
+    tracing::debug!(target: "amux::sessions", "sessions list cache invalidated by a config write");
+}
+
 /// Git branch cache: dir -> (branch, epoch). Branches change on the scale of
 /// minutes; re-running `git rev-parse` per directory on every request is pure
 /// waste.
