@@ -1081,6 +1081,70 @@ fn transcript_display_name(jf: &Path) -> Option<String> {
     pick(&serde_json::from_str::<Value>(&first).ok()?)
 }
 
+/// conv-id (transcript file stem) -> owning lane, from every session meta's
+/// `cc_conversation_id` claim. TTL-cached: it reads ~113 small meta files and
+/// its consumers run per fleet pass.
+///
+/// This is the CLAIM side of conversation ownership — a decision amux
+/// recorded — as opposed to the transcript's own title records, which are
+/// labels that go stale across a rename (session `amux` still titled
+/// 'amux-rust' 20k lines later). AMUX-2612 established the precedence for
+/// `session_jsonl_path`; `conversation_owner` below applies the same order to
+/// every other reader so there is one answer to "whose conversation is this",
+/// not four.
+pub(crate) fn conversation_claims() -> std::collections::BTreeMap<String, String> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = (f64, std::collections::BTreeMap<String, String>);
+    static C: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let now = now_f64();
+    let cache = C.get_or_init(|| Mutex::new((0.0, std::collections::BTreeMap::new())));
+    if let Ok(g) = cache.lock() {
+        if now - g.0 < 30.0 && !g.1.is_empty() {
+            return g.1.clone();
+        }
+    }
+    let mut map = std::collections::BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("env") {
+                continue;
+            }
+            let Some(lane) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            let cid = meta_str(&load_meta(lane), "cc_conversation_id");
+            if !cid.is_empty() {
+                map.insert(cid, lane.to_string());
+            }
+        }
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = (now, map.clone());
+    }
+    map
+}
+
+/// The owning lane of a conversation transcript: the meta CLAIM first, the
+/// transcript's LAST title record second, "" for an ad-hoc conversation amux
+/// does not own.
+///
+/// Every reader of "which lane does this transcript belong to" goes through
+/// here. Before this there were four spellings and three of them read the
+/// FIRST line — reintroducing the staleness AMUX-2612 fixed, which is how the
+/// `amux` lane's subagents, tokens and model were all being attributed to
+/// `amux-rust`, its pre-rename name (Ethan, 2026-08-11: "ensure they're
+/// always in sync").
+pub(crate) fn conversation_owner(
+    conv: &Path,
+    claims: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if let Some(stem) = conv.file_stem().and_then(|s| s.to_str()) {
+        if let Some(lane) = claims.get(stem) {
+            return lane.clone();
+        }
+    }
+    transcript_display_name(conv).unwrap_or_default()
+}
+
 /// Model + total context tokens read straight out of a lane's own transcript.
 ///
 /// WHY THE SERVER DOES THIS ITSELF (2026-08-11, AMUX-2829/AMUX-2676): the
@@ -1257,6 +1321,26 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Text sitting under the composer's `❯`, or None when it is empty.
+///
+/// The composer is the LAST `❯` line of the frame — everything above it is
+/// conversation, where a quoted `❯` is a word, not a prompt (the same
+/// content-vs-chrome split as `pane_bar_says_generating`). Selector frames
+/// (`❯ 1. …`) are pickers, not composers, and are already handled by the
+/// input-required stamp — excluded here so one state never claims two names.
+pub(crate) fn composer_text(raw_output: &str) -> Option<String> {
+    let clean = strip_ansi(raw_output);
+    let line = clean.lines().rev().find(|l| l.trim_start().starts_with('\u{276f}'))?;
+    let t = line
+        .trim_start()
+        .trim_start_matches('\u{276f}')
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{a0}');
+    if t.is_empty() || t.starts_with("1.") {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -6802,6 +6886,11 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
     let dir = sessions_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
     let mut found = 0usize;
+    // One fleet-wide pass, shared with the status derivation — the stuck-
+    // composer gate below must agree with derive_status about whether a
+    // lane's background agents are live, or a lane reads `active` on the
+    // fleet list and `stuck` here in the same breath.
+    let sub_activity = crate::api::sessions_legacy::scan_subagent_activity();
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("env") {
@@ -6847,6 +6936,57 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                     "session.input_required",
                     Some(json!({"detected_by": "sweep"})),
                     Some(format!("inputreq:{name}:{}", now_i64() / 3600)),
+                    "status",
+                )
+                .await;
+            }
+        }
+
+        // STUCK COMPOSER (AMUX-2904, found live 2026-08-11 on three lanes at
+        // once). Text sits under `❯`, the main loop is idle, and nothing moves
+        // — because Claude Code queued the message behind background agents it
+        // still believes in. When those agents are PHANTOM (their transcripts
+        // went cold days ago: backend's Aug 9, mixpeek-homepage-claude's
+        // Jul 20), the message is hostage forever, Enter does not force it
+        // (verified by hand on backend), and only a restart clears it. The
+        // lane read `idle` throughout, which is how a typed command from Ethan
+        // sat invisible for days.
+        //
+        // Text in the composer while GENERATING or while agents are genuinely
+        // hot is the legitimate queue doing its job — it flushes at the next
+        // turn boundary, so it is not stamped. What is stamped is the state
+        // with no exit: text + idle main loop + zero live agents.
+        let agents_live = sub_activity
+            .get(name)
+            .is_some_and(|m| now_f64() - m < 180.0);
+        let stuck_now = !is_rate_limit_menu(&pane)
+            && !selector_now
+            && !pane_bar_says_generating(&pane)
+            && detect_claude_status(&pane) != "active"
+            && !agents_live
+            && composer_text(&pane).is_some();
+        let meta_now = load_meta(name);
+        let stuck_was = meta_now["composer_stuck_since"].as_i64().unwrap_or(0) > 0;
+        if stuck_now != stuck_was {
+            let preview = composer_text(&pane)
+                .map(|t| chars_truncate(&t, 120))
+                .unwrap_or_default();
+            update_meta(
+                name,
+                &[
+                    ("composer_stuck_since", json!(if stuck_now { now_i64() } else { 0 })),
+                    ("composer_preview", json!(if stuck_now { preview.clone() } else { String::new() })),
+                ],
+            );
+            if stuck_now {
+                tracing::warn!(session = %name, preview = %preview,
+                    "unsubmitted text is stuck in the composer with no live turn or agents — the lane will read `waiting` until it is submitted or cleared");
+                emit_event(
+                    state,
+                    name,
+                    "session.composer_stuck",
+                    Some(json!({"preview": preview, "detected_by": "sweep"})),
+                    Some(format!("composerstuck:{name}:{}", now_i64() / 3600)),
                     "status",
                 )
                 .await;
@@ -7090,9 +7230,11 @@ async fn dispatch(
 
 /// A lane's subagents, from `~/.claude/projects/<proj>/<conv-uuid>/subagents/`.
 ///
-/// The parent conversation carries the owning session in its first record's
-/// `customTitle` — the same resolution the token-ledger indexer uses
-/// (runtime_jobs/token_ledger.rs), deliberately not a second one.
+/// The parent conversation's owner resolves through [`conversation_owner`] —
+/// meta claim first, last title record second — the same resolution the
+/// token-ledger indexer and the fleet's subagent-activity scan use,
+/// deliberately not a second one (it WAS a first-line read here, which
+/// attributed the `amux` lane's subagents to its pre-rename name).
 ///
 /// A subagent's own first record is a `fork-context-ref` (agentId,
 /// parentSessionId, contextLength); the handed-down task carries
@@ -7106,6 +7248,7 @@ fn session_subagents(name: &str) -> Value {
     let Ok(projs) = std::fs::read_dir(&projects) else {
         return json!({"session": name, "subagents": [], "source": "transcripts"});
     };
+    let claims = conversation_claims();
     for proj in projs.flatten() {
         let Ok(convs) = std::fs::read_dir(proj.path()) else { continue };
         for c in convs.flatten() {
@@ -7113,7 +7256,7 @@ fn session_subagents(name: &str) -> Value {
             if conv.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if first_record_title(&conv).as_deref() != Some(name) {
+            if conversation_owner(&conv, &claims) != name {
                 continue;
             }
             let stem = conv.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -7147,17 +7290,6 @@ fn session_subagents(name: &str) -> Value {
     // Most recently active first: a switcher is read to jump to what is moving.
     out.sort_by_key(|v| -(v["last_active"].as_i64().unwrap_or(0)));
     json!({"session": name, "subagents": out, "source": "transcripts"})
-}
-
-/// `customTitle`/`sessionName` from a conversation's FIRST line.
-fn first_record_title(path: &Path) -> Option<String> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).ok()?;
-    let mut line = String::new();
-    std::io::BufReader::new(f).read_line(&mut line).ok()?;
-    let v: Value = serde_json::from_str(&line).ok()?;
-    let t = v.get("customTitle").or_else(|| v.get("sessionName"))?.as_str()?.trim();
-    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// (subagent_type, description, turn count). Scans only the head of the file —
@@ -8461,6 +8593,40 @@ fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Did `them` send to `us` recently? The evidence is a cmd_history row written
+/// at delivery time, so a lane cannot manufacture a reply window for itself.
+fn recently_contacted_by(them: &str, us: &str) -> bool {
+    let Some(home) = dirs_home() else { return false };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        home.join("amux.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    let cutoff = (now_i64() - REPLY_WINDOW_S) * 1000;
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT 1 FROM cmd_history WHERE session=?1 AND origin=?2 AND ts > ?3 LIMIT 1",
+        rusqlite::params![us, them, cutoff],
+        |_| Ok(true),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// How long a lane may answer an inbound cross-group message. A working day:
+/// long enough for a real exchange, short enough that it is not a standing
+/// permission earned once.
+const REPLY_WINDOW_S: i64 = 24 * 3600;
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var("AMUX_HOME").ok().map(std::path::PathBuf::from).or_else(|| {
+        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".amux"))
+    })
+}
+
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
 /// Ethan's rule: "worker to worker communication should be limited to intra
@@ -8490,6 +8656,19 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
         Some("1") | Some("true") | Some("yes")
     ) {
         return Ok("receiver-open");
+    }
+    // REPLY EXEMPTION. Ethan's objection was to a lane BROADCASTING across groups
+    // unsolicited — ts-gke reaching 9 lanes in 5 groups, twice. A reply is not
+    // that, and blocking one makes the rule worse than no rule: within minutes
+    // of shipping this gate it refused MY OWN answer to a cross-group lane that
+    // had just reported a bug to me, leaving the channel one-way — reports in,
+    // answers impossible.
+    //
+    // So: you may answer a lane that contacted you inside the window. It cannot
+    // be used to initiate, only to respond, and the evidence is the durable
+    // cmd_history row of THEIR send to YOU — not something the replier asserts.
+    if recently_contacted_by(target, origin) {
+        return Ok("reply-to-inbound");
     }
     let allow: Vec<String> = parse_env(origin)
         .get("CC_SEND_ALLOW")
