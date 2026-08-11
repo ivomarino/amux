@@ -289,6 +289,7 @@ mod tests {
     fn app(state: AppState) -> Router {
         Router::new()
             .route("/api/stats/daily", axum::routing::get(daily))
+            .route("/api/stats/reset", axum::routing::post(reset))
             .with_state(state)
     }
 
@@ -420,6 +421,87 @@ mod tests {
         let v = get(&app).await;
         assert_eq!(v["total_tokens"], json!(150));
         assert_eq!(v["sessions"][0]["total"], json!(150));
+    }
+
+    /// The pair that had never been exercised together: reset WRITES the file
+    /// daily READS. Deliberately tested end-to-end through both handlers rather
+    /// than by asserting the JSON on disk — the bug this ports away from was
+    /// exactly a writer and a reader that each looked right alone.
+    #[tokio::test]
+    async fn reset_zeroes_today_and_the_reader_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/alpha.env"), "\n").unwrap();
+
+        let state = state();
+        let now = chrono::Local::now().timestamp();
+        insert_row(&state, now, "alpha", 100, 50).await;
+        let app = app(state.clone());
+
+        assert_eq!(get(&app).await["total_tokens"], json!(150));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/stats/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        // The baseline captures RAW totals, so the response echoes 150 even
+        // though the reader will now report 0.
+        assert_eq!(v["total_input"], json!(100));
+
+        let after = get(&app).await;
+        assert_eq!(after["total_tokens"], json!(0), "reset must zero today");
+        assert_eq!(after["sessions"].as_array().unwrap().len(), 0);
+
+        // CONTROL: usage recorded AFTER the reset must still be counted, or the
+        // endpoint is a mute button rather than a reset.
+        insert_row(&state, now, "alpha", 7, 3).await;
+        assert_eq!(get(&app).await["total_tokens"], json!(10));
+    }
+
+    /// The baseline is keyed by session, and a session that renamed must not
+    /// silently keep subtracting under its old key (py:9788's reason for
+    /// keying on proj_dir rather than the display label).
+    #[tokio::test]
+    async fn reset_keys_the_baseline_by_session_and_skips_the_unowned_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        let state = state();
+        let now = chrono::Local::now().timestamp();
+        insert_row(&state, now, "alpha", 10, 5).await;
+        insert_row(&state, now, "", 1, 1).await; // unowned conversation
+        let app = app(state);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/stats/reset").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("token_baseline.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["sessions"]["alpha"]["input"], json!(10));
+        assert!(
+            written["sessions"].get("").is_none(),
+            "the empty-session bucket has no stable key and must not be written"
+        );
+        // Totals still include it — the "All Claude Code" line stays honest.
+        assert_eq!(written["total_input"], json!(11));
     }
 
     #[tokio::test]
