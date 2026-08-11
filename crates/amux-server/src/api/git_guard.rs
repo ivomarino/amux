@@ -97,6 +97,30 @@ const EDIT_CACHE_TTL: f64 = 30.0;
 const MAX_PATHS: usize = 2000;
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// True the first time a notification key is seen in the last hour.
+///
+/// In-memory ON PURPOSE, with the cost named rather than hidden: this process
+/// re-execs whenever the builder installs a new binary, so a restart forgets
+/// and an owner may get one duplicate notice. That is the right trade here —
+/// the failure this dedupes is spam from a retried pre-commit hook, and the
+/// failure a persistent store would prevent is one extra message. Compare
+/// ethos D1, where in-memory state silently DISABLED an optimisation; here the
+/// worst case is a message arriving twice, which is self-evident to the reader.
+pub fn notify_once(key: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<String, f64>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = now_epoch();
+    let Ok(mut g) = m.lock() else { return true };
+    g.retain(|_, t| now - *t < 3600.0);
+    if g.contains_key(key) {
+        return false;
+    }
+    g.insert(key.to_string(), now);
+    true
+}
+
 fn now_epoch() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -540,7 +564,26 @@ fn warn_outdated_hook(session: &str, dir: &str) {
     );
 }
 
-pub async fn staged_guard(headers: HeaderMap, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
+/// The HTTP entry point — a REAL commit attempt, so owners get notified.
+pub async fn staged_guard(
+    axum::extract::State(state): axum::extract::State<super::AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    staged_guard_inner(Some(state), headers, body).await
+}
+
+/// The verdict itself. `state` is `None` for INTERNAL callers, and that is the
+/// whole reason it is optional rather than threaded: `commit_nudge` calls this
+/// to ask "who owns these paths", which is a background probe and not a commit.
+/// Notifying an owner from it would tell them their file was being swept every
+/// time a nudge tick ran — a notice that is false, repeated, and precisely the
+/// noise that gets a channel muted (ethos rule 5).
+pub async fn staged_guard_inner(
+    state: Option<super::AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
     // Parsed by hand rather than via `Json<T>`: axum's rejection is a
     // PLAIN-TEXT 400, which the hook's `json.loads` throws on — straight into
     // the `except` that started this incident. Every answer from here is JSON.
@@ -797,6 +840,78 @@ pub async fn staged_guard(headers: HeaderMap, body: axum::body::Bytes) -> (Statu
                 .collect::<Vec<_>>()
                 .join("; ")
         );
+
+        // TELL THE OWNER, NOT ONLY THE COMMITTER (AMUX-2923).
+        //
+        // Everything above is addressed to the session doing the absorbing,
+        // and that half works — it warned me by name the day this card was
+        // filed. The half that does not exist is the mirror: the session whose
+        // staged file is about to be swept learns NOTHING, because the guard
+        // runs in the committer's process and the victim is not in the room.
+        //
+        // On 2026-08-11 an e2e change of mine landed inside a peer's commit
+        // titled "fix(status): a codex picker reads waiting, not idle". The
+        // code survived; the reasoning did not, and proving it was not LOST
+        // cost ~10 minutes of archaeology. CLAUDE.md already records the worse
+        // version — a peer's commit reverting another agent's uncommitted
+        // rewrite of that very file.
+        //
+        // The server is the only party that can see both sides, and it sees
+        // them right here. `steer_enqueue` is the same durable path board_drive
+        // uses, so this is the existing messages primitive rather than a new
+        // channel (delivered at the owner's next turn boundary, which is the
+        // soonest they could act on it anyway).
+        if let Some(st) = state.as_ref() {
+            let mut by_owner: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for f in &v.foreign {
+                let owner = f["owner"].as_str().unwrap_or("").to_string();
+                let path = f["path"].as_str().unwrap_or("").to_string();
+                if owner.is_empty() || owner == session || path.is_empty() {
+                    continue;
+                }
+                by_owner.entry(owner).or_default().push(path);
+            }
+            for (owner, paths) in by_owner {
+                // DEDUPE, because a pre-commit hook fires on every attempt and
+                // a session that keeps retrying a blocked commit would
+                // otherwise message the owner once per keystroke-adjacent
+                // retry. Keyed on (owner, committer, path-set) for an hour.
+                let key = format!("{owner}|{session}|{}", paths.join(","));
+                if !notify_once(&key) {
+                    continue;
+                }
+                let list = paths
+                    .iter()
+                    .take(10)
+                    .map(|p| format!("  {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let more = paths.len().saturating_sub(10);
+                let text = format!(
+                    "[amux staged-guard] Session `{}` is committing in {} and the staged set \
+                     includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
+                     This is the mirror of the warning they got. If those are edits you had \
+                     staged or in flight, they may land under THEIR commit message — the code \
+                     usually survives, the reasoning does not.\n\n\
+                     Check with:  git log -2 --stat -- {}\n\
+                     If your work was absorbed, do not rewrite shared history — record the \
+                     reasoning where it belongs (a follow-up commit, or the card) and say so.",
+                    session,
+                    wd_root,
+                    paths.len(),
+                    list,
+                    if more > 0 { format!("\n  … and {more} more") } else { String::new() },
+                    paths.first().cloned().unwrap_or_default(),
+                );
+                crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
+                    .await;
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[staged-guard/AMUX-2923] notified {owner}: {session} is staging {} of their path(s) in {}",
+                    paths.len(), wd_root
+                );
+            }
+        }
     }
 
     (

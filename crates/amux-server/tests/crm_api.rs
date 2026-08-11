@@ -260,3 +260,22 @@ fn invalidating_the_sessions_cache_forces_the_next_read_to_rebuild() {
     invalidate_sessions_cache();
     invalidate_sessions_cache();
 }
+
+// ---------------------------------------------------------------------------
+// AMUX-2923: the staged-guard's owner notification is deduped per hour, so a
+// retried pre-commit hook cannot spam the session whose file is being swept.
+// ---------------------------------------------------------------------------
+
+/// The dedupe must SUPPRESS a repeat and must NOT suppress a different pair.
+/// A dedupe that returns false for everything would silence the notification
+/// entirely — the failure would look exactly like the bug it fixes.
+#[test]
+fn the_owner_notification_dedupes_per_pair_not_globally() {
+    use amux_server::api::git_guard::notify_once;
+    let a = format!("ownerA|committerB|{}", std::process::id());
+    let b = format!("ownerA|committerC|{}", std::process::id());
+    assert!(notify_once(&a), "first sighting notifies");
+    assert!(!notify_once(&a), "a retried hook must NOT notify again");
+    assert!(notify_once(&b), "a DIFFERENT committer is a different notice");
+    assert!(!notify_once(&b));
+}

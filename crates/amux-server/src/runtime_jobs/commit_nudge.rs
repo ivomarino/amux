@@ -361,7 +361,10 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
     if let Ok(v) = axum::http::HeaderValue::from_str(session) {
         headers.insert("x-amux-session", v);
     }
-    let (status, axum::Json(v)) = crate::api::git_guard::staged_guard(
+    // `None` state: this is an ownership PROBE, not a commit attempt, so it
+    // must not fire the owner notifications the HTTP path sends (AMUX-2923).
+    let (status, axum::Json(v)) = crate::api::git_guard::staged_guard_inner(
+        None,
         headers,
         axum::body::Bytes::from(body.to_string()),
     )
