@@ -101,9 +101,7 @@ fn now_epoch() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default)
-}
+use crate::config::env_f64;
 
 fn window_secs() -> f64 {
     env_f64("AMUX_STAGED_GUARD_WINDOW_SECS", WINDOW_DEFAULT).max(WINDOW_FLOOR)

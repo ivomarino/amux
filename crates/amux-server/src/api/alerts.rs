@@ -323,12 +323,7 @@ fn py_repr(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+use crate::config::now_f64;
 
 /// Best-effort ledger append (Python `_record_owner_alert`): never let a
 /// ledger-write failure block the alarm itself.

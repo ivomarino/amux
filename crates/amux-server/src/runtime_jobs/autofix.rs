@@ -87,12 +87,8 @@ use std::collections::BTreeMap;
 /// that runs hot competes with the traffic it is measuring.
 pub const AUTOFIX_TICK_SECS: u64 = 120;
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
+use crate::config::env_f64;
+use crate::config::env_i64;
 fn env_str(key: &str) -> String {
     std::env::var(key).unwrap_or_default().trim().to_string()
 }

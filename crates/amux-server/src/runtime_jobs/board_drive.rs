@@ -117,12 +117,8 @@ const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
 const DEFAULT_ITEM_TYPE: &str = "code";
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
+use crate::config::env_f64;
+use crate::config::env_i64;
 
 /// py:14453 `AMUX_MAX_DOING_PER_SESSION`.
 fn wip_cap() -> i64 {
@@ -137,12 +133,7 @@ fn needsyou_renag_days() -> f64 {
     env_f64("AMUX_NEEDSYOU_RENAG_DAYS", 3.0)
 }
 
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+use crate::config::now_f64;
 
 // ---------------------------------------------------------------------------
 // The trace. This is the product, not a byproduct.

@@ -302,3 +302,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+// ── Shared env parsing (AMUX-2919) ─────────────────────────────────────────
+// These were duplicated verbatim across runtime_jobs/board_drive.rs,
+// runtime_jobs/autofix.rs and api/git_guard.rs. Unlike `amux_home` above, the
+// copies genuinely WERE identical, so this consolidation is mechanical.
+
+/// `$KEY` parsed as f64, trimmed, falling back to `default`.
+pub fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// `$KEY` parsed as i64, trimmed, falling back to `default`.
+pub fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Unix epoch seconds as f64. Three identical copies (board_drive, alerts,
+/// session_verbs).
+///
+/// NOT to be conflated with the two `now_secs()` functions, which return
+/// DIFFERENT TYPES from different clocks — api/upload.rs returns u64 from
+/// SystemTime, api/board.rs returns i64 from chrono::Utc. They share a name and
+/// nothing else; merging them on the strength of the name is the mistake this
+/// comment exists to prevent.
+pub fn now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
