@@ -33,6 +33,37 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Deliberately compares against the ROUTER'S OWN TABLE rather than a
 /// hand-written expectation list, and normalises `{param}` segments, so adding
 /// a caller without a route fails even if nobody remembers to update a fixture.
+/// Paths the SPA calls that THIS SERVER NEVER OWNS — the cloud gateway answers
+/// them, in front of this process, in the deployment where they exist at all.
+///
+/// NOT an environment branch (single-codebase rule): these are not served by
+/// amux-server in cloud either, so the statement "this server does not own
+/// them" is true everywhere and needs no `if IS_CLOUD`. Verified 2026-08-11
+/// against cloud/gateway/gateway.py, which handles each one.
+///
+/// They are excluded because a failure list that can never reach zero stops
+/// being read — the same reason the extractor refuses to guess a path. Seven
+/// permanent rows would have trained everyone to skim past the real ones.
+const GATEWAY_OWNED: &[&str] =
+    &["/api/gateway/", "/api/stripe/", "/api/cloud-logout"];
+
+/// An entry ending in `/` is a PREFIX (a whole family); one without is an EXACT
+/// path. Applying prefix logic to both over-excluded — `/api/cloud-logout-extra`
+/// matched `/api/cloud-logout` and would have been silently dropped from the
+/// census. Caught by this function's own test, which is why it asserts the
+/// near-misses and not just the hits: an exclusion list that swallows a sibling
+/// hides exactly the work it was meant to make visible (ethos rule 1's
+/// over-filtering corollary).
+fn gateway_owned(path: &str) -> bool {
+    GATEWAY_OWNED.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('/') {
+            path == prefix || path.starts_with(p)
+        } else {
+            path == *p
+        }
+    })
+}
+
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
@@ -49,6 +80,9 @@ pub fn route_callers_have_routes(
     }
     let mut out = Vec::new();
     for c in callers {
+        if gateway_owned(&c.path) {
+            continue;
+        }
         let mut verdict = if c.interpolated {
             match_prefix(mounted, &c.method, &c.path)
         } else {
@@ -584,6 +618,21 @@ mod negative_controls {
             "the census MUST fail on the /api/workers/<n>/send gap — this is the \
              bug the spec names as the thing it should have caught"
         );
+    }
+
+    /// Gateway-owned paths are excluded, and ONLY those. A list that can never
+    /// reach zero stops being read, but over-excluding hides real misses — so
+    /// this pins both directions.
+    #[test]
+    fn only_gateway_owned_paths_are_excluded() {
+        assert!(gateway_owned("/api/gateway/orgs"));
+        assert!(gateway_owned("/api/stripe/checkout"));
+        assert!(gateway_owned("/api/cloud-logout"));
+        // Near-misses that this server DOES own must still be checked.
+        assert!(!gateway_owned("/api/gatewayish"), "prefix must not swallow a sibling");
+        assert!(!gateway_owned("/api/board"));
+        assert!(!gateway_owned("/api/sql"));
+        assert!(!gateway_owned("/api/cloud-logout-extra"), "only the exact logout path");
     }
 
     #[test]
