@@ -327,6 +327,11 @@ pub fn canonical_port() -> u16 {
         .unwrap_or(crate::config::DEFAULT_PORT)
 }
 
+/// Ports this server used to answer and no longer does. Consumed by
+/// `endpoint.json` so a hook inheriting a stale `AMUX_URL` can still self-heal
+/// after the bind is gone (AMUX-2946).
+const RETIRED_PORTS: &[u16] = &[8822];
+
 /// Publish where this server actually is, into `<amux_home>/endpoint.json`.
 ///
 /// # Why a file, and why the server writes it
@@ -358,6 +363,21 @@ pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Opt
         "canonical_url": format!("https://localhost:{canonical}"),
         "canonical_port": canonical,
         "legacy_port": legacy,
+        // RETIRED PORTS OUTLIVE THE BIND, and that is the whole point.
+        //
+        // The self-heal in .git/hooks/amux-staged-guard keyed on `legacy_port`
+        // being non-null: "if your AMUX_URL is the legacy port, use
+        // canonical_url". The moment the bind was dropped this began
+        // publishing null, the condition went false, and the hook fell back to
+        // the stale inherited URL — so the mechanism built for exactly this
+        // moment stopped working at exactly this moment. Measured immediately:
+        // "staged-guard: NOT ENFORCED — connection refused", i.e. cross-session
+        // sweep protection off for every pre-cutover session at once.
+        //
+        // A retired address needs to stay KNOWN after it stops being served,
+        // because the processes that still name it are precisely the ones that
+        // cannot be told anything else.
+        "retired_ports": RETIRED_PORTS,
         "pid": std::process::id(),
         "written_at": now(),
         "consumer_rule": "if your AMUX_URL is https://localhost:<legacy_port>, use canonical_url",
