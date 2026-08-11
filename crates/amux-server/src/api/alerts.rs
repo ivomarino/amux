@@ -85,6 +85,21 @@ impl AlertChannels for RealChannels {
                 }
             }
         }
+        // ZERO SUBSCRIBERS IS NOT A SEND (AMUX-2938). `send_all` returns an
+        // empty vec when `push_subscriptions` is empty, which fell through
+        // every branch above and reported `"push": "sent"`. Measured on this
+        // machine 2026-08-11: 0 rows in that table, and a real
+        // POST /api/alert/owner answered {"channels":{"push":"sent"}}.
+        //
+        // On any other endpoint that would be a cosmetic lie. Here it is the
+        // FIRE ALARM — the one path whose entire job is reaching a human who
+        // is not looking at the screen — and it reported success having
+        // reached nobody. CLAUDE.md tells every session both channels are
+        // "wired and confirmed working"; a session that fires this and reads
+        // "sent" has been told the owner was notified.
+        if results.is_empty() {
+            return Err("no push subscriptions — nobody is registered to receive it".into());
+        }
         Ok(())
     }
 
@@ -541,9 +556,31 @@ async fn post_owner(
             Ok(()) => out_channels.insert("push".into(), json!("sent")),
             Err(e) => out_channels.insert("push".into(), json!(format!("error: {}", truncate(&e, 80)))),
         };
+    } else {
+        // Symmetric with the sms branch below: a channel that was switched off
+        // must SAY it was switched off. Omitting the key made "disabled" and
+        // "never attempted" identical on the wire (AMUX-2938).
+        out_channels.insert("push".into(), json!("disabled (AMUX_URGENT_PUSH=0)"));
     }
     let phone = effective_env(&home, "AMUX_OWNER_PHONE").unwrap_or_default();
-    if effective_env(&home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0" && !phone.is_empty() {
+    let sms_enabled = effective_env(&home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
+    // SAY WHY IT DID NOT TEXT, rather than omitting the key (AMUX-2938). The
+    // response used to carry no `sms` field at all when either condition was
+    // false, so "disabled on purpose", "no phone configured" and "the send was
+    // never attempted" were the same bytes on the wire — and CLAUDE.md
+    // documents the contract as {"channels":{"push":...,"sms":...}}, so a
+    // caller checking `channels.sms` got None and could not tell.
+    //
+    // Both are OFF on this machine right now (AMUX_URGENT_SMS=0, and
+    // AMUX_OWNER_PHONE present but empty), which is very likely a deliberate
+    // response to the 38-SMS night of 2026-08-03 — see cmd_alert in the CLI.
+    // Deliberate or not, the alarm must say so out loud.
+    if !sms_enabled {
+        out_channels.insert("sms".into(), json!("disabled (AMUX_URGENT_SMS=0)"));
+    } else if phone.is_empty() {
+        out_channels.insert("sms".into(), json!("no phone configured (AMUX_OWNER_PHONE is empty)"));
+    }
+    if sms_enabled && !phone.is_empty() {
         // Stamp the originating session so the owner sees WHICH session
         // raised the alarm (the push title already carries it).
         let sms_prefix = if !session.is_empty() {
@@ -925,15 +962,63 @@ mod tests {
     async fn owner_alert_respects_channel_config() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = test_env::set_home(dir.path());
-        // Push disabled, no phone: nothing is attempted, response says so.
+        // Push disabled, no phone: nothing is attempted, and the response SAYS
+        // so per channel. This assertion used to be `json!({})` — an empty
+        // object — directly under a comment claiming "response says so", which
+        // it plainly did not (AMUX-2938). The comment described the intent; the
+        // assertion locked in the opposite, and a caller could not distinguish
+        // "disabled on purpose" from "the alarm silently did nothing".
         set_server_env_key(dir.path(), "AMUX_URGENT_PUSH", "0").unwrap();
         let mock = MockChannels::ok();
         let app = app(mock.clone());
         let (_, v) =
             send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "no channels case" }))).await;
         assert_eq!(v["ok"], json!(true));
-        assert_eq!(v["channels"], json!({}));
+        assert_eq!(
+            v["channels"],
+            json!({
+                "push": "disabled (AMUX_URGENT_PUSH=0)",
+                "sms": "no phone configured (AMUX_OWNER_PHONE is empty)",
+            })
+        );
         assert_eq!(v_len(&mock), 0);
+    }
+
+    /// A FIRE ALARM MUST NOT REPORT SUCCESS HAVING REACHED NOBODY (AMUX-2938).
+    ///
+    /// Measured on the live machine 2026-08-11, while Ethan was asking whether
+    /// the urgent path works: `push_subscriptions` held 0 rows and a real
+    /// POST /api/alert/owner answered `{"channels":{"push":"sent"}}`. `send_all`
+    /// returns an empty vec with no subscribers, which fell through every
+    /// failure branch and landed on Ok(()).
+    ///
+    /// This is the only endpoint whose entire job is reaching a human who is
+    /// not looking at the screen, and it said "sent" to nobody — while
+    /// CLAUDE.md tells every session both channels are "wired and confirmed
+    /// working".
+    #[tokio::test]
+    async fn push_with_no_subscribers_is_not_a_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        // RealChannels, not the mock: the defect lived in RealChannels::push's
+        // reading of send_all, so a mocked push would prove nothing.
+        let store = crate::db::Store::open(&dir.path().join("push-test.db")).unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let out = RealChannels.push(&state, "amux", "drill").await;
+        assert!(
+            out.is_err(),
+            "0 subscriptions must NOT report a send — got {out:?}"
+        );
+        let e = out.unwrap_err();
+        assert!(
+            e.contains("no push subscriptions"),
+            "the reason must name the cause, got {e:?}"
+        );
     }
 
     #[tokio::test]
