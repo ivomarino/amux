@@ -740,7 +740,20 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             for line in hay.lines() {
                 let l = line.trim();
                 let low = l.to_lowercase();
-                for m in ["needs-you:", "needs you:", "needsyou:", "needs-ethan:", "needs-human:"] {
+                // EVERY SPELLING THE CLIENT REGEX ACCEPTS, or the two disagree
+                // about the same card. app.js's _focusAsk uses
+                // /NEEDS[- ]?(?:YOU|ETHAN|HUMAN):/i, which admits the space and
+                // no-separator forms for ETHAN and HUMAN too — this list had
+                // only the hyphenated ones, so a card marked "NEEDS ETHAN:"
+                // produced a note in the client and none here. Under slim the
+                // client reads THIS field, so the divergence would have shown
+                // up as the marker silently ceasing to work for those spellings
+                // the moment the poll flipped.
+                for m in [
+                    "needs-you:", "needs you:", "needsyou:",
+                    "needs-ethan:", "needs ethan:", "needsethan:",
+                    "needs-human:", "needs human:", "needshuman:",
+                ] {
                     if let Some(p) = low.find(m) {
                         let v = l[p + m.len()..].trim();
                         if !v.is_empty() {
@@ -851,7 +864,24 @@ fn truthy(v: Option<&str>) -> bool {
 /// `-Terminal-Returned`) — a silent cap manufactured wrong absence claims
 /// twice in one week (AC-291, AC-301), so the two counts come from
 /// `cap_terminal` itself, never re-derived from list lengths.
-pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
+pub async fn list_board(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(p): Query<ListParams>,
+) -> Response {
+    // ETag based on global_rev — saves 3.5MB on unchanged polls.
+    let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
+    let etag_val = format!("\"board-{}\"", rev);
+    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+        if inm == etag_val || inm == format!("W/{etag_val}") {
+            let mut h = HeaderMap::new();
+            if let Ok(v) = etag_val.parse() {
+                h.insert("etag", v);
+            }
+            return (StatusCode::NOT_MODIFIED, h).into_response();
+        }
+    }
+
     if let Some(term) = p.q.as_deref().or(p.query.as_deref()).or(p.search.as_deref()) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -961,6 +991,7 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
     put(&mut headers, "x-amux-total", total.to_string());
     put(&mut headers, "x-amux-offset", offset.to_string());
     put(&mut headers, "x-amux-returned", items.len().to_string());
+    put(&mut headers, "etag", etag_val);
     (StatusCode::OK, headers, Json(Value::Array(items))).into_response()
 }
 
@@ -2768,6 +2799,32 @@ mod slim_tests {
         // string, so a client can distinguish "no marker" from "a blank marker".
         let plain = IssueRow { desc: "ordinary card".into(), ..Default::default() };
         assert!(list_body(&plain, true, false).get("needsyou_note").is_none());
+    }
+
+    /// Every spelling app.js's /NEEDS[- ]?(?:YOU|ETHAN|HUMAN):/i accepts must
+    /// produce a note here, or the slim client and the full client disagree
+    /// about the same card. The three ETHAN/HUMAN space and no-separator forms
+    /// were missing until 2026-08-11.
+    #[test]
+    fn needsyou_matches_every_spelling_the_client_regex_accepts() {
+        for spelling in [
+            "NEEDS-YOU:", "NEEDS YOU:", "NEEDSYOU:",
+            "NEEDS-ETHAN:", "NEEDS ETHAN:", "NEEDSETHAN:",
+            "NEEDS-HUMAN:", "NEEDS HUMAN:", "NEEDSHUMAN:",
+            "needs-you:", "needs ethan:",
+        ] {
+            let row = IssueRow {
+                id: "X-1".into(),
+                title: "a card".into(),
+                desc: format!("{spelling} answer me"),
+                item_type: "code".into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                list_body(&row, true, false)["needsyou_note"], "answer me",
+                "spelling {spelling:?} must yield a note — the client regex accepts it"
+            );
+        }
         // A marker with nothing after it is not a marker.
         let empty = IssueRow { desc: "NEEDS-YOU:   ".into(), ..Default::default() };
         assert!(list_body(&empty, true, false).get("needsyou_note").is_none());

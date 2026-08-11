@@ -19356,13 +19356,25 @@ function _focusRebuild() {
 // The card's ASK: an explicit NEEDS-YOU marker line in the log wins; else the
 // first line of desc; else the title. Never guesses beyond the marker.
 function _focusAsk(item) {
+  // PREFER THE SERVER'S DERIVATION (AMUX-2840 step 3). Under slim=1 the list
+  // carries neither desc nor log, so the local scan below has nothing to read
+  // and every card would fall through to its title — the marker would appear
+  // to stop working the moment the poll flips, with no error anywhere.
+  //
+  // needsyou_note is derived server-side from the SAME haystack (desc + log)
+  // with the same last-wins rule and, as of 2026-08-11, the same nine
+  // spellings; a test pins that the two accept the same set, because a view
+  // and the mechanism it describes must share a predicate or they drift.
+  if (item.needsyou_note) return String(item.needsyou_note).slice(0, 400);
   // The explicit ask wins wherever it lives (desc or log) — take the LAST
   // NEEDS-YOU marker so a re-marked card shows its freshest question. Only
   // then fall back to the desc's first meaningful line, then the title.
   const hay = (item.desc || '') + '\n' + (item.log || '');
   const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|ETHAN|HUMAN):\s*([^\n]+)/ig)];
   if (ms.length) return ms[ms.length - 1][1].trim().slice(0, 400);
-  const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim());
+  // desc_head is the slim counterpart of "first meaningful line of desc".
+  const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim())
+            || (item.desc_head || '').replace(/^\*\*Prompt:\*\*\s*/i, '');
   return (d || item.title || '').slice(0, 400);
 }
 function _focusClose() {
@@ -20882,9 +20894,15 @@ async function boardDetailSave() {
   // like the board eating people's notes. _bdHydrate normally beats the user to
   // it, but a slow or failed fetch must not turn into data loss.
   //
-  // `desc_len` is served in BOTH modes, so it is the one field that can always
-  // answer "does this card have a description". If it says yes and we are about
-  // to send an empty one without having hydrated, refuse and retry the fetch.
+  // BOTH TERMS BELOW ARE LOAD-BEARING, one per mode, and neither alone is
+  // enough. Measured 2026-08-11: `desc_len` is served ONLY under slim=1, and
+  // `desc` only WITHOUT it — this comment previously claimed desc_len was in
+  // both, which would invite someone to simplify the test down to desc_len and
+  // silently disarm it in full mode, today's default. The failure that follows
+  // is not a crash, it is a blanked description.
+  //
+  // If either says the card has a description and we are about to send an empty
+  // one without having hydrated, refuse and retry the fetch.
   {
     const cur = boardItems.find(i => i.id === boardDetailId);
     const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
