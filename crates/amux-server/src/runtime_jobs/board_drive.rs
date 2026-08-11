@@ -2094,7 +2094,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 /// Claim happens BEFORE delivery, and delivery is a durable queue row, so the
 /// two cannot disagree for long: Python called `send_text` after the UPDATE, so
 /// a failed send left a card claimed with nobody told.
-async fn claim_card(state: &AppState, session: &str, card: &str) {
+pub async fn claim_card(state: &AppState, session: &str, card: &str) {
     let card_s = card.to_string();
     let _ = state
         .store

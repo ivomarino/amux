@@ -1384,7 +1384,14 @@ enum PatchOut {
     Refused(StatusCode, Value),
     /// Invariant 37: nothing changed; `rev` unmoved.
     Noop { body: Value, ignored: Vec<String> },
-    Applied { body: Value, ignored: Vec<String> },
+    Applied {
+        body: Value,
+        ignored: Vec<String>,
+        /// (session, from_status, to_status) when a status change happened,
+        /// for reactive pickup: if the transition freed the lane (done/verified/
+        /// discarded), fire an immediate pickup instead of waiting 60s.
+        status_transition: Option<(String, String, String)>,
+    },
 }
 
 /// Map a (from, to) pair onto the core transition vocabulary. `None` means
@@ -2547,11 +2554,19 @@ pub async fn patch_item(
                 None => MutationKind::Updated,
             };
             let event = ev_snap(&next, mutation);
+            let st = status_event.as_ref().map(|(f, t)| {
+                (
+                    next.session.clone().unwrap_or_default(),
+                    f.clone(),
+                    t.clone(),
+                )
+            });
             finish(
                 &slot_w,
                 PatchOut::Applied {
                     body: detail_body(&next),
                     ignored,
+                    status_transition: st,
                 },
                 WriteOutcome {
                     applied: true,
@@ -2581,7 +2596,7 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Some(PatchOut::Applied { mut body, ignored }) => {
+        Some(PatchOut::Applied { mut body, ignored, status_transition }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
             if !ignored.is_empty() {
@@ -2591,8 +2606,64 @@ pub async fn patch_item(
                      the rest of this response reflects the card as stored"
                 );
             }
+            // REACTIVE PICKUP: when a card transitions to a terminal state,
+            // immediately check if the lane has a next todo card and claim it.
+            // This removes the up-to-60s wait for the board-drive tick. The
+            // delivery still goes through steer_enqueue (turn-boundary gated),
+            // so this cannot interrupt a mid-turn session.
+            if let Some((session, _from, to)) = status_transition {
+                if matches!(to.as_str(), "done" | "verified" | "discarded")
+                    && !session.is_empty()
+                {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        reactive_pickup(&st, &session).await;
+                    });
+                }
+            }
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+// ---- Reactive pickup (AMUX board-drive latency fix) -----------------------
+//
+// When a card transitions to done/verified/discarded, fire an immediate pickup
+// for the same session instead of waiting for the 60s board-drive tick. Uses the
+// SAME select_pickup + claim_card + deliver path as the drive loop, so every
+// guard (WIP cap, junk filter, freshness, cooldowns) applies identically.
+//
+// This is a SUPPLEMENT, not a replacement. The drive tick remains the backstop
+// (a crashed reactive path is invisible; the tick is visible in the trace). The
+// trace does NOT record reactive pickups — they are not part of the sweep — but
+// the `task.claimed` event they emit IS what the drive tick reads to avoid
+// re-claiming.
+
+async fn reactive_pickup(state: &AppState, session: &str) {
+    use crate::runtime_jobs::board_drive::{select_pickup, Pickup};
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let pickup = select_pickup(&conn, session, now);
+    drop(conn);
+
+    if let Pickup::Claim { card, prompt } = pickup {
+        crate::runtime_jobs::board_drive::claim_card(state, session, &card).await;
+        crate::api::session_verbs::steer_enqueue(
+            state, session, &prompt, "board-drive:reactive", "",
+        )
+        .await;
+        tracing::info!(
+            session,
+            card = card.as_str(),
+            "reactive pickup: claimed {card} immediately after status change"
+        );
     }
 }
 
