@@ -941,6 +941,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
+    // Mounted-but-untabled, all found by curling the census's "missing" list
+    // against the live server (AMUX-2871). Each was reported as unrouted while
+    // answering, because the census reads this table.
+    RouteEntry { path: "/api/client-debug", methods: &["POST"] },
+    RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/review/week", methods: &["GET"] },
+    RouteEntry { path: "/api/review/digest", methods: &["GET"] },
+    RouteEntry { path: "/api/channels", methods: &["GET"] },
+    RouteEntry { path: "/api/channels/{a}/{b}/messages", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/log-search", methods: &["GET"] },
     RouteEntry { path: "/api/sql", methods: &["POST"] },
     RouteEntry { path: "/api/sql/schema", methods: &["GET"] },

@@ -219,16 +219,31 @@ fn every_directly_routed_api_path_is_in_the_table() {
     let src = include_str!("../src/api/mod.rs");
     let tabled: std::collections::HashSet<&str> =
         ROUTE_TABLE.iter().map(|e| e.path).collect();
+    // SCANS THE WHOLE SOURCE, NOT LINE BY LINE. The first version of this test
+    // read one line at a time and so missed every multi-line declaration —
+    //     .route(
+    //         "/api/memory/global",
+    //         axum::routing::get(...),
+    //     )
+    // which is the shape rustfmt produces for anything with two handlers. It
+    // passed while /api/memory/global, /api/review/* and /api/channels sat
+    // mounted-and-untabled, i.e. it had exactly the blind spot it was written
+    // to close, one formatting style over.
     let mut missing = Vec::new();
-    for line in src.lines() {
-        let Some(i) = line.find(".route(\"/api/") else { continue };
-        let rest = &line[i + ".route(\"".len()..];
-        let Some(end) = rest.find('"') else { continue };
-        let path = &rest[..end];
-        if !tabled.contains(path) {
+    let mut rest = src;
+    while let Some(i) = rest.find(".route(") {
+        rest = &rest[i + ".route(".len()..];
+        // Skip whitespace/newlines between `.route(` and the path literal.
+        let after = rest.trim_start();
+        let Some(stripped) = after.strip_prefix('"') else { continue };
+        let Some(end) = stripped.find('"') else { continue };
+        let path = &stripped[..end];
+        if path.starts_with("/api/") && !tabled.contains(path) {
             missing.push(path.to_string());
         }
     }
+    missing.sort();
+    missing.dedup();
     assert!(
         missing.is_empty(),
         "mounted in api/mod.rs but absent from ROUTE_TABLE — the route census reads \
