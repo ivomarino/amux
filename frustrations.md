@@ -3049,3 +3049,64 @@ CARD: AMUX-3049
 SYMPTOM: Ethan: "click run now on a schedule -> says the server did not accept it." Diagnosis stalled because `_amux_request_log` showed EVERY real run-now as 200 and the only 404 was my own test — his click was simply ABSENT from the log. It never reached the server (the POST threw during a builder binary-swap restart), and the window.fetch offline interceptor caught the throw, queued the op, and returned a synthetic 202 SILENTLY — no `amuxTrack` beacon on that path. So a user-visible client failure produced zero server-side evidence. Compounding it, the synthetic 202 body `{ok,queued,offline}` has no `status`, so `_schedRunToast` rendered a queued run as "Ran · unknown outcome", and `runScheduleNow` keyed on the stale `online` flag (still true on the first failure) to print "the server did not accept it" — a rejection message over an op that was actually queued for replay.
 COST: a long forensic pass (widen the log window, enumerate every run-now status, trace three client code paths, unit-test the toast) to establish that the ENDPOINT was fine all along and the failure was purely client-side + invisible. The invisibility is the real defect: ethos rule 4 — a diagnosis being impossible from the data IS the bug — and the two-fixes rule, since the next such report would have been just as trace-less.
 FIX: fixed dc34708. The interceptor's throw path now emits `amuxTrack('fetch_unreachable',{url,method,err})` so the failing call is server-visible (lossy only during a FULL outage, which is separately visible as a moved `/health` build hash). Plus the two UX bugs: `_schedRunToast` handles the offline 202 -> "queued, will fire on reconnect" (unit-tested against the shipped fn), and `runScheduleNow` drops the stale-`online` "did not accept it" (apiCall already toasts a real refusal's reason). Note the irony: the trigger was a routine build-swap restart — every session's commit deploys by swapping the running binary, so ANY user action during that ~5s window hits this class; the beacon + honest messaging make it legible instead of alarming.
+## The server went silent 15s after install: no panic, no log, listening socket held
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-35
+SYMPTOM: Fresh `./install.sh` on this machine came up healthy, answered `/health` twice,
+  then stopped answering ANYTHING — `/health`, `/api/board`, the dashboard, even the
+  plain-HTTP redirect that is handled before TLS. The process stayed alive, kept its
+  listening socket, sat at 0% CPU with every thread parked, and wrote NOTHING further to
+  server-rs.log. `curl` hung mid-TLS-handshake because the kernel completes the TCP
+  handshake from the listen backlog while nothing ever calls accept(). Root cause: the
+  disk-pressure autofix detector shells out to `du` with blocking
+  `std::process::Command::output()` and no timeout, on a tokio worker; on a 96%-full disk
+  `du -skx ~/Library/Caches` runs for minutes, so each tick parked another worker until
+  none were left to poll the accept loop.
+COST: ~90 minutes, almost entirely spent on the instrument rather than the bug. Four
+  hypotheses died first: a leaked semaphore permit, a head-of-line block in
+  RedirectingAcceptor's peek, self-adoption exiting, and `server.env` (which "confirmed"
+  itself, then un-confirmed when the no-file control ALSO failed — the earlier survival
+  was timing luck, not configuration). A fault that emits no panic, no log and no CPU is
+  indistinguishable from a network problem, and every cheap probe returns silence, which
+  reads as "nothing wrong here". The discriminator was free and I reached it late:
+  `ps -eo pid,ppid` on the wedged process showed one child, `/usr/bin/du -skx
+  ~/Library/Caches`, 1m40s old. Compounding it, the release binary is unsymbolicated, so
+  `sample` printed `???` for every amux frame until I rebuilt with debug info.
+FIX: bound every `du` with per-path and total wall-clock budgets, kill AND reap on
+  timeout (an unreaped `du` holds the FDs the neighbouring FdPressure detector counts),
+  and OMIT a timed-out path instead of sizing it 0 — a silent zero sorts the largest
+  consumer last and aims the report at an innocent directory. The incomplete ranking now
+  says so in the log (rule 4). The deeper fix this entry is really arguing for: a
+  detector that only runs when the resource is already scarce must be bounded BY
+  CONSTRUCTION, and the whole sync detector sweep still runs on the async runtime holding
+  a store connection — `tmutil` and the build detector's git calls are the same shape,
+  bounded only by luck. Moving that sweep to `spawn_blocking` is the real exit.
+
+## A `Map` and a `Value` index identically and behave oppositely, so the sweep panicked on every pre-cutover lane
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-35
+SYMPTOM: First boot after the Python->Rust cutover: `thread 'tokio-rt-worker' panicked at
+  session_verbs.rs:6637: no entry found for key`, once per tick, killing the rate-limit
+  sweep for the whole fleet. `load_meta()` returns a `serde_json::Map`, and
+  `Map["missing"]` forwards to `BTreeMap::index`, which PANICS — while the visually
+  identical `Value["missing"]` yields `Null`. No pre-cutover `*.meta.json` carries
+  `rate_limited_since`, so this fired on all 5 lanes, guaranteed, on every machine
+  migrating from Python.
+COST: ~15 minutes, and it bought a wrong conclusion first: the panic is caught and logged
+  as a WARN, so it looked like the cause of the server hang it merely coincided with.
+  Fixing it correctly (verified: the panic stopped) left the server still hanging, which
+  is the only reason I kept looking.
+FIX: added `meta_i64()` next to the existing `meta_str()` so the safe form is the obvious
+  one, with a `#[should_panic]` test pinning the `Map`-vs-`Value` trap so nobody
+  "simplifies" it back to indexing. The general shape worth remembering: two types whose
+  index syntax is identical and whose missing-key behaviour is opposite will be confused
+  again, and no amount of care at the call site prevents it — only removing the sharp
+  form from reach does.
