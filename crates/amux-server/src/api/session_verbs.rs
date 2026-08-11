@@ -4572,6 +4572,53 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             }
         }
     }
+    // CODEX SELF-UPDATE EXIT (AMUX-2921, observed live 2026-08-11): on a
+    // version bump codex updates itself via npm, prints "🎉 Update ran
+    // successfully! Please restart Codex." and EXITS — the launch watch
+    // times out on a bare shell and the lane is dead while start_session
+    // reports started. Relaunch ONCE, gated on the positive marker AND a
+    // childless shell — never on the timeout alone, which is the same
+    // no-blind-retype rule the claude fallback above follows (a retype into
+    // a live TUI is a garbage prompt to the model).
+    if !launched && provider == "codex" {
+        let o = strip_ansi(&tmux_capture(name, 30).await);
+        if o.contains("Update ran successfully")
+            && at_shell_prompt(&o)
+            && pane_has_live_child(name).await != Some(true)
+        {
+            tracing::warn!(session = %name,
+                "codex self-updated and exited on launch — relaunching once");
+            emit_event(
+                state,
+                name,
+                "session.codex_update_relaunch",
+                Some(json!({"detected_by": "start_session"})),
+                None,
+                "start_session",
+            )
+            .await;
+            let _ = send_literal(name, &cmd).await;
+            sleep_ms(150).await;
+            send_key(name, "Enter").await;
+            let mut relaunched = false;
+            for _ in 0..20 {
+                sleep_ms(500).await;
+                let o2 = strip_ansi(&tmux_capture(name, 10).await);
+                if claude_ui_visible(&o2) {
+                    relaunched = true;
+                    break;
+                }
+            }
+            if !relaunched {
+                // The one relaunch did not take either — say so durably
+                // instead of reporting a started lane that is a dead shell.
+                tracing::warn!(session = %name,
+                    "codex relaunch after self-update did not reach the UI");
+                meta.insert("start_error".into(), json!("codex exited after self-update; relaunch did not reach the UI"));
+                save_meta(name, &meta);
+            }
+        }
+    }
     // Stream output to the session log (py:24800).
     let _ = std::fs::create_dir_all(logs_dir());
     let lp = log_path(name);
