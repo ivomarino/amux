@@ -3081,3 +3081,44 @@ FIX: playwright.config.ts runs `cargo run -p amux-server` against the working tr
   builder deploys COMMITTED HEAD, and committed source is what ships (CLAUDE.md), so the
   harness should build from HEAD too — a detached worktree like scripts/rust-auto-build.sh
   already uses. That also makes an e2e result mean something reproducible.
+
+## The builder threw away the only line that named a build failure
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2927
+SYMPTOM: `rust-auto-build.sh` piped cargo through `tail -3`, so a failed deploy build
+  logged "For more information about this error..." and "could not compile ... due to N
+  previous errors" and nothing else. The `error[E0432]: unresolved import` line with its
+  file and line number was discarded. Three failures the same day (68d7114, 2acab08,
+  388847f) were each undiagnosable from the log they wrote.
+COST: Three build failures on the fleet's deploy path that nobody could explain without
+  re-running the build by hand, and a wrong initial diagnosis: "concurrent cargo builds"
+  is the obvious reading and is wrong — cargo's own lock already serialises those. The
+  actual culprit was the disk guard's `rm -rf` of the shared target dir, which runs
+  outside cargo's lock and deletes the tree another invocation is building against. A
+  lock around the cargo call alone would have looked correct and fixed nothing.
+FIX: 09cb2d2 — capture the build output and print every error with context on the failing
+  path (success still logs 3 lines); mkdir-based single-instance lock covering the disk
+  guard AND the build; contention logged rather than silent.
+
+## A second `trap ... EXIT` silently replaces the first
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2927
+SYMPTOM: Hit twice in one day in two unrelated shell scripts. In deploy-cloud.yml a
+  `trap rollback ERR` did not fire on explicit `exit 1`, so the rollback was absent on
+  exactly the three failure paths it was written for. In rust-auto-build.sh, adding a lock
+  release before the existing worktree `trap ... EXIT` would have had the worktree trap
+  discard it — leaking the lock every run and blocking every later invocation.
+COST: Nothing shipped, because both were caught by RUNNING the scripts against stubs
+  rather than reading them. That is the point of the entry: neither is visible on a read,
+  both look correct, and both defeat the exact guard they are part of.
+FIX: ce2f1bb and 09cb2d2 — one cleanup function per script, installed once, with an EXIT
+  trap gated on a success flag rather than ERR. Worth a lint: more than one `trap` on the
+  same signal in one script is almost always a bug.
