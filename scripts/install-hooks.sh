@@ -158,6 +158,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/pre-commit" "$ROOT/.git/hooks/pre-commi
 install -m 0755 "$ROOT/scripts/git-hooks/amux-staged-guard" "$ROOT/.git/hooks/amux-staged-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/prepare-commit-msg" "$ROOT/.git/hooks/prepare-commit-msg"
 install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$ROOT/.git/hooks/pre-push"
+install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$ROOT/.git/hooks/post-commit"
 
 # Verify rather than announce (ethos #7): compare what landed against its source,
 # so a stale installed copy cannot hide behind a success message. That drift was
@@ -166,7 +167,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$ROOT/.git/hooks/pre-push"
 # commits printed "Security scan passed" from a scanner that could match none of
 # them.
 fail=0
-for h in pre-commit amux-staged-guard prepare-commit-msg pre-push; do
+for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit; do
   if cmp -s "$ROOT/scripts/git-hooks/$h" "$ROOT/.git/hooks/$h"; then
     echo "  ok   .git/hooks/$h matches scripts/git-hooks/$h"
   else
