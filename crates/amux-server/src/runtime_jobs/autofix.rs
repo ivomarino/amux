@@ -1102,9 +1102,21 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
                     "{rollup_at} distinct entities (AMUX_INVARIANT_ROLLUP_AT)"
                 )),
             ],
+            // READS `failures` AND `invariant_id` — the shape the endpoint
+            // actually returns. This said `.get('results',[])` and `r.get('id')`
+            // and the endpoint has NEITHER key, so it printed `[]` no matter
+            // what was failing. Every auto-filed invariant card shipped a
+            // re-check that reported CLEAN unconditionally, as its own first
+            // instruction — the AMUX-2140 shape, where following the sanctioned
+            // step exactly is what produces the wrong answer. Verified against
+            // the live endpoint: it returns {checks, confidence, failures,
+            // live_incidents, note, unknowns}, and failure rows carry
+            // `invariant_id`, not `id`.
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 print([r for r in json.load(sys.stdin).get('results',[]) if r.get('id')=='{id}'])\""
+                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
+                 if r.get('invariant_id')=='{id}']; \
+                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
             ),
             owner: None,
             count: filing.len() as u64,
@@ -1138,9 +1150,21 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
                 ("last_seen".into(), rl::local_when(last)),
                 ("occurrences".into(), occ.to_string()),
             ],
+            // READS `failures` AND `invariant_id` — the shape the endpoint
+            // actually returns. This said `.get('results',[])` and `r.get('id')`
+            // and the endpoint has NEITHER key, so it printed `[]` no matter
+            // what was failing. Every auto-filed invariant card shipped a
+            // re-check that reported CLEAN unconditionally, as its own first
+            // instruction — the AMUX-2140 shape, where following the sanctioned
+            // step exactly is what produces the wrong answer. Verified against
+            // the live endpoint: it returns {checks, confidence, failures,
+            // live_incidents, note, unknowns}, and failure rows carry
+            // `invariant_id`, not `id`.
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 print([r for r in json.load(sys.stdin).get('results',[]) if r.get('id')=='{id}'])\""
+                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
+                 if r.get('invariant_id')=='{id}']; \
+                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
             ),
             owner: None,
             count: occ as u64,
