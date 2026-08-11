@@ -5701,6 +5701,32 @@ pub(crate) fn refresh_fleet_rosters() -> usize {
     n
 }
 
+/// The worker-memory block as it appears in Claude's MEMORY.md, NAMED with the
+/// lane that wrote it. Empty when the lane has recorded nothing — a header over
+/// nothing is itself a claim.
+///
+/// AMUX-2831. The content is PER-WORKER (mem_file(name)); the destination is
+/// PER-CWD. Measured 2026-08-11: 40 of 113 lanes share a cwd, 18 share
+/// ~/Dev/mixpeek and 6 share ~/Dev/amux, all reading ONE MEMORY.md. The harm
+/// the card names is not that the file is shared — that is Claude Code's keying
+/// and amux cannot change it — but that a lane "READS A PEER'S MEMORY AND
+/// CANNOT TELL". An unlabelled block implicitly claims to be the reader's own
+/// notes, which is false for every lane except the last writer.
+///
+/// Same rule fleet_roster follows: content in a shared file must be true for
+/// EVERY reader, because the file cannot know who is reading it.
+fn compose_worker_block(name: &str, session_content: &str) -> String {
+    if session_content.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Worker memory — `{name}`\n\n         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
+         memory: useful context, not your own notes. Your own is at \
+         ~/.amux/memory/<your-worker>.md and reaches this file when you write it. -->\n\n{}",
+        session_content.trim()
+    )
+}
+
 fn write_claude_memory(name: &str, work_dir: &str) {
     let pname = project_name(work_dir);
     let session_file = mem_file(name);
@@ -5718,8 +5744,9 @@ fn write_claude_memory(name: &str, work_dir: &str) {
         ));
     }
     parts.push(MEM_MARKER.to_string());
-    if !session_content.trim().is_empty() {
-        parts.push(session_content.trim().to_string());
+    let worker_block = compose_worker_block(name, &session_content);
+    if !worker_block.is_empty() {
+        parts.push(worker_block);
     }
     let composed = parts.join("\n\n") + "\n";
 
@@ -12504,6 +12531,7 @@ mod refusal_status_tests {
 
 #[cfg(test)]
 mod roster_tests {
+    use super::*;
     /// The roster is DERIVED from the session env files, so these assertions
     /// are about shape rather than content — the fleet changes hourly and a
     /// fixture would be a second source of truth (the thing the roster exists
@@ -12516,6 +12544,28 @@ mod roster_tests {
     /// and wrong for the other sixteen — they read a list that includes
     /// themselves and omits the writer. That is the last-writer-wins bug this
     /// card is about, and the roster was an instance of it.
+    /// Anything written into Claude's MEMORY.md must be true for EVERY reader,
+    /// because the file is keyed on the project DIRECTORY and up to 18 lanes
+    /// share one. The roster obeys this by listing everyone; the worker-memory
+    /// block obeys it by NAMING ITS OWNER (AMUX-2831).
+    #[test]
+    fn propagated_worker_memory_names_the_lane_that_wrote_it() {
+        let b = compose_worker_block("amux", "remember: the thing");
+        assert!(b.contains("Worker memory — `amux`"), "must name its owner; got:\n{b}");
+        assert!(
+            b.contains("If you are not amux"),
+            "a peer reading this must be told it is not theirs; got:\n{b}"
+        );
+        assert!(b.contains("remember: the thing"), "content must survive labelling");
+    }
+
+    /// A header over nothing is itself a claim ("this lane recorded nothing").
+    #[test]
+    fn no_worker_memory_block_when_the_lane_recorded_nothing() {
+        assert_eq!(compose_worker_block("amux", "   \n  "), "");
+        assert_eq!(compose_worker_block("amux", ""), "");
+    }
+
     #[test]
     fn the_roster_lists_every_live_worker_because_the_file_is_shared() {
         let r = super::fleet_roster();
