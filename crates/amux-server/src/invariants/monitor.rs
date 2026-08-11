@@ -253,7 +253,18 @@ fn scan_js_calls(js: &str, source: &str) -> Vec<checks::CallerPath> {
         // have made the whole 405 class invisible — the exact bug this census
         // exists to catch. Backward is still consulted for the
         // `const opts = {method:'PATCH'}; fetch(url, opts)` shape.
-        let fwd = &js[clamp(end)..clamp(end + 200)];
+        // BOUNDED TO THE SAME STATEMENT. A flat 200-char window bleeds past the
+        // end of this call and attaches a neighbour's verb: `fetch('/api/
+        // layout-presets')` (a GET) sat within 200 chars of a later
+        // `{method:'DELETE'}` and was reported as `DELETE /api/layout-presets`
+        // — a route that does not exist, while the DELETE the client really
+        // makes (`/api/layout-presets/{name}`) is mounted and fine. One
+        // confirmed false positive in the 2026-08-11 census, on a check whose
+        // entire output is a work list. The options object lives inside the
+        // same statement, so stopping at the first `;` keeps every real shape
+        // and drops the bleed.
+        let fwd_raw = &js[clamp(end)..clamp(end + 200)];
+        let fwd = fwd_raw.split(';').next().unwrap_or(fwd_raw);
         let back = &js[clamp(start.saturating_sub(200))..clamp(start)];
         let find_m = |hay: &str| {
             ["POST", "PATCH", "DELETE", "PUT"]
@@ -358,6 +369,30 @@ mod tests {
 
     /// Interpolated paths must be skipped, not guessed — a phantom failure
     /// trains people to ignore the check.
+    /// A verb belonging to a LATER call must not be attached to this one.
+    /// The flat 200-char forward window did exactly that and produced a
+    /// confirmed false positive in the live census (2026-08-11): a plain GET
+    /// reported as `DELETE /api/layout-presets`, a path that is not mounted,
+    /// while the real DELETE goes to /api/layout-presets/{name} and works.
+    #[test]
+    fn a_neighbours_method_is_not_attached_to_this_call() {
+        let js = "const r = await fetch('/api/layout-presets');\n\
+                  async function del(name) {\n\
+                    await fetch('/api/layout-presets/' + name, {method:'DELETE'});\n\
+                  }";
+        let got = scan_js_calls(js, "t");
+        let base: Vec<_> = got.iter().filter(|c| c.path == "/api/layout-presets" && !c.interpolated).collect();
+        assert!(!base.is_empty(), "the plain GET must still be extracted");
+        for c in &base {
+            assert_eq!(c.method, "GET", "a later {{method:'DELETE'}} must not become this call's verb");
+        }
+        // ...and the real DELETE is still found, as an interpolated prefix.
+        assert!(
+            got.iter().any(|c| c.path == "/api/layout-presets" && c.interpolated && c.method == "DELETE"),
+            "the parameterised DELETE must still be extracted: {got:?}"
+        );
+    }
+
     #[test]
     fn interpolated_paths_are_not_guessed() {
         let js = r#"fetch(API + '/api/workers/' + name + '/send', {method:'POST'})"#;
