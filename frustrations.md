@@ -2960,7 +2960,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-08-11
 SESSION: amux (reported by ts-gke)
-CARD: AMUX-2868
+CARD: AMUX-2870
 SYMPTOM: GET /api/board?session=ts-gke returned 68 done cards; the truth was 94.
   GET /api/board/<id> returned the missing ones fine. cap_terminal keeps the 100
   most-recent done|verified|discarded|quarantined rows, and ts-gke had 174 of
