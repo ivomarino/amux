@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.582';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.583';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16317,7 +16317,8 @@ function switchView(view) {
     // Only poll if SSE is not active (SSE pushes board updates)
     if (_sseFallback && !boardTimer) boardTimer = setInterval(fetchBoard, 5000);
   } else if (view === 'scheduler') {
-    Promise.all([fetchSchedules(), fetchSchedulerRuns()]).then(() => renderScheduler());
+    Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()])
+      .then(() => { renderScheduler(); renderSchedulerAudit(); });
     // amux's own background jobs live under the user's schedules. Fetched
     // separately because they are a separate thing (see renderSystemJobs), and
     // refreshed on a timer because a frozen age is the exact failure the
@@ -17781,6 +17782,75 @@ async function fetchSchedulerRuns() {
   }
 }
 
+let _schedulerAudit = [];
+async function fetchSchedulerAudit() {
+  try {
+    const r = await fetch(API + '/api/schedules/audit?limit=200');
+    if (r.ok) {
+      _schedulerAudit = await r.json();
+      try { localStorage.setItem('amux_sched_audit_cache', JSON.stringify(_schedulerAudit)); } catch(e) {}
+    }
+  } catch(e) {
+    try { var c = localStorage.getItem('amux_sched_audit_cache'); if (c) _schedulerAudit = JSON.parse(c); } catch(e2) {}
+  }
+}
+
+/// The change history panel (AMUX-2755).
+//
+// GET /api/schedules/audit was routed and the SPA referenced it ZERO times.
+// The trail existed and reached nobody — ethos rule 1, in the subsystem whose
+// own incident (AMUX-1812: eight schedules vanished with no attribution) is the
+// reason it was built.
+//
+// DELETED SCHEDULES ARE THE POINT. A per-schedule row cannot show one: the row
+// is gone. Measured 2026-08-11: 151 schedules have audit rows, 118 still exist,
+// so 45 are visible ONLY here. Rendering this as an annotation on live rows
+// would have reproduced the original blindness with a new coat of paint.
+// Params are a TEST SEAM with production defaults. `_schedulerAudit` and
+// `schedules` are top-level `let`s, and in a classic script those do NOT become
+// window properties — so a test assigning window._schedulerAudit is writing to
+// a different binding than this function reads, and the panel renders empty
+// while every assertion still runs. That failure looks exactly like a broken
+// renderer. Taking the data as arguments makes the test drive the real code
+// path instead of a lookalike.
+function renderSchedulerAudit(rowsIn, liveIdsIn) {
+  const el = document.getElementById('scheduler-audit');
+  const nEl = document.getElementById('sched-audit-n');
+  if (!el) return;
+  const rows = (rowsIn || _schedulerAudit || []).slice(0, 60);
+  if (nEl) nEl.textContent = rows.length ? '(' + rows.length + ')' : '';
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty" style="font-size:0.75rem;">No recorded schedule changes.</div>';
+    return;
+  }
+  const live = liveIdsIn || new Set((schedules || []).map(s => s.id));
+  el.innerHTML = rows.map(r => {
+    const gone = !live.has(r.schedule_id);
+    const del = r.field === 'deleted' || r.source === 'api-delete';
+    const who = r.by_who || 'unattributed';
+    const label = del ? 'deleted' : (r.source === 'api-create' ? 'created' : 'changed ' + esc(r.field || '?'));
+    // An unattributed write is the failure this trail exists to make visible,
+    // so it is called out rather than rendered as a blank.
+    const whoHtml = r.by_who
+      ? '<span style="color:var(--accent);">' + esc(who) + '</span>'
+      : '<span style="color:var(--red);" title="No X-Amux-Session on the write — this is the gap AMUX-1812 was about">unattributed</span>';
+    const gonePill = gone
+      ? ' <span style="font-size:0.62rem;color:var(--red);border:1px solid var(--red);border-radius:4px;padding:0 4px;" title="This schedule no longer exists — visible only here">gone</span>'
+      : '';
+    const diff = (r.old_value || r.new_value)
+      ? '<div style="color:var(--dim);font-size:0.66rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
+        + (r.old_value ? esc(String(r.old_value).slice(0, 60)) + ' \u2192 ' : '')
+        + esc(String(r.new_value || '').slice(0, 60)) + '</div>'
+      : '';
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:0.72rem;">'
+      + '<div style="display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;">'
+      + '<span style="font-weight:600;">' + esc(r.title || r.schedule_id || '?') + '</span>' + gonePill
+      + '<span style="color:var(--dim);">' + label + ' by </span>' + whoHtml
+      + '<span style="color:var(--dim);margin-left:auto;">' + timeAgo(Number(r.ts) || 0) + '</span>'
+      + '</div>' + diff + '</div>';
+  }).join('');
+}
+
 // WHAT A RUN DOT MEANS (AMUX-2647). Before the delivery verdict existed there
 // were two states — `ok` and everything-else-is-red — and every rust run row
 // said `ok`, including the ones that delivered nothing at all. Mapping the new
@@ -18320,8 +18390,9 @@ async function runScheduleNow(id) {
     });
     if (r) {
       const d = (typeof r.json === 'function') ? await r.json().catch(() => ({})) : (r || {});
-      await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
+      await Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()]);
       renderScheduler();
+      renderSchedulerAudit();
       _peekRefreshSchedIfActive();
       if (typeof showToast === 'function') showToast(_schedRunToast(d));
     } else if (typeof showToast === 'function') {

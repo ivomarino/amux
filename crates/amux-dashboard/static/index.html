@@ -601,6 +601,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </summary>
     <div id="scheduler-runs"></div>
   </details>
+  <!-- AMUX-2755. GET /api/schedules/audit was routed and the SPA referenced it
+       ZERO times — a trail that exists and reaches nobody. It matters most for
+       the case a per-schedule row structurally CANNOT show: a DELETED schedule
+       has no row. 45 of the 151 audited schedules no longer exist, which is the
+       AMUX-1812 shape (8 schedules vanished with no attribution). -->
+  <details id="sched-audit-details" style="border-top:1px solid var(--border);padding:0 12px 10px;">
+    <summary style="cursor:pointer;font-size:0.78rem;font-weight:600;color:var(--dim);padding:8px 0 4px;list-style:none;display:flex;align-items:center;gap:5px;">
+      <span style="font-size:0.6rem;transition:transform 0.15s;display:inline-block;" id="sched-audit-arrow">▶</span> Change history <span id="sched-audit-n" style="color:var(--dim);font-weight:400;"></span>
+    </summary>
+    <div id="scheduler-audit"></div>
+  </details>
 </div>
 
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
