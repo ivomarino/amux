@@ -810,11 +810,7 @@ pub async fn staged_guard(headers: HeaderMap, body: axum::body::Bytes) -> (Statu
     )
 }
 
-fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+use crate::config::amux_home;
 
 // ---------------------------------------------------------------------------
 // Tests — every one of these fires the BLOCK path or a bypass of it. A guard

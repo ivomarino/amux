@@ -41,7 +41,7 @@ use axum::routing::any;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Nested at /api/groups: the list plus the /config sub-resource. ONE
 /// wildcard route dispatching on the sub-path, exactly like Python's
@@ -87,11 +87,7 @@ async fn not_found() -> Response {
     j(404, json!({"error": "not found"}))
 }
 
-pub(crate) fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+pub(crate) use crate::config::amux_home;
 
 /// Python `_hdr_worker` (py:15100 region): X-Amux-Worker is canonical,
 /// X-Amux-Session still honored. Shared with api/scope.rs (same attribution

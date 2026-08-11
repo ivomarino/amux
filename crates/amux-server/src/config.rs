@@ -100,13 +100,8 @@ impl ServerConfig {
     }
 
     pub fn from_process_env() -> Self {
-        let home = std::env::var("AMUX_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_home().join(".amux")
-            });
         let process_env: BTreeMap<String, String> = std::env::vars().collect();
-        Self::load(home, &process_env)
+        Self::load(amux_home(), &process_env)
     }
 
     pub fn tls_dir(&self) -> PathBuf {
@@ -124,8 +119,111 @@ impl ServerConfig {
     }
 }
 
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+/// THE amux home: `$AMUX_HOME`, legacy `$CC_HOME`, else `~/.amux`.
+///
+/// One resolver, because there were TEN and they did not agree (AMUX-2919).
+/// Nine private copies plus `from_process_env` had drifted into three distinct
+/// behaviours, and the divergences were the interesting part:
+///
+///   * **`AMUX_HOME=""` was treated as SET by nine of the ten.**
+///     `std::env::var` returns `Ok("")` for an exported-but-empty variable, so
+///     `PathBuf::from("")` produced an EMPTY path and every `amux_home().join(x)`
+///     silently became the RELATIVE path `x` — writing the DB, tls dir and auth
+///     token wherever the process happened to be cwd'd. Only api/settings.rs
+///     checked for empty. That check is now the shared one.
+///   * **`CC_HOME` was honoured by exactly one of the ten** (api/settings.rs,
+///     which serves settings/journal/history). So with `CC_HOME` set and
+///     `AMUX_HOME` unset, settings read one home while groups, dictation, push
+///     and the rest read another — one server, two data directories. `CC_HOME`
+///     is unset on this machine today, so unifying on it changes nothing now
+///     and closes the split-brain if anything ever sets it. The bash `amux` CLI
+///     already honours it (amux:35), which is where the divergence would bite.
+///   * **The `$HOME`-missing fallback split** `unwrap_or_default()` (→ the
+///     relative `.amux`) against `PathBuf::from("/")` (→ `/.amux`). Now `/.amux`
+///     everywhere: an absolute path is wrong loudly, a relative one is wrong
+///     silently.
+///
+/// api/settings.rs's docstring claimed it matched `from_process_env`; it did
+/// not, in both of the ways above. That claim is now true because there is only
+/// one implementation left to be true about (ethos rule 6).
+pub fn amux_home() -> PathBuf {
+    resolve_home(|k| std::env::var(k).ok())
+}
+
+/// The resolution itself, over an injected lookup.
+///
+/// Split out so the rules above are testable WITHOUT setting process env:
+/// `std::env::set_var` is global and `cargo test` runs threads in parallel, so
+/// an env-mutating test races every other test that reads a home — which is
+/// most of them. A test that must run single-threaded to be correct is one
+/// that will be made green by `--test-threads=1` and quietly stop
+/// discriminating (ethos rule 7).
+fn resolve_home(get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    for var in ["AMUX_HOME", "CC_HOME"] {
+        match get(var) {
+            Some(h) if !h.is_empty() => return PathBuf::from(h),
+            _ => {}
+        }
+    }
+    match get("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(".amux"),
+        _ => PathBuf::from("/").join(".amux"),
+    }
+}
+
+#[cfg(test)]
+mod home_resolution_tests {
+    use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn amux_home_wins_and_cc_home_is_the_legacy_fallback() {
+        assert_eq!(
+            resolve_home(env(&[("AMUX_HOME", "/a"), ("CC_HOME", "/c"), ("HOME", "/h")])),
+            PathBuf::from("/a")
+        );
+        assert_eq!(
+            resolve_home(env(&[("CC_HOME", "/c"), ("HOME", "/h")])),
+            PathBuf::from("/c"),
+            "CC_HOME was honoured by exactly one of the ten old copies — settings read \
+             one home while groups/dictation/push read another"
+        );
+        assert_eq!(resolve_home(env(&[("HOME", "/h")])), PathBuf::from("/h/.amux"));
+    }
+
+    /// The bug that made this consolidation worth doing. An exported-but-empty
+    /// variable yields `Ok("")`, and nine of the ten copies mapped that
+    /// straight to `PathBuf::from("")` — an EMPTY path, so every `.join(x)`
+    /// became the RELATIVE path `x` and the DB, tls dir and auth token landed
+    /// wherever the process was cwd'd. Silent, and cwd-dependent.
+    #[test]
+    fn an_exported_but_empty_var_is_not_a_home() {
+        assert_eq!(
+            resolve_home(env(&[("AMUX_HOME", ""), ("HOME", "/h")])),
+            PathBuf::from("/h/.amux")
+        );
+        assert_eq!(
+            resolve_home(env(&[("AMUX_HOME", ""), ("CC_HOME", ""), ("HOME", "/h")])),
+            PathBuf::from("/h/.amux")
+        );
+        // The shape the old code produced, asserted as NOT happening: a
+        // relative path is the failure mode, so name it explicitly.
+        let got = resolve_home(env(&[("AMUX_HOME", ""), ("HOME", "/h")]));
+        assert!(got.is_absolute(), "an empty AMUX_HOME must not yield a relative home: {got:?}");
+    }
+
+    /// `$HOME` missing split the old copies too: `unwrap_or_default()` gave the
+    /// relative `.amux`, `PathBuf::from("/")` gave `/.amux`. Absolute wins —
+    /// wrong loudly beats wrong silently.
+    #[test]
+    fn a_missing_home_still_resolves_absolute() {
+        let got = resolve_home(env(&[]));
+        assert_eq!(got, PathBuf::from("/.amux"));
+        assert!(got.is_absolute());
+    }
 }
 
 /// Parse a KEY=VALUE env file. Supports `#` comments, blank lines, single or

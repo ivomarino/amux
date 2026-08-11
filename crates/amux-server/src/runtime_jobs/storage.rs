@@ -98,7 +98,7 @@
 use crate::api::AppState;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::RwLock;
 
 /// Default tick: hourly. Retention is not time-critical; the only thing that
@@ -245,11 +245,7 @@ pub fn retain_days(spec: &SweepSpec) -> f64 {
         .unwrap_or(spec.default_days)
 }
 
-pub fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+pub use crate::config::amux_home;
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)

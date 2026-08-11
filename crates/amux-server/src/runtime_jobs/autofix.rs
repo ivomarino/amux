@@ -2719,11 +2719,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
     }))
 }
 
-pub fn amux_home() -> std::path::PathBuf {
-    std::env::var("AMUX_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+pub use crate::config::amux_home;
 
 /// `GET /api/debug/autofix` — the answer to "why didn't it file?" in one
 /// request. Carries the toggle state, every threshold, every signature seen,

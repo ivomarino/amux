@@ -312,16 +312,7 @@ pub async fn send_all(state: &AppState, title: &str, body: &str, session: &str, 
     results
 }
 
-fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .join(".amux")
-        })
-}
+use crate::config::amux_home;
 
 // ---- HTTP API (route names + shapes match the Python server) --------------
 

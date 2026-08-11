@@ -35,16 +35,7 @@ use std::sync::{LazyLock, Mutex};
 /// profile was never flushed (Python `_CHROME_SINGLETONS`).
 pub const CHROME_SINGLETONS: [&str; 3] = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
 
-pub fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .join(".amux")
-        })
-}
+pub use crate::config::amux_home;
 
 /// The user's real Chrome user-data-dir (Python `_chrome_user_data_dir`).
 pub fn chrome_user_data_dir() -> PathBuf {

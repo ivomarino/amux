@@ -33,7 +33,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::AppState;
 
@@ -49,23 +49,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// The amux home for settings/journal/history file access: `$AMUX_HOME`,
-/// legacy `$CC_HOME`, else `~/.amux` — the same resolution as Python's
-/// `_amux_home` and config.rs's `from_process_env`. Resolved per-request so
-/// tests can inject a temp home.
-pub(crate) fn amux_home() -> PathBuf {
-    for var in ["AMUX_HOME", "CC_HOME"] {
-        if let Ok(h) = std::env::var(var) {
-            if !h.is_empty() {
-                return PathBuf::from(h);
-            }
-        }
-    }
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
-        .join(".amux")
-}
+pub(crate) use crate::config::amux_home;
 
 /// Effective value of a server-config key: non-empty `server.env` entry
 /// first (Python's boot loader only overrides `os.environ` with non-empty

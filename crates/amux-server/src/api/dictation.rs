@@ -697,12 +697,7 @@ fn dictation_model() -> String {
     std::env::var("AMUX_DICTATION_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".into())
 }
 
-/// `~/.amux` (AMUX_HOME override), same resolution as sessions_legacy.rs.
-fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+use crate::config::amux_home;
 
 /// Env half of the key lookup, override-able in tests (process env reads
 /// are not hermetic under parallel tests).
