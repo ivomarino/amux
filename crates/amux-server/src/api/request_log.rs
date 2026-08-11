@@ -946,6 +946,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // CRM (AMUX-2929). Mounted via .nest("/api/crm", crm::routes()), which the
     // completeness test could not see until AMUX-2917 taught it to follow
     // nests — so these answered 200 while the census called them unrouted.
+    // Nested-router capabilities that were never tabled (AMUX-2937). All eight
+    // answer JSON from their handlers — probed live, not the SPA catch-all's
+    // HTML — so the census was calling real routes unrouted. Found once the
+    // completeness test learned to follow .nest() (AMUX-2917); it previously
+    // scanned only api/mod.rs's own .route() calls.
+    RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
+    RouteEntry { path: "/api/search", methods: &["GET"] },
+    RouteEntry { path: "/api/search/status", methods: &["GET"] },
+    RouteEntry { path: "/api/search/reindex", methods: &["POST"] },
+    RouteEntry { path: "/api/why", methods: &["GET"] },
+    RouteEntry { path: "/api/why/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/why/{kind}/{id}", methods: &["GET"] },
     RouteEntry { path: "/api/crm/contacts", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/crm/contacts/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/crm/contacts/{id}/interactions", methods: &["POST"] },

@@ -227,25 +227,7 @@ async fn route_table_matches_the_real_router_both_directions() {
 ///
 /// The list is checked in BOTH directions below, so it cannot go stale: adding
 /// a row to ROUTE_TABLE without removing it here fails too.
-const KNOWN_UNTABLED: &[&str] = &[
-    "/api/board/contract",
-    "/api/browser",
-    "/api/browser/{*rest}",
-    "/api/dictation",
-    "/api/dictation/{*rest}",
-    "/api/file/{*rest}",
-    "/api/fs",
-    "/api/fs/{*rest}",
-    "/api/schedules/{id}/skip",
-    "/api/scope/{*rest}",
-    "/api/search",
-    "/api/search/reindex",
-    "/api/search/status",
-    "/api/tags/{*rest}",
-    "/api/why",
-    "/api/why/contract",
-    "/api/why/{kind}/{id}",
-];
+const KNOWN_UNTABLED: &[&str] = &[];
 
 #[test]
 fn every_directly_routed_api_path_is_in_the_table() {
@@ -366,6 +348,33 @@ fn every_directly_routed_api_path_is_in_the_table() {
             // here means the scan wandered outside the nested router, so
             // gluing the prefix on would fabricate a path.
             if sub.starts_with("/api/") {
+                continue;
+            }
+            // HONOUR THE TABLE'S OWN DOCUMENTED EXCLUSION. request_log.rs says
+            // plainly what is deliberately NOT a row: "module-internal
+            // catch-alls whose only job is answering a JSON 404 … they are 'no
+            // such route' answerers, not capabilities", and it names
+            // /api/fs/{*rest}, /api/browser/{*rest} and four more.
+            //
+            // My first version reported all six as gaps, which is the same
+            // mistake I made filing AMUX-2917 against /api/stripe: read a
+            // missing row, call it an omission, never read the policy sitting
+            // above the list. A test that contradicts the documented design of
+            // the thing it checks trains people to allowlist their way past it.
+            //
+            // Detected from the HANDLER, not the path shape, because the two
+            // diverge: /api/groups/{*rest} is a real capability and IS tabled,
+            // while /api/fs/{*rest} answers 404. Whatever the policy is, the
+            // handler is where it is true.
+            let handler_end = st[e..].find(')').map(|k| e + k).unwrap_or(st.len());
+            let handler = &st[e..handler_end];
+            // Matched on the NAMING CONVENTION, not one spelling: browser.rs
+            // calls its answerer `catalog_404`, fs.rs calls it `not_found`,
+            // dictation.rs inlines `route_not_found()`. A check keyed to a
+            // single name passes on the module that happens to use it and
+            // silently reports the others as gaps — which is exactly what the
+            // first version did.
+            if handler.contains("not_found") || handler.contains("_404") {
                 continue;
             }
             let full =
