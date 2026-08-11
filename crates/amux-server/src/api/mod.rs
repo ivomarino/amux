@@ -38,6 +38,7 @@ pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod proxies;
 pub mod py_proxy;
 pub mod request_log;
 pub mod review;
@@ -197,6 +198,7 @@ pub fn router(state: AppState) -> Router {
         .merge(habits::routes())
         .merge(observability::routes())
         .merge(self_update::routes())
+        .nest("/api/proxies", proxies::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())

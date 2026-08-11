@@ -952,6 +952,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
     RouteEntry { path: "/api/observability", methods: &["GET"] },
     RouteEntry { path: "/api/pull", methods: &["POST"] },
+    RouteEntry { path: "/api/proxies", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },
+    RouteEntry { path: "/api/proxies/{id}/stop", methods: &["POST"] },
     // The D1-exit pair. Reached by the bash CLI's own curl, which the caller
     // census does not enumerate — so these 405'd for the whole cutover while
     // every layer that mentions them kept routing sessions at them.
