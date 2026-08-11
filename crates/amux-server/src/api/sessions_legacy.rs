@@ -259,6 +259,19 @@ pub struct FleetSignals {
     /// status for the same lane. A view that disagrees with the mechanism it
     /// describes is worse than no view.
     pub panes: BTreeMap<String, String>,
+    /// session -> newest mtime across its SUBAGENT transcripts
+    /// (`~/.claude/projects/<proj>/<conv>/subagents/*.jsonl`).
+    ///
+    /// A lane's Stop hook fires when the MAIN turn ends, so a lane whose
+    /// background agents are still working reports `idle` — correctly, about
+    /// the main turn, and misleadingly about the lane. Measured 2026-08-11:
+    /// primis read `idle` while a subagent had written 20 seconds earlier.
+    ///
+    /// This is the structured answer to that, not a pane marker: it is durable,
+    /// survives a lane that is not painting, and does not break when Claude
+    /// Code changes a glyph (D1). One walk per pass — 21ms for 1844 transcripts
+    /// on this machine, 0.16% of a scan tick.
+    pub subagent_activity: BTreeMap<String, f64>,
     pub now: f64,
 }
 
@@ -400,6 +413,7 @@ impl FleetSignals {
             transitions,
             started,
             panes: BTreeMap::new(),
+            subagent_activity: scan_subagent_activity(),
             now: chrono::Utc::now().timestamp() as f64,
         }
     }
@@ -464,6 +478,14 @@ impl FleetSignals {
     /// steering gate asks — so a lane this reports as working is exactly a
     /// lane that would refuse a mid-turn delivery. A second spelling of the
     /// detector would be a second thing to keep in step with Claude Code's UI.
+    /// Has a background agent of this lane written within the contradiction
+    /// window? Reported `idle` describes the MAIN turn; this describes the lane.
+    fn subagents_working(&self, name: &str) -> bool {
+        self.subagent_activity
+            .get(name)
+            .is_some_and(|m| self.now - m < self.contradiction_window())
+    }
+
     fn pane_says_working(&self, name: &str) -> bool {
         let Some(raw) = self.pane_of(name) else {
             return false;
@@ -626,8 +648,82 @@ impl FleetSignals {
         {
             status = "active".into();
         }
+        // SUBAGENTS ARE THE LANE WORKING TOO (AMUX-2904). Same one-way rule as
+        // the pane contradiction above: only ever idle -> active, so a missed
+        // signal costs a late correction and never a false "busy".
+        if status == "idle" && self.subagents_working(name) {
+            status = "active".into();
+        }
         status
     }
+}
+
+
+/// lane -> newest subagent-transcript mtime, in ONE pass over
+/// `~/.claude/projects/<proj>/<conversation>/subagents/`.
+///
+/// The owning lane is the parent conversation's `customTitle` — the SAME
+/// resolution the token-ledger indexer and the /subagents endpoint use, not a
+/// fourth spelling of it. Measured 21ms for 1844 transcripts across 69
+/// conversations, so it is affordable once per fleet pass; per-lane it would
+/// not be.
+fn scan_subagent_activity() -> BTreeMap<String, f64> {
+    use std::io::BufRead;
+    let projects = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/projects");
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    let Ok(projs) = std::fs::read_dir(&projects) else { return out };
+    for proj in projs.flatten() {
+        let Ok(entries) = std::fs::read_dir(proj.path()) else { continue };
+        for e in entries.flatten() {
+            let conv = e.path();
+            if conv.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let subs = conv.with_extension("").join("subagents");
+            let Ok(files) = std::fs::read_dir(&subs) else { continue };
+            let mut newest = 0.0f64;
+            for f in files.flatten() {
+                if !f.file_name().to_string_lossy().ends_with(".jsonl") {
+                    continue;
+                }
+                if let Some(m) = f
+                    .metadata()
+                    .ok()
+                    .and_then(|md| md.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                {
+                    newest = newest.max(m.as_secs_f64());
+                }
+            }
+            if newest <= 0.0 {
+                continue;
+            }
+            // Only open the parent's first line once we know there is activity
+            // worth attributing — most conversations have no subagents at all.
+            let Ok(fh) = std::fs::File::open(&conv) else { continue };
+            let mut line = String::new();
+            if std::io::BufReader::new(fh).read_line(&mut line).is_err() {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let owner = rec
+                .get("customTitle")
+                .or_else(|| rec.get("sessionName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if owner.is_empty() {
+                continue;
+            }
+            let slot = out.entry(owner).or_insert(0.0);
+            if newest > *slot {
+                *slot = newest;
+            }
+        }
+    }
+    out
 }
 
 /// The set of sessions currently `active` — the board's `stale` flag reads
@@ -1641,6 +1737,36 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 mod tests {
     use super::*;
 
+    /// AMUX-2904. A lane's Stop hook fires when the MAIN turn ends, so a lane
+    /// whose background agents are still working self-reports `idle` —
+    /// correctly about the turn, misleadingly about the lane. Measured
+    /// 2026-08-11: primis read `idle` with a subagent write 20s old.
+    ///
+    /// One-way, like the pane contradiction beside it: idle -> active only, so
+    /// a missed signal is a late correction and never a false "busy".
+    #[test]
+    fn a_lane_with_live_subagents_is_not_idle() {
+        let mut sig = signals();
+        sig.now = 1_000_000.0;
+        // CONTROL FIRST: with no subagent activity the lane stays idle, or the
+        // assertion below proves nothing.
+        assert!(!sig.subagents_working("primis"));
+
+        // A write inside the contradiction window contradicts `idle`.
+        sig.subagent_activity.insert("primis".into(), sig.now - 20.0);
+        assert!(sig.subagents_working("primis"), "a 20s-old subagent write must contradict idle");
+
+        // Stale activity does NOT. An agent that finished an hour ago is not
+        // evidence the lane is busy now.
+        sig.subagent_activity.insert("primis".into(), sig.now - 86_400.0);
+        assert!(!sig.subagents_working("primis"), "stale subagent activity must not pin a lane active");
+
+        // Scoped per lane.
+        sig.subagent_activity.insert("other".into(), sig.now - 5.0);
+        assert!(!sig.subagents_working("primis"));
+        assert!(sig.subagents_working("other"));
+    }
+
     #[test]
     fn status_vocabulary_matches_python() {
         assert_eq!(python_status(r#"{"state":"active","turn":null}"#), "active");
@@ -1656,6 +1782,7 @@ mod tests {
             running: BTreeSet::new(),
             shell_only: BTreeSet::new(),
             reports: serde_json::Value::Null,
+            subagent_activity: BTreeMap::new(),
             transitions: BTreeMap::new(),
             started: BTreeMap::new(),
             panes: BTreeMap::new(),
