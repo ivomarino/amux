@@ -13,10 +13,24 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/", get(list_skills)).route("/{name}", get(get_skill))
+    // POST/DELETE on {name} were never ported (AMUX-2623 census). The Skills
+    // tab has an editor with Save and Delete wired to exactly these two verbs
+    // (app.js:23784, 23799) against a GET-only route, so Save toasted "Save
+    // failed" and Delete did nothing — a dead editor, shipped and unnoticed
+    // because a 405 in a fetch is silent unless someone reads the toast.
+    Router::new()
+        .route("/", get(list_skills))
+        .route("/{name}", get(get_skill).post(save_skill).delete(delete_skill))
+}
+
+/// Shared name rule — one predicate, three handlers. `get_skill` had it
+/// inline; a second copy in each writer is how the read and the write start
+/// disagreeing about what a valid name is.
+fn bad_name(name: &str) -> bool {
+    name.is_empty() || name.contains('/') || name.contains("..")
 }
 
 pub fn slash_routes() -> Router<AppState> {
@@ -218,5 +232,98 @@ mod tests {
         assert_eq!(frontmatter_fields("no frontmatter here"), (String::new(), String::new()));
         // An unterminated block parses nothing (Python: find("---", 3) < 0).
         assert_eq!(frontmatter_fields("---\ndescription: x"), (String::new(), String::new()));
+    }
+}
+
+/// Upsert. Python stored skills in the shared `skills` table keyed by name, so
+/// saving an existing skill REPLACES it — which is what the editor's Save
+/// means, and why this is not an INSERT that 409s on a name you already have.
+async fn save_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if bad_name(&name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid name" }))).into_response();
+    }
+    let content = body.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    // An empty body would silently blank a skill the user can no longer see the
+    // text of — the same shape as the board's blanked-desc hazard. Refuse it.
+    if content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "content required — use DELETE to remove a skill" })),
+        )
+            .into_response();
+    }
+    let n2 = name.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, content TEXT NOT NULL)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO skills (name, content) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET content=excluded.content",
+                rusqlite::params![n2, content],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    match write {
+        Ok(_) => Json(json!({ "ok": true, "name": name })).into_response(),
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+                .into_response()
+        }
+    }
+}
+
+/// Delete. Reports whether a row actually went — `{"deleted": false}` for a
+/// name that was not there, rather than a cheerful ok that cannot be
+/// distinguished from a real removal.
+async fn delete_skill(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    if bad_name(&name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid name" }))).into_response();
+    }
+    let n2 = name.clone();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let slot_w = slot.clone();
+    let write = state
+        .store
+        .write_async(move |conn| {
+            let n = conn.execute("DELETE FROM skills WHERE name=?1", rusqlite::params![n2])?;
+            *slot_w.lock().expect("slot") = n;
+            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        })
+        .await;
+    match write {
+        Ok(_) => {
+            let n = *slot.lock().expect("slot");
+            Json(json!({ "ok": true, "name": name, "deleted": n > 0 })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// The name rule is shared by read and both writes. A writer with its own
+    /// copy is how a path that GET rejects becomes one POST accepts.
+    #[test]
+    fn the_name_rule_rejects_what_would_escape_the_key_space() {
+        assert!(bad_name(""), "empty");
+        assert!(bad_name("a/b"), "a slash would address another route");
+        assert!(bad_name(".."), "traversal-shaped names never reach the table");
+        assert!(bad_name("../etc/passwd"));
+        assert!(!bad_name("my-skill"));
+        assert!(!bad_name("my_skill.v2"));
     }
 }
