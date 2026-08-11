@@ -206,9 +206,62 @@ fn cap_key(session: &str, now: f64) -> String {
 /// ONE real entry — an untracked draft that `git add -A` would genuinely have
 /// swept up — arrived already discounted.
 ///
-/// UNTRACKED PATHS ARE NEVER DROPPED. They are the genuinely dangerous ones for
-/// `git add -A` and cannot match origin by definition.
-async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> Vec<String> {
+/// UNTRACKED IS NOT A SYNONYM FOR ABSENT-FROM-ORIGIN, and an earlier version of
+/// this comment said it was. Reported by creative-dna and reproduced: a file
+/// ADDED on origin after local HEAD reads `??` from `git status`, because the
+/// local index predates the commit that added it. Untracked is the same
+/// artifact for adds that dirty-status is for edits. So the test is PRESENCE ON
+/// ORIGIN, never the porcelain letter — a `??` path that matches origin is a
+/// phantom and is dropped, while a `??` path genuinely absent from origin is
+/// the real unprotected-WIP case and is always kept.
+async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<String>, String) {
+    // REFRESH origin FIRST, and say what we compared against (tubescience).
+    //
+    // Nothing in this job fetched, so the comparison read whatever the LOCAL
+    // origin/main ref happened to be — current only if some session had been
+    // fetching for its own reasons. Against a frozen ref every path landed
+    // since fails equality, gets kept, and the warning degrades straight back
+    // to the noise this filter removes.
+    //
+    // The danger is not the noise, it is that THE DEGRADED STATE IS
+    // INDISTINGUISHABLE FROM THE PRE-FIX STATE: same warning, same phantoms,
+    // and nobody files a second report because it looks like the bug already
+    // fixed. So the fix goes quiet without anyone learning it went quiet.
+    // A filter that can silently stop filtering must say what it filtered
+    // against — hence the returned provenance string, which the warning prints.
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("git")
+            .args(["-C", dir, "fetch", "--quiet", "origin", "main"])
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .map(|o| o.status.success())
+    .unwrap_or(false);
+
+    let ref_age = tokio::process::Command::new("git")
+        .args(["-C", dir, "log", "-1", "--format=%cr", "origin/main"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let provenance = match (fetched, ref_age.as_deref()) {
+        (true, Some(age)) => format!("compared against origin/main (just fetched; tip {age})"),
+        (false, Some(age)) => format!(
+            "compared against a STALE origin/main (fetch failed; tip {age}) —              paths landed since then will be listed even if they match origin"
+        ),
+        (_, None) => "NOT compared against origin (no origin/main ref) — every path listed".into(),
+    };
+    if ref_age.is_none() {
+        // Cannot compare at all: keep everything. Noisy beats silent.
+        return (paths, provenance);
+    }
+
     let mut kept = Vec::new();
     for p in paths {
         // Does the path exist on origin at all? THE TRAP tubescience hit and
@@ -223,7 +276,7 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> Vec<St
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !exists {
-            kept.push(p); // untracked on origin: always report
+            kept.push(p); // genuinely absent from origin: the real WIP case
             continue;
         }
         let local = tokio::process::Command::new("git")
@@ -247,7 +300,7 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> Vec<St
             kept.push(p);
         }
     }
-    kept
+    (kept, provenance)
 }
 
 /// `git status --porcelain` under `dir`, as repo-relative paths.
@@ -374,14 +427,22 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         // Filtered against ORIGIN, not local HEAD — see
         // drop_paths_identical_to_origin for why `git status` alone answers the
         // wrong question on a graft-push checkout.
-        let dirty = drop_paths_identical_to_origin(dir, dirty_paths(dir).await).await;
+        let (dirty, provenance) =
+            drop_paths_identical_to_origin(dir, dirty_paths(dir).await).await;
         if dirty.is_empty() {
             continue;
         }
         let Some(own) = ownership_from_guard(session, dir, &dirty).await else {
             continue;
         };
-        let Some(msg) = build(dir, &dirty, &own) else { continue };
+        // Provenance rides on EVERY nudge, not only the degraded ones. It is the
+        // healthy line that makes the stale line legible: with a stamp present
+        // in both states, "compared against a STALE origin/main" reads as a
+        // difference. Printed only when degraded, it reads as ordinary prose and
+        // gets skimmed exactly like the phantom paths it is warning about.
+        let Some(msg) = build(dir, &dirty, &own).map(|m| format!("{m}\n\n({provenance})")) else {
+            continue;
+        };
 
         // Cap AFTER deciding there is something to say, so a suppressed-by-cap
         // day does not also consume the "nothing to say" path.
@@ -504,6 +565,87 @@ fn idle_lanes_with_dirs(state: &AppState) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// The reported case, run against a REAL repo because the whole defect is a
+    /// disagreement between what `git status` says and what origin holds — a
+    /// mocked porcelain string cannot express it (creative-dna, 2026-08-10).
+    ///
+    /// A file added on origin AFTER local HEAD reads `??` from `git status`,
+    /// because the local index predates the commit that added it. The earlier
+    /// comment here asserted untracked paths "cannot match origin by
+    /// definition" and this test is what refutes it: the assertion below fails
+    /// the moment anyone "corrects" the code to trust the porcelain letter.
+    #[tokio::test]
+    async fn untracked_but_present_on_origin_is_a_phantom() {
+        let root = std::env::temp_dir().join(format!("amux-nudge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bare, work) = (root.join("origin.git"), root.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // A peer lands a file on origin; we fetch the ref but never merge, so
+        // local HEAD does not contain it.
+        let peer = root.join("peer");
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::write(peer.join("landed.txt"), "from peer\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "peer"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+
+        // Same bytes appear locally. `git status` calls this UNTRACKED.
+        std::fs::write(work.join("landed.txt"), "from peer\n").unwrap();
+        // ...and genuine unprotected WIP, which must survive the filter.
+        std::fs::write(work.join("mywip.txt"), "mine\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let porcelain = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", dir, "status", "--porcelain"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(porcelain.contains("?? landed.txt"), "premise: {porcelain}");
+
+        let (kept, provenance) = drop_paths_identical_to_origin(
+            dir,
+            vec!["landed.txt".into(), "mywip.txt".into()],
+        )
+        .await;
+
+        assert!(!kept.contains(&"landed.txt".to_string()), "untracked-but-on-origin is a phantom");
+        assert!(kept.contains(&"mywip.txt".to_string()), "real WIP must never be dropped");
+        assert!(provenance.contains("origin/main"), "must state what it compared against");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
