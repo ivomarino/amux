@@ -26,8 +26,10 @@
 //!   "All Claude Code" line shows) honest.
 //! - the `token_baseline.json` written by POST /api/stats/reset is honored
 //!   on read (subtract, clamp at 0, ignore stale dates) so both servers
-//!   agree after a reset. The reset endpoint itself is not part of this
-//!   port.
+//!   agree after a reset. The reset endpoint is now ported too (AMUX-2871) —
+//!   until 2026-08-11 this file read a baseline nothing could write, so the
+//!   Tokens tab's reset button was inert and the newest baseline on this
+//!   machine dated from the Python era.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -181,6 +183,86 @@ pub async fn daily(State(state): State<AppState>) -> Response {
         })).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+/// POST /api/stats/reset — "zero today's counter" (py:67954).
+///
+/// The READER above has been honoring `token_baseline.json` since the cutover
+/// while nothing could write it: the route was unmounted, so the Tokens tab's
+/// reset button did nothing and the newest baseline on this machine dated from
+/// 2026-02-18 (the Python era). A reader whose input can never be produced is
+/// the "capability that only exists" shape — the code looks complete and the
+/// feature is inert.
+///
+/// Python recovered the RAW totals by adding its existing baseline back onto
+/// already-subtracted stats. Here the ledger is right there, so raw is read
+/// directly: same result, and it cannot drift out of step with the subtraction
+/// above if either side changes.
+pub async fn reset(State(state): State<AppState>) -> Response {
+    let now = chrono::Local::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let (start, end) = local_day_bounds(now);
+
+    let store = state.store.clone();
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, i64, i64)>> {
+        let conn = store.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT session, COALESCE(SUM(input), 0), COALESCE(SUM(output), 0)
+             FROM token_ledger WHERE ts >= ?1 AND ts < ?2 GROUP BY session",
+        )?;
+        let out = stmt
+            .query_map([start, end], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    })
+    .await;
+    let rows = match rows {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+                .into_response()
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+                .into_response()
+        }
+    };
+
+    let mut sessions = serde_json::Map::new();
+    let (mut total_in, mut total_out) = (0i64, 0i64);
+    for (session, input, output) in rows {
+        total_in += input;
+        total_out += output;
+        // Keyed by proj_dir, which for these rows IS the session key — py:9788
+        // keys by proj_dir "not by display label (can change)". A label-keyed
+        // baseline silently stops matching the moment a worker is renamed.
+        if !session.is_empty() {
+            sessions.insert(session, json!({"input": input, "output": output}));
+        }
+    }
+    let baseline = json!({
+        "date": today,
+        "sessions": Value::Object(sessions),
+        "total_input": total_in,
+        "total_output": total_out,
+    });
+
+    let path = amux_home().join("token_baseline.json");
+    let tmp = path.with_extension("json.tmp");
+    let text = baseline.to_string();
+    match std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+        Ok(()) => Json(json!({"ok": true, "date": today,
+                              "total_input": total_in, "total_output": total_out}))
+        .into_response(),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not write {}: {e}", path.display())})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

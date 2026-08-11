@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.586';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.587';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16364,11 +16364,28 @@ async function _habitsLoad() {
 }
 
 async function _habitsSave() {
-  await fetch(API + '/api/habits', {
-    method: 'PUT',
-    headers: _authHeaders({'Content-Type':'application/json'}),
-    body: JSON.stringify(_habits)
-  });
+  // This awaited a response and read none. The route was unmounted from the
+  // Rust cutover until AMUX-2871, so every tick, add and rename PUT a 404 and
+  // rendered as saved — the file on disk had not moved since 2026-07-04 and
+  // nothing anywhere said so. A whole-array PUT means one unnoticed failure
+  // loses every habit and every day of history, so this is the one call that
+  // must never fail quietly.
+  try {
+    const r = await fetch(API + '/api/habits', {
+      method: 'PUT',
+      headers: _authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify(_habits)
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showToast('Habits NOT saved: ' + (d.error || ('HTTP ' + r.status)));
+      return false;
+    }
+    return true;
+  } catch(e) {
+    showToast('Habits NOT saved: ' + e.message);
+    return false;
+  }
 }
 
 function _habitsRender() {

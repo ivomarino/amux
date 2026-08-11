@@ -23,6 +23,7 @@ pub mod fs;
 pub mod git_guard;
 pub mod gmail_auth;
 pub mod groups;
+pub mod habits;
 pub mod health;
 pub mod history;
 pub mod invariants_api;
@@ -39,6 +40,7 @@ pub mod prefs;
 pub mod py_proxy;
 pub mod request_log;
 pub mod review;
+pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
 pub mod search;
@@ -118,6 +120,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
         .route("/api/stats/daily", axum::routing::get(stats::daily))
+        // The writer for the baseline `daily` already reads (AMUX-2871).
+        .route("/api/stats/reset", axum::routing::post(stats::reset))
         .route("/api/branding", axum::routing::get(branding::get_branding)
             .post(branding::post_branding).delete(branding::delete_branding))
         // base64 icons: the handler's own 5MB check must answer (Python's
@@ -187,6 +191,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/layout-presets", layout_presets::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
+        .nest("/api/saved-messages", saved_messages::routes())
+        .merge(habits::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())

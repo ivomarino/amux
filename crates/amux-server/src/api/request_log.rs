@@ -945,6 +945,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/suggest-branch", methods: &["POST"] },
     RouteEntry { path: "/api/tmux-sessions", methods: &["GET"] },
     RouteEntry { path: "/api/iterm2/sessions", methods: &["GET"] },
+    // -- saved messages / habits / token-baseline reset (AMUX-2871)
+    RouteEntry { path: "/api/saved-messages", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/saved-messages/{id}", methods: &["DELETE", "PATCH"] },
+    RouteEntry { path: "/api/habits", methods: &["GET", "PUT"] },
+    RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },

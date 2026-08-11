@@ -166,6 +166,8 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/suggest-branch", "branch-name suggestions; deterministic with no goal text, helper CLI with one (api/worker_create.rs)"),
     ("/api/tmux-sessions", "tmux sessions amux does not already own, for Connect (api/worker_create.rs)"),
     ("/api/iterm2", "open iTerm2 panes, for Connect-a-pane (api/worker_create.rs)"),
+    ("/api/saved-messages", "peek composer's reusable snippets, per worker (api/saved_messages.rs, AMUX-2871)"),
+    ("/api/habits", "Habits tab state — one JSON array in ~/.amux/habits.json (api/habits.rs, AMUX-2871)"),
     ("/api/scope", "uniform per-capability scope read/write — memory/rules/env/gates/status_mode at global/group/worker, python storage shared byte-for-byte (api/scope.rs, AMUX-2608: the family whose cutover emptied PROXIED_FAMILIES)"),
     ("/api/mcp", "MCP registry — list/import/remove (AMUX-2871)"),
     ("/api/sql", "SQL browser — schema/rows/query, read-only unless write:true"),
