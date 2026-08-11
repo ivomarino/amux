@@ -1588,16 +1588,44 @@ async function _upqDrain() {
   _upqRenderBadge();
 }
 
+// ONE pending count over BOTH offline stores (AMUX-2317).
+//
+// Files and dictation keep SEPARATE IDB stores on purpose — reviewer decision,
+// amux-homepage: a file upload lands bytes and is done, while a dictation POST
+// returns a transcript that goes into the composer and whose retry legitimately
+// yields a NEW result for the same audio. One queue would have to special-case
+// that, at which point it is not one queue.
+//
+// What a user needs is not one store, it is one ANSWER to "is anything of mine
+// still unsent". Before this, file uploads were visible only on Files/Explore
+// and clips only inside the peek dictation tab, so each surface confidently
+// showed a partial count and neither said so.
+async function _pendingSummary() {
+  let files = [], clips = [];
+  try { files = await _upqList(); } catch (e) {}
+  try { clips = ((await _idb.get('dict_pending')) || []).filter(x => x.state !== 'done'); } catch (e) {}
+  const bytes = files.reduce((a, x) => a + (x.size || 0), 0)
+              + clips.reduce((a, x) => a + ((x.blob && x.blob.size) || 0), 0);
+  return { files: files.length, clips: clips.length, total: files.length + clips.length, bytes };
+}
+
+function _fmtPendingBytes(b) {
+  return b / 1024 >= 1024 ? (b / 1048576).toFixed(1) + ' MB'
+                          : Math.max(1, Math.round(b / 1024)) + ' KB';
+}
+
 // A pending upload must never be indistinguishable from a lost one.
 async function _upqRenderBadge() {
-  const q = await _upqList();
+  const p = await _pendingSummary();
   document.querySelectorAll('.upq-badge').forEach(el => {
-    if (!q.length) { el.style.display = 'none'; el.textContent = ''; return; }
-    const bytes = q.reduce((a, x) => a + (x.size || 0), 0);
+    if (!p.total) { el.style.display = 'none'; el.textContent = ''; return; }
+    // Name BOTH kinds when both are present. "3 queued uploads" while one of
+    // them is a voice note is the partial-count problem with extra confidence.
+    const parts = [];
+    if (p.files) parts.push(p.files + ' upload' + (p.files === 1 ? '' : 's'));
+    if (p.clips) parts.push(p.clips + ' recording' + (p.clips === 1 ? '' : 's'));
     el.style.display = '';
-    el.textContent = q.length + ' queued upload' + (q.length === 1 ? '' : 's')
-      + ' (' + (bytes / 1024 >= 1024 ? (bytes / 1048576).toFixed(1) + ' MB'
-                                     : Math.max(1, Math.round(bytes / 1024)) + ' KB') + ')'
+    el.textContent = parts.join(' + ') + ' queued (' + _fmtPendingBytes(p.bytes) + ')'
       + (online ? ' \u2014 sending\u2026' : ' \u2014 waiting for connection');
   });
 }
@@ -6952,7 +6980,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.589';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.590';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11700,6 +11728,9 @@ async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
   const n = q.filter(x => x.state !== 'done').length;
+  // Repaint the shared badge too: a clip added or drained changes the ONE
+  // pending count, and the Files/Explore surfaces have no other trigger for it.
+  try { _upqRenderBadge(); } catch (e) {}
   const el = document.getElementById('dict-pending');
   if (el) el.textContent = n ? n + ' pending' : '';
   const dot = document.getElementById('dict-outbox-dot');
