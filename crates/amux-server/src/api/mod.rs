@@ -65,6 +65,7 @@ pub mod workers_deadletters;
 use crate::db::SharedStore;
 use axum::Router;
 use std::time::Instant;
+use tower_http::compression::CompressionLayer;
 
 /// Shared application state for handlers.
 #[derive(Clone)]
@@ -302,6 +303,12 @@ pub fn router(state: AppState) -> Router {
     // router. Auth is inside the wrapper — legacy paths are exactly as
     // protected as canonical ones.
     let app = aliases::alias_layer(app);
+
+    // Transparent gzip compression for every response whose client sends
+    // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
+    // sessions from 149KB to 21KB, and the SPA shell from 215KB to 46KB.
+    let app = app.layer(CompressionLayer::new());
+
     // Structured request log (AMUX-2605): the OUTERMOST wrap, so every
     // request — including alias-rewritten and fallback paths — is recorded
     // with the RAW path the client sent. Never blocks or fails a request
