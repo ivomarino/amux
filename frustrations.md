@@ -2889,3 +2889,25 @@ FIX: The older path is now a delegate that execs the real one, with a comment
   reporting itself (see the entry above — already-running lanes never call
   either path), but it does mean a lane started from now on cannot get the
   degraded version.
+
+## Peek "Loading latest..." visible for 300ms+ on cellular despite cached content being ready
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-10
+SESSION: amux
+CARD: AMUX-2847
+SYMPTOM: Opening a peek on mobile showed "Loading latest..." spinner for 150ms+
+  even when IDB had cached peek content from a prior open. Two causes:
+  (1) the IDB fallback timer was 150ms, designed for WiFi where live fetch is 18ms
+  but too long on cellular where the fetch is 300-600ms.
+  (2) _paintCachedPeek re-ran the full ansiToHtml pipeline on ~143KB of cached raw
+  ANSI text every open, taking 50-200ms on a phone, when the rendered HTML was
+  already available from the prior render.
+COST: Every peek open on cellular felt sluggish. The first content frame was
+  delayed by both the timer and the re-render, totaling 200-400ms of unnecessary
+  spinner on mobile.
+FIX: Two changes: (a) cache pre-rendered HTML (liveHTML, histHTML) alongside raw
+  in IDB, so _paintCachedPeek skips ansiToHtml when cached HTML exists; (b) reduce
+  the IDB fallback timer from 150ms to 30ms (WiFi live fetch still wins at ~18ms,
+  but cellular gets cached content 120ms sooner).
