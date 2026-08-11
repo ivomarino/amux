@@ -6908,7 +6908,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.575';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.576';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23111,8 +23111,37 @@ async function _swOfferGoodOrigin() {
     + (good && good !== here
         ? '<button onclick="location.href=' + JSON.stringify(good) + '" style="flex-shrink:0;min-height:44px;padding:0 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.5);background:transparent;color:#fff;font-weight:600;cursor:pointer;">Open</button>'
         : '')
-    + '<button onclick="this.parentNode.remove()" style="flex-shrink:0;min-height:44px;min-width:44px;border:none;background:transparent;color:#fff;font-size:1.1rem;cursor:pointer;">&#215;</button>';
-  const attach = () => document.body && document.body.appendChild(bar);
+    + '<button onclick="window._swFailDismiss&&window._swFailDismiss()" style="flex-shrink:0;min-height:44px;min-width:44px;border:none;background:transparent;color:#fff;font-size:1.1rem;cursor:pointer;">&#215;</button>';
+  // PUBLISH THE BAR'S HEIGHT so overlays can clear it (AMUX-2584).
+  //
+  // The bar is position:fixed bottom:0 at z-index 9999; .board-edit-overlay is
+  // 600. So it lands ON TOP of the modal, and the modal's Save/Cancel row is
+  // `position:sticky; bottom:0` INSIDE the box — i.e. pinned to exactly the
+  // strip the bar occupies. At 375px the bar wraps to three or four lines and
+  // swallows the whole action row: the modal opens, looks fine, and Save cannot
+  // be tapped. Raising the modal's z-index would be wrong — the bar says
+  // offline mode is off, which the user needs to keep seeing.
+  //
+  // A CSS variable rather than a fixed offset because the height is not
+  // knowable up front: it depends on which of the two messages is shown, on
+  // whether the Open button is present, on the wrap at this width, and on
+  // env(safe-area-inset-bottom). Measured after attach, so it is the real one.
+  const publishHeight = () => {
+    const h = bar.offsetHeight || 0;
+    document.documentElement.style.setProperty('--sw-fail-h', h + 'px');
+  };
+  window._swFailDismiss = () => {
+    bar.remove();
+    document.documentElement.style.setProperty('--sw-fail-h', '0px');
+  };
+  const attach = () => {
+    if (!document.body) return;
+    document.body.appendChild(bar);
+    publishHeight();
+    // Re-measure on rotate/resize: the message re-wraps and the height changes.
+    if (window.ResizeObserver) new ResizeObserver(publishHeight).observe(bar);
+    else window.addEventListener('resize', publishHeight);
+  };
   if (document.body) attach(); else document.addEventListener('DOMContentLoaded', attach);
 }
 

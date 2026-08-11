@@ -3770,7 +3770,15 @@
   .board-edit-overlay {
     position: fixed; inset: 0; z-index: 600;
     background: rgba(0,0,0,0); align-items: center; justify-content: center;
-    padding: 16px; display: flex; pointer-events: none;
+    /* Bottom padding clears the sw-fail-bar (AMUX-2584). That bar is fixed at
+       bottom:0 with z-index 9999, above this overlay, and the box's Save row is
+       sticky bottom:0 INSIDE the box — so without this the bar covers exactly
+       the strip Save lives in, and at 375px it wraps to 3-4 lines and hides the
+       action row entirely. --sw-fail-h is published by the bar itself after it
+       measures, and reset to 0px when dismissed; the fallback keeps this inert
+       on every origin that installs its service worker normally. */
+    padding: 16px 16px calc(16px + var(--sw-fail-h, 0px));
+    display: flex; pointer-events: none;
     transition: background 0.25s;
   }
   .board-edit-overlay.active { background: rgba(0,0,0,0.6); pointer-events: auto; }
@@ -3782,7 +3790,9 @@
   .board-edit-box {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; padding: 16px; width: 100%; max-width: 400px;
-    max-height: calc(100dvh - 32px); overflow-y: auto;
+    /* Same subtraction as the overlay padding: the box must shrink, not just
+       shift, or a tall card still runs its sticky footer under the bar. */
+    max-height: calc(100dvh - 32px - var(--sw-fail-h, 0px)); overflow-y: auto;
   }
   .board-edit-box input, .board-edit-box textarea, .board-edit-box select {
     width: 100%; padding: 8px 10px; border-radius: 8px;
