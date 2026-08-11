@@ -3153,3 +3153,60 @@ FIX: b5a874a — strip before the truthiness test, and name the likely cause
   outcomes rather than transport — and its one total-silence path was never
   exercised, because it only fires when the server returns nothing at all.
   A handler for the case you believe cannot happen is the handler nobody runs.
+
+## A ported reader over an unported writer served a confident zero for 36 hours
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2892
+SYMPTOM: `GET /api/stats/daily` — ported, live, and looking entirely healthy —
+  served `{"total_tokens": 0, "sessions": 0}`. token_ledger's newest row was
+  36.3 hours old with ZERO rows in the last 24h. The only INSERT INTO
+  token_ledger anywhere in crates/ was a TEST helper. Source data was never the
+  problem: the conversation JSONLs were being appended that same minute.
+COST: the Tokens tab has read zero since the cutover, and nobody noticed,
+  because a zero on a usage panel is indistinguishable from a quiet day. Anyone
+  reading fleet spend in that window got a number that was wrong in the
+  direction that raises no questions. I found it only because I was about to
+  port a SECOND reader (/api/observability) onto the same dead table — which
+  would have shipped a Cost tab rendering confidently over nothing.
+FIX: cd731bd — the indexer is ported as a periodic runtime job.
+  The pattern, and this is the third instance in one day: the cutover split
+  reader/writer pairs and shipped whichever half was reachable from a route.
+  POST /api/stats/reset was a WRITER whose reader existed (inert button, ported
+  9f4ef24). token_ledger was a READER whose writer did not (confident zero).
+  apply-template was a reader whose PATH RESOLUTION had been deleted with the
+  Python server. Each half looked complete in isolation and each passed review.
+  What none of them had was a check that the OTHER end existed — which is
+  cheaper than it sounds: every one of the three was found in under a minute by
+  asking "who writes this / who reads this" and grepping for the answer.
+  Worth a standing sweep: for every table and every file the server reads,
+  assert something in crates/ writes it, and vice versa.
+
+## I quoted a file count without checking the code could reach all of it
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2894
+SYMPTOM: I wrote "2637 JSONLs under ~/.claude/projects ... nothing read them"
+  into a board card AND a commit message. The count was right; the implication
+  was false. Only 337 sit at `projects/*/*.jsonl`, the depth the indexer
+  actually scans. I had run `find -name '*.jsonl'` (recursive) and compared it
+  against code doing a ONE-LEVEL glob, without noticing the two were measuring
+  different sets.
+COST: small directly — a wrong scale figure in a commit message, corrected on
+  the card. Worth logging anyway because it is the same failure as the
+  `-newermt` probe 20 minutes earlier in the same session (bfs rejected the
+  expression, `2>/dev/null` swallowed the error, `wc -l` printed 0, and I read
+  "no recent activity" off a probe that had not run). Twice in one hour I
+  measured with a tool whose scope did not match the code's.
+FIX: the discipline is one line — when a number describes what CODE sees, take
+  the measurement the way the code takes it, not the way that is convenient to
+  type. `ls projects/*/*.jsonl` and `find projects -name '*.jsonl'` differ by
+  87% here and neither is wrong; only one of them was about the indexer.
+  The error was productive by luck, not by method: the 2300-file discrepancy is
+  what exposed AMUX-2894 (subagent usage never counted, by either server).
