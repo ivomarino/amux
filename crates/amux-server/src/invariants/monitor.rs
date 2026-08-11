@@ -253,6 +253,21 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
         if path.len() < 5 || !path.starts_with("/api/") {
             continue;
         }
+        // A GLOB IS DOCUMENTATION, NOT A CALL SITE. `amux crm help` prints
+        // "HTTP: /api/crm/*", and the curl anchor does NOT save it — the help
+        // heredoc sits within 600 chars of the branch's real curls. So the
+        // anchor narrows the phantom class, it does not eliminate it, and the
+        // remaining shapes have to be named. `*` cannot appear in a request
+        // path this server routes, so a literal containing one is prose.
+        //
+        // Caught by dumping what the scanner actually reported instead of
+        // trusting the failure count: the census was clean, because the SPA
+        // catch-all happens to match `/api/crm/*` today. A phantom that is
+        // currently harmless is still a phantom, and it would have surfaced as
+        // a false failure the moment that matching changed.
+        if path.contains('*') || path.contains('{') || path.contains('%') {
+            continue;
+        }
         // Interpolated if the literal was cut short by an expansion or ended in
         // a slash — then it is a prefix and must match leniently.
         let cut_char = rest[endrel..].chars().next();
@@ -598,6 +613,25 @@ mod shell_scanner_tests {
         assert!(got[0].interpolated, "an expansion means match leniently");
     }
 
+    /// Documentation shapes are not call sites, even with a curl nearby — the
+    /// anchor narrows the phantom class but does not eliminate it.
+    #[test]
+    fn a_glob_in_the_path_is_prose_not_a_caller() {
+        let sh = r#"
+          curl -sk "$AMUX_URL/api/crm/contacts"
+          cat <<'EOH'
+          amux crm — contacts (HTTP: /api/crm/*)
+EOH
+        "#;
+        let got = scan_shell_calls(sh, "t");
+        assert!(
+            got.iter().all(|c| !c.path.contains('*')),
+            "a glob is documentation: {:?}",
+            got.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+        assert!(got.iter().any(|c| c.path == "/api/crm/contacts"), "the real call still counts");
+    }
+
     /// The real CLI must yield real call sites — an extractor that finds
     /// nothing is broken, not vindicated (the empty-grep trap).
     #[test]
@@ -607,6 +641,27 @@ mod shell_scanner_tests {
         assert!(
             found.iter().any(|c| c.path.starts_with("/api/board")),
             "the CLI certainly calls /api/board"
+        );
+    }
+}
+
+#[cfg(test)]
+mod extractor_wiring_tests {
+    /// The CLI scan must actually be WIRED into the census, not merely exist.
+    /// A scanner nobody calls and a codebase with no CLI defects produce the
+    /// identical result — zero new failures — so the count alone cannot tell
+    /// them apart (ethos rule 4).
+    #[test]
+    fn extract_caller_paths_includes_the_cli() {
+        let all = super::extract_caller_paths();
+        let cli: Vec<_> = all.iter().filter(|c| c.source == "cli:amux").collect();
+        let spa: Vec<_> = all.iter().filter(|c| c.source == "spa:app.js").collect();
+        assert!(!spa.is_empty(), "the SPA scan regressed");
+        assert!(
+            cli.len() > 10,
+            "the CLI scan is not reaching the census — found {} cli callers out of {} total",
+            cli.len(),
+            all.len()
         );
     }
 }
