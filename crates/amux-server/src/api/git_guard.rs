@@ -788,6 +788,35 @@ pub async fn staged_guard_inner(
              an empty result does not clear their files",
             blind.join(", ")
         ));
+        // AND SAY SO WHERE IT CAN BE COUNTED (AMUX-2936). Until now this
+        // verdict was returned to the hook and nowhere else: the operator saw
+        // "PARTIAL — no transcript for cotenant(s) X" on their own terminal and
+        // the server recorded nothing, so the rate was unmeasurable from the
+        // logs. That is the reason AMUX-2936 could not be decided — its own
+        // instruction was "measure the base rate before choosing a design", and
+        // the base rate had no trace to measure.
+        //
+        // It matters more than a missing counter usually would, because this is
+        // the ONLY class through which an absorption passes silently. `foreign`
+        // already exits 1 and blocks the commit (740 blocks in 40 hours, so the
+        // blocking half demonstrably works). A blind cotenant cannot produce a
+        // `foreign` row at all — their edits are invisible — so their files land
+        // in `unclaimed`, which is explicitly not blockable, and the sweep goes
+        // through with a warning nobody is obliged to read.
+        //
+        // Coverage also DECAYS: a session that has stopped has no live
+        // transcript, so every retired lane permanently widens the blind set
+        // while the guard keeps answering 200.
+        tracing::warn!(
+            target: "staged_guard",
+            "[staged-guard/AMUX-2936] blind-cotenant verdict for {} in {}: {} invisible ({}), \
+             {} staged path(s) — an absorption of THEIR work would pass silently here",
+            if session.is_empty() { "(no session)" } else { &session },
+            wd_root,
+            blind.len(),
+            blind.join(","),
+            rel_paths.len()
+        );
     }
 
     let now = now_epoch();
