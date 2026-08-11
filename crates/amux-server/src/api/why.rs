@@ -188,9 +188,7 @@ impl Why {
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response()
-}
+use super::internal;
 
 fn epoch_to_rfc3339(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)

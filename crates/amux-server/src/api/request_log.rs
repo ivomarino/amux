@@ -36,7 +36,6 @@
 use super::AppState;
 use crate::db::{SharedStore, WriteOutcome};
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -750,13 +749,7 @@ fn raw_payload(log_path: &Path, lines_n: usize, state: &AppState) -> anyhow::Res
     }))
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": e.to_string()})),
-    )
-        .into_response()
-}
+use super::internal;
 
 // ---------------------------------------------------------------------------
 // ROUTE_TABLE — the routing truth (AMUX-2610)
@@ -1636,6 +1629,7 @@ pub async fn debug_routes() -> axum::Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;   // lib no longer needs it; these tests do
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;

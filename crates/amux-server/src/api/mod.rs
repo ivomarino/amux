@@ -354,6 +354,23 @@ const PLACEHOLDER_API_KEYS: &[&str] = &[
     "sk-ant-xxx", "sk-ant-your-key", "sk-ant-example", "sk-ant-placeholder",
 ];
 
+/// The 500 every API module was spelling for itself (AMUX-2919).
+///
+/// Fourteen identical private copies, in two spellings — half via a local
+/// `err()`, half constructing the tuple inline — all producing exactly
+/// `500 {"error": "<display>"}`. Identical output, so unlike `truthy` below
+/// this one really was duplication rather than divergence. Shared so the error
+/// SHAPE cannot drift per-module: a client parsing `.error` should not have to
+/// care which family answered.
+pub(crate) fn internal(e: impl std::fmt::Display) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
+
 /// Python truthiness for a JSON value ({} , "" , [] , 0 falsy) — identity's
 /// `oauthAccount` check and scope's `if items:` gate share it.
 pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {

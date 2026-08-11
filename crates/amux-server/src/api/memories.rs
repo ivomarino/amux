@@ -44,12 +44,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    err(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({ "error": e.to_string() }),
-    )
-}
+use super::internal;
 
 fn not_found(id: &str) -> Response {
     err(
