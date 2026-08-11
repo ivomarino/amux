@@ -123,13 +123,28 @@ async fn async_main() {
     fn stdout_is_same_file(f: &std::fs::File) -> bool {
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
             use std::os::unix::fs::MetadataExt;
-            match (f.metadata(), std::fs::metadata("/dev/fd/1")) {
-                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            // fstat the DESCRIPTOR, never stat("/dev/fd/1"): on macOS that path
+            // stats the /dev entry itself and reports a character device, so it
+            // never matches a regular file. The first cut of this fix did
+            // exactly that, shipped, and reported tee_to_stdout=true against a
+            // log that was provably still doubling — a probe guessing where the
+            // answer lived and missing by one layer.
+            //
+            // try_clone_to_owned() dups fd 1; dropping the dup does not close
+            // stdout, so this stays safe with no `unsafe` and no mem::forget.
+            let Ok(a) = f.metadata() else { return false };
+            let same = std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .map(std::fs::File::from)
+                .and_then(|sf| sf.metadata())
+                .map(|b| a.dev() == b.dev() && a.ino() == b.ino())
                 // Unknown: keep the tee. Over-logging is recoverable; losing the
                 // log because a stat failed is not.
-                _ => false,
-            }
+                .unwrap_or(false);
+            same
         }
         #[cfg(not(unix))]
         {
