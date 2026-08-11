@@ -940,7 +940,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/layout-presets/{name}", methods: &["DELETE"] },
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/skills", methods: &["GET"] },
-    RouteEntry { path: "/api/skills/{name}", methods: &["GET"] },
+    RouteEntry { path: "/api/skills/{name}", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/slash-commands", methods: &["GET"] },
     RouteEntry { path: "/api/slash-commands/{name}", methods: &["GET"] },
     RouteEntry { path: "/api/map", methods: &["GET", "POST"] },
