@@ -200,6 +200,100 @@ fn extract_caller_paths() -> Vec<checks::CallerPath> {
         let text = String::from_utf8_lossy(&js.data);
         out.extend(scan_js_calls(&text, "spa:app.js"));
     }
+    // THE CLI HALF (AMUX-2917). CallerPath::source has documented
+    // `"spa:app.js" / "cli:amux"` since this check was written, and CLAUDE.md's
+    // observability table describes the invariant as enumerating "SPA/CLI call
+    // sites" — but only the SPA was ever scanned. The CLI is the fleet's other
+    // real client (every `amux board`, `amux send`, `amux crm` is a curl), so
+    // half the callers were outside the only check that can name an unrouted
+    // one.
+    //
+    // Embedded at BUILD time, like app.js, deliberately: reading it off disk
+    // would check whatever `amux` happens to be sitting in the checkout —
+    // possibly a peer's mid-edit — instead of the source this binary was built
+    // from. Same reason the e2e harness builds HEAD (AMUX-2924).
+    out.extend(scan_shell_calls(include_str!("../../../../amux"), "cli:amux"));
+    out
+}
+
+/// Pull `"$AMUX_URL/api/..."` call sites out of the bash CLI, with their method.
+///
+/// METHOD IS KNOWABLE HERE, unlike in the SPA, because curl's own rules decide
+/// it: an explicit `-X VERB` wins, otherwise `-d`/`--data`/`--data-binary`
+/// means POST, otherwise GET. That is not a heuristic, it is curl's documented
+/// behaviour — so these call sites carry `method_known: true` and a genuine
+/// 405 (route exists, wrong verb) is detectable in the CLI as well.
+///
+/// Anchored on the `curl` token rather than on the path, and that is the whole
+/// accuracy story: this file is 2400 lines of shell in which `/api/...` also
+/// appears inside help text, echoed examples and comments. Requiring a `curl`
+/// within the preceding window is what keeps a printed example (`echo "  curl
+/// -sk \"$AMUX_URL/api/workers/...\""`) from being reported as a live caller —
+/// though an echoed example that really is malformed will still be caught,
+/// which is a feature.
+fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(p) = sh[i..].find("/api/") {
+        let start = i + p;
+        // The literal runs until anything that ends a shell word or starts an
+        // expansion. `$` stops it because `/api/board/$id` is a PREFIX, not a
+        // path — same rule the JS scanner uses, for the same reason.
+        let rest = &sh[start..];
+        let endrel = rest
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | '$' | '?' | '\\' | ')' | ';' | '|' | '>')
+            })
+            .unwrap_or(rest.len());
+        let raw = &rest[..endrel];
+        i = start + endrel.max(1);
+
+        let path = raw.trim_end_matches('/');
+        if path.len() < 5 || !path.starts_with("/api/") {
+            continue;
+        }
+        // Interpolated if the literal was cut short by an expansion or ended in
+        // a slash — then it is a prefix and must match leniently.
+        let cut_char = rest[endrel..].chars().next();
+        let interpolated = raw.ends_with('/') || matches!(cut_char, Some('$') | Some('`'));
+
+        // Backward to the anchoring `curl`. Bash puts flags BEFORE the URL, so
+        // backward is correct here — the opposite of the SPA, where the method
+        // literal follows the URL.
+        let win_start = start.saturating_sub(600);
+        let mut win_start = win_start;
+        while win_start > 0 && !sh.is_char_boundary(win_start) {
+            win_start -= 1;
+        }
+        let window = &sh[win_start..start];
+        let Some(curl_at) = window.rfind("curl") else { continue };
+        let cmd = &window[curl_at..];
+
+        let method = if let Some(x) = cmd.find("-X ") {
+            cmd[x + 3..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("GET")
+                .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                .to_uppercase()
+        } else if cmd.contains(" -d ") || cmd.contains("--data") {
+            // curl: a body without an explicit verb is a POST.
+            "POST".to_string()
+        } else {
+            "GET".to_string()
+        };
+        if method.is_empty() {
+            continue;
+        }
+        out.push(checks::CallerPath {
+            method,
+            path: path.to_string(),
+            source: source.to_string(),
+            interpolated,
+            method_known: true,
+        });
+    }
     out
 }
 
@@ -453,3 +547,66 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod shell_scanner_tests {
+    use super::*;
+
+    /// curl's own rules, which is why these carry method_known=true: an
+    /// explicit -X wins; a body without one is a POST; otherwise GET.
+    #[test]
+    fn the_method_comes_from_curls_rules_not_a_guess() {
+        let sh = r#"
+          curl -sk "$AMUX_URL/api/board"
+          curl -sk -X PATCH -H 'x: y' -d "$body" "$AMUX_URL/api/prefs"
+          curl -sk -d "$json" "$AMUX_URL/api/alert/owner"
+          curl -sk -X DELETE "$AMUX_URL/api/schedules/SCHED-1"
+        "#;
+        let got: Vec<(String, String)> =
+            scan_shell_calls(sh, "t").into_iter().map(|c| (c.method, c.path)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("GET".into(), "/api/board".into()),
+                ("PATCH".into(), "/api/prefs".into()),
+                ("POST".into(), "/api/alert/owner".into()),
+                ("DELETE".into(), "/api/schedules/SCHED-1".into()),
+            ]
+        );
+    }
+
+    /// The anchor is what stops help text and comments being reported as live
+    /// callers. Without it this file's 2400 lines of shell would produce
+    /// phantom failures, and a check that cries wolf gets turned off.
+    #[test]
+    fn a_path_with_no_curl_in_front_of_it_is_not_a_caller() {
+        let sh = r#"
+          # see also /api/does-not-exist for the old contract
+          echo "  try: $AMUX_URL/api/also-not-real"
+        "#;
+        assert!(scan_shell_calls(sh, "t").is_empty(), "comments and echoes are not call sites");
+    }
+
+    /// `$` cuts the literal, so `/api/board/$id` is a PREFIX. Treating it as an
+    /// exact path is what produced 86 false failures on the SPA scanner's first
+    /// live run.
+    #[test]
+    fn an_expansion_makes_the_path_a_prefix() {
+        let got = scan_shell_calls(r#"curl -sk "$AMUX_URL/api/board/$id""#, "t");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/api/board");
+        assert!(got[0].interpolated, "an expansion means match leniently");
+    }
+
+    /// The real CLI must yield real call sites — an extractor that finds
+    /// nothing is broken, not vindicated (the empty-grep trap).
+    #[test]
+    fn the_real_cli_yields_call_sites() {
+        let found = scan_shell_calls(include_str!("../../../../amux"), "cli:amux");
+        assert!(found.len() > 20, "only {} call sites scraped from the CLI", found.len());
+        assert!(
+            found.iter().any(|c| c.path.starts_with("/api/board")),
+            "the CLI certainly calls /api/board"
+        );
+    }
+}
