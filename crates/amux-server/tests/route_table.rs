@@ -214,6 +214,39 @@ async fn route_table_matches_the_real_router_both_directions() {
 /// inside the module and are not visible to a source scan of mod.rs — stating
 /// that plainly rather than implying full coverage, which is the overclaim this
 /// test exists to correct.
+/// Nested routes known to be missing from ROUTE_TABLE (AMUX-2937).
+///
+/// These answer for real — probed live, they return JSON from their handlers,
+/// not the SPA catch-all's HTML — while `/api/debug/routes` and the
+/// `route.callers_have_routes` census both read the TABLE and so report them as
+/// unrouted. They are listed rather than fixed in the same pass because a
+/// ROUTE_TABLE row carries METHODS, and a row with the WRONG methods is worse
+/// than a missing one: it manufactures false 405 verdicts in the very census
+/// this table feeds. Extracting the verbs mechanically resolved 6 of 17
+/// reliably, so the rest need reading by hand.
+///
+/// The list is checked in BOTH directions below, so it cannot go stale: adding
+/// a row to ROUTE_TABLE without removing it here fails too.
+const KNOWN_UNTABLED: &[&str] = &[
+    "/api/board/contract",
+    "/api/browser",
+    "/api/browser/{*rest}",
+    "/api/dictation",
+    "/api/dictation/{*rest}",
+    "/api/file/{*rest}",
+    "/api/fs",
+    "/api/fs/{*rest}",
+    "/api/schedules/{id}/skip",
+    "/api/scope/{*rest}",
+    "/api/search",
+    "/api/search/reindex",
+    "/api/search/status",
+    "/api/tags/{*rest}",
+    "/api/why",
+    "/api/why/contract",
+    "/api/why/{kind}/{id}",
+];
+
 #[test]
 fn every_directly_routed_api_path_is_in_the_table() {
     let src = include_str!("../src/api/mod.rs");
@@ -242,8 +275,122 @@ fn every_directly_routed_api_path_is_in_the_table() {
             missing.push(path.to_string());
         }
     }
+    // AND FOLLOW `.nest()` INTO THE SUB-ROUTER. The scan above only sees
+    // `.route()` calls written in api/mod.rs itself, so an entire family
+    // mounted as `.nest("/api/crm", crm::routes())` was invisible: its routes
+    // live in crm.rs. That is the same blind spot as the multi-line one above,
+    // one level up — and it cost exactly what the docstring predicts. The CRM
+    // port (AMUX-2929) shipped five routes that answered 200 while
+    // `/api/debug/routes` and `route.callers_have_routes` both called them
+    // unrouted, and this test stayed green through all of it.
+    //
+    // Found by the CLI caller scan (AMUX-2917) reporting `POST /api/crm/contacts`
+    // as having no route — a NEW instrument catching the gap an older one was
+    // structurally unable to see.
+    let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+    let mut rest = src;
+    while let Some(i) = rest.find(".nest(") {
+        rest = &rest[i + ".nest(".len()..];
+        let after = rest.trim_start();
+        let Some(stripped) = after.strip_prefix('"') else { continue };
+        let Some(end) = stripped.find('"') else { continue };
+        let prefix = &stripped[..end];
+        if !prefix.starts_with("/api/") {
+            continue;
+        }
+        // `.nest("/api/crm", crm::routes())` and
+        // `.nest("/api/push", crate::push::routes())` — take the LAST module
+        // segment before `::fn()`, so a `crate::` prefix does not become a
+        // module named "crate" (it did, and reported an unreadable crate.rs).
+        let tail = &stripped[end..];
+        let Some(comma) = tail.find(',') else { continue };
+        let Some(open) = tail[comma..].find('(') else { continue };
+        let callee: String = tail[comma + 1..comma + open].trim().to_string();
+        let segs: Vec<&str> = callee.split("::").map(str::trim).collect();
+        if segs.len() < 2 {
+            continue;
+        }
+        let func = segs[segs.len() - 1];
+        let module = segs[segs.len() - 2];
+        if module.is_empty() || module == "crate" {
+            continue;
+        }
+        // `push` is a DIRECTORY module (src/push/mod.rs), so try both layouts
+        // before declaring it unreadable.
+        let msrc = std::fs::read_to_string(api_dir.join(format!("{module}.rs")))
+            .or_else(|_| std::fs::read_to_string(api_dir.join(module).join("mod.rs")))
+            .or_else(|_| {
+                std::fs::read_to_string(
+                    api_dir.parent().unwrap().join(module).join("mod.rs"),
+                )
+            });
+        let Ok(msrc) = msrc else {
+            // A module we cannot read is NOT a pass — a silently skipped nest
+            // is the failure this block exists to fix.
+            missing.push(format!("<unreadable {module}.rs for nest {prefix}>"));
+            continue;
+        };
+        // ONLY THE NAMED FUNCTION'S BODY. Scanning the whole file was the first
+        // version and it was wrong in two ways at once: a module may define
+        // SEVERAL routers (groups.rs has routes() and tags_routes()), and any
+        // `.route("/api/...")` belonging to a non-nested one got the nest
+        // prefix glued on — producing "/api/cal-events/api/calendar.ics" and
+        // "/api/logs/api/board", paths that exist nowhere. A check that invents
+        // paths is worse than the blindness it replaced.
+        let Some(fstart) = msrc.find(&format!("fn {func}(")) else { continue };
+        let Some(brace) = msrc[fstart..].find('{') else { continue };
+        let mut depth = 0i32;
+        let mut fend = fstart + brace;
+        for (k, c) in msrc[fstart + brace..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        fend = fstart + brace + k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &msrc[fstart + brace..fend];
+        let mut mrest = body;
+        while let Some(j) = mrest.find(".route(") {
+            mrest = &mrest[j + ".route(".len()..];
+            let a = mrest.trim_start();
+            let Some(st) = a.strip_prefix('"') else { continue };
+            let Some(e) = st.find('"') else { continue };
+            let sub = &st[..e];
+            // A nested router's paths are RELATIVE. An absolute /api/ literal
+            // here means the scan wandered outside the nested router, so
+            // gluing the prefix on would fabricate a path.
+            if sub.starts_with("/api/") {
+                continue;
+            }
+            let full =
+                if sub == "/" { prefix.to_string() } else { format!("{}{}", prefix, sub) };
+            if !tabled.contains(full.as_str()) {
+                missing.push(full);
+            }
+        }
+    }
+
     missing.sort();
     missing.dedup();
+
+    // The mirror, so the allowlist cannot rot: a path that has since been
+    // tabled must be dropped from KNOWN_UNTABLED, or the list slowly becomes a
+    // place where real gaps hide.
+    let stale: Vec<&str> =
+        KNOWN_UNTABLED.iter().copied().filter(|k| !missing.iter().any(|m| m == k)).collect();
+    assert!(
+        stale.is_empty(),
+        "KNOWN_UNTABLED lists paths that are now tabled (or gone) — delete them: {stale:?}"
+    );
+
+    let missing: Vec<String> =
+        missing.into_iter().filter(|m| !KNOWN_UNTABLED.contains(&m.as_str())).collect();
     assert!(
         missing.is_empty(),
         "mounted in api/mod.rs but absent from ROUTE_TABLE — the route census reads \

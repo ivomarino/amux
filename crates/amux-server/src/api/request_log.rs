@@ -943,6 +943,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/saved-messages", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/saved-messages/{id}", methods: &["DELETE", "PATCH"] },
     RouteEntry { path: "/api/habits", methods: &["GET", "PUT"] },
+    // CRM (AMUX-2929). Mounted via .nest("/api/crm", crm::routes()), which the
+    // completeness test could not see until AMUX-2917 taught it to follow
+    // nests — so these answered 200 while the census called them unrouted.
+    RouteEntry { path: "/api/crm/contacts", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/crm/contacts/{id}", methods: &["GET", "PATCH", "DELETE"] },
+    RouteEntry { path: "/api/crm/contacts/{id}/interactions", methods: &["POST"] },
+    RouteEntry { path: "/api/crm/interactions/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/crm/followups", methods: &["GET"] },
     RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
     RouteEntry { path: "/api/observability", methods: &["GET"] },
     RouteEntry { path: "/api/pull", methods: &["POST"] },
