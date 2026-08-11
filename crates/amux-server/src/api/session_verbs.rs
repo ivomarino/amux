@@ -55,6 +55,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Compile-once regex at the use site: each expansion gets its own static.
+///
+/// This file's pane detectors run on the steering tick, the status sweep and
+/// every peek — measured 2026-08-11 (AMUX-2906 survey): 41 `Regex::new`
+/// compiles per call on those paths while 25 other sites in the same file
+/// already used the OnceLock idiom by hand. One spelling, zero per-call
+/// compiles. Only for STATIC patterns — a dynamic pattern would cache its
+/// first value forever and silently ignore every later one.
+macro_rules! cached_re {
+    ($pat:expr) => {{
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new($pat).unwrap())
+    }};
+}
+
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Python: MAX_LOG_BYTES = 10MB (py:892).
@@ -409,9 +424,9 @@ fn herdr_agent_name(name: &str) -> String {
     }
     // Python persists the mapping back into the env file (py:4779); reading
     // side only here — the write happens on herdr start, which stays a gap.
-    let re = regex::Regex::new(r"[^a-z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-z0-9_-]");
     let mut mapped = re.replace_all(&name.to_lowercase(), "-").into_owned();
-    let re2 = regex::Regex::new(r"-{2,}").unwrap();
+    let re2 = cached_re!(r"-{2,}");
     mapped = re2.replace_all(&mapped, "-").trim_matches('-').chars().take(32).collect();
     mapped = mapped.trim_matches('-').to_string();
     if mapped.is_empty() || !mapped.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) {
@@ -503,7 +518,7 @@ fn strip_scroll_pill(text: &str) -> String {
     if !text.contains("Jump to bottom") {
         return text.to_string();
     }
-    let re = regex::Regex::new(r"\s*Jump to bottom \(click\)\s*[↓]?\s*").unwrap();
+    let re = cached_re!(r"\s*Jump to bottom \(click\)\s*[↓]?\s*");
     re.replace_all(text, " ").into_owned()
 }
 
@@ -536,7 +551,7 @@ fn strip_launch_noise(text: &str) -> String {
     {
         return text.to_string();
     }
-    let bare_prompt = regex::Regex::new(r"^[A-Za-z0-9._-]{1,24}\$$").unwrap();
+    let bare_prompt = cached_re!(r"^[A-Za-z0-9._-]{1,24}\$$");
     let lines: Vec<&str> = text.split('\n').collect();
     let mut last: isize = -1;
     for (i, ln) in lines.iter().enumerate() {
@@ -585,12 +600,11 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
     }
     fn norm(s: &str) -> String {
         let s = strip_ansi(s);
-        let re = regex::Regex::new(
-            "[*#`_|\u{2502}\u{250c}\u{2510}\u{2514}\u{2518}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}\u{2500}=>\u{2022}\u{00b7}\u{00bb}\u{276f}\u{23bf}\u{23fa}\u{273b}\u{2726}\u{25cf}]+",
-        )
-        .unwrap();
+        let re = cached_re!(
+            "[*#`_|\u{2502}\u{250c}\u{2510}\u{2514}\u{2518}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}\u{2500}=>\u{2022}\u{00b7}\u{00bb}\u{276f}\u{23bf}\u{23fa}\u{273b}\u{2726}\u{25cf}]+"
+        );
         let s = re.replace_all(&s, " ");
-        let ws = regex::Regex::new(r"\s+").unwrap();
+        let ws = cached_re!(r"\s+");
         ws.replace_all(s.trim(), " ").to_lowercase()
     }
     let tlines: Vec<&str> = transcript.split('\n').collect();
@@ -647,7 +661,7 @@ fn is_prompt_line(s: &str) -> bool {
 /// py:8229 _claude_ui_visible (claude + codex + gemini markers).
 fn claude_ui_visible(clean_output: &str) -> bool {
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let shell_prompt = regex::Regex::new(r"^.*[$%]\s").unwrap();
+    let shell_prompt = cached_re!(r"^.*[$%]\s");
     let n = lines.len();
     for l in &lines[n.saturating_sub(3)..] {
         let ls = l.trim().to_lowercase();
@@ -672,7 +686,7 @@ fn claude_ui_visible(clean_output: &str) -> bool {
             }
         }
     }
-    let gpt_re = regex::Regex::new(r"gpt-\d|o[34][-m]").unwrap();
+    let gpt_re = cached_re!(r"gpt-\d|o[34][-m]");
     for l in &lines[n.saturating_sub(12)..] {
         let s = l.trim();
         let sl = s.to_lowercase();
@@ -731,8 +745,8 @@ fn at_shell_prompt(clean_output: &str) -> bool {
         return false;
     }
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let ends = regex::Regex::new(r"[$%]\s*$").unwrap();
-    let leaks = regex::Regex::new(r"^\S+[$%]\s").unwrap();
+    let ends = cached_re!(r"[$%]\s*$");
+    let leaks = cached_re!(r"^\S+[$%]\s");
     for l in &lines[lines.len().saturating_sub(5)..] {
         let ls = l.trim();
         if ends.is_match(ls) && !ls.contains('\u{276f}') {
@@ -807,7 +821,7 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return String::new();
     }
     let n = lines.len();
-    let reading_re = regex::Regex::new(r"^Reading \d+ file").unwrap();
+    let reading_re = cached_re!(r"^Reading \d+ file");
     // 0. Active spinner, wide window.
     for l in lines[n.saturating_sub(30)..].iter().rev() {
         let s = l.trim();
@@ -844,7 +858,7 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         }
     }
     // 2. Bottom-up scan of the last 12 lines.
-    let completed_re = regex::Regex::new(r" for \d+\s*[hms]\b").unwrap();
+    let completed_re = cached_re!(r" for \d+\s*[hms]\b");
     for l in lines[n.saturating_sub(12)..].iter().rev() {
         let s = l.trim();
         let sl = s.to_lowercase();
@@ -1362,9 +1376,9 @@ fn md_render_table(block: &[&str], max_width: usize) -> String {
         r.split('|').map(|c| c.trim().to_string()).collect()
     }
     fn strip_md(s: &str) -> String {
-        let re1 = regex::Regex::new(r"`([^`]+)`").unwrap();
-        let re2 = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-        let re3 = regex::Regex::new(r"__([^_]+)__").unwrap();
+        let re1 = cached_re!(r"`([^`]+)`");
+        let re2 = cached_re!(r"\*\*([^*]+)\*\*");
+        let re3 = cached_re!(r"__([^_]+)__");
         let s = re1.replace_all(s, "$1");
         let s = re2.replace_all(&s, "$1");
         re3.replace_all(&s, "$1").into_owned()
@@ -1471,7 +1485,7 @@ fn md_render_table(block: &[&str], max_width: usize) -> String {
 
 fn md_to_ansi(text: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
-    let header_re = regex::Regex::new(r"^(#{1,6})\s+(.*)$").unwrap();
+    let header_re = cached_re!(r"^(#{1,6})\s+(.*)$");
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -1549,12 +1563,12 @@ fn render_session_transcript(name: &str, max_chars: usize) -> String {
     let Some(path) = session_jsonl_path(name) else { return String::new() };
     let max_read = std::cmp::max(max_chars * 5, 5_000_000) as u64;
     let mut out: Vec<String> = Vec::new();
-    let sysrem = regex::Regex::new(r"(?s)<system-reminder>.*?</system-reminder>").unwrap();
-    let tasknote = regex::Regex::new(r"(?s)<task-notification>.*?</task-notification>").unwrap();
-    let caveat = regex::Regex::new(r"(?s)<local-command-caveat>.*?</local-command-caveat>").unwrap();
-    let cmd_re = regex::Regex::new(r"(?s)<command-name>(.*?)</command-name>").unwrap();
-    let arg_re = regex::Regex::new(r"(?s)<command-args>(.*?)</command-args>").unwrap();
-    let out_re = regex::Regex::new(r"(?s)<local-command-stdout>(.*?)</local-command-stdout>").unwrap();
+    let sysrem = cached_re!(r"(?s)<system-reminder>.*?</system-reminder>");
+    let tasknote = cached_re!(r"(?s)<task-notification>.*?</task-notification>");
+    let caveat = cached_re!(r"(?s)<local-command-caveat>.*?</local-command-caveat>");
+    let cmd_re = cached_re!(r"(?s)<command-name>(.*?)</command-name>");
+    let arg_re = cached_re!(r"(?s)<command-args>(.*?)</command-args>");
+    let out_re = cached_re!(r"(?s)<local-command-stdout>(.*?)</local-command-stdout>");
     for o in iter_jsonl_tail(&path, max_read) {
         let t = o["type"].as_str().unwrap_or("");
         if t != "user" && t != "assistant" {
@@ -1874,7 +1888,7 @@ fn validate_model_name(value: &Value) -> Result<String, String> {
     if normalized.chars().count() > MODEL_ID_MAX_LEN {
         return Err(format!("model name too long (max {MODEL_ID_MAX_LEN} chars)"));
     }
-    let re = regex::Regex::new(r"^[A-Za-z0-9._:\[\]@/+][A-Za-z0-9._:\[\]@/+\-]*$").unwrap();
+    let re = cached_re!(r"^[A-Za-z0-9._:\[\]@/+][A-Za-z0-9._:\[\]@/+\-]*$");
     if !normalized.is_empty() && !re.is_match(&normalized) {
         return Err("invalid model name (allowed: alphanumeric and ._:[]@/+-, no leading hyphen)".into());
     }
@@ -1915,7 +1929,7 @@ fn strip_provider_yolo_flags(flags: &str) -> String {
         for f in PROVIDER_YOLO_FLAGS {
             out = out.replace(f, "");
         }
-        let re = regex::Regex::new(r"--approval-mode(?:=|\s+)yolo\b").unwrap();
+        let re = cached_re!(r"--approval-mode(?:=|\s+)yolo\b");
         return re.replace_all(&out, "").trim().to_string();
     };
     let mut filtered = Vec::new();
@@ -4117,7 +4131,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     }
     let mut meta = load_meta(name);
     let provider = provider_of(&cfg);
-    let uuid_re = regex::Regex::new(r"^[0-9a-fA-F-]{36}$").unwrap();
+    let uuid_re = cached_re!(r"^[0-9a-fA-F-]{36}$");
     // Resume strategy (py:24250-24295). The Rust origin resolves via the
     // conversation UUID (deterministic, hook-reported); the name-indexed
     // lookup Python layers on top needs its session-name index, which is a
@@ -4812,8 +4826,8 @@ struct AgentRow {
 fn agent_panel(clean: &str) -> (bool, Vec<AgentRow>) {
     let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut rows: Vec<AgentRow> = Vec::new();
-    let gap_re = regex::Regex::new(r"\s{4,}").unwrap();
-    let ws_re = regex::Regex::new(r"\s+").unwrap();
+    let gap_re = cached_re!(r"\s{4,}");
+    let ws_re = cached_re!(r"\s+");
     let mut i = lines.len() as isize - 1;
     while i >= 0 {
         let s = lines[i as usize].trim();
@@ -7816,7 +7830,7 @@ async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
             let fmt_arg = format!("--format={fmt}");
             let mut commits = vec![];
             if let Some(out) = git_out(&wd, &["log", &count_arg, &fmt_arg], Duration::from_secs(10)).await {
-                let sess_re = regex::Regex::new(r"(?m)^Amux-Session:\s*(.+)$").unwrap();
+                let sess_re = cached_re!(r"(?m)^Amux-Session:\s*(.+)$");
                 for entry in out.split('\u{1E}') {
                     let entry = entry.trim();
                     if entry.is_empty() {
@@ -7872,7 +7886,7 @@ async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
             let staged = qs_first(qs, "staged", "0") == "1";
             let base = qs_first(qs, "base", "").to_string();
             if !base.is_empty() {
-                let base_re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,120}$").unwrap();
+                let base_re = cached_re!(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,120}$");
                 if !base_re.is_match(&base) {
                     return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid base"}));
                 }
@@ -7944,7 +7958,7 @@ fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
     };
     if *method == Method::POST {
         let conv_id = body_str(body, "conversation_id").trim().to_string();
-        let conv_re = regex::Regex::new(r"^[0-9a-fA-F-]{8,64}$").unwrap();
+        let conv_re = cached_re!(r"^[0-9a-fA-F-]{8,64}$");
         if !conv_id.is_empty() && conv_re.is_match(&conv_id) {
             let owner = conversation_owned_by_other(&conv_id, name);
             if owner.is_empty() {
@@ -8243,7 +8257,7 @@ async fn post_dispatch(
             if branch.is_empty() {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
             }
-            let re = regex::Regex::new(r"^[a-zA-Z0-9_./@\-]+$").unwrap();
+            let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
             if !re.is_match(&branch) {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
             }
@@ -8357,7 +8371,7 @@ async fn post_dispatch(
             if new_name.is_empty() {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
             }
-            let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+            let re = cached_re!(r"[^a-zA-Z0-9_-]");
             let new_name = re.replace_all(&new_name, "-").into_owned();
             let new_file = env_path(&new_name);
             if new_file.exists() {
@@ -8455,7 +8469,7 @@ async fn post_dispatch(
         }
         "report" => report_post(state, name, headers, body).await,
         "apply-template" => {
-            let re = regex::Regex::new(r"[^a-z0-9\-]").unwrap();
+            let re = cached_re!(r"[^a-z0-9\-]");
             let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
             let work_dir = body_str(body, "dir").trim().to_string();
             // Two different failures, two different messages. They shared one
@@ -8841,7 +8855,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     if new_name.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
     }
-    let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
     let new_name = re.replace_all(&new_name, "-").into_owned();
     let new_file = env_path(&new_name);
     if new_file.exists() {
@@ -9399,7 +9413,7 @@ async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool 
 static RENAME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn sanitize_session_name(raw: &str) -> String {
-    let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
     re.replace_all(raw.trim(), "-").into_owned()
 }
 
@@ -9876,7 +9890,7 @@ fn config_switch_confirm_key(pane: &str) -> Option<String> {
     if !clean.contains(CC_CONFIG_CONFIRM_BODY) {
         return None;
     }
-    let re = regex::Regex::new(r"(?i)(?:^|\s)(\d+)\.\s*yes\b").unwrap();
+    let re = cached_re!(r"(?i)(?:^|\s)(\d+)\.\s*yes\b");
     clean
         .lines()
         .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
