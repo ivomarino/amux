@@ -117,6 +117,26 @@ async fn async_main() {
     let env_filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
     };
+    /// Is fd 1 the very file we just opened? See the call site for why this is
+    /// (dev, ino) and not a path comparison. Non-unix has no `/dev/fd`, and no
+    /// launchd either, so the tee is correct there.
+    fn stdout_is_same_file(f: &std::fs::File) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (f.metadata(), std::fs::metadata("/dev/fd/1")) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                // Unknown: keep the tee. Over-logging is recoverable; losing the
+                // log because a stat failed is not.
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = f;
+            false
+        }
+    }
     let log_file = {
         let dir = cfg.amux_home.join("logs");
         std::fs::create_dir_all(&dir).ok();
@@ -129,11 +149,36 @@ async fn async_main() {
     match log_file {
         Some(f) => {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter())
-                .with_ansi(false)
-                .with_writer(std::io::stdout.and(Arc::new(f)))
-                .init()
+            // ...but NOT when stdout ALREADY IS that file, which under launchd
+            // it always is: com.amux.server-rs.plist sets both StandardOutPath
+            // and StandardErrorPath to this exact path. Teeing then writes every
+            // line twice — measured 2026-08-11 on the live log, 1,485 unique
+            // lines out of 3,000.
+            //
+            // That is not merely wasted bytes, it is a CORRUPT INSTRUMENT: this
+            // file is what `GET /api/logs/raw` tails and what the SPA's Logs tab
+            // renders, so every count taken from it — by a human, a sweep, or an
+            // autofix loop — was inflated ~2x, and inflated silently, because
+            // duplicate log lines look exactly like a thing that really happened
+            // twice. It cost me a wrong first reading of my own AMUX-2909 probe
+            // (one delivery, reported by the log as two).
+            //
+            // Compared by (dev, ino) rather than by path: launchd hands us an
+            // already-open fd and the path could be a symlink, a relative spelling
+            // or a rotated file, so string comparison would silently miss.
+            let dup = stdout_is_same_file(&f);
+            let sub = tracing_subscriber::fmt().with_env_filter(env_filter()).with_ansi(false);
+            if dup {
+                sub.with_writer(Arc::new(f)).init()
+            } else {
+                sub.with_writer(std::io::stdout.and(Arc::new(f))).init()
+            }
+            // Say which way it went, once, so "why is my log duplicated / empty"
+            // is answerable from the log itself instead of from this comment.
+            tracing::info!(
+                tee_to_stdout = !dup,
+                "log writer configured (stdout suppressed when it is the same file — AMUX-2906)"
+            );
         }
         None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
     }
