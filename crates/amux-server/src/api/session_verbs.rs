@@ -3326,6 +3326,20 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
     }
 }
 
+/// Which delivery mode a send takes: `true` = tmux paste-buffer, `false` =
+/// `send-keys -l` (typing).
+///
+/// Pure, and separated from `send_text_inner` on purpose. The decision
+/// otherwise sits in the middle of a ~400-line async fn that needs a live tmux
+/// pane to reach, which is precisely the shape that ships untested — and this
+/// one shipped wrong (AMUX-2909: short text typed into a generating lane, the
+/// mode measured as lossy 1/1).
+pub(crate) fn must_paste(generating: bool, chars: usize, picker_shaped: bool) -> bool {
+    // `generating` first because it is the one that was missing: mid-turn, paste
+    // is the only mode measured as non-lossy, regardless of size or shape.
+    generating || chars > 400 || picker_shaped
+}
+
 pub(crate) async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
     send_text_inner(state, name, text, defer_if_busy, false, false, false).await
 }
@@ -3691,7 +3705,9 @@ async fn send_text_inner(
     // below safe for the three of amux's five queued messages that carry an
     // `@`, which under the old branch could never be delivered to a busy lane
     // at all.
-    let use_paste = text.chars().count() > 400 || at_picker_text(&text);
+    //
+    // `use_paste` is computed BELOW, after the generating re-check, because
+    // being mid-turn is itself a reason to paste (AMUX-2909).
     let mut esc_at: Option<std::time::Instant> = None;
     // Exclusive use of the pane for the whole type+Enter+verify choreography.
     // Without it a second send (or the ghost-rescue sweep) can fire an Enter
@@ -3723,6 +3739,42 @@ async fn send_text_inner(
             esc_at = Some(std::time::Instant::now());
             sleep_ms(50).await;
         }
+    }
+    // A GENERATING LANE ALWAYS GETS THE PASTE PATH (AMUX-2909). Ethan's report:
+    // a message typed into a lane that is visibly working. The delivery MODE is
+    // the whole defect — the measurement recorded a few lines above is amux's
+    // own, on a live pane: typed mid-turn, the text was LOST 1/1 (the composer
+    // held it and the turn ended without it); the SAME text pasted mid-turn was
+    // accepted 4/4, each recorded by Claude Code as `queue-operation: enqueue`
+    // and folded into the turn. That evidence was already in this file, and the
+    // paste path was still gated on length/picker-shape alone, so every SHORT
+    // human message — the dashboard composer's whole output — took the lossy
+    // mode precisely when the lane was busiest.
+    //
+    // Note what this deliberately is NOT: a deferral to the next turn boundary.
+    // Claude Code already has a queue and enqueues pasted text itself, so
+    // holding the message would add latency and duplicate a queue the harness
+    // owns — amux's job is to hand the text over in the form the harness
+    // accepts, not to build a second queue in front of it. Idle lanes are
+    // untouched: they still type, with no added latency.
+    let use_paste = must_paste(generating, text.chars().count(), at_picker_text(&text));
+    if generating {
+        // Mid-turn delivery is the risky case, so make every instance
+        // self-announcing rather than reconstructable (ethos rule 4 / the
+        // two-fix rule): before this, nothing recorded WHICH MODE a message was
+        // delivered in, so "was it typed or pasted, and was the lane mid-turn?"
+        // — the exact question this bug turns on — could not be answered from
+        // anything amux kept. A sweep can now count mid-turn deliveries, and
+        // `mode="type"` here should be structurally impossible.
+        tracing::warn!(
+            session = %name,
+            mode = if use_paste { "paste" } else { "type" },
+            chars = text.chars().count(),
+            from_steering,
+            allow_mid_turn,
+            "delivering to a GENERATING lane — paste is the only mode measured as \
+             non-lossy mid-turn (AMUX-2909); mode=type here is a regression"
+        );
     }
     send_key(name, "C-u").await;
     sleep_ms(40).await;
@@ -12857,6 +12909,40 @@ mod pipe_reconcile_tests {
 // ---------------------------------------------------------------------------
 // AMUX-2681 — a refusal is not a server error.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod delivery_mode_tests {
+    use super::*;
+
+    /// AMUX-2909, pinned. Ethan's report: a message typed into a lane that was
+    /// visibly working. This FAILS against the pre-fix predicate
+    /// (`chars > 400 || picker_shaped`), which is the whole point — a short
+    /// plain message to a generating lane is the exact case that shipped wrong,
+    /// and it is also the case that looks least alarming.
+    #[test]
+    fn a_generating_lane_is_never_typed_into() {
+        assert!(
+            must_paste(true, 12, false),
+            "a SHORT plain message to a generating lane must paste — typed \
+             mid-turn was measured lost 1/1, pasted was accepted 4/4"
+        );
+        // Size and shape must not rescue it either.
+        assert!(must_paste(true, 0, false), "even empty-ish text");
+        assert!(must_paste(true, 5000, true));
+    }
+
+    /// The control, without which the test above passes for a `must_paste` that
+    /// simply returned true — an unfailable check is worse than none (rule 7).
+    /// An IDLE lane keeps typing: that path is unchanged and adds no latency.
+    #[test]
+    fn an_idle_lane_still_types_short_plain_text() {
+        assert!(!must_paste(false, 12, false), "the fix must not paste everything");
+        assert!(!must_paste(false, 400, false), "400 is the boundary, not over it");
+        // The two pre-existing reasons to paste still hold on an idle lane.
+        assert!(must_paste(false, 401, false), "long text still pastes");
+        assert!(must_paste(false, 12, true), "picker-shaped text still pastes");
+    }
+}
 
 #[cfg(test)]
 mod refusal_status_tests {
