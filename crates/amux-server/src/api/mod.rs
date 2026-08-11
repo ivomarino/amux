@@ -23,6 +23,7 @@ pub mod fs;
 pub mod git_guard;
 pub mod gmail_auth;
 pub mod groups;
+pub mod crm;
 pub mod habits;
 pub mod health;
 pub mod history;
@@ -189,6 +190,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/groups", groups::routes())
         .nest("/api/tags", groups::tags_routes())
         .nest("/api/journal", journal::routes())
+        // CRM: a PORT of the python contract, not a new feature — the schema and
+        // 308 live contacts survived the cutover with no routes to reach them
+        // (AMUX-2929).
+        .nest("/api/crm", crm::routes())
         .nest("/api/layout-presets", layout_presets::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())

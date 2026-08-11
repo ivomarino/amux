@@ -118,6 +118,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/groups", "group list + per-group config (api/groups.rs)"),
     ("/api/tags", "legacy spelling of the group list (api/groups.rs)"),
     ("/api/journal", "journal"),
+    ("/api/crm", "contacts/tags/interactions/followups — a PORT of the python contract (api/crm.rs, AMUX-2929). The schema shipped in 0001_baseline and 308 contacts were live the whole time; only the routes were missing, so CLAUDE.md documented a 405 to every session"),
     ("/api/layout-presets", "tab layout presets save/load/delete (api/layout_presets.rs)"),
     ("/api/templates", "worker templates the New Worker modal lists (api/worker_create.rs, AMUX-2871)"),
     ("/api/git-check", "is this dir a git worktree — gates the Worktree checkbox (api/worker_create.rs)"),
