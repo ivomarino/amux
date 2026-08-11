@@ -185,6 +185,71 @@ fn cap_key(session: &str, now: f64) -> String {
     format!("commit_nudge:{session}:{day}")
 }
 
+
+/// Drop tracked paths whose CONTENT already matches `origin/main`.
+///
+/// Reported by tubescience 2026-08-10, measured rather than argued: 6 of 7
+/// paths in one ownership warning were BYTE-IDENTICAL to origin. They were not
+/// edits at all.
+///
+/// The cause is a workflow, not a bug in git: several lanes land work with
+/// scripts/graft-push.sh, which pushes a tree built from origin WITHOUT moving
+/// the local branch. Local HEAD therefore sits permanently behind origin, and
+/// every file anyone has successfully landed reads as modified forever after.
+/// `git status` is answering "how does the worktree differ from local HEAD",
+/// while the warning asks "what might a peer be mid-edit on" — an instrument
+/// answering a question adjacent to the one asked.
+///
+/// It cost a real decision: a session read this signal on tenant_canary.py,
+/// concluded a peer was mid-edit, and declined a three-line fix. The file was
+/// identical to origin. And a warning wrong 6 times in 7 gets skimmed, so the
+/// ONE real entry — an untracked draft that `git add -A` would genuinely have
+/// swept up — arrived already discounted.
+///
+/// UNTRACKED PATHS ARE NEVER DROPPED. They are the genuinely dangerous ones for
+/// `git add -A` and cannot match origin by definition.
+async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> Vec<String> {
+    let mut kept = Vec::new();
+    for p in paths {
+        // Does the path exist on origin at all? THE TRAP tubescience hit and
+        // documented: `git rev-parse origin/main:<path>` on a path that does not
+        // exist there prints the literal argument to STDOUT rather than failing
+        // cleanly, so a naive is-empty check does not fire and an untracked file
+        // scores as "differs from origin". Test the exit code via cat-file -e.
+        let exists = tokio::process::Command::new("git")
+            .args(["-C", dir, "cat-file", "-e", &format!("origin/main:{p}")])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            kept.push(p); // untracked on origin: always report
+            continue;
+        }
+        let local = tokio::process::Command::new("git")
+            .args(["-C", dir, "hash-object", "--", &p])
+            .output()
+            .await;
+        let remote = tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", &format!("origin/main:{p}")])
+            .output()
+            .await;
+        let same = match (local, remote) {
+            (Ok(l), Ok(r)) if l.status.success() && r.status.success() => {
+                String::from_utf8_lossy(&l.stdout).trim()
+                    == String::from_utf8_lossy(&r.stdout).trim()
+            }
+            // Cannot compare -> keep it. A path we failed to check is not a path
+            // we have cleared.
+            _ => false,
+        };
+        if !same {
+            kept.push(p);
+        }
+    }
+    kept
+}
+
 /// `git status --porcelain` under `dir`, as repo-relative paths.
 ///
 /// Supplies the LIST only. Whose they are is the guard's answer, never this
@@ -306,7 +371,10 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         if session.is_empty() || dir.is_empty() {
             continue;
         }
-        let dirty = dirty_paths(dir).await;
+        // Filtered against ORIGIN, not local HEAD — see
+        // drop_paths_identical_to_origin for why `git status` alone answers the
+        // wrong question on a graft-push checkout.
+        let dirty = drop_paths_identical_to_origin(dir, dirty_paths(dir).await).await;
         if dirty.is_empty() {
             continue;
         }
