@@ -286,16 +286,21 @@ fn scan_js_calls(js: &str, source: &str) -> Vec<checks::CallerPath> {
                 })
                 .map(|m| m.to_string())
         };
-        let method = find_m(fwd).or_else(|| find_m(back)).unwrap_or_else(|| "GET".into());
+        let observed = find_m(fwd).or_else(|| find_m(back));
+        let method_known = observed.is_some();
+        let method = observed.unwrap_or_else(|| "GET".into());
         out.push(checks::CallerPath {
             method,
             path: path.to_string(),
             source: source.to_string(),
             interpolated,
+            method_known,
         });
     }
     out.sort_by(|a, b| (&a.path, &a.method).cmp(&(&b.path, &b.method)));
-    out.dedup_by(|a, b| a.path == b.path && a.method == b.method && a.interpolated == b.interpolated);
+    out.dedup_by(|a, b| {
+        a.path == b.path && a.method == b.method && a.interpolated == b.interpolated
+    });
     out
 }
 
@@ -386,6 +391,28 @@ mod tests {
     /// confirmed false positive in the live census (2026-08-11): a plain GET
     /// reported as `DELETE /api/layout-presets`, a path that is not mounted,
     /// while the real DELETE goes to /api/layout-presets/{name} and works.
+    /// A URL built into a variable puts the verb outside the URL's own
+    /// statement, so no method is observable. The extractor must SAY so rather
+    /// than default to GET and let the census file a phantom 405 — which is
+    /// what `GET /api/dictate` was, while the real call five lines down is a
+    /// POST.
+    #[test]
+    fn a_defaulted_verb_is_marked_as_not_observed() {
+        let js = "const url = API + '/api/dictate?session=' + s;\n\
+                  const r = await fetch(url, { method: 'POST' });";
+        let got = scan_js_calls(js, "t");
+        let d: Vec<_> = got.iter().filter(|c| c.path == "/api/dictate").collect();
+        assert!(!d.is_empty(), "the path must still be extracted");
+        for c in &d {
+            assert!(!c.method_known, "no verb is in this statement — it must not be claimed as observed");
+        }
+        // A verb in the SAME statement is still observed.
+        let js2 = "await fetch(API + '/api/dictate', {method:'POST'});";
+        let got2 = scan_js_calls(js2, "t");
+        let d2: Vec<_> = got2.iter().filter(|c| c.path == "/api/dictate").collect();
+        assert!(d2.iter().all(|c| c.method_known && c.method == "POST"), "{got2:?}");
+    }
+
     #[test]
     fn a_neighbours_method_is_not_attached_to_this_call() {
         let js = "const r = await fetch('/api/layout-presets');\n\

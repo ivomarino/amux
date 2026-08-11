@@ -49,11 +49,22 @@ pub fn route_callers_have_routes(
     }
     let mut out = Vec::new();
     for c in callers {
-        let verdict = if c.interpolated {
+        let mut verdict = if c.interpolated {
             match_prefix(mounted, &c.method, &c.path)
         } else {
             match_route_full(mounted, &c.method, &c.path)
         };
+        // The verb was DEFAULTED, not observed: `const url = API + '/api/x';
+        // ... fetch(url, {method:'POST'})` puts the literal outside the URL's
+        // own statement. Asserting the default would file a 405 against a call
+        // that never makes it — which is what `GET /api/dictate` was, while the
+        // real call is a POST five lines down. Path existence is still checked;
+        // only the method claim is withheld.
+        if !c.method_known {
+            if let RouteMatch::MethodNotAllowed(_) = verdict {
+                verdict = RouteMatch::Ok;
+            }
+        }
         match verdict {
             RouteMatch::Missing => out.push(
                 InvariantResult::fail(
@@ -106,6 +117,11 @@ pub struct CallerPath {
     /// module docs warn about. A prefix is satisfied when SOME mounted route
     /// lives under it with the right method.
     pub interpolated: bool,
+    /// False when no method literal was found in the call's own statement, so
+    /// `method` is the GET DEFAULT rather than something observed. A guessed
+    /// verb produces a phantom 405 exactly the way a guessed path produces a
+    /// phantom 404 — see the extractor's own note about not guessing paths.
+    pub method_known: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -560,7 +576,7 @@ mod negative_controls {
             method: "POST".into(),
             path: "/api/workers/amux/send".into(),
             source: "cli:amux".into(),
-            interpolated: false,
+            interpolated: false, method_known: true,
         }];
         let rs = route_callers_have_routes(&mounted(), &callers);
         assert!(
@@ -600,7 +616,7 @@ mod negative_controls {
             method: "POST".into(),
             path: "/api/workers/amux/send".into(),
             source: "cli:amux".into(),
-            interpolated: false,
+            interpolated: false, method_known: true,
         }];
         let rs = route_callers_have_routes(&m, &callers);
         assert!(rs.iter().all(|r| r.status == Status::Pass), "must pass after the fix");
