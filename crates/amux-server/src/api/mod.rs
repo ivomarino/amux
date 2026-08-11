@@ -33,6 +33,7 @@ pub mod log_search;
 pub mod map;
 pub mod memories;
 pub mod metrics;
+pub mod observability;
 pub mod offline_origin;
 pub mod messages;
 pub mod org;
@@ -193,6 +194,7 @@ pub fn router(state: AppState) -> Router {
         .merge(worker_create::routes())
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
+        .merge(observability::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())

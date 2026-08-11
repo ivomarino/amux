@@ -1,4 +1,4 @@
-const CACHE = 'amux-v0.9.587';
+const CACHE = 'amux-v0.9.588';
 const SHELL_URLS = ['/', '/manifest.json', '/icon.svg', '/icon.png', '/icon-192.png', '/icon-512.png'];
 
 // Install: pre-cache entire app shell

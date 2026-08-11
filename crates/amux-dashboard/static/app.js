@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.587';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.588';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -25871,9 +25871,21 @@ function _costRender(d, opts) {
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
     <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
     <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
+    ${d.delegated_turns ? `<div class="cost-card" title="Subagent turns, charged to the lane that delegated them. Counted since 2026-08-11 (AMUX-2894) \u2014 before that they were invisible, so a lane that delegates looked cheaper than one working inline."><div class="cost-card-v">${_fmtUsd(d.delegated_cost)}</div><div class="cost-card-l">of which delegated</div></div>` : ''}
   </div>`;
+  // The ledger's own freshness, not this slice's. A rollup over a STALE ledger
+  // renders perfectly and shows small numbers, and small is indistinguishable
+  // from quiet — which is exactly how token_ledger sat 36h dead behind a
+  // confident zero (AMUX-2892). Say it where the numbers are read.
+  const staleS = d.ledger_stale_s;
+  const staleBanner = (typeof staleS === 'number' && staleS > 3600)
+    ? `<div style="margin:0 0 10px;padding:8px 10px;border:1px solid var(--red);border-radius:8px;font-size:0.78rem;color:var(--red);">
+         These figures stop ${staleS >= 86400 ? Math.round(staleS/86400) + 'd' : Math.round(staleS/3600) + 'h'} ago \u2014 the token-ledger indexer has not run since.
+         <span style="color:var(--dim);">Everything below is real but INCOMPLETE; check the token-ledger job.</span>
+       </div>`
+    : '';
   const sec = (title, body) => `<div class="cost-section"><div class="cost-section-h">${title}</div>${body}</div>`;
-  let html = cards;
+  let html = staleBanner + cards;
   html += sec('By task', _costBars(d.by_task, 'title', { limit: 20, emptyLabel: 'Ambient (untasked)' }));
   if (!opts.perSession) html += sec('By worker', _costBars(d.by_session, 'session', { limit: 20, onSession: true, emptyLabel: '(ad-hoc)' }));
   html += sec('By model', _costBars(d.by_model, 'model', { limit: 8 }));
