@@ -214,8 +214,8 @@
     padding: 8px 11px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--card); font-size: 0.8rem;
   }
-  .archived-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
-  .archived-card-name { font-weight: 600; color: var(--text); flex-shrink: 0; cursor: pointer; }
+  .archived-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .archived-card-name { font-weight: 600; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .archived-card-name:hover { color: var(--accent); }
   .archived-card-chip {
     font-size: 0.63rem; padding: 1px 6px; border-radius: 9px; flex-shrink: 0;
@@ -229,7 +229,7 @@
     color: var(--dim); font-size: 0.7rem; display: flex; gap: 5px 10px; flex-wrap: wrap;
     align-items: center; min-width: 0;
   }
-  .archived-card-meta code { font-size: 0.68rem; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; color: var(--text); }
+  .archived-card-meta code { font-size: 0.68rem; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; color: var(--text); word-break: break-all; }
   .archived-card-tag { color: var(--accent); font-size: 0.68rem; }
   .archived-card-preview {
     color: var(--dim); font-size: 0.72rem; line-height: 1.4; min-width: 0;
@@ -246,6 +246,14 @@
     color: var(--dim); background: transparent; cursor: pointer; min-height: 28px;
   }
   .archived-del-btn:hover { border-color: var(--red); color: var(--red); }
+  @media (max-width: 600px) {
+    .archived-card { padding: 10px 12px; gap: 6px; }
+    .archived-card-top { gap: 6px; }
+    .archived-card-name { font-size: 0.85rem; max-width: calc(100% - 120px); }
+    .archived-wake-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
+    .archived-del-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
+    .archived-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
 
   /* Edit modal */
   .edit-overlay {
