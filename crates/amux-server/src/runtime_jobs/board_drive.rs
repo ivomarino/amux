@@ -3136,4 +3136,104 @@ mod tests {
         assert!(text.contains("`todo`"), "must offer the promote-to-todo exit: {text}");
         assert!(text.contains("needs:you"), "must offer the needs:you exit: {text}");
     }
+
+    /// The DB predicates behind the triage nudge. Every excluded row must
+    /// stay excluded from BOTH the count and the candidate list, or the
+    /// nudge's headline and its list describe different sets (rule 4: a view
+    /// must share the predicate of the mechanism it claims to describe).
+    #[test]
+    fn stale_backlog_predicates_exclude_everything_that_is_not_a_stale_agent_backlog_card() {
+        let conn = board_db();
+        let now = 100 * 86400; // day 100, arbitrary epoch anchor
+        let old = now - BACKLOG_STALE_AGE_S - 86400; // 15 days old: stale
+        let fresh = now - 86400; // 1 day old: not stale
+        let ins = |id: &str, session: &str, status: &str, owner: &str, arch: i64, del: Option<i64>, created: i64| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,created,updated) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'code',?8,?8)",
+                rusqlite::params![id, format!("card {id}"), status, session, owner, arch, del, created],
+            )
+            .expect("insert");
+        };
+        ins("S-1", "lane", "backlog", "agent", 0, None, old); // the only one that qualifies
+        ins("S-2", "lane", "backlog", "human", 0, None, old); // ethos rule 8: never sweep a human's card
+        ins("S-3", "lane", "backlog", "agent", 1, None, old); // archived
+        ins("S-4", "lane", "backlog", "agent", 0, Some(1), old); // deleted
+        ins("S-5", "lane", "todo", "agent", 0, None, old); // not in backlog
+        ins("S-6", "other", "backlog", "agent", 0, None, old); // another lane
+        ins("S-7", "lane", "backlog", "agent", 0, None, fresh); // not yet stale
+
+        let candidates = stale_backlog_candidates(&conn, "lane", now);
+        let ids: Vec<&str> = candidates.iter().map(|(i, _, _)| i.as_str()).collect();
+        assert_eq!(ids, vec!["S-1"], "only this lane's own live agent-owned stale backlog card");
+        assert_eq!(stale_backlog_count(&conn, "lane", now), 1, "the count must share the candidates' predicate");
+    }
+
+    /// Age is reported in whole days, and the oldest card leads the list —
+    /// the nudge is meant to surface the longest-neglected work first.
+    #[test]
+    fn stale_backlog_candidates_orders_oldest_first_with_correct_age() {
+        let conn = board_db();
+        let now = 100 * 86400;
+        let ins = |id: &str, created: i64| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,created,updated) \
+                 VALUES (?1,?2,'backlog','lane','agent',0,'code',?3,?3)",
+                rusqlite::params![id, format!("card {id}"), created],
+            )
+            .expect("insert");
+        };
+        ins("O-1", now - 20 * 86400); // 20d old
+        ins("O-2", now - 30 * 86400); // 30d old
+        ins("O-3", now - 15 * 86400); // 15d old, just past the cutoff
+
+        let candidates = stale_backlog_candidates(&conn, "lane", now);
+        let ids: Vec<&str> = candidates.iter().map(|(i, _, _)| i.as_str()).collect();
+        assert_eq!(ids, vec!["O-2", "O-1", "O-3"], "oldest-first ordering");
+        let ages: std::collections::HashMap<&str, i64> =
+            candidates.iter().map(|(i, _, a)| (i.as_str(), *a)).collect();
+        assert_eq!(ages["O-2"], 30);
+        assert_eq!(ages["O-1"], 20);
+        assert_eq!(ages["O-3"], 15);
+    }
+
+    /// The candidate list caps at 10 (LIMIT 10 in the query, for prompt
+    /// brevity) but the count must not — the same drift the "...and N more"
+    /// arithmetic in backlog_triage_text depends on staying pinned.
+    #[test]
+    fn stale_backlog_candidates_caps_at_ten_but_the_count_does_not() {
+        let conn = board_db();
+        let now = 100 * 86400;
+        for i in 0..15 {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,created,updated) \
+                 VALUES (?1,?2,'backlog','lane','agent',0,'code',?3,?3)",
+                rusqlite::params![format!("C-{i}"), format!("card {i}"), now - (20 + i) * 86400],
+            )
+            .expect("insert");
+        }
+        let candidates = stale_backlog_candidates(&conn, "lane", now);
+        assert_eq!(candidates.len(), 10, "capped for prompt brevity");
+        assert_eq!(stale_backlog_count(&conn, "lane", now), 15, "but the count sees all of them");
+    }
+
+    /// A card created exactly at the 14-day boundary is not yet stale — the
+    /// cutoff is a strict `<`, not `<=`.
+    #[test]
+    fn a_card_created_exactly_at_the_cutoff_is_not_yet_stale() {
+        let conn = board_db();
+        let now = 100 * 86400;
+        let ins = |id: &str, created: i64| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,created,updated) \
+                 VALUES (?1,?2,'backlog','lane','agent',0,'code',?3,?3)",
+                rusqlite::params![id, format!("card {id}"), created],
+            )
+            .expect("insert");
+        };
+        ins("E-1", now - BACKLOG_STALE_AGE_S); // exactly 14 days old
+        assert_eq!(stale_backlog_count(&conn, "lane", now), 0, "exactly-14-days is not yet over 14 days");
+        ins("E-2", now - BACKLOG_STALE_AGE_S - 1); // one second past
+        assert_eq!(stale_backlog_count(&conn, "lane", now), 1, "one second past the cutoff is stale");
+    }
 }
