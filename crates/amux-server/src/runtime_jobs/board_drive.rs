@@ -1100,6 +1100,29 @@ fn outstanding_work(
     (bc, dc, blocked, done)
 }
 
+/// The `{blocked, done}` the LAST continue-nudge reported for this lane, or
+/// None if it has never fired (or the row is unreadable, which must re-arm
+/// rather than suppress — a nudge that goes silent on a parse error is the
+/// failure this whole card is about, one layer down).
+///
+/// Extracted so it can be TESTED. Inline in the scan loop it was unreachable
+/// from a test, which is exactly how the un-terminated version shipped.
+fn last_continue_nudge_counts(conn: &Connection, lane: &str) -> Option<(i64, i64)> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT data FROM session_events WHERE session=?1 \
+             AND type='continue.nudge' ORDER BY ts DESC LIMIT 1",
+            rusqlite::params![lane],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten();
+    let v: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+    Some((v.get("blocked")?.as_i64()?, v.get("done")?.as_i64()?))
+}
+
 fn continue_nudge_text(
     blocked_count: i64,
     done_count: i64,
@@ -2213,6 +2236,31 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         "has {bc} blocked + {dc} done but continue-nudge sent within 30min"
                     ));
                 }
+                // TERMINATION (AMUX-2903). The cooldown above is a RATE limit,
+                // not an exit — and `done` is monotonic, so without one this
+                // fires every 30 minutes for the life of a lane. Measured
+                // before the first nudge ever went out: 15 lanes eligible, 277
+                // done cards among them, ~720 nudges/day.
+                //
+                // Worse, its prescribed exit is `verified`, whose first
+                // criterion is "CI passed on the merged commit" — red on
+                // origin/main with 112 commits unpushed (AMUX-2902). A lane
+                // that answers honestly ("these cannot be verified, here is
+                // why") would be asked again forever, which is ethos rule 3:
+                // a constraint with no truthful path forward.
+                //
+                // So the nudge now responds to CHANGE, not to time. If the
+                // outstanding set is identical to what the last nudge reported,
+                // the previous one produced no movement and repeating it will
+                // not either. Any real progress — a blocker cleared, a card
+                // verified or archived, new work finished — moves a count and
+                // re-arms it.
+                if last_continue_nudge_counts(&conn, lane) == Some((bc, dc)) {
+                    break 'cont Some(format!(
+                        "has {bc} blocked + {dc} done, unchanged since the last \
+                         continue-nudge — not repeating it (AMUX-2903)"
+                    ));
+                }
                 drop(conn);
                 let text = continue_nudge_text(bc, dc, &blocked, &done);
                 crate::api::session_verbs::emit_event(
@@ -2392,6 +2440,67 @@ pub fn routes() -> axum::Router<AppState> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// AMUX-2903. The continue-nudge's cooldown is a RATE limit, not an exit,
+    /// and `done` never shrinks — so without change-detection it fires every 30
+    /// minutes for the life of a lane. Measured before the first nudge went out:
+    /// 15 lanes eligible, 277 done cards, ~720/day.
+    #[test]
+    fn the_continue_nudge_does_not_repeat_an_unchanged_outstanding_set() {
+        let conn = Connection::open_in_memory().expect("memdb");
+        conn.execute_batch(
+            "CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT,
+                idem TEXT, source TEXT NOT NULL DEFAULT '');",
+        )
+        .expect("schema");
+        let fire = |ts: f64, session: &str, data: &str| {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data) VALUES (?1,?2,'continue.nudge',?3)",
+                rusqlite::params![ts, session, data],
+            )
+            .expect("insert");
+        };
+
+        // Never nudged -> nothing to compare, so the first nudge must go out.
+        assert_eq!(last_continue_nudge_counts(&conn, "me"), None);
+
+        fire(100.0, "me", r#"{"blocked":3,"done":56}"#);
+        assert_eq!(last_continue_nudge_counts(&conn, "me"), Some((3, 56)));
+
+        // The NEWEST event wins — an older one must not resurrect a stale set.
+        fire(200.0, "me", r#"{"blocked":2,"done":57}"#);
+        assert_eq!(last_continue_nudge_counts(&conn, "me"), Some((2, 57)));
+
+        // Scoped per lane: another lane's nudge must not silence this one.
+        fire(300.0, "other", r#"{"blocked":9,"done":9}"#);
+        assert_eq!(last_continue_nudge_counts(&conn, "me"), Some((2, 57)));
+
+        // CONTROLS — every one of these must RE-ARM, not suppress. A nudge that
+        // goes quiet on unreadable state is the same defect one layer down.
+        let conn2 = Connection::open_in_memory().expect("memdb");
+        conn2
+            .execute_batch(
+                "CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                    session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT,
+                    idem TEXT, source TEXT NOT NULL DEFAULT '');",
+            )
+            .expect("schema");
+        for bad in [Some("not json"), Some("{}"), Some(r#"{"blocked":1}"#), None] {
+            conn2.execute("DELETE FROM session_events", []).expect("clear");
+            conn2
+                .execute(
+                    "INSERT INTO session_events (ts, session, type, data) VALUES (1,'me','continue.nudge',?1)",
+                    rusqlite::params![bad],
+                )
+                .expect("insert");
+            assert_eq!(
+                last_continue_nudge_counts(&conn2, "me"),
+                None,
+                "unreadable nudge state must re-arm, not suppress (data={bad:?})"
+            );
+        }
+    }
 
     /// AMUX-2825's non-negotiable constraint, which fe44d61 did not implement:
     /// the sweep MUST exclude types where `verified` is meaningless. 299 of
