@@ -2537,6 +2537,19 @@ function _cardDoingCount(name) {
   });
   return n;
 }
+/** Total live board items owned by a worker, any status (Ethan, 2026-08-11).
+ *
+ * Shares the deleted/archived/session predicate with _cardDoingCount above and
+ * differs ONLY in dropping the status filter, so "doing" can never exceed
+ * "total" — a view must share the predicate of the thing it describes, and two
+ * hand-written filters over the same list drift the moment either changes. */
+function _cardBoardTotal(name) {
+  let n = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && c.session === name) n++;
+  });
+  return n;
+}
 function _grpMembers(g) {
   const all = (sessions || []).filter(s => !s.archived);
   return all.filter(s => (s.tags || []).includes(g));
@@ -2793,11 +2806,18 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
                holds. Successor to the counts row 09aa88e removed — this is
                the two-figure version of it. */
             const d = _cardDoingCount(s.name);
+            const tot = _cardBoardTotal(s.name);
             const parts = [];
             if (s.sched_on || s.sched_off) {
               parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
+            /* Total board items, any status. Same bare-number treatment as the
+               other two. Shown whenever the worker owns any, INCLUDING when
+               `doing` is 0 — a lane with 40 queued items and none in progress is
+               exactly the case worth seeing, and the doing-only row read as
+               empty for it. */
+            if (tot) parts.push(`<span class="mc-total">${tot}</span> items`);
             return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
@@ -6908,7 +6928,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.576';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.577';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7094,8 +7114,8 @@ function _offlineCacheInfo() {
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
-  _peekHistoryHTML = cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '';
-  _lastLiveHTML = cached.output ? _markAgentRows(wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output))))) : '';
+  _peekHistoryHTML = cached.histHTML || (cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '');
+  _lastLiveHTML = cached.liveHTML || (cached.output ? _markAgentRows(wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output))))) : '');
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -7219,24 +7239,22 @@ function openPeek(name, opts) {
   _syncPeekOverlayToVisualViewport();
   _vvKick();   // keyboard may already be up or mid-animation when peek opens
   setTimeout(_peekGeoBeacon, 1500);   // mobile geometry self-report (once per load)
-  // The cached frame is a FALLBACK for slow/offline opens — NOT something to
-  // flash before the live frame. IndexedDB resolves (~10-30ms) before the live
-  // fetch (~33ms wifi, more on cellular), so painting it eagerly showed a stale
-  // "Cached Xm ago" view for a beat on every open. Give the live fetch a short
-  // head start: only paint cached if the live frame hasn't landed within ~150ms
-  // (slow network / offline). On a normal connection live wins and you open
-  // straight onto the LATEST. (lastPeekHTML is '' until a real frame paints.)
+  // Cached frame is a FALLBACK for slow/offline opens. IDB resolves (~10-30ms)
+  // before the live fetch (~18ms wifi, much more on cellular). The 30ms delay
+  // lets a local live fetch win on WiFi (no stale flash), but on cellular where
+  // the fetch is 300ms+ the cached content — with pre-rendered HTML — paints
+  // almost immediately instead of showing "Loading latest..." for 150ms+.
   _idb.get('peek_' + name).then(cached => {
     if (peekSession !== name || !cached) return;
     setTimeout(() => {
       if (peekSession !== name) return;
-      if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {   // live still hasn't painted
+      if (!lastPeekHTML) {
         if (_paintCachedPeek(cached)) {
           const body = document.getElementById('peek-body');
           body.scrollTop = body.scrollHeight;
         }
       }
-    }, 150);
+    }, 30);
   });
   // Paint the CURRENT terminal instantly from the few-KB live frame, THEN pull the
   // full payload (~138KB, mostly transcript history) to fill in scrollback. Clicking
@@ -8520,7 +8538,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
     // live frame (sometimes ''), which painted an EMPTY black peek from cache
     // (social, 2026-07-16). Never write an entry with no content.
-    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, time: Date.now() });
+    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
   } catch(e) {
     console.error('peek:', e);
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)

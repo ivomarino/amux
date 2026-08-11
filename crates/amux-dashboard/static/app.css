@@ -1850,6 +1850,11 @@
   /* In-progress board issues for this worker: informational, so accent rather
      than a success/failure colour — it is a count, not a verdict. */
   .meta-count .mc-doing { color: var(--accent); font-weight: 700; }
+  /* Total board items: deliberately DIMMER than .mc-doing. Both sit in the same
+     bare-number row, and if the larger number (total is always >= doing) were
+     the brighter one it would read as the more urgent figure. Doing is what
+     wants attention. */
+  .meta-count .mc-total { color: var(--text); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
   /* ── Dictation: compact recording popup (above the composer) ── */
