@@ -126,6 +126,40 @@ pub enum ItemType {
 }
 
 impl ItemType {
+    /// Every variant, so predicates over the set can be DERIVED rather than
+    /// hand-listed. The `is_dormant` comment below records what a re-typed
+    /// literal already cost here once; this exists so the next one does not
+    /// have to be written at all.
+    pub const ALL: [ItemType; 10] = [
+        ItemType::Code,
+        ItemType::Escalation,
+        ItemType::Blocker,
+        ItemType::Investigation,
+        ItemType::Ops,
+        ItemType::Research,
+        ItemType::Chore,
+        ItemType::Doc,
+        ItemType::Tripwire,
+        ItemType::Watch,
+    ];
+
+    /// The wire/DB spelling — the same snake_case serde emits, so a value
+    /// built from this matches what is stored in `issues.type`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ItemType::Code => "code",
+            ItemType::Escalation => "escalation",
+            ItemType::Blocker => "blocker",
+            ItemType::Investigation => "investigation",
+            ItemType::Ops => "ops",
+            ItemType::Research => "research",
+            ItemType::Chore => "chore",
+            ItemType::Doc => "doc",
+            ItemType::Tripwire => "tripwire",
+            ItemType::Watch => "watch",
+        }
+    }
+
     /// Dormant types: cards that arm and wait for an event instead of being
     /// worked. Only these may take [`BoardTransition::Arm`]. Kept as ONE
     /// predicate so the exemption ("never auto-picked") and the surfacing
@@ -1270,6 +1304,20 @@ pub fn verified_is_meaningful(item_type: ItemType) -> bool {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    /// as_str must equal what serde emits, or a SQL filter built from it
+    /// silently matches nothing for that type.
+    #[test]
+    fn item_type_as_str_matches_the_serde_spelling() {
+        for t in ItemType::ALL {
+            let ser = serde_json::to_string(&t).expect("serialize");
+            assert_eq!(
+                format!("\"{}\"", t.as_str()),
+                ser,
+                "as_str and serde disagree for {t:?}"
+            );
+        }
+    }
 
     #[test]
     fn control_words_and_short_fragments_mint_no_card() {

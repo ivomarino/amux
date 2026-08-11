@@ -876,15 +876,40 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
 // Verify nudge — option B (idle session) + option A (batched daily)
 // ---------------------------------------------------------------------------
 
+/// The SQL fragment excluding types for which `verified` is meaningless,
+/// DERIVED from `verified_is_meaningful` rather than hand-listed.
+///
+/// AMUX-2825 names calling that predicate as non-negotiable, and the shipped
+/// nudge (fe44d61) did not call it once: it selected every `done` card
+/// regardless of type. Measured on the live board, 299 of 1162 agent-owned
+/// done cards — 25%, across 36 lanes — are doc/chore/investigation/research/
+/// escalation/watch, which ship nothing and so have no production to confirm
+/// in. Nagging a lane to verify those is precisely the make-work AMUX-2816's
+/// narrowing removed, re-created one tier down.
+///
+/// NOT IN rather than IN, deliberately: `issues.type` holds values outside the
+/// enum (10 cards are typed `bug` today). An IN-list would silently drop them;
+/// NOT IN keeps an unknown type verifiable, which matches how the rest of this
+/// file treats it (`COALESCE(type,'code')`). Unknown defaults to code-like.
+fn unverifiable_types_sql() -> String {
+    let names: Vec<String> = amux_core::board::ItemType::ALL
+        .iter()
+        .filter(|t| !amux_core::board::verified_is_meaningful(**t))
+        .map(|t| format!("'{}'", t.as_str()))
+        .collect();
+    format!("AND COALESCE(type,'code') NOT IN ({})", names.join(","))
+}
+
 /// Cards in `done` that this session could verify. Returns (id, title, type)
 /// tuples, capped at 8 for prompt brevity.
 fn done_verify_candidates(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
-    conn.prepare(
+    conn.prepare(&format!(
         "SELECT id, title, COALESCE(type,'code') FROM issues \
          WHERE session=?1 AND status='done' AND deleted IS NULL \
-         AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         AND COALESCE(archived,0)=0 AND owner_type='agent' {} \
          ORDER BY updated DESC LIMIT 8",
-    )
+        unverifiable_types_sql()
+    ))
     .and_then(|mut st| {
         st.query_map(rusqlite::params![session], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
@@ -896,9 +921,15 @@ fn done_verify_candidates(conn: &Connection, session: &str) -> Vec<(String, Stri
 
 /// Total count of done cards for this session (for the "and N more" line).
 fn done_card_count(conn: &Connection, session: &str) -> i64 {
+    // SAME predicate as the selector, including the type filter. These two feed
+    // the "... and N more" arithmetic; if they diverge the prompt states a
+    // total its own list cannot account for.
     conn.query_row(
-        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='done' \
-         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+        &format!(
+            "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='done' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' {}",
+            unverifiable_types_sql()
+        ),
         rusqlite::params![session],
         |r| r.get(0),
     )
@@ -2027,6 +2058,48 @@ pub fn routes() -> axum::Router<AppState> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// AMUX-2825's non-negotiable constraint, which fe44d61 did not implement:
+    /// the sweep MUST exclude types where `verified` is meaningless. 299 of
+    /// 1162 live agent-owned done cards (25%, 36 lanes) are such types.
+    #[test]
+    fn the_sweep_never_lists_a_card_that_cannot_be_verified() {
+        let conn = board_db();
+        let ins = |id: &str, typ: &str| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
+                 VALUES (?1,?2,'done','me','agent',0,?3,100)",
+                rusqlite::params![id, format!("card {id}"), typ],
+            )
+            .expect("insert");
+        };
+        // Every enum variant, split by the predicate itself — so this test
+        // cannot disagree with verified_is_meaningful even if it changes.
+        for t in amux_core::board::ItemType::ALL {
+            ins(&format!("T-{}", t.as_str()), t.as_str());
+        }
+        ins("T-bug", "bug"); // outside the enum — must stay verifiable
+
+        let got = done_verify_candidates(&conn, "me");
+        let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _, _)| i.as_str()).collect();
+
+        for t in amux_core::board::ItemType::ALL {
+            let id = format!("T-{}", t.as_str());
+            let want = amux_core::board::verified_is_meaningful(t);
+            assert_eq!(
+                ids.contains(id.as_str()),
+                want,
+                "{} verified_is_meaningful={want} but selection said otherwise",
+                t.as_str()
+            );
+        }
+        assert!(ids.contains("T-bug"), "an unknown type must stay verifiable, not be silently dropped");
+        assert_eq!(
+            done_card_count(&conn, "me") as usize,
+            ids.len(),
+            "the count and the selector must share the type filter too"
+        );
+    }
 
     /// The verify-nudge shipped with no test of its own (fe44d61). These pin
     /// the two properties that decide whether it nags correctly or wrongly.
