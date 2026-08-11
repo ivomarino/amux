@@ -978,7 +978,6 @@ fn catalog_body(path: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::py_proxy::tests::{fake_python, PY_BASE_OVERRIDE, PY_LOCK};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -1049,16 +1048,19 @@ mod tests {
         assert_eq!(v["error"], "q required", "{v}");
     }
 
-    /// Post-cutover invariant: NO browser verb reaches the Python proxy. A
-    /// fake python sits armed the whole time; with no amux-launched Chrome
-    /// the driver verbs answer an honest 409 naming /start, the catalog 404
-    /// answers unknown paths, /agent answers 501 — all with zero proxied
-    /// requests and no x-amux-answered-by header anywhere.
+    /// Post-cutover invariant: NO browser verb reaches a proxy. With no
+    /// amux-launched Chrome the driver verbs answer an honest 409 naming
+    /// /start, the catalog 404 answers unknown paths, /agent answers 501 — all
+    /// natively, with no `x-amux-answered-by` header anywhere.
+    ///
+    /// This used to arm a fake python listener and assert it received nothing.
+    /// AMUX-2906 deleted the forwarder, so that half could no longer fail and
+    /// was removed (ethos rule 7). The `!proxied` assertions below are KEPT:
+    /// unlike the fake listener, they would still fail if a proxy hop were
+    /// ever reintroduced here, which makes them a live regression guard rather
+    /// than theatre.
     #[tokio::test]
     async fn driver_verbs_answer_natively_never_proxy() {
-        let _guard = PY_LOCK.lock().await;
-        let (base, log) = fake_python(StatusCode::OK, r#"{"ok": true}"#).await;
-        *PY_BASE_OVERRIDE.lock().unwrap() = Some(base);
         let app = app();
 
         for (method, uri, body) in [
@@ -1112,12 +1114,5 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(!proxied);
         assert_eq!(v["running"], json!(false));
-
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "no browser verb may reach the python proxy: {:?}",
-            log.lock().unwrap().iter().map(|s| s.path_and_query.clone()).collect::<Vec<_>>()
-        );
-        *PY_BASE_OVERRIDE.lock().unwrap() = None;
     }
 }

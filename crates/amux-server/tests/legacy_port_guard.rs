@@ -85,12 +85,13 @@ const ALLOW: &[(&str, &str)] = &[
          connected account, and the value must match byte-for-byte. Retiring it is a \
          coordinated change (update the console, then this constant), NOT a port sweep",
     ),
+    // NOTE: crates/amux-server/src/api/py_proxy.rs was allowlisted here for its
+    // `AMUX_PY_URL` fallback, with the reasoning "this default is unreachable;
+    // it dies with the module". It did — AMUX-2906 deleted the forwarder, so
+    // the literal is gone and this row went with it. That is
+    // `allowlist_rows_are_live_and_reasoned` doing its job a second time: the
+    // row could not outlive the code it excused.
     // -- historical / dead code --
-    (
-        "crates/amux-server/src/api/py_proxy.rs",
-        "AMUX_PY_URL fallback for the retired python proxy. PROXIED_FAMILIES is empty \
-         and asserted empty, so this default is unreachable; it dies with the module",
-    ),
     (
         "crates/amux-server/src/api/request_log.rs",
         "provenance comments recording the URL a golden fixture was captured from — \

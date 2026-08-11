@@ -1,108 +1,67 @@
-//! Strangler-fig passthrough: endpoint families the PYTHON server still owns
-//! forward to it until cutover. **Post-AMUX-2608 that set is EMPTY — every
-//! /api family answers natively** — and this module survives as the registry
-//! that PROVES it stays empty, plus the machinery a future row would need.
+//! The rust/python boundary REGISTRY — and, post-cutover, the standing proof
+//! that nothing proxies any more.
 //!
-//! **The boundary is a TABLE, not archaeology** (AMUX-2597: "there needs to
-//! be a clear separation between the two servers"). Any family that proxies
-//! must be declared ONCE in [`PROXIED_FAMILIES`] — path, why Python owns
-//! it, and the exit condition that retires the proxy — and the axum mounts
-//! derive from that table ([`family_routes`], called from mod.rs). A
-//! module-internal proxy hop (`ProxyMount::Module`) must also be declared in
-//! the same table with its mount site named, so nothing proxies without a
-//! row here. Runtime view: `GET /api/debug/boundary` (ethos rule 4 — the
-//! separation must be enumerable where people look), which now reports
-//! `proxied: []`; `tests/proxy_composition.rs` asserts the table is empty.
-//! Full ownership matrix: docs/rust-migration/server-boundary.md.
+//! **The boundary is a TABLE, not archaeology** (AMUX-2597: "there needs to be
+//! a clear separation between the two servers"). [`PROXIED_FAMILIES`] is that
+//! table; it is EMPTY (AMUX-2608 cut the last row, `/api/scope`) and
+//! `tests/proxy_composition.rs` fails the build if a row reappears. Runtime
+//! view: `GET /api/debug/boundary` — ethos rule 4, the separation must be
+//! enumerable where people already look. Full matrix:
+//! docs/rust-migration/server-boundary.md.
 //!
-//! What no longer rides this: `/api/fs` (native, api/fs.rs), `/api/groups` +
-//! `/api/tags` (native, api/groups.rs), `/api/upload` + `/api/uploads`
-//! (native, api/upload.rs), `/api/file` (+ raw/vtt/prepare/transcode) +
-//! `/api/library` (native, api/file_viewer.rs — AMUX-2598: durable media
-//! jobs in `_amux_media_jobs` replaced python's in-process `_MEDIA_PREP_JOBS`),
-//! `POST /api/dictate` + `/api/dictation/config` (native, api/dictation.rs —
-//! AMUX-2598: the whisper worker + Gemini fallback run in THIS process),
-//! `/api/browser/{driver verbs}` (native, api/browser.rs — AMUX-2598: CDP
-//! websocket client against the server-machine Chrome; /agent = honest 501),
-//! `/api/scope` (native, api/scope.rs — AMUX-2608: the LAST row; python
-//! storage — memory .md files, env files, statuses/session_gates/
-//! status_scope tables — shared byte-for-byte).
+//! **The forwarding machinery is GONE (AMUX-2906), and it is not coming back.**
+//! It was kept after the last cutover "for a future row". Two facts retired
+//! that rationale:
 //!
-//! Rust-managed workers (wrk_ ids) never proxied — that guard moved to
-//! api/session_verbs.rs with the session-verb cutover (same 501 pointer).
+//! 1. The Python server was DELETED at 792ce1f. CLAUDE.md is explicit — do not
+//!    resurrect it or add anything that depends on it — so there is no future
+//!    row for the machinery to serve.
+//! 2. Worse, it had become actively dangerous. `py_base()` defaulted to
+//!    localhost on the RETIRED legacy port — which, since the cutover, is THIS
+//!    SAME PROCESS answering on its compatibility bind (verified: identical
+//!    `pid` and `build` on the retired port and the canonical one). A
+//!    `Namespace` row would therefore have forwarded a request to ourselves,
+//!    re-entered the same passthrough, and looped — every hop holding a 600s
+//!    reqwest timeout and an unbounded buffered body in RAM. Machinery that
+//!    would hang the server is not machinery a future row "needs".
 //!
-//! Transport notes, load-bearing:
-//! - The Python server is `BaseHTTPRequestHandler`-based: it reads request
-//!   bodies via `Content-Length` and does NOT speak chunked uploads. So the
-//!   forwarder BUFFERS the body (giving reqwest a known length) rather than
-//!   streaming — a streamed body would arrive at Python as zero bytes.
-//!   Python buffers whole uploads in RAM too (`rfile.read(length)`), so this
-//!   is parity, not a new cost.
-//! - Headers forward denylist-style (hop-by-hop stripped) so multipart
-//!   boundaries, `X-Amux-Session`, `X-Amux-UI-Token` and future headers
-//!   survive without each needing to be remembered here.
-//! - Every proxied response carries `x-amux-answered-by: python-proxy` so a
-//!   debugging session can tell which server actually answered (ethos rule 4).
+//! `crates/amux-server/tests/legacy_port_guard.rs` had already reasoned to the
+//! same conclusion in its allowlist ("this default is unreachable; it dies with
+//! the module") and its `allowlist_rows_are_live_and_reasoned` check enforces
+//! it: the row is now gone because the literal is.
+//!
+//! Git history has the forwarder (buffered bodies for Python's
+//! `Content-Length`-only reader, a hop-by-hop header denylist, the
+//! `x-amux-answered-by: python-proxy` stamp) if a genuine cross-process proxy
+//! is ever needed. The transport lesson worth keeping — why a passthrough must
+//! use explicit routes rather than `.fallback()` — moved to the SPA catch-all
+//! in mod.rs, which is where it stays true.
 
-use super::AppState;
-use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::any;
-use axum::{Json, Router};
 use serde_json::json;
 
-fn py_base() -> String {
-    #[cfg(test)]
-    if let Some(v) = tests::PY_BASE_OVERRIDE.lock().expect("py base override").clone() {
-        return v;
-    }
-    std::env::var("AMUX_PY_URL").unwrap_or_else(|_| "https://localhost:8822".into())
-}
-
-// ---------------------------------------------------------------------------
-// The boundary registry (AMUX-2597)
-// ---------------------------------------------------------------------------
-
-/// Where a proxied family's axum mount lives.
-#[derive(Debug, Clone, Copy)]
-pub enum ProxyMount {
-    /// Whole-namespace passthroughs at these prefixes, derived by
-    /// [`family_routes`] — nothing else may mount a namespace proxy.
-    Namespace(&'static [&'static str]),
-    /// The proxy hop is interleaved with NATIVE routes inside the named
-    /// module's router (a namespace mount would shadow the native half).
-    /// Declared here so the boundary stays enumerable; the module's router
-    /// is the mount site.
-    Module(&'static str),
-}
-
-/// One endpoint family the Python server still owns. `why` names the
-/// capability (not just data) that keeps it in Python; `exit` is the
-/// condition that retires the row. Deleting a row and mounting a native
-/// router is the ONLY sanctioned way to cut a family over.
+/// One endpoint family the Python server owns. Retained as the type of the
+/// (empty, and permanently empty) [`PROXIED_FAMILIES`] table so
+/// `/api/debug/boundary` and `tests/proxy_composition.rs` keep a shape to
+/// report on.
 pub struct ProxiedFamily {
     pub family: &'static str,
     pub why: &'static str,
     pub exit: &'static str,
-    pub mount: ProxyMount,
 }
 
 /// Everything that still proxies, in one place. Runtime view:
 /// `GET /api/debug/boundary`. Doc: docs/rust-migration/server-boundary.md.
 ///
 /// **EMPTY, and it MUST stay empty (AMUX-2608).** `/api/scope` was the last
-/// row; its native port (api/scope.rs) retired it, and an empty table that
-/// is asserted empty — `tests/proxy_composition.rs` fails the build if a row
-/// reappears — is the cutover's standing proof. The registry MECHANISM stays
-/// on purpose: if a future family ever must proxy again, a table row here is
-/// still the only sanctioned way, and `/api/debug/boundary` will say so
-/// where a debugging session already looks.
+/// row; its native port (api/scope.rs) retired it. There is no forwarder left
+/// to mount a row against (see the module doc), so re-proxying is now a
+/// deliberate build-it-again decision rather than a table edit — which is the
+/// correct cost for resurrecting a boundary the cutover removed.
 pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 
 /// The RUST-NATIVE /api families, with one-line notes — the other half of
-/// `GET /api/debug/boundary`. Kept adjacent to [`PROXIED_FAMILIES`] so a
-/// cutover edits one file; `tests/proxy_composition.rs` cross-checks this
+/// `GET /api/debug/boundary`. Kept adjacent to [`PROXIED_FAMILIES`] so the
+/// boundary reads as one file; `tests/proxy_composition.rs` cross-checks this
 /// list against the routes mod.rs actually mounts (a view must share the
 /// predicate of the mechanism it describes — ethos rule 1).
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
@@ -189,352 +148,29 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/debug", "debug endpoints, incl. this boundary registry"),
 ];
 
-/// The axum mounts DERIVED from [`PROXIED_FAMILIES`] — merged once in
-/// mod.rs. Adding a proxied family means adding a table row, never an
-/// ad-hoc mount; `Module` rows contribute no routes here because their
-/// mount site is inside the named module (interleaved with native routes).
-pub fn family_routes() -> Router<AppState> {
-    let mut r = Router::new();
-    for fam in PROXIED_FAMILIES {
-        match fam.mount {
-            ProxyMount::Namespace(prefixes) => {
-                for p in prefixes {
-                    r = r.nest(p, passthrough_routes());
-                }
-            }
-            ProxyMount::Module(_) => {}
-        }
-    }
-    r
-}
-
-/// GET /api/debug/boundary — the registry as JSON, so which server owns
-/// which family is a runtime fact, not archaeology (ethos rule 4). Proxied
-/// responses additionally self-identify via `x-amux-answered-by:
-/// python-proxy` on every hop.
+/// GET /api/debug/boundary — the registry as JSON, so which server owns which
+/// family is a runtime fact, not archaeology (ethos rule 4).
+///
+/// `proxy_machinery` is stated explicitly because `proxied: []` alone is a
+/// weak signal — CLAUDE.md already warns that an empty list "cannot report
+/// incompleteness". Naming the absent forwarder tells a debugging session the
+/// emptiness is STRUCTURAL (there is nothing left that could forward) rather
+/// than a table that merely happens to be clear today.
 pub async fn boundary() -> axum::Json<serde_json::Value> {
-    let mount_str = |m: &ProxyMount| match m {
-        ProxyMount::Namespace(p) => format!("namespace nest at {}", p.join(", ")),
-        ProxyMount::Module(m) => format!("inside {m}::routes(), interleaved with native routes"),
-    };
     axum::Json(json!({
         "proxied": PROXIED_FAMILIES.iter().map(|f| json!({
             "family": f.family,
             "owner": "python",
             "why": f.why,
             "exit": f.exit,
-            "mount": mount_str(&f.mount),
         })).collect::<Vec<_>>(),
         "native": NATIVE_FAMILIES.iter().map(|(fam, note)| json!({
             "family": fam, "owner": "rust", "note": note,
         })).collect::<Vec<_>>(),
-        "python_base": py_base(),
-        "marker": "every proxied response carries x-amux-answered-by: python-proxy",
+        "proxy_machinery": "removed (AMUX-2906) — the python server was deleted at 792ce1f and \
+                            the forwarder's default target had become this same process on the \
+                            retired legacy bind, i.e. a self-proxy loop. `proxied` is empty \
+                            STRUCTURALLY, not incidentally.",
         "doc": "docs/rust-migration/server-boundary.md",
     }))
-}
-
-/// Hop-by-hop / transport-computed headers that must not be copied onto the
-/// forwarded request (reqwest derives its own).
-const SKIP_REQUEST_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "connection",
-    "transfer-encoding",
-    "accept-encoding",
-    "expect",
-    "upgrade",
-    "keep-alive",
-    "te",
-    "trailer",
-    "proxy-authorization",
-    "proxy-authenticate",
-];
-
-/// Forward an already-decomposed request to the Python server. The shared
-/// core under every proxied family; callers that still hold the whole
-/// [`Request`] use [`forward_to_python`] instead.
-pub async fn forward_built(
-    method: axum::http::Method,
-    path_and_query: &str,
-    headers: &HeaderMap,
-    body: Vec<u8>,
-) -> Response {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true) // the Python server's self-signed localhost cert
-        // Long deliberately: /api/browser/agent runs a multi-minute model
-        // loop and /api/fs/upload can carry a large file; a 30s cap here
-        // turned real work into fake 502s.
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .expect("proxy client");
-    let mut fwd = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        format!("{}{}", py_base(), path_and_query),
-    );
-    for (k, v) in headers {
-        if SKIP_REQUEST_HEADERS.contains(&k.as_str()) {
-            continue;
-        }
-        if let Ok(v) = v.to_str() {
-            fwd = fwd.header(k.as_str(), v);
-        }
-    }
-    if !body.is_empty() {
-        fwd = fwd.body(body);
-    }
-
-    match fwd.send().await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let bytes = resp.bytes().await.unwrap_or_default();
-            (
-                status,
-                [
-                    ("content-type", ct),
-                    // Name the origin so a debugging session can tell which
-                    // server actually answered (ethos rule 4).
-                    ("x-amux-answered-by", "python-proxy".into()),
-                ],
-                bytes.to_vec(),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": "python server unreachable for proxied path",
-                "path": path_and_query,
-                "detail": e.to_string(),
-                "python": py_base(),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// Forward this request verbatim (method, ORIGINAL path+query, headers,
-/// body) to the Python server.
-pub async fn forward_to_python(req: Request) -> Response {
-    // Nested routers strip their prefix from `req.uri()`; OriginalUri keeps
-    // the path the CLIENT sent, which is the path Python routes on.
-    let uri = req
-        .extensions()
-        .get::<axum::extract::OriginalUri>()
-        .map(|u| u.0.clone())
-        .unwrap_or_else(|| req.uri().clone());
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_default();
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    // Buffered, unbounded: Python imposes no cap on /api/fs/upload and reads
-    // the whole body into RAM the same way; inventing a cap here would make
-    // the Rust origin reject uploads the Python origin accepts.
-    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
-        Ok(b) => b.to_vec(),
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-    forward_built(method, &path_and_query, &headers, body).await
-}
-
-/// Axum handler shape of [`forward_to_python`] for direct route mounting.
-pub async fn forward_handler(req: Request) -> Response {
-    forward_to_python(req).await
-}
-
-/// Whole-namespace passthrough router — mounted ONLY via
-/// [`family_routes`], for the `ProxyMount::Namespace` rows of
-/// [`PROXIED_FAMILIES`]. EXPLICIT `/` + `/{*rest}` routes, not a
-/// `.fallback()`: in the full app composition the static SPA catch-all
-/// (`/{*path}`) out-competes a nested router's fallback, so a fallback-based
-/// passthrough silently served index.html instead of proxying — the exact
-/// swallow that broke the SPA's group picker (AMUX-2594) and misled an auth
-/// probe into reporting an unauthenticated 200 on /api/fs.
-///
-/// Body limit disabled: the Python origin imposes no body caps on these
-/// families, and axum's 2MB default would 413 requests the Python origin
-/// accepts. (The /api/file + /api/library family — long this mount's main
-/// tenant — went native in AMUX-2598; the machinery serves whatever
-/// `Namespace` rows remain in the registry, and the tests below pin its
-/// transport semantics against a SYNTHETIC prefix so they survive rows
-/// coming and going.)
-pub fn passthrough_routes() -> Router<AppState> {
-    Router::new()
-        .route("/", any(forward_handler))
-        .route("/{*rest}", any(forward_handler))
-        .layer(axum::extract::DefaultBodyLimit::disable())
-}
-// ---------------------------------------------------------------------------
-// Tests — a local fake "Python" listener; no live servers touched.
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    /// Test override for the Python base URL (same pattern as dictation's
-    /// GEMINI_KEY_OVERRIDE: process-env reads are not hermetic).
-    pub(crate) static PY_BASE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
-    /// Serializes tests that set the override (async-aware).
-    pub(crate) static PY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// One captured request, as the fake Python saw it.
-    #[derive(Clone, Debug)]
-    pub(crate) struct Seen {
-        pub method: String,
-        pub path_and_query: String,
-        pub headers: Vec<(String, String)>,
-        pub body: Vec<u8>,
-    }
-
-    /// Spin a plain-HTTP fake Python server answering `status`/`body` to
-    /// every request and recording what arrived. Returns (base_url, log).
-    pub(crate) async fn fake_python(
-        status: StatusCode,
-        body: &'static str,
-    ) -> (String, Arc<Mutex<Vec<Seen>>>) {
-        let log: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
-        let log_c = log.clone();
-        let app = Router::new().fallback(move |req: Request| {
-            let log = log_c.clone();
-            async move {
-                let method = req.method().to_string();
-                let path_and_query = req
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_default();
-                let headers = req
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
-                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                    .await
-                    .unwrap_or_default();
-                log.lock().expect("seen log").push(Seen {
-                    method,
-                    path_and_query,
-                    headers,
-                    body: bytes.to_vec(),
-                });
-                (status, [("content-type", "application/json")], body)
-            }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        (format!("http://{addr}"), log)
-    }
-
-    fn state() -> AppState {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
-        AppState {
-            store,
-            started: std::time::Instant::now(),
-            build_hash: "test".into(),
-            auth_token: None,
-        }
-    }
-
-    /// Transport semantics of the namespace passthrough, exercised through
-    /// [`passthrough_routes`] nested at a SYNTHETIC prefix (no live
-    /// `Namespace` row exists post-AMUX-2598, and pinning the machinery to a
-    /// registry row would break every time a family cuts over): verbatim
-    /// path+query via OriginalUri, byte-for-byte body, header survival, and
-    /// the answered-by stamp.
-    #[tokio::test]
-    async fn namespace_passthrough_forwards_verbatim_and_stamps_answered_by() {
-        let _guard = PY_LOCK.lock().await;
-        let (base, log) = fake_python(StatusCode::OK, r#"{"ok": true}"#).await;
-        *PY_BASE_OVERRIDE.lock().unwrap() = Some(base);
-
-        let app: Router =
-            Router::new().nest("/api/py-ns-test", passthrough_routes()).with_state(state());
-        // Multipart-shaped body with a boundary in the content-type: the
-        // header must survive the hop byte-for-byte or Python cannot parse
-        // the form at all.
-        let body = b"--XX\r\nContent-Disposition: form-data; name=\"dir\"\r\n\r\n/tmp\r\n--XX--\r\n".to_vec();
-        use tower::ServiceExt;
-        let res = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri("/api/py-ns-test?x=1")
-                    .header("content-type", "multipart/form-data; boundary=XX")
-                    .header("x-amux-session", "updict-test")
-                    .header("authorization", "Bearer tok-abc")
-                    .body(axum::body::Body::from(body.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            res.headers().get("x-amux-answered-by").unwrap(),
-            "python-proxy"
-        );
-        let out = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&out[..], br#"{"ok": true}"#);
-
-        let seen = log.lock().unwrap().first().cloned().expect("request reached fake python");
-        assert_eq!(seen.method, "PUT");
-        // OriginalUri: the nested router must NOT strip the prefix off the
-        // forwarded path — Python routes on the full path.
-        assert_eq!(seen.path_and_query, "/api/py-ns-test?x=1");
-        assert_eq!(seen.body, body, "body forwarded byte-for-byte");
-        let h = |k: &str| {
-            seen.headers
-                .iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.clone())
-        };
-        assert_eq!(h("content-type").unwrap(), "multipart/form-data; boundary=XX");
-        assert_eq!(h("x-amux-session").unwrap(), "updict-test");
-        assert_eq!(h("authorization").unwrap(), "Bearer tok-abc");
-        *PY_BASE_OVERRIDE.lock().unwrap() = None;
-    }
-
-    #[tokio::test]
-    async fn unreachable_python_is_an_honest_502() {
-        let _guard = PY_LOCK.lock().await;
-        // A port nothing listens on: reserve via bind-then-drop.
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", l.local_addr().unwrap());
-        drop(l);
-        *PY_BASE_OVERRIDE.lock().unwrap() = Some(dead);
-
-        let app: Router =
-            Router::new().nest("/api/py-ns-test", passthrough_routes()).with_state(state());
-        use tower::ServiceExt;
-        let res = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/py-ns-test/raw?path=/tmp/x.mp4")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
-        let out = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["error"], json!("python server unreachable for proxied path"));
-        assert_eq!(v["path"], json!("/api/py-ns-test/raw?path=/tmp/x.mp4"));
-        *PY_BASE_OVERRIDE.lock().unwrap() = None;
-    }
 }

@@ -155,14 +155,12 @@ pub fn router(state: AppState) -> Router {
         // Uniform per-capability scope read/write — NATIVE (AMUX-2608: the
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
-        // Any python-proxied mount derives from py_proxy's PROXIED_FAMILIES
-        // table (AMUX-2597: the rust/python boundary is a registry, not
-        // scattered mounts). The table is EMPTY post-AMUX-2608 and must stay
-        // that way — this merge (now a no-op) plus the registry, the
-        // /api/debug/boundary view and tests/proxy_composition.rs are the
+        // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
+        // and the forwarder it fed was deleted in AMUX-2906, so the merge that
+        // used to sit here (already a no-op) is gone too — the registry, the
+        // /api/debug/boundary view and tests/proxy_composition.rs remain the
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
-        .merge(py_proxy::family_routes())
         .nest("/api/browser", browser::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
