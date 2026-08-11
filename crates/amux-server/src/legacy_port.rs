@@ -151,9 +151,24 @@ pub async fn count(mut req: Request, next: Next) -> Response {
         .chars()
         .take(120)
         .collect::<String>();
+    // The discriminator this counter was missing (AMUX-2769). ip+ua collapses
+    // the WHOLE fleet into one row — every lane is 127.0.0.1 wearing curl/8 —
+    // and the exit decision needs to separate two populations that look
+    // identical there:
+    //   * a pre-cutover SESSION whose process env still says 8822. Cannot be
+    //     rotated in a live process, harmless, drains when that lane restarts.
+    //   * an UNATTRIBUTED caller — new code, a doc, a script someone just
+    //     wrote against the retired address. That is a real defect to fix.
+    // Waiting cannot retire the port while the first group is running, and
+    // until now nothing could tell the reader which group the traffic was.
+    let session = crate::api::groups::hdr_worker(req.headers())
+        .trim()
+        .chars()
+        .take(64)
+        .collect::<String>();
     let path = req.uri().path().to_string();
 
-    let port = record(&ip, &ua, &path);
+    let port = record(&ip, &ua, &session, &path);
     // Tell the SHELL handler it is answering on the retired socket. Only the
     // dashboard document acts on this; the API surface stays identical. Set
     // outside the lock so a poisoned counter cannot silently disable the
@@ -169,14 +184,17 @@ pub async fn count(mut req: Request, next: Next) -> Response {
 /// numbers it had written by hand (ethos rule 7: test the shipped code path).
 ///
 /// Returns the armed legacy port, or 0 when the bind is not enabled.
-fn record(ip: &str, ua: &str, path: &str) -> u16 {
+fn record(ip: &str, ua: &str, session: &str, path: &str) -> u16 {
     let Ok(mut s) = state().lock() else { return 0 };
     let t = now();
     s.hits_total += 1;
     s.hour_hits += 1;
     s.last_hit = t;
     let port = s.port;
-    let key = format!("{ip} {ua}");
+    // TAB-separated: a user-agent contains spaces, so the old
+    // `"{ip} {ua}"` + `split_once(' ')` only worked because ip has none.
+    // A third field needs an unambiguous separator.
+    let key = format!("{ip}\t{ua}\t{session}");
     // Decide admission BEFORE taking the entry: `get_mut(..) else entry(..)`
     // borrows `s.clients` across both arms and does not compile.
     let admit = s.clients.contains_key(&key) || s.clients.len() < MAX_CLIENTS;
@@ -271,7 +289,10 @@ pub fn snapshot() -> serde_json::Value {
         .clients
         .iter()
         .map(|(k, v)| {
-            let (ip, ua) = k.split_once(' ').unwrap_or((k.as_str(), "-"));
+            let mut parts = k.splitn(3, '\t');
+            let ip = parts.next().unwrap_or("-");
+            let ua = parts.next().unwrap_or("-");
+            let session = parts.next().unwrap_or("");
             // Loudest path first, for the same reason clients are sorted that
             // way: this list is read to decide WHICH caller wearing this
             // user-agent to go and fix next.
@@ -281,6 +302,11 @@ pub fn snapshot() -> serde_json::Value {
             serde_json::json!({
                 "ip": ip,
                 "user_agent": ua,
+                // "" = unattributed. That is the row that matters: an
+                // attributed lane drains on its next restart, an unattributed
+                // caller is code still pointing at the retired address.
+                "session": session,
+                "attributed": !session.is_empty(),
                 "count": v.count,
                 "first_seen": v.first_seen,
                 "last_seen": v.last_seen,
@@ -292,11 +318,45 @@ pub fn snapshot() -> serde_json::Value {
         .collect();
     // Loudest caller first: the list is read to decide who to go and fix.
     clients.sort_by_key(|c| std::cmp::Reverse(c["count"].as_u64().unwrap_or(0)));
+
+    // THE EXIT VERDICT, computed rather than left for a reader to eyeball.
+    // "Zero hits for 7 days" is unsatisfiable by waiting while pre-cutover
+    // lanes are alive — their process env cannot be rotated — so the useful
+    // question is not "is it zero" but "is any of this traffic a DEFECT".
+    // Attributed traffic drains on its lane's next restart; unattributed
+    // traffic is code that still names the retired address.
+    let mut sessions: Vec<&str> = clients
+        .iter()
+        .filter_map(|c| c["session"].as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let unattributed: u64 = clients
+        .iter()
+        .filter(|c| !c["attributed"].as_bool().unwrap_or(false))
+        .map(|c| c["count"].as_u64().unwrap_or(0))
+        .sum();
+    let attributed: u64 = clients
+        .iter()
+        .filter(|c| c["attributed"].as_bool().unwrap_or(false))
+        .map(|c| c["count"].as_u64().unwrap_or(0))
+        .sum();
     let elapsed = t.saturating_sub(s.started_at);
     serde_json::json!({
         "enabled": s.port != 0,
         "port": s.port,
         "canonical_port": std::env::var("AMUX_RS_PORT").unwrap_or_else(|_| crate::config::DEFAULT_PORT.to_string()),
+        "attributed_hits": attributed,
+        "unattributed_hits": unattributed,
+        "sessions_still_on_legacy": sessions,
+        "verdict": if unattributed > 0 {
+            "BLOCKED: unattributed traffic on the retired port — that is code naming 8822, find it via the paths below and fix it"
+        } else if !sessions.is_empty() {
+            "DRAINING: every hit is an attributed pre-cutover lane whose process env cannot be rotated; it clears when those lanes restart, not by waiting"
+        } else {
+            "CLEAR: no traffic on the retired port this uptime"
+        },
         // Per-UPTIME, not all-time: the server re-execs on every install, and
         // reporting a restarted counter as a lifetime total would make the
         // retirement window look satisfied when it had just been reset.
@@ -473,15 +533,15 @@ mod tests {
         // one path going quiet while the other does not — with a single
         // `last_path` field that is invisible, so "did my fix work?" was
         // unanswerable from what this module kept.
-        assert_eq!(record("127.0.0.1", "curl/8", "/api/sessions/a/report"), 8822);
-        record("127.0.0.1", "curl/8", "/api/sessions/a/report");
-        record("127.0.0.1", "curl/8", "/api/board");
+        assert_eq!(record("127.0.0.1", "curl/8", "", "/api/sessions/a/report"), 8822);
+        record("127.0.0.1", "curl/8", "", "/api/sessions/a/report");
+        record("127.0.0.1", "curl/8", "", "/api/board");
         let busy = take_hour().expect("still armed");
         assert_eq!(busy.hits_last_hour, 3);
         assert!(busy.still_in_use, "a non-zero hour must be flagged in-use");
         assert_eq!(
             busy.top.first().map(|(k, c)| (k.as_str(), *c)),
-            Some(("127.0.0.1 curl/8", 3)),
+            Some(("127.0.0.1\tcurl/8\t", 3)),
             "the WARN line must be able to name the caller"
         );
 
@@ -522,5 +582,34 @@ mod tests {
             "the uptime total must NOT reset — only the hour window does"
         );
         assert!(!after.still_in_use);
+
+        // THE EXIT DISCRIMINATOR (AMUX-2769). Everything above is unattributed
+        // traffic, so the verdict must say BLOCKED — that is code naming the
+        // retired port and it is a defect someone has to go and fix.
+        let snap = snapshot();
+        assert_eq!(snap["unattributed_hits"], 3);
+        assert_eq!(snap["attributed_hits"], 0);
+        assert!(
+            snap["verdict"].as_str().unwrap_or("").starts_with("BLOCKED"),
+            "unattributed traffic must not read as merely draining"
+        );
+
+        // Now an ATTRIBUTED lane — a pre-cutover session whose process env
+        // still says 8822. Same ip, same user-agent: on the OLD key these were
+        // byte-identical to the rows above and the whole fleet collapsed into
+        // one number, which is exactly why "zero hits for 7 days" could never
+        // be reasoned about.
+        record("127.0.0.1", "curl/8", "mixpeek-studio", "/api/board");
+        record("127.0.0.1", "curl/8", "amux", "/api/board");
+        let snap = snapshot();
+        assert_eq!(snap["attributed_hits"], 2);
+        assert_eq!(
+            snap["sessions_still_on_legacy"],
+            serde_json::json!(["amux", "mixpeek-studio"]),
+            "the lanes to restart must be NAMED — an ip+ua tally cannot name them"
+        );
+        // Unattributed traffic still outranks: a defect is not cleared by a
+        // lane that merely needs restarting.
+        assert!(snap["verdict"].as_str().unwrap_or("").starts_with("BLOCKED"));
     }
 }
