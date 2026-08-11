@@ -3066,3 +3066,34 @@ FIX: e4e77f6 + c5368e4. The status now stamps the tag on entry (both the PATCH
   printer; the printer fix landed and the belief did not, which is why the
   second session repeated the detour to a raw PATCH rather than inheriting the
   conclusion.
+
+## "template not found" meant two different things and only ever said one
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2871
+SYMPTOM: `POST /api/sessions/<n>/apply-template {"template_id":"software-project"}`
+  returned `{"error":"template not found"}`. So did `zzz-does-not-exist`. Byte
+  for byte the same response, because `templates_dir()` returned None and the
+  root-missing branch shared its error string with the bad-id branch. All three
+  resolution rungs were dead: `AMUX_TEMPLATES_DIR` unset, `~/.amux/templates`
+  absent, and the middle rung canonicalized `~/.local/bin/amux-server.py` —
+  deleted with the Python server at 792ce1f, with nothing put in its place.
+COST: the templates feature has been fully dead since 792ce1f (2026-08-09) and
+  nobody could tell from the outside. The error names the operand the caller
+  supplied, so every reading of it says "you asked for a template that does not
+  exist" — the one hypothesis that sends you to check your own input instead of
+  the server. I only found it because I was porting the sibling LIST endpoint
+  and ran a bogus id as a control; without the control I would have shipped a
+  working accordion in front of an apply path that silently does nothing, which
+  is worse than today's hidden section.
+FIX: c857430. Two branches, two messages — root-missing names the paths it
+  tried, bad-id names the id and the dir it searched. install.sh syncs
+  `templates/` to `~/.amux/templates` so the surviving rung exists.
+  The pattern worth counting: deleting a component (the Python server) silently
+  killed a resolution rung in a DIFFERENT component that merely pointed at it,
+  and the pointer's failure mode was already indistinguishable from ordinary
+  user error. When something is removed, the greps that find its name are not
+  enough — the paths that were derived from where it lived do not mention it.
