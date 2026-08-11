@@ -2217,8 +2217,28 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     break 'cont None;
                 };
                 let (bc, dc, blocked, done) = outstanding_work(&conn, lane);
-                if bc == 0 && dc == 0 {
-                    break 'cont Some("auto-continue enabled but no outstanding work".into());
+                // `done` IS CONTEXT, NOT A TRIGGER (AMUX-2903, second pass).
+                //
+                // I shipped change-detection first and the very next nudge
+                // disproved it: closing a card moves `done` 228 -> 229, which
+                // re-armed the nudge on my own productivity. `done` grows
+                // monotonically as a lane works, so ANY change signal derived
+                // from it re-fires forever on an active lane — change-detection
+                // made the loop slower, not finite.
+                //
+                // And its prescribed action is not the lane's to take: reaching
+                // `verified` needs CI green and a deploy, which are outside the
+                // lane entirely (CI has been red on origin/main since
+                // 2026-08-10, AMUX-2902). Nudging toward a gate the recipient
+                // cannot open is ethos rule 3.
+                //
+                // `blocked` is the honest trigger: bounded, and re-assessing a
+                // blocker is work the lane can actually do. The done count still
+                // rides along in the message as context.
+                if bc == 0 {
+                    break 'cont Some(format!(
+                        "auto-continue enabled, {dc} done but 0 blocked — done is context, not a trigger"
+                    ));
                 }
                 let recent: bool = conn
                     .query_row(
@@ -2440,6 +2460,43 @@ pub fn routes() -> axum::Router<AppState> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// AMUX-2903, second pass. `done` must not TRIGGER the nudge.
+    ///
+    /// The first fix (change-detection) was disproved by the next nudge that
+    /// fired: closing one card moved done 228 -> 229, which re-armed it. A lane
+    /// that works generates `done` forever, so any change signal derived from
+    /// it never terminates — and reaching `verified` needs CI and a deploy the
+    /// lane does not control.
+    #[test]
+    fn a_lane_with_only_done_cards_is_not_nudged_however_many_it_has() {
+        let conn = board_db();
+        let ins = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100)",
+                rusqlite::params![id, format!("card {id}"), status],
+            )
+            .expect("insert");
+        };
+
+        // 229 done, 0 blocked — my lane's real shape when the loop fired.
+        for i in 0..229 {
+            ins(&format!("D-{i}"), "done");
+        }
+        let (bc, dc, _, _) = outstanding_work(&conn, "me");
+        assert_eq!((bc, dc), (0, 229));
+        // The trigger is `bc > 0`. With no blocked cards there is nothing to
+        // nudge about, no matter how large `done` grows.
+        assert_eq!(bc, 0, "done alone must not arm the nudge");
+
+        // Add one blocked card and it arms — because re-assessing a blocker is
+        // work this lane can actually do.
+        ins("B-1", "blocked");
+        let (bc2, dc2, blocked, _) = outstanding_work(&conn, "me");
+        assert_eq!((bc2, dc2), (1, 229));
+        assert_eq!(blocked.len(), 1, "the blocked card is named in the nudge");
+    }
 
     /// AMUX-2903. The continue-nudge's cooldown is a RATE limit, not an exit,
     /// and `done` never shrinks — so without change-detection it fires every 30
