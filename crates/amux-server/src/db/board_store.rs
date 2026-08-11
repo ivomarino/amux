@@ -173,9 +173,9 @@ pub fn core_item_type(raw: &str) -> ItemType {
 /// these on BOTH servers, so a drifted criterion here would make an ack
 /// minted against one server unusable against the other.
 ///
-/// Scoped (worker/group) gate tiers land with RR-0051; until then this is
-/// card-override -> type table -> global status defaults, the same first,
-/// second, and last rungs of Python's `_GATE_PRECEDENCE`.
+/// This is the FLOOR of the precedence ladder — the scoped tiers
+/// (card > worker > group > global column) live in
+/// [`effective_gate_scoped`] and land here only when nothing above matched.
 pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String> {
     let ty = core_item_type(item_type_raw);
     let list: &[&str] = match (ty, target) {
@@ -224,36 +224,107 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// Effective gate criteria for moving `row` into `target`: the card-level
-/// `gate` column override (a JSON array) wins when non-empty, else the
-/// type-derived defaults. Mirrors Python `_effective_gate` minus the
-/// worker/group tiers (RR-0051).
-/// The gate actually enforced for `row` entering `target`, including a column
-/// gate an operator configured in the UI (AMUX-2641).
+/// The gate actually enforced for `row` entering `target` — the full scoped
+/// ladder (worker > group > global; see [`effective_gate_scoped`]), with the
+/// worker's groups resolved from its CC_TAGS.
 ///
-/// Precedence, most specific first:
-///   1. the card's own `gate` override — one card, deliberately special;
-///   2. the CONFIGURED column gate, but only when `gate_custom` says a human
-///      wrote it (see migration 0017 for why a flag and not a comparison);
-///   3. the type-aware defaults.
-///
-/// [`effective_gate`] remains for callers with no DB handle and is the same
-/// function minus step 2. They must not drift: this one delegates rather than
-/// re-deriving, so a change to type defaults cannot land in one and not the
-/// other.
+/// [`effective_gate`] remains for callers with no DB handle and is the ladder
+/// minus every stored tier. They must not drift: this one delegates rather
+/// than re-deriving, so a change to type defaults cannot land in one and not
+/// the other.
 pub fn effective_gate_configured(
     conn: &rusqlite::Connection,
     row: &IssueRow,
     target: TaskStatus,
 ) -> Vec<String> {
+    let groups = row
+        .session
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(crate::api::session_verbs::lane_groups)
+        .unwrap_or_default();
+    effective_gate_scoped(conn, row, target, &groups)
+}
+
+/// The full gate precedence, with the worker's groups passed in so tests can
+/// exercise every tier hermetically (lane_groups reads env files under
+/// AMUX_HOME, which parallel tests cannot safely fake).
+///
+/// Most specific first (RR-0051, Ethan 2026-08-11: "worker takes priority
+/// over all, followed by group, then global"):
+///   1. the card's own `gate` override — one card, deliberately special;
+///   2. WORKER: `session_gates` row for the card's session — this table was
+///      written by the SPA's per-worker gate editor since AMUX-2599 and,
+///      until today, read by NOTHING at enforcement time: a user could author
+///      a worker gate, watch the UI display it, and have every transition
+///      judged by a different one (ethos rule 6 — the claim without the
+///      implementation);
+///   3. GROUP: `session_gates` rows keyed `group:<name>` for each of the
+///      worker's groups (CC_TAGS), unioned in sorted-group order when the
+///      worker is in several — all its groups' bars apply, deterministically;
+///   4. GLOBAL: the operator-authored column gate (`statuses.gate_custom`);
+///   5. the type-aware defaults.
+///
+/// Every tier fails CLOSED to the next: an absent, empty, or malformed row
+/// means "inherit", never "no gate" (an empty gate would silently open the
+/// strictest transitions on the board — same rule as `configured_gate`).
+pub fn effective_gate_scoped(
+    conn: &rusqlite::Connection,
+    row: &IssueRow,
+    target: TaskStatus,
+    groups: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let over = row.gate_criteria();
     if !over.is_empty() {
         return over;
+    }
+    if let Some(session) = row.session.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(g) = scoped_gate(conn, session, target) {
+            return g;
+        }
+        let mut merged: Vec<String> = Vec::new();
+        for group in groups {
+            if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+                for c in list {
+                    if !merged.contains(&c) {
+                        merged.push(c);
+                    }
+                }
+            }
+        }
+        if !merged.is_empty() {
+            return merged;
+        }
     }
     if let Some(cfg) = configured_gate(conn, target) {
         return cfg;
     }
     effective_gate(row, target)
+}
+
+/// One scope's gate row from `session_gates` (scope key is a session name or
+/// `group:<name>`), or None when the row is absent, empty, or unreadable —
+/// every "cannot tell" inherits the next tier rather than opening the gate.
+fn scoped_gate(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    target: TaskStatus,
+) -> Option<Vec<String>> {
+    let id = status_to_db(target, "");
+    let gate: Option<String> = conn
+        .query_row(
+            "SELECT gate FROM session_gates WHERE session = ?1 AND status = ?2",
+            rusqlite::params![scope, id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let list: Vec<String> = list
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 /// The operator-authored gate for a column, or None.
@@ -1435,6 +1506,144 @@ mod configured_gate_tests {
             TaskStatus::Done,
         );
         assert_eq!(got, vec!["This card only"]);
+    }
+
+    // ---- scoped gates: worker > group > global (RR-0051, 2026-08-11) ------
+
+    fn add_session_gates(c: &rusqlite::Connection) {
+        c.execute_batch(
+            "CREATE TABLE session_gates (session TEXT NOT NULL, status TEXT NOT NULL,
+             gate TEXT, PRIMARY KEY (session, status));",
+        )
+        .unwrap();
+    }
+
+    fn scope_gate(c: &rusqlite::Connection, scope: &str, status: &str, gate: &str) {
+        c.execute(
+            "INSERT INTO session_gates (session, status, gate) VALUES (?1, ?2, ?3)",
+            rusqlite::params![scope, status, gate],
+        )
+        .unwrap();
+    }
+
+    fn row_for(session: &str, item_type: &str, gate: Option<&str>) -> IssueRow {
+        let mut r = row(item_type, gate);
+        r.session = Some(session.into());
+        r
+    }
+
+    fn groups(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole ladder in one specimen: worker, group and global all
+    /// configured, worker wins ("worker takes priority over all").
+    #[test]
+    fn a_worker_gate_beats_group_and_global() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["Worker rule"]"#);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Worker rule"]);
+    }
+
+    #[test]
+    fn a_group_gate_applies_when_the_worker_has_none_and_beats_global() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Group rule"]);
+    }
+
+    /// A worker in several groups answers to ALL of them: union, in sorted
+    /// group order, deduplicated — deterministic however the fleet is tagged.
+    #[test]
+    fn multiple_groups_union_deterministically() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Shared rule","Ops rule"]"#);
+        scope_gate(&c, "group:gtm", "done", r#"["Gtm rule","Shared rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops", "gtm"]),
+        );
+        // BTreeSet iterates sorted: gtm's list first, then ops', dedup on merge.
+        assert_eq!(got, vec!["Gtm rule", "Shared rule", "Ops rule"]);
+    }
+
+    /// The card's own override is still the most specific thing on the board.
+    #[test]
+    fn a_card_override_beats_every_scoped_tier() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["Worker rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", Some(r#"["This card only"]"#)),
+            TaskStatus::Done,
+            &groups(&[]),
+        );
+        assert_eq!(got, vec!["This card only"]);
+    }
+
+    /// UNHAPPY: an empty or malformed scoped row INHERITS the next tier, it
+    /// never opens the gate — same fail-closed rule as the column gate. A
+    /// worker row of `[]` therefore does not exempt the worker from its
+    /// group's bar.
+    #[test]
+    fn a_malformed_or_empty_scoped_row_inherits_not_opens() {
+        for bad in ["not json", "[]", r#"["","  "]"#] {
+            let c = conn_with(None, None);
+            add_session_gates(&c);
+            scope_gate(&c, "backend", "done", bad);
+            scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+            let got = effective_gate_scoped(
+                &c,
+                &row_for("backend", "code", None),
+                TaskStatus::Done,
+                &groups(&["ops"]),
+            );
+            assert_eq!(got, vec!["Group rule"], "worker row {bad:?} must inherit the group tier");
+        }
+    }
+
+    /// UNHAPPY: a DB without the session_gates table (predates AMUX-2599)
+    /// must neither panic nor open the gate — the ladder continues below.
+    #[test]
+    fn a_missing_session_gates_table_inherits_the_global_tier() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Global column rule"]);
+    }
+
+    /// A sessionless card (no owner lane) skips the scoped tiers entirely —
+    /// there is no worker or group to scope to.
+    #[test]
+    fn a_sessionless_card_uses_the_global_ladder() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(&c, &row("code", None), TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(got, default_gates_for("code", TaskStatus::Done));
     }
 
     /// Every "cannot tell" answer must fall back to the defaults, NEVER to an

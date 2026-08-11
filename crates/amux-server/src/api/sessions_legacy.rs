@@ -1244,7 +1244,10 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "flags": flags,
             "creator": env.get("CC_CREATOR").cloned().unwrap_or_default(),
             "backend": backend,
-            "auto_continue": env.get("CC_AUTO_CONTINUE").map(|v| v == "1").unwrap_or(false),
+            // Same predicate as board_drive's nudge gate (default-ON,
+            // CC_AUTO_CONTINUE=0 opts out) — the view must not disagree with
+            // the mechanism it describes.
+            "auto_continue": crate::api::session_verbs::auto_continue_on(env.get("CC_AUTO_CONTINUE").map(String::as_str)),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),

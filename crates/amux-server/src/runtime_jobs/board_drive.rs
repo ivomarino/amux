@@ -256,10 +256,12 @@ pub trait Fleet: Send + Sync {
     /// reimplemented: a second copy of "is this lane mid-turn" is the
     /// two-implementations-of-one-rule defect the board keeps producing.
     async fn at_boundary(&self, lane: &str) -> bool;
-    /// `CC_AUTO_CONTINUE=1` — when a session runs out of todo cards but still
-    /// has blocked/done work, keep nudging it to re-assess and continue.
-    /// OPT-IN because the default fleet behavior is to go quiet when the queue
-    /// is empty; auto-continue is for workers that should never stop.
+    /// When a session runs out of todo cards but still has blocked/done work,
+    /// keep nudging it to re-assess and continue. ON BY DEFAULT since
+    /// 2026-08-11 (Ethan: "standing order whenever idle to take care of any
+    /// non-terminal board task"); CC_AUTO_CONTINUE=0 opts a lane out. The
+    /// explicit =1 additionally implies YOLO (is_yolo_enabled); the default
+    /// deliberately does not.
     fn auto_continue_enabled(&self, lane: &str) -> bool;
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
@@ -293,10 +295,7 @@ impl Fleet for LiveFleet {
     }
     fn auto_continue_enabled(&self, lane: &str) -> bool {
         let cfg = crate::api::session_verbs::parse_env(lane);
-        matches!(
-            cfg.get("CC_AUTO_CONTINUE").map(|v| v.trim().to_lowercase()).as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        crate::api::session_verbs::auto_continue_on(cfg.get("CC_AUTO_CONTINUE"))
     }
     async fn is_running(&self, lane: &str) -> bool {
         crate::api::session_verbs::is_running(lane).await
