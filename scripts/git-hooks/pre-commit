@@ -1,6 +1,22 @@
 #!/bin/bash
 # amux-staged-guard  (see the block below for why this call is HERE now)
 g="$(dirname -- "$0")/amux-staged-guard"
+# SELF-HEAL RATHER THAN WARN (AMUX-2663). The guard BLOCKS a commit that touches
+# another lane's in-flight files — that is the whole protection — and it was one
+# file mode away from being inert: the tracked copy was 100644, so every path
+# that PRESERVES mode (git checkout of a fresh clone, cp -p, tar) landed a
+# non-executable guard, `[ -x ]` failed, and this branch printed one line to
+# stderr and let the commit through. A protection that announces it is off and
+# proceeds is the incident this card records, not a warning about it.
+#
+# Mode is fixed at the source too, but self-healing here covers the checkouts
+# that already have the bad copy and will never run install-hooks.sh again.
+if [ ! -x "$g" ]; then
+  _src="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/git-hooks/amux-staged-guard"
+  if [ -f "$_src" ]; then
+    install -m 0755 "$_src" "$g" 2>/dev/null       && echo "amux: staged-guard was not executable - reinstalled from $_src" >&2
+  fi
+fi
 if [ -x "$g" ]; then "$g" || exit 1; else echo "amux: staged-guard MISSING at $g - cross-session sweep protection is OFF (AMUX-1730)" >&2; fi
 # Pre-commit hook: security scan + Rust/client-JS syntax
 set -e

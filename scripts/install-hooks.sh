@@ -47,6 +47,27 @@ set -e
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # --- foreign checkout: install the guard, verify, never touch their pre-commit
+# THE TRACKED MODE IS PART OF THE PROTECTION (AMUX-2663). install here uses
+# -m 0755 and so masks a wrong mode at the source — which is exactly how the
+# guard sat tracked as 100644 while every checkout that ran this script looked
+# fine. Any checkout that did NOT run it (a fresh clone, cp -p, tar) got a
+# non-executable guard, `[ -x ]` in pre-commit failed, and cross-session sweep
+# protection was silently OFF. Assert the source mode so it cannot regress
+# behind this script's own success.
+check_tracked_guard_mode() {
+  local mode
+  mode=$(git -C "$SRC" ls-files -s scripts/git-hooks/amux-staged-guard 2>/dev/null | awk '{print $1}')
+  if [ "$mode" != "100755" ]; then
+    echo "  FAIL scripts/git-hooks/amux-staged-guard is tracked as ${mode:-<untracked>}, not 100755." >&2
+    echo "       Every checkout that does not run this script gets a NON-EXECUTABLE guard," >&2
+    echo "       pre-commit's [ -x ] test fails, and sweep protection is off with one line" >&2
+    echo "       on stderr. Fix: git update-index --chmod=+x scripts/git-hooks/amux-staged-guard" >&2
+    return 1
+  fi
+  echo "  ok   scripts/git-hooks/amux-staged-guard is tracked executable (100755)"
+  return 0
+}
+
 install_guard_only() {
   local target="$1" fail=0
   if [ ! -d "$target/.git/hooks" ]; then
@@ -82,6 +103,7 @@ if [ "${1:-}" = "--all" ]; then
   # the same class of false-green as a grep that could not have matched.
   roots="${AMUX_HOOK_SCAN_ROOTS:-$HOME/Dev}"
   echo "scanning for installed amux guards under: $roots (override: AMUX_HOOK_SCAN_ROOTS)"
+  check_tracked_guard_mode || true
   allfail=0
   found=0
   # shellcheck disable=SC2086
@@ -95,9 +117,11 @@ if [ "${1:-}" = "--all" ]; then
   [ "$allfail" -eq 0 ] || echo "one or more checkouts need attention (see WARN/FAIL above)" >&2
   # fall through to install into the amux checkout itself
 elif [ -n "${1:-}" ]; then
+  check_tracked_guard_mode || true
   install_guard_only "$(cd "$1" && pwd)"
   exit $?
 fi
+check_tracked_guard_mode || true
 
 ROOT="$SRC"
 
