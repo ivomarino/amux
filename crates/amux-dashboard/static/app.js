@@ -6908,7 +6908,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.574';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.575';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8105,9 +8105,22 @@ function linkifyOutput(text) {
   return rewriteLocalhostUrls(html);
 }
 
+function _classifyPromptKind(promptText) {
+  const clean = promptText.replace(/^❯\s*/, '').trim();
+  if (!clean || typeof _peekMsgRows === 'undefined') return 'human';
+  const rows = (_peekMsgRows || _cmdHistory || []);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (!r || typeof r === 'string') continue;
+    const t = (r.text || '').trim();
+    if (t && clean.startsWith(t.slice(0, 60))) return _msgKind(r);
+  }
+  return 'human';
+}
 function highlightPrompts(html) {
   const lines = html.split('\n');
   let inPrompt = false;
+  let promptText = '';
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -8116,13 +8129,17 @@ function highlightPrompts(html) {
     const isContinuation = inPrompt && /^  \S/.test(textStart);
     if (isPromptStart) {
       inPrompt = true;
-      out.push('<span class="peek-prompt">' + raw);
+      promptText = textStart;
+      const kind = _classifyPromptKind(textStart);
+      out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind + '">' + raw);
     } else if (isContinuation) {
+      promptText += '\n' + textStart;
       out.push(raw);
     } else {
       if (inPrompt) {
         out[out.length - 1] += '</span>';
         inPrompt = false;
+        promptText = '';
       }
       out.push(raw);
     }
@@ -8591,19 +8608,30 @@ function _closePeekMore() {
 
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
+let _peekMsgNavKind = 'human';
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
-  return body ? Array.from(body.querySelectorAll('.peek-prompt')) : [];
+  if (!body) return [];
+  if (peekSearchQuery) {
+    return Array.from(body.querySelectorAll('.peek-search-match'));
+  }
+  const all = Array.from(body.querySelectorAll('.peek-prompt'));
+  if (_peekMsgNavKind === 'all') return all;
+  return all.filter(el => (el.dataset.msgKind || 'human') === _peekMsgNavKind);
 }
 function _peekMsgUpdate(prompts) {
   const countEl = document.getElementById('peek-msg-count');
   if (!countEl) return;
-  prompts.forEach(p => p.classList.remove('peek-msg-current'));
-  if (!prompts.length) { countEl.textContent = '❯'; return; }
+  document.querySelectorAll('.peek-prompt.peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (!prompts.length) {
+    countEl.textContent = peekSearchQuery ? '0' : '❯';
+    return;
+  }
   if (_peekMsgIndex < 0 || _peekMsgIndex >= prompts.length) _peekMsgIndex = prompts.length - 1;
   prompts[_peekMsgIndex].classList.add('peek-msg-current');
   prompts[_peekMsgIndex].scrollIntoView({ block: 'center', behavior: 'smooth' });
-  countEl.textContent = (_peekMsgIndex + 1) + '/' + prompts.length;
+  const label = peekSearchQuery ? '' : (_peekMsgNavKind === 'all' ? '' : _peekMsgNavKind.slice(0,1).toUpperCase());
+  countEl.textContent = (label ? label + ' ' : '') + (_peekMsgIndex + 1) + '/' + prompts.length;
 }
 function peekMsgNext() {
   const p = _peekMsgPrompts();
@@ -8616,6 +8644,17 @@ function peekMsgPrev() {
   if (!p.length) return;
   _peekMsgIndex = _peekMsgIndex <= 0 ? p.length - 1 : _peekMsgIndex - 1;
   _peekMsgUpdate(p);
+}
+function _peekMsgNavCycle() {
+  const kinds = ['human', 'session', 'schedule', 'amux', 'all'];
+  const i = kinds.indexOf(_peekMsgNavKind);
+  _peekMsgNavKind = kinds[(i + 1) % kinds.length];
+  _peekMsgIndex = -1;
+  const p = _peekMsgPrompts();
+  const label = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || {}).label || _peekMsgNavKind;
+  const countEl = document.getElementById('peek-msg-count');
+  if (countEl) countEl.textContent = label + ' ' + p.length;
+  showToast('Navigate: ' + label + ' messages (' + p.length + ')');
 }
 
 // ── Peek command bar ──

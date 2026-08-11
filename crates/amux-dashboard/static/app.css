@@ -1684,9 +1684,11 @@
   /* Peek search highlight */
   .peek-highlight { background: rgba(210,153,34,0.35); color: #fff; border-radius: 2px; }
   .peek-highlight.current { background: rgba(210,153,34,0.85); color: #000; }
-  /* Prompt lines keep their span (block) but no added decoration — the peek
-     should render what tmux renders, not restyle it (user feedback). */
-  .peek-prompt { display: block; }
+  .peek-prompt { display: block; border-left: 3px solid transparent; padding-left: 4px; margin-left: -7px; }
+  .peek-prompt-human    { border-left-color: #58a6ff; }
+  .peek-prompt-session  { border-left-color: #8957e5; }
+  .peek-prompt-schedule { border-left-color: #3fb950; }
+  .peek-prompt-amux     { border-left-color: #8b949e; }
 
   /* Peek overlay — flush to the true screen bottom. In a toolbar-less standalone
      webview window.innerHeight IS the full visible height, so fixed bottom:0 already

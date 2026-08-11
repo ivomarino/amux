@@ -1867,9 +1867,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="peek-nav-btn" onclick="peekSearchNext()" title="Next match (Enter)">&#x2193;</button>
         <button class="search-clear" onclick="event.stopPropagation();clearPeekSearch()">&#x2715;</button>
       </div>
-      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate user messages">
+      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate messages (click counter to change kind)">
         <button class="peek-nav-btn" onclick="peekMsgPrev()" title="Previous message">&#x2191;</button>
-        <span class="peek-msg-count" id="peek-msg-count">❯</span>
+        <span class="peek-msg-count" id="peek-msg-count" onclick="_peekMsgNavCycle()" style="cursor:pointer;" title="Click to cycle: Human / Session / Scheduled / amux / All">❯</span>
         <button class="peek-nav-btn" onclick="peekMsgNext()" title="Next message">&#x2193;</button>
       </div>
       <div class="peek-more-wrap">
