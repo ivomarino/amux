@@ -928,18 +928,27 @@ test('settings_notes_folder_row', async ({}, testInfo) => {
 test('settings_missing_endpoint_probe', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
-  const MISSING: Array<{ path: string; fixme: string }> = [
-    // /api/usage left this list on 2026-08-09: it was already ported, this
-    // probe was firing as designed, and its fixme is now the real
-    // settings_usage_meter UI test above.
-    { path: '/api/alert/config', fixme: 'settings_alerts_config' },
-    { path: '/api/alert/owner', fixme: 'settings_send_test_alert' },
-    // /api/org was on this list until 2026-08-09, when org.rs landed in the
-    // working tree MID-RUN and this probe fired exactly as designed; its fixme
-    // was promoted to the real settings_team_section test above.
-    { path: '/api/stats/daily', fixme: 'settings_about_token_stats' },
-    { path: '/api/branding', fixme: 'settings_about_branding_editor' },
-  ];
+  // EMPTY, and that is the intended end state — every entry has graduated.
+  //
+  // /api/usage left on 2026-08-09, /api/org the same day, both because this
+  // probe fired exactly as designed and their fixmes became real tests.
+  //
+  // The last four left on 2026-08-11: /api/alert/config, /api/alert/owner,
+  // /api/stats/daily and /api/branding are all routed native (verified against
+  // GET /api/debug/routes: [GET,PATCH], [GET,POST], [GET], [GET,POST,DELETE])
+  // and all four return application/json. Their fixmes had ALREADY been
+  // promoted to real tests on 2026-08-11 under AMUX-2621 — see the un-fixme
+  // note above settings_alerts_config — but the paths were left here, so this
+  // probe had been firing against correctly-ported endpoints and rust.yml's e2e
+  // job was RED on main for it (runs of 2026-08-10 onward).
+  //
+  // BE HONEST ABOUT WHAT THIS COSTS: with an empty list the loop below asserts
+  // nothing, so this test cannot currently fail. It is kept, rather than
+  // deleted, because the MECHANISM is what has value — it has caught three
+  // ports mid-flight — and the next endpoint that is genuinely absent in Rust
+  // belongs here. A dormant tripwire with its purpose written down beats
+  // deleting the pattern and rediscovering the need for it.
+  const MISSING: Array<{ path: string; fixme: string }> = [];
   for (const m of MISSING) {
     const res = await request.get(m.path, { headers: authHeaders(token) });
     const ct = res.headers()['content-type'] || '';
