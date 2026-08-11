@@ -6908,7 +6908,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.573';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.574';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -20461,10 +20461,46 @@ function _boardDraftsPersist() {
   try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
 }
 
+// Set false on every open, true once GET /api/board/<id> has filled desc/log.
+// The SAVE path refuses to write a desc while this is false and the card is
+// known to have one — see the guard in the save handler (AMUX-2840).
+let _bdHydrated = false;
+
+/// Fetch the authoritative card and fill desc/log, WITHOUT clobbering anything
+/// the user has typed.
+///
+/// The modal has always read desc off the LIST item. That is stale by however
+/// long the poll interval is, and under `slim=1` (which the poll is moving to,
+/// 3.5MB -> 554KB) it is absent entirely — so the textarea would open empty and
+/// saving would BLANK the description. This makes the modal read from the one
+/// place that always has it.
+async function _bdHydrate(id) {
+  try {
+    const r = await apiCall(API + '/api/board/' + id);
+    if (!r || !r.ok) return;
+    const full = await r.json();
+    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    const idx = boardItems.findIndex(i => i.id === id);
+    if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
+    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    const d = document.getElementById('bd-desc');
+    // Only fill if the user has not started typing into it.
+    if (d && (d.value === '' || d.value === (full.desc || ''))) d.value = full.desc || '';
+    const l = document.getElementById('bd-log');
+    if (l && full.log !== undefined) l.textContent = full.log || '';
+    _bdHydrated = true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+}
+
 function openBoardDetail(id) {
   const item = boardItems.find(i => i.id === id);
   if (!item) return;
   boardDetailId = id;
+  // Render instantly from cache, then correct it from the server. Blocking the
+  // modal on a fetch would make every card open feel slow for a field most
+  // opens never edit.
+  _bdHydrated = (item.desc !== undefined);
+  _bdHydrate(id);
   const draft = _boardDrafts[id];
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
   const titleEl = document.getElementById('bd-title');
@@ -20706,6 +20742,27 @@ async function boardDetailSave() {
   const title = document.getElementById('bd-title').value.trim();
   if (!title) return;
   const desc = document.getElementById('bd-desc').value.trim();
+
+  // NEVER WRITE AN EMPTY DESC OVER A CARD THAT HAS ONE (AMUX-2840).
+  //
+  // The modal used to fill this textarea from the LIST item. Once the poll
+  // moves to `slim=1` the list carries no desc, so the box would open empty and
+  // this save would blank the card — silently, irreversibly, and it would look
+  // like the board eating people's notes. _bdHydrate normally beats the user to
+  // it, but a slow or failed fetch must not turn into data loss.
+  //
+  // `desc_len` is served in BOTH modes, so it is the one field that can always
+  // answer "does this card have a description". If it says yes and we are about
+  // to send an empty one without having hydrated, refuse and retry the fetch.
+  {
+    const cur = boardItems.find(i => i.id === boardDetailId);
+    const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
+    if (!_bdHydrated && !desc && hadDesc) {
+      showToast && showToast('Still loading this card — not saving yet');
+      _bdHydrate(boardDetailId);
+      return;
+    }
+  }
   const sel = document.getElementById('bd-session');
   const worker = sel ? sel.value : undefined;
   const gateEl = document.getElementById('bd-gate');
