@@ -621,7 +621,18 @@ impl FleetSignals {
             let st = rep["state"].as_str().unwrap_or("");
             // ts is time.time() — a FLOAT. as_i64() on it is None, which
             // silently read every report as epoch-0 (the age_s bug).
-            let age = self.now - rep["ts"].as_f64().unwrap_or(0.0);
+            let ts = rep["ts"].as_f64().unwrap_or(0.0);
+            // A report from BEFORE the session's last (re)start describes a
+            // PREVIOUS LIFE — the same guard the transition block above has
+            // had all along, missing here. Found live 2026-08-11: board-exp-1
+            // switched claude -> codex, its hours-old claude `idle` report
+            // (24h trust window) outranked the codex trust picker the pane
+            // was showing, and a lane blocked on input read idle. A restarted
+            // claude lane loses nothing: its hooks re-report on the first
+            // turn, and until then the pane and activity decide — which is
+            // exactly right for the boot window.
+            let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
+            let age = self.now - ts;
             let stale_active = st == "active" && age > heartbeat;
             let live = age
                 < if st == "idle" {
@@ -629,7 +640,11 @@ impl FleetSignals {
                 } else {
                     env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
                 };
-            if !stale_active && live && matches!(st, "active" | "idle" | "waiting") {
+            if from_this_life
+                && !stale_active
+                && live
+                && matches!(st, "active" | "idle" | "waiting")
+            {
                 status = st.to_string();
                 if st == "idle" {
                     idle_report_age = Some(age);
@@ -876,13 +891,7 @@ fn stopped_session_raw(name: &str) -> String {
 
 // ---- misc shared helpers -------------------------------------------------
 
-fn amux_home() -> std::path::PathBuf {
-    std::env::var("AMUX_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-        })
-}
+use crate::config::amux_home;
 
 /// ~/.amux/sessions/<name>.meta.json (py:_load_meta) — last_send,
 /// last_started, task_summary live here.
@@ -1881,6 +1890,27 @@ mod tests {
         assert_eq!(s.derive_status("x", true), "idle");
         // A fresh waiting report wins over the activity fallback.
         s.reports = json!({"x": {"state": "waiting", "ts": 999_990.0, "source": "hook"}});
+        assert_eq!(s.derive_status("x", true), "waiting");
+    }
+
+    /// A report from BEFORE the session's last (re)start is a PREVIOUS LIFE
+    /// and licenses nothing — live specimen 2026-08-11: board-exp-1 switched
+    /// claude -> codex, and its hours-old claude `idle` report (24h idle
+    /// window) outranked the codex trust picker on the pane, reading a lane
+    /// blocked on input as idle. The control half: the same report with no
+    /// restart after it keeps its authority.
+    #[test]
+    fn a_report_from_before_the_last_restart_is_a_previous_life() {
+        let mut s = signals();
+        // Pane paints a picker; activity fresh so the pane is admissible.
+        s.activity.insert("amux-x".into(), 999_970);
+        s.panes.insert("x".into(), "Do you trust this directory?\n\u{203a} 1. Yes, continue\n  2. No, quit\n  Press enter to continue".into());
+        s.reports = json!({"x": {"state": "idle", "ts": 985_600.0, "source": "stop-hook"}});
+        // CONTROL: no restart recorded — the old idle report still wins.
+        assert_eq!(s.derive_status("x", true), "idle");
+        // The lane restarted AFTER the report (provider switch): the report
+        // is void and the pane's waiting shows through.
+        s.started.insert("x".into(), 999_000.0);
         assert_eq!(s.derive_status("x", true), "waiting");
     }
 
