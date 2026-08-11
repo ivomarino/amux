@@ -729,6 +729,31 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         let folded_n = row.desc.matches("New task:").count()
             + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
         obj.insert("folded_n".into(), json!(folded_n));
+
+        // The third derivation the list makes over desc+log (app.js:19231): the
+        // LAST "NEEDS-YOU:" marker, which is what a card shows when it is
+        // waiting on a human. Last rather than first — a re-marked card should
+        // show its freshest question, which is the client's own rule.
+        let ny = {
+            let hay = format!("{}\n{}", row.desc, row.log.as_deref().unwrap_or(""));
+            let mut found: Option<String> = None;
+            for line in hay.lines() {
+                let l = line.trim();
+                let low = l.to_lowercase();
+                for m in ["needs-you:", "needs you:", "needsyou:", "needs-ethan:", "needs-human:"] {
+                    if let Some(p) = low.find(m) {
+                        let v = l[p + m.len()..].trim();
+                        if !v.is_empty() {
+                            found = Some(v.chars().take(400).collect());
+                        }
+                    }
+                }
+            }
+            found
+        };
+        if let Some(n) = ny {
+            obj.insert("needsyou_note".into(), json!(n));
+        }
     }
     if stale {
         obj.insert("stale".into(), json!(true));
@@ -2677,6 +2702,36 @@ mod slim_tests {
             "app.js:18866 counts 'New task:' across desc AND log for the folded badge"
         );
         assert_eq!(slim["desc_len"], row.desc.chars().count());
+    }
+
+    /// The third derivation (app.js:19231). LAST marker wins, not first — a
+    /// re-marked card must show its freshest question, which is the client's own
+    /// rule and the reason a naive `find` would be wrong.
+    #[test]
+    fn slim_carries_the_latest_needsyou_marker() {
+        let row = IssueRow {
+            desc: "NEEDS-YOU: the stale one\nsome prose".into(),
+            log: Some("`10:00` moved\nNEEDS-YOU: the fresh one".into()),
+            ..Default::default()
+        };
+        assert_eq!(list_body(&row, true, false)["needsyou_note"], "the fresh one");
+
+        // Spelling variants the client accepts, case-insensitively.
+        for spelling in ["NEEDS-YOU:", "needs you:", "NEEDSYOU:", "Needs-Ethan:", "needs-human:"] {
+            let r = IssueRow { desc: format!("{spelling} answer me"), ..Default::default() };
+            assert_eq!(
+                list_body(&r, true, false)["needsyou_note"], "answer me",
+                "spelling {spelling} must be recognised"
+            );
+        }
+
+        // ABSENT means ABSENT: the key is omitted rather than served as an empty
+        // string, so a client can distinguish "no marker" from "a blank marker".
+        let plain = IssueRow { desc: "ordinary card".into(), ..Default::default() };
+        assert!(list_body(&plain, true, false).get("needsyou_note").is_none());
+        // A marker with nothing after it is not a marker.
+        let empty = IssueRow { desc: "NEEDS-YOU:   ".into(), ..Default::default() };
+        assert!(list_body(&empty, true, false).get("needsyou_note").is_none());
     }
 
     /// The preview must be bounded and must not panic on multi-byte text — it
