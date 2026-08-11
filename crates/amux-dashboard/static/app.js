@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.581';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.582';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18399,7 +18399,20 @@ async function fetchBoard() {
     const [r, rs, rsg] = await Promise.all([
       // ?archived=0 (AMUX-2271): 4.7MB -> 129KB. Archived cards load lazily,
       // only when something actually asks to see them.
-      fetch(API + '/api/board?archived=0', _boardEtag ? { headers: boardHeaders } : undefined),
+      //
+      // &slim=1 (AMUX-2840): 3,574,524 B -> 690,122 B on EVERY poll. desc and
+      // log are 81% of the payload and the list renders neither — it renders
+      // derivations of them, which the server now ships directly (desc_head,
+      // folded_n, desc_len, needsyou_note).
+      //
+      // FLIPPED LAST, deliberately, and only after enumerating every consumer
+      // that reads desc/log rather than trusting the list of known ones. There
+      // were SEVEN; four were unlisted, and every one fails SILENTLY — a blank
+      // preview, a filter that selects nothing, an empty history, a disarmed
+      // save guard. The edit modal is the one that mattered: it filled its
+      // textarea from the list item and saved that back, so flipping this line
+      // first would have blanked the description of every card anyone opened.
+      fetch(API + '/api/board?archived=0&slim=1', _boardEtag ? { headers: boardHeaders } : undefined),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);

@@ -1,5 +1,14 @@
 import { test, expect } from '@playwright/test';
 
+// PINNED TO 375px, not left to whichever project runs it. The bug and its
+// control are both WIDTH-DEPENDENT: at 375 the bar's message wraps to three or
+// four lines and swallows the action row, while at desktop width it is a single
+// line that clears Save on its own. Run under the desktop project, the control
+// stopped reproducing the bug and reported failure — a control that silently
+// declines to reproduce is the "check that cannot fail" problem inverted, and
+// it points at the code rather than at itself.
+test.use({ viewport: { width: 375, height: 667 } });
+
 // AMUX-2584. The sw-fail-bar is position:fixed bottom:0 at z-index 9999;
 // .board-edit-overlay is z-index 600 and its Save/Cancel row is
 // position:sticky bottom:0 INSIDE the box. So the bar lands on exactly the
