@@ -746,12 +746,22 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // every other session reads. Archived cards do NOT hold WIP (Ethan, primis
     // 2026-08-04: an archived `doing` card consumed a lane's entire WIP-1 budget
     // forever while the board hid it), and neither do dormant types — an armed
-    // tripwire can never be completed by working it.
+    // tripwire can never be completed by working it — and neither do `doing`
+    // cards tagged needs:you (Ethan/backend 2026-08-11: BACKE-3249 sat
+    // needs:you for 31 HOURS holding the lane's whole WIP-1 budget while 28
+    // eligible todos waited behind it; "there should be no reason any of these
+    // stop"). A card blocked on a human is parked, not in progress — idling
+    // the lane does not answer the human's question any faster, and the
+    // needs:you re-nag keeps chasing the human either way. Same LIKE form as
+    // the candidate query below, so the two loops can never disagree about
+    // which cards are human-blocked (the py split this fixes).
     let cap = wip_cap();
     let holding: Vec<String> = conn
         .prepare(
             "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+             AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
+                             AND lower(t.tag) LIKE 'needs:you%') \
              ORDER BY id",
         )
         .and_then(|mut st| {
@@ -2857,6 +2867,33 @@ mod tests {
         conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// Ethan/backend 2026-08-11: BACKE-3249 sat `doing` + needs:you for 31
+    /// hours, holding the lane's whole WIP-1 budget while 28 eligible todos
+    /// waited behind it. A card blocked on a HUMAN is parked, not in
+    /// progress — idling the lane does not answer the human faster. The
+    /// control half: the needs:you card itself must never be re-dispatched
+    /// (that exemption already exists in the candidate query; this asserts
+    /// releasing WIP did not loosen it).
+    #[test]
+    fn a_needs_you_doing_card_does_not_hold_wip() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "D-1", "lane", "doing", "waiting on Ethan", "SCOPE: x");
+        tag(&conn, "D-1", "needs:you", now - 31.0 * 3600.0);
+        add_card(&conn, "T-1", "lane", "todo", "next real work", "SCOPE: x\n- [ ] y");
+        assert_eq!(
+            claimed(&select_pickup(&conn, "lane", now)),
+            Some("T-1"),
+            "a human-blocked doing card must not idle the lane"
+        );
+        // Sub-tagged asks are the same state (the LIKE form both loops share).
+        let conn2 = board_db();
+        add_card(&conn2, "D-2", "lane", "doing", "waiting on a decision", "SCOPE: x");
+        tag(&conn2, "D-2", "needs:you:decision", now);
+        add_card(&conn2, "T-2", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
+        assert_eq!(claimed(&select_pickup(&conn2, "lane", now)), Some("T-2"));
     }
 
     /// An armed tripwire "costs nothing until it fires" and can never be
