@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.588';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.589';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7322,6 +7322,66 @@ function _markAgentRows(html) {
       ')" title="Tap to view">' + lines[li] + '</span>';
   });
   return lines.join('\n');
+}
+
+// ── Subagent list (AMUX-2635) ───────────────────────────────────────────────
+// Reads DURABLE transcripts via GET /api/sessions/<n>/subagents rather than
+// inferring from the pane. The predicate this replaces matched 0 of 50 lanes;
+// the transcripts match 50 of 50. Note there is no visibility gate on the
+// button at all — the fix for a predicate that matched nothing is to need no
+// predicate, not to write a better one.
+function closeSubagents() {
+  document.getElementById('subagents-overlay')?.classList.remove('active');
+}
+
+async function openSubagents() {
+  if (!peekSession) return;
+  const ov = document.getElementById('subagents-overlay');
+  const list = document.getElementById('subagents-list');
+  const title = document.getElementById('subagents-title');
+  if (!ov || !list) return;
+  if (title) title.textContent = 'Subagents \u00B7 ' + peekSession;
+  list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">Loading\u2026</div>';
+  ov.classList.add('active');
+  const sess = peekSession;
+  let d;
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(sess) + '/subagents',
+                          { headers: _authHeaders() });
+    d = await r.json();
+    if (!r.ok) throw new Error(d && d.error ? d.error : ('HTTP ' + r.status));
+  } catch (e) {
+    // Say WHICH failure. The old switcher's one message blamed the panel for
+    // every cause, which is what made this unreachable for months.
+    list.innerHTML = '<div style="color:var(--red);font-size:0.85rem;padding:18px;text-align:center;">'
+      + 'Could not load subagents.<br><span style="color:var(--dim);font-size:0.78rem;">' + esc(e.message) + '</span></div>';
+    return;
+  }
+  if (peekSession !== sess) return;   // switched away mid-fetch
+  const subs = (d && d.subagents) || [];
+  if (!subs.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px 12px;text-align:center;">'
+      + 'No subagents for this worker yet.<br>'
+      + '<span style="font-size:0.78rem;">Forks it spawns will appear here.</span></div>';
+    return;
+  }
+  list.innerHTML = subs.map(s => {
+    const when = s.last_active ? timeAgo(s.last_active) : '';
+    // An ABSENT description renders as the agent id in dim type — never a
+    // guessed label. 11 of 66 real transcripts carry none, and an invented
+    // one cannot be told from a real one.
+    const label = s.description
+      ? '<span style="color:var(--text);">' + esc(s.description) + '</span>'
+      : '<span style="color:var(--dim);font-style:italic;">' + esc(s.id) + '</span>';
+    const kind = s.type ? '<span class="chip" style="font-size:0.68rem;">' + esc(s.type) + '</span>' : '';
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:8px;">'
+      + '<div style="display:flex;gap:8px;align-items:flex-start;justify-content:space-between;">'
+      +   '<div style="min-width:0;font-size:0.86rem;line-height:1.35;">' + label + '</div>' + kind
+      + '</div>'
+      + '<div style="color:var(--dim);font-size:0.72rem;margin-top:5px;">'
+      +   (s.turns || 0) + ' turns' + (when ? ' \u00B7 ' + esc(when) : '')
+      + '</div></div>';
+  }).join('');
 }
 
 async function agentNav(dir, index) {

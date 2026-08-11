@@ -1857,6 +1857,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Peek overlay -->
+<div id="subagents-overlay" class="overlay" onclick="if(event.target===this)closeSubagents()">
+      <div class="overlay-card" style="max-width:640px;">
+        <div class="overlay-head">
+          <span id="subagents-title">Subagents</span>
+          <button class="btn" onclick="closeSubagents()">&#x2715;</button>
+        </div>
+        <div id="subagents-list" style="max-height:60vh;overflow:auto;padding:4px 2px;"></div>
+      </div>
+    </div>
 <div id="peek-overlay" class="overlay">
   <div class="overlay-header" style="flex-direction:column;gap:4px;padding-bottom:6px;">
     <div id="peek-title-row" style="display:flex;align-items:center;gap:8px;min-width:0;">
@@ -1946,6 +1955,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button onclick="agentNav('main')" title="View main conversation">&#x2302;</button>
         <button onclick="agentNav('up')" title="View previous agent">&#x25B2;</button>
         <button onclick="agentNav('down')" title="View next agent">&#x25BC;</button>
+      </div>
+      <!-- Subagent LIST. Deliberately has no visibility predicate: the three
+           buttons above drive the live TUI and really do need its panel open,
+           but listing forks reads durable transcripts, which every lane has.
+           The old gate matched 0 of 50 lanes; the fix is to delete the
+           predicate here, not to write a better one (AMUX-2635). -->
+      <div class="peek-agent-nav" id="peek-subagents-nav">
+        <button onclick="openSubagents()" title="List this worker's subagents">&#x2687;</button>
       </div>
     </div>
     <div id="peek-status" class="overlay-status" onclick="_peekGeoDebug()" title="Tap for layout debug"></div>
