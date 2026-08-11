@@ -101,6 +101,11 @@ const RECLAIM_COOLDOWN_S: f64 = 86400.0;
 /// checking more often than once a day for a low-priority idle task is the
 /// nag shape that got the `done` tier removed in the first place.
 const VERIFY_NUDGE_COOLDOWN_S: f64 = 24.0 * 3600.0;
+/// Continue-nudge cooldown: when a session has no todo/doing cards but still
+/// holds blocked/done work, nudge it to re-assess and keep going. 30 minutes
+/// — short enough that a worker doesn't sit idle for long, long enough that
+/// it's not a nag. Only fires for sessions with CC_AUTO_CONTINUE=1.
+const CONTINUE_NUDGE_COOLDOWN_S: f64 = 30.0 * 60.0;
 /// Backlog-triage nudge cooldown: once per 72h per session. Sessions with
 /// 10+ backlog cards older than 14 days get a prompt to triage them
 /// (archive stale ones, promote actionable ones to todo).
@@ -251,6 +256,11 @@ pub trait Fleet: Send + Sync {
     /// reimplemented: a second copy of "is this lane mid-turn" is the
     /// two-implementations-of-one-rule defect the board keeps producing.
     async fn at_boundary(&self, lane: &str) -> bool;
+    /// `CC_AUTO_CONTINUE=1` — when a session runs out of todo cards but still
+    /// has blocked/done work, keep nudging it to re-assess and continue.
+    /// OPT-IN because the default fleet behavior is to go quiet when the queue
+    /// is empty; auto-continue is for workers that should never stop.
+    fn auto_continue_enabled(&self, lane: &str) -> bool;
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
 }
@@ -280,6 +290,13 @@ impl Fleet for LiveFleet {
             .map(|t| t.trim().to_lowercase())
             .filter(|t| !t.is_empty())
             .collect()
+    }
+    fn auto_continue_enabled(&self, lane: &str) -> bool {
+        let cfg = crate::api::session_verbs::parse_env(lane);
+        matches!(
+            cfg.get("CC_AUTO_CONTINUE").map(|v| v.trim().to_lowercase()).as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
     }
     async fn is_running(&self, lane: &str) -> bool {
         crate::api::session_verbs::is_running(lane).await
@@ -1040,6 +1057,101 @@ fn backlog_triage_text(
          - If it NEEDS A HUMAN DECISION: tag it `needs:you`.\n\n\
          A backlog that only grows is not a queue, it is a log. Triage is the \
          difference."
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Continue nudge — for workers that should never stop
+// ---------------------------------------------------------------------------
+
+/// Outstanding non-terminal cards for a session: (blocked_count, done_count,
+/// blocked_cards [(id, title)], done_cards [(id, title)]).
+#[allow(clippy::type_complexity)]
+fn outstanding_work(
+    conn: &Connection,
+    session: &str,
+) -> (i64, i64, Vec<(String, String)>, Vec<(String, String)>) {
+    let query = |status: &str| -> (i64, Vec<(String, String)>) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE session=?1 AND status=?2 \
+                 AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+                rusqlite::params![session, status],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let cards: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, title FROM issues WHERE session=?1 AND status=?2 \
+                 AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+                 ORDER BY updated DESC LIMIT 8",
+            )
+            .and_then(|mut st| {
+                st.query_map(rusqlite::params![session, status], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        (count, cards)
+    };
+    let (bc, blocked) = query("blocked");
+    let (dc, done) = query("done");
+    (bc, dc, blocked, done)
+}
+
+fn continue_nudge_text(
+    blocked_count: i64,
+    done_count: i64,
+    blocked: &[(String, String)],
+    done: &[(String, String)],
+) -> String {
+    let mut sections = Vec::new();
+
+    if !blocked.is_empty() {
+        let mut lines: Vec<String> = blocked
+            .iter()
+            .map(|(id, title)| {
+                let t: String = title.chars().take(65).collect();
+                format!("  {id} {t}")
+            })
+            .collect();
+        if blocked_count > blocked.len() as i64 {
+            lines.push(format!("  ... and {} more", blocked_count - blocked.len() as i64));
+        }
+        sections.push(format!(
+            "{blocked_count} blocked card(s) — re-assess each blocker. If the \
+             upstream fix landed or you can now measure it, move it to `todo` and \
+             work it. If genuinely still blocked, leave it but ensure the blocker \
+             is named in the desc.\n{}",
+            lines.join("\n")
+        ));
+    }
+
+    if !done.is_empty() {
+        let mut lines: Vec<String> = done
+            .iter()
+            .map(|(id, title)| {
+                let t: String = title.chars().take(65).collect();
+                format!("  {id} {t}")
+            })
+            .collect();
+        if done_count > done.len() as i64 {
+            lines.push(format!("  ... and {} more", done_count - done.len() as i64));
+        }
+        sections.push(format!(
+            "{done_count} done card(s) — verify each in prod or archive if \
+             superseded.\n{}",
+            lines.join("\n")
+        ));
+    }
+
+    format!(
+        "[amux auto-continue] Your todo queue is empty but you still have \
+         outstanding work:\n\n{}\n\n\
+         Keep going until everything is verified, archived, or genuinely blocked \
+         on someone else. Don't stop between cards.",
+        sections.join("\n\n")
     )
 }
 
@@ -2071,6 +2183,60 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open);
             };
 
+            // CONTINUE NUDGE. When CC_AUTO_CONTINUE is set, a lane with
+            // no todo cards but outstanding blocked/done work gets nudged to
+            // keep going instead of idling. 30min cooldown.
+            let continue_trace = 'cont: {
+                if !fleet.auto_continue_enabled(lane) {
+                    break 'cont None;
+                }
+                let Ok(conn) = state.store.read() else {
+                    break 'cont None;
+                };
+                let (bc, dc, blocked, done) = outstanding_work(&conn, lane);
+                if bc == 0 && dc == 0 {
+                    break 'cont Some("auto-continue enabled but no outstanding work".into());
+                }
+                let recent: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type='continue.nudge' AND ts > ?2 LIMIT 1",
+                        rusqlite::params![lane, now - CONTINUE_NUDGE_COOLDOWN_S],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if recent {
+                    break 'cont Some(format!(
+                        "has {bc} blocked + {dc} done but continue-nudge sent within 30min"
+                    ));
+                }
+                drop(conn);
+                let text = continue_nudge_text(bc, dc, &blocked, &done);
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "continue.nudge",
+                    Some(json!({
+                        "blocked": bc,
+                        "done": dc,
+                    })),
+                    None,
+                    "board-drive",
+                )
+                .await;
+                fleet.deliver(lane, &text).await;
+                return LaneTrace::acted(
+                    lane,
+                    "continue-nudge",
+                    "",
+                    format!("{bc} blocked + {dc} done, auto-continue nudge delivered"),
+                )
+                .with_counts(eligible, open);
+            };
+
             let (areason, adetail) = advance_reason;
             let mut full_detail = if adetail.is_empty() {
                 detail
@@ -2082,6 +2248,9 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             }
             if let Some(td) = triage_trace {
                 full_detail = format!("{full_detail} | backlog-triage: {td}");
+            }
+            if let Some(cd) = continue_trace {
+                full_detail = format!("{full_detail} | continue: {cd}");
             }
             LaneTrace::skip(lane, reason, full_detail).with_counts(eligible, open)
         }

@@ -6980,7 +6980,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.590';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.591';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18006,7 +18006,11 @@ function _schedRunToast(d) {
     case 'error':     return 'Failed' + (tail || ' · delivery failed');
     // Shell schedules: `ok` genuinely means the command ran to completion, and
     // "no output" is a real, common answer for them (`exit 0 [noop] quiet`).
-    case 'ok':        return 'Ran' + (note ? ' · ' + note : ' · no output');
+    // Say the QUIET part too (AMUX-2899): "Ran · exit 0 [noop] ..." never told
+    // anyone that nothing was sent to the worker named on the row, which is why
+    // the button got pressed three times.
+    case 'ok':        return 'Ran on the host' + (note ? ' · ' + note : ' · no output')
+      + (d.session ? ' · nothing sent to ' + d.session + ' (shell schedule)' : '');
     default:          return 'Ran · ' + (d.status || 'unknown outcome') + tail;
   }
 }
@@ -18148,9 +18152,25 @@ function renderScheduler(opts) {
         return `<span class="sched-run-dot ${cls}" title="${esc(bits.join(' · '))}"></span>`;
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
-      const sessLink = s.session
-        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
-        : `<span style="color:var(--dim);">(shell)</span>`;
+      // KIND, not the presence of a session (AMUX-2899). This keyed on
+      // `s.session` being empty, so a shell schedule that HAS a session — 4 of
+      // the 7 shell schedules do — rendered byte-identically to a prompt
+      // schedule pointed at that worker. Ethan pressed Run Now on SCHED-99
+      // three times because nothing reached ts-gke; nothing was ever going to,
+      // and the row said the opposite. A view must key on the same field the
+      // mechanism does (ethos rule 1).
+      const isShell = s.kind === 'shell';
+      const kindChip = isShell
+        ? `<code class="sched-cadence-pill" style="color:var(--yellow,#fbbf24);" title="Runs a command on the host and routes on its exit code. It does NOT prompt a worker.">shell</code>`
+        : '';
+      const sessLink = !s.session
+        ? `<span style="color:var(--dim);">(no worker)</span>`
+        : isShell
+          // The worker is who OWNS/gets alerted, not where the command goes.
+          // Still linked — you want to reach the owner — but labelled so the
+          // row cannot be read as a delivery target.
+          ? `<span class="sched-sess-dot ${sessStatus}" title="${esc(s.session)}: ${sessStatus} — owner / alert routing, NOT a delivery target"></span><span style="color:var(--dim);">owner </span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
+          : `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`;
       const nextRel = s.next_run ? `▶ <strong style="color:var(--text);" title="${s.next_run}">${relTime(s.next_run)}</strong>` : '';
       // Measured cost badge (MG audit #1): fires last 24h + fleet share; red
       // when one schedule dominates — 51% of wake-ups sat invisible until
@@ -18179,7 +18199,7 @@ function renderScheduler(opts) {
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
               <code class="sched-id-badge" title="Schedule id — click to copy" onclick="event.stopPropagation();_copySchedId('${esc(s.id)}')">${esc(s.id)}</code>
               <span style="font-weight:600;font-size:0.84rem;cursor:pointer;" onclick="toggleSchedExpand('${esc(s.id)}')">${esc(s.title)}</span>
-              <code class="sched-cadence-pill">${esc(recLabel)}</code>${fireBadge}
+              <code class="sched-cadence-pill">${esc(recLabel)}</code>${kindChip}${fireBadge}
             </div>
             <div style="font-size:0.72rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dim);">
               <span style="display:flex;align-items:center;gap:3px;">${sessLink}</span>
