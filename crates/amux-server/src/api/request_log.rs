@@ -941,6 +941,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/log-search", methods: &["GET"] },
     RouteEntry { path: "/api/sql", methods: &["POST"] },
     RouteEntry { path: "/api/sql/schema", methods: &["GET"] },
     RouteEntry { path: "/api/sql/rows", methods: &["GET"] },

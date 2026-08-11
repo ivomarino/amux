@@ -198,3 +198,40 @@ async fn route_table_matches_the_real_router_both_directions() {
     std::env::remove_var("AMUX_PY_URL");
     std::env::remove_var("AMUX_HOME");
 }
+
+/// THE OTHER DIRECTION: a route MOUNTED but absent from the table.
+///
+/// The module comment above claimed ROUTE_TABLE was "kept honest BOTH
+/// directions by tests/route_table.rs". It was not — the test above iterates
+/// `for entry in ROUTE_TABLE`, so it can only catch a table row with no route.
+/// A route with no table row is invisible to it, and one sat that way:
+/// `/api/log-search` was mounted and answering while the route census (which
+/// reads the TABLE) reported it as "no route matches this path" and someone
+/// nearly ported it a second time.
+///
+/// Only DIRECT `.route("/api/...")` calls in api/mod.rs are checked here.
+/// Nested families (`.nest("/api/x", x::routes())`) declare their sub-paths
+/// inside the module and are not visible to a source scan of mod.rs — stating
+/// that plainly rather than implying full coverage, which is the overclaim this
+/// test exists to correct.
+#[test]
+fn every_directly_routed_api_path_is_in_the_table() {
+    let src = include_str!("../src/api/mod.rs");
+    let tabled: std::collections::HashSet<&str> =
+        ROUTE_TABLE.iter().map(|e| e.path).collect();
+    let mut missing = Vec::new();
+    for line in src.lines() {
+        let Some(i) = line.find(".route(\"/api/") else { continue };
+        let rest = &line[i + ".route(\"".len()..];
+        let Some(end) = rest.find('"') else { continue };
+        let path = &rest[..end];
+        if !tabled.contains(path) {
+            missing.push(path.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "mounted in api/mod.rs but absent from ROUTE_TABLE — the route census reads \
+         the TABLE, so these are reported as unrouted while they answer fine: {missing:?}"
+    );
+}
