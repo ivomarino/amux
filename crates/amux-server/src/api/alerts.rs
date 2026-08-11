@@ -425,6 +425,26 @@ async fn post_owner(
         Ok(conn) => guard_state_from_ledger(&conn, &session, &msg),
         Err(_) => (vec![], None),
     };
+    // `simulate_history: N` (dry-run only) — synthesise N prior in-window
+    // attempts so the send->dedupe->mute TRANSITION can be exercised without
+    // writing history or paging anyone.
+    //
+    // mixpeek-frustrations could verify "a first alert still sends" and "dry-run
+    // does not mutate", but NOT the transition, and for a structural reason: a
+    // dry run cannot write history, so repeating it can never cross
+    // threshold=2. Their words, and they are right — without this the claim
+    // "the guard suppresses" stays reasoned-not-measured, which is precisely
+    // the state my own 81-rows-zero-deduped finding shows is dangerous.
+    let simulate: Option<i64> = body.get("simulate_history").and_then(Value::as_i64);
+    let ledger_hist: Vec<f64> = match simulate {
+        // Spread them inside the storm window, oldest first, all strictly
+        // before `now` — the same shape a real burst leaves behind.
+        Some(n) if dry_run && n > 0 => (1..=n.min(64))
+            .map(|i| now - (STORM_WINDOW / (n.min(64) as f64 + 1.0)) * (i as f64))
+            .rev()
+            .collect(),
+        _ => ledger_hist,
+    };
     let (action, hist_len) = {
         let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
         let mem_hist: Vec<f64> = g.hist.get(&key).cloned().unwrap_or_default();
@@ -467,7 +487,16 @@ async fn post_owner(
                 AlertAction::StormNotice => "send ONE storm notice, then mute",
                 AlertAction::Muted => "suppress (storm mute active)",
             },
-            "hist_len": hist_len,
+            // NAMED FOR WHAT IT IS. `hist_len` was ambiguous exactly at the
+            // boundary the guard turns on: it counts in-window history
+            // INCLUDING this hypothetical alert, so a novel message reports 1
+            // and a key with one prior row reports 2 — which is threshold, so
+            // the SECOND alert is the one that mutes. mixpeek-frustrations
+            // caught the ambiguity and inferred the right reading; a field that
+            // needs inferring on the deciding boundary is a bad field.
+            "would_be_attempt_number": hist_len,
+            "prior_attempts_in_window": hist_len.saturating_sub(1),
+            "simulated_history": simulate.filter(|_| dry_run),
             "storm_threshold": STORM_THRESHOLD,
             "storm_window_s": STORM_WINDOW,
             "storm_mute_s": STORM_MUTE,
