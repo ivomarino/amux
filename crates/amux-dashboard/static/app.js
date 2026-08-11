@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.579';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.580';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19217,11 +19217,56 @@ function _bfOpenMenu(ev, target) {
   setTimeout(() => document.addEventListener('click', _bfOutside, true), 0);
 }
 
+// FREE-TEXT SEARCH NEEDS desc AND log, WHICH slim=1 DOES NOT SHIP (AMUX-2840
+// step 2). The card's plan was to move this to /api/search. Measured
+// 2026-08-11, that endpoint is not a substitute for THIS matcher:
+//
+//   query    /api/search   this matcher
+//   ansi              4              60   FTS tokenises, so it misses the
+//                                         intra-word substrings a person
+//                                         actually types (ansiToHtml)
+//   nudge           348              67   different corpus/semantics entirely
+//   sw-fail           2               2   agree
+//
+// and it is paginated (20 of 348 returned), so a board view cannot be filtered
+// from its results without paging the whole corpus. Swapping it in would have
+// silently changed what the board's primary surface finds, in both directions.
+//
+// So: keep this matcher authoritative and byte-identical, and pay for desc/log
+// ONLY while a text query is active. The poll — the thing that runs every few
+// seconds forever — stays slim; a search costs one full fetch, cached. That
+// inverts the cost onto the rare action instead of the constant one.
+//
+// INERT until the poll actually flips to slim: if the loaded items already
+// carry desc, nothing here fires.
+let _bqFullAt = 0;
+let _bqFullPending = false;
+function _bqEnsureFullText(items) {
+  if (!items.length || items[0].desc !== undefined) return;   // not slim — nothing to do
+  if (_bqFullPending || Date.now() - _bqFullAt < 60000) return;
+  _bqFullPending = true;
+  fetch(API + '/api/board?archived=0')
+    .then(r => (r.ok ? r.json() : null))
+    .then(full => {
+      if (!Array.isArray(full)) return;
+      const by = new Map(full.map(i => [i.id, i]));
+      boardItems.forEach(i => {
+        const f = by.get(i.id);
+        if (f) { i.desc = f.desc; i.log = f.log; i.gate_note = f.gate_note; }
+      });
+      _bqFullAt = Date.now();
+      renderBoard();
+    })
+    .catch(() => {})
+    .finally(() => { _bqFullPending = false; });
+}
+
 function _bqFilter(items, q) {
   const s = (q || '').trim();
   if (!s) return items;
   const ast = _bqParse(s);
   if (!ast.terms.length && !ast.text.length) return items;
+  if (ast.text.length) _bqEnsureFullText(items);
   const ix = _bqSessionIndex();
   const out = items.filter(i => _bqMatch(i, ast, ix));
   // If the query names a card exactly, that card goes first. Searching an id
