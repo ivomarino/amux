@@ -98,7 +98,6 @@ pub mod ids {
     pub const BOOTSTRAP: &str = "session-bootstrap";
     pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const SELF_ADOPT: &str = "self-adoption";
-    pub const LEGACY_PORT: &str = "legacy-port-reporter";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -128,7 +127,6 @@ pub const ALL_IDS: &[&str] = &[
     ids::BOOTSTRAP,
     ids::COMMIT_NUDGE,
     ids::SELF_ADOPT,
-    ids::LEGACY_PORT,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::GHOST_RESCUE,
@@ -328,25 +326,6 @@ pub const CATALOG: &[Doc] = &[
         env: NO_ENV,
         pref: None,
         detail: None,
-    },
-    Doc {
-        id: ids::LEGACY_PORT,
-        name: "Legacy port reporter",
-        // No port literal here on purpose — tests/legacy_port_guard.rs refuses
-        // one anywhere outside its allow-list, because the legacy bind is a
-        // countdown and not an address to build on.
-        purpose: "Counts requests still arriving on the retired legacy socket — the number that decides when that bind can be dropped.",
-        // UNSET is the off state here, not "0": no var means no legacy bind
-        // and therefore, correctly, no reporter. Without this sentinel a
-        // retired port renders as a red NOT RUNNING forever, which is how a
-        // health panel trains people to ignore it.
-        env: &[EnvControl {
-            var: "AMUX_RS_LEGACY_PORT",
-            effect: "port to also bind; unset retires it",
-            off: Some(OFF_WHEN_UNSET),
-        }],
-        pref: None,
-        detail: Some("/api/debug/legacy-port"),
     },
 ];
 

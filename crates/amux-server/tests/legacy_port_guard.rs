@@ -35,15 +35,18 @@ use std::path::{Path, PathBuf};
 
 /// Files permitted to contain a literal legacy address, each with the reason.
 /// When the bind is finally dropped, most of these disappear with it.
+///
+/// THE BIND WAS DROPPED 2026-08-11 (Ethan: "no more 8822 just rust"), and
+/// lib.rs's row went with it — exactly as this comment predicted. The mirror
+/// check below is what forced it: it failed with "allowlisted but no longer
+/// contains a legacy address — delete the row so the file is guarded again",
+/// which is the whole point of checking an allowlist in both directions. A
+/// stale exemption is a file quietly outside the guard.
 const ALLOW: &[(&str, &str)] = &[
     // -- the dual-bind implementation itself --
     (
         "crates/amux-server/src/legacy_port.rs",
         "the retirement instrument; it exists to talk about this port",
-    ),
-    (
-        "crates/amux-server/src/lib.rs",
-        "the bind block's own comment, explaining why the port is answered",
     ),
     (
         "crates/amux-server/src/config.rs",

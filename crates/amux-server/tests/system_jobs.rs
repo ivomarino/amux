@@ -41,11 +41,7 @@ const ALLOWED_BARE_SPAWNS: &[(&str, &str)] = &[
         "DELETE FROM _amux_conversations",
         "StoreConversationSink::forget — same",
     ),
-    (
-        "axum_server::bind(legacy_addr)",
-        "the legacy-port LISTENER; it is a server, not a periodic job (its reporter loop IS registered)",
-    ),
-];
+    ];
 
 /// Every `tokio::spawn(` in `src` that is not on the allow-list, returned with
 /// its byte offset so a failure names where to look.

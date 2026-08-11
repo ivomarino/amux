@@ -524,61 +524,26 @@ async fn async_main() {
         }
     });
 
-    // LEGACY PORT TAKEOVER (python retirement, 2026-08-09): every running
-    // fleet session carries AMUX_URL=https://localhost:8822 baked into its
-    // process env — env vars in live processes cannot be rotated, so the
-    // moment the python server stopped, the whole fleet's board/API calls
-    // started failing. The rust server therefore answers the OLD port too:
-    // same router, same TLS, same auth. Gated on AMUX_RS_LEGACY_PORT so a
-    // deliberate python resurrection (unset it) gets the port back without a
-    // code change. Set to 8822 in ~/.amux/server.env.
+    // THE LEGACY 8822 BIND IS GONE (Ethan, 2026-08-11: "no more 8822 just rust").
     //
-    // THE ADDRESS IS RETIRED (2026-08-10); only these carried-over processes
-    // keep it alive. Every config, doc, CLI default and newly-spawned session
-    // now uses the canonical port (AMUX_RS_PORT, 8824 locally). This bind is
-    // therefore a countdown, not a feature — see `legacy_port` for the exit
-    // condition and `GET /api/debug/legacy-port` for the number that decides
-    // it. DO NOT drop this bind on the assumption the fleet has rotated; read
-    // the counter, because being wrong breaks ~60 live sessions at once.
-    let legacy_cfg = std::env::var("AMUX_RS_LEGACY_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok());
-
-    // Publish where this server actually is, for the one class of client that
-    // cannot be told any other way: a hook spawned by a pre-cutover `claude`
-    // process, which inherits `AMUX_URL=…:8822` from an env that cannot be
-    // rotated. Fixing those hooks' DEFAULTS did nothing — a default only fires
-    // when the variable is UNSET. See `legacy_port::publish_endpoint`.
-    legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, legacy_cfg);
-
-    if let Some(legacy_port) = legacy_cfg {
-        let legacy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], legacy_port));
-        let legacy_acceptor = tls::RedirectingAcceptor::new(
-            axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg.clone()),
-            format!("localhost:{legacy_port}"),
-        );
-        // Counted by LAYER on this clone, so a hit means the request physically
-        // arrived on the legacy socket — a Host-header sniff would also count
-        // requests that merely SAY 8822 while arriving on the canonical port.
-        let legacy_app = app
-            .clone()
-            .layer(axum::middleware::from_fn(legacy_port::count));
-        legacy_port::arm(legacy_port);
-        jobs::spawn_loop(jobs::ids::LEGACY_PORT, None, legacy_port::run_reporter());
-        tracing::info!(%legacy_addr, "listening on LEGACY port (fleet AMUX_URL compatibility)");
-        tokio::spawn(async move {
-            if let Err(e) = axum_server::bind(legacy_addr)
-                .acceptor(legacy_acceptor)
-                .serve(
-                    legacy_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .await
-            {
-                // Port taken (python running?) — log loudly, keep the primary.
-                tracing::error!(error = %e, port = legacy_port, "legacy port bind failed");
-            }
-        });
-    }
+    // It existed because the python retirement stranded every running lane:
+    // AMUX_URL was baked into live process envs that cannot be rotated, so the
+    // rust server answered the old port too — same router, same TLS, same auth.
+    // It was always a countdown rather than a feature, and this is the owner
+    // calling it, ahead of the automatic 7-day-quiet exit.
+    //
+    // WHAT REPLACED IT, so nobody re-adds the bind to fix the symptom: sessions
+    // are launched with AMUX_URL derived from `config::canonical_port()`
+    // (session_verbs.rs), the CLI defaults to the canonical port, and
+    // `publish_endpoint` below writes the real address for the one client class
+    // that can be told no other way — a hook spawned by a pre-cutover process,
+    // which inherits the stale variable and whose DEFAULT therefore never
+    // fires. Any lane still holding the old address gets connection-refused,
+    // which is loud and fixed by restarting that lane.
+    //
+    // tests/legacy_port_guard.rs fails the build if the retired address
+    // reappears in code, scripts or e2e.
+    legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https, plain-http redirected)");
