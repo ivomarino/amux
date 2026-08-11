@@ -3013,7 +3013,7 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-11
 SESSION: amux
-CARD: AMUX-2879
+CARD: AMUX-2878
 SYMPTOM: `amux board needsyou AMUX-2466` printed "AMUX-2466 → tagged needs:you"
   and left status at `review`. But `needsyou` is ALSO a real board status — cards
   sit in it (AMUX-2815, AMUX-2830) and it is what keeps a card out of my review
