@@ -292,6 +292,10 @@ async fn async_main() {
     // while those directories were GROWING, so a fleet that stopped transcoding
     // never evicted a transcode.
     drop(runtime_jobs::storage::spawn(state.clone()));
+    // The token_ledger WRITER. Every reader of that table was ported at the
+    // cutover and this was not, so /api/stats/daily served a confident
+    // total_tokens: 0 for 36 hours (AMUX-2892).
+    drop(runtime_jobs::token_ledger::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
