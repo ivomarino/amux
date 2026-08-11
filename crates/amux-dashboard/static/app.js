@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.584';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.585';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19071,13 +19071,25 @@ function _bqIs(item, val, ix) {
                         && (!item.last_verified_at
                             || (Date.now()/1000 - item.last_verified_at) > 86400);
     case 'needsyou': return _bqIs(item, 'open', ix) && (
+                       // The CANONICAL status says exactly this ("stuck on the
+                       // user, with the exact question" — core's Doing->NeedsYou).
+                       // It was missing here, so a card parked by the documented
+                       // transition surfaced NOWHERE: the status also excludes it
+                       // from auto-pickup and from the advance path, and the 3-day
+                       // re-nag JOINs issue_tags, so nothing handed it out and
+                       // nothing brought it back. Measured 2026-08-11: 23 of 38
+                       // open needsyou cards were invisible to this view, incl.
+                       // four SLA breaches aged 127-194h. The server now stamps
+                       // the tag on the transition too; this arm is what surfaces
+                       // the ones already sitting in that state, without a sweep.
+                       st === 'needsyou'
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
                        // owner:human card, which is the standing backlog and
                        // floods the queue (306 -> the real blocked set). Own
                        // filed work lives in the Mine view; needs-you is only
                        // what is actively stopped ON you.
-                       (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
+                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
                        || (!!sess && (sess.status === 'waiting'
                                       || !!sess.credit_limited || !!sess.rate_limited_until)));
     case 'offline':  return !!item.session && (!sess || !sess.running);

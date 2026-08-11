@@ -929,6 +929,51 @@ pub fn set_tags(conn: &Connection, id: &str, tags: &[String], now: i64) -> rusql
     Ok(())
 }
 
+/// The canonical "blocked on a human" tag. Every consumer matches it as a
+/// PREFIX (`lower(tag) LIKE 'needs:you%'`), so a sub-tagged ask like
+/// `needs:you:decision` counts — board_drive's re-nag, its pickup exclusion
+/// and its advance-path branch all already use that shape, and the helpers
+/// below exist so a fourth caller cannot spell it a fifth way.
+pub const NEEDS_YOU_TAG: &str = "needs:you";
+
+/// Does this card carry any `needs:you*` tag?
+pub fn has_needs_you_tag(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM issue_tags WHERE issue_id = ?1 \
+         AND lower(tag) LIKE 'needs:you%')",
+        params![id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+}
+
+/// Stamp `needs:you` unless the card already carries one. Returns whether a
+/// row was written.
+///
+/// `added_at` is the ASK CLOCK: board_drive ages the ask from
+/// `MIN(issue_tags.added_at)`, deliberately not from `issues.updated`, because
+/// `updated` is last-touch and the cards carrying the most commentary were
+/// exactly the ones whose stale-ask check could never fire (AC-178). Stamping
+/// at the transition is what makes that clock mean "when the human was asked".
+pub fn add_needs_you_tag(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool> {
+    if has_needs_you_tag(conn, id)? {
+        return Ok(false);
+    }
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?1, ?2, ?3)",
+        params![id, NEEDS_YOU_TAG, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Drop every `needs:you*` tag. Returns how many rows went.
+pub fn clear_needs_you_tags(conn: &Connection, id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM issue_tags WHERE issue_id = ?1 AND lower(tag) LIKE 'needs:you%'",
+        params![id],
+    )
+}
+
 /// Would giving `self_id` the dependency set `new_deps` create a cycle?
 /// Returns the cycle as SEMANTIC ids for the error message, or `None` when
 /// acyclic. Uses core's [`board::detect_cycle`] over the whole board's
@@ -1019,6 +1064,60 @@ pub fn depends_on_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Every consumer matches this family as a PREFIX (`LIKE 'needs:you%'`), so
+    /// a sub-tagged ask must count as already-asked — otherwise a card carrying
+    /// `needs:you:decision` gets a second, duplicate `needs:you` stamped on it
+    /// and the ask clock (`MIN(added_at)`) is silently reset to now.
+    #[test]
+    fn needs_you_helpers_match_the_prefix_every_consumer_uses() {
+        for existing in ["needs:you", "needs:you:decision", "NEEDS:YOU"] {
+            let conn = tag_db();
+            conn.execute(
+                "INSERT INTO issue_tags VALUES ('C-1', ?1, 100.0)",
+                params![existing],
+            )
+            .unwrap();
+            assert!(has_needs_you_tag(&conn, "C-1").unwrap(), "{existing} must count as asked");
+            assert!(
+                !add_needs_you_tag(&conn, "C-1", 999).unwrap(),
+                "{existing} is already an ask — stamping a second resets the clock"
+            );
+            let kept: f64 = conn
+                .query_row("SELECT MIN(added_at) FROM issue_tags WHERE issue_id='C-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(kept, 100.0, "{existing}: the original ask time must survive");
+            assert_eq!(clear_needs_you_tags(&conn, "C-1").unwrap(), 1);
+            assert!(!has_needs_you_tag(&conn, "C-1").unwrap());
+        }
+    }
+
+    /// CONTROL: the helpers must not be matching everything. An unrelated tag is
+    /// neither an ask nor collateral damage when the ask is cleared.
+    #[test]
+    fn needs_you_helpers_leave_unrelated_tags_alone() {
+        let conn = tag_db();
+        conn.execute("INSERT INTO issue_tags VALUES ('C-1','needs:review',100.0)", []).unwrap();
+        assert!(!has_needs_you_tag(&conn, "C-1").unwrap(), "needs:review is not an ask");
+        assert!(add_needs_you_tag(&conn, "C-1", 200).unwrap(), "the first ask must be stamped");
+        assert_eq!(clear_needs_you_tags(&conn, "C-1").unwrap(), 1, "only the ask goes");
+        let left: String =
+            conn.query_row("SELECT tag FROM issue_tags WHERE issue_id='C-1'", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(left, "needs:review", "clearing the ask must not take other tags with it");
+    }
 
     #[test]
     fn a_stale_cycle_elsewhere_does_not_block_an_unrelated_edge() {

@@ -2493,6 +2493,48 @@ pub async fn patch_item(
             if let Some(tags) = &tags_change {
                 bs::set_tags(conn, &next.id, tags, next.updated)?;
             }
+            // KEEP THE `needsyou` STATUS AND THE `needs:you` TAG IN STEP.
+            //
+            // They are two spellings of one fact and the readers are split
+            // across them: the status is what EXCLUDES a card (auto-pickup
+            // takes `status='todo'`, the advance path takes `status IN
+            // ('doing','review')`), while every mechanism that SURFACES a
+            // human-blocked card keys on the TAG — the dashboard's
+            // `is:needsyou` view and Focus mode, the 3-day re-nag (which
+            // JOINs issue_tags), and board_drive's "the human owes the
+            // answer, not the lane" branch.
+            //
+            // So setting the canonical status alone parked the card where
+            // nothing hands it out AND nothing brings it back — strictly
+            // worse than leaving it in `todo`, and reached by taking the
+            // DOCUMENTED transition (core: `Doing -> NeedsYou`, "stuck on the
+            // user, with the exact question"). Measured on the live board
+            // 2026-08-11: 23 of 38 open `needsyou` cards carried no tag,
+            // across six sessions, including four SLA breaches aged 127-194h
+            // that the re-nag structurally could not see.
+            //
+            // Syncing here rather than teaching each reader both spellings is
+            // deliberate: one write fixes five consumers, and there is no
+            // second predicate left to drift.
+            if let Some((from_raw, to_raw)) = &status_event {
+                let was = bs::parse_status(from_raw);
+                let now_st = bs::parse_status(to_raw);
+                let is_ny = |s: Option<TaskStatus>| s == Some(TaskStatus::NeedsYou);
+                // An explicit `tags` in the same PATCH is the caller stating
+                // intent; it wins over this sync either way.
+                let caller_set_ny = tags_change.as_ref().is_some_and(|t| {
+                    t.iter().any(|x| x.to_lowercase().starts_with("needs:you"))
+                });
+                if is_ny(now_st) && !is_ny(was) {
+                    bs::add_needs_you_tag(conn, &next.id, next.updated)?;
+                } else if is_ny(was) && !is_ny(now_st) && !caller_set_ny {
+                    // The answer landed (`NeedsYou -> Doing` is core's
+                    // "the user answered"). Leaving the tag on would re-nag
+                    // the lane about a question that is no longer open —
+                    // the re-nag only skips done/verified/discarded.
+                    bs::clear_needs_you_tags(conn, &next.id)?;
+                }
+            }
             let mutation = match &status_event {
                 Some((f, t)) => MutationKind::StatusChanged {
                     from: f.clone(),

@@ -1115,10 +1115,29 @@ pub fn select_advance(
     let renag_cut = now - needsyou_renag_days() * 86400.0;
     let stale: Option<(String, String, i64, f64)> = conn
         .query_row(
-            "SELECT i.id, i.title, COALESCE(i.archived,0), MIN(t.added_at) AS asked_at \
-             FROM issues i JOIN issue_tags t ON t.issue_id = i.id \
+            // EITHER SPELLING OF THE ASK. `needsyou` is a canonical status as
+            // well as a tag, and this query used to see only the tag — so a
+            // card parked by the DOCUMENTED transition (core's Doing->NeedsYou)
+            // could never re-nag, while the same status also kept it out of
+            // auto-pickup and out of the advance path. Nothing handed it out
+            // and nothing brought it back. Measured 2026-08-11: 23 of 38 open
+            // needsyou cards carried no tag, across six sessions, the oldest
+            // four days silent. api/board.rs now stamps the tag on the
+            // transition, but that only helps cards parked AFTER it; this arm
+            // is what reaches the ones already sitting there, without writing
+            // to six other sessions' cards to do it.
+            //
+            // Ask clock: still MIN(added_at) when a tag exists (AC-178 — never
+            // `updated`, which is last-touch and so the most-commented asks
+            // were the ones that could never fire). `updated` is the fallback
+            // ONLY for a status-only card, where no tag row exists to date the
+            // ask and the alternative is not firing at all.
+            "SELECT i.id, i.title, COALESCE(i.archived,0), \
+                    COALESCE(MIN(t.added_at), i.updated) AS asked_at \
+             FROM issues i LEFT JOIN issue_tags t \
+                  ON t.issue_id = i.id AND lower(t.tag) LIKE 'needs:you%' \
              WHERE i.session=?1 AND i.deleted IS NULL AND i.owner_type='agent' \
-             AND lower(t.tag) LIKE 'needs:you%' \
+             AND (t.tag IS NOT NULL OR i.status='needsyou') \
              AND i.status NOT IN ('done','verified','discarded') \
              GROUP BY i.id HAVING asked_at IS NOT NULL AND asked_at < ?2 \
              ORDER BY asked_at ASC LIMIT 1",
@@ -2246,6 +2265,76 @@ mod tests {
             assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
             assert_eq!(eligible_todo_count(&conn, "lane"), 0, "{t} must not count as eligible");
         }
+    }
+
+    /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
+    /// "stuck on the user, with the exact question" — carries the `needsyou`
+    /// STATUS and, historically, no tag. The re-nag JOINed `issue_tags`, so it
+    /// could not see that card; the same status also kept it out of auto-pickup
+    /// (`status='todo'`) and out of the advance path (`doing`/`review`). Nothing
+    /// handed it out and nothing brought it back, so taking the sanctioned exit
+    /// was strictly worse than leaving the card in `todo`.
+    ///
+    /// Measured on the live board 2026-08-11: 23 of 38 open `needsyou` cards
+    /// carried no tag, across six sessions, the oldest four days silent.
+    #[test]
+    fn a_status_only_needsyou_card_still_re_nags() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "N-1", "lane", "needsyou", "Ask Ethan about pricing", "SCOPE: x");
+        // No tag(): status alone, which is the whole point of the case.
+        let old = (now - 5.0 * 86400.0) as i64;
+        conn.execute("UPDATE issues SET updated=?1 WHERE id='N-1'", rusqlite::params![old])
+            .expect("age the ask");
+        match select_advance(&conn, "lane", &[], now) {
+            Advance::Nudge { card, kind, .. } => {
+                assert_eq!(card, "N-1");
+                assert_eq!(kind, "renag", "a 5-day-old unanswered ask must re-nag");
+            }
+            Advance::None { reason, detail } => {
+                panic!("status-only needsyou never re-nagged: {reason} / {detail}")
+            }
+        }
+    }
+
+    /// The control that proves the test above can fail: the ONLY thing separating
+    /// a fire from a no-fire is the age of the ask, so a green result cannot be
+    /// coming from the query matching everything.
+    #[test]
+    fn a_fresh_status_only_needsyou_card_does_not_re_nag() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "N-1", "lane", "needsyou", "Ask Ethan about pricing", "SCOPE: x");
+        let recent = (now - 3600.0) as i64;
+        conn.execute("UPDATE issues SET updated=?1 WHERE id='N-1'", rusqlite::params![recent])
+            .expect("freshen");
+        assert!(
+            !matches!(select_advance(&conn, "lane", &[], now), Advance::Nudge { kind: "renag", .. }),
+            "an ask made an hour ago is not stale and must not re-nag"
+        );
+    }
+
+    /// The tagged path keeps its own clock. `issue_tags.added_at` is the ask
+    /// time, NOT `issues.updated` — AC-178: `updated` is last-touch, so the
+    /// cards carrying the most commentary were exactly the ones whose stale-ask
+    /// check could never fire. Widening the query to status-only cards must not
+    /// quietly demote the tagged ones onto the worse clock.
+    #[test]
+    fn a_tagged_ask_ages_from_the_tag_not_the_row() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "N-1", "lane", "todo", "Ask Ethan about pricing", "SCOPE: x");
+        tag(&conn, "N-1", "needs:you", now - 5.0 * 86400.0);
+        // Touched a minute ago — under `updated` this ask would look brand new.
+        conn.execute(
+            "UPDATE issues SET updated=?1 WHERE id='N-1'",
+            rusqlite::params![(now - 60.0) as i64],
+        )
+        .expect("touch");
+        assert!(
+            matches!(select_advance(&conn, "lane", &[], now), Advance::Nudge { kind: "renag", .. }),
+            "a 5-day-old TAG on a freshly-touched row must still re-nag"
+        );
     }
 
     /// The view must share the predicate of the mechanism it describes: the
