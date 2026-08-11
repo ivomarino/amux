@@ -61,6 +61,7 @@ pub mod torrents;
 pub mod upload;
 pub mod verify;
 pub mod why;
+pub mod worker_create;
 pub mod workers;
 pub mod workers_deadletters;
 
@@ -184,6 +185,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/tags", groups::tags_routes())
         .nest("/api/journal", journal::routes())
         .nest("/api/layout-presets", layout_presets::routes())
+        // The New Worker / Connect modals' supporting reads (AMUX-2871).
+        .merge(worker_create::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())

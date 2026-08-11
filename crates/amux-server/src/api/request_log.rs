@@ -938,6 +938,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/journal/{id}/media", methods: &["POST"] },
     RouteEntry { path: "/api/layout-presets", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/layout-presets/{name}", methods: &["DELETE"] },
+    // -- New Worker / Connect modals (api/worker_create.rs, AMUX-2871)
+    RouteEntry { path: "/api/templates", methods: &["GET"] },
+    RouteEntry { path: "/api/git-check", methods: &["GET"] },
+    RouteEntry { path: "/api/git-branches", methods: &["GET"] },
+    RouteEntry { path: "/api/suggest-branch", methods: &["POST"] },
+    RouteEntry { path: "/api/tmux-sessions", methods: &["GET"] },
+    RouteEntry { path: "/api/iterm2/sessions", methods: &["GET"] },
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },

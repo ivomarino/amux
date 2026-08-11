@@ -8094,12 +8094,27 @@ async fn post_dispatch(
             let re = regex::Regex::new(r"[^a-z0-9\-]").unwrap();
             let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
             let work_dir = body_str(body, "dir").trim().to_string();
+            // Two different failures, two different messages. They shared one
+            // string until 2026-08-11, and that is precisely why a dead
+            // templates_dir() went unnoticed: "template not found" reads as
+            // "you asked for a template that doesn't exist", so nobody
+            // suspected the ROOT was missing. Name which one it is.
             let Some(tmpl_root) = templates_dir() else {
-                return jresp(StatusCode::NOT_FOUND, json!({"error": "template not found"}));
+                return jresp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error": "no templates directory on this machine",
+                           "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
+                           "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
+                                     home().join("templates").display().to_string()]}),
+                );
             };
             let tmpl_path = tmpl_root.join(&tmpl_id);
             if tmpl_id.is_empty() || !tmpl_path.is_dir() {
-                return jresp(StatusCode::NOT_FOUND, json!({"error": "template not found"}));
+                return jresp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error": format!("no template '{tmpl_id}'"),
+                           "templates_dir": tmpl_root.display().to_string()}),
+                );
             }
             if !work_dir.is_empty() {
                 let work = expanduser(&work_dir);
@@ -8156,23 +8171,24 @@ async fn post_dispatch(
     }
 }
 
-/// Templates live beside amux-server.py (py:143 TEMPLATES_DIR). The rust
-/// binary resolves them via AMUX_TEMPLATES_DIR, then the installed
-/// amux-server.py symlink's parent, then ~/.amux/templates.
-fn templates_dir() -> Option<PathBuf> {
+/// Where the worker templates live: `AMUX_TEMPLATES_DIR`, else
+/// `~/.amux/templates` (install.sh syncs the repo's `templates/` there).
+///
+/// This used to carry a middle rung that canonicalized
+/// `~/.local/bin/amux-server.py` and looked beside it — py:143's
+/// `TEMPLATES_DIR = Path(__file__).parent / "templates"`. That symlink went
+/// away with the Python server at 792ce1f, and nothing replaced the rung, so
+/// ALL THREE resolved to nothing and this returned None on every call. The
+/// visible effect was `apply-template` answering "template not found" for a
+/// perfectly real id — indistinguishable, from the client, from a typo'd one,
+/// which is why it sat unnoticed. Verified 2026-08-11 with a control: the real
+/// `software-project` and a bogus `zzz-does-not-exist` returned byte-identical
+/// 404s.
+pub(crate) fn templates_dir() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("AMUX_TEMPLATES_DIR") {
         let p = PathBuf::from(v);
         if p.is_dir() {
             return Some(p);
-        }
-    }
-    let installed = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin/amux-server.py");
-    if let Ok(target) = std::fs::canonicalize(&installed) {
-        if let Some(parent) = target.parent() {
-            let t = parent.join("templates");
-            if t.is_dir() {
-                return Some(t);
-            }
         }
     }
     let fallback = home().join("templates");

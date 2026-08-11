@@ -119,6 +119,18 @@ esac
 mkdir -p "$AMUX_HOME/logs"
 say "data dir: $AMUX_HOME (existing data untouched)"
 
+# Worker templates are CODE, not data: they ship with the checkout and an
+# upgrade should carry new ones. They used to be found beside the installed
+# amux-server.py, which was deleted with the Python server — after which
+# templates_dir() resolved to nothing and `apply-template` answered "template
+# not found" for every real id. Syncing them here is what makes that rung exist.
+# Override with AMUX_TEMPLATES_DIR if you keep your own set.
+if [[ -d "$SCRIPT_DIR/templates" ]]; then
+  mkdir -p "$AMUX_HOME/templates"
+  cp -R "$SCRIPT_DIR/templates/." "$AMUX_HOME/templates/"
+  say "templates: $AMUX_HOME/templates ($(find "$AMUX_HOME/templates" -name template.json | wc -l | tr -d ' ') available)"
+fi
+
 # ── 5. Service ──────────────────────────────────────────────────────────────
 if [[ "$OS" != "Darwin" ]]; then
   # Honest degrade: no launchd here, and pretending to manage systemd from a
