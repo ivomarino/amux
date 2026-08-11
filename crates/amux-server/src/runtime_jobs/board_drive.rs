@@ -101,6 +101,14 @@ const RECLAIM_COOLDOWN_S: f64 = 86400.0;
 /// checking more often than once a day for a low-priority idle task is the
 /// nag shape that got the `done` tier removed in the first place.
 const VERIFY_NUDGE_COOLDOWN_S: f64 = 24.0 * 3600.0;
+/// Backlog-triage nudge cooldown: once per 72h per session. Sessions with
+/// 10+ backlog cards older than 14 days get a prompt to triage them
+/// (archive stale ones, promote actionable ones to todo).
+const BACKLOG_TRIAGE_COOLDOWN_S: f64 = 72.0 * 3600.0;
+/// Minimum stale backlog cards before the triage nudge fires.
+const BACKLOG_TRIAGE_THRESHOLD: usize = 10;
+/// Cards older than this (created_at) are considered stale backlog.
+const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
 const DEFAULT_ITEM_TYPE: &str = "code";
 
@@ -146,7 +154,7 @@ fn now_f64() -> f64 {
 pub struct LaneTrace {
     pub session: String,
     /// `assigned` | `advance-nudged` | `review-routed` | `decompose-asked` |
-    /// `renag` | `verify-nudge` | `skipped`
+    /// `renag` | `verify-nudge` | `backlog-triage` | `skipped`
     pub outcome: String,
     pub reason: String,
     pub detail: String,
@@ -964,6 +972,74 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
          Cards that genuinely cannot be verified by you (e.g., they require a human \
          decision or access you lack) should be tagged `needs:you` so they surface \
          in the owner digest rather than sitting here indefinitely."
+    )
+}
+
+/// Stale backlog cards for this session: id, title, age in days.
+fn stale_backlog_candidates(
+    conn: &Connection,
+    session: &str,
+    now: i64,
+) -> Vec<(String, String, i64)> {
+    let cutoff = now - BACKLOG_STALE_AGE_S;
+    conn.prepare(
+        "SELECT id, title, created FROM issues \
+         WHERE session=?1 AND status='backlog' AND deleted IS NULL \
+         AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         AND created < ?2 \
+         ORDER BY created ASC LIMIT 10",
+    )
+    .and_then(|mut st| {
+        st.query_map(rusqlite::params![session, cutoff], |r| {
+            let created: i64 = r.get(2)?;
+            let age_days = (now - created) / 86400;
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, age_days))
+        })
+        .map(|rows| rows.flatten().collect())
+    })
+    .unwrap_or_default()
+}
+
+fn stale_backlog_count(conn: &Connection, session: &str, now: i64) -> i64 {
+    let cutoff = now - BACKLOG_STALE_AGE_S;
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         AND created < ?2",
+        rusqlite::params![session, cutoff],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+fn backlog_triage_text(
+    cards: &[(String, String, i64)],
+    total: i64,
+    total_backlog: i64,
+) -> String {
+    let mut lines: Vec<String> = cards
+        .iter()
+        .map(|(id, title, age)| {
+            let t: String = title.chars().take(65).collect();
+            format!("  {id} ({age}d old) {t}")
+        })
+        .collect();
+    if total > cards.len() as i64 {
+        lines.push(format!("  ... and {} more stale", total - cards.len() as i64));
+    }
+    let list = lines.join("\n");
+    format!(
+        "[amux] You have {total_backlog} cards in `backlog`, {total} of which are over \
+         14 days old and have not been triaged.\n\n\
+         {list}\n\n\
+         For each card:\n\
+         - If the work is DONE, SUPERSEDED, or NO LONGER RELEVANT: archive it \
+         with a note (`amux board archive <id>`).\n\
+         - If it is still ACTIONABLE and you should work on it: move it to \
+         `todo` so the board-drive loop can assign it.\n\
+         - If it NEEDS A HUMAN DECISION: tag it `needs:you`.\n\n\
+         A backlog that only grows is not a queue, it is a log. Triage is the \
+         difference."
     )
 }
 
@@ -1928,6 +2004,73 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open);
             };
 
+            // BACKLOG TRIAGE NUDGE. Sessions accumulate backlog cards
+            // (findings, investigations, decomposed work) that nobody ever
+            // triages. backlog is deliberately outside auto-pickup, but cards
+            // sitting there for 14+ days are either stale (should be archived)
+            // or actionable (should be promoted to todo). 72h cooldown.
+            let triage_trace = 'triage: {
+                let Ok(conn) = state.store.read() else {
+                    break 'triage None;
+                };
+                let now_i = now as i64;
+                let stale_count = stale_backlog_count(&conn, lane, now_i);
+                if (stale_count as usize) < BACKLOG_TRIAGE_THRESHOLD {
+                    break 'triage None;
+                }
+                let recent: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type='backlog.triage_nudge' AND ts > ?2 LIMIT 1",
+                        rusqlite::params![lane, now - BACKLOG_TRIAGE_COOLDOWN_S],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if recent {
+                    break 'triage Some(format!(
+                        "has {stale_count} stale backlog card(s) but triage-nudge sent within 72h"
+                    ));
+                }
+                let total_backlog: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+                        rusqlite::params![lane],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let cards = stale_backlog_candidates(&conn, lane, now_i);
+                if cards.is_empty() {
+                    break 'triage None;
+                }
+                drop(conn);
+                let text = backlog_triage_text(&cards, stale_count, total_backlog);
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "backlog.triage_nudge",
+                    Some(json!({
+                        "stale_count": stale_count,
+                        "total_backlog": total_backlog,
+                        "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>(),
+                    })),
+                    None,
+                    "board-drive",
+                )
+                .await;
+                fleet.deliver(lane, &text).await;
+                return LaneTrace::acted(
+                    lane,
+                    "backlog-triage",
+                    cards.first().map(|(id,_,_)| id.as_str()).unwrap_or(""),
+                    format!("{stale_count} stale backlog card(s) of {total_backlog} total, triage prompt delivered"),
+                )
+                .with_counts(eligible, open);
+            };
+
             let (areason, adetail) = advance_reason;
             let mut full_detail = if adetail.is_empty() {
                 detail
@@ -1936,6 +2079,9 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             };
             if let Some(vd) = verify_trace {
                 full_detail = format!("{full_detail} | verify: {vd}");
+            }
+            if let Some(td) = triage_trace {
+                full_detail = format!("{full_detail} | backlog-triage: {td}");
             }
             LaneTrace::skip(lane, reason, full_detail).with_counts(eligible, open)
         }
