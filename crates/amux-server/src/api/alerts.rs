@@ -203,6 +203,43 @@ pub(crate) fn urgent_alert_decision(
     (AlertAction::Send, recent, 0.0)
 }
 
+/// Rebuild guard state for one key from the `owner_alerts` LEDGER.
+///
+/// The in-memory maps below are the Python port's shape, and on this server
+/// they are fiction: `AlertGuard::default()` is constructed in `routes()`, and
+/// the process re-execs every time the auto-builder adopts a commit — many
+/// times an hour on a shared checkout. So the storm guard forgot everything
+/// constantly and every alert arrived as a first alert.
+///
+/// MEASURED (MF-427, 2026-08-11): 81 rows in owner_alerts, **0 with deduped=1**
+/// — the guard had never suppressed anything, ever. The reported storm was 38
+/// identical `--help` alerts over 186 minutes at a ~302s cadence;
+/// STORM_THRESHOLD=2 over an 1800s window would have muted it after the second,
+/// had the state survived.
+///
+/// The durable history was already written on every attempt — including
+/// suppressed ones, deliberately, so suppression never hides evidence. Nothing
+/// read it back. This reads it back.
+fn guard_state_from_ledger(
+    conn: &rusqlite::Connection,
+    session: &str,
+    msg: &str,
+) -> (Vec<f64>, Option<f64>) {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT ts FROM owner_alerts WHERE claimed=?1 AND message=?2 ORDER BY ts DESC LIMIT 64",
+    ) else {
+        return (vec![], None);
+    };
+    let ts: Vec<f64> = stmt
+        .query_map(rusqlite::params![session, msg], |r| r.get::<_, f64>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    let last = ts.first().copied();
+    let mut hist = ts;
+    hist.reverse(); // oldest-first, for the storm window filter
+    (hist, last)
+}
+
 /// Per-router guard state (Python's `_urgent_alert_last` / `_hist` / `_mute`
 /// module dicts). Keyed by sha256(claimed_session + "|" + msg)[..16].
 #[derive(Default)]
@@ -361,6 +398,8 @@ async fn post_owner(
         .into_response();
     }
 
+    let dry_run = body.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+
     let mut msg = m.to_string();
     if !reason.is_empty() {
         msg = format!("{msg}\n({reason})");
@@ -378,13 +417,24 @@ async fn post_owner(
         hex::encode(h.finalize())[..16].to_string()
     };
     let now = now_f64();
+    // Seed from the LEDGER when the in-memory guard has nothing for this key —
+    // i.e. after every restart, which is most of the time on this server. The
+    // in-memory maps stay the hot path; the ledger is what lets the guard
+    // survive the auto-builder swapping the binary underneath it.
+    let (ledger_hist, ledger_last) = match state.store.read() {
+        Ok(conn) => guard_state_from_ledger(&conn, &session, &msg),
+        Err(_) => (vec![], None),
+    };
     let (action, hist_len) = {
         let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mem_hist: Vec<f64> = g.hist.get(&key).cloned().unwrap_or_default();
+        let hist_in: Vec<f64> = if mem_hist.is_empty() { ledger_hist } else { mem_hist };
+        let last_in = g.last.get(&key).copied().or(ledger_last);
         let (action, new_hist, new_mute) = urgent_alert_decision(
             now,
-            g.hist.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+            &hist_in,
             g.mute.get(&key).copied().unwrap_or(0.0),
-            g.last.get(&key).copied(),
+            last_in,
         );
         let hist_len = new_hist.len();
         g.hist.insert(key.clone(), new_hist);
@@ -394,6 +444,32 @@ async fn post_owner(
         }
         (action, hist_len)
     };
+
+    // DRY RUN (MF-427). Verifying a storm guard used to require FIRING the
+    // channel, which reaches Ethan's phone by push AND iMessage — and because a
+    // storm needs a sustained burst to reproduce, an honest test meant paging
+    // him repeatedly. mixpeek-frustrations correctly refused to make that trade
+    // and stopped. This runs the identical decision against the identical state
+    // and reports the verdict, sending nothing and writing nothing.
+    if dry_run {
+        return Json(json!({
+            "ok": true, "dry_run": true,
+            "would": match action {
+                AlertAction::Send => "send",
+                AlertAction::Dedupe => "suppress (dedupe: same message within 60s)",
+                AlertAction::StormNotice => "send ONE storm notice, then mute",
+                AlertAction::Muted => "suppress (storm mute active)",
+            },
+            "hist_len": hist_len,
+            "storm_threshold": STORM_THRESHOLD,
+            "storm_window_s": STORM_WINDOW,
+            "storm_mute_s": STORM_MUTE,
+            "key": key,
+            "message": msg, "origin": origin, "claimed": session,
+            "note": "no channel was contacted and no ledger row was written",
+        }))
+        .into_response();
+    }
 
     match action {
         AlertAction::Dedupe => {
@@ -526,6 +602,53 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MF-427. The guard was correct and its STATE was fiction: the in-memory
+    /// maps are rebuilt by `routes()` and this process re-execs on every commit
+    /// the auto-builder adopts. Measured on the live ledger: 81 alerts, 0 ever
+    /// deduped, including a 38x `--help` storm at a ~302s cadence that
+    /// STORM_THRESHOLD=2 over 1800s should have muted after the second.
+    ///
+    /// This replays that storm through the pure decision to show the guard
+    /// stops it WHEN IT REMEMBERS — so the defect is provably the persistence,
+    /// not the policy.
+    #[test]
+    fn the_302s_storm_is_muted_once_history_survives_a_restart() {
+        let mut hist: Vec<f64> = vec![];
+        let mut mute = 0.0;
+        let mut last: Option<f64> = None;
+        let mut sent = 0;
+        let mut suppressed = 0;
+        let t0 = 1_000_000.0;
+
+        for i in 0..38 {
+            let now = t0 + (i as f64) * 302.0;
+            let (action, h, m) = urgent_alert_decision(now, &hist, mute, last);
+            hist = h;
+            mute = m;
+            match action {
+                AlertAction::Send | AlertAction::StormNotice => { sent += 1; last = Some(now); }
+                _ => suppressed += 1,
+            }
+        }
+        // 38 attempts, and the owner is paged a handful of times, not 38.
+        assert!(sent < 10, "38 identical alerts paged the owner {sent} times — the guard did not hold");
+        assert_eq!(sent + suppressed, 38);
+
+        // THE CONTROL, and the actual bug: reset the state between every alert,
+        // which is exactly what a restart does. Every one gets through.
+        let mut sent_amnesiac = 0;
+        for i in 0..38 {
+            let now = t0 + (i as f64) * 302.0;
+            let (action, _, _) = urgent_alert_decision(now, &[], 0.0, None);
+            if matches!(action, AlertAction::Send | AlertAction::StormNotice) { sent_amnesiac += 1; }
+        }
+        assert_eq!(
+            sent_amnesiac, 38,
+            "with state reset each time every alert is delivered — this is what the ledger fix prevents"
+        );
+    }
+
     use crate::api::settings::test_env;
     use axum::body::Body;
     use axum::http::Request;
