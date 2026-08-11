@@ -840,12 +840,13 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
 }
 
 pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
-    };
-    match build_array(&conn) {
-        Ok(arr) => Json(serde_json::Value::Array(arr)).into_response(),
+    match legacy_sessions_array(&state.store) {
+        Ok(json) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
