@@ -213,18 +213,33 @@ jobs:
       #
       # Not-setting it is the safe state: the gateway defaults to http and logs
       # "container hop: http:// (cert verification n/a)".
+      #
+      # ---- 2026-08-11: THE FLIP MOVED OUT OF THIS JOB ENTIRELY --------------
+      # Gating it here was necessary and still not sufficient, because the
+      # ORDER was inverted: this job writes the scheme, and `redeploy` (which
+      # `needs: [build, deploy]`) is what makes the containers rust. So the
+      # gateway was pointed at https BEFORE anything answered https, and the
+      # window between the two jobs was a guaranteed outage rather than a risk.
+      #
+      # Worse, a failure inside that window was unrecoverable by the workflow.
+      # When the verify step below failed on a deploy that was otherwise fine
+      # (see the race it hit, now fixed), `redeploy` never ran — so the scheme
+      # stayed https and the containers stayed python. Measured on a live
+      # workspace port during that run:
+      #     https://127.0.0.1:9056/api/sessions -> 000
+      #     http://127.0.0.1:9056/api/sessions  -> 200
+      # Every workspace hop was down until a human unset the scheme by hand.
+      # A failed deploy must leave the system UNCHANGED; this one left it in
+      # precisely the half-flipped state the gating above was written to
+      # prevent. The gate stopped a PUSH from causing it and did not stop a
+      # legitimate dispatch from causing it.
+      #
+      # The flip now lives in `redeploy`, immediately AFTER the recreate loop
+      # has proved every container answers as rust, and it restores the previous
+      # value on any failure. Both halves of the cutover are in the job that
+      # owns them, in the only order that is safe, and a failed run ends where
+      # it started. Reported by amux-cloud, who restored prod by hand.
       # ---------------------------------------------------------------------
-      - name: Gateway env — container hop scheme (ONLY with a real recreate)
-        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
-        run: |
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
-            set -e
-            touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env
-            grep -v "^CONTAINER_SCHEME=" /etc/amux/gateway.env > /etc/amux/.ge.tmp || true
-            mv /etc/amux/.ge.tmp /etc/amux/gateway.env
-            chmod 600 /etc/amux/gateway.env
-            echo "CONTAINER_SCHEME=https" >> /etc/amux/gateway.env
-            echo "container hop: $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env)"'
 
       - name: Sync gateway secrets from repo secrets (host-only, never in a container)
         run: |
@@ -273,20 +288,12 @@ jobs:
       #
       # So: this asserts the hop ONLY on the run that set it. On every other
       # deploy there is nothing to verify, because nothing changed the scheme.
-      - name: Gateway is actually on the https hop (fails if the restart did not take)
-        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
-        run: |
-          # `systemctl is-active` proves a process exists, not that it read the
-          # new env. The startup line names the scheme; grepping for it is the
-          # only thing that distinguishes "restarted" from "restarted with the
-          # config we just wrote".
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
-            line=$(grep -a "container hop:" /var/log/amux-gateway.log | tail -1)
-            echo "gateway says: ${line:-<no container-hop line — gateway.py is older than this deploy>}"
-            case "$line" in
-              *"container hop: https://"*) exit 0 ;;
-              *) echo "::error::gateway is not on the https container hop"; exit 1 ;;
-            esac'
+      #
+      # ---- 2026-08-11: MOVED, with the flip it verifies ---------------------
+      # It has to travel with its writer — that pairing is the whole argument
+      # above, and it is just as true in the other direction. The assertion now
+      # sits inside the flip step in `redeploy`, where it can also roll back.
+      # -----------------------------------------------------------------------
 
       # The half worth keeping on EVERY deploy: that the gateway came back at
       # all. It is scheme-agnostic on purpose — it must pass both before and
@@ -441,4 +448,92 @@ jobs:
               fi
             done
             exit "$bad"
+          ENDSSH
+
+      # THE OTHER HALF OF THE CUTOVER — and it runs here, last, on purpose.
+      #
+      # The containers above have just PROVEN they answer https as rust. Only
+      # now is it true that pointing the gateway at https:// is safe. The long
+      # comment in the `deploy` job records what this ordering cost when it was
+      # inverted: prod half-flipped, every workspace hop down, restored by hand.
+      #
+      # Two properties this step must have, both learned the hard way:
+      #
+      #   ATOMIC. Any failure restores the previous CONTAINER_SCHEME and
+      #   restarts, so a red run ends where it started. `trap` fires on the
+      #   error path of every command under `set -e`, including the verify.
+      #
+      #   RACE-FREE VERIFY. The old check grepped `tail -1` of the log
+      #   immediately after `systemctl restart` and read the PREVIOUS startup
+      #   line, because the new one had not flushed yet — failing a deploy that
+      #   was fine, which is what triggered the outage. Counting the hop lines
+      #   BEFORE the restart and waiting for the count to grow is what makes
+      #   "the line I am reading is from THIS restart" a fact rather than a
+      #   hope. Waiting for a newer line is the fix; dropping the assertion is
+      #   not (a scheme-agnostic check here cannot fail, ethos rule 7).
+      - name: Flip the gateway to the https hop (atomic — restores on any failure)
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+            set -eu
+            LOG=/var/log/amux-gateway.log
+            ENV=/etc/amux/gateway.env
+            touch "$ENV"; chmod 600 "$ENV"
+
+            PREV=$(grep "^CONTAINER_SCHEME=" "$ENV" || true)
+            echo "previous hop setting: ${PREV:-<unset — http>}"
+
+            write_scheme() {   # $1 = full line, or empty to unset (= http default)
+              grep -v "^CONTAINER_SCHEME=" "$ENV" > /etc/amux/.ge.tmp || true
+              # `if`, not `[ -n "$1" ] && echo`: the latter returns 1 when the
+              # argument is empty, which is precisely the rollback-to-unset
+              # path — the real pre-cutover state — and leaning on set -e's
+              # exemption rules there is not worth the ambiguity.
+              if [ -n "$1" ]; then echo "$1" >> /etc/amux/.ge.tmp; fi
+              mv /etc/amux/.ge.tmp "$ENV"; chmod 600 "$ENV"
+            }
+            rollback() {
+              echo "::error::https flip failed — restoring ${PREV:-<unset — http>} and restarting"
+              write_scheme "$PREV"
+              systemctl restart amux-gateway || true
+              sleep 2
+              systemctl is-active amux-gateway || echo "::error::gateway did not come back after rollback"
+            }
+            # EXIT, not ERR, and it is not a style preference: an ERR trap does
+            # NOT fire on an explicit `exit 1`, so every hand-written failure
+            # path below — the 30s timeout, the wrong-scheme case, the
+            # is-active check — would have skipped the rollback and left prod
+            # in exactly the half-flipped state this step exists to prevent.
+            # A rollback that cannot fire on the failures it was written for is
+            # the purest form of ethos rule 7.
+            SUCCESS=0
+            trap '[ "$SUCCESS" = 1 ] || rollback' EXIT
+
+            # Count BEFORE the restart — this is the race fix.
+            # `grep -c` PRINTS the count and exits 1 when it is zero, so the
+            # obvious `|| echo 0` appends a second line and yields "0\n0",
+            # which then breaks `-gt`. Assign, then correct on failure.
+            BEFORE=$(grep -ac "container hop:" "$LOG" 2>/dev/null) || BEFORE=0
+
+            write_scheme "CONTAINER_SCHEME=https"
+            systemctl restart amux-gateway
+
+            # Wait for a hop line that did not exist before this restart.
+            ok=0
+            for _ in $(seq 1 30); do
+              now=$(grep -ac "container hop:" "$LOG" 2>/dev/null) || now=0
+              if [ "$now" -gt "$BEFORE" ]; then ok=1; break; fi
+              sleep 1
+            done
+            [ "$ok" = 1 ] || { echo "::error::no new 'container hop:' line within 30s of restart (before=$BEFORE)"; exit 1; }
+
+            line=$(grep -a "container hop:" "$LOG" | tail -1)
+            echo "gateway says: $line"
+            case "$line" in
+              *"container hop: https://"*) ;;
+              *) echo "::error::gateway restarted but is not on the https container hop"; exit 1 ;;
+            esac
+
+            systemctl is-active --quiet amux-gateway || { echo "::error::amux-gateway is not active"; exit 1; }
+            SUCCESS=1
+            echo "https hop live, containers on rust — cutover complete"
           ENDSSH
