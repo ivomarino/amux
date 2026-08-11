@@ -57,7 +57,26 @@ pub struct Ownership {
 ///
 /// `dirty` is the list of paths `git status` reported under the session's
 /// working directory — a LIST, carrying no ownership claim.
-pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
+pub fn build(
+    dir: &str,
+    dirty: &[String],
+    own: &Ownership,
+    provenance: &str,
+) -> Option<String> {
+    // PROVENANCE IS A REQUIRED PARAMETER, NOT A FIELD THE CALLER MAY FORGET
+    // (tubescience, 2026-08-11). It shipped first as the second half of a
+    // `(Vec<String>, String)` tuple, which a future caller retires with
+    // `let (dirty, _) = ...` — one underscore and the warning silently stops
+    // saying what it compared against, which is the exact degradation this
+    // whole fix exists to make visible.
+    //
+    // Their formulation, from mechanising it in their own harness: "wherever
+    // claims get emitted in a structured way, put the scope in the constructor
+    // and make it mandatory. Prose is where scope goes to be optional." A
+    // nudge is a claim about someone's uncommitted work; this signature is what
+    // makes it impossible to state one without saying what it was measured
+    // against. It covers the caller written months from now by someone who read
+    // none of this — the population a remembered habit cannot reach.
     if dirty.is_empty() {
         return None;
     }
@@ -110,6 +129,7 @@ pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
         if let Some(why) = &own.partial {
             m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
         }
+        m.push_str(&format!("\n\n({provenance})"));
         return Some(m);
     }
 
@@ -165,6 +185,7 @@ pub fn build(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
             it
         ));
     }
+    msg.push_str(&format!("\n\n({provenance})"));
     Some(msg)
 }
 
@@ -440,9 +461,7 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         // in both states, "compared against a STALE origin/main" reads as a
         // difference. Printed only when degraded, it reads as ordinary prose and
         // gets skimmed exactly like the phantom paths it is warning about.
-        let Some(msg) = build(dir, &dirty, &own).map(|m| format!("{m}\n\n({provenance})")) else {
-            continue;
-        };
+        let Some(msg) = build(dir, &dirty, &own, &provenance) else { continue };
 
         // Cap AFTER deciding there is something to say, so a suppressed-by-cap
         // day does not also consume the "nothing to say" path.
@@ -565,6 +584,26 @@ fn idle_lanes_with_dirs(state: &AppState) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// A nudge may not exist without stating what it was measured against —
+    /// asserted on EVERY branch, because the signature alone only proves the
+    /// caller supplied a scope, not that the reader ever sees it. Both exits
+    /// from `build` are exercised: the positively-mine path and the
+    /// ownership-unknown path.
+    #[test]
+    fn every_nudge_states_what_it_compared_against() {
+        let dirty = vec!["a.rs".to_string()];
+
+        // `mine` is DERIVED — not foreign, not unknown — so a default
+        // Ownership over a dirty path is exactly the positively-mine branch.
+        let m = build("/repo", &dirty, &Ownership::default(), "SCOPE-MARKER")
+            .expect("mine branch");
+        assert!(m.contains("SCOPE-MARKER"), "mine branch dropped its scope: {m}");
+
+        let unknown = Ownership { unclaimed: vec!["a.rs".to_string()], ..Default::default() };
+        let u = build("/repo", &dirty, &unknown, "SCOPE-MARKER").expect("unknown branch");
+        assert!(u.contains("SCOPE-MARKER"), "unknown branch dropped its scope: {u}");
+    }
+
     /// The reported case, run against a REAL repo because the whole defect is a
     /// disagreement between what `git status` says and what origin holds — a
     /// mocked porcelain string cannot express it (creative-dna, 2026-08-10).
@@ -667,7 +706,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            build("/repo", &dirty, &own).is_none(),
+            build("/repo", &dirty, &own, "test-provenance").is_none(),
             "a session with no work of its own must not be told to commit"
         );
     }
@@ -685,7 +724,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own).expect("should nudge");
+        let msg = build("/repo", &dirty, &own, "test-provenance").expect("should nudge");
         assert!(msg.contains("1 uncommitted change(s)"), "must count MINE only: {msg}");
         assert!(msg.contains("mine.rs"));
         assert!(!msg.contains("  theirs_a.rs\n"), "a peer's file is not work to commit: {msg}");
@@ -701,7 +740,7 @@ mod tests {
             foreign: vec![("theirs.rs".into(), "amux-cloud".into())],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own).unwrap();
+        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
         assert!(msg.contains("NOT YOURS"), "{msg}");
         assert!(msg.contains("theirs.rs") && msg.contains("amux-cloud"), "{msg}");
         assert!(msg.contains("Do not commit it"), "{msg}");
@@ -718,7 +757,7 @@ mod tests {
             shared: vec![("hot.rs".into(), "peer".into())],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own).expect("shared must not suppress");
+        let msg = build("/repo", &dirty, &own, "test-provenance").expect("shared must not suppress");
         assert!(msg.contains("CONTESTED") && msg.contains("peer"), "{msg}");
         assert!(msg.contains("git add -p"), "per-hunk is the actionable advice: {msg}");
     }
@@ -735,7 +774,7 @@ mod tests {
     fn an_unclaimed_file_is_reported_as_unknown_never_as_yours() {
         let dirty = s(&["CLAUDE.md"]);
         let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
-        let msg = build("/repo", &dirty, &own).expect("a dirty tree is still worth reporting");
+        let msg = build("/repo", &dirty, &own, "test-provenance").expect("a dirty tree is still worth reporting");
         assert!(msg.contains("OWNERSHIP IS UNKNOWN"), "{msg}");
         assert!(
             !msg.contains("Commit completed work"),
@@ -750,7 +789,7 @@ mod tests {
     fn unknown_files_are_disclosed_but_not_counted_as_mine() {
         let dirty = s(&["mine.rs", "CLAUDE.md"]);
         let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
-        let msg = build("/repo", &dirty, &own).unwrap();
+        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
         assert!(msg.contains("1 uncommitted change(s)"), "count MINE only: {msg}");
         assert!(msg.contains("OWNERSHIP UNKNOWN") && msg.contains("CLAUDE.md"), "{msg}");
     }
@@ -764,14 +803,14 @@ mod tests {
             partial: Some("no transcript for cotenant amux-helper".into()),
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own).unwrap();
+        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
         assert!(msg.contains("ATTRIBUTION IS PARTIAL"), "{msg}");
         assert!(msg.contains("amux-helper"), "name who is invisible: {msg}");
     }
 
     #[test]
     fn a_clean_tree_says_nothing() {
-        assert!(build("/repo", &[], &Ownership::default()).is_none());
+        assert!(build("/repo", &[], &Ownership::default(), "test-provenance").is_none());
     }
 
     /// Ten shown, the rest elided — a nudge that pastes 82 paths is a nudge
@@ -779,7 +818,7 @@ mod tests {
     #[test]
     fn a_long_list_is_capped_but_the_count_is_honest() {
         let dirty: Vec<String> = (0..25).map(|i| format!("f{i}.rs")).collect();
-        let msg = build("/repo", &dirty, &Ownership::default()).unwrap();
+        let msg = build("/repo", &dirty, &Ownership::default(), "test-provenance").unwrap();
         assert!(msg.contains("25 uncommitted change(s)"), "count must be the TRUE total: {msg}");
         assert!(msg.contains('…'), "the list must show it was truncated: {msg}");
         assert!(!msg.contains("f24.rs"), "only the first ten are listed: {msg}");
