@@ -1689,6 +1689,11 @@
   .peek-prompt-session  { border-left-color: #8957e5; }
   .peek-prompt-schedule { border-left-color: #3fb950; }
   .peek-prompt-amux     { border-left-color: #8b949e; }
+  /* Reconciled raw-tmux injection (AMUX-2670): delivery UNVERIFIED and the
+     origin is the CLI's claim, not a server stamp. Amber and dashed so it
+     cannot be mistaken for an audited send at a glance — which is the exact
+     failure the card names. */
+  .peek-prompt-unstamped { border-left-color: #d29922; border-left-style: dashed; }
 
   /* Peek overlay — flush to the true screen bottom. In a toolbar-less standalone
      webview window.innerHeight IS the full visible height, so fixed bottom:0 already

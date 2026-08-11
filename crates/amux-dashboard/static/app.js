@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.583';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.584';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10889,6 +10889,13 @@ function _msgKind(e) {
   if (t === 'session') return 'session';
   if (t === 'schedule') return 'schedule';
   if (t === 'system') return 'amux';   // amux's own nudges, not a person
+  // A send that went in via raw tmux while the server was unreachable, and was
+  // reconciled into the trail afterwards by the CLI (AMUX-2670). It MUST NOT
+  // fall through to 'human': that is the card's whole complaint — an unstamped
+  // injection rendering identically to an audited send. Its delivery was never
+  // verified (keystrokes reached a pane; a picker may have eaten them) and its
+  // origin is the CLI's word, not a server-side stamp.
+  if (t === 'raw-tmux-fallback') return 'unstamped';
   return 'human';   // direct / steering / user / '' — all a person typing
 }
 // Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
