@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.578';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.579';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8902,7 +8902,30 @@ function renderPeekFiles() {
   const bar = document.getElementById('peek-attach-bar');
   if (!bar) return;
   bar.classList.toggle('has-files', peekFiles.length > 0);
-  bar.innerHTML = peekFiles.map((f, i) => {
+  if (peekFiles.length > 12) {
+    const uploading = peekFiles.filter(f => !f.path).length;
+    const done = peekFiles.length - uploading;
+    const totalMB = peekFiles.reduce((a, f) => a + (parseFloat(f.sizeMB) || 0), 0);
+    const queued = _uploadQueue.length;
+    let status = '';
+    if (uploading > 0) {
+      const avgPct = peekFiles.filter(f => !f.path).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
+      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>`;
+    } else {
+      status = `<span style="color:var(--green)">all uploaded</span>`;
+    }
+    bar.innerHTML = `<div class="peek-attach-summary" onclick="_peekFilesExpanded=!_peekFilesExpanded;renderPeekFiles()">
+      <span>📎 ${peekFiles.length} files${totalMB > 0 ? ' (' + totalMB.toFixed(1) + ' MB)' : ''}</span>
+      ${status}
+      <span class="chip-remove" onclick="event.stopPropagation();clearPeekFiles()" title="Remove all">×</span>
+    </div>` + (_peekFilesExpanded ? _renderPeekFileChips() : '');
+    return;
+  }
+  bar.innerHTML = _renderPeekFileChips();
+}
+let _peekFilesExpanded = false;
+function _renderPeekFileChips() {
+  return peekFiles.map((f, i) => {
     const isUploading = !f.path;
     let thumb = '';
     if (f.isImage && f.previewUrl) {
@@ -8964,6 +8987,35 @@ function _peekFilesRestore(session) {
 
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
 
+// Concurrency-limited upload queue: max 4 simultaneous uploads so bulk drops
+// (80+ files) don't fire 240+ HTTP requests at once and starve the connection pool.
+const _UPLOAD_CONCURRENCY = 4;
+let _uploadQueue = [];
+let _uploadActive = 0;
+function _enqueueUpload(file) {
+  _uploadQueue.push(file);
+  _drainUploadQueue();
+}
+function _drainUploadQueue() {
+  while (_uploadQueue.length && _uploadActive < _UPLOAD_CONCURRENCY) {
+    _uploadActive++;
+    const f = _uploadQueue.shift();
+    uploadAndAttach(f).finally(() => { _uploadActive--; _drainUploadQueue(); });
+  }
+}
+
+// Throttle renderPeekFiles to one repaint per frame — bulk uploads call it after
+// every chunk, which is hundreds of full innerHTML rewrites for 80+ files.
+let _renderPeekFilesRAF = null;
+function _scheduleRenderPeekFiles() {
+  if (!_renderPeekFilesRAF) {
+    _renderPeekFilesRAF = requestAnimationFrame(() => {
+      _renderPeekFilesRAF = null;
+      renderPeekFiles();
+    });
+  }
+}
+
 async function uploadAndAttach(file) {
   const isImage = file.type.startsWith('image/');
   let previewUrl = null;
@@ -8978,8 +9030,8 @@ async function uploadAndAttach(file) {
   // placeholder never gets its .path (send then stalls on "wait for upload").
   const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB, chunk: 0, totalChunks };
   peekFiles.push(placeholder);
-  renderPeekFiles();
-  const _present = () => peekFiles.indexOf(placeholder) >= 0;  // false once the user removes it
+  _scheduleRenderPeekFiles();
+  const _present = () => peekFiles.indexOf(placeholder) >= 0;
 
   try {
     const startR = await fetch(API + '/api/upload/start', {
@@ -8992,7 +9044,7 @@ async function uploadAndAttach(file) {
     const uploadId = startD.id;
 
     for (let i = 0; i < totalChunks; i++) {
-      if (!_present()) return;   // user removed the chip mid-upload — stop cleanly
+      if (!_present()) return;
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const blob = file.slice(start, end);
@@ -9005,29 +9057,27 @@ async function uploadAndAttach(file) {
         const d = await r.json().catch(() => ({}));
         throw new Error(d.error || 'chunk ' + i + ' failed');
       }
-      placeholder.chunk = i + 1;   // mutate the same object, wherever it now sits
-      renderPeekFiles();
+      placeholder.chunk = i + 1;
+      _scheduleRenderPeekFiles();
     }
 
     const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST' });
     const finD = await finR.json();
     if (!finR.ok || finD.error) throw new Error(finD.error || 'finalize failed');
-    if (!_present()) return;   // removed while finishing — don't resurrect it
-    // Mutate in place so the entry stays exactly where it is in the array and
-    // simply gains its path/url (isUploading = !f.path flips to done).
+    if (!_present()) return;
     placeholder.path = finD.path;
     placeholder.url = finD.url;
   } catch(e) {
     console.error('Upload error:', e);
     showToast('Upload failed: ' + e.message);
     const i = peekFiles.indexOf(placeholder);
-    if (i >= 0) peekFiles.splice(i, 1);   // remove THIS file by identity, not a stale index
+    if (i >= 0) peekFiles.splice(i, 1);
   }
-  renderPeekFiles();
+  _scheduleRenderPeekFiles();
 }
 
 function handlePeekFileInput(e) {
-  for (const f of e.target.files) uploadAndAttach(f);
+  for (const f of e.target.files) _enqueueUpload(f);
   e.target.value = '';
 }
 
@@ -9040,7 +9090,7 @@ function handlePeekPaste(e) {
   for (const item of items) {
     if (item.kind === 'file') {
       e.preventDefault();
-      uploadAndAttach(item.getAsFile());
+      _enqueueUpload(item.getAsFile());
       return;
     }
   }
@@ -9071,7 +9121,7 @@ function handlePeekPaste(e) {
     if (!document.getElementById('peek-cmd-row')?.classList.contains('open')) {
       togglePeekCmd(); // auto-open the send bar on drop
     }
-    for (const f of e.dataTransfer.files) uploadAndAttach(f);
+    for (const f of e.dataTransfer.files) _enqueueUpload(f);
   });
 })();
 
@@ -15200,7 +15250,7 @@ document.addEventListener('paste', function(e) {
     for (const item of e.clipboardData.items) {
       if (item.kind === 'file') {
         e.preventDefault();
-        uploadAndAttach(item.getAsFile());
+        _enqueueUpload(item.getAsFile());
         return;
       }
     }
@@ -15314,7 +15364,7 @@ function _pwaCb(e) {
             item.getType(imgType).then(blob => {
               const ext = imgType.split('/')[1] || 'png';
               const file = new File([blob], 'pasted-image.' + ext, { type: imgType });
-              uploadAndAttach(file);
+              _enqueueUpload(file);
             });
             return;
           }
