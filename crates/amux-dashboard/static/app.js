@@ -1852,7 +1852,20 @@ async function apiCall(url, options) {
       amuxTrack('api_error', { url: url.split('?')[0], status: r.status, method: options.method || 'GET' });
       return null;
     }
-    consecutiveFailures = 0;
+    // A LOCALLY-QUEUED 202 IS NOT PROOF OF CONNECTIVITY (AMUX-2585).
+    //
+    // apiCall handles mutations, so while offline every call here is
+    // intercepted by the outbox and handed back a synthetic 202 that never
+    // touched the network. It is `ok`, so this line used to reset the failure
+    // counter — meaning the client's own queued writes perpetually cleared the
+    // evidence that the server was unreachable, and consecutiveFailures could
+    // never climb back to the 2 that latches offline. The more the user did
+    // while offline, the more thoroughly the offline detector was disarmed.
+    //
+    // The GET paths (fetchSessions, the status poll) reset unconditionally and
+    // correctly: the outbox only intercepts POST/PATCH/PUT/DELETE, so a
+    // successful GET really did reach the server.
+    if (!_isLocallyQueued(r)) consecutiveFailures = 0;
     // No _warnIgnoredFields call here: apiCall goes through fetch, which the
     // watch at the top of this file already wraps. Calling it here too would
     // toast twice for every apiCall mutation.
@@ -1918,8 +1931,19 @@ function _outboxQueueable(url, init) {
   return !_OUTBOX_SKIP.test(url);
 }
 function _outboxAccepted() {
+  // MARKED so connectivity logic can tell it apart (AMUX-2585). This Response
+  // never left the browser; it is manufactured here. A 202 is `ok`, so any
+  // caller treating "response arrived" as "server reachable" draws exactly the
+  // wrong conclusion from it — see the guard in apiCall.
   return new Response(JSON.stringify({ ok: true, queued: true, offline: true }),
-                      { status: 202, headers: { 'Content-Type': 'application/json' } });
+                      { status: 202, headers: { 'Content-Type': 'application/json',
+                                                'X-Amux-Outbox': 'queued' } });
+}
+/** True for a Response this client synthesised for the outbox — i.e. one that
+ *  is NOT evidence of anything about the network. */
+function _isLocallyQueued(r) {
+  try { return !!(r && r.status === 202 && r.headers && r.headers.get('X-Amux-Outbox') === 'queued'); }
+  catch (e) { return false; }
 }
 window.fetch = function(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -6928,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.577';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.578';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
