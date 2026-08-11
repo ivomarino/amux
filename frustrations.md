@@ -2844,3 +2844,48 @@ FIX: The generalisable half is the CORROBORATION, not the bad grep. I confirmed 
   Wanted: before believing a negative about a mechanism, confirm the probe ran where
   the mechanism could fire — for hooks specifically, resolve core.hooksPath first,
   because the file at the obvious path may not be the one that runs.
+
+## A hook-config change reaches no already-running lane, and nothing says so
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2829
+SYMPTOM: ~/.claude/settings.json was repointed at a reporting hook that extracts
+  the model and context size. Verified working end to end (86-byte rich body).
+  Across 292 report POSTs, every body from a real lane was 37/39/41 bytes — the
+  byte-exact shape of the PREDECESSOR script. 42 lanes reporting, 2 with a model,
+  1 with tokens. Claude Code loads hook config at SESSION START, so ~47 lanes
+  running since before the edit still hold the old command string in memory.
+COST: A correct fix that reached nobody for a day, and auto-compact — whose only
+  input was the same absent field — had never fired once for any lane, which is
+  the behaviour Ethan asked for in as many words. I then spent a further pass on
+  a WRONG fix (converging the two scripts on disk, reasoning that a script is
+  re-read per invocation where a config is not); five lanes reported after it
+  landed, none with a model.
+FIX: 10b31f3 + a5b272e — the server reads model/tokens from each lane's own
+  transcript, which a running lane cannot withhold. Report still preferred. The
+  generalisable rule: NO EDIT ON DISK REACHES A COMMAND STRING ALREADY BAKED
+  INTO A RUNNING PROCESS. When a hook change matters, verify at the RECEIVER
+  (req_bytes on the request log discriminated this in one query) rather than by
+  reading settings.json, which looked correct throughout.
+
+## Two report scripts existed; the fleet used the one that reported less
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2829
+SYMPTOM: ~/.amux/hook-report.sh (extracts model + tokens) and
+  ~/.amux/hooks/amux-report.sh (posts {state, source} only) both existed, doing
+  the same job at different fidelity. Nothing named which was canonical.
+COST: Made the diagnosis above much harder — a bare report body was consistent
+  with three different causes (wrong script, right script failing, payload
+  missing fields) and no artifact distinguished them.
+FIX: The older path is now a delegate that execs the real one, with a comment
+  saying why it still exists and not to re-fork it. Note this did NOT fix the
+  reporting itself (see the entry above — already-running lanes never call
+  either path), but it does mean a lane started from now on cannot get the
+  degraded version.
