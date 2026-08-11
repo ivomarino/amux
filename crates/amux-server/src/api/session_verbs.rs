@@ -8350,6 +8350,55 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
 /// state into the SHARED prefs store Python reads at boot and
 /// sessions_legacy reads live.
+
+/// The model's context window, in tokens. `AMUX_CONTEXT_WINDOW`.
+///
+/// A knob rather than a constant because it is the one number here amux cannot
+/// observe: the harness reports tokens USED and never the ceiling. The default
+/// is set from measurement, not a guess — this session's own transcript carried
+/// 817,201 tokens, so the window is at least that, and 1M is the smallest round
+/// figure consistent with it. Wrong in the LOW direction only costs an early
+/// compact; wrong in the HIGH direction means the lane hits the wall, which is
+/// the failure this whole card exists to stop, so the default errs low.
+fn context_window() -> u64 {
+    std::env::var("AMUX_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1_000_000)
+}
+
+/// Tokens out of a report payload, accepting both shapes seen in the wild: a
+/// bare integer (what the hook sends) and `{input,output,total}` (what the
+/// usage path writes). Returns None rather than 0 for "not reported" — a lane
+/// with no token data must not read as an empty context, which would look like
+/// 100% remaining and silently disable compaction for it.
+pub(crate) fn tokens_used(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(o) = v.as_object() {
+        if let Some(t) = o.get("total").and_then(Value::as_u64) {
+            return Some(t);
+        }
+        let i = o.get("input").and_then(Value::as_u64).unwrap_or(0);
+        let out = o.get("output").and_then(Value::as_u64).unwrap_or(0);
+        if i + out > 0 {
+            return Some(i + out);
+        }
+    }
+    None
+}
+
+/// Percent of the context window still free, clamped to 0..=100.
+pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
+    if window == 0 {
+        return 100;
+    }
+    let used_pct = (used.saturating_mul(100) / window).min(100);
+    (100 - used_pct) as u8
+}
+
 async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
@@ -8433,6 +8482,9 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
         let m: String = m.trim().chars().take(60).collect();
         (!m.is_empty()).then_some(m)
     };
+    // Captured BEFORE the writer closure moves `tokens_opt` — the compaction
+    // check below runs after the write and would otherwise borrow a moved value.
+    let used_tokens: Option<u64> = body.get("tokens").and_then(tokens_used);
     let tokens_opt: Option<Value> = body.get("tokens").and_then(|t| {
         let get = |k: &str| t.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
         let (i, o) = (get("input"), get("output"));
@@ -8519,6 +8571,51 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                 tokio::spawn(async move {
                     steer_deliver_for_session(&st_clone, &name_clone).await;
                 });
+            }
+
+            // AUTO-COMPACT (AMUX-2829). Ethan: "theres no reason amux should
+            // ever stop." It stopped because this consumer did not exist.
+            //
+            // orchestrator/compaction.rs has held the POLICY since the rust
+            // port — four tiers keyed on percent remaining — and had ZERO
+            // callers outside its own tests. Nothing emitted ContextLow because
+            // nothing knew any lane's context size, because the hooks reported
+            // tokens:None. That half shipped earlier today; this is the other.
+            //
+            // Sent as STEERING rather than typed directly: the queue already
+            // delivers at a turn boundary, which is the only moment /compact is
+            // meaningful, and it already refuses to type at a selector. The
+            // `auto-compact` guard makes it at-most-one-pending per lane — a
+            // second report before the first is consumed replaces it rather
+            // than stacking, which is what stops this becoming the nag that
+            // got the `done` tier removed from the advance loop.
+            if let Some(used) = used_tokens {
+                let pct = context_pct_remaining(used, context_window());
+                let action = crate::orchestrator::compaction::compaction_action(pct);
+                use crate::orchestrator::compaction::CompactionAction as CA;
+                if matches!(action, CA::Compact | CA::ForceCompact) {
+                    let msg = format!(
+                        "/compact\n\nContext is at {pct}% remaining ({used} tokens of a \
+                         {} window). Compacting now keeps you working — running out is not a \
+                         reason to stop. If you are mid-task, compact and continue where you \
+                         left off.",
+                        context_window()
+                    );
+                    steer_enqueue(state, name, &msg, "auto-compact", "").await;
+                    tracing::warn!(
+                        session = %name, pct, used, ?action,
+                        "auto-compact queued — context low"
+                    );
+                    emit_event(
+                        state,
+                        name,
+                        "session.auto_compact",
+                        Some(json!({"pct_remaining": pct, "tokens": used, "action": format!("{action:?}")})),
+                        Some(format!("compact:{name}:{}", now_i64() / 1800)),
+                        "compaction",
+                    )
+                    .await;
+                }
             }
             j200(json!({"ok": true, "state": st}))
         }
@@ -11736,6 +11833,65 @@ mod steer_max_age_tests {
         assert!(!flags(busy));
         let idle = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
         assert!(!flags(idle));
+    }
+
+    /// AUTO-COMPACT'S ARITHMETIC (AMUX-2829). This decides when amux interrupts
+    /// a working lane, so the boundaries are pinned rather than left to a
+    /// reading of the policy file.
+    #[test]
+    fn context_arithmetic_and_the_tiers_it_feeds() {
+        use crate::orchestrator::compaction::{compaction_action, CompactionAction as CA};
+        let w = 1_000_000u64;
+
+        // Percent REMAINING, not used — the policy is keyed on headroom.
+        assert_eq!(context_pct_remaining(0, w), 100);
+        assert_eq!(context_pct_remaining(700_000, w), 30);
+        assert_eq!(context_pct_remaining(850_000, w), 15);
+        assert_eq!(context_pct_remaining(950_000, w), 5);
+        // Over-full clamps to 0 instead of underflowing — a lane past its window
+        // is the case that MOST needs a compact, so this must not wrap to 100.
+        assert_eq!(context_pct_remaining(2_000_000, w), 0);
+        assert_eq!(context_pct_remaining(1, 0), 100, "unknown window must not force a compact");
+
+        // The tiers this session actually acts on.
+        assert_eq!(compaction_action(context_pct_remaining(500_000, w)), CA::None);
+        assert!(matches!(compaction_action(context_pct_remaining(900_000, w)), CA::Compact));
+        assert!(matches!(
+            compaction_action(context_pct_remaining(990_000, w)),
+            CA::ForceCompact
+        ));
+        // THIS SESSION'S OWN MEASURED LOAD, and the assertion is not the one I
+        // first wrote. 817,201 of 1M is 18% remaining, which the policy calls
+        // PrepareIndicator — NOT Compact. I asserted Compact, the test failed,
+        // and the test was right: the session that prompted this card would not
+        // have been auto-compacted by it.
+        //
+        // Left as the truth rather than bent to pass. Two things follow and both
+        // are recorded on AMUX-2829 rather than fixed by widening a threshold
+        // here: PrepareIndicator has NO consumer either (same producer-without-
+        // consumer shape one tier up), and 1M is a floor for the window, not a
+        // measurement — if it is really larger, 817k is a smaller fraction and
+        // the tier is even further away.
+        assert_eq!(
+            compaction_action(context_pct_remaining(817_201, w)),
+            CA::PrepareIndicator,
+            "18% remaining is the prepare tier; amux acts on Compact and below"
+        );
+    }
+
+    /// A lane with NO token data must read as unknown, never as an empty
+    /// context. Returning 0 would compute 100% remaining and silently disable
+    /// compaction for exactly the lanes whose harness is not reporting — the
+    /// hardcoded-empty failure this repo has now hit five times.
+    #[test]
+    fn missing_tokens_are_unknown_not_zero() {
+        assert_eq!(tokens_used(&json!(null)), None);
+        assert_eq!(tokens_used(&json!({})), None);
+        assert_eq!(tokens_used(&json!("nonsense")), None);
+        // Both shapes seen in the wild.
+        assert_eq!(tokens_used(&json!(817_201u64)), Some(817_201));
+        assert_eq!(tokens_used(&json!({"total": 12345})), Some(12345));
+        assert_eq!(tokens_used(&json!({"input": 100, "output": 23})), Some(123));
     }
 
     /// THE DISTINCTION, IN BOTH DIRECTIONS. Getting it wrong one way deadlocks a
