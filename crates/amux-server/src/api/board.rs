@@ -774,20 +774,6 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     v
 }
 
-/// Python `_board_slim_desc` (amux-server.py:13958) — the SSE board channel
-/// ships the first desc line (200 chars) + `desc_truncated`; the full desc
-/// stays REST/detail-only. Applied by the SSE serializer, never the GET.
-pub fn apply_sse_desc_slim(v: &mut Value, desc: &str) {
-    if desc.chars().count() <= 200 {
-        return;
-    }
-    let first: String = desc.split('\n').next().unwrap_or("").chars().take(200).collect();
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("desc".into(), json!(first));
-        obj.insert("desc_truncated".into(), json!(true));
-    }
-}
-
 /// Python `_board_item_stale` (amux-server.py:15671): an in-progress card
 /// whose owning session is not actively working and that nobody has touched
 /// for 30 minutes. `working` is the derived active-session set — the SAME

@@ -214,17 +214,12 @@ fn legacy_board_json(store: &crate::db::SharedStore) -> Option<String> {
     let now = chrono::Utc::now().timestamp();
     let items: Vec<serde_json::Value> = kept
         .iter()
-        // The API's own list serializer — the SSE view and the GET view can
-        // never disagree (a view must share its mechanism's predicate) —
-        // plus Python's SSE-only desc slimming on top.
         .map(|r| {
-            let mut v = crate::api::board::list_body(
+            crate::api::board::list_body(
                 r,
-                false,
+                true,
                 crate::api::board::is_stale(r, now, &working),
-            );
-            crate::api::board::apply_sse_desc_slim(&mut v, &r.desc);
-            v
+            )
         })
         .collect();
     serde_json::to_string(&items).ok()
