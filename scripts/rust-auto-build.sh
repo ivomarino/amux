@@ -36,6 +36,25 @@ last=$(cat "$STAMP" 2>/dev/null || echo "")
   WORK=$(mktemp -d /tmp/amux-rs-build.XXXXXX)
   trap 'git -C "$REPO" worktree remove --force "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
   git -C "$REPO" worktree add --detach "$WORK" "$(git -C "$REPO" rev-parse HEAD)" >/dev/null
+  # DISK GUARD (AMUX-2754). The shared target dir has no GC — cargo never
+  # reclaims — so it grows without bound, and on 2026-08-10 the volume hit
+  # 741MB free with a 50-session fleet and writes failing with ENOSPC.
+  #
+  # The trigger is FREE DISK, deliberately not target-dir size. Disk-full is
+  # the thing that actually broke the fleet; dir size is a proxy for it whose
+  # threshold would be a guess, and the same 28GB is fine on this volume and
+  # fatal on a smaller one. Free space is the condition that is absent in the
+  # healthy state, which is the signal worth tripping on.
+  #
+  # Clearing the cache costs one cold build (~3min, once). That is the cheap
+  # side of this trade by a wide margin: the expensive side is every lane
+  # failing to write.
+  FREE_GB=$(df -g "$HOME" | awk 'NR==2{print $4}')
+  if [ "${FREE_GB:-999}" -lt "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
+    TGT_GB=$(du -sg "$HOME/.amux/rust-build-target" 2>/dev/null | awk '{print $1}')
+    echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_MIN_FREE_GB:-25}GB). Clearing the ${TGT_GB:-?}GB shared target dir; next build is cold."
+    rm -rf "$HOME/.amux/rust-build-target"
+  fi
   # Shared target dir: incremental rebuilds (~15s) instead of cold ones
   # (~3min) — the worktree isolates SOURCE, the cache is content-keyed.
   if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server 2>&1 | tail -3); then
