@@ -1,5 +1,7 @@
 # amux
 
+- whenever you fix a bug do 2 things: 1) fix it durably at the root cause and 2) make it so that the bug would have surfaced in the amux logs so that a log sweep would've caught it, you may need to replicate the bug to confirm it appears in the logs. 
+
 A **Rust workspace** (`crates/amux-core`, `amux-server`, `amux-cli`, `amux-dashboard`)
 serving a static SPA. **The address is 8824** (`AMUX_RS_PORT`, what `./install.sh`
 sets) — use it everywhere.
@@ -105,6 +107,38 @@ and fix it at its root**, not as an obstacle to route around in your own task.
 
 The bar: after you are done, could someone hit the same problem again? If yes, you fixed
 your task, not the platform.
+
+## EVERY BUG FIX IS TWO FIXES (Ethan, 2026-08-11 — standing, no exceptions)
+
+When you fix a bug in amux, you owe **both** of these, and the second is not optional:
+
+1. **Fix it durably, at the root cause.** Not the caller, not the symptom, not your own
+   workaround — the thing that generated it. This is the rule above.
+2. **Make the bug SURFACE IN THE AMUX LOGS.** After your fix, the *next* instance of that
+   bug — or of anything in its class — must be visible in what amux already records, so a
+   sweep or an autofix loop can find it without a human noticing first.
+
+The second is what turns a fix into a class kill. A root-cause fix stops one bug; a fix
+plus a signal stops the next one, in a lane nobody is watching, on a night nobody is
+looking. Autofix cannot act on something that leaves no trace.
+
+**The test, and it is concrete:** *would the bug I just fixed have shown up in
+`GET /api/logs/analyze`, `/api/debug/*`, the structured request log, or a job's own
+report — WITHOUT me going and looking for it?* If the honest answer is no, you are not
+finished. Add the counter, the verdict field, the WARN line, or the trace that makes the
+next occurrence self-announcing.
+
+**Worked example, 2026-08-11.** A worker reported the same message delivered twice.
+Establishing it had NOT been required grepping a 1.6MB pane log, normalising ANSI, and
+deduping redraw captures by hand — because a pipe-pane log re-captures a visible line on
+every repaint, so counting occurrences there is meaningless. The store said one row; the
+pane said "53 occurrences" and meant one delivery. Nothing in amux could answer "was this
+delivered once or twice" directly. THAT is the bug worth fixing, whatever the original
+report turns out to be: `send_dedup` and `cmd_history.delivery` exist, and no view joins
+them into an answer.
+
+The shape to avoid: fixing the reported thing, and leaving the next occurrence just as
+invisible as this one was.
 
 **MANDATORY: log the friction, not just the fix — [`frustrations.md`](frustrations.md).**
 **Any issue you experience with amux gets an entry, whether or not you fixed it, and
