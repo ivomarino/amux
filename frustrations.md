@@ -2950,3 +2950,36 @@ FIX: c5b4b34 — crates/amux-server/tests/dashboard_assets.rs. Size floors plus
   SYNTAX check was standing in for a CONTENT check, and the two differ exactly
   where it matters — deletion. Any gate of the form "does it parse" should be
   asked what it says about an empty input before it is trusted as the gate.
+
+## A peer's commit swept my STAGED work into their commit, under their message
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2899
+SYMPTOM: I ran `git add app.js sw.js && git commit -F -`. The commit returned
+  "nothing to commit, working tree clean" — while the change was demonstrably
+  live (APP_VER 0.9.591 serving). A peer had committed in the gap between my add
+  and my commit, and their `381fb3c` ("feat(board-drive): auto-continue nudge for
+  lanes with outstanding work") contains my 32-line scheduler-UI fix and my sw.js
+  CACHE bump alongside their 169 lines of board_drive.rs.
+COST: no code lost — I verified all five markers of my change are intact in HEAD
+  and serving. The cost is the RECORD. This repo does constant archaeology; every
+  fix cites a sha and CLAUDE.md's own recipes tell you to read `git log --grep`
+  and `<sha>^` to find the pre-fix specimen. Anyone tracing why shell schedules
+  render an owner chip now lands on a commit about an auto-continue nudge, by a
+  different author, whose message says nothing about it. The AMUX-2899 card would
+  be the only thread back.
+FIX: none yet. CLAUDE.md documents the mirror of this ("a peer's commit can
+  silently REVERT your uncommitted work", 2026-08-09, where staged DELETIONS were
+  swept in) but not this direction, and the existing staged-guard fires on the
+  COMMITTER — it warned me about their staged board_drive.rs — while the party
+  who needs warning is the one whose work is about to be carried off.
+  What would actually help: `git commit` with explicit paths is already the
+  advice, and I did not follow it here (I used a bare `git commit -F -` after a
+  targeted `git add`). A bare commit takes the whole index, and on a shared
+  checkout the index is shared. The narrow rule is: on this checkout, ALWAYS
+  `git commit -- <your paths>`, never rely on having staged only your own.
+  I have used the path-scoped form elsewhere today; I did not here, and that is
+  the difference.
