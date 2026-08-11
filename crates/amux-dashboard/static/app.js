@@ -2524,7 +2524,19 @@ function updatePeekStatus() {
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
   let badge = '';
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s) + _liveWorkLine(s);
+  // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
+  // need the task name, status and model"). `_liveWorkLine` used to append the
+  // worker's current progress line — "Perusing… (4m 11s · ↓ 5.4k tokens)" — up
+  // to 60 chars of it, ALWAYS present while a worker is active. At 375px that
+  // pushed the row past the viewport: the worker name was clipped to
+  // "escience" and the model chip fell off the right edge, so the three things
+  // the header exists to show were the three things you could not read.
+  //
+  // It is dropped rather than moved: the terminal pane directly below shows
+  // the same output live, so this was a lossy 60-char summary of something
+  // already on screen. amux is mobile-first — when the phone and a nice-to-have
+  // trade off, the phone wins.
+  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
@@ -3268,25 +3280,6 @@ const _STALL_MINS = 15;
 // where the question is actually asked. Nothing new is computed or inferred —
 // if the harness is not drawing a progress line, this shows nothing rather than
 // manufacturing reassurance.
-function _liveWorkLine(s) {
-  if (!s || s.status !== 'active') return '';
-  const lines = (s.preview_lines && s.preview_lines.length)
-    ? s.preview_lines
-    : String(s.preview || '').split('\n');
-  // Claude Code's progress line: "· Verb… (2m 6s · ↓ 5.4k tokens)". Match on the
-  // elapsed/token parenthetical rather than the verb — the verb is random.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const l = String(lines[i]).trim();
-    if (/\((?:[\d.]+[smh]\s|\d+m\s\d+s)/.test(l) || /tokens\)/.test(l) || /esc to interrupt/i.test(l)) {
-      // Claude Code cycles spinner glyphs (·, ✽, ✳, …), so strip ANY leading
-      // non-letter rather than a list that goes stale on the next glyph.
-      const txt = l.replace(/^[^\p{L}\p{N}]+/u, '').slice(0, 60);
-      if (txt) return '<span class="live-work" title="Live from the worker\'s terminal — this is what it is doing right now">'
-                  + esc(txt) + '</span>';
-    }
-  }
-  return '';
-}
 
 function _stalledFor(s) {
   if (!s.waiting_since || s.credit_limited || s.rate_limited_until) return '';
@@ -7068,7 +7061,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.597';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.598';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

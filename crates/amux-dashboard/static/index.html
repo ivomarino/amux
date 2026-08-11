@@ -1869,10 +1869,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
 <div id="peek-overlay" class="overlay">
   <div class="overlay-header" style="flex-direction:column;gap:4px;padding-bottom:6px;">
-    <div id="peek-title-row" style="display:flex;align-items:center;gap:8px;min-width:0;">
-      <h2 id="peek-title" style="margin:0;font-size:0.92rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">peek</h2>
-      <span id="peek-session-status"></span>
-      <span id="peek-model-badge" style="font-size:0.75rem;padding:2px 8px;border-radius:9999px;background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);white-space:nowrap;"></span>
+    <div id="peek-title-row" style="display:flex;align-items:center;gap:8px;min-width:0;width:100%;overflow:hidden;">
+      <!-- flex:1 + min-width:0 is what makes the ellipsis actually fire. A flex
+           item will not shrink below its content width without min-width:0, so
+           the name did not truncate — the ROW overflowed instead, and on a
+           375px phone that clipped "tubescience" to "escience" and pushed the
+           model chip off the right edge. The two badges are flex-shrink:0 so
+           the name gives up space first: status and model are short and fixed,
+           the name is the one that can afford an ellipsis. -->
+      <h2 id="peek-title" style="margin:0;font-size:0.92rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0;">peek</h2>
+      <span id="peek-session-status" style="flex-shrink:0;display:flex;align-items:center;gap:4px;"></span>
+      <span id="peek-model-badge" style="font-size:0.75rem;padding:2px 8px;border-radius:9999px;background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);white-space:nowrap;flex-shrink:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;"></span>
     </div>
     <div id="peek-task-row" style="display:none;align-items:center;gap:6px;min-width:0;max-width:100%;">
       <span style="font-size:0.72rem;color:var(--dim);flex-shrink:0;">Task:</span>
