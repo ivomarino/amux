@@ -66,7 +66,7 @@ const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 // AppState-captured-home refactor is a named deviation there.
 // ---------------------------------------------------------------------------
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
     })
