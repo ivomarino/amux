@@ -42,7 +42,7 @@
     <h1>os.execv: The One-Syscall Way to Hot-Reload a Python Server</h1>
 <p class="subtitle">Replace the running process with a new version of itself. Same PID, same port, new code.</p>
 
-<p>amux is a single Python file — about 25,000 lines of server, dashboard HTML/CSS/JS, and agent orchestration logic. During development, this file changes constantly. Sometimes by me, sometimes by the AI agents that amux is orchestrating (they edit the file, the server picks up the changes, and the agents see the new behavior immediately). The server needs to reload without manual intervention, without a process manager, and without losing the port binding for more than a fraction of a second.</p>
+<p>amux is a single Rust binary — about 25,000 lines of server, dashboard HTML/CSS/JS, and agent orchestration logic. During development, this file changes constantly. Sometimes by me, sometimes by the AI agents that amux is orchestrating (they edit the file, the server picks up the changes, and the agents see the new behavior immediately). The server needs to reload without manual intervention, without a process manager, and without losing the port binding for more than a fraction of a second.</p>
 
 <p>The solution is one syscall: <code>os.execv</code>.</p>
 

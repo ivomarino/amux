@@ -137,7 +137,7 @@ curl -sk $AMUX_URL/api/sessions/nightly-refactor/peek  # read output</code></pre
       <li><strong>You run 5+ parallel agents.</strong> At that scale, session fees start to dominate and you'll want a dashboard anyway.</li>
       <li><strong>You want mobile access.</strong> amux ships a PWA you can pin to your home screen and drive agents from your phone during a commute.</li>
       <li><strong>You need model-agnostic orchestration.</strong> Mix Claude, GPT, and local models in the same fleet.</li>
-      <li><strong>You care about the runtime as infrastructure, not a product.</strong> amux is tmux, SQLite, and a single Python file. You can read the whole server in an afternoon and patch it.</li>
+      <li><strong>You care about the runtime as infrastructure, not a product.</strong> amux is tmux, SQLite, and a single Rust binary. You can read the whole server in an afternoon and patch it.</li>
       <li><strong>Your data can't leave your machine.</strong> Regulated codebases, customer data in logs, client NDAs — self-hosting removes an entire category of compliance work.</li>
       <li><strong>You want to experiment without a meter.</strong> Agent experiments have a way of ballooning. A metered runtime makes you cautious; a free runtime makes you curious.</li>
     </ul>
@@ -148,7 +148,7 @@ curl -sk $AMUX_URL/api/sessions/nightly-refactor/peek  # read output</code></pre
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
 amux serve  # → https://localhost:8824</code></pre>
-    <p>From there you have a web dashboard, a kanban board, mobile PWA, REST API, and inter-session messaging. Spin up as many sessions as your RAM allows. The whole thing is <a href="https://github.com/mixpeek/amux/blob/main/amux-server.py">one Python file</a>, MIT-licensed, and hackable.</p>
+    <p>From there you have a web dashboard, a kanban board, mobile PWA, REST API, and inter-session messaging. Spin up as many sessions as your RAM allows. The whole thing is <a href="https://github.com/mixpeek/amux/blob/main/amux-server-rs">one Rust binary</a>, MIT-licensed, and hackable.</p>
 
     <h2>Related reading</h2>
     <ul>

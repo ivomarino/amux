@@ -103,7 +103,7 @@
     <h3>Step 1 — Install amux and start the server</h3>
     <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux serve  # → https://localhost:8824</code></pre>
-    <p>If you already have amux installed, just make sure you are on the latest version: <code>git pull &amp;&amp; touch amux-server.py</code> to trigger a reload.</p>
+    <p>If you already have amux installed, just make sure you are on the latest version: <code>git pull &amp;&amp; ./install.sh</code> to trigger a reload.</p>
 
     <h3>Step 2 — Open Calendar settings in the dashboard</h3>
     <p>In the amux dashboard at <code>https://localhost:8824</code>, open the calendar section. You will see two options: the iCal feed URL (for passive subscription from any calendar app) and the Google Calendar OAuth connection for live two-way sync.</p>
@@ -145,7 +145,7 @@ amux serve  # → https://localhost:8824</code></pre>
     <h2>Why no other AI agent tool does this</h2>
     <p>Most AI coding agent tools are SaaS products with their own dashboards and notification systems. They send you emails, Slack notifications, or in-app alerts when a task completes. These are push notifications — they interrupt you. A calendar event is different: it is ambient information you encounter when you are already planning your day.</p>
     <p>amux is self-hosted and lives on your machine, which means it can interact with local credentials and OAuth flows in ways that cloud services cannot. The Google Calendar integration uses the OAuth tokens you approve on your own machine, writing events directly from the amux server to Google's API. There is no third-party intermediary, no data leaving your machine to a vendor, and no dependency on amux's cloud infrastructure.</p>
-    <p>This is one of the reasons the "single Python file, zero external dependencies" architecture matters: amux can add integrations like Google Calendar without adding cloud dependencies. The file that runs your agents is the same file that pushes to your calendar.</p>
+    <p>This is one of the reasons the "single Rust binary, zero external dependencies" architecture matters: amux can add integrations like Google Calendar without adding cloud dependencies. The file that runs your agents is the same file that pushes to your calendar.</p>
 
     <h2>Frequently asked questions</h2>
 

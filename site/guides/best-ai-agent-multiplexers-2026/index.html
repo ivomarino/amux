@@ -331,7 +331,7 @@
         <span>Python + tmux</span>
         <span>macOS, Linux, cloud VMs</span>
       </div>
-      <p>amux is an orchestration platform built as a single Python file (<code>amux-server.py</code>). It runs a local HTTPS server that manages tmux sessions, serves a web dashboard, and exposes a comprehensive REST API. The self-healing watchdog auto-restarts crashed agents, auto-compacts context overflows, and detects stuck sessions. Run an AI engineering team from one dashboard — start agents before bed, review PRs in the morning.</p>
+      <p>amux is an orchestration platform built as a single Rust binary (<code>amux-server-rs</code>). It runs a local HTTPS server that manages tmux sessions, serves a web dashboard, and exposes a comprehensive REST API. The self-healing watchdog auto-restarts crashed agents, auto-compacts context overflows, and detects stuck sessions. Run an AI engineering team from one dashboard — start agents before bed, review PRs in the morning.</p>
       <p><strong>Distinguishing features:</strong></p>
       <ul>
         <li>Self-healing watchdog with crash recovery, context compaction, and stuck detection</li>
@@ -733,7 +733,7 @@ ittybitty → dmux → workmux → Agent Teams → Superset → cmux → amux �
 
     <div class="cta-box" style="margin-top:3rem;">
       <h3>Try amux</h3>
-      <p>Run dozens of AI coding agents in parallel with self-healing, mobile monitoring, and token tracking. Works on macOS, Linux, and cloud VMs. Open source, MIT, single Python file. Compatible with Claude Code, OpenAI Codex CLI, and Gemini CLI.</p>
+      <p>Run dozens of AI coding agents in parallel with self-healing, mobile monitoring, and token tracking. Works on macOS, Linux, and cloud VMs. Open source, MIT, single Rust binary. Compatible with Claude Code, OpenAI Codex CLI, and Gemini CLI.</p>
       <pre><code># Homebrew (macOS)
 brew install mixpeek/amux/amux
 

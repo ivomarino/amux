@@ -45,7 +45,7 @@
 
     <div style="background:var(--bg-2);border:1px solid var(--line);border-radius:8px;padding:1.5rem;margin:2rem 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;">
       <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">License</div><div style="font-weight:600">MIT + Commons Clause</div></div>
-      <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Codebase</div><div style="font-weight:600">~30k LOC, single Python file</div></div>
+      <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Codebase</div><div style="font-weight:600">~115k LOC Rust workspace</div></div>
       <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Launched</div><div style="font-weight:600">2025</div></div>
       <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">GitHub Stars</div><div style="font-weight:600"><span id="gh-stars-stat">—</span></div></div>
       <div><div style="font-family:var(--font-mono);font-size:11px;color:var(--fg-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Mobile</div><div style="font-weight:600">iOS App Store + PWA</div></div>
@@ -58,7 +58,7 @@
 
     <p>The core problem amux solves: AI coding agents are powerful but fragile. They crash overnight from context exhaustion, they can only run one at a time, and there is no shared view of what multiple agents are doing. amux adds a self-healing watchdog that automatically compacts context, restarts crashed sessions, and replays the last message — so agents keep working while the developer sleeps. A shared kanban board with atomic task claiming (SQLite compare-and-swap) prevents duplicate work when multiple agents pull from the same queue.</p>
 
-    <p>amux is built as a single Python file with inline HTML/CSS/JS — no build step, no Docker, no microservices. It auto-restarts on file save. The same file runs locally and in cloud VMs. A native iOS app and installable PWA let developers monitor their agent fleet and approve pull requests from a phone. The project is MIT + Commons Clause licensed and built by Mixpeek.</p>
+    <p>amux is built as a single Rust binary with inline HTML/CSS/JS — no build step, no Docker, no microservices. It auto-restarts on file save. The same file runs locally and in cloud VMs. A native iOS app and installable PWA let developers monitor their agent fleet and approve pull requests from a phone. The project is MIT + Commons Clause licensed and built by Mixpeek.</p>
 
     <h2>Key links</h2>
 

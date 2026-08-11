@@ -108,7 +108,7 @@
     </div>
 
     <h2>How to set up AI coding agents to run overnight</h2>
-    <p>Setup takes under ten minutes. You need Python 3, tmux, and a valid Anthropic API key. No Docker, no cloud account, no external services required — amux is a single Python file with zero external dependencies.</p>
+    <p>Setup takes under ten minutes. You need Python 3, tmux, and a valid Anthropic API key. No Docker, no cloud account, no external services required — amux is a single Rust binary with zero external dependencies.</p>
 
     <h3>Step 1 — Install amux</h3>
     <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh</code></pre>
@@ -312,7 +312,7 @@ amux start myproject   # start another — each claims its own task from the boa
           <tr>
             <td>Setup complexity</td>
             <td>Hours of scripting; breaks when Claude Code updates</td>
-            <td>10-minute install; single Python file, zero external dependencies</td>
+            <td>10-minute install; single Rust binary, zero external dependencies</td>
           </tr>
           <tr>
             <td>License</td>
@@ -374,7 +374,7 @@ amux start myproject   # start another — each claims its own task from the boa
 
     <div class="cta-box">
       <h3>Run your AI engineering team tonight</h3>
-      <p>Install amux in ten minutes. Queue tasks before bed. Wake up to pull requests. Open source, single Python file, MIT licensed.</p>
+      <p>Install amux in ten minutes. Queue tasks before bed. Wake up to pull requests. Open source, single Rust binary, MIT licensed.</p>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux board add "Your first overnight task"

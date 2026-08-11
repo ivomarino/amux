@@ -1023,7 +1023,7 @@
       <div class="kicker">// Why amux</div>
       <h2>Multi-agent infra, without the duct tape.</h2>
       <p class="sub">If you're already running parallel coding agents from a stack of terminal windows,
-        you've felt every one of these. amux fixes them in a single Python file.</p>
+        you've felt every one of these. amux fixes them in a single Rust binary.</p>
     </div>
 
     <div class="ps">
@@ -1079,7 +1079,7 @@
       <div class="kicker">// Dashboard</div>
       <h2>One pane of glass for the whole fleet.</h2>
       <p class="sub">Session cards, live terminal peek, kanban, notes, CRM, scheduler, files.
-        Everything lives in a single Python file with inline HTML &mdash; clone it, edit it, deploy it.</p>
+        Everything lives in a single Rust binary with inline HTML &mdash; clone it, edit it, deploy it.</p>
     </div>
 
     <div class="showcase">
@@ -1215,7 +1215,7 @@
                 </div>
                 <div style="padding:16px 20px; font-size:13.5px; line-height:1.6; color:var(--fg-2);">
                   <div style="font:600 16px/1 'Geist',sans-serif; color:var(--fg); margin-bottom:14px;">Architecture Overview</div>
-                  <p style="margin:0 0 10px;">amux uses a single-file architecture. <span style="color:var(--accent);">amux-server.py</span> contains the Python HTTP server, SQLite database layer, and the full HTML/CSS/JS dashboard.</p>
+                  <p style="margin:0 0 10px;">amux uses a single-file architecture. <span style="color:var(--accent);">amux-server-rs</span> contains the Python HTTP server, SQLite database layer, and the full HTML/CSS/JS dashboard.</p>
                   <p style="margin:0 0 10px;">Sessions are managed via tmux. Each agent gets an isolated pane with a permanent conversation ID. The watchdog monitors all panes and auto-heals on context overflow or corruption.</p>
                   <p style="margin:0;">Inter-agent communication uses 1:1 channels with @mentions. The board provides atomic task claiming via SQLite CAS.</p>
                 </div>
@@ -1307,7 +1307,7 @@
         </div>
         <div class="m-card" style="padding: 18px 20px;">
           <div style="font: 500 11px/1 'JetBrains Mono', monospace; color: var(--accent); letter-spacing:0.1em;">// SINGLE FILE</div>
-          <h3 style="margin: 6px 0 0; font-size: 17px; font-weight: 600;">One Python file. Edit it.</h3>
+          <h3 style="margin: 6px 0 0; font-size: 17px; font-weight: 600;">One Rust binary. Edit it.</h3>
           <p style="margin:0; color: var(--fg-2); font-size: 14px;">No build step, no node_modules, no Docker. Inline HTML/CSS/JS. Save the file, it restarts itself.</p>
         </div>
         <div class="m-card" style="padding: 18px 20px;">
@@ -1594,7 +1594,7 @@
       <div class="kicker">// Everything inside</div>
       <h2>Batteries included.</h2>
       <p class="sub">amux ships with the workspace tools an agent fleet needs &mdash; kanban, CRM, email, browser automation, scheduler, and tunnel.
-        Every feature lives in the same single Python file.</p>
+        Every feature lives in the same single Rust binary.</p>
     </div>
 
     <div class="features">
@@ -1650,7 +1650,7 @@
         <div class="num">09</div>
         <div class="glyph"><svg class="ic" width="16" height="16" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 8h16M8 4v16"/></svg></div>
         <h3>Single-file architecture</h3>
-        <p>One Python file with inline HTML/CSS/JS. No build step. No dependencies. Edit and save &mdash; it restarts itself. Audit the whole thing in an afternoon.</p>
+        <p>One Rust binary with inline HTML/CSS/JS. No build step. No dependencies. Edit and save &mdash; it restarts itself. Audit the whole thing in an afternoon.</p>
       </div>
       <div class="feat">
         <div class="num">10</div>
