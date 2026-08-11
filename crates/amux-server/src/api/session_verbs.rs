@@ -832,6 +832,16 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
             if ('\u{2700}'..='\u{27bf}').contains(&c) && s.contains('\u{2026}') {
                 return "active".into();
             }
+            // GEMINI/CODEX spin with BRAILLE glyphs (U+2800-28FF), not the
+            // dingbat range above — found live 2026-08-11 (AMUX-2913): a
+            // gemini tool turn (`⠙ Thinking... (esc to cancel, 9s)`) read as
+            // not-active for its entire run, and a stale picker stamp showed
+            // through as `waiting` while the lane was demonstrably working.
+            // A line STARTING with a braille char is spinner chrome; prose
+            // does not start mid-word with braille.
+            if ('\u{2800}'..='\u{28ff}').contains(&c) {
+                return "active".into();
+            }
         }
         if s.starts_with("Running\u{2026}") || reading_re.is_match(s) {
             return "active".into();
@@ -2076,12 +2086,7 @@ fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+use crate::config::now_f64;
 fn now_i64() -> i64 {
     now_f64() as i64
 }
@@ -11332,6 +11337,11 @@ mod tests {
         assert_eq!(detect_claude_status(gemini), "waiting");
         let gemini_prose = "gemini renders \u{25cf} 1. Yes as its cursor";
         assert_ne!(detect_claude_status(gemini_prose), "waiting");
+        // Gemini mid-tool-turn, live frame: braille spinner = ACTIVE. This
+        // read as waiting for an entire 20s shell run (a stale picker stamp
+        // showed through because nothing recognised the spinner).
+        let gemini_working = "\u{2502} \u{22b7}  Shell sleep 15 && echo ROUND2\n \u{2819} Thinking... (esc to cancel, 9s)\n YOLO Ctrl+Y";
+        assert_eq!(detect_claude_status(gemini_working), "active");
     }
 
     // ---- AMUX-2612: session identity survives a resume --------------------
