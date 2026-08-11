@@ -1907,7 +1907,25 @@ for tag in item.get('tags',[]):
       # `amux board ls --all` for the archived rows too.
       local _lsq="slim=1&archived=0"
       [[ "${1:-}" == "--all" || "${1:-}" == "-a" ]] && _lsq="slim=1"
-      curl -sk "$AMUX_API/api/board?$_lsq" | python3 -c "
+      # --mine: scoped, and a scoped query is UNCAPPED by the server, so this is
+      # the answer to "where are my done cards" rather than a filtered view of a
+      # truncated one.
+      [[ "${1:-}" == "--mine" || "${1:-}" == "-m" ]] && _lsq="slim=1&session=${AMUX_SESSION:-}&done_limit=0"
+      # SAY WHEN THE LIST IS TRUNCATED. This query is UNSCOPED, so the server
+      # caps terminal rows (done/verified/discarded) to the 100 most recently
+      # updated FLEET-WIDE — across ~50 lanes, that can be none of yours. The
+      # cap is right (uncapped is 5620 rows / 19.8MB and `ls` becomes a wall);
+      # the SILENCE was the bug. Three sessions independently reported "my
+      # cards are missing from the board" on 2026-08-11 — ts-gke, social-media
+      # and, downstream, a sweep that judged cards abandoned — and each had to
+      # discover the cap by experiment.
+      #
+      # The server has always sent x-amux-truncated / x-amux-terminal-total;
+      # nobody reads response headers from a pipe, which is ethos rule 4's
+      # second layer: a tag in a store the reader never opens. So read them
+      # here and print one line, in the place the reader is already looking.
+      local _hdr; _hdr=$(mktemp)
+      curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq" | python3 -c "
 import sys,json
 items=json.load(sys.stdin)
 for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
@@ -1915,6 +1933,17 @@ for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
     tags = ' '.join(f'[{t}]' for t in i.get('tags',[])) if i.get('tags') else ''
     print(f\"{status_sym} {i['id']:12s} {i['title'][:50]:50s} [{i['status']}] {tags}\")
 "
+      # One line, only when rows were actually dropped.
+      if grep -qi '^x-amux-truncated: 1' "$_hdr" 2>/dev/null; then
+        local _tt _tr
+        _tt=$(grep -i '^x-amux-terminal-total:' "$_hdr" | tr -d '\r' | awk '{print $2}')
+        _tr=$(grep -i '^x-amux-terminal-returned:' "$_hdr" | tr -d '\r' | awk '{print $2}')
+        echo "${DIM}— showing ${_tr:-?} of ${_tt:-?} done/verified/discarded cards (newest first, fleet-wide cap)."
+        echo "  YOUR terminal cards may be entirely outside this list. To see them:"
+        echo "    amux board ls --mine        # this session, uncapped"
+        echo "    curl -sk \"\$AMUX_API/api/board?session=\$AMUX_SESSION&done_limit=0\"${RESET}"
+      fi
+      rm -f "$_hdr"
       ;;
     help|*)
       # An UNKNOWN verb must not exit 0. `amux board note X "..."` printed this
