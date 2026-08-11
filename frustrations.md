@@ -2920,3 +2920,33 @@ FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
   smaller action than its name implies. Same class as `amux board claim` exiting
   0 without claiming (AMUX-2140).
 
+
+## `node --check` passes on an empty file, so the JS gate cannot see a truncated one
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2635
+SYMPTOM: I emptied `crates/amux-dashboard/static/sw.js` from 6123 bytes to 0 and
+  COMMITTED it. The cause was mine — `open(p,'w').write(open(p).read()...)`
+  truncates when the write handle is created, before the argument is evaluated,
+  so the read returned "". But every gate said yes: the PostToolUse hook runs
+  `node --check`, and an empty program is valid JavaScript, so it passed. The
+  commit shipped a service worker with no install/fetch/push handlers, no shell
+  pre-cache and no offline fallback.
+COST: ~10 minutes to catch and restore, and it was luck — I only looked because
+  a `grep -n "CACHE = "` printed nothing where I expected a line. Had the grep
+  not been in the same command, this ships and the next PWA client to update
+  registers an empty worker. The real cost is the class: every client-JS edit in
+  this repo has been guarded by a check that cannot distinguish "valid" from
+  "present".
+FIX: c5b4b34 — crates/amux-server/tests/dashboard_assets.rs. Size floors plus
+  the named handlers whose absence breaks a PWA, so partial writes are caught as
+  well as total ones; and it enforces the APP_VER/CACHE pairing that CLAUDE.md
+  had only in prose. Verified by reproducing both defects: truncating sw.js
+  passes `node --check` and fails the new suite.
+  The generalisable half is not "be careful with file writes". It is that a
+  SYNTAX check was standing in for a CONTENT check, and the two differ exactly
+  where it matters — deletion. Any gate of the form "does it parse" should be
+  asked what it says about an empty input before it is trusted as the gate.
