@@ -109,6 +109,66 @@ struct Inner {
     clients_dropped: u64,
 }
 
+/// Where the observation window survives a restart (AMUX-2769).
+///
+/// The window used to be per-UPTIME, and the reason was sound: a counter that
+/// resets and then reports itself as a lifetime total "would make the
+/// retirement window look satisfied when it had just been reset". Safe — but
+/// it made the exit UNREACHABLE, which is the failure this file is supposed to
+/// prevent, one level up. `ready_to_retire` required `hours_elapsed >= 168`
+/// (7d) on a process that re-execs every time anyone commits to `crates/`:
+/// measured 2026-08-11, the builder had installed 316 times and the window
+/// stood at 0.71 hours. The countdown reset before it could ever finish, so
+/// the bind that CLAUDE.md calls "a countdown, not an address" had no way to
+/// reach zero.
+///
+/// Persisting `last_hit` fixes it without giving up the safety, because the
+/// verdict now keys on QUIET TIME (`now - last_hit`) rather than on process
+/// uptime. That is also what the prose always said — "zero hits for 7 days" —
+/// and unlike an uptime window it cannot be satisfied by a restart: a restart
+/// does not make traffic older.
+fn persist_path() -> std::path::PathBuf {
+    // Overridable so the lifecycle test below drives the SHIPPED load/save path
+    // against a temp file instead of this machine's real window. Without it the
+    // test reads whatever traffic the running fleet has recorded and
+    // "arming must not fabricate a hit" fails with hits_total=1 — a test whose
+    // verdict depends on the host, which is the same trap as an env-mutating
+    // test racing its siblings (see this module's own test doc).
+    if let Ok(p) = std::env::var("AMUX_LEGACY_PORT_STATE") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    crate::config::amux_home().join("legacy-port-window.json")
+}
+
+/// Load the persisted window. Absent/corrupt file = a fresh window, which is
+/// the conservative direction: it delays retirement, never advances it.
+fn load_persisted() -> (u64, u64, u64) {
+    let Ok(txt) = std::fs::read_to_string(persist_path()) else { return (0, 0, 0) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return (0, 0, 0) };
+    (
+        v.get("first_armed").and_then(|x| x.as_u64()).unwrap_or(0),
+        v.get("hits_total").and_then(|x| x.as_u64()).unwrap_or(0),
+        v.get("last_hit").and_then(|x| x.as_u64()).unwrap_or(0),
+    )
+}
+
+fn save_persisted(first_armed: u64, hits_total: u64, last_hit: u64) {
+    let body = serde_json::json!({
+        "first_armed": first_armed,
+        "hits_total": hits_total,
+        "last_hit": last_hit,
+        "note": "legacy 8822 observation window; survives restarts so the 7-day \
+                 quiet period can actually accumulate (AMUX-2769)",
+    });
+    let p = persist_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, body.to_string());
+}
+
 static STATE: OnceLock<Mutex<Inner>> = OnceLock::new();
 
 fn state() -> &'static Mutex<Inner> {
@@ -128,9 +188,25 @@ fn now() -> u64 {
 pub fn arm(port: u16) {
     if let Ok(mut s) = state().lock() {
         let t = now();
+        let (first_armed, hits, last) = load_persisted();
         s.port = port;
-        s.started_at = t;
+        // The window CONTINUES across restarts; only a never-armed machine
+        // starts one. hits_total and last_hit are restored with it, so the
+        // quiet period is measured from real traffic rather than from boot.
+        s.started_at = if first_armed > 0 { first_armed } else { t };
+        s.hits_total = hits;
+        s.last_hit = last;
         s.hour_started = t;
+        // The PER-UPTIME fields start empty, because that is what arming means:
+        // this process has begun answering. In production arm() runs once on a
+        // fresh process so these are already default — stating it makes the
+        // split explicit (persisted: window + traffic recency; per-uptime:
+        // who is calling right now) and lets the test model a restart honestly
+        // instead of inheriting the previous phase's clients.
+        s.clients.clear();
+        s.clients_dropped = 0;
+        s.hour_hits = 0;
+        save_persisted(s.started_at, s.hits_total, s.last_hit);
     }
 }
 
@@ -189,8 +265,19 @@ fn record(ip: &str, ua: &str, session: &str, path: &str) -> u16 {
     let t = now();
     s.hits_total += 1;
     s.hour_hits += 1;
+    let prev_last = s.last_hit;
     s.last_hit = t;
     let port = s.port;
+    // THROTTLED to once a minute. `last_hit` is what the retirement verdict
+    // reads, and it only needs to be accurate to well within the 7-day quiet
+    // period — writing a file on every request would put a syscall in the path
+    // of a listener whose entire purpose is to be byte-identical to the
+    // primary one. A crash can lose at most 60s of recency, which moves the
+    // verdict in the CONSERVATIVE direction (an older last_hit would only ever
+    // make retirement look closer, and we round the other way by persisting
+    // the first hit in a window immediately).
+    let should_persist = prev_last == 0 || t.saturating_sub(prev_last) >= 60;
+    let persist_args = (s.started_at, s.hits_total, s.last_hit);
     // TAB-separated: a user-agent contains spaces, so the old
     // `"{ip} {ua}"` + `split_once(' ')` only worked because ip has none.
     // A third field needs an unambiguous separator.
@@ -200,6 +287,10 @@ fn record(ip: &str, ua: &str, session: &str, path: &str) -> u16 {
     let admit = s.clients.contains_key(&key) || s.clients.len() < MAX_CLIENTS;
     if !admit {
         s.clients_dropped += 1;
+        drop(s);
+        if should_persist {
+            save_persisted(persist_args.0, persist_args.1, persist_args.2);
+        }
         return port;
     }
     let e = s.clients.entry(key).or_insert(ClientTally { first_seen: t, ..Default::default() });
@@ -212,6 +303,16 @@ fn record(ip: &str, ua: &str, session: &str, path: &str) -> u16 {
         e.paths.insert(path.to_string(), 1);
     } else {
         e.paths_dropped += 1;
+    }
+    // PERSIST LAST, never with an early return. The first version returned
+    // straight after saving and so skipped the client tally below — the hour
+    // WARN line lost its caller and the module's own lifecycle test caught it
+    // ("the WARN line must be able to name the caller"). The save is a side
+    // effect of recording a hit; it must not decide whether the hit is
+    // recorded.
+    drop(s);
+    if should_persist {
+        save_persisted(persist_args.0, persist_args.1, persist_args.2);
     }
     port
 }
@@ -365,22 +466,42 @@ pub fn snapshot() -> serde_json::Value {
         } else {
             "CLEAR: no traffic on the retired port this uptime"
         },
-        // Per-UPTIME, not all-time: the server re-execs on every install, and
-        // reporting a restarted counter as a lifetime total would make the
-        // retirement window look satisfied when it had just been reset.
+        // PERSISTED across restarts now (AMUX-2769). The old per-uptime
+        // counter was chosen so a reset counter could not be misread as a
+        // lifetime total — sound, but it made `ready_to_retire` unreachable:
+        // it wanted 168h of window on a process the builder re-execs several
+        // times an hour (316 installs, window standing at 0.71h when measured).
+        // The verdict now keys on QUIET TIME instead, which a restart cannot
+        // fake because a restart does not make traffic older.
         "hits_total": s.hits_total,
         "window": {
             "started_at": s.started_at,
             "hours_elapsed": elapsed as f64 / 3600.0,
-            "resets_on_restart": true,
+            "resets_on_restart": false,
+            "persisted_at": persist_path().to_string_lossy(),
+        },
+        "quiet_for_hours": if s.last_hit == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(t.saturating_sub(s.last_hit) as f64 / 3600.0)
         },
         "last_hit": if s.last_hit == 0 { serde_json::Value::Null } else { s.last_hit.into() },
         "clients": clients,
         "clients_dropped": s.clients_dropped,
-        "retire_when": "hits_total == 0 with window.hours_elapsed >= 168 (7d) AND clients empty \
-                        -> drop AMUX_RS_LEGACY_PORT from ~/.amux/server.env and delete the bind \
-                        block in lib.rs. See docs/rust-migration/server-boundary.md.",
-        "ready_to_retire": s.hits_total == 0 && s.clients.is_empty() && elapsed >= 7 * 24 * 3600,
+        "retire_when": "quiet_for_hours >= 168 (7d with no hit at all) AND clients empty this \
+                        uptime -> drop AMUX_RS_LEGACY_PORT from ~/.amux/server.env and delete the \
+                        bind block in lib.rs. See docs/rust-migration/server-boundary.md. \
+                        Measured from a PERSISTED last_hit, so restarts no longer reset the \
+                        countdown (they used to, several times an hour, which made this \
+                        unreachable).",
+        "ready_to_retire": s.clients.is_empty()
+            && match s.last_hit {
+                // Armed, never hit, and observed for a week: the genuine
+                // all-clear. `started_at` is persisted too, so this is real
+                // observation time rather than uptime.
+                0 => elapsed >= 7 * 24 * 3600,
+                last => t.saturating_sub(last) >= 7 * 24 * 3600,
+            },
     })
 }
 
@@ -502,6 +623,12 @@ mod tests {
         assert_eq!(off["enabled"], false, "unarmed must report enabled:false");
         assert_eq!(off["port"], 0);
 
+        // Point the persisted window at a throwaway file. arm() restores from
+        // it (AMUX-2769), so without this the test asserts against the live
+        // fleet's traffic and its verdict depends on the host.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("AMUX_LEGACY_PORT_STATE", tmp.path().join("w.json"));
+
         arm(8822);
         let on = snapshot();
         assert_eq!(on["enabled"], true, "armed must report enabled:true");
@@ -619,5 +746,39 @@ mod tests {
         // Unattributed traffic still outranks: a defect is not cleared by a
         // lane that merely needs restarting.
         assert!(snap["verdict"].as_str().unwrap_or("").starts_with("INVESTIGATE"));
+
+        // (5) THE COUNTDOWN MUST SURVIVE A RESTART (AMUX-2769). `ready_to_retire`
+        // wanted 168h of observation on a process the builder re-execs several
+        // times an hour — measured 2026-08-11: 316 installs, window standing at
+        // 0.71h. The retirement this module exists to decide could never be
+        // reached, and nothing said so: the field just read `false` forever,
+        // which is indistinguishable from "still busy".
+        //
+        // Folded into THIS test rather than written as its own, for the exact
+        // reason the doc above gives: arm() mutates shared state, so a second
+        // arming test is order-dependent across threads. It failed that way on
+        // the first run.
+        let long_ago = now().saturating_sub(8 * 24 * 3600);
+        save_persisted(long_ago, 42, long_ago);
+        arm(8822); // "restart"
+        let back = snapshot();
+        assert_eq!(back["hits_total"], 42, "a restart must not forget prior traffic");
+        assert_eq!(
+            back["window"]["resets_on_restart"], false,
+            "the field must stop claiming a reset it no longer does"
+        );
+        let quiet = back["quiet_for_hours"].as_f64().expect("quiet_for_hours");
+        assert!(quiet >= 168.0, "8 days of silence must read as >=168h, got {quiet}");
+        assert_eq!(
+            back["ready_to_retire"], true,
+            "no hit for 8 days and no clients this uptime IS the all-clear"
+        );
+
+        // A fresh hit must revoke it — a one-way latch would be worse than a
+        // verdict that never fires.
+        record("127.0.0.1", "curl/8", "", "/api/board");
+        let after = snapshot();
+        assert_eq!(after["ready_to_retire"], false, "a hit must revoke the all-clear");
+        assert!(after["quiet_for_hours"].as_f64().unwrap_or(999.0) < 1.0);
     }
 }

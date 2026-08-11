@@ -11,9 +11,11 @@
 # where everything works. Verified live before tracking: POST
 # /api/sessions/<n>/commit-report answers 200.
 #
-# The default URL was https://localhost:8822 — the RETIRED address that
-# CLAUDE.md says not to re-teach. A hook copied to a new checkout would have
-# carried it forward. Now 8824.
+# Its fallback URL named the RETIRED port (the one CLAUDE.md says not to
+# re-teach) rather than the canonical 8824, so copying this hook to a new
+# checkout carried the dead address forward. The literal is deliberately not
+# repeated here: tests/legacy_port_guard.rs greps for it, and a comment
+# containing it is exactly how it spreads.
 [ -n "$AMUX_SESSION" ] || exit 0
 sha=$(git rev-parse --short HEAD 2>/dev/null)
 # tr strips the two JSON-hostile characters instead of escaping them — a
