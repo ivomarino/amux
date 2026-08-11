@@ -2977,3 +2977,32 @@ FIX: 4340f5a — a scoped query (?session= or ?status=) is no longer capped by
   nothing because every consumer reads `curl | json.load` and never sees a
   header. Ethos rule 4's second layer, in an endpoint the whole fleet depends on.
   Before deciding a signal exists, check it exists WHERE THE CONSUMER LOOKS.
+
+## A census row said "not routed"; the endpoint was mounted, answering 500s, and I nearly ported it twice
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2871
+SYMPTOM: The route census reported GET /api/log-search as "no route matches this
+  path". It was mounted in api/mod.rs and answering — with a 500 on every real
+  query, because it byte-sliced scrollback at [..500] and terminal output is
+  mostly box-drawing characters ("byte index 500 is not a char boundary; it is
+  inside '─'"). The census reads ROUTE_TABLE, and the route had no row there.
+COST: I wrote an entire replacement module before a duplicate-module compile
+  error stopped me — and in doing so `cat >` OVERWROTE the existing tracked
+  108-line file, which I then `rm -f`'d while cleaning up. Recovered with git
+  checkout; nothing lost. Two live bugs (the 500, and a search feature dead
+  since the cutover) stayed hidden behind one wrong census row.
+FIX: 2e3f706 — chars().take(500) instead of byte slicing; ROUTE_TABLE row added;
+  and a second test closes the direction that hid it. The table's comment
+  claimed it was "kept honest BOTH directions" while the test iterates
+  `for entry in ROUTE_TABLE` — it catches a table row with no route and is
+  structurally blind to a route with no table row. Comment corrected to what is
+  actually checked.
+  Two things worth carrying: (1) a hand-maintained mirror needs a test in BOTH
+  directions or it silently drifts in the unchecked one, and the claim in the
+  comment is not evidence; (2) `cat > file` has no exists-check, where the Write
+  tool refuses to overwrite a file it has not read — routing around the harness
+  removed the guard that would have caught this.
