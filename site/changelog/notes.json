@@ -1,5 +1,77 @@
 [
   {
+    "hash": "bdf691ecb73250bcc8ec79e037f587276821e40e",
+    "short": "bdf691e",
+    "title": "Cost tab — real-time token spend per session and across your fleet",
+    "date": "2026-08-11",
+    "type": "feat",
+    "tags": ["cost", "observability", "ledger", "fleet"],
+    "description": "The new /api/observability endpoint powers a Cost tab in the dashboard showing live token spend per session and total fleet burn. The ledger was previously inert — tokens read 0 because the write path was missing. Now every token consumed, including subagent delegation, is recorded and surfaced in real time."
+  },
+  {
+    "hash": "9f4ef2405cec0a093b3828f48770572ee0aaf8f2",
+    "short": "9f4ef24",
+    "title": "Saved messages and habits — reuse prompts you send every day",
+    "date": "2026-08-11",
+    "type": "feat",
+    "tags": ["messages", "habits", "ux", "productivity"],
+    "description": "Frequently used prompts can now be saved as habits and recalled from the message panel. The token-reset route that clears a session's spend counter is also live — previously missing, so the reset button silently did nothing."
+  },
+  {
+    "hash": "90636a6b2756c288e28db39790c421e526c7c8ea",
+    "short": "90636a6",
+    "title": "Subagent token spend now charged to the delegating session",
+    "date": "2026-08-11",
+    "type": "feat",
+    "tags": ["cost", "ledger", "subagents", "attribution"],
+    "description": "When a session delegates to a subagent, the subagent's token consumption is now recorded under the parent lane that spawned it. Previously subagent tokens were lost, not counted anywhere. Fleet cost totals are now accurate even for deeply orchestrated runs."
+  },
+  {
+    "hash": "0cbb44deca34dbda69b65e44e7e5f2b13e90d5b3",
+    "short": "0cbb44d",
+    "title": "Board pickup is now reactive — agents claim the next card immediately on completion",
+    "date": "2026-08-11",
+    "type": "feat",
+    "tags": ["board", "automation", "fleet", "throughput"],
+    "description": "Previously a session completing a card had to wait up to 30 seconds for the next pickup poll before claiming a new one. Now a status-change event triggers immediate re-evaluation. Useful for high-throughput overnight runs where idle time between tasks accumulates."
+  },
+  {
+    "hash": "93398c6c232f8e224f231e02868caa31c2b368f3",
+    "short": "93398c6",
+    "title": "Backlog-triage nudge — sessions with 10+ stale cards get reminded",
+    "date": "2026-08-11",
+    "type": "feat",
+    "tags": ["board", "nudge", "automation", "hygiene"],
+    "description": "A session sitting on 10 or more cards that have not moved in over 24 hours now receives a triage nudge naming the stale count and suggesting review. Prevents backlog rot from silently accumulating across long-running fleets."
+  },
+  {
+    "hash": "c857430dcc04840b2a978f7696de5a0cb7f298a3",
+    "short": "c857430",
+    "title": "New Worker and Connect modals restored — 6 dead routes fixed",
+    "date": "2026-08-11",
+    "type": "fix",
+    "tags": ["ui", "sessions", "connect", "modals"],
+    "description": "The New Worker and Connect modals were silently failing. Six API routes they depended on returned 404 after the Python-to-Rust migration, and the templates directory they referenced was gone. All 6 routes are restored. The Connect panel now shows a clear message when iTerm2's pane list is empty instead of blaming the user."
+  },
+  {
+    "hash": "e4e77f68814b18c412525337521506ea688318f6",
+    "short": "e4e77f6",
+    "title": "needsyou board status now surfaces — 23 of 38 blocked asks were invisible",
+    "date": "2026-08-11",
+    "type": "fix",
+    "tags": ["board", "needsyou", "visibility", "fleet"],
+    "description": "Cards with status 'needsyou' were not surfaced in any board view, so sessions could file an ask for human input and it would disappear from sight. 23 of 38 open asks were in this state. The status now appears in the board and fleet summaries. A card filed into needsyou also carries its ask text so the owner sees what is needed without clicking through."
+  },
+  {
+    "hash": "b5a874aade5694edd8675a19ece0807a79a154f2",
+    "short": "b5a874a",
+    "title": "Board status-request and status-update routes fixed — were returning 405",
+    "date": "2026-08-11",
+    "type": "fix",
+    "tags": ["board", "api", "fleet", "status"],
+    "description": "POST /api/board/:id/status-request and /api/board/:id/status-update were returning 405. These are the two endpoints the whole fleet is told to use for D1-exit status reporting. Sessions following the documented instruction were hitting a dead end. Both routes are now mounted correctly."
+  },
+  {
     "hash": "eda75251ef1849cb09f6fbd083e3f1a5f52b5512",
     "short": "eda7525",
     "title": "Commit nudge — agents are reminded to commit before progress is lost",
