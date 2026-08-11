@@ -11221,9 +11221,6 @@ function _cmdHistItemHTML(e, ctx) {
   const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
-  const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
-  const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
-  const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
   // A MATCHING message is force-expanded while a search is active, even if the
   // user collapsed it earlier. Otherwise the search highlights the term inside
   // a clamped body and the hit is invisible — a result you cannot see is not a
@@ -11232,7 +11229,7 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -27309,7 +27306,13 @@ function _msgsFmtTs(ts) {
 function _msgLocate(session, encText) {
   if (!session) { showToast('No worker recorded for this message'); return; }
   const text = decodeURIComponent(encText);
-  const snippet = (text.split('\n')[0] || '').slice(0, 32).trim();
+  // FIRST NON-EMPTY line, not line[0]. A message that opens with a blank line
+  // yielded an empty query, and openPeek treats an empty query as "no search" —
+  // so Find silently did nothing and looked like the message was not in the
+  // log. A locate that no-ops is worse than one that says it found nothing.
+  const line = text.split('\n').map(l => l.trim()).find(l => l.length > 0) || '';
+  const snippet = line.slice(0, 32);
+  if (!snippet) { showToast('Nothing searchable in this message'); return; }
   if (typeof closeCmdHistoryModal === 'function') closeCmdHistoryModal();
   openPeek(session, { query: snippet });
 }
