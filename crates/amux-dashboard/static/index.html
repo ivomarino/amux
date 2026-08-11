@@ -1,7 +1,8 @@
 <!DOCTYPE html>
-<!-- EXTRACTED from amux-server.py (Phase 8, RR). This file is the static twin of
-     DASHBOARD_HTML (amux-server.py lines 27923-63729); the Python server keeps its
-     inline copy. (Tag names below are spelled without angle brackets so naive
+<!-- EXTRACTED from the retired Python server's inline DASHBOARD_HTML (deleted at
+     792ce1f, 2026-08-09; git history has it - the line references below are into
+     that historical file). This static file is now the ONLY copy.
+     (Tag names below are spelled without angle brackets so naive
      script/style-tag greps - the AMUX-2331 CI class - never match comment text.)
      Deviations from the inline original, each a judgment call:
      1. The single top-level head style block (lines 28001-32660) now loads via a
@@ -22,11 +23,11 @@
         cannot live in app.js. KEPT INLINE: the two one-line body scripts
         (document.write(location.host); the _cloudEmail pull-btn check) - both are
         parse-position-dependent.
-     4. The window._AMUX_* bootstrap below replaces the Python server's serve-time
-        injection (amux-server.py:65679, which string-replaces the head close tag
-        with a script defining these values). Values here are the unconfigured
-        defaults; a server MAY substitute the block between the AMUX-BOOTSTRAP
-        markers with real values at serve time.
+     4. The window._AMUX_* bootstrap below replaces the retired Python server's
+        serve-time injection (historical amux-server.py:65679, which
+        string-replaced the head close tag with a script defining these values).
+        Values here are the unconfigured defaults; the server MAY substitute the
+        block between the AMUX-BOOTSTRAP markers with real values at serve time.
 -->
 <html lang="en">
 <head>

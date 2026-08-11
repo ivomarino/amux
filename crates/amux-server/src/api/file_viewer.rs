@@ -3,7 +3,7 @@
 //! PROXIED_FAMILIES row "/api/file (+ /raw /prepare /transcode) +
 //! /api/library").
 //!
-//! Python source of record (amux-server.py, checked 2026-08-09):
+//! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - GET  /api/file (viewer payload)        py:67956-68067
 //! - PUT  /api/file (text write-back)       py:67901-67935
 //! - GET  /api/file/vtt (SRT → WebVTT)      py:67858-67877

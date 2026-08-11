@@ -16,7 +16,7 @@ requires and where to get it.
 
 | Evidence | Command | Last result |
 |---|---|---|
-| Migration rehearsal | `./scripts/migration-rehearsal.sh` | PASSED 2026-08-09 vs a copy of the live 640k-row DB: 7 migrations, no table lost, row counts unchanged, integrity ok, Python reads+writes post-migration |
+| Migration rehearsal | `./docs/rust-migration/migration-rehearsal.sh` (moved from scripts/ 2026-08-11 — HISTORICAL, do not run against the live system) | PASSED 2026-08-09 vs a copy of the live 640k-row DB: 7 migrations, no table lost, row counts unchanged, integrity ok, Python reads+writes post-migration |
 | Perf baseline | `cargo build --release -p amux-server && ./scripts/perf-baseline.sh` | PASSED 2026-08-09: dashboard 3ms, health 2ms, board 28ms @ 622KB, RSS 66MB (targets 500/50/200/200) |
 | Test suite | `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings` | 470+ tests, 0 warnings |
 | Browser suite | `npx playwright test --config e2e/playwright.config.ts` | 52+ scenarios, real dashboard, desktop+mobile |

@@ -1,7 +1,7 @@
 //! /api/groups + /api/tags — NATIVE group list + per-group config
 //! (AMUX-2597 boundary work; previously proxied to Python, AMUX-2594).
 //!
-//! Python source of record (amux-server.py, checked 2026-08-09):
+//! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - alias: `/api/groups/*` rewrites to `/api/tags/*` EXCEPT paths ending in
 //!   `/config` (py:65345-65347) — net effect: both spellings serve the same
 //!   list; only the /api/groups spelling has a `/config` sub-resource, and

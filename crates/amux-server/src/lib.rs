@@ -149,7 +149,7 @@ async fn async_main() {
     };
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
-    // Lets scripts/migration-rehearsal.sh exercise the EXACT production
+    // Lets docs/rust-migration/migration-rehearsal.sh exercise the EXACT production
     // migration path against a DB copy without binding ports.
     if cfg.env.get("AMUX_RS_MIGRATE_ONLY").map(|v| v == "1").unwrap_or(false) {
         let conn = store.read().expect("read after migrate");
