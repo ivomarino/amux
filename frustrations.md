@@ -2983,3 +2983,25 @@ FIX: none yet. CLAUDE.md documents the mirror of this ("a peer's commit can
   `git commit -- <your paths>`, never rely on having staged only your own.
   I have used the path-scoped form elsewhere today; I did not here, and that is
   the difference.
+
+## A needs:you doing card idled a lane for 31 hours while 28 todos waited
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux (Ethan-direct lane)
+CARD: AMUX-2907
+SYMPTOM: backend read idle for a day with 28 eligible todos; board-drive trace said "wip-cap: holding 1/1 in doing: BACKE-3249" and the advance trace said the same card was needs:you (31h). The lane could not honestly take work, and nothing anywhere said "this lane is parked because a HUMAN owes an answer" where Ethan looks.
+COST: A full lane-day of throughput on the fleet's largest queue; Ethan concluded "these workers just stop" and spent his attention on delivery theories (auto-continue, message loss) that were all false.
+FIX: ad2429c — doing+needs:you no longer holds WIP (same exemption family as archived/dormant). Residual: the needs:you ask itself still only reaches Ethan via the 3-day re-nag; a parked-on-you card should be visible on the fleet view, not just the card.
+
+## Everything a renamed lane produced was attributed to its dead name
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux (Ethan-direct lane)
+CARD: AMUX-2904
+SYMPTOM: Token ledger charged the `amux` lane's spend to `amux-rust`; /subagents listed its agents under `amux-rust`; the day-old subagent-activity scan could not credit `amux` with live agents at all. Four separate spellings of "whose conversation is this", three reading the transcript's FIRST line, which keeps the birth name forever (AMUX-2612 documented this and the fix only reached one of the four readers).
+COST: Ethan saw a worker identifying as a session that does not exist; ledger rows misattributed for a month; the fresh agents-status fix (554fa02) silently missed every renamed lane on the day it shipped.
+FIX: dc65d4a — one conversation_owner() (meta claim first, LAST title record second) used by ledger, /subagents and the activity scan. Residual: ledger rows indexed before today still carry the dead name; the pane separator shows the birth name until the lane restarts (the --name-on-resume writer already exists).
