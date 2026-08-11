@@ -3006,3 +3006,27 @@ FIX: 2e3f706 — chars().take(500) instead of byte slicing; ROUTE_TABLE row adde
   comment is not evidence; (2) `cat > file` has no exists-check, where the Write
   tool refuses to overwrite a file it has not read — routing around the harness
   removed the guard that would have caught this.
+
+## `amux board needsyou <id>` tags the card; it does not move it to the needsyou STATUS
+AREA: cli
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2879
+SYMPTOM: `amux board needsyou AMUX-2466` printed "AMUX-2466 → tagged needs:you"
+  and left status at `review`. But `needsyou` is ALSO a real board status — cards
+  sit in it (AMUX-2815, AMUX-2830) and it is what keeps a card out of my review
+  queue and in the owner's view. So one word names two different things and the
+  CLI silently picks the weaker one.
+COST: The card stayed in `review`, where the idle nudge re-fires at me, while
+  reading as routed-to-owner. I only caught it because I re-read the status
+  after the command said success — the output is not wrong, it just answers a
+  question I did not ask. Needed a raw PATCH to actually move it, which is the
+  unaudited path CLAUDE.md warns about.
+FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
+  flag apply the tag), or it should print what it did NOT do — "tagged
+  needs:you; status unchanged (use --status to move it)". The general shape is
+  the one this file keeps recording: a command whose success message describes a
+  smaller action than its name implies. Same class as `amux board claim` exiting
+  0 without claiming (AMUX-2140).
