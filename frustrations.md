@@ -3130,3 +3130,49 @@ COST: Nothing shipped, because both were caught by RUNNING the scripts against s
 FIX: ce2f1bb and 09cb2d2 — one cleanup function per script, installed once, with an EXIT
   trap gated on a success flag rather than ERR. Worth a lint: more than one `trap` on the
   same signal in one script is almost always a bug.
+
+## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux-homepage
+CARD: none
+SYMPTOM: AMUX_URL was baked as https://localhost:8822 in a long-lived session's process env.
+  When 8822 was decommissioned mid-session, `curl -sk $AMUX_URL/...` returned an empty string
+  rather than a connection error. Piping the empty response into `python3 -c "...json.load(sys.stdin)"` 
+  raised JSONDecodeError, which looks identical to a malformed or missing card — NOT a dead endpoint.
+  Writes to the dead port also returned empty with no error, so a session that did not re-read
+  its own PATCH response had no signal that the write was lost.
+COST: ~5 min to diagnose after the amux session flagged it. ts-gke nearly filed a phantom 
+  missing-card bug before catching it. All writes in this session happened to land while 8822 
+  was still alive as the compat bind, so no data was lost — this time.
+FIX: Two fixes needed: (1) the amux CLI (which resolves port itself) should be the default for
+  all board mutations, not raw curl — it also stamps attribution; (2) curl wrapper or health-check
+  pattern that distinguishes empty-response from empty-body: `[ -z "$response" ] && echo DEAD`.
+  A session restart picks up the correct AMUX_URL automatically.
+
+## The staged-guard's self-heal was disabled by the change that made it necessary
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2946
+SYMPTOM: One minute after the legacy bind was dropped, my own commit printed
+  "amux staged-guard: NOT ENFORCED — could not reach the amux server ... Connection refused.
+  Cross-session sweep protection is OFF for this commit". Not off for one commit — off for
+  every pre-cutover session at once (~46), which are exactly the sessions sharing this
+  checkout that the guard protects from each other.
+COST: Would have been a silent loss of sweep protection fleet-wide for as long as nobody
+  looked. It cost minutes only because the hook fails LOUDLY and records to
+  staged-guard-unenforced.jsonl. Fail-open plus a record beats fail-open plus silence, and
+  this is the concrete case for it.
+FIX: fe003d5. The hook already had a self-heal for precisely this — endpoint.json publishes
+  canonical_url and it redirects a stale AMUX_URL — but it was gated on `if legacy and
+  canonical`, and dropping the bind made the server publish `legacy_port: null`. The
+  condition went false and it fell back to the dead env. The mechanism built for this moment
+  was disabled BY this moment. Now publishes `retired_ports`, a list that OUTLIVES the bind,
+  and self-heals on any known-retired loopback port. A retired address has to stay known
+  after it stops being served, because the processes still naming it are the ones that
+  cannot be told anything else.
