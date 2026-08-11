@@ -2953,3 +2953,27 @@ FIX: The habit that fails here is specific and worth naming: a claim of the form
   and it needs the same query a claim that X did happen would need. Declining to
   assert something is not the same as being conservative — I asserted a negative
   and did not check it.
+
+## A list endpoint's truncation was reported only in HTTP headers, so every JSON consumer inherited a confident undercount
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux (reported by ts-gke)
+CARD: AMUX-2868
+SYMPTOM: GET /api/board?session=ts-gke returned 68 done cards; the truth was 94.
+  GET /api/board/<id> returned the missing ones fine. cap_terminal keeps the 100
+  most-recent done|verified|discarded|quarantined rows, and ts-gke had 174 of
+  them, so which cards survived depended on how many OTHER terminal cards sorted
+  above them by `updated`. ?limit=5000 changed nothing — it pages the
+  already-capped set.
+COST: A verification digest built on that list reported 25 where the truth was
+  94. ts-gke published claims derived from it and had to retract them. Two cards
+  compared field-by-field looked identical because the discriminator was in
+  neither card.
+FIX: 4340f5a — a scoped query (?session= or ?status=) is no longer capped by
+  default. The reusable part is NOT "add a cap flag": the cap WAS reported, in
+  x-amux-truncated / x-amux-terminal-total response headers, and that changed
+  nothing because every consumer reads `curl | json.load` and never sees a
+  header. Ethos rule 4's second layer, in an endpoint the whole fleet depends on.
+  Before deciding a signal exists, check it exists WHERE THE CONSUMER LOOKS.
