@@ -3005,3 +3005,36 @@ CARD: AMUX-2904
 SYMPTOM: Token ledger charged the `amux` lane's spend to `amux-rust`; /subagents listed its agents under `amux-rust`; the day-old subagent-activity scan could not credit `amux` with live agents at all. Four separate spellings of "whose conversation is this", three reading the transcript's FIRST line, which keeps the birth name forever (AMUX-2612 documented this and the fix only reached one of the four readers).
 COST: Ethan saw a worker identifying as a session that does not exist; ledger rows misattributed for a month; the fresh agents-status fix (554fa02) silently missed every renamed lane on the day it shipped.
 FIX: dc65d4a — one conversation_owner() (meta claim first, LAST title record second) used by ledger, /subagents and the activity scan. Residual: ledger rows indexed before today still carry the dead name; the pane separator shows the birth name until the lane restarts (the --name-on-resume writer already exists).
+
+## `cargo clippy -D warnings` passed on 437 lines of dead code, including a self-proxy loop
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2910
+SYMPTOM: py_proxy.rs carried an entire python forwarder (forward_built /
+  forward_to_python / forward_handler / passthrough_routes) with ZERO call sites
+  anywhere outside its own file. `cargo clippy --workspace --all-targets -- -D
+  warnings` — the standing pre-push gate, which CI also enforces — passed on it
+  every single run. dead_code never fires because `pub` items in a lib crate are
+  reachable by definition, and amux-server is almost entirely `pub`.
+  The code was not merely dead. `py_base()` defaulted to localhost on the RETIRED
+  legacy port, which since the cutover is THIS SAME PROCESS on its compatibility
+  bind (identical pid and build answering both ports). Adding a `Namespace` row —
+  which the module documented as "the ONLY sanctioned way to cut a family over" —
+  would have forwarded a request to ourselves, re-entered the same passthrough and
+  looped, each hop holding a 600s reqwest timeout and an unbounded buffered body
+  in RAM.
+COST: no incident, because nobody added a row — but that is luck, not a control.
+  The real cost is the class: every dead `pub` API in this crate is invisible to
+  the gate that is supposed to catch exactly this, so "clippy is clean" carries
+  confidence it has not earned. Finding it took a hand-rolled call-site census,
+  and my first census was capped by `head -20` and MISSED a consumer (browser.rs)
+  that clippy then caught at compile time — i.e. the ad-hoc probe was worse than
+  the compiler at the one job I was using it for.
+FIX: forwarder deleted in 5d850fc (registry, answered_by read path and the
+  still-failable !proxied guards kept). The INSTRUMENT gap is AMUX-2910: amux
+  needs a check that can fail here — cargo-udeps, or a test that censuses `pub fn`
+  definitions against call sites, which is the same shape ethos rule 7 already
+  prescribes for the client JS (enumerate defined vs called, then inspect callers).
