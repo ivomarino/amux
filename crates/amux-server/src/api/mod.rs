@@ -45,6 +45,7 @@ pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
 pub mod search;
+pub mod self_update;
 pub mod session_verbs;
 pub mod board_themes;
 pub mod lookup;
@@ -195,6 +196,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
+        .merge(self_update::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())
