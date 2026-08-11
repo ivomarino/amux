@@ -1954,10 +1954,31 @@ fn strip_provider_yolo_flags(flags: &str) -> String {
     filtered.iter().map(|t| sh_quote(t)).collect::<Vec<_>>().join(" ")
 }
 
+/// Standing order (Ethan 2026-08-11: "whenever idle, take care of any
+/// non-terminal board task"): the board-drive continue-nudge is ON by
+/// default; CC_AUTO_CONTINUE=0 opts a lane out. Ethos rule 1 — prefer
+/// opt-out for anything that expands what a session can do; the opt-in
+/// version reached 2 lanes of ~50.
+///
+/// ONE predicate for the mechanism (board_drive) and the view
+/// (/api/sessions `auto_continue`): a view that disagrees with the
+/// mechanism it describes is worse than no view.
+pub(crate) fn auto_continue_on(val: Option<&str>) -> bool {
+    !matches!(
+        val.map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
 fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {
     PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f))
         || flags.contains("--approval-mode=yolo")
         || flags.contains("--approval-mode yolo")
+        // The EXPLICIT flag, deliberately NOT auto_continue_on(): setting
+        // CC_AUTO_CONTINUE=1 asks for a worker that never stops, which
+        // implies skip-permissions. The DEFAULT-on nudge must not — routing
+        // the default through here would flip the whole fleet to YOLO as a
+        // side effect of a scheduling change.
         || matches!(cfg.get("CC_AUTO_CONTINUE"), Some("1" | "true" | "yes"))
 }
 
@@ -8635,7 +8656,7 @@ pub(crate) fn templates_dir() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// A lane's groups, from `CC_TAGS` in its env file.
-fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
+pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
     parse_env(lane)
         .get("CC_TAGS")
         .map(|v| {
@@ -10503,12 +10524,63 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
 
     // Tags (py:76685). Python invalidates its sessions cache here; this
     // origin computes the list per request, so the write IS the refresh.
+    //
+    // ACCEPT AN ARRAY, WHICH IS WHAT THE DASHBOARD SENDS. This was
+    // `tv.as_str().unwrap_or("")`: on the `{"tags":["amux"]}` the client
+    // actually sends, `as_str()` on an Array is None, so it wrote CC_TAGS=""
+    // and answered {"ok":true,"message":"tags updated"}. Every group edit from
+    // the UI silently CLEARED the worker's groups and reported success —
+    // Ethan, 2026-08-11: "i just tried to add a group but nothing happened".
+    // Worse than a no-op, because groups are DERIVED from CC_TAGS
+    // (GET /api/groups: "derived_from: CC_TAGS across workers"), so a wiped
+    // tag removes the worker from every group it belonged to.
+    //
+    // An unrecognised shape is now a 400 rather than a silent clear. Clearing
+    // stays reachable, but only by ASKING for it (`[]`, `""` or null) — the
+    // rule being that destroying data must be requested, never inferred from a
+    // type the handler failed to understand.
     if let Some(tv) = body.get("tags") {
-        cfg.set("CC_TAGS", tv.as_str().unwrap_or("").trim());
+        let joined = match tv {
+            Value::Array(items) => {
+                let mut bad = None;
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|x| match x.as_str() {
+                        Some(s) => Some(s.trim().to_string()),
+                        None => {
+                            bad = Some(x.clone());
+                            None
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if let Some(b) = bad {
+                    return jresp(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": format!("tags must be strings; got {b}"), "wrote": false}),
+                    );
+                }
+                parts.join(",")
+            }
+            Value::String(s) => s.trim().to_string(),
+            Value::Null => String::new(),
+            other => {
+                return jresp(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!("tags must be an array of strings, a comma-separated string, or null; got {other}"),
+                        "wrote": false,
+                    }),
+                );
+            }
+        };
+        cfg.set("CC_TAGS", &joined);
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
-        return j200(json!({"ok": true, "message": "tags updated"}));
+        // Echo what was stored: the caller sent an array and a bare "ok" is what
+        // let the silent clear go unnoticed for as long as it did.
+        return j200(json!({"ok": true, "message": "tags updated", "tags": joined}));
     }
 
     // MCP config (py:76731).
