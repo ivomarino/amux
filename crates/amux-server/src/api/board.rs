@@ -96,6 +96,48 @@ async fn get_contract() -> Response {
             "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED from the type.",
         },
+        // AMUX-2933 (ts-gke). The list filters WORK and were documented
+        // NOWHERE — "discoverable only by guessing", and the cap was worse than
+        // undocumented: silent. A lane auditing its own board got the 100
+        // most-recent terminal rows fleet-wide and no signal that it was a
+        // sample, so `GET /api/board` could return FEWER of its done cards than
+        // `?session=<lane>` did. That reads as data, not as truncation.
+        "list": {
+            "endpoint": "GET /api/board",
+            "returns": "a bare JSON array of items (NOT an envelope) — kept that way \
+                        because every caller and the SPA index it directly",
+            "filters": {
+                "session": "comma-separated worker names",
+                "status": "comma-separated statuses",
+                "archived": "absent/\"\" = no filter · 1|true|yes = archived ONLY · \
+                             any other value (0, false, …) = non-archived only",
+                "done_limit": "cap on TERMINAL items (done/verified/discarded), keeping the \
+                               most recently updated. 0 or negative = uncapped",
+                "limit": "page size, applied AFTER done_limit",
+                "offset": "page offset",
+                "slim": "1 = trimmed item bodies",
+            },
+            "not_a_filter": {
+                "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
+                                       return the entire board. Use /api/search?q=",
+            },
+            "terminal_cap": {
+                "default_unscoped": 100,
+                "default_scoped": 0,
+                "scoped_means": "session= or status= is present — a bounded QUESTION is answered \
+                                 in full; only the unbounded list is sampled",
+                "why": "the unfiltered board is ~4.5MB at a cap of 100 and ~19.8MB uncapped \
+                        (1186 vs 5576 items, measured 2026-08-11). amux is mobile-first, so the \
+                        default stays capped — the defect was never the cap, it was the silence",
+                "detect_truncation": "response headers x-amux-truncated (1|0), \
+                                      x-amux-terminal-total, x-amux-terminal-returned, \
+                                      x-amux-done-limit",
+                "to_get_everything": "?done_limit=0 (or scope the query with session=/status=)",
+                "auditing_your_own_cards": "GET /api/board?session=<worker> — uncapped by \
+                                            default, so it is the query to trust for a \
+                                            self-audit; the bare list is not",
+            },
+        },
     }))
     .into_response()
 }
