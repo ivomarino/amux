@@ -767,6 +767,14 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         if let Some(n) = ny {
             obj.insert("needsyou_note".into(), json!(n));
         }
+
+        // Detail-only fields the list never renders. The SPA fetches the
+        // full card on demand when the detail panel opens, so these are
+        // pure payload waste on the list/SSE path. Keeps depends_on
+        // (is:blocked filter) and folded_n (is:folded filter).
+        for k in ["source_ref", "last_verified_at", "reviewer", "due_time", "gate"] {
+            obj.remove(k);
+        }
     }
     if stale {
         obj.insert("stale".into(), json!(true));
