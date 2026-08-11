@@ -3070,4 +3070,70 @@ mod tests {
         assert!(reviewer_acts_next("done"));
         assert!(!reviewer_acts_next("doing"), "doing->review is not a sign-off");
     }
+
+    // --- backlog triage ---------------------------------------------------
+
+    /// The nudge shipped in 93398c6 with no test of its own. Pin the shape a
+    /// lane actually reads: both totals, and every listed card with its age.
+    #[test]
+    fn backlog_triage_text_names_both_totals_and_every_card() {
+        let cards = vec![
+            ("B-1".to_string(), "Investigate the flaky retry".to_string(), 20),
+            ("B-2".to_string(), "Old finding nobody triaged".to_string(), 45),
+        ];
+        let text = backlog_triage_text(&cards, 2, 6);
+        assert!(text.contains("6 cards in `backlog`"), "must state the true backlog total: {text}");
+        assert!(text.contains("2 of which are over"), "must state the stale total: {text}");
+        assert!(text.contains("B-1") && text.contains("B-2"), "every listed card must appear: {text}");
+        assert!(text.contains("20d old") && text.contains("45d old"), "age must be shown: {text}");
+        assert!(!text.contains("more"), "nothing was dropped; got: {text}");
+    }
+
+    /// stale_backlog_candidates caps at LIMIT 10 but stale_backlog_count does
+    /// not — the same view-vs-mechanism drift the verify-nudge test above
+    /// pins. If the arithmetic disagrees, the prompt states a number the list
+    /// cannot account for.
+    #[test]
+    fn backlog_triage_and_n_more_agrees_with_the_stale_total() {
+        let cards: Vec<(String, String, i64)> =
+            (0..10).map(|i| (format!("B-{i}"), format!("card {i}"), 15 + i)).collect();
+        let text = backlog_triage_text(&cards, 14, 20);
+        assert!(text.contains("... and 4 more stale"), "14 - 10 = 4; got: {text}");
+        for (id, _, _) in &cards {
+            assert!(text.contains(id.as_str()), "{id} listed in the candidates but absent from the prompt");
+        }
+    }
+
+    /// A lane with exactly as many stale cards as were listed must not be
+    /// told there are "0 more" (mirrors no_and_n_more_line_when_nothing_was_dropped
+    /// for the verify-nudge).
+    #[test]
+    fn no_backlog_and_n_more_line_when_nothing_was_dropped() {
+        let cards = vec![("B-1".to_string(), "t".to_string(), 20)];
+        let text = backlog_triage_text(&cards, 1, 1);
+        assert!(!text.contains("more"), "nothing was dropped; got: {text}");
+    }
+
+    /// Titles are truncated to 65 chars so one runaway title can't blow out
+    /// the whole nudge.
+    #[test]
+    fn backlog_triage_truncates_long_titles() {
+        let long_title = "x".repeat(200);
+        let cards = vec![("B-1".to_string(), long_title.clone(), 20)];
+        let text = backlog_triage_text(&cards, 1, 1);
+        assert!(!text.contains(&long_title), "the full 200-char title must not appear verbatim: {text}");
+        assert!(text.contains(&"x".repeat(65)), "the first 65 chars must survive: {text}");
+        assert!(!text.contains(&"x".repeat(66)), "must be truncated at exactly 65 chars: {text}");
+    }
+
+    /// The nudge names the three sanctioned exits so a lane reading it has an
+    /// honest path forward for every card shape (ethos rule 3).
+    #[test]
+    fn backlog_triage_text_names_the_three_triage_exits() {
+        let cards = vec![("B-1".to_string(), "stale thing".to_string(), 30)];
+        let text = backlog_triage_text(&cards, 1, 1);
+        assert!(text.contains("archive"), "must offer the archive exit: {text}");
+        assert!(text.contains("`todo`"), "must offer the promote-to-todo exit: {text}");
+        assert!(text.contains("needs:you"), "must offer the needs:you exit: {text}");
+    }
 }
