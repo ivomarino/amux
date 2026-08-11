@@ -2911,3 +2911,45 @@ FIX: Two changes: (a) cache pre-rendered HTML (liveHTML, histHTML) alongside raw
   in IDB, so _paintCachedPeek skips ansiToHtml when cached HTML exists; (b) reduce
   the IDB fallback timer from 150ms to 30ms (WiFi live fetch still wins at ~18ms,
   but cellular gets cached content 120ms sooner).
+
+## A feature shipped, delivered to 22 lanes, then got the constraint its own parent card called non-negotiable
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2866
+SYMPTOM: The verify-nudge (fe44d61) selected every `done` card regardless of
+  type. AMUX-2825, its parent, names calling verified_is_meaningful() as
+  constraint 1 and says a sweep ignoring it "re-creates the make-work this was
+  narrowed to avoid". board_drive.rs called it zero times.
+COST: 22 lanes nudged, 120 cards named, 44 of them (36%) doc/chore/investigation/
+  research/escalation/watch — types that ship nothing and so can never reach
+  `verified`. 13 lanes were told to verify something they cannot; roadtrip's
+  entire 5-card nudge was chore/doc. The fix landed 12 minutes after the send.
+FIX: 1eb0ca2 — type filter DERIVED from verified_is_meaningful (amux-core gains
+  ItemType::ALL + as_str) on both the selector and the count. The reusable part
+  is not "read the parent card": it is that a feature which SENDS PROMPTS TO
+  LANES shipped with no test at all, so nothing could have caught the missing
+  filter either. Tests added in 3c853bf, and the type test splits every variant
+  by the predicate itself so it cannot drift from it.
+
+## "The evidence is a day away" — said without running the one query that disproved it
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2866
+SYMPTOM: I declined to claim `verified` on the grounds that the loop runs on a
+  24h cooldown so no nudge could have been delivered yet. 22 had already fired,
+  hours earlier. `SELECT ... FROM session_events WHERE type='verify.nudge'` took
+  one query and I ran it only after asserting the opposite.
+COST: A wrong statement about my own work in a user-facing summary, and a
+  12-minute-late fix that I described as pre-emptive when it was actually
+  post-delivery. The correction is on the card.
+FIX: The habit that fails here is specific and worth naming: a claim of the form
+  "X cannot have happened yet" is a claim ABOUT DATA, not a piece of caution,
+  and it needs the same query a claim that X did happen would need. Declining to
+  assert something is not the same as being conservative — I asserted a negative
+  and did not check it.
