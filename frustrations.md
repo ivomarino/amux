@@ -3097,3 +3097,59 @@ FIX: c857430. Two branches, two messages — root-missing names the paths it
   and the pointer's failure mode was already indistinguishable from ordinary
   user error. When something is removed, the greps that find its name are not
   enough — the paths that were derived from where it lived do not mention it.
+
+## The status-update the whole fleet is told to run answered 405 with an empty body
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2871
+SYMPTOM: `amux board status-update AMUX-2871 --stdin` exited 1 and printed
+  nothing. `POST /api/board/<id>/status-request` and `/status-update` both
+  answered 405 with an EMPTY body — neither existed anywhere in the Rust
+  server. Both are the D1-exit pair: the board is the source of truth BECAUSE
+  the owning session pushes its own model-authored status here instead of amux
+  scraping a terminal.
+COST: unmeasurable and fleet-wide. Every layer kept routing sessions at a dead
+  endpoint for the whole cutover: the CLI's own help, the SPA card menu's "ask
+  for status", the advance nudge ("post a status-update / mark its blocker"),
+  the board contract's `board_is_source_of_truth` clause, and ethos.md's D1
+  section. Any session that complied got silence and moved on. Ethan's card
+  menu button has been reporting "Could not reach <session>" this whole time.
+FIX: b5a874a. Both handlers ported; status-update additionally 404s on an
+  unknown id (Python appended to a card it never checked existed, so a typo'd
+  id answered ok and wrote a line nobody could find), and delivery goes through
+  steer_enqueue rather than Python's background thread.
+  The generalisable half is about the INSTRUMENT, not the routes.
+  `route.callers_have_routes` reads green here because it enumerates SPA and
+  CLI call SITES, and the bash CLI reaches these two by hand-rolled curl — so
+  the endpoints the CLI most depends on are exactly the ones the "does every
+  caller have a route" invariant cannot see. A census whose blind spot is
+  correlated with its subject reads as coverage. Next time that invariant is
+  green, that is what it is green ABOUT.
+
+## `_board_outcome`'s "empty response" message could never print
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2871
+SYMPTOM: `amux board status-update <id> "text"` exited 1 having written nothing
+  to stdout OR stderr. The guard `sys.stderr.write((raw[:300] or "empty
+  response") + "\n")` looks like it covers this. It cannot: every caller pipes
+  `echo "$result"`, echo appends a newline unconditionally, so on an empty
+  server reply `raw` is "\n" — truthy — and the fallback string is dead code.
+  The command wrote one blank line and exited 1.
+COST: ~20 minutes chasing a CLI arg-parsing bug (`shift`, `--stdin` handling,
+  the heredoc) before checking the endpoint itself. The silence pointed at the
+  wrong layer: a curl failure and an unrouted endpoint were indistinguishable,
+  and both looked like the CLI.
+FIX: b5a874a — strip before the truthiness test, and name the likely cause
+  ("the endpoint may not be routed on this build"). Worth noting WHY it
+  survived: this function exists specifically to end silent board failures
+  (AMUX-2140), was written carefully, carries a long comment about reporting
+  outcomes rather than transport — and its one total-silence path was never
+  exercised, because it only fires when the server returns nothing at all.
+  A handler for the case you believe cannot happen is the handler nobody runs.
