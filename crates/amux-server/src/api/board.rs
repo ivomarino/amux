@@ -133,9 +133,26 @@ async fn get_contract() -> Response {
                                       x-amux-terminal-total, x-amux-terminal-returned, \
                                       x-amux-done-limit",
                 "to_get_everything": "?done_limit=0 (or scope the query with session=/status=)",
-                "auditing_your_own_cards": "GET /api/board?session=<worker> — uncapped by \
-                                            default, so it is the query to trust for a \
-                                            self-audit; the bare list is not",
+                // CORRECTED by ts-gke's reconciliation, 2026-08-11. The first
+                // version of this line said `?session=<worker>` full stop, and
+                // that is the query for "everything I own" — NOT for "what do I
+                // still have to act on". Their three counts, all correct once
+                // understood: bare list 8 (capped), ?session&status=done 101,
+                // the same +archived=0 → 59. The 42-card difference is archived
+                // cards, which are TERMINAL AND IMMUTABLE — a status PATCH on
+                // one is refused with `archived_task_immutable`
+                // ("task is archived; restore it first", amux-core/src/board.rs).
+                // So an audit built on 101 counts 42 cards nobody can act on,
+                // and the auto-continue nudge that said 60 was right the whole
+                // time: it counts the actionable set.
+                "auditing_your_own_cards": "GET /api/board?session=<worker>&status=done&archived=0 \
+                                            — scoped queries are uncapped, and archived=0 drops \
+                                            cards that are terminal AND immutable (a status PATCH \
+                                            on an archived card is refused with \
+                                            archived_task_immutable). Dropping archived=0 answers \
+                                            'everything I own', which is a different question and \
+                                            the one that inflates a verification backlog. The bare \
+                                            list answers neither.",
             },
         },
     }))
