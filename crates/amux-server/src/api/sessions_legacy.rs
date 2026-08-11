@@ -1499,8 +1499,14 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 ))
             }) {
                 for (id, session, text, queued_at, guard) in rows.flatten() {
+                    // `system`: amux's own push (board-drive, sched:…), not a
+                    // human's queued message — the SPA separates the surfaces
+                    // and Clear-all spares these (AMUX-2922).
+                    let system =
+                        crate::api::session_verbs::steer_guard_is_system(&guard);
                     steering.entry(session).or_default().push(json!({
                         "id": id, "text": text, "queued_at": queued_at, "guard": guard,
+                        "system": system,
                     }));
                 }
             }

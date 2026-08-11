@@ -2913,7 +2913,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
           ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
-          ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
+          ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
             /* Bare numbers, no chips (Ethan: "just numbers no outline ...
@@ -5055,7 +5055,7 @@ async function sendFromInput(name) {
     inp.style.borderColor = '#a371f7';
     setTimeout(() => { inp.style.borderColor = ''; }, 600);
     const sess = sessions.find(s => s.name === name);
-    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
+    const cnt = _steerHumanCount(sess);
     if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
     return;
   }
@@ -5763,29 +5763,51 @@ async function savePeekInstructions(apply) {
 let _steerLastQueueLen = 0;
 let _steerHistLoadedFor = null;
 
+// Human-queued rows only — system pushes (m.system, server-classified) are
+// amux's own drive prompts and never count as "queued" on any surface.
+function _steerHumanCount(sess) {
+  return ((sess && sess.steering) || []).filter(m => !m.system).length;
+}
+
 function _steeringRender() {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
   const queue = (sess && sess.steering) || [];
   const countEl = document.getElementById('peek-steering-count');
   const list = document.getElementById('peek-steering-list');
-  countEl.textContent = queue.length ? queue.length + ' queued' : 'No queued messages';
+  // SYSTEM pushes (board-drive, schedules — server-classified by the guard
+  // every system enqueuer stamps) are a separate surface from the human
+  // queue (Ethan: "board pushes should be system level not queues"). They
+  // do not count as "queued" — that number is what YOU have pending — and
+  // Clear all leaves them alone.
+  const human = queue.filter(m => !m.system);
+  const sys = queue.filter(m => m.system);
+  countEl.textContent = (human.length ? human.length + ' queued' : 'No queued messages')
+    + (sys.length ? ' · ' + sys.length + ' system' : '');
+  const row = m => {
+    const ago = timeAgo(m.queued_at);
+    const sysTag = m.system ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(148,163,184,0.15);color:var(--dim);margin-right:6px;">SYSTEM${m.guard ? ' · ' + esc(m.guard) : ''}</span>` : '';
+    return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:${m.system ? 'rgba(255,255,255,0.02)' : 'var(--card-bg)'};border:1px solid var(--border);border-radius:8px;${m.system ? 'opacity:0.85;' : ''}">
+      <div style="flex:1;min-width:0;">
+        ${sysTag ? `<div style="margin-bottom:4px;">${sysTag}</div>` : ''}
+        <div style="font-size:0.85rem;color:${m.system ? 'var(--dim)' : 'var(--fg)'};white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
+        <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0;">
+        <button class="btn primary" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringSendNow('${m.id}')">Send now</button>
+        <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringCancel('${m.id}')">✕</button>
+      </div>
+    </div>`;
+  };
   if (!queue.length) {
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:20px 0;text-align:center;">No steering messages queued.<br>Send a message while the worker is active to queue it.</div>';
   } else {
-    list.innerHTML = queue.map(m => {
-      const ago = timeAgo(m.queued_at);
-      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;">
-        <div style="flex:1;min-width:0;">
-          <div style="font-size:0.85rem;color:var(--fg);white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
-          <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
-        </div>
-        <div style="display:flex;gap:4px;flex-shrink:0;">
-          <button class="btn primary" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringSendNow('${m.id}')">Send now</button>
-          <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringCancel('${m.id}')">✕</button>
-        </div>
-      </div>`;
-    }).join('');
+    let html = human.map(row).join('');
+    if (sys.length) {
+      html += `<div style="font-size:0.72rem;color:var(--dim);margin:8px 0 2px;letter-spacing:0.04em;">SYSTEM PUSHES — amux's own drive prompts; delivered at the next turn boundary, not cleared by Clear all</div>`
+        + sys.map(row).join('');
+    }
+    list.innerHTML = html;
   }
   // Refresh the sent-history log when the tab/session was just (re)opened or
   // whenever the queue shrank — a message just left the queue (delivered/sent).
@@ -5830,10 +5852,10 @@ function _steerHistApply() {
 
 function _steeringUpdateBadge() {
   const sess = sessions.find(s => s.name === peekSession);
-  const queue = (sess && sess.steering) || [];
+  const n = _steerHumanCount(sess);
   const badge = document.getElementById('peek-tab-steering-count');
   if (!badge) return;
-  if (queue.length > 0) { badge.textContent = queue.length; badge.classList.add('has-count'); }
+  if (n > 0) { badge.textContent = n; badge.classList.add('has-count'); }
   else { badge.textContent = ''; badge.classList.remove('has-count'); }
 }
 
@@ -5888,14 +5910,18 @@ async function _steeringCancel(msgId) {
 async function _steeringClearAll() {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
-  const had = sess && sess.steering ? sess.steering.length : 0;
-  if (sess) sess.steering = [];
+  // Optimistic update mirrors the server's rule: Clear all removes HUMAN
+  // rows only; system pushes (board-drive, schedules) stay queued. Per-row ✕
+  // still cancels a system push individually.
+  const had = sess && sess.steering ? sess.steering.filter(m => !m.system).length : 0;
+  if (sess) sess.steering = (sess.steering || []).filter(m => m.system);
   _steeringRender();
   _steeringUpdateBadge();
   render();
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: '{}' });
     if (had) showToast('Cleared ' + had + ' queued message' + (had > 1 ? 's' : ''));
+    else showToast('Nothing to clear (system pushes are kept)');
     fetchSessions();
   } catch(e) { showToast('Failed to clear queue'); }
 }
@@ -7042,7 +7068,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.595';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.596';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9338,7 +9364,7 @@ async function sendPeekCmd() {
     await steerSession(peekSession, text);
     if (peekSendBtn) { peekSendBtn.textContent = peekSendBtn.dataset.prevText || 'Queue'; peekSendBtn.disabled = false; peekSendBtn.style.opacity = ''; }
     const sess = sessions.find(s => s.name === peekSession);
-    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
+    const cnt = _steerHumanCount(sess);
     showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
     return;
   }

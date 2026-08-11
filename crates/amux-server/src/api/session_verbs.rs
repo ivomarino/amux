@@ -8069,6 +8069,24 @@ fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
 // steer POST/DELETE (py:75463-75533).
 // ---------------------------------------------------------------------------
 
+/// Was this queue row enqueued by AMUX ITSELF (board-drive, a schedule,
+/// commit-nudge, auto-compact, status-request…) rather than by a human?
+///
+/// Ethan 2026-08-11, on a scheduler board-push sitting in tubescience's
+/// user-facing queue as "1 queued": "board pushes should be system level not
+/// queues". The delivery mechanism is the same (turn-boundary steering); the
+/// SURFACE must not be — a system push counted with human messages reads as
+/// something a person queued, and "Clear all" could silently discard the
+/// fleet's own drive prompts alongside a stray draft.
+///
+/// The discriminator is the guard every system enqueuer already stamps.
+/// Human paths enqueue with guard "" — or "selector-answer", which is human
+/// INTENT (their answer to a picker) wearing a dedupe guard. The SQL
+/// predicate in the clear-all below must stay the mirror of this.
+pub(crate) fn steer_guard_is_system(guard: &str) -> bool {
+    !guard.is_empty() && guard != "selector-answer"
+}
+
 async fn steer_mutate(
     state: &AppState,
     name: &str,
@@ -8079,6 +8097,7 @@ async fn steer_mutate(
     if *method == Method::DELETE {
         let msg_id = body_str(body, "id");
         let sent = body.get("sent").map(py_truthy).unwrap_or(false);
+        let include_system = body.get("include_system").map(py_truthy).unwrap_or(false);
         let session = name.to_string();
         let id2 = msg_id.clone();
         let reply = state
@@ -8096,8 +8115,19 @@ async fn steer_mutate(
                         )
                         .ok();
                     removed = conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])? as i64;
-                } else {
+                } else if include_system {
                     removed = conn.execute("DELETE FROM steering_queue WHERE session=?", [&session])? as i64;
+                } else {
+                    // Clear-all spares SYSTEM rows (board pushes, schedules —
+                    // mirror of steer_guard_is_system): a human clearing their
+                    // queue is discarding THEIR drafts, not amux's drive
+                    // prompts. Per-row ✕ still removes anything by id, and
+                    // include_system:true asks for the full sweep explicitly.
+                    removed = conn.execute(
+                        "DELETE FROM steering_queue WHERE session=? \
+                         AND (COALESCE(guard,'')='' OR guard='selector-answer')",
+                        [&session],
+                    )? as i64;
                 }
                 if let Some((text, queued_at)) = sent_row.filter(|_| sent) {
                     let hid = id2.clone();
