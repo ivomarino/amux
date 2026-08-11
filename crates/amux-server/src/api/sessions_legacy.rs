@@ -1410,7 +1410,19 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     if let Some(m) = rep["model"].as_str().filter(|m| !m.is_empty()) {
                         v["active_model"] = json!(m);
                     }
-                    if rep["tokens"].is_object() {
+                    // Same over-window rejection the compaction path applies
+                    // (a5b272e). Without it the two disagree about one fact:
+                    // /api/sessions rendered this session at 3,156,510 tokens
+                    // while the trigger rejected the identical number as not a
+                    // context size. A dashboard showing an impossible value is
+                    // how the number stops being questioned — and it is the
+                    // only lane on the fleet where the two paths could differ,
+                    // so the disagreement would have stayed invisible.
+                    let plausible = rep["tokens"]["total"]
+                        .as_u64()
+                        .map(|t| t <= crate::api::session_verbs::context_window())
+                        .unwrap_or(false);
+                    if rep["tokens"].is_object() && plausible {
                         v["tokens"] = rep["tokens"].clone();
                     }
                 }

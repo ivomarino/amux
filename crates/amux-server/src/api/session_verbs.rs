@@ -8446,7 +8446,7 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
 /// figure consistent with it. Wrong in the LOW direction only costs an early
 /// compact; wrong in the HIGH direction means the lane hits the wall, which is
 /// the failure this whole card exists to stop, so the default errs low.
-fn context_window() -> u64 {
+pub(crate) fn context_window() -> u64 {
     std::env::var("AMUX_CONTEXT_WINDOW")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
