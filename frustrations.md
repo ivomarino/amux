@@ -3042,7 +3042,7 @@ FIX: forwarder deleted in 5d850fc (registry, answered_by read path and the
 ## A peer's concurrent commit swept my staged file into their unrelated commit
 AREA: attribution
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-11
 SESSION: amux
 CARD: AMUX-2923
@@ -3057,7 +3057,11 @@ COST: The code survived (the rationale was in a code comment, which is why it is
   five CI runs of evidence for WHY that budget is 60s now sits under a codex-status title,
   where nobody looking at the e2e change will find it. Also ~10 minutes proving the change
   was not lost.
-FIX: The staged-guard already detects the cotenant case and prints the reconcile recipe —
+FIX: PARTLY FIXED in 7fb9598 — the guard now also messages the OWNING session when a
+  commit stages paths whose edit records are theirs, naming the committer, the repo, the
+  paths and the git command to check. That closes the "nobody told the victim" half. The
+  window itself is NOT closed: a peer can still absorb a staged file, you now find out
+  promptly instead of by archaeology. Original analysis: the staged-guard already detects the cotenant case and prints the reconcile recipe —
   but it warns the committer about ABSORBING someone else's work, and is silent about the
   mirror risk of one's own staged file being absorbed. It cannot see a `git commit -a` that
   another session is about to run. A pre-commit advisory lock (or simply having the guard
