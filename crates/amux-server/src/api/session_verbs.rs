@@ -8347,10 +8347,6 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     j200(json!({"ok": true, "message": "deleted"}))
 }
 
-/// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
-/// state into the SHARED prefs store Python reads at boot and
-/// sessions_legacy reads live.
-
 /// The model's context window, in tokens. `AMUX_CONTEXT_WINDOW`.
 ///
 /// A knob rather than a constant because it is the one number here amux cannot
@@ -8399,6 +8395,9 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
     (100 - used_pct) as u8
 }
 
+/// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
+/// state into the SHARED prefs store Python reads at boot and
+/// sessions_legacy reads live.
 async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
