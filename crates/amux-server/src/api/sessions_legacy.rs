@@ -1418,6 +1418,45 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
         }
     }
 
+    // FALLBACK TO THE TRANSCRIPT when the report carried neither field.
+    //
+    // The report path above is correct and stays PREFERRED — this only fills a
+    // gap it cannot currently reach. Measured 2026-08-11: 42 lanes reporting, 2
+    // with a model, 1 with tokens, because Claude Code loads hook config at
+    // SESSION START and every running lane predates the settings change that
+    // repointed the hook at the extracting script. All 292 sampled report POSTs
+    // carried the predecessor's byte-exact 37/39/41-byte body. No edit on disk
+    // reaches a command string already baked into a running process.
+    //
+    // Without tokens, orchestrator/compaction.rs is never called, so no lane
+    // ever auto-compacts — which is the thing Ethan asked for in as many words.
+    // A capability that exists and reaches nobody is the failure ethos rule 1
+    // names, and waiting for ~47 lanes to restart is not a fix.
+    //
+    // Never invents: absent transcript, unreadable file, or records carrying
+    // neither field all leave the honest empty in place.
+    for v in out.iter_mut() {
+        let Some(name) = v["name"].as_str().map(str::to_string) else { continue };
+        let need_model = v["active_model"].as_str().unwrap_or("").is_empty();
+        let need_tokens = v["tokens"]["total"].as_u64().unwrap_or(0) == 0;
+        if !need_model && !need_tokens {
+            continue;
+        }
+        let (m, t) = crate::api::session_verbs::transcript_evidence(&name);
+        if need_model {
+            if let Some(m) = m {
+                v["active_model"] = json!(m);
+                v["model_source"] = json!("transcript");
+            }
+        }
+        if need_tokens {
+            if let Some(t) = t {
+                v["tokens"] = json!({"input": t, "output": 0, "total": t});
+                v["tokens_source"] = json!("transcript");
+            }
+        }
+    }
+
     // branch: bounded parallel git lookups, deduped by directory (many
     // sessions share a checkout — one git call per DISTINCT dir).
     // Cached with a 30s TTL: branches change on the scale of minutes.

@@ -1081,6 +1081,96 @@ fn transcript_display_name(jf: &Path) -> Option<String> {
     pick(&serde_json::from_str::<Value>(&first).ok()?)
 }
 
+/// Model + total context tokens read straight out of a lane's own transcript.
+///
+/// WHY THE SERVER DOES THIS ITSELF (2026-08-11, AMUX-2829/AMUX-2676): the
+/// reporting hook DOES extract both, correctly — verified end to end, an 86-byte
+/// rich body with model and tokens. It reaches nobody. Every real lane posts a
+/// 37/39/41-byte `{state, source}` body, which is the byte-exact shape of the
+/// PREDECESSOR script, because CLAUDE CODE LOADS HOOK CONFIG AT SESSION START
+/// and all ~47 lanes were started before settings.json was repointed. Measured
+/// over 292 report POSTs: 0 rich bodies from a real session, 3 from my own
+/// synthetic tests. Editing files on disk cannot fix that — the command string
+/// is already baked into each running process.
+///
+/// So the evidence has to come from somewhere a running lane cannot withhold.
+/// The transcript is the harness's own structured record, the server can already
+/// resolve it per session, and reading it is not the terminal-scraping D1 warns
+/// about: no rendered UI, no regex over a pane, just the JSONL the harness
+/// writes. A REPORT still wins when one carries these fields — this only fills
+/// the gap, so the D1 direction (the model reporting its own state) is intact
+/// and this quietly stops being load-bearing as lanes restart.
+///
+/// Tail-bounded and TTL-cached: /api/sessions is polled hard and there are ~47
+/// lanes, so an uncached full read would be a file scan per lane per poll.
+pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = HashMap<String, (f64, Option<String>, Option<u64>)>;
+    static EV: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let ttl = std::env::var("AMUX_TRANSCRIPT_EVIDENCE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let now = now_f64();
+    let cache = EV.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some((at, m, t)) = g.get(name) {
+            if now - at < ttl {
+                return (m.clone(), *t);
+            }
+        }
+    }
+    let (mut model, mut tokens) = (None, None);
+    if let Some(path) = session_jsonl_path(name) {
+        if let Ok(f) = std::fs::File::open(&path) {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            // Tail only. A long-running lane's transcript reaches hundreds of
+            // MB; the last records are the only ones that describe NOW.
+            const TAIL: u64 = 512_000;
+            let mut buf = String::new();
+            let mut rdr = std::io::BufReader::new(f);
+            if len > TAIL {
+                use std::io::Seek;
+                let _ = rdr.seek(std::io::SeekFrom::Start(len - TAIL));
+            }
+            use std::io::Read;
+            let _ = rdr.read_to_string(&mut buf);
+            // Backwards: the LAST record that carries each field wins, and
+            // stopping early avoids parsing the whole tail once both are found.
+            for line in buf.lines().rev() {
+                if model.is_some() && tokens.is_some() {
+                    break;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let msg = &v["message"];
+                if model.is_none() {
+                    if let Some(m) = msg["model"].as_str().filter(|m| !m.is_empty()) {
+                        model = Some(m.to_string());
+                    }
+                }
+                if tokens.is_none() {
+                    let u = if msg["usage"].is_object() { &msg["usage"] } else { &v["usage"] };
+                    if u.is_object() {
+                        let g = |k: &str| u[k].as_u64().unwrap_or(0);
+                        let t = g("input_tokens")
+                            + g("cache_read_input_tokens")
+                            + g("cache_creation_input_tokens")
+                            + g("output_tokens");
+                        if t > 0 {
+                            tokens = Some(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.insert(name.to_string(), (now, model.clone(), tokens));
+    }
+    (model, tokens)
+}
+
 /// Newest JSONL for a session (py:5590 _session_jsonl_path_uncached): meta
 /// conv-id first, then title match, then the single unclaimed candidate.
 pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
