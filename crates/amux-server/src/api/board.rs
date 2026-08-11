@@ -846,7 +846,7 @@ pub struct ListParams {
     pub search: Option<String>,
 }
 
-fn truthy(v: Option<&str>) -> bool {
+fn qp_truthy(v: Option<&str>) -> bool {
     // Python lowercases before the membership test (`.lower() in ("1",
     // "true","yes")`), so `slim=TRUE` counts.
     matches!(
@@ -949,7 +949,7 @@ pub async fn list_board(
     // a bound gets exactly that.
     let scoped = p.session.is_some() || p.status.is_some();
     let done_limit = p.done_limit.unwrap_or(if scoped { 0 } else { 100 });
-    let slim = truthy(p.slim.as_deref());
+    let slim = qp_truthy(p.slim.as_deref());
 
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {

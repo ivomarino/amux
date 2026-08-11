@@ -8303,17 +8303,7 @@ async fn steer_mutate(
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
 }
 
-/// Python truthiness over JSON (mirrors api/mod.rs's private helper).
-fn py_truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
+use super::py_truthy;
 
 // ---------------------------------------------------------------------------
 // POST verbs (py:75534-76326).

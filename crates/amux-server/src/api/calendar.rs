@@ -226,16 +226,7 @@ pub async fn create(
 }
 
 /// Python truthiness over a JSON value (`if body.get("all_day")`).
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
+use super::py_truthy as truthy;
 
 // ---- PATCH /api/cal-events/{id} -------------------------------------------
 

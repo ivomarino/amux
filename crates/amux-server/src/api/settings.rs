@@ -127,16 +127,7 @@ fn atomic_write_secure(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// JSON truthiness with Python `bool()` semantics — the guard PATCHes run
 /// the body value through `bool(...)`, so `0`, `""`, `[]`, `{}` disable.
-pub(crate) fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
+pub(crate) use super::py_truthy as truthy;
 
 // ---- shlex port (Python shlex.split / shlex.quote, POSIX mode) ------------
 

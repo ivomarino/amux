@@ -476,3 +476,26 @@ async fn global_memory_post(
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod truthy_reachability {
+    /// Does `Number::as_f64()` EVER return None in this build?
+    ///
+    /// The whole premise of AMUX-2928 was that py_truthy and calendar/email's
+    /// truthy disagree on a number that does not fit f64. Worth confirming such
+    /// a number can exist here before "fixing" anything — without the
+    /// `arbitrary_precision` feature, serde_json stores every number as
+    /// u64/i64/f64 and `as_f64()` casts lossily rather than failing.
+    #[test]
+    fn as_f64_never_none_without_arbitrary_precision() {
+        for s in ["18446744073709551615", "-9223372036854775808", "0", "1", "1.5"] {
+            let v: serde_json::Value = serde_json::from_str(s).unwrap();
+            let n = v.as_number().expect("parsed as a number");
+            assert!(
+                n.as_f64().is_some(),
+                "{s} produced as_f64() == None — the truthy divergence IS reachable, \
+                 and AMUX-2928's fix is a behaviour change after all"
+            );
+        }
+    }
+}
