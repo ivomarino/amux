@@ -437,10 +437,17 @@ async fn post_owner(
             last_in,
         );
         let hist_len = new_hist.len();
-        g.hist.insert(key.clone(), new_hist);
-        g.mute.insert(key.clone(), new_mute);
-        if matches!(action, AlertAction::Send | AlertAction::StormNotice) {
-            g.last.insert(key.clone(), now);
+        // A DRY RUN MUST NOT MUTATE THE GUARD. Caught on the first live probe of
+        // this very feature: four dry-runs of one message returned send, then
+        // dedupe, dedupe, dedupe — because the first had written `last`. That
+        // means a dry run could suppress a subsequent REAL alert for 60s, and a
+        // rehearsal that quiets the fire alarm is worse than no rehearsal.
+        if !dry_run {
+            g.hist.insert(key.clone(), new_hist);
+            g.mute.insert(key.clone(), new_mute);
+            if matches!(action, AlertAction::Send | AlertAction::StormNotice) {
+                g.last.insert(key.clone(), now);
+            }
         }
         (action, hist_len)
     };
