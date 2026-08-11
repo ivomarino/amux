@@ -209,20 +209,25 @@ async fn conversation_continuity_across_turns() {
     collect_events(&mut rx1, Duration::from_secs(60)).await;
     wait_state(&proto, &w, |s| *s == AgentState::Idle).await;
 
-    // Verify a conversation ref was saved
-    let saves = sink.saves.lock().unwrap();
-    assert!(
-        !saves.is_empty(),
-        "ConversationSink.save was never called — no conversation ref captured"
-    );
-    let (_, family, cref) = &saves[saves.len() - 1];
+    // Verify a conversation ref was saved. Cloned out of the guard rather than
+    // asserted under it: clippy denies a MutexGuard held across an await, and
+    // this scope awaits below (amux, 2026-08-11 — lint only, no behaviour
+    // change; `cargo clippy --all-targets -D warnings` was red workspace-wide).
+    let last_save = {
+        let saves = sink.saves.lock().unwrap();
+        assert!(
+            !saves.is_empty(),
+            "ConversationSink.save was never called — no conversation ref captured"
+        );
+        saves[saves.len() - 1].clone()
+    };
+    let (_, family, cref) = &last_save;
     assert_eq!(family, "claude-code");
     assert!(
         !cref.is_empty(),
         "conversation ref is empty — resume will fail"
     );
     eprintln!("conversation ref from turn 1: {cref}");
-    drop(saves);
 
     // Turn 2: ask for the secret word (only works if --resume is passed)
     let mut rx2 = proto.events(&w);
@@ -309,7 +314,7 @@ async fn tool_use_events_are_emitted() {
         .collect();
     eprintln!("tools used: {tool_names:?}");
     assert!(
-        tool_names.iter().any(|t| *t == "Bash"),
+        tool_names.contains(&"Bash"),
         "expected a Bash tool event, got: {tool_names:?}"
     );
 }
