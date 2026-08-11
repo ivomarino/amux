@@ -60,6 +60,10 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+        // The D1-exit pair — see the handlers below for why their 405 was the
+        // most expensive shape available.
+        .route("/{id}/status-request", post(status_request))
+        .route("/{id}/status-update", post(status_update))
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
@@ -2788,6 +2792,190 @@ pub async fn delete_item(
             (StatusCode::OK, Json(body)).into_response()
         }
     }
+}
+
+// ---- POST /api/board/{id}/status-request · /status-update ----------------
+//
+// The D1-exit pair (AMUX-2174), and the ethos inverse of terminal scraping:
+// amux does not INFER a card's status, it routes a request and the owning
+// session's own model AUTHORS the answer onto the card. ethos.md records this
+// as the reason the board is the source of truth.
+//
+// Both were lost in the Rust cutover and answered 405 with an EMPTY body, which
+// is the worst available failure for this pair, because every layer that
+// mentions them kept telling the fleet to use them:
+//   - `amux board ask` / `amux board status-update` (the CLI's own help)
+//   - the SPA card menu's "ask for status" (`_askCardStatus`, app.js)
+//   - the advance nudge: "post a status-update / mark its blocker"
+//   - the board contract's `board_is_source_of_truth` clause
+// This is AMUX-2140's shape a second time: following the sanctioned instruction
+// exactly is what produced the failure. It also escaped the route census,
+// because that enumerates SPA and CLI call sites and the CLI reaches these by
+// hand-rolled curl — so the endpoint the CLI most depends on is exactly the one
+// the "does every caller have a route" invariant could not see.
+
+/// The size cap Python applied (py:69770). A status update is a summary; the
+/// card log is not a transcript sink.
+const STATUS_UPDATE_MAX: usize = 1200;
+
+async fn status_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let question: String = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("question"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(400)
+        .collect();
+    let (_actor, requester) = actor_from_headers(&headers);
+    let requester = if requester.is_empty() || requester == "api-anonymous" {
+        headers
+            .get("X-Amux-User-Email")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("Ethan")
+            .to_string()
+    } else {
+        requester
+    };
+
+    let (session, title) = {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return internal(e),
+        };
+        match bs::get_issue(&conn, &id) {
+            Ok(Some(row)) => (row.session.clone().unwrap_or_default(), row.title.clone()),
+            Ok(None) => return not_found(&id),
+            Err(e) => return internal(e),
+        }
+    };
+    let session = session.trim().to_string();
+    if session.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "delivered": false,
+                        "reason": "card has no owning session to ask"})),
+        )
+            .into_response();
+    }
+    if !crate::api::session_verbs::is_running(&session).await {
+        // Honest offline path (ethos rule 7): never fake a live answer, and say
+        // plainly that nothing was queued, so the caller knows to ask again
+        // rather than waiting on a delivery that will not happen.
+        return Json(json!({
+            "ok": false, "delivered": false,
+            "reason": format!("session '{session}' is not running"),
+            "hint": "the request is not queued; ask again when the session runs",
+        }))
+        .into_response();
+    }
+
+    let q_part = if question.is_empty() {
+        String::new()
+    } else {
+        format!(": {question}")
+    };
+    let prompt = format!(
+        "[amux status request on {id}: {}] {requester} asks for a status update{q_part}.\n\
+         Reply by running:  amux board status-update {id} \"<what's done, what's next, any blocker>\"\n\
+         That posts to the BOARD, which is the source of truth — a chat reply alone does not update the card.",
+        title.chars().take(80).collect::<String>()
+    );
+    // Delivered at the next TURN BOUNDARY via the one steering queue, never a
+    // direct send: the decision recorded in ethos.md ("Board state changes are
+    // delivered at turn boundaries") is that a running agent cannot consume an
+    // event faster than its next turn anyway.
+    crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
+        .await;
+
+    let line = if question.is_empty() {
+        format!("status requested by {requester} (routed to {session})")
+    } else {
+        format!("status requested by {requester} — \"{question}\" (routed to {session})")
+    };
+    if let Err(e) = append_card_log(&state, &id, &line).await {
+        return internal(e);
+    }
+    Json(json!({"ok": true, "delivered": true, "session": session,
+                "message": format!("asked {session} to post a status update to {id}")}))
+    .into_response()
+}
+
+async fn status_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let text: String = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(STATUS_UPDATE_MAX)
+        .collect();
+    if text.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "text required"}))).into_response();
+    }
+    let (_actor, actor_name) = actor_from_headers(&headers);
+    let actor = if actor_name.is_empty() || actor_name == "api-anonymous" {
+        "session".to_string()
+    } else {
+        actor_name
+    };
+    {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return internal(e),
+        };
+        match bs::get_issue(&conn, &id) {
+            Ok(Some(_)) => {}
+            // Python appended to a card it never checked existed, so a typo'd
+            // id reported {"ok": true} and wrote nothing anyone could find.
+            Ok(None) => return not_found(&id),
+            Err(e) => return internal(e),
+        }
+    }
+    if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
+        return internal(e);
+    }
+    Json(json!({"ok": true, "id": id, "actor": actor, "chars": text.chars().count()}))
+        .into_response()
+}
+
+/// Append one stamped line to a card's log. Both handlers above write only
+/// here — a status update must never move the card, and reusing the PATCH path
+/// would put a status report one typo away from a status TRANSITION.
+async fn append_card_log(
+    state: &AppState,
+    id: &str,
+    line: &str,
+) -> Result<(), rusqlite::Error> {
+    let (id, line, stamp) = (id.to_string(), line.to_string(), hhmm());
+    state
+        .store
+        .write_async(move |conn| {
+            let existing: Option<String> = conn
+                .query_row("SELECT log FROM issues WHERE id=?1", [&id], |r| r.get(0))
+                .unwrap_or(None);
+            let next = bs::append_log(existing.as_deref(), &stamp, &line);
+            conn.execute(
+                "UPDATE issues SET log=?1 WHERE id=?2",
+                rusqlite::params![next, id],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
 }
 
 #[cfg(test)]

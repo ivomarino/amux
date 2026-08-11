@@ -1307,7 +1307,17 @@ raw = sys.stdin.read()
 try:
     d = json.loads(raw)
 except Exception:
-    sys.stderr.write((raw[:300] or "empty response") + "\n")
+    # STRIP FIRST. Every caller reaches this via `echo "$result" | ...`, and
+    # echo appends a newline unconditionally — so on an empty server reply
+    # `raw` was "\n", which is TRUTHY, so `or "empty response"` never fired and
+    # this wrote a bare newline to stderr. The command then exited 1 having
+    # printed nothing on either stream: a silent failure from the sanctioned
+    # path, which is the exact class this whole function exists to end.
+    # Caught 2026-08-11 when `amux board status-update` (a 405 with an empty
+    # body) failed in total silence.
+    body = raw.strip()[:300]
+    sys.stderr.write((body or "empty response from the server — the endpoint "
+                              "may not be routed on this build") + "\n")
     sys.exit(1)
 err = (d.get("error") or "") if isinstance(d, dict) else ""
 ok = isinstance(d, dict) and not err and d.get("ok") is not False
