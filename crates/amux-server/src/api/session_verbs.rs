@@ -8443,7 +8443,102 @@ pub(crate) fn templates_dir() -> Option<PathBuf> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Group scoping for worker-to-worker sends (Ethan, 2026-08-11)
+// ---------------------------------------------------------------------------
+
+/// A lane's groups, from `CC_TAGS` in its env file.
+fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
+    parse_env(lane)
+        .get("CC_TAGS")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_matches('"').to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
+///
+/// Ethan's rule: "worker to worker communication should be limited to intra
+/// group unless explicitly stated." The escapes are CONFIG, never something the
+/// sending agent can assert about itself in a request body — a flag any caller
+/// could set would make the rule advisory.
+///
+/// - same group (or a self-send)          -> allowed
+/// - sender's `CC_SEND_ALLOW`             -> groups it may reach, or `*`
+/// - receiver's `CC_RECEIVE_ANY=1`        -> a documented fleet-wide routing
+///   target. `amux` is one by construction: the worker roster tells every lane
+///   to route amux platform bugs here, which IS the explicit statement, and
+///   683 of the 908 worker-to-worker sends in the 24h before this shipped were
+///   cross-group — mostly bug reports inbound to this lane. Blocking those
+///   would have severed the fleet's only bug channel to fix a broadcast problem.
+fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+    if origin.is_empty() || origin == target {
+        return Ok("self-or-human");
+    }
+    let (og, tg) = (lane_groups(origin), lane_groups(target));
+    if !og.is_disjoint(&tg) {
+        return Ok("same-group");
+    }
+    let env_t = parse_env(target);
+    if matches!(
+        env_t.get("CC_RECEIVE_ANY").map(|v| v.trim().trim_matches('"').to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    ) {
+        return Ok("receiver-open");
+    }
+    let allow: Vec<String> = parse_env(origin)
+        .get("CC_SEND_ALLOW")
+        .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
+        .unwrap_or_default();
+    if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
+        return Ok("sender-allowlist");
+    }
+    let fmt = |g: &std::collections::BTreeSet<String>| {
+        if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
+    };
+    Err(format!(
+        "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
+         messaging is intra-group unless explicitly configured. To allow it: set \
+         CC_SEND_ALLOW on {origin} (comma-separated groups, or *), or CC_RECEIVE_ANY=1 \
+         on {target} if it is a fleet-wide routing target. A human send is never \
+         restricted — this applies only to sends carrying a worker origin.",
+        fmt(&og), fmt(&tg)
+    ))
+}
+
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // GROUP SCOPING, before anything is delivered or recorded. The origin is the
+    // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
+    // cannot talk its way across a group boundary.
+    let send_origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    if std::env::var("AMUX_GROUP_SEND_ENFORCE")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
+        .unwrap_or(true)
+    {
+        if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+            // LOUD AND QUERYABLE, per CLAUDE.md's two-fixes rule: a refusal that
+            // leaves no trace is a rule nobody can audit or tune.
+            tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+            emit_event(
+                state,
+                name,
+                "send.cross_group_refused",
+                Some(json!({"origin": send_origin, "target": name})),
+                None,
+                "group-scope",
+            )
+            .await;
+            return jresp(
+                StatusCode::FORBIDDEN,
+                json!({"ok": false, "error": reason, "blocked": "cross_group"}),
+            );
+        }
+    }
     let mut text = body_str(body, "text");
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if !msg_id.is_empty() && send_dedup_seen(state, name, &msg_id).await {
@@ -10365,6 +10460,49 @@ fn getrandom_fill(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
+    /// explicitly configured. The escapes must be CONFIG — a body flag any
+    /// caller could set would make the rule advisory.
+    #[test]
+    fn cross_group_sends_are_refused_unless_configured() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let write = |n: &str, body: &str| {
+            std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+        };
+        write("ts-gke", "CC_TAGS=\"customers\"\n");
+        write("tubescience", "CC_TAGS=\"customers\"\n");
+        write("gtm-engine", "CC_TAGS=\"gtm\"\n");
+        write("amux", "CC_TAGS=\"amux\"\nCC_RECEIVE_ANY=1\n");
+        write("broadcaster", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"gtm\"\n");
+        write("lonely", "\n"); // untagged
+
+        // THE REPORTED CASE: different groups, no config -> refused.
+        let err = cross_group_send_ok("ts-gke", "gtm-engine").expect_err("must refuse");
+        assert!(err.contains("cross-group send refused"), "{err}");
+        // The refusal must NAME both escapes, or it is a wall rather than a rule.
+        assert!(err.contains("CC_SEND_ALLOW"), "{err}");
+        assert!(err.contains("CC_RECEIVE_ANY"), "{err}");
+
+        // Same group is untouched.
+        assert_eq!(cross_group_send_ok("ts-gke", "tubescience").unwrap(), "same-group");
+        // A human send carries no worker origin and is never restricted.
+        assert_eq!(cross_group_send_ok("", "gtm-engine").unwrap(), "self-or-human");
+        // Self-send.
+        assert_eq!(cross_group_send_ok("ts-gke", "ts-gke").unwrap(), "self-or-human");
+        // Documented fleet-wide routing target: bug reports to amux still work.
+        assert_eq!(cross_group_send_ok("ts-gke", "amux").unwrap(), "receiver-open");
+        // Sender allowlisted for that specific group.
+        assert_eq!(cross_group_send_ok("broadcaster", "gtm-engine").unwrap(), "sender-allowlist");
+        // ...but not for a group it did not name.
+        assert!(cross_group_send_ok("broadcaster", "lonely").is_err());
+        // An untagged lane shares no group with anyone — including other
+        // untagged lanes. Consistent with "untagged sees itself".
+        assert!(cross_group_send_ok("lonely", "gtm-engine").is_err());
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
