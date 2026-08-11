@@ -1253,10 +1253,17 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "flags": flags,
             "creator": env.get("CC_CREATOR").cloned().unwrap_or_default(),
             "backend": backend,
-            // Same predicate as board_drive's nudge gate (default-ON,
-            // CC_AUTO_CONTINUE=0 opts out) — the view must not disagree with
-            // the mechanism it describes.
-            "auto_continue": crate::api::session_verbs::auto_continue_on(env.get("CC_AUTO_CONTINUE").map(String::as_str)),
+            // Same predicate as board_drive's nudge gate — the view must not
+            // disagree with the mechanism it describes. That means the SCOPED
+            // one (AMUX-2930): reading the worker env alone reported
+            // auto_continue=true for a lane whose group or global env had
+            // turned standing orders off, so the card said "on" while the
+            // nudger said "off". `standing_orders` is the master switch's own
+            // state, exposed so the SPA can show WHY a lane is quiet without
+            // re-deriving the layering.
+            "auto_continue": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_CONTINUE"),
+            "auto_pickup": crate::api::session_verbs::standing_orders_on(&name, "CC_AUTO_PICKUP"),
+            "standing_orders": crate::api::session_verbs::standing_orders_on(&name, "CC_STANDING_ORDERS"),
             "worktree": env.get("CC_WORKTREE").cloned().unwrap_or_default(),
             "worktree_repo": env.get("CC_WORKTREE_REPO").cloned().unwrap_or_default(),
             "mcp": env.get("CC_MCP").cloned().unwrap_or_default(),

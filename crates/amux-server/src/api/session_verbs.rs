@@ -227,6 +227,65 @@ pub(crate) fn parse_env(name: &str) -> EnvFile {
     EnvFile::load(&env_path(name))
 }
 
+/// One setting for a lane, resolved WORKER > GROUP > GLOBAL (AMUX-2930).
+///
+/// `parse_env` reads a single file — the worker's own env — which is right for
+/// per-worker facts like CC_DIR or CC_PROVIDER. It is wrong for POLICY, and
+/// standing-order switches are policy: `/api/scope` has advertised `env` at
+/// `["global", "group", "worker"]` since the cutover, backed by real files
+/// (`~/.amux/amux.env`, `~/.amux/env/<group>.env`,
+/// `~/.amux/sessions/<worker>.env`), and the scope UI writes all three. But
+/// every consumer read the worker file only, so turning a standing order off
+/// globally or for a group wrote a file that nothing consulted — the setting
+/// appeared to save and changed nothing.
+///
+/// That is ethos rule 1's exact shape: a view that does not share the predicate
+/// of the mechanism it describes. The mechanism is fixed here rather than the
+/// view narrowed, because the scoped view is what Ethan asked for.
+///
+/// GLOBAL is the amux.env that lane shells already source at startup, so this
+/// does not introduce a new file or a new spelling — it makes the gates read
+/// the layer that was always there. Worker wins over group, group over global;
+/// first match wins, so an explicit `=1` at worker level overrides a `=0` set
+/// fleet-wide, which is the direction a per-worker exception has to run.
+/// The resolution itself, over an explicit home.
+///
+/// Parameterised for the same reason `config::resolve_home` is: `AMUX_HOME` is
+/// process-global and `cargo test` runs a binary's tests in PARALLEL, so tests
+/// that set it race each other over ONE `amux.env` — three of these tests
+/// failed exactly that way on the first run, each having its global layer
+/// rewritten mid-assertion by a sibling. Serialising them with a mutex or
+/// `--test-threads=1` would have made them green while quietly making them
+/// order-dependent.
+pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -> Option<String> {
+    fn nonempty(v: &str) -> Option<String> {
+        let t = v.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+    let worker = EnvFile::load(&home.join("sessions").join(format!("{lane}.env")));
+    if let Some(v) = worker.get(key).and_then(nonempty) {
+        return Some(v);
+    }
+    // Groups come from the worker's own CC_TAGS — the same source
+    // `lane_groups` uses, not a second spelling of "which groups is this in".
+    let groups: Vec<String> = worker
+        .get("CC_TAGS")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_matches('"').to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for g in groups {
+        let path = home.join("env").join(format!("{g}.env"));
+        if let Some(v) = EnvFile::load(&path).get(key).and_then(nonempty) {
+            return Some(v);
+        }
+    }
+    EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
+}
+
 fn provider_of(cfg: &EnvFile) -> String {
     let p = cfg.get_or("CC_PROVIDER", "claude").trim().to_lowercase();
     if SESSION_PROVIDERS.contains(&p.as_str()) && !p.is_empty() {
@@ -1997,6 +2056,37 @@ pub(crate) fn auto_continue_on(val: Option<&str>) -> bool {
         val.map(|v| v.trim().to_lowercase()).as_deref(),
         Some("0") | Some("false") | Some("no") | Some("off")
     )
+}
+
+/// Is a standing order live for this lane? Scoped worker > group > global,
+/// with `CC_STANDING_ORDERS` as the master off-switch (AMUX-2930).
+///
+/// Ethan, 2026-08-11: "I should be able to shut off standing orders like 'Hey
+/// you have stuff in your to-do. Keep going.' … on the group, global, or
+/// individual worker level … configurable but also obviously have defaults."
+///
+/// TWO LEVELS ON PURPOSE, and no more. `CC_STANDING_ORDERS=0` silences every
+/// board-drive nudge at whatever scope it is set — one knob, the one to reach
+/// for. The per-class keys (`CC_AUTO_PICKUP`, `CC_AUTO_CONTINUE`) stay for the
+/// finer cut, and are checked only when the master has not already said no.
+/// A third spelling would be a second way to express the same thing, which is
+/// how the board keeps growing predicates that disagree.
+///
+/// DEFAULT IS ON, at every level, and that is deliberate rather than inherited:
+/// ethos rule 1 — the opt-IN version of auto-continue reached 2 lanes out of
+/// ~50, so a capability nobody is enrolled in is decoration. Off must be a
+/// choice someone made, and now it is a choice they can make once, for
+/// everyone, instead of 50 times.
+pub fn standing_orders_on(lane: &str, key: &str) -> bool {
+    standing_orders_on_in(&home(), lane, key)
+}
+
+/// Same, over an explicit home — see [`scoped_setting_in`] for why.
+pub fn standing_orders_on_in(home: &std::path::Path, lane: &str, key: &str) -> bool {
+    if !auto_continue_on(scoped_setting_in(home, lane, "CC_STANDING_ORDERS").as_deref()) {
+        return false;
+    }
+    auto_continue_on(scoped_setting_in(home, lane, key).as_deref())
 }
 
 fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {

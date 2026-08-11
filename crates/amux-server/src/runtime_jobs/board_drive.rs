@@ -269,11 +269,7 @@ impl Fleet for LiveFleet {
         crate::api::session_verbs::all_lane_names()
     }
     fn auto_pickup_enabled(&self, lane: &str) -> bool {
-        let cfg = crate::api::session_verbs::parse_env(lane);
-        !matches!(
-            cfg.get("CC_AUTO_PICKUP").map(|v| v.trim().to_lowercase()).as_deref(),
-            Some("0") | Some("false") | Some("no") | Some("off")
-        )
+        crate::api::session_verbs::standing_orders_on(lane, "CC_AUTO_PICKUP")
     }
     fn tags(&self, lane: &str) -> Vec<String> {
         let cfg = crate::api::session_verbs::parse_env(lane);
@@ -285,8 +281,7 @@ impl Fleet for LiveFleet {
             .collect()
     }
     fn auto_continue_enabled(&self, lane: &str) -> bool {
-        let cfg = crate::api::session_verbs::parse_env(lane);
-        crate::api::session_verbs::auto_continue_on(cfg.get("CC_AUTO_CONTINUE"))
+        crate::api::session_verbs::standing_orders_on(lane, "CC_AUTO_CONTINUE")
     }
     async fn is_running(&self, lane: &str) -> bool {
         crate::api::session_verbs::is_running(lane).await
