@@ -852,6 +852,15 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             params![id, tag, now],
         )?;
     }
+    // A card FILED straight into `needsyou` needs the tag too. The PATCH path
+    // syncs on the status TRANSITION, which a create never produces — so the
+    // sync's own blind spot was the one case that never gets a second chance:
+    // a card created blocked-on-a-human and never touched again. Caught by
+    // running the shipped path rather than the transition I had in mind; 1 of
+    // the 23 cards in the live census got there this way.
+    if parse_status(&new.status) == Some(TaskStatus::NeedsYou) {
+        add_needs_you_tag(conn, &id, now)?;
+    }
     Ok(get_issue(conn, &id)?.expect("row just inserted"))
 }
 
@@ -1101,6 +1110,69 @@ mod tests {
             assert_eq!(kept, 100.0, "{existing}: the original ask time must survive");
             assert_eq!(clear_needs_you_tags(&conn, "C-1").unwrap(), 1);
             assert!(!has_needs_you_tag(&conn, "C-1").unwrap());
+        }
+    }
+
+    /// A card FILED straight into `needsyou` — never PATCHed, so no status
+    /// transition ever fires — must still carry the ask. This is the case with
+    /// no second chance: nothing touches the card again, so if the tag is not
+    /// stamped at creation it is never stamped at all.
+    ///
+    /// Found by exercising the shipped POST path after fixing only the PATCH
+    /// path, which is the ethos-rule-1 nesting trap: after adding a surfacing
+    /// mechanism, ask what the mechanism itself filters out. 1 of the 23 cards
+    /// in the 2026-08-11 live census got there this way.
+    #[test]
+    fn a_card_filed_directly_into_needsyou_carries_the_ask() {
+        for (status, want) in [("needsyou", true), ("needs_you", true), ("todo", false)] {
+            let conn = create_db();
+            let row = create_issue(&conn, &new_card(status), 1000).expect("create");
+            assert_eq!(row.status, status, "the fixture must actually store {status}");
+            assert_eq!(
+                has_needs_you_tag(&conn, &row.id).unwrap(),
+                want,
+                "filed as {status}: expected tagged={want}"
+            );
+        }
+    }
+
+    fn create_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
+                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
+                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
+                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
+                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                deleted INTEGER);
+             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));
+             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn new_card(status: &str) -> NewIssue {
+        NewIssue {
+            title: "Ask Ethan about pricing".into(),
+            desc: String::new(),
+            status: status.into(),
+            session: Some("lane".into()),
+            item_type: "code".into(),
+            creator: "lane".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
         }
     }
 
