@@ -79,11 +79,14 @@ async function settle(page: Page): Promise<void> {
   }
 }
 
+/** One queued op as the SPA persists it (see `_queueOp` in app.js). */
+type OutboxOp = { url: string; options?: { method?: string; body?: string } };
+
 /** The SPA's offline outbox, straight from localStorage (its storage of record). */
-function outbox(page: Page): Promise<Array<{ url: string }>> {
+function outbox(page: Page): Promise<OutboxOp[]> {
   return page.evaluate(
     "JSON.parse(localStorage.getItem('amux_offline_queue') || '[]')",
-  ) as Promise<Array<{ url: string }>>;
+  ) as Promise<OutboxOp[]>;
 }
 
 /** In-memory board state — the `boardItems` lexical global. */
@@ -166,7 +169,17 @@ test('golden_offline_queue_and_replay', async ({ page, request }, testInfo) => {
   }
 
   // ---- offline queue mechanics: outbox holds exactly our 3 mutations ------
-  await expect.poll(async () => (await outbox(page)).length, { timeout: 10_000 }).toBe(3);
+  // Poll on the URL LIST, not on `.length`. A bare count fails with
+  // "Expected: 3 / Received: 4" and names nothing, so the one question that
+  // matters — WHICH op is the extra one — costs a local repro to answer (it
+  // did, on 2026-08-11, for a mobile-only failure that had been red on main
+  // for two days). The list makes a double-queue, a stray telemetry write and
+  // a duplicated title distinguishable straight from the CI log.
+  await expect
+    .poll(async () => (await outbox(page)).map((o) => `${o.options?.method || 'GET'} ${o.url}`), {
+      timeout: 10_000,
+    })
+    .toEqual(titles.map(() => 'POST /api/board'));
   const queued = await outbox(page);
   for (const op of queued) expect(op.url).toContain('/api/board');
 

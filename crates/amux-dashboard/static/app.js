@@ -1676,7 +1676,24 @@ async function runSyncBanner() {
   const rawQueue = [...offlineQueue];
   offlineQueue = [];
   saveQueue();
-  const queue = reconcileQueue(rawQueue);
+  let queue = reconcileQueue(rawQueue);
+  // Drop anything unreplayable that a PREVIOUS client version persisted — the
+  // pre-2026-08-11 apiCall queued GETs (and FormData bodies) that no replay
+  // can honestly re-issue. This is the half of the fix that reaches users who
+  // already have a poisoned localStorage: the enqueue guard stops new ones,
+  // this clears the ones already on disk. Beacons from HERE are the reliable
+  // signal, because replay only ever runs while online.
+  const unreplayable = queue.filter(q => !_outboxQueueable(q.url, q.options || {}));
+  if (unreplayable.length) {
+    queue = queue.filter(q => _outboxQueueable(q.url, q.options || {}));
+    try {
+      amuxTrack('outbox_unreplayable_dropped', {
+        n: unreplayable.length,
+        sample: unreplayable.slice(0, 5).map(q =>
+          ((q.options && q.options.method) || 'GET') + ' ' + String(q.url).split('?')[0]).join(', '),
+      });
+    } catch (e) {}
+  }
   const skipped = rawQueue.length - queue.length;
   const totalOps = draftCount + queue.length;
   if (!totalOps) return;
@@ -1909,6 +1926,34 @@ async function apiCall(url, options) {
   }
 }
 function _queueOp(url, options) {
+  // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
+  //
+  // There are two independent queuing paths — apiCall's `!online` branch and
+  // the window.fetch interceptor — and until 2026-08-11 they applied DIFFERENT
+  // rules: the interceptor screened on method and _OUTBOX_SKIP, apiCall
+  // screened on nothing. So an offline GET went into a durable replay queue,
+  // was counted in the user-visible "N pending ops" badge, and got re-issued
+  // on reconnect. `golden_offline_queue_and_replay` caught it as a stray
+  // "GET /api/board/themes?min_size=4" and rust.yml's e2e job was red on main
+  // for two days over it.
+  //
+  // The guard lives HERE rather than in each caller because a predicate that
+  // has to be re-stated at every call site is one that will disagree with
+  // itself again (ethos rule 1: a view must share the predicate of the
+  // mechanism it describes). It also kills a latent TypeError — apiCall(url)
+  // with no options reached `options.body` below and threw.
+  if (!_outboxQueueable(url, options || {})) {
+    // Self-announcing: this beacon is logged server-side, so the next caller
+    // that tries to persist an unreplayable op shows up in the request log
+    // instead of as a silent count mismatch in one e2e test.
+    try {
+      amuxTrack('outbox_refused', {
+        url: String(url).split('?')[0],
+        method: ((options && options.method) || 'GET').toUpperCase(),
+      });
+    } catch (e) {}
+    return false;
+  }
   // Cap the outbox so localStorage can't overflow — oldest ops drop first
   if (offlineQueue.length >= 200) {
     offlineQueue.shift();
@@ -1930,6 +1975,7 @@ function _queueOp(url, options) {
   saveQueue();
   updateConnectionStatus();
   showToast('Queued (' + offlineQueue.length + ' pending)');
+  return true;
 }
 
 // ═══════ GLOBAL OFFLINE OUTBOX — fetch interceptor ═══════
@@ -6996,7 +7042,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.594';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.595';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
