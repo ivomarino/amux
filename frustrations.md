@@ -47,7 +47,7 @@ counted.
 ## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
 AREA: attribution
 SEVERITY: slows
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-227
@@ -61,25 +61,17 @@ COST: Blocked my own push, asked a peer for permission they did not need to give
 FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
   comparison step to identify cherry-picks/rebases before asking about foreign commits.
   Validated by amux-cloud.
-## A reviewer who BLOCKS a card is re-nudged forever
-AREA: notices
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-06
-SESSION: amux-cloud
-CARD: AC-234
-SYMPTOM: Blocking a card is a completed review action, but the card stays in `review`, so
-  the sweep re-selects it every cycle. I was nudged three times for one card I had already
-  reviewed and blocked, with the analysis sitting on it.
-COST: The re-nag becomes the loudest signal in the room while the actual defect sits
-  untouched, and only the author can clear it. Trains reviewers to ignore review nudges,
-  which is the one class that should never be ignored.
-FIX: e20a112 — the advance loop now checks interaction_log for deliberate reviewer writes
-  (patch/status_update/gate_force). If the reviewer's most recent deliberate write is newer
-  than any other party's, the nudge is suppressed ("ball is with the author"). Fail-open
-  on errors so a broken check never silences real review requests. AC-234 reviewed and
-  closed by amux-frustrations.
-  Validated by amux-cloud.
+
+REFUSED 2026-08-11 by amux-cloud — only the DOCUMENTATION half shipped. CLAUDE.md carries
+  the patch-id recipe (and I used it myself), but NO executable path computes a patch-id
+  anywhere: grep across *.sh, *.rs and the amux CLI returns nothing. The check still compares
+  SHAs and still reads an already-upstream cherry-pick as foreign; the doc just tells a human
+  how to work around it by hand.
+  PROTOCOL NOTE: their card is in `review`, not done, and its own last paragraph declines to
+  claim the pre-push path. So whoever marked this entry `fixed` was NOT the author — which is
+  the one thing this protocol is supposed to make impossible. Flipped back to open.
+
+
 ## A review PATCH using `desc` silently DELETED the author's entire card content
 AREA: board
 SEVERITY: blocks
@@ -186,7 +178,7 @@ NOTE: the sharp edge is that 503 is HEALTH-SHAPED. A 404 says "you asked for som
 ## The decompose nudge told me to patch three cards I had already closed
 AREA: notices
 SEVERITY: slows
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-06
 SESSION: amux-cloud
 CARD: AC-252
@@ -217,6 +209,19 @@ NOTE: the general shape is a nudge asserting a fact with a shorter shelf life th
   not the code — I selected it with status='todo' and no `deleted IS NULL`, so I picked a
   deleted card. The same missing-predicate mistake in the probe that the guard fixes in the
   product, one layer down, which is the nesting ethos rule 1 describes.
+
+REFUSED 2026-08-11 by amux-cloud — THE FIX DID NOT SURVIVE THE MIGRATION, so this was
+  marked fixed against code that no longer exists. The recorded fix was _steer_guard_stale:
+  revalidate the asserted card state AT DELIVERY. I verified their claim independently:
+  `steer_guard_stale` and `guard_stale` return ZERO files across crates/. The `guard` COLUMN
+  survived, but only as a dedupe key —
+    session_verbs.rs:2197 DELETE FROM steering_queue WHERE session=?1 AND (text=?2 OR guard=?3)
+  — which is easy to mistake for the fix because the field name is identical.
+  Their honesty is worth preserving: they do NOT claim the frustration is live either, because
+  board_drive recomputes nudges from current card state each tick, so the stale window may now
+  be one STEER_TICK_SECS rather than unbounded. Nobody has established that. Not deleted.
+
+
 ## Assignment notices arrive for cards that were deleted a second after being created
 AREA: notices
 SEVERITY: slows
@@ -647,6 +652,13 @@ NOTE: distinct from the already-fixed "co-edit notice asks the reader to resolve
   moment while a false statement sends you hunting a defect that does not exist. The emitter
   is right to be conservative; over-warning about a sweep beats under-warning. Only re-check it.
 
+RELATED LOSS, found 2026-08-11 while validating AC-252: this entry's recorded fix used the
+  same mechanism, and it is gone too. `steer_guard_stale` has zero hits in crates/. So the
+  delivery-time revalidation that c32cf8a/7504abf added no longer exists in the rust server.
+  The entry was already correctly `open`; this records WHY it cannot be closed by pointing at
+  the python fix.
+
+
 ## SessionStart freshness hook named files upstream never touched
 AREA: instruments
 SEVERITY: slows
@@ -740,32 +752,6 @@ FIX: Writer stores bare tags; `parse_entity_type` (db/mod.rs) + `entity_tag`
   defaults are an implementation detail until SQL depends on them.
 
 ---
-## Rust origin answered unknown /api/* with the SPA shell (200 text/html) — nested proxy fallbacks silently shadowed
-AREA: instruments
-SEVERITY: wrong-conclusion
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (updict/browser parity lane)
-CARD: AMUX-2594
-SYMPTOM: On 8824, GET /api/groups, /api/browser/state, /api/fs?path=/tmp and every
-  other unrouted API path returned 200 text/html — the static catch-all
-  (`/{*path}`) serving index.html. Two distinct downstream failures: (1) the SPA
-  group picker silently emptied ("adding a group didn't work": r.json() threw on
-  HTML, .catch swallowed it), and (2) an auth probe reported "/api/fs returns 200
-  with NO token", reading the shell as an unauthenticated file listing. Worse: a
-  nested router `.fallback(py_proxy)` compiled, passed its unit tests, and was
-  STILL shadowed in the full composition, because unit tests nest the router
-  without the competing static catch-all.
-COST: One wrong security conclusion shipped upstream (phantom unauthenticated fs
-  endpoint); the SPA groups feature broken on the Rust origin; a browser-verb
-  proxy that looked done on unit-test evidence and was inert live.
-FIX: static_files.rs returns Python's JSON 404 for unknown /api/*; proxied
-  namespaces use EXPLICIT `/` + `/{*rest}` routes (py_proxy::passthrough_routes),
-  never nested `.fallback()`; tests/proxy_composition.rs pins the property at the
-  FULL-router level with a dead python port. Durable lesson: a nested fallback is
-  not a route — test routing properties on the composed app, not the nest.
-
----
 ## Rust and Python servers each minted their own auth token — same claimed file, different names
 AREA: instruments
 SEVERITY: slows
@@ -849,36 +835,6 @@ COST: Anyone following the error's advice sets an env var that changes nothing.
 FIX: The Rust port implements AMUX_SEARCH_RG for real rather than inheriting the
   false claim (crates/amux-server/src/api/fs.rs). Python side still carries the
   dead promise — fix or delete the text there.
-
----
-## Rust SSE "ping" goes out as an SSE COMMENT — EventSource clients can never see it
-AREA: sse
-SEVERITY: slows
-STATUS: fixed (5899463 — KeepAlive::new().event(...data(ping_payload())), sse.rs:120-122)
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2611
-SYMPTOM: Wire capture of GET /api/events on the Rust server (build 51f43c50d66e88b9)
-  shows the keep-alive as `: {"type":"ping","v":"0.9.529"}` — a comment frame, not a
-  `data:` event. sse.rs's own comment says "The keep-alive IS the ping contract: 10s
-  cadence, real data event", but axum 0.8.9's KeepAlive::text(t) is literally
-  `self.event(Event::default().comment(t))` (axum src/response/sse.rs:552). The SPA
-  consumes pings via EventSource.onmessage (app.js:21378), which fires only on data
-  events, so `msg.type === 'ping'` (app.js:21462) is unreachable against the Rust
-  server: the version self-reload-on-deploy path is dead, and pings never feed
-  `_lastDataTime`, so an idle fleet (>18s without real events) trips the client's
-  zombie detector and forces reconnect loops. The `v` value itself is correct
-  (matches served app.js APP_VER).
-COST: A 12s data-line probe reported 0 pings and initially read as "no pings sent";
-  discriminating comment-vs-data took a raw curl capture. In prod: deploy adoption
-  by open windows silently does not happen on the Rust server, and quiet fleets
-  reconnect every ~18s. Secondary: axum keep-alives fire only after `interval` of
-  SILENCE (unlike Python's unconditional 10s ping), so even after the data-event
-  fix, a busy stream can starve version-adoption pings.
-FIX: crates/amux-server/src/api/sse.rs — replace `.text(ping_payload())` with
-  `.event(Event::default().data(ping_payload()))` (KeepAlive::event exists in axum
-  0.8.9); consider an unconditional 10s ping task for Python parity. Regression
-  test: read the raw stream and assert the ping arrives as a `data:` frame.
 
 ---
 ## Browser profile DELETE can rmtree a real Chrome profile (python, live)
@@ -1028,28 +984,6 @@ FIX: not a request to reverse the protocol - deletion is Ethan's call and he mad
   is where someone hitting it again would actually look. amux-cloud argued the general form of
   this before the deletions and was told, correctly, that the call was made; this entry is the
   evidence they asked for rather than a re-litigation.
-
-## A 405 on an unrouted path — the GET-only SPA catch-all makes "no such route" wear "wrong method"
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (AMUX-2610 build lane)
-CARD: AMUX-2610
-SYMPTOM: Any non-GET request to a path the rust router does not mount answers 405 (with
-  Allow: GET) from the SPA catch-all (`/{*path}` is registered GET-only in static_files.rs),
-  while a GET to the same unknown /api path answers 404. So POST /api/lookup logged a 405 —
-  a status that says "path exists, method wrong" about a path that does not exist at all.
-  Verified live on 8824 and reproduced against the router in tests.
-COST: fed directly into the incident that motivated AMUX-2610: a model diagnosing a 405 had
-  to grep mod.rs + module routers to discover whether the path was even routed — the
-  expensive token spend Ethan flagged. The status code alone cannot discriminate the three
-  honest cells (wrong method / unknown path / route landed after the rows).
-FIX: not changed at the router (the catch-all's GET-only shape is load-bearing for the SPA
-  shell); fixed at the instrument instead, same commit as this entry: /api/logs/analyze
-  computes a per-405-group verdict that names the cell explicitly, including "no route
-  exists at this path — the 405 is the GET-only SPA catch-all answering a non-GET", and
-  /api/debug/routes serves the ROUTE_TABLE so "is X routed" is a GET, not a grep.
 
 ## Every direct prompt to a rust worker ran TWICE — the ledger card re-dispatched its own prompt
 AREA: board
@@ -2494,30 +2428,6 @@ FIX: The server now publishes `~/.amux/endpoint.json` (canonical_url + legacy_po
   **a default is not a fix for an inherited value.** Before "fixing" a fallback, check
   whether the variable is ever actually unset in the population you are trying to fix.
 
-## The retired-port tally could not tell two callers apart, so no fix could be shown to work
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2769
-SYMPTOM: `GET /api/debug/legacy-port` grouped callers by (ip, user-agent) and kept one
-  `last_path`. On this machine `curl/8.7.1` is BOTH the Claude Code report hooks and every
-  agent's own `curl $AMUX_URL/...`, and `Python-urllib` is BOTH the git pre-commit guard and
-  the PreToolUse Bash guard — so four callers rendered as two rows and "did my fix work?"
-  was unanswerable from the instrument the whole retirement rests on. Worse, the single
-  loudest row (an iPhone user-agent, ~3,200 req/h, blamed on the owner's phone) was actually
-  a leftover iOS SIMULATOR parked on the old port: every legacy client IP was 127.0.0.1, and
-  a real phone cannot reach the Mac's loopback. The instrument had the discriminator (`ip`)
-  and nobody read it.
-COST: A fix was scoped, and a manual step was nearly written into the owner's report, for a
-  device that was not the caller. Also ~40 minutes of measuring deltas that could not
-  separate the caller that had just been fixed from the one that had not.
-FIX: Per-client path histogram (capped, with the drop count reported) in the snapshot, with
-  a mutation test proving the collapsed-into-one-bucket version goes red. The broader rule:
-  when a tally exists to drive a drain, group it by whatever distinguishes the things you
-  will fix ONE AT A TIME — a row you cannot decompose is a row you cannot watch fall.
-
 ## Nothing could update an amux git hook outside the amux checkout
 AREA: cli
 SEVERITY: slows
@@ -2798,27 +2708,6 @@ FIX: The staged-guard is the designed prevention and it was DOWN for both events
   so cross-session sweep protection was off exactly when four lanes were committing into one tree.
   Being loud about it is right; being down is the hazard it exists for. See AMUX-2807.
 
-## /api/board?q=<anything> returns the entire board, shaped like search results
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2842
-SYMPTOM: `?q=ownership` and `?q=nudge` returned byte-identical 1382-row lists. So
-  did `?q=zzzznonexistentzzz`. `q` is not in ListParams and axum drops unknown query
-  params silently, so the param was inert and the full board came back looking like
-  ranked hits.
-COST: Two searches for an existing card before filing a new one. I caught it only
-  because I ran two queries and happened to compare them — a single query reads as
-  "no card exists for this", which is exactly how a duplicate gets filed against a
-  board that already has the card. The board has 1382 items and duplicate-filing is
-  the specific waste it cannot absorb.
-FIX: fc6badf — q/query/search recognised only to be refused, 400 naming
-  /api/search?q=<term> (verified discriminating: 0 hits for nonsense, 11 for a real
-  term) plus the filters /api/board does support. Not silently honoured instead,
-  because /api/search returns a different shape.
-
 ## A probe read a hook file that git never executes, and a correct measurement certified the wrong conclusion
 AREA: instruments
 SEVERITY: slows
@@ -3031,182 +2920,3 @@ FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
   smaller action than its name implies. Same class as `amux board claim` exiting
   0 without claiming (AMUX-2140).
 
-## SUPERSEDES the entry above: the needsyou STATUS was the dead end, not the tag
-AREA: board
-SEVERITY: cost-hours
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2879
-SYMPTOM: I filed the entry above backwards. Tracing it properly: "blocked on a
-  human" has TWO spellings and the readers are split across them. The STATUS
-  `needsyou` is what EXCLUDES a card (auto-pickup takes `status='todo'`, the
-  advance path takes `status IN ('doing','review')`). The TAG `needs:you` is
-  what SURFACES it — `is:needsyou` and Focus mode, the 3-day re-nag (which JOINs
-  issue_tags), and board_drive's "the human owes the answer, not the lane"
-  branch. So a card parked by the DOCUMENTED transition — core's
-  `Doing -> NeedsYou`, "stuck on the user, with the exact question" — landed
-  where nothing hands it out AND nothing brings it back. `amux board needsyou`
-  writing the tag was correct all along; the sanctioned status was the trap.
-COST: 23 of 38 open needsyou cards (61%) were invisible to the view Ethan
-  triages from, across six sessions — including four SLA breaches aged 127-194h,
-  two spend decisions and a credential-purge decision. Unmeasurable in hours;
-  the cost is asks that sat for days because taking the documented exit is what
-  buried them. Plus my own wrong entry above, which would have sent the next
-  session to "fix" the one part that worked.
-FIX: e4e77f6 + c5368e4. The status now stamps the tag on entry (both the PATCH
-  transition and the CREATE path) and clears it on exit; the re-nag matches
-  either spelling; `is:needsyou` reads the status directly. Live: re-nag reach
-  75 -> 88, view 79 -> 102, 0 lost in both.
-  The generalisable half is NOT "check your premise". It is that I diagnosed
-  from the COMMAND's behaviour instead of from the consumers, so I found the
-  asymmetry and guessed its direction. Asking "who reads this field?" before
-  "which writer is wrong?" would have inverted the answer in one grep. A peer
-  had already made the same misread from the same side (AC-222) and fixed the
-  printer; the printer fix landed and the belief did not, which is why the
-  second session repeated the detour to a raw PATCH rather than inheriting the
-  conclusion.
-
-## "template not found" meant two different things and only ever said one
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2871
-SYMPTOM: `POST /api/sessions/<n>/apply-template {"template_id":"software-project"}`
-  returned `{"error":"template not found"}`. So did `zzz-does-not-exist`. Byte
-  for byte the same response, because `templates_dir()` returned None and the
-  root-missing branch shared its error string with the bad-id branch. All three
-  resolution rungs were dead: `AMUX_TEMPLATES_DIR` unset, `~/.amux/templates`
-  absent, and the middle rung canonicalized `~/.local/bin/amux-server.py` —
-  deleted with the Python server at 792ce1f, with nothing put in its place.
-COST: the templates feature has been fully dead since 792ce1f (2026-08-09) and
-  nobody could tell from the outside. The error names the operand the caller
-  supplied, so every reading of it says "you asked for a template that does not
-  exist" — the one hypothesis that sends you to check your own input instead of
-  the server. I only found it because I was porting the sibling LIST endpoint
-  and ran a bogus id as a control; without the control I would have shipped a
-  working accordion in front of an apply path that silently does nothing, which
-  is worse than today's hidden section.
-FIX: c857430. Two branches, two messages — root-missing names the paths it
-  tried, bad-id names the id and the dir it searched. install.sh syncs
-  `templates/` to `~/.amux/templates` so the surviving rung exists.
-  The pattern worth counting: deleting a component (the Python server) silently
-  killed a resolution rung in a DIFFERENT component that merely pointed at it,
-  and the pointer's failure mode was already indistinguishable from ordinary
-  user error. When something is removed, the greps that find its name are not
-  enough — the paths that were derived from where it lived do not mention it.
-
-## The status-update the whole fleet is told to run answered 405 with an empty body
-AREA: board
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2871
-SYMPTOM: `amux board status-update AMUX-2871 --stdin` exited 1 and printed
-  nothing. `POST /api/board/<id>/status-request` and `/status-update` both
-  answered 405 with an EMPTY body — neither existed anywhere in the Rust
-  server. Both are the D1-exit pair: the board is the source of truth BECAUSE
-  the owning session pushes its own model-authored status here instead of amux
-  scraping a terminal.
-COST: unmeasurable and fleet-wide. Every layer kept routing sessions at a dead
-  endpoint for the whole cutover: the CLI's own help, the SPA card menu's "ask
-  for status", the advance nudge ("post a status-update / mark its blocker"),
-  the board contract's `board_is_source_of_truth` clause, and ethos.md's D1
-  section. Any session that complied got silence and moved on. Ethan's card
-  menu button has been reporting "Could not reach <session>" this whole time.
-FIX: b5a874a. Both handlers ported; status-update additionally 404s on an
-  unknown id (Python appended to a card it never checked existed, so a typo'd
-  id answered ok and wrote a line nobody could find), and delivery goes through
-  steer_enqueue rather than Python's background thread.
-  The generalisable half is about the INSTRUMENT, not the routes.
-  `route.callers_have_routes` reads green here because it enumerates SPA and
-  CLI call SITES, and the bash CLI reaches these two by hand-rolled curl — so
-  the endpoints the CLI most depends on are exactly the ones the "does every
-  caller have a route" invariant cannot see. A census whose blind spot is
-  correlated with its subject reads as coverage. Next time that invariant is
-  green, that is what it is green ABOUT.
-
-## `_board_outcome`'s "empty response" message could never print
-AREA: cli
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2871
-SYMPTOM: `amux board status-update <id> "text"` exited 1 having written nothing
-  to stdout OR stderr. The guard `sys.stderr.write((raw[:300] or "empty
-  response") + "\n")` looks like it covers this. It cannot: every caller pipes
-  `echo "$result"`, echo appends a newline unconditionally, so on an empty
-  server reply `raw` is "\n" — truthy — and the fallback string is dead code.
-  The command wrote one blank line and exited 1.
-COST: ~20 minutes chasing a CLI arg-parsing bug (`shift`, `--stdin` handling,
-  the heredoc) before checking the endpoint itself. The silence pointed at the
-  wrong layer: a curl failure and an unrouted endpoint were indistinguishable,
-  and both looked like the CLI.
-FIX: b5a874a — strip before the truthiness test, and name the likely cause
-  ("the endpoint may not be routed on this build"). Worth noting WHY it
-  survived: this function exists specifically to end silent board failures
-  (AMUX-2140), was written carefully, carries a long comment about reporting
-  outcomes rather than transport — and its one total-silence path was never
-  exercised, because it only fires when the server returns nothing at all.
-  A handler for the case you believe cannot happen is the handler nobody runs.
-
-## A ported reader over an unported writer served a confident zero for 36 hours
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2892
-SYMPTOM: `GET /api/stats/daily` — ported, live, and looking entirely healthy —
-  served `{"total_tokens": 0, "sessions": 0}`. token_ledger's newest row was
-  36.3 hours old with ZERO rows in the last 24h. The only INSERT INTO
-  token_ledger anywhere in crates/ was a TEST helper. Source data was never the
-  problem: the conversation JSONLs were being appended that same minute.
-COST: the Tokens tab has read zero since the cutover, and nobody noticed,
-  because a zero on a usage panel is indistinguishable from a quiet day. Anyone
-  reading fleet spend in that window got a number that was wrong in the
-  direction that raises no questions. I found it only because I was about to
-  port a SECOND reader (/api/observability) onto the same dead table — which
-  would have shipped a Cost tab rendering confidently over nothing.
-FIX: cd731bd — the indexer is ported as a periodic runtime job.
-  The pattern, and this is the third instance in one day: the cutover split
-  reader/writer pairs and shipped whichever half was reachable from a route.
-  POST /api/stats/reset was a WRITER whose reader existed (inert button, ported
-  9f4ef24). token_ledger was a READER whose writer did not (confident zero).
-  apply-template was a reader whose PATH RESOLUTION had been deleted with the
-  Python server. Each half looked complete in isolation and each passed review.
-  What none of them had was a check that the OTHER end existed — which is
-  cheaper than it sounds: every one of the three was found in under a minute by
-  asking "who writes this / who reads this" and grepping for the answer.
-  Worth a standing sweep: for every table and every file the server reads,
-  assert something in crates/ writes it, and vice versa.
-
-## I quoted a file count without checking the code could reach all of it
-AREA: instruments
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2894
-SYMPTOM: I wrote "2637 JSONLs under ~/.claude/projects ... nothing read them"
-  into a board card AND a commit message. The count was right; the implication
-  was false. Only 337 sit at `projects/*/*.jsonl`, the depth the indexer
-  actually scans. I had run `find -name '*.jsonl'` (recursive) and compared it
-  against code doing a ONE-LEVEL glob, without noticing the two were measuring
-  different sets.
-COST: small directly — a wrong scale figure in a commit message, corrected on
-  the card. Worth logging anyway because it is the same failure as the
-  `-newermt` probe 20 minutes earlier in the same session (bfs rejected the
-  expression, `2>/dev/null` swallowed the error, `wc -l` printed 0, and I read
-  "no recent activity" off a probe that had not run). Twice in one hour I
-  measured with a tool whose scope did not match the code's.
-FIX: the discipline is one line — when a number describes what CODE sees, take
-  the measurement the way the code takes it, not the way that is convenient to
-  type. `ls projects/*/*.jsonl` and `find projects -name '*.jsonl'` differ by
-  87% here and neither is wrong; only one of them was about the indexer.
-  The error was productive by luck, not by method: the 2300-file discrepancy is
-  what exposed AMUX-2894 (subagent usage never counted, by either server).
