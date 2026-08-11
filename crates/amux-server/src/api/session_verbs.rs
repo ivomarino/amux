@@ -2109,6 +2109,12 @@ impl DeliveryMeta<'_> {
     }
 }
 
+/// How recently an identical message must have been recorded for the second
+/// one to count as a duplicate DELIVERY rather than a person repeating
+/// themselves. Two minutes: long enough to span a retry, a restart and a queue
+/// drain; short enough that "run the same command again" is not flagged.
+const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -2128,6 +2134,58 @@ pub(crate) async fn cmd_hist_record_full(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let now_ms = now_i64() * 1000;
+
+    // DUPLICATE-DELIVERY DETECTOR (Ethan's standing rule, 2026-08-11: fix the
+    // bug AND make the next one surface in the logs).
+    //
+    // send_dedup only catches a retry carrying the SAME msg_id, its rows are
+    // pruned after 600s, and a dedupe hit writes nothing anywhere — so "was
+    // this delivered twice?" had no answer in amux at all. Establishing that
+    // ONE report was a false alarm took grepping a 1.6MB pane log and
+    // hand-deduping redraw captures, because a pipe-pane log re-captures a
+    // visible line on every repaint ("53 occurrences" meant one delivery).
+    //
+    // This does NOT suppress the second delivery. Two identical sends can be
+    // deliberate, and silently dropping one would turn a visible annoyance into
+    // an invisible data-loss bug — strictly worse. It announces, and lets a
+    // human or a sweep decide.
+    let dup_prior: Option<(i64, i64)> = {
+        let session_q = session.clone();
+        let text_q = text.clone();
+        match state.store.read() {
+            Ok(conn) => conn
+                .query_row(
+                    "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
+                     AND ts > ?3 ORDER BY ts DESC LIMIT 1",
+                    rusqlite::params![session_q, text_q, now_ms - DUP_DELIVERY_WINDOW_MS],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok(),
+            Err(_) => None,
+        }
+    };
+    if let Some((prior_id, prior_ts)) = dup_prior {
+        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
+        tracing::warn!(
+            session = %session, prior_id, age_s,
+            preview = %chars_truncate(&text, 80),
+            "duplicate delivery: identical text already recorded for this lane"
+        );
+        emit_event(
+            state,
+            &session,
+            "message.duplicate",
+            Some(json!({
+                "prior_id": prior_id, "age_s": age_s, "type": ctype,
+                "chars": text.chars().count(),
+                "preview": chars_truncate(&text, 120),
+            })),
+            None,
+            "cmd-history",
+        )
+        .await;
+    }
+
     let _ = state
         .store
         .write_async(move |conn| {
@@ -6868,6 +6926,10 @@ pub async fn steer_deliver_loop(state: AppState) {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions/{name}", any(session_root_handler))
+        // A WARN nobody can query is the same gap one layer out: this is
+        // where a sweep or an autofix loop asks "did anything get delivered
+        // twice, and to whom" without grepping a pane log.
+        .route("/api/debug/duplicate-deliveries", axum::routing::get(debug_duplicate_deliveries))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
         // Why steering is or is not moving. See `steering_debug`.
         .route("/api/debug/steering", axum::routing::get(steering_debug))
@@ -7144,6 +7206,56 @@ fn json_str_after(blob: &str, key: &str) -> Option<String> {
     let end = rest.find('"')?;
     let v = &rest[..end];
     (!v.is_empty() && v.len() <= 200).then(|| v.to_string())
+}
+
+
+/// GET /api/debug/duplicate-deliveries?hours=24 — every lane that received the
+/// SAME text twice inside the detector's window, newest first.
+///
+/// Reads `session_events` rows the detector writes, so it reports what actually
+/// happened rather than re-deriving a heuristic. `window_ms` is echoed so a
+/// reader knows what "duplicate" meant without going to the source.
+async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    let params = parse_qs(q.as_deref().unwrap_or(""));
+    let hours: f64 = qs_get(&params, "hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let since = now_f64() - hours * 3600.0;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    let rows: Vec<Value> = conn
+        .prepare(
+            "SELECT ts, session, data FROM session_events \
+             WHERE type='message.duplicate' AND ts > ?1 ORDER BY ts DESC LIMIT 200",
+        )
+        .and_then(|mut st| {
+            let it = st.query_map(rusqlite::params![since], |r| {
+                let data: Option<String> = r.get(2)?;
+                Ok(json!({
+                    "ts": r.get::<_, f64>(0)?,
+                    "session": r.get::<_, String>(1)?,
+                    "detail": data
+                        .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                        .unwrap_or(Value::Null),
+                }))
+            })?;
+            Ok(it.flatten().collect())
+        })
+        .unwrap_or_default();
+    let mut by_session: BTreeMap<String, i64> = BTreeMap::new();
+    for r in &rows {
+        *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
+    }
+    j200(json!({
+        "hours": hours,
+        "window_ms": DUP_DELIVERY_WINDOW_MS,
+        "total": rows.len(),
+        "by_session": by_session,
+        "events": rows,
+        "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
+                 Deliveries are never suppressed on this signal — two identical sends can be \
+                 deliberate, and dropping one would turn a visible annoyance into silent loss.",
+    }))
 }
 
 fn qs_first<'a>(qs: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
@@ -8423,7 +8535,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     } else {
         send_failure_status(&msg)
     };
-    let mut resp = json!({"ok": ok, "message": msg});
+    let send_id = format!("msg-{}-{}", name, (now_f64() * 1000.0) as i64);
+    let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
     }
