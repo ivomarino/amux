@@ -6952,7 +6952,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.585';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.586';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14552,7 +14552,15 @@ async function openConnectIterm2() {
     const d = await r.json();
     const panes = d.panes || [];
     if (!panes.length) {
-      list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;text-align:center;padding:20px;">No open iTerm2 panes found.<br>Make sure iTerm2 is running.</div>';
+      // "Make sure iTerm2 is running" was this arm's ONLY message, and it was
+      // wrong for every cause that isn't that: a missing route (this endpoint
+      // 404'd until AMUX-2871) and, on this machine, osascript blocking on a
+      // macOS Automation consent that never gets answered from a launchd
+      // process. The server now says which it was — show it rather than
+      // re-guessing at the user's machine.
+      list.innerHTML = d.error
+        ? `<div style="color:var(--red);font-size:0.85rem;text-align:center;padding:20px;">Could not list iTerm2 panes.<br><span style="color:var(--dim);font-size:0.78rem;">${esc(d.error)}</span><br><span style="color:var(--dim);font-size:0.78rem;">If iTerm2 is running, grant Automation access to amux in System Settings → Privacy &amp; Security.</span></div>`
+        : '<div style="color:var(--dim);font-size:0.85rem;text-align:center;padding:20px;">No open iTerm2 panes found.<br>Make sure iTerm2 is running.</div>';
       return;
     }
     list.innerHTML = panes.map(p => `
