@@ -2028,6 +2028,69 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// The verify-nudge shipped with no test of its own (fe44d61). These pin
+    /// the two properties that decide whether it nags correctly or wrongly.
+    #[test]
+    fn verify_candidates_never_include_a_humans_card_or_an_archived_one() {
+        let conn = board_db();
+        let ins = |id: &str, session: &str, status: &str, owner: &str, arch: i64, del: Option<i64>| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,updated)                  VALUES (?1,?2,?3,?4,?5,?6,?7,'code',100)",
+                rusqlite::params![id, format!("card {id}"), status, session, owner, arch, del],
+            )
+            .expect("insert");
+        };
+        ins("A-1", "me", "done", "agent", 0, None);      // the only one that qualifies
+        ins("A-2", "me", "done", "human", 0, None);      // ethos rule 8: never sweep a human's work
+        ins("A-3", "me", "done", "agent", 1, None);      // archived
+        ins("A-4", "me", "done", "agent", 0, Some(1));   // deleted
+        ins("A-5", "me", "todo", "agent", 0, None);      // not done
+        ins("A-6", "other", "done", "agent", 0, None);   // another lane
+
+        let got = done_verify_candidates(&conn, "me");
+        let ids: Vec<&str> = got.iter().map(|(i, _, _)| i.as_str()).collect();
+        assert_eq!(ids, vec!["A-1"], "only this lane's own live agent-owned done card");
+        assert_eq!(done_card_count(&conn, "me"), 1, "the count must share the selector's predicate");
+    }
+
+    /// The "... and N more" line is arithmetic over TWO queries. If they ever
+    /// disagree the prompt states a number the list cannot account for — the
+    /// view-vs-mechanism drift this repo keeps finding. This pins them together
+    /// past the LIMIT 8 boundary, where the two genuinely differ by design.
+    #[test]
+    fn the_and_n_more_line_agrees_with_the_selector_past_the_cap() {
+        let conn = board_db();
+        for i in 0..11 {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated)                  VALUES (?1,?2,'done','me','agent',0,'code',?3)",
+                rusqlite::params![format!("A-{i}"), format!("card {i}"), i],
+            )
+            .expect("insert");
+        }
+        let cards = done_verify_candidates(&conn, "me");
+        let total = done_card_count(&conn, "me");
+        assert_eq!(cards.len(), 8, "capped at 8 for prompt brevity");
+        assert_eq!(total, 11, "but the count sees all of them");
+
+        let text = verify_nudge_text(&cards, total);
+        assert!(text.contains("... and 3 more"), "11 - 8 = 3; got: {text}");
+        assert!(text.contains("11 of your"), "the headline must state the true total");
+        // Every listed card must actually appear, or the list and the count
+        // describe different sets.
+        for (id, _, _) in &cards {
+            assert!(text.contains(id.as_str()), "{id} listed in the selector but absent from the prompt");
+        }
+    }
+
+    /// A lane with exactly the cap must not be told there are "0 more".
+    #[test]
+    fn no_and_n_more_line_when_nothing_was_dropped() {
+        let cards: Vec<(String, String, String)> =
+            (0..3).map(|i| (format!("A-{i}"), "t".into(), "code".into())).collect();
+        let text = verify_nudge_text(&cards, 3);
+        assert!(!text.contains("more"), "nothing was dropped; got: {text}");
+    }
+
     /// The live board schema, trimmed to the columns these predicates read.
     fn board_db() -> Connection {
         let conn = Connection::open_in_memory().expect("memdb");
