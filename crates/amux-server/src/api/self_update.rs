@@ -107,6 +107,69 @@ fn repo_dir() -> Option<PathBuf> {
     None
 }
 
+/// The refusals, extracted so they can be TESTED. Inline in the handler they
+/// were unreachable from a test: this server resolves to `standalone` on its own
+/// machine (launchd gives it no useful cwd and the binary lives outside the
+/// checkout), so the live endpoint never reaches them — the most important logic
+/// in this file had no way to fail.
+///
+/// Returns `Some(refusal_body)` when the pull must not proceed.
+pub(crate) async fn preflight(dir: &Path) -> Option<serde_json::Value> {
+    // A rebase/merge/cherry-pick left half-done. Pulling into one produces git
+    // errors that read like a network problem.
+    for (marker, what) in [
+        ("rebase-merge", "a rebase"),
+        ("rebase-apply", "a rebase"),
+        ("MERGE_HEAD", "a merge"),
+        ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ] {
+        if dir.join(".git").join(marker).exists() {
+            return Some(json!({"ok": false, "blocked": "operation_in_progress",
+                "output": format!("Refusing to pull: {what} is in progress in {}.\n\
+                                   Finish or abort it first — pulling now would compound it.",
+                                  dir.display())}));
+        }
+    }
+
+    // A dirty tree. `--ff-only` may still succeed here and silently move files
+    // under a session that is mid-edit — the failure this repo has already paid
+    // for. Name the FILES rather than the count: "3 files" is not actionable.
+    if let Some(o) = git(dir, &["status", "--porcelain"], GIT_TIMEOUT).await {
+        let dirty: Vec<String> = out_of(&o)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !dirty.is_empty() {
+            let shown: Vec<String> = dirty.iter().take(20).cloned().collect();
+            return Some(json!({"ok": false, "blocked": "dirty_tree", "files": shown.clone(),
+                "output": format!(
+                    "Refusing to pull: {} uncommitted change(s) in {}.\n{}\n\n\
+                     This is a shared checkout — those edits may belong to another session \
+                     that is not even running. Commit or stash them first.",
+                    dirty.len(), dir.display(), shown.join("\n"))}));
+        }
+    }
+
+    // Local commits not on the remote. `--ff-only` refuses these anyway, but
+    // with git's own wording, which never mentions that the commits exist or
+    // how many — and on this checkout the answer has been 100.
+    if let Some(o) = git(dir, &["rev-list", "--count", "@{u}..HEAD"], GIT_TIMEOUT).await {
+        if o.status.success() {
+            let ahead: i64 = out_of(&o).trim().parse().unwrap_or(0);
+            if ahead > 0 {
+                return Some(json!({"ok": false, "blocked": "unpushed_commits", "ahead": ahead,
+                    "output": format!(
+                        "Refusing to pull: {ahead} local commit(s) are not on the remote.\n\
+                         --ff-only would abort anyway; refusing here so the reason is legible.\n\
+                         On a shared checkout these commits may not all be yours — check the \
+                         Amux-Session trailers on `git log @{{u}}..HEAD` before pushing them.")}));
+            }
+        }
+    }
+    None
+}
+
 async fn pull() -> Response {
     match install_channel().0 {
         "brew" => {
@@ -129,58 +192,8 @@ async fn pull() -> Response {
         .into_response();
     };
 
-    // ---- pre-flight, in the order that makes the refusal most useful -------
-
-    // A rebase/merge/cherry-pick left half-done. Pulling into one produces
-    // git errors that read like a network problem.
-    for (marker, what) in [
-        ("rebase-merge", "a rebase"),
-        ("rebase-apply", "a rebase"),
-        ("MERGE_HEAD", "a merge"),
-        ("CHERRY_PICK_HEAD", "a cherry-pick"),
-    ] {
-        if dir.join(".git").join(marker).exists() {
-            return Json(json!({"ok": false, "blocked": "operation_in_progress",
-                "output": format!("Refusing to pull: {what} is in progress in {}.\n\
-                                   Finish or abort it first — pulling now would compound it.",
-                                  dir.display())}))
-            .into_response();
-        }
-    }
-
-    // A dirty tree. `--ff-only` may still succeed here and silently move files
-    // under a session that is mid-edit — the failure this repo has already paid
-    // for. Name the files rather than the count: "3 files" is not actionable.
-    if let Some(o) = git(&dir, &["status", "--porcelain"], GIT_TIMEOUT).await {
-        let dirty: Vec<String> = out_of(&o).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-        if !dirty.is_empty() {
-            return Json(json!({"ok": false, "blocked": "dirty_tree",
-                "files": dirty.iter().take(20).collect::<Vec<_>>(),
-                "output": format!(
-                    "Refusing to pull: {} uncommitted change(s) in {}.\n{}\n\n\
-                     This is a shared checkout — those edits may belong to another session \
-                     that is not even running. Commit or stash them first.",
-                    dirty.len(), dir.display(),
-                    dirty.iter().take(20).cloned().collect::<Vec<_>>().join("\n"))}))
-            .into_response();
-        }
-    }
-
-    // Local commits not on the remote. `--ff-only` refuses these anyway, but
-    // with git's own wording, which never mentions that the commits exist or
-    // how many — and on this checkout the answer has been 97.
-    if let Some(o) = git(&dir, &["rev-list", "--count", "@{u}..HEAD"], GIT_TIMEOUT).await {
-        let ahead: i64 = out_of(&o).trim().parse().unwrap_or(0);
-        if ahead > 0 {
-            return Json(json!({"ok": false, "blocked": "unpushed_commits", "ahead": ahead,
-                "output": format!(
-                    "Refusing to pull: {ahead} local commit(s) are not on the remote.\n\
-                     --ff-only would abort anyway; refusing here so the reason is legible.\n\
-                     On a shared checkout these commits may not all be yours — check\n\
-                     `git log --format='%h [%(trailers:key=Amux-Session,valueonly)] %s' @{{u}}..HEAD`\n\
-                     before pushing or rebasing them.")}))
-            .into_response();
-        }
+    if let Some(refusal) = preflight(&dir).await {
+        return Json(refusal).into_response();
     }
 
     // ---- the pull itself ---------------------------------------------------
@@ -256,6 +269,74 @@ fn https_equiv(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway repo with one commit and an upstream, so `@{u}..HEAD` is a
+    /// real question rather than an error.
+    fn repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let run = |args: &[&str], cwd: &Path| {
+            std::process::Command::new("git")
+                .args(args).current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap()
+        };
+        // A bare "remote" so the branch can have a real upstream.
+        let remote = d.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&["init", "--bare", "-b", "main", remote.to_str().unwrap()], d.path());
+        let work = d.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        run(&["init", "-b", "main"], &work);
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."], &work);
+        run(&["commit", "-m", "first"], &work);
+        run(&["remote", "add", "origin", remote.to_str().unwrap()], &work);
+        run(&["push", "-u", "origin", "main"], &work);
+        d
+    }
+
+    /// The refusal that matters most: a dirty tree on a SHARED checkout, where
+    /// the uncommitted edit may belong to a session that is not even running.
+    #[tokio::test]
+    async fn a_dirty_tree_is_refused_and_the_files_are_named() {
+        let d = repo();
+        let work = d.path().join("work");
+        // CONTROL: clean and level with the remote — nothing to refuse.
+        assert!(preflight(&work).await.is_none(), "a clean, up-to-date repo must pull");
+
+        std::fs::write(work.join("a.txt"), "edited by a peer\n").unwrap();
+        let r = preflight(&work).await.expect("a dirty tree must be refused");
+        assert_eq!(r["blocked"], "dirty_tree");
+        // The FILE, not just a count — "1 file" tells nobody what to look at.
+        assert_eq!(r["files"][0].as_str().unwrap().trim(), "M a.txt");
+    }
+
+    #[tokio::test]
+    async fn unpushed_commits_are_refused_with_their_count() {
+        let d = repo();
+        let work = d.path().join("work");
+        std::fs::write(work.join("b.txt"), "two\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "local only"]] {
+            std::process::Command::new("git").args(&args).current_dir(&work)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+        }
+        let r = preflight(&work).await.expect("unpushed commits must be refused");
+        assert_eq!(r["blocked"], "unpushed_commits");
+        assert_eq!(r["ahead"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_half_finished_merge_is_refused_before_anything_else() {
+        let d = repo();
+        let work = d.path().join("work");
+        std::fs::write(work.join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
+        let r = preflight(&work).await.expect("an in-progress merge must be refused");
+        assert_eq!(r["blocked"], "operation_in_progress");
+        assert!(r["output"].as_str().unwrap().contains("a merge"));
+    }
 
     #[test]
     fn ssh_remotes_convert_and_junk_does_not() {
