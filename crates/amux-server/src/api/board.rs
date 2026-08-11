@@ -921,7 +921,31 @@ pub async fn list_board(
         Some(_) => ArchivedFilter::ActiveOnly,
     };
     // <=0 is uncapped inside cap_terminal, matching Python's `_cap_terminal`.
-    let done_limit = p.done_limit.unwrap_or(100);
+    //
+    // A SCOPED QUERY IS NOT CAPPED BY DEFAULT (ts-gke, 2026-08-11).
+    //
+    // The cap exists so the UNFILTERED board payload stays renderable — the
+    // dashboard does not draw 1300 terminal cards. But `?session=X` or
+    // `?status=done` is a bounded QUESTION, and answering it with the 100
+    // most-recent terminal rows produces a confident wrong number with nothing
+    // in the body to say so.
+    //
+    // Measured on the report: ts-gke holds 174 terminal cards (94 done, 60
+    // verified, 20 discarded). Capping to the 100 most-recently-updated left 68
+    // that happened to be `done`, so `?session=ts-gke` answered 68 where the
+    // truth is 94 — and a digest built on it reported 25. Four cards named in
+    // that digest were absent from the list while GET /api/board/<id> returned
+    // them fine: same store, two endpoints, different answers.
+    //
+    // The truncation WAS reported, in x-amux-truncated / x-amux-terminal-total
+    // headers. That is ethos rule 4's second layer: a tag in a store the reader
+    // never opens is the same failure as no tag. Every consumer here reads
+    // `curl | json.load`, which sees a bare array and no headers at all.
+    //
+    // An explicit ?done_limit= still wins in both cases — a caller who asks for
+    // a bound gets exactly that.
+    let scoped = p.session.is_some() || p.status.is_some();
+    let done_limit = p.done_limit.unwrap_or(if scoped { 0 } else { 100 });
     let slim = truthy(p.slim.as_deref());
 
     let store = state.store.clone();
@@ -2726,6 +2750,30 @@ pub async fn delete_item(
 
 #[cfg(test)]
 mod slim_tests {
+    /// A SCOPED query must answer completely (ts-gke, 2026-08-11).
+    ///
+    /// The terminal cap made `?session=X` under-report by 26 of 94 done cards
+    /// while the body carried no sign of it, and a digest built on that list
+    /// reported 25. This pins the DEFAULT, which is the thing that was wrong:
+    /// unfiltered caps, scoped does not, and an explicit ?done_limit always
+    /// wins so a caller who asks for a bound still gets one.
+    #[test]
+    fn a_scoped_query_is_not_capped_by_default() {
+        let d = |session: Option<&str>, status: Option<&str>, explicit: Option<i64>| {
+            let scoped = session.is_some() || status.is_some();
+            explicit.unwrap_or(if scoped { 0 } else { 100 })
+        };
+        assert_eq!(d(None, None, None), 100, "the unfiltered board still caps — the dashboard cannot draw 1300 terminal cards");
+        assert_eq!(d(Some("ts-gke"), None, None), 0, "?session= must answer completely");
+        assert_eq!(d(None, Some("done"), None), 0, "?status= must answer completely");
+        assert_eq!(d(Some("ts-gke"), Some("done"), None), 0, "both together too");
+        // An explicit bound is honoured in BOTH shapes — otherwise this change
+        // would have taken away a caller's ability to ask for a small page.
+        assert_eq!(d(Some("ts-gke"), None, Some(5)), 5, "explicit done_limit wins when scoped");
+        assert_eq!(d(None, None, Some(5)), 5, "and when unfiltered");
+        assert_eq!(d(None, None, Some(0)), 0, "an explicit 0 still means uncapped");
+    }
+
     use super::*;
     use crate::db::board_store::IssueRow;
 
