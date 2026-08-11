@@ -3038,3 +3038,46 @@ FIX: forwarder deleted in 5d850fc (registry, answered_by read path and the
   needs a check that can fail here — cargo-udeps, or a test that censuses `pub fn`
   definitions against call sites, which is the same shape ethos rule 7 already
   prescribes for the client JS (enumerate defined vs called, then inspect callers).
+
+## A peer's concurrent commit swept my staged file into their unrelated commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2923
+SYMPTOM: `git add e2e/settings.spec.ts && git commit -F -` ran the staged-guard, passed
+  cargo check, then printed "nothing to commit, working tree clean" and left HEAD at
+  446e15e — a peer's commit titled "fix(status): a codex picker reads waiting, not idle".
+  My e2e timeout change was INSIDE it. The same guard run also warned that my commit was
+  about to carry 28 insertions of amux-cloud's session_verbs.rs work, so the sweeping goes
+  both directions in the same few seconds.
+COST: The code survived (the rationale was in a code comment, which is why it is worth
+  writing them there and not only in the message). What was lost is the commit message —
+  five CI runs of evidence for WHY that budget is 60s now sits under a codex-status title,
+  where nobody looking at the e2e change will find it. Also ~10 minutes proving the change
+  was not lost.
+FIX: The staged-guard already detects the cotenant case and prints the reconcile recipe —
+  but it warns the committer about ABSORBING someone else's work, and is silent about the
+  mirror risk of one's own staged file being absorbed. It cannot see a `git commit -a` that
+  another session is about to run. A pre-commit advisory lock (or simply having the guard
+  refuse when another session's index activity is <60s old) would close the window.
+
+## The e2e harness compiles the shared WORKING TREE, so a peer mid-edit fails my run
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2924
+SYMPTOM: `npx playwright test settings.spec.ts` died with "Process from config.webServer was
+  not able to start. Exit code: 101" / E0425 / "could not compile amux-server (lib) due to 2
+  previous errors". My changes were JS and TS only. `cargo check -p amux-server` passed 40s
+  later — a peer had been mid-edit in session_verbs.rs, which was dirty in the shared tree.
+COST: A few minutes, but the failure mode is the dangerous one: a red e2e run whose cause is
+  a stranger's half-saved file looks exactly like a red e2e run caused by my own change. On
+  a slower day that is a wrong conclusion published against innocent code.
+FIX: playwright.config.ts runs `cargo run -p amux-server` against the working tree. The
+  builder deploys COMMITTED HEAD, and committed source is what ships (CLAUDE.md), so the
+  harness should build from HEAD too — a detached worktree like scripts/rust-auto-build.sh
+  already uses. That also makes an e2e result mean something reproducible.
