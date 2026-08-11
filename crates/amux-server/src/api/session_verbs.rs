@@ -902,6 +902,13 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     {
         return "waiting".into();
     }
+    // GEMINI's picker cursor is `●` (U+25CF) inside a `│`-bordered box —
+    // third provider, third selector spelling, found on the same day as the
+    // codex one. The border char on the cursor's own line is the chrome
+    // anchor prose cannot fake (same trick as the `│ ❯ 1.` claude form).
+    if clean.contains("\u{2502} \u{25cf} 1.") {
+        return "waiting".into();
+    }
     if clean.contains('\u{276f}') {
         return "idle".into();
     }
@@ -11273,6 +11280,11 @@ mod tests {
         assert_eq!(detect_claude_status(trust), "waiting");
         let quoted = "the doc says codex renders \u{203a} 1. Yes, continue as its cursor";
         assert_ne!(detect_claude_status(quoted), "waiting");
+        // Gemini, captured live the same day: `●` cursor in a `│` box.
+        let gemini = " \u{2502} \u{25cf} 1. Yes\n \u{2502}   2. Yes, and remember the directories as trusted\n \u{2502}   3. No";
+        assert_eq!(detect_claude_status(gemini), "waiting");
+        let gemini_prose = "gemini renders \u{25cf} 1. Yes as its cursor";
+        assert_ne!(detect_claude_status(gemini_prose), "waiting");
     }
 
     // ---- AMUX-2612: session identity survives a resume --------------------
