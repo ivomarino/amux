@@ -952,6 +952,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
     RouteEntry { path: "/api/observability", methods: &["GET"] },
     RouteEntry { path: "/api/pull", methods: &["POST"] },
+    RouteEntry { path: "/api/sessions/{name}/subagents", methods: &["GET"] },
     RouteEntry { path: "/api/proxies", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },

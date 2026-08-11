@@ -7025,6 +7025,127 @@ async fn dispatch(
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
 }
 
+
+/// A lane's subagents, from `~/.claude/projects/<proj>/<conv-uuid>/subagents/`.
+///
+/// The parent conversation carries the owning session in its first record's
+/// `customTitle` — the same resolution the token-ledger indexer uses
+/// (runtime_jobs/token_ledger.rs), deliberately not a second one.
+///
+/// A subagent's own first record is a `fork-context-ref` (agentId,
+/// parentSessionId, contextLength); the handed-down task carries
+/// `subagent_type` and a human-readable `description`. Both are reported when
+/// present and omitted when not — a made-up label is worse than none in a
+/// switcher, because it cannot be told from a real one.
+fn session_subagents(name: &str) -> Value {
+    let projects = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/projects");
+    let mut out: Vec<Value> = Vec::new();
+    let Ok(projs) = std::fs::read_dir(&projects) else {
+        return json!({"session": name, "subagents": [], "source": "transcripts"});
+    };
+    for proj in projs.flatten() {
+        let Ok(convs) = std::fs::read_dir(proj.path()) else { continue };
+        for c in convs.flatten() {
+            let conv = c.path();
+            if conv.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if first_record_title(&conv).as_deref() != Some(name) {
+                continue;
+            }
+            let stem = conv.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = conv.with_extension("").join("subagents");
+            let Ok(agents) = std::fs::read_dir(&dir) else { continue };
+            for a in agents.flatten() {
+                let p = a.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let meta = p.metadata().ok();
+                let modified = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let (kind, description, turns) = subagent_head(&p);
+                out.push(json!({
+                    "id": p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    "conversation": stem,
+                    "type": kind,
+                    "description": description,
+                    "turns": turns,
+                    "last_active": modified,
+                    "bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                }));
+            }
+        }
+    }
+    // Most recently active first: a switcher is read to jump to what is moving.
+    out.sort_by_key(|v| -(v["last_active"].as_i64().unwrap_or(0)));
+    json!({"session": name, "subagents": out, "source": "transcripts"})
+}
+
+/// `customTitle`/`sessionName` from a conversation's FIRST line.
+fn first_record_title(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(f).read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(&line).ok()?;
+    let t = v.get("customTitle").or_else(|| v.get("sessionName"))?.as_str()?.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// (subagent_type, description, turn count). Scans only the head of the file —
+/// the fork boilerplate is in the first few records and some of these are tens
+/// of MB.
+fn subagent_head(path: &Path) -> (Value, Value, i64) {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return (Value::Null, Value::Null, 0) };
+    let mut kind = Value::Null;
+    let mut desc = Value::Null;
+    let mut turns = 0i64;
+    for (i, line) in std::io::BufReader::new(f).lines().enumerate() {
+        let Ok(line) = line else { break };
+        turns += 1;
+        if i > 12 || (!kind.is_null() && !desc.is_null()) {
+            // Keep counting turns cheaply once the head is parsed.
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let blob = v.to_string();
+        for key in ["subagent_type", "subagentType", "agentType"] {
+            if kind.is_null() {
+                if let Some(x) = json_str_after(&blob, key) {
+                    kind = json!(x);
+                }
+            }
+        }
+        if desc.is_null() {
+            if let Some(x) = json_str_after(&blob, "description") {
+                desc = json!(x);
+            }
+        }
+    }
+    (kind, desc, turns)
+}
+
+/// `"key": "value"` out of a serialized record. The task metadata is nested
+/// inside tool-use content blocks whose shape Claude Code changes freely, so a
+/// typed struct here would silently stop matching; this degrades to None
+/// instead, which the caller reports as an absent label rather than a wrong one.
+fn json_str_after(blob: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let i = blob.find(&pat)? + pat.len();
+    let rest = blob[i..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let v = &rest[..end];
+    (!v.is_empty() && v.len() <= 200).then(|| v.to_string())
+}
+
 fn qs_first<'a>(qs: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
     qs_get(qs, key).unwrap_or(default)
 }
@@ -7064,6 +7185,17 @@ async fn get_dispatch(
             }
         }
         "tasks" => j200(session_cc_tasks(name).await),
+        // GET /api/sessions/<n>/subagents — this lane's forks/subagents, read
+        // from their DURABLE transcripts rather than inferred from the pane
+        // (AMUX-2635).
+        //
+        // The pane-glyph predicate this replaces matched 0 of 50 lanes, twice,
+        // confirmed in both directions. The transcripts matched 50 of 50 — same
+        // question, opposite answer, because the instrument was wrong and not
+        // the feature. That is D1's documented exit: a real interface instead of
+        // a scrape of rendered output, and it improves as Claude Code does
+        // rather than breaking on the next glyph change.
+        "subagents" => j200(session_subagents(name)),
         "peek" => {
             let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
             let live_only = qs_flag(qs, "live");
