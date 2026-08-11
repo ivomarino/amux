@@ -225,10 +225,21 @@ fn claude_projects_dir() -> PathBuf {
 /// One indexing pass. Returns rows inserted. Cheap on a fully-indexed tree —
 /// a stat per file and nothing else.
 pub async fn index_once(store: &SharedStore, home: &Path) -> anyhow::Result<usize> {
-    let projects = claude_projects_dir();
+    index_once_at(store, home, &claude_projects_dir()).await
+}
+
+/// The pass, with the projects root injected. Split out so tests drive a temp
+/// tree instead of setting a process-global env var — env in tests races every
+/// other test in the binary, and a racy test is one that gets deleted later.
+pub async fn index_once_at(
+    store: &SharedStore,
+    home: &Path,
+    projects: &Path,
+) -> anyhow::Result<usize> {
     if !projects.is_dir() {
         return Ok(0);
     }
+    let projects = projects.to_path_buf();
     let table = prices(home);
 
     let cursors: HashMap<String, (u64, i64)> = {
@@ -255,6 +266,10 @@ pub async fn index_once(store: &SharedStore, home: &Path) -> anyhow::Result<usiz
         .unwrap_or(200);
     let mut skipped_for_cap = 0usize;
     let mut pending: Vec<(String, u64, i64, Vec<Turn>)> = Vec::new();
+    // Owner titles are read from a conversation's FIRST line; subagent files
+    // all share one parent, so cache per parent rather than re-opening it once
+    // per delegated transcript.
+    let mut owner_cache: HashMap<PathBuf, String> = HashMap::new();
     let Ok(entries) = std::fs::read_dir(&projects) else {
         return Ok(0);
     };
@@ -265,36 +280,64 @@ pub async fn index_once(store: &SharedStore, home: &Path) -> anyhow::Result<usiz
         }
         let Ok(files) = std::fs::read_dir(&p) else { continue };
         for f in files.flatten() {
-            let jf = f.path();
-            if jf.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+            let path = f.path();
+            // Two shapes under a project dir:
+            //   <proj>/<conversation-uuid>.jsonl              a real conversation
+            //   <proj>/<conversation-uuid>/subagents/*.jsonl  its delegated turns
+            let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+            if path.is_dir() {
+                let subs = path.join("subagents");
+                if let Ok(rd) = std::fs::read_dir(&subs) {
+                    // The parent conversation is the sibling <uuid>.jsonl, and
+                    // it is where the owning session's name lives — a subagent
+                    // transcript's first record is {"type":"user"} with no
+                    // customTitle at all (AMUX-2894).
+                    let parent = path.with_extension("jsonl");
+                    for sf in rd.flatten() {
+                        let sp = sf.path();
+                        if sp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                            targets.push((sp, Some(parent.clone())));
+                        }
+                    }
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                targets.push((path, None));
             }
-            let Ok(st) = jf.metadata() else { continue };
-            let size = st.len();
-            let mtime = st
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let conv = jf.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            let (off, cmt) = cursors.get(&conv).copied().unwrap_or((0, 0));
-            // Both halves matter. Size alone misses an in-place rewrite; mtime
-            // alone re-reads an untouched file after any `touch`.
-            if off >= size && cmt == mtime {
-                continue;
+
+            for (jf, parent) in targets {
+                let Ok(st) = jf.metadata() else { continue };
+                let size = st.len();
+                let mtime = st
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let conv = jf.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let (off, cmt) = cursors.get(&conv).copied().unwrap_or((0, 0));
+                // Both halves matter. Size alone misses an in-place rewrite;
+                // mtime alone re-reads an untouched file after any `touch`.
+                if off >= size && cmt == mtime {
+                    continue;
+                }
+                if cap > 0 && pending.len() >= cap {
+                    skipped_for_cap += 1;
+                    continue;
+                }
+                // A file that SHRANK was rotated or rewritten — re-read from 0
+                // rather than seeking past its new end, which would park the
+                // cursor permanently beyond the data and index nothing forever.
+                let start = if off > size { 0 } else { off };
+                let owner = match &parent {
+                    None => jsonl_owner_title(&jf),
+                    Some(pp) => owner_cache
+                        .entry(pp.clone())
+                        .or_insert_with(|| jsonl_owner_title(pp))
+                        .clone(),
+                };
+                let (new_off, turns) = parse_from(&jf, start, mtime, &owner, &table);
+                pending.push((conv, new_off, mtime, turns));
             }
-            // A file that SHRANK was rotated or rewritten — re-read from 0
-            // rather than seeking past its new end, which would park the cursor
-            // permanently beyond the data and silently index nothing forever.
-            if cap > 0 && pending.len() >= cap {
-                skipped_for_cap += 1;
-                continue;
-            }
-            let start = if off > size { 0 } else { off };
-            let owner = jsonl_owner_title(&jf);
-            let (new_off, turns) = parse_from(&jf, start, mtime, &owner, &table);
-            pending.push((conv, new_off, mtime, turns));
         }
     }
     if skipped_for_cap > 0 {
@@ -505,6 +548,124 @@ mod tests {
         // 0 would silently park the turn in 1970 and drop it out of every
         // since-cutoff query — a row that exists and can never be counted.
         assert_eq!(turns[0].ts, 1_786_000_000);
+    }
+
+    fn store() -> SharedStore {
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::db::Store::open(&dir.path().join("ledger-test.db")).unwrap();
+        std::mem::forget(dir);
+        std::sync::Arc::new(st)
+    }
+
+    async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {
+        let conn = store.read().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT session, conversation, input FROM token_ledger ORDER BY conversation, input")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.flatten().collect()
+    }
+
+    /// AMUX-2894. A subagent transcript's first record is `{"type":"user"}` —
+    /// no customTitle — so reading its owner the ordinary way yields "" and
+    /// every delegated turn lands in the unowned bucket. That is WORSE than not
+    /// indexing them: ~112k records would move from invisible to misattributed,
+    /// and the lane that actually spent the tokens still would not be charged.
+    #[tokio::test]
+    async fn subagent_turns_are_charged_to_the_parent_conversation_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let proj = projects.path().join("-Users-ethan-Dev-amux");
+        let conv = "f427b1c9-7c16-48cd-96d2-c9b59a8a6b1a";
+        std::fs::create_dir_all(proj.join(conv).join("subagents")).unwrap();
+
+        // Parent conversation: carries the owning session.
+        std::fs::write(
+            proj.join(format!("{conv}.jsonl")),
+            format!("{}\n{}\n", r#"{"customTitle":"gtm-videos"}"#,
+                    line("claude-opus-5", "2026-08-11T10:00:00Z", 11, 0, 0, 1)),
+        )
+        .unwrap();
+        // Delegated transcript: NO owner of its own.
+        std::fs::write(
+            proj.join(conv).join("subagents").join("agent-abc123.jsonl"),
+            format!("{}\n{}\n", r#"{"type":"user"}"#,
+                    line("claude-opus-5", "2026-08-11T10:01:00Z", 22, 0, 0, 2)),
+        )
+        .unwrap();
+
+        let st = store();
+        let n = index_once_at(&st, home.path(), projects.path()).await.unwrap();
+        assert_eq!(n, 2, "one parent turn + one delegated turn");
+
+        let rows = ledger(&st).await;
+        let by_conv: std::collections::HashMap<_, _> =
+            rows.iter().map(|(s, c, i)| (c.clone(), (s.clone(), *i))).collect();
+        assert_eq!(by_conv[conv], ("gtm-videos".into(), 11));
+        assert_eq!(
+            by_conv["agent-abc123"],
+            ("gtm-videos".into(), 22),
+            "delegated spend must be charged to the lane that delegated it"
+        );
+        // And it stays DISTINGUISHABLE without a schema change: the subagent
+        // keeps its own `agent-*` conversation id, so "of which N was
+        // delegated" is a query, not a migration.
+        assert!(by_conv.keys().any(|k| k.starts_with("agent-")));
+    }
+
+    /// A subagent whose parent conversation was deleted has no owner to
+    /// inherit. It must land unowned — honestly uncharged — rather than being
+    /// attributed to whichever lane happens to be nearby.
+    #[tokio::test]
+    async fn an_orphaned_subagent_is_unowned_rather_than_misattributed() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let proj = projects.path().join("-proj");
+        std::fs::create_dir_all(proj.join("dead-uuid").join("subagents")).unwrap();
+        std::fs::write(
+            proj.join("dead-uuid").join("subagents").join("agent-zzz.jsonl"),
+            format!("{}\n{}\n", r#"{"type":"user"}"#,
+                    line("sonnet", "2026-08-11T10:00:00Z", 5, 0, 0, 1)),
+        )
+        .unwrap();
+
+        let st = store();
+        assert_eq!(index_once_at(&st, home.path(), projects.path()).await.unwrap(), 1);
+        assert_eq!(ledger(&st).await, vec![(String::new(), "agent-zzz".into(), 5)]);
+    }
+
+    /// A second pass over an unchanged tree must insert NOTHING. Without this
+    /// the indexer double-bills every conversation every 120s, which is the one
+    /// failure mode worse than the zero it was written to fix.
+    #[tokio::test]
+    async fn a_second_pass_over_an_unchanged_tree_bills_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let proj = projects.path().join("-proj");
+        std::fs::create_dir_all(proj.join("u1").join("subagents")).unwrap();
+        std::fs::write(
+            proj.join("u1.jsonl"),
+            format!("{}\n{}\n", r#"{"customTitle":"amux"}"#,
+                    line("sonnet", "2026-08-11T10:00:00Z", 9, 0, 0, 1)),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("u1").join("subagents").join("agent-q.jsonl"),
+            format!("{}\n{}\n", r#"{"type":"user"}"#,
+                    line("sonnet", "2026-08-11T10:01:00Z", 3, 0, 0, 1)),
+        )
+        .unwrap();
+
+        let st = store();
+        assert_eq!(index_once_at(&st, home.path(), projects.path()).await.unwrap(), 2);
+        assert_eq!(
+            index_once_at(&st, home.path(), projects.path()).await.unwrap(),
+            0,
+            "an unchanged tree must be a no-op"
+        );
+        assert_eq!(ledger(&st).await.len(), 2);
     }
 
     #[test]
