@@ -810,6 +810,30 @@ pub struct ListParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    // SEARCH-INTENT PARAMS, RECOGNISED ONLY TO BE REFUSED (2026-08-11).
+    //
+    // axum drops unknown query params silently, so `/api/board?q=nudge`
+    // returned THE WHOLE BOARD — 1382 rows that look exactly like search
+    // results. That is the failure mode ethos rule 7 names: a filter that
+    // silently matches everything hands you a confident wrong answer instead of
+    // silence, and nothing about the response prompts a recheck.
+    //
+    // It cost a real one here: two different queries returned byte-identical
+    // lists, and only comparing them by accident revealed the param was inert.
+    // One query alone reads as "no such card exists" — which is how a duplicate
+    // gets filed against a board that already had the card.
+    //
+    // Not silently honoured either, because /api/search is the real one and it
+    // returns a different (ranked, typed) shape. Naming it in a 400 routes the
+    // caller to the working endpoint, the same way the gate 409 publishes its
+    // escape. Nothing in the SPA or CLI sends these — verified before making
+    // them loud — so this cannot break a client holding a stale service worker.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
 }
 
 fn truthy(v: Option<&str>) -> bool {
@@ -828,6 +852,21 @@ fn truthy(v: Option<&str>) -> bool {
 /// twice in one week (AC-291, AC-301), so the two counts come from
 /// `cap_terminal` itself, never re-derived from list lengths.
 pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
+    if let Some(term) = p.q.as_deref().or(p.query.as_deref()).or(p.search.as_deref()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "/api/board does not search — it would have returned the ENTIRE board",
+                "you_sent": term,
+                "use_instead": format!("/api/search?q={term}"),
+                "why": "This param was silently ignored until 2026-08-11, so the full board came \
+                        back looking like ranked results. Refusing loudly beats answering wrongly.",
+                "board_filters": ["status", "session", "archived", "done_limit", "slim", "limit", "offset"],
+            })),
+        )
+            .into_response();
+    }
     let split = |s: &Option<String>| -> Vec<String> {
         s.as_deref()
             .unwrap_or("")
