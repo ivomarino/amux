@@ -7278,7 +7278,14 @@ async fn dispatch(
         return post_dispatch(&state, &name, &action, &headers, &body).await;
     }
     if method == Method::PATCH {
-        return patch_dispatch(&state, &name, &action, &body).await;
+        // Bare PATCH on the resource aliases the config verb — the fourth
+        // instance of the reach-for-the-obvious-verb class documented on the
+        // DELETE alias below (found live 2026-08-11: a tags edit sent to
+        // PATCH /api/sessions/<n> answered a bare 404 that named nothing,
+        // while /config sat one path segment away). Same rule as DELETE: an
+        // alias to the SAME function, so the two spellings cannot drift.
+        let act = if action.is_empty() { "config" } else { action.as_str() };
+        return patch_dispatch(&state, &name, act, &body).await;
     }
     // DELETE on the RESOURCE — the conventional REST spelling (AMUX-2665).
     //
