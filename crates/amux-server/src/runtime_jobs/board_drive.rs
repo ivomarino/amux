@@ -95,6 +95,12 @@ const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 const PICKUP_FRESHNESS_S: i64 = 7 * 86400;
 /// py:14515 re-claim cooldown (AMUX-1857).
 const RECLAIM_COOLDOWN_S: f64 = 86400.0;
+/// Verify-nudge cooldown: once per 24h per session. A session that has no
+/// todo/doing/review work but holds `done` cards gets a batched nudge to
+/// verify them. 24h because verification requires prod evidence, and
+/// checking more often than once a day for a low-priority idle task is the
+/// nag shape that got the `done` tier removed in the first place.
+const VERIFY_NUDGE_COOLDOWN_S: f64 = 24.0 * 3600.0;
 /// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
 const DEFAULT_ITEM_TYPE: &str = "code";
 
@@ -140,7 +146,7 @@ fn now_f64() -> f64 {
 pub struct LaneTrace {
     pub session: String,
     /// `assigned` | `advance-nudged` | `review-routed` | `decompose-asked` |
-    /// `renag` | `skipped`
+    /// `renag` | `verify-nudge` | `skipped`
     pub outcome: String,
     pub reason: String,
     pub detail: String,
@@ -864,6 +870,70 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
         reason: "all-candidates-refused",
         detail: skipped.join("; "),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Verify nudge — option B (idle session) + option A (batched daily)
+// ---------------------------------------------------------------------------
+
+/// Cards in `done` that this session could verify. Returns (id, title, type)
+/// tuples, capped at 8 for prompt brevity.
+fn done_verify_candidates(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
+    conn.prepare(
+        "SELECT id, title, COALESCE(type,'code') FROM issues \
+         WHERE session=?1 AND status='done' AND deleted IS NULL \
+         AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         ORDER BY updated DESC LIMIT 8",
+    )
+    .and_then(|mut st| {
+        st.query_map(rusqlite::params![session], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })
+        .map(|rows| rows.flatten().collect())
+    })
+    .unwrap_or_default()
+}
+
+/// Total count of done cards for this session (for the "and N more" line).
+fn done_card_count(conn: &Connection, session: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='done' \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+        rusqlite::params![session],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Build the batched verify-nudge prompt.
+fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
+    let mut lines: Vec<String> = cards
+        .iter()
+        .map(|(id, title, typ)| {
+            let t: String = title.chars().take(70).collect();
+            format!("  {id} [{typ}] {t}")
+        })
+        .collect();
+    if total > cards.len() as i64 {
+        lines.push(format!("  ... and {} more", total - cards.len() as i64));
+    }
+    let list = lines.join("\n");
+    format!(
+        "[amux] You have no queued work (no todo/doing/review cards), but {total} of your \
+         cards sit in `done` awaiting verification.\n\n\
+         {list}\n\n\
+         For each card where ALL of these hold:\n\
+         1. CI/CD passed on the merged commit\n\
+         2. The change is deployed to production\n\
+         3. Confirmed working end-to-end in prod\n\
+         4. No regressions in existing behavior\n\n\
+         Move it to `verified` with evidence of what you checked. If you cannot confirm \
+         all four, leave it in `done`. If the work is stale or was superseded, archive \
+         it with a note explaining why.\n\n\
+         Cards that genuinely cannot be verified by you (e.g., they require a human \
+         decision or access you lack) should be tagged `needs:you` so they surface \
+         in the owner digest rather than sitting here indefinitely."
+    )
 }
 
 /// py:14713 — the claim prompt.
@@ -1749,20 +1819,75 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open)
         }
         Pickup::None { reason, detail } => {
-            // SILENCE IS THE CORRECT OUTPUT FOR AN EMPTY BOARD (Invariant 20).
-            // Nothing here invents work; the trace records that the lane was
-            // examined and had nothing, which is the fact that was missing.
+            // VERIFY NUDGE — options A+B. When a session has no todo/doing/
+            // review work but holds `done` cards, nudge it to verify them.
+            // This is NOT the removed `done` advance tier (lines 1042-1076):
+            //   - fires only when the session has NOTHING ELSE to do
+            //   - one batched message, not per-card nudges
+            //   - 24h cooldown (the old tier nudged per card per cooldown)
+            //   - the session decides what to verify, not the loop
+            let verify_trace = 'verify: {
+                if eligible > 0 || open > 0 {
+                    break 'verify None;
+                }
+                let Ok(conn) = state.store.read() else {
+                    break 'verify None;
+                };
+                let total = done_card_count(&conn, lane);
+                if total == 0 {
+                    break 'verify None;
+                }
+                let recent: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type='verify.nudge' AND ts > ?2 LIMIT 1",
+                        rusqlite::params![lane, now - VERIFY_NUDGE_COOLDOWN_S],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if recent {
+                    break 'verify Some(format!(
+                        "has {total} done card(s) but verify-nudge sent within 24h"
+                    ));
+                }
+                let cards = done_verify_candidates(&conn, lane);
+                if cards.is_empty() {
+                    break 'verify None;
+                }
+                drop(conn);
+                let text = verify_nudge_text(&cards, total);
+                crate::api::session_verbs::emit_event(
+                    state,
+                    lane,
+                    "verify.nudge",
+                    Some(json!({"done_count": total, "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>()})),
+                    None,
+                    "board-drive",
+                )
+                .await;
+                fleet.deliver(lane, &text).await;
+                return LaneTrace::acted(
+                    lane,
+                    "verify-nudge",
+                    cards.first().map(|(id,_,_)| id.as_str()).unwrap_or(""),
+                    format!("{total} done card(s), batched verify prompt delivered"),
+                )
+                .with_counts(eligible, open);
+            };
+
             let (areason, adetail) = advance_reason;
-            LaneTrace::skip(
-                lane,
-                reason,
-                if adetail.is_empty() {
-                    detail
-                } else {
-                    format!("{detail} | advance: {areason} ({adetail})")
-                },
-            )
-            .with_counts(eligible, open)
+            let mut full_detail = if adetail.is_empty() {
+                detail
+            } else {
+                format!("{detail} | advance: {areason} ({adetail})")
+            };
+            if let Some(vd) = verify_trace {
+                full_detail = format!("{full_detail} | verify: {vd}");
+            }
+            LaneTrace::skip(lane, reason, full_detail).with_counts(eligible, open)
         }
     }
 }
