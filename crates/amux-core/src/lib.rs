@@ -16,26 +16,27 @@
 //! - `turn`          RR-0013 (Invariants 6, 16, 27)
 //! - `memory`        RR-0014 (Invariant 42)
 //! - `verification`  RR-0015 (Invariants 7, 28)
-//! - `group`         RR-0016 (Invariant 12)
 //! - `search`        RR-0017 (Invariants 32, 40)
 //! - `limits`        RR-0028f (Invariants 47, 49)
-//! - `capability`    RR-0028g (Invariants 52, 36)
 //! - `circuit`       RR-0028h (Invariants 48, 45, 10)
 //! - `provider_fleet` RR-0044b (Invariants 20, 22)
 //! - `criteria`      RR-0028i (Invariant 50)
-//! - `isolation`     RR-0028k (Invariants 33, 10, 49)
+//!
+//! Deleted 2026-08-11 (AMUX-2906, Ethan: "you don't need me for any of these
+//! just do it"): `capability`, `group`, `mention`, `isolation` — port-era
+//! scaffolding with zero references from any crate for the life of the Rust
+//! server. If the AgentRuntime seam (ethos D6 exit) wants them back, git
+//! history at this commit^ has all four intact; re-adopting from history is
+//! cheaper than carrying 1,100 dead lines every build. `stall` looked like
+//! the same case and is NOT: board.rs and orchestrator.rs import it.
 
 pub mod board;
-pub mod capability;
 pub mod circuit;
 pub mod criteria;
 pub mod events;
-pub mod group;
 pub mod ids;
-pub mod isolation;
 pub mod limits;
 pub mod memory;
-pub mod mention;
 pub mod message;
 pub mod orchestrator;
 pub mod protocol;
