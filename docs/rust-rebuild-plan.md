@@ -2478,7 +2478,7 @@ Searchable entities:
 ```
 tasks, messages, workers, groups, turns, logs, tool calls,
 verification evidence, gate evaluations, memories, files,
-browser history/artifacts, email, calendar, schedules, events
+browser history/artifacts, email, calendar, CRM, schedules, events
 ```
 
 Each result carries provenance:

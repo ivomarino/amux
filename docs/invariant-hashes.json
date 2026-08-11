@@ -8,7 +8,7 @@
     "title": "No-stall guarantee (the cardinal acceptance criterion)"
   },
   "Invariant 11": {
-    "hash": "b405fbe0bf9b2a3b",
+    "hash": "2cc74e0d3e89a553",
     "title": "Worker state is always current"
   },
   "Invariant 12": {
@@ -28,7 +28,7 @@
     "title": "Three cardinal rules"
   },
   "Invariant 16": {
-    "hash": "b8ea9b7225ed44ba",
+    "hash": "f779aac7da57b9f5",
     "title": "Token budgets are a runtime primitive"
   },
   "Invariant 17": {
@@ -64,7 +64,7 @@
     "title": "Server-side integration degradation"
   },
   "Invariant 24": {
-    "hash": "c54af50da138ebb2",
+    "hash": "7c727ef78e301116",
     "title": "Immutable event history"
   },
   "Invariant 25": {
@@ -92,7 +92,7 @@
     "title": "Board is the system of record for all work"
   },
   "Invariant 30": {
-    "hash": "bde12cced1493afe",
+    "hash": "ded1c34bf049bf36",
     "title": "Structured events for machines, append-only logs for humans"
   },
   "Invariant 31": {
@@ -104,7 +104,7 @@
     "title": "Universal search without embeddings"
   },
   "Invariant 33": {
-    "hash": "344fded08f64cbc3",
+    "hash": "5efe497978c16218",
     "title": "Backend independence"
   },
   "Invariant 34": {
@@ -176,7 +176,7 @@
     "title": "Failure feeds forward -- retries are not re-rolls"
   },
   "Invariant 5": {
-    "hash": "224750ba2f20dad1",
+    "hash": "dbb7edaf47211550",
     "title": "Typed command/event protocol (the D1 exit)"
   },
   "Invariant 50": {
