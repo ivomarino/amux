@@ -46,6 +46,9 @@ use std::sync::{Arc, Mutex};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_messages).post(create_message))
+        // Human-message -> tracked-work accountability (AMUX-2986). Placed
+        // BEFORE "/{id}" so the literal path is not swallowed by the id capture.
+        .route("/accountability", get(accountability))
         .route("/{id}", get(get_message))
         .route("/{id}/ack", post(ack_message))
         .route("/{id}/acted", post(acted_message))
@@ -435,6 +438,160 @@ pub async fn list_messages(
     let items: Vec<Value> = rows.iter().map(message_body).collect();
     match PagedResponse::new(items, total, offset, limit) {
         Ok(page) => Json(serde_json::to_value(&page).unwrap_or(Value::Null)).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+// ---- GET /api/messages/accountability -------------------------------------
+//
+// "Did every human message become executed work accountable by a worker?"
+// (Ethan, 2026-08-12; AMUX-2985/2986/2987). The honest answer needs a JOIN
+// nothing exposed: human messages live in `cmd_history` (type='user', empty
+// origin — the [HH:MM] dashboard sends; a scheduler carries origin=<title>, an
+// agent carries origin=<session>), and the work lives on the board (`issues`).
+//
+// There is NO per-message->card link today (cmd_history.card_id is NULL for
+// 100% of human messages), so this cannot claim "ask X was done by card Y".
+// What it CAN do, honestly, is the PROXY: per target worker, count human
+// messages in the window against cards that worker CREATED or MOVED in the same
+// window, and flag a worker that received messages but produced zero board
+// activity. That flag is the self-surfacing signal (ethos rule 4) the drive
+// loop can nudge on — the manual cross-reference that produced the first audit
+// was exactly the instrument that should not have to be hand-run.
+
+#[derive(Deserialize)]
+pub struct AccountabilityParams {
+    /// Look-back window in hours (default 24).
+    #[serde(default = "default_since_h")]
+    pub since_h: u64,
+}
+
+fn default_since_h() -> u64 {
+    24
+}
+
+pub async fn accountability(
+    State(state): State<AppState>,
+    Query(p): Query<AccountabilityParams>,
+) -> Response {
+    let since_h = p.since_h.clamp(1, 24 * 30);
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let conn = store.read()?;
+        let now_s = Utc::now().timestamp();
+        let cutoff_s = now_s - (since_h as i64) * 3600;
+        let cutoff_ms = cutoff_s * 1000; // cmd_history.ts is MILLISECONDS; issues.* are seconds.
+
+        // Per worker: human messages, latest ts/snippet, and how many carried a
+        // card_id (the systemic-linkage measure — expected ~0 today).
+        #[derive(Default)]
+        struct Row {
+            msgs: u64,
+            linked: u64,
+            latest_ts_ms: i64,
+            latest_snippet: String,
+            created: u64,
+            moved: u64,
+        }
+        let mut rows: std::collections::BTreeMap<String, Row> = std::collections::BTreeMap::new();
+
+        let mut stmt = conn.prepare(
+            "SELECT session, ts, card_id, substr(text,1,80) \
+             FROM cmd_history \
+             WHERE type='user' AND origin='' AND ts >= ?1 \
+             ORDER BY ts DESC",
+        )?;
+        let mut q = stmt.query(params![cutoff_ms])?;
+        while let Some(r) = q.next()? {
+            let session: String = r.get(0)?;
+            if session.is_empty() {
+                continue;
+            }
+            let ts: i64 = r.get(1)?;
+            let card_id: Option<String> = r.get(2)?;
+            let snippet: String = r.get::<_, String>(3)?.replace(['\n', '\r'], " ");
+            let e = rows.entry(session).or_default();
+            e.msgs += 1;
+            if card_id.as_deref().map(|c| !c.is_empty()).unwrap_or(false) {
+                e.linked += 1;
+            }
+            if ts > e.latest_ts_ms {
+                e.latest_ts_ms = ts;
+                e.latest_snippet = snippet;
+            }
+        }
+
+        // Per worker: board cards created / moved in the same window. Only
+        // sessions that received a human message matter here.
+        let mut bstmt = conn.prepare(
+            "SELECT session, \
+                    SUM(CASE WHEN created >= ?1 THEN 1 ELSE 0 END), \
+                    SUM(CASE WHEN updated >= ?1 THEN 1 ELSE 0 END) \
+             FROM issues \
+             WHERE COALESCE(deleted,0)=0 AND (created >= ?1 OR updated >= ?1) \
+             GROUP BY session",
+        )?;
+        let mut bq = bstmt.query(params![cutoff_s])?;
+        while let Some(r) = bq.next()? {
+            let session: String = r.get(0)?;
+            if let Some(e) = rows.get_mut(&session) {
+                e.created = r.get::<_, i64>(1)? as u64;
+                e.moved = r.get::<_, i64>(2)? as u64;
+            }
+        }
+
+        let mut workers = Vec::new();
+        let mut unaccounted = Vec::new();
+        let mut total_msgs = 0u64;
+        let mut total_linked = 0u64;
+        for (session, e) in &rows {
+            total_msgs += e.msgs;
+            total_linked += e.linked;
+            // A worker with messages but zero board activity has no tracked work
+            // to show for the asks. NOTE it is a proxy: a terse "continue"/"do
+            // it", or a board-less personal lane, lands here legitimately — the
+            // flag is a prompt to look, not a verdict of failure.
+            let accounted = e.created > 0 || e.moved > 0;
+            let entry = json!({
+                "worker": session,
+                "human_messages": e.msgs,
+                "messages_linked_to_a_card": e.linked,
+                "cards_created_in_window": e.created,
+                "cards_moved_in_window": e.moved,
+                "latest_message_snippet": e.latest_snippet,
+                "verdict": if accounted { "tracking" } else { "no-board-activity" },
+            });
+            if !accounted {
+                unaccounted.push(json!({"worker": session, "human_messages": e.msgs,
+                    "latest_message_snippet": e.latest_snippet}));
+            }
+            workers.push(entry);
+        }
+        // Loudest gaps first: most messages with no board activity on top.
+        workers.sort_by(|a, b| {
+            b["human_messages"].as_u64().unwrap_or(0).cmp(&a["human_messages"].as_u64().unwrap_or(0))
+        });
+        unaccounted.sort_by(|a, b| {
+            b["human_messages"].as_u64().unwrap_or(0).cmp(&a["human_messages"].as_u64().unwrap_or(0))
+        });
+
+        Ok(json!({
+            "since_h": since_h,
+            "total_human_messages": total_msgs,
+            "total_linked_to_a_card": total_linked,
+            "linkage_note": "cmd_history.card_id is the ONLY hard link from an ask to its work; \
+                             it is ~0 today, so `verdict` is a board-activity PROXY, not proof a \
+                             specific ask was executed. The durable fix is stamping card_id when a \
+                             worker opens a card from a message (AMUX-2986).",
+            "workers": workers,
+            "unaccounted": unaccounted,
+            "unaccounted_count": unaccounted.len(),
+        }))
+    })
+    .await;
+    match joined {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
     }
 }
@@ -859,6 +1016,58 @@ mod tests {
 
         let (st, _) = send(&app, "GET", "/api/messages/msg_missing", None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accountability_flags_a_worker_with_messages_but_no_board_activity() {
+        let (app, store, _dir) = app();
+        let now_s = Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // w-gap: got a human message, produced no board card. w-ok: got a human
+        // message AND created a card in-window. w-sched: a SCHEDULER message
+        // (origin set) that must be excluded from the human count.
+        store
+            .write(move |conn| {
+                let ins_msg = |session: &str, origin: &str, ty: &str, ts: i64| {
+                    conn.execute(
+                        "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES (?1,?2,?3,?4,?5)",
+                        params![format!("ask for {session}"), ty, session, ts, origin],
+                    )
+                    .unwrap();
+                };
+                ins_msg("w-gap", "", "user", now_ms - 1000);
+                ins_msg("w-ok", "", "user", now_ms - 1000);
+                ins_msg("w-sched", "Daily thing", "user", now_ms - 1000); // origin set -> not human
+                // A board card w-ok created just now; w-gap has none.
+                conn.execute(
+                    "INSERT INTO issues (id,title,status,session,created,updated) VALUES ('I-OK','t','todo','w-ok',?1,?1)",
+                    params![now_s],
+                )
+                .unwrap();
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let (st, v) = send(&app, "GET", "/api/messages/accountability?since_h=24", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Only the two human messages count; the scheduler one is excluded.
+        assert_eq!(v["total_human_messages"], json!(2), "{v}");
+        let unacc: Vec<&str> = v["unaccounted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|u| u["worker"].as_str())
+            .collect();
+        assert_eq!(unacc, vec!["w-gap"], "only the worker with no board activity is flagged: {v}");
+        // And w-ok reads as tracking, not flagged.
+        let ok_row = v["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["worker"] == "w-ok")
+            .unwrap();
+        assert_eq!(ok_row["verdict"], json!("tracking"));
+        assert_eq!(ok_row["cards_created_in_window"], json!(1));
     }
 
     #[tokio::test]
