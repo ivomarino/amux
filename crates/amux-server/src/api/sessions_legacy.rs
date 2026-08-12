@@ -992,6 +992,45 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             return Ok(c.1.clone());
         }
     }
+    // SINGLE-FLIGHT, STALE-WHILE-REVALIDATE (AR-135). The build holds a pooled
+    // read connection across ~100 tmux + git subprocesses (80-950ms), and the
+    // pool is only CPU-count deep. When the 2s TTL expired under a client
+    // burst, EVERY concurrent request became a builder, each holding a
+    // connection for the better part of a second — and the pool starved.
+    // Measured 08-10 13:03-13:05: ten "timed out waiting for connection" 5xxs
+    // across /api/sessions, /api/board/statuses, /api/board/session-gates and
+    // /api/calendar.ics, real iPhone/macOS clients; two more 08-11 14:38. The
+    // victims were endpoints that never shell out at all — they just could not
+    // get a connection because five copies of THIS function held them.
+    //
+    // try_lock, never lock: this runs on the async executor, so blocking here
+    // would trade pool starvation for executor starvation. Exactly one caller
+    // rebuilds; everyone else gets the last snapshot, which for a 2s-TTL list
+    // is at worst a couple of seconds staler than they hoped — the same
+    // trade the cache itself already made.
+    static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_flight) = FLIGHT.try_lock() else {
+        if let Ok(c) = build_array_cache().lock() {
+            if !c.1.is_empty() {
+                return Ok(c.1.clone());
+            }
+        }
+        // Cold start with a builder already in flight: fall through and build
+        // anyway — an empty answer would render an empty fleet as truth.
+        return {
+            let conn = store.read()?;
+            let arr = build_array(&conn)?;
+            let json = serde_json::to_string(&arr)?;
+            Ok(json)
+        };
+    };
+    // Double-check under the flight lock: the previous holder may have just
+    // refreshed, and rebuilding immediately would waste its work.
+    if let Ok(c) = build_array_cache().lock() {
+        if now - c.0 < ttl && !c.1.is_empty() {
+            return Ok(c.1.clone());
+        }
+    }
     let conn = store.read()?;
     let arr = build_array(&conn)?;
     let json = serde_json::to_string(&arr)?;
