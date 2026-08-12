@@ -849,6 +849,37 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
         };
     }
 
+    // BOUNCE-LOOP BREAKER (backend, 2026-08-11). A lane that keeps returning
+    // its pickups to todo converts its queue into 24h reclaim-cooldowns at
+    // one card per tick — measured 16 claims in one hour, 19 cards enriched
+    // with notes and nothing executed, and the drive kept feeding it. Three
+    // bounced claims inside two hours means the NEXT card will not fare
+    // better: stop dealing, say so in the trace, and let the advance/nudge
+    // paths (and the fixed pickup prompt's honest exits) resolve the state.
+    // The breaker clears itself: it counts only claims whose card is BACK in
+    // todo, so moving any of them forward (or to backlog/review) releases it.
+    let bounced: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_events e WHERE e.type='task.claimed' \
+             AND e.session=?1 AND e.ts > ?2 \
+             AND EXISTS (SELECT 1 FROM issues i WHERE i.status='todo' AND i.deleted IS NULL \
+                         AND e.data LIKE '%\"' || i.id || '\"%')",
+            rusqlite::params![session, now - 7200.0],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if bounced >= 3 {
+        tracing::warn!(session = %session, bounced,
+            "pickup bounce-loop: this lane returned its recent pickups to todo — dealing it more cards would only burn cooldowns");
+        return Pickup::None {
+            reason: "bounce-loop",
+            detail: format!(
+                "{bounced} claims in the last 2h are back in todo — the lane is declining \
+                 pickups, not working them; withholding further cards until one moves"
+            ),
+        };
+    }
+
     // py:14487 candidate selection. Board drag order IS the priority queue
     // (AMUX-2128): `pos` is what the user reorders in the UI, so dragging a card
     // up prioritizes it; `created` breaks ties for never-dragged cards.
@@ -1301,13 +1332,26 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         // the count is context; above it, grinding one-at-a-time is the wrong
         // shape and saying so is the whole point.
         if qn >= 10 {
+            // The re-shape instruction MUST name its honest exits, or it
+            // manufactures a decline loop (backend, 2026-08-11: 19 pickups in
+            // an afternoon each ended `doing -> todo` with analysis appended
+            // and nothing executed — a compliant reading of the old wording.
+            // Every bounce armed the 24h reclaim cooldown, so the lane
+            // triaged its whole queue into undispatchability in two hours
+            // while reading as busy. The instruction and the failure were the
+            // same action — the AMUX-2140 class.)
             qnote.push_str(
                 " That is a BACKLOG, not a work queue, and picking it up one card per turn costs \
                  a full scope-and-decide cycle each time. Before working through it: check \
                  whether these are actually READY (a card that is real work but not yet ready is \
                  `backlog`, not `todo` — backlog is never auto-picked), and whether several \
-                 should be handled together or triaged in one pass. Say so and re-shape the \
-                 queue rather than grinding it.",
+                 should be handled together or triaged in one pass. Re-shaping means MOVING \
+                 cards: not-ready ones to `backlog` (with what would make them ready), \
+                 owner-blocked ones to review/reassigned. It never means returning a READY card \
+                 to todo with notes — a todo-bounce re-queues it behind a 24h cooldown, and a \
+                 lane that bounces every pickup converts its whole queue into cooldown while \
+                 doing no work. THIS card you claimed: either advance it one real step now, or \
+                 move it where it honestly belongs.",
             );
         }
     }
@@ -2940,6 +2984,37 @@ mod tests {
         conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
+    /// bounced `doing -> todo` with notes, nothing executed — and the drive
+    /// kept dealing. Three bounced claims in 2h now stop the deal. The
+    /// controls: two bounces do NOT trip it, and a bounced card that MOVED
+    /// (worked, or re-shaped to backlog) no longer counts toward the trip.
+    #[test]
+    fn a_lane_bouncing_its_pickups_stops_being_dealt_cards() {
+        let conn = board_db();
+        let now = now_f64();
+        for n in 1..=3 {
+            add_card(&conn, &format!("B-{n}"), "lane", "todo", "bounced back", "SCOPE: x\n- [ ] y");
+            conn.execute(
+                "INSERT INTO session_events (session, type, ts, data) VALUES ('lane','task.claimed',?1,?2)",
+                rusqlite::params![now - 600.0 * n as f64, format!("{{\"issue\":\"B-{n}\",\"status\":\"doing\"}}")],
+            )
+            .expect("claim event");
+        }
+        add_card(&conn, "T-1", "lane", "todo", "fresh work", "SCOPE: x\n- [ ] y");
+        match select_pickup(&conn, "lane", now) {
+            Pickup::None { reason, .. } => assert_eq!(reason, "bounce-loop"),
+            _ => panic!("three bounced claims in 2h must stop the deal"),
+        }
+        // Working one of them (todo -> done) releases the breaker: only
+        // claims whose card is still parked in todo count.
+        conn.execute("UPDATE issues SET status='done' WHERE id='B-1'", []).expect("advance");
+        assert!(
+            !matches!(select_pickup(&conn, "lane", now), Pickup::None { reason: "bounce-loop", .. }),
+            "moving a bounced card must release the breaker"
+        );
     }
 
     /// Ethan/backend 2026-08-11: BACKE-3249 sat `doing` + needs:you for 31
