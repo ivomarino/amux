@@ -4,6 +4,55 @@
 //! structural fix in the Rust system, named so `incident_regression::*`
 //! greps to its origin. A regression suite assembled from imagined failures
 //! tests things that were never going to break — these all actually broke.
+//!
+//! ── THE 12 RUST-CUTOVER FAILURES (AMUX-2627, enumeration = the card's FIRST
+//!    STEP) ────────────────────────────────────────────────────────────────
+//!
+//! The 4 tests below predate the cutover (they pin PYTHON-era incidents). The
+//! card asks for the migration's OWN 12 failures. Enumerated here from the
+//! cards that recorded them, each mapped to the INVARIANT it revealed and
+//! WHERE that invariant is already enforced — because most of them already are,
+//! by the census guards built after the cutover:
+//!
+//!   ROUTE-EXISTENCE CLASS — a shipped client called a path this server did not
+//!   mount (405/404). ALL of these are now regression-covered by ONE living
+//!   check, `route.callers_have_routes` (src/invariants/checks.rs), which
+//!   enumerates every SPA/CLI call site against the mounted table. Its
+//!   negative-control test `detects_the_workers_send_405_that_shipped`
+//!   (checks.rs:604) rebuilds the exact production 405 and asserts the check
+//!   FAILS on it — i.e. the regression test the card wants already exists, for
+//!   the whole class, and it can fail (ethos rule 7). Verified live 2026-08-12:
+//!   the check currently flags EXACTLY the two still-unported families
+//!   (/api/tts, /api/tunnel) and nothing else, so it is actively guarding.
+//!     - AMUX-2614  staged-guard 405
+//!     - AMUX-2615  /api/workers/<n>/send 405   (negative control cites this one)
+//!     - AMUX-2665  DELETE /api/sessions/<n> 405
+//!     - AMUX-2669  rename 404
+//!     - AMUX-2647  /api/schedules dead
+//!     - AMUX-2630  /api/board/clear-done
+//!     - d177625    /api/lookup
+//!   Also cross-checked by `tests/route_table.rs` (the mounted table matches
+//!   the router, both directions) and `route.method_allowed`.
+//!
+//!   BEHAVIORAL CLASS — the route existed but did the wrong thing. These are
+//!   NOT covered by the census and are the real remaining test-work; each needs
+//!   its own test AND per-incident archaeology to verify it fails pre-fix
+//!   (use `<sha>^`, never HEAD~1 — shared checkout):
+//!     - AMUX-2616     auto-pickup selected nothing (dispatch predicate)
+//!     - AMUX-2653     SIGPIPE crashed the process on a closed client
+//!     - AMUX-2672     port default — CAUTION: DEFAULT_PORT is 8823 BY DESIGN
+//!                     (install.sh sets AMUX_RS_PORT=8824); a test asserting
+//!                     "default == 8824" is WRONG. The incident was narrower
+//!                     than "the default is wrong"; read the card's artifact
+//!                     before writing this one. (Nearly shipped that wrong test
+//!                     while enumerating this — recorded so the next person does
+//!                     not.)
+//!     - AC-322/323   CLI `force` + `progress` verbs (bash, not rust-unit)
+//!     - AMUX-2679/80 scheduler skip 405 + inert editor fields
+//!
+//! STATUS: route-existence class (7) is covered and live-verified; the 5
+//! behavioral items are the open work, itemized so the next pass writes tests
+//! against real artifacts rather than assumptions. See AMUX-2627.
 
 use amux_server::db::{PendingEvent, Store, WriteOutcome};
 use std::sync::Arc;
