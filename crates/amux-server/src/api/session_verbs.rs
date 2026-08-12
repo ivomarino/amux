@@ -1367,7 +1367,7 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     if files.is_empty() {
         return None;
     }
@@ -5564,7 +5564,7 @@ fn get_claude_stats(work_dir: &str) -> Value {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     let Some((_, newest)) = files.first() else {
         return json!({"tokens": 0, "last_active": ""});
     };
@@ -5947,7 +5947,7 @@ fn backup_session_jsonl(name: &str, reason: &str) -> Option<String> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     let (_, src) = files.first()?;
     let dest_dir = transcripts_dir().join(name);
     std::fs::create_dir_all(&dest_dir).ok()?;
@@ -5962,7 +5962,7 @@ fn backup_session_jsonl(name: &str, reason: &str) -> Option<String> {
             .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
             .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
             .collect();
-        backups.sort_by(|a, b| a.0.cmp(&b.0));
+        backups.sort_by_key(|e| e.0);
         let excess = backups.len().saturating_sub(20);
         for (_, old) in backups.into_iter().take(excess) {
             let _ = std::fs::remove_file(old);
@@ -5980,7 +5980,7 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     files
         .into_iter()
         .filter_map(|(_, f)| {
@@ -9261,7 +9261,7 @@ fn find_latest_session_id(work_dir: &str) -> String {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     for (_, f) in files {
         for entry in iter_jsonl_tail(&f, u64::MAX) {
             if matches!(entry["type"].as_str(), Some("user") | Some("assistant")) {

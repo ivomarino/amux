@@ -1310,7 +1310,7 @@ fn du_top(paths: &[std::path::PathBuf], limit: usize) -> Vec<(String, u64)> {
             Some((p.display().to_string(), kb * 1024))
         })
         .collect();
-    sized.sort_by(|a, b| b.1.cmp(&a.1));
+    sized.sort_by_key(|e| std::cmp::Reverse(e.1));
     sized.truncate(limit);
     sized
 }

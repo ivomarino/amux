@@ -1560,7 +1560,7 @@ fn lib_facets(books: &[Value]) -> Value {
     }
     let top = |d: &std::collections::HashMap<String, i64>, n: usize| -> Vec<Value> {
         let mut kv: Vec<(&String, &i64)> = d.iter().collect();
-        kv.sort_by(|a, b| (-a.1, a.0.to_lowercase()).cmp(&(-b.1, b.0.to_lowercase())));
+        kv.sort_by_key(|e| (std::cmp::Reverse(e.1), e.0.to_lowercase()));
         kv.into_iter().take(n).map(|(k, v)| json!({"name": k, "count": v})).collect()
     };
     json!({
