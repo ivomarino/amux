@@ -385,7 +385,95 @@ pub fn prose_dependency(blob: &str) -> Option<String> {
         )
         .expect("prose dep regex")
     });
-    re.captures(blob).and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+    // DIRECTION, not just presence (AMUX-2948). The phrase alone does not say
+    // WHICH card is blocked, and the reverse construction is ordinary English
+    // on a well-written card:
+    //
+    //     "Evidence record: BACKE-3272. Fix that depends on this: BACKE-3276."
+    //
+    // That declares BACKE-3276 a DEPENDENT of this card. The matcher read it as
+    // "this is blocked by BACKE-3276" and refused to dispatch — and because the
+    // refusal guard runs per card, every todo carrying a downstream-work note
+    // was held. Measured on backend 2026-08-11: 17 eligible todos, ALL refused,
+    // lane idle with auto-pickup enabled and the drive loop running. The
+    // skip detail even told the operator to "POPULATE depends_on", which is
+    // sound advice that nobody had followed on any of the 17.
+    //
+    // `this`/`these`/`the above` between the phrase and the id is the tell: the
+    // subject of the dependency is THIS card, so the id named is the dependent,
+    // not the blocker. Deliberately narrow — it rejects a reversed reading
+    // rather than trying to parse the sentence, and when it is unsure it still
+    // blocks, which is the safe direction for a dispatch gate.
+    let c = re.captures(blob)?;
+    let whole = c.get(0)?.as_str();
+    let id = c.get(1)?.as_str();
+    let between = &whole[..whole.len() - id.len().min(whole.len())];
+    let reversed = ["this", "these", "the above", "us"]
+        .iter()
+        .any(|w| between.to_ascii_lowercase().contains(w));
+    if reversed {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+#[cfg(test)]
+mod prose_direction_tests {
+    use super::prose_dependency;
+
+    /// THE SPECIMEN, verbatim from BACKE-3278 (AMUX-2948). This sentence
+    /// declares a DEPENDENT, and reading it as a blocker held backend's entire
+    /// queue: 17 eligible todos, all refused, lane idle with auto-pickup on.
+    #[test]
+    fn a_downstream_dependent_does_not_block_this_card() {
+        let blob = "Evidence record: BACKE-3272. Fix that depends on this: BACKE-3276.                     Migration (owner-gated): BACKE-3277.";
+        assert_eq!(
+            prose_dependency(blob),
+            None,
+            "\"depends on this: X\" names X as the DEPENDENT — this card is not blocked by it"
+        );
+    }
+
+    /// The forward direction must still block, or the fix trades a stalled lane
+    /// for a dispatch that ignores real dependencies — strictly worse, and
+    /// invisible until something ships out of order.
+    #[test]
+    fn a_real_blocker_still_blocks() {
+        // WRITTEN TO WHAT THE REGEX ACTUALLY MATCHES, after two drafts that
+        // were not. It is case-SENSITIVE ("Cannot start until X" at the head of
+        // a sentence has never matched) and it takes `waits?`, not `waiting`.
+        // Both of my first fixtures asserted capability the code never had, so
+        // the red was mine rather than the fix's — the same "verify the fixture
+        // is actually broken" trap this repo keeps paying for, twice in one
+        // function.
+        //
+        // Both gaps are real and filed (AMUX-2949). Deliberately NOT widened
+        // here: broadening the matcher newly BLOCKS cards that dispatch fine
+        // today, and this change exists to unstall a lane, not to stall more.
+        for blob in [
+            "this is blocked by BACKE-3276 until the cache lands.",
+            "cannot start until BACKE-3276 ships.",
+            "depends on BACKE-3276",
+            "waits on BACKE-3276 to land",
+            "blocked on BACKE-3276",
+        ] {
+            assert_eq!(
+                prose_dependency(blob),
+                Some("BACKE-3276".to_string()),
+                "must still block: {blob:?}"
+            );
+        }
+    }
+
+    /// A bare citation was never matched and must stay unmatched — the guard
+    /// keys on dependency LANGUAGE, which is what makes it usable at all on a
+    /// fleet whose cards cite each other constantly (backend's 17 todos carry
+    /// up to 9 citations each).
+    #[test]
+    fn a_bare_citation_is_not_a_dependency() {
+        assert_eq!(prose_dependency("See BACKE-3276 for the measurement."), None);
+        assert_eq!(prose_dependency("Split from BACKE-3276; supersedes AC-12."), None);
+    }
 }
 
 /// py:13126 `_norm_actor` — a session name reduced to a comparable form.
