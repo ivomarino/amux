@@ -418,6 +418,9 @@ pub async fn tick(state: &AppState) -> (Confidence, usize) {
     let t0 = std::time::Instant::now();
     let results = evaluate_all(state).await;
     let conf = super::rollup(&results);
+    // Publish for /health (AMUX-2625): the endpoint everyone polls reads this
+    // cached verdict rather than re-running the suite per request.
+    super::record_confidence(conf, chrono::Utc::now().timestamp() as f64);
     let opened = store::record(&state.store, results, t0.elapsed().as_millis() as i64).await;
     if opened > 0 {
         tracing::warn!(opened, confidence = conf.as_str(), "invariant incidents opened");

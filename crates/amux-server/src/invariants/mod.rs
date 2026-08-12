@@ -168,6 +168,49 @@ impl Confidence {
     }
 }
 
+/// Last confidence the monitor rolled up, with the epoch it was computed at
+/// (AMUX-2625 item 2). `/health` reads this — a cheap mutex, no DB, no
+/// dependency on the monitor being alive — so the ONE endpoint every consumer
+/// polls can express the four states. The staleness gate below is the whole
+/// point: an old verdict is `Unknown`, never a stale `Healthy`, because a dead
+/// monitor rendering "all good" is exactly the invisible-failure this card is
+/// about.
+fn last_conf_cell() -> &'static std::sync::Mutex<Option<(Confidence, f64)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<(Confidence, f64)>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Called by the monitor after each roll-up.
+pub fn record_confidence(c: Confidence, ts: f64) {
+    if let Ok(mut g) = last_conf_cell().lock() {
+        *g = Some((c, ts));
+    }
+}
+
+/// `(confidence, age_s)` for `/health`. Evidence older than
+/// `AMUX_HEALTH_CONF_STALE_S` (default 120s — a few monitor ticks) collapses to
+/// `Unknown` while still reporting its age, so a wedged monitor shows as
+/// `unknown` with a growing age rather than a frozen `healthy`. Never recorded
+/// yet -> `Unknown` with no age.
+pub fn health_confidence(now: f64) -> (Confidence, Option<f64>) {
+    let stale = std::env::var("AMUX_HEALTH_CONF_STALE_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(120.0);
+    match last_conf_cell().lock().ok().and_then(|g| *g) {
+        Some((c, ts)) => {
+            let age = (now - ts).max(0.0);
+            if age > stale {
+                (Confidence::Unknown, Some(age))
+            } else {
+                (c, Some(age))
+            }
+        }
+        None => (Confidence::Unknown, None),
+    }
+}
+
 /// Roll a set of results into one confidence verdict.
 ///
 /// An empty set is `Unknown`, NOT `Healthy` — "nothing ran" must never render
@@ -212,6 +255,26 @@ mod tests {
     #[test]
     fn empty_is_unknown_not_healthy() {
         assert_eq!(rollup(&[]), Confidence::Unknown);
+    }
+
+    /// /health's confidence read (AMUX-2625 item 2): fresh verdict passes
+    /// through, a STALE one collapses to Unknown (a wedged monitor must not
+    /// freeze on `healthy`), and the age is always reported once anything has
+    /// been recorded. Serialised because it mutates the process-global cell.
+    #[test]
+    fn health_confidence_is_fresh_through_stale_unknown() {
+        std::env::set_var("AMUX_HEALTH_CONF_STALE_S", "120");
+        record_confidence(Confidence::Healthy, 1_000.0);
+        // 30s old -> passes through.
+        let (c, age) = health_confidence(1_030.0);
+        assert_eq!(c, Confidence::Healthy);
+        assert_eq!(age, Some(30.0));
+        // 200s old (> 120 stale) -> Unknown, but the age still shows so a
+        // wedged monitor is visible rather than silently green.
+        let (c, age) = health_confidence(1_200.0);
+        assert_eq!(c, Confidence::Unknown);
+        assert_eq!(age, Some(200.0));
+        std::env::remove_var("AMUX_HEALTH_CONF_STALE_S");
     }
 
     /// Unknown must survive the rollup rather than being rounded to a pass —
