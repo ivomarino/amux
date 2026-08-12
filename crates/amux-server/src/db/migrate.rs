@@ -224,14 +224,18 @@ fn guard_live_db(db_path: &std::path::Path, pending: &[&str]) -> anyhow::Result<
 /// The guard with its one environmental input injected.
 ///
 /// Split out so the positive test can supply a cargo-target-shaped path
-/// instead of asserting something about where IT happens to have been built.
-/// That assertion was a real trap: `is_cargo_target_build` deliberately does
-/// NOT match `~/.amux/rust-build-target/` (it needs a leading-slash
-/// `/target/`), which is exactly the shared build dir the workflow tells every
-/// session to use — so running the sanctioned command failed the test, on code
-/// that was entirely correct. A test whose precondition depends on the build
-/// location cannot survive a change in build location, and the fleet is
-/// changing its build location precisely to stop making 15GB target trees.
+/// instead of asserting something about where IT happens to have been built —
+/// a test whose precondition depends on the build location cannot survive a
+/// change in build location.
+///
+/// NB an earlier version of this paragraph described `is_cargo_target_build`
+/// as "deliberately not matching ~/.amux/rust-build-target/" — PAST behaviour,
+/// stated in the present tense. That non-match was the AMUX-2799 hole (guard
+/// off for the mandated build dir, on for the banned one) and it is FIXED: the
+/// matcher now keys on the debug/release profile component, which the shared
+/// dir does contain. See is_cargo_target_build's own doc for the full arc. The
+/// paragraph is corrected because a comment describing a closed hole as
+/// current design is how the hole gets faithfully re-implemented.
 fn guard_live_db_with_exe(
     db_path: &std::path::Path,
     pending: &[&str],
