@@ -260,7 +260,7 @@ pub async fn auth_url(
         );
     }
     // THE CALLBACK PORT MUST BE ONE WE ANSWER, and since 2026-08-11 it is not
-    // (AMUX-2942). GMAIL_REDIRECT_URI is hardcoded to the retired address; the
+    // (AMUX-2943). GMAIL_REDIRECT_URI is hardcoded to the retired address; the
     // compatibility bind that used to answer it was dropped on Ethan's call
     // ("no more 8822 just rust"), with the Gmail cost accepted knowingly.
     //
@@ -283,14 +283,14 @@ pub async fn auth_url(
     let canonical = crate::config::canonical_port();
     if redirect_port.is_some_and(|p| p != canonical) {
         let warning = format!(
-            "This authorization WILL FAIL at the redirect. The registered callback points at port              {} and this server answers {}, so Google will send the browser to a port nothing is              listening on — amux never sees the callback, which is why nothing else will report              an error. FIX (needs the Google Cloud console, which is Ethan's): register              http://localhost:{}/api/gmail/callback for this client_id, then GMAIL_REDIRECT_URI              is changed to match. Card: AMUX-2942.",
+            "This authorization WILL FAIL at the redirect. The registered callback points at port              {} and this server answers {}, so Google will send the browser to a port nothing is              listening on — amux never sees the callback, which is why nothing else will report              an error. FIX (needs the Google Cloud console, which is Ethan's): register              http://localhost:{}/api/gmail/callback for this client_id, then GMAIL_REDIRECT_URI              is changed to match. Card: AMUX-2943.",
             redirect_port.unwrap_or(0),
             canonical,
             canonical
         );
         tracing::warn!(
             target: "gmail_auth",
-            "[gmail/AMUX-2942] auth URL issued for {account} with a callback on port {} that this \
+            "[gmail/AMUX-2943] auth URL issued for {account} with a callback on port {} that this \
              server does not answer (canonical {}) — the redirect will dead-end silently",
             redirect_port.unwrap_or(0),
             canonical
