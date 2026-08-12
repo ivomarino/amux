@@ -159,10 +159,73 @@ fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
 /// ~100 tmux subprocesses for previews + N git subprocesses + ~226 filesystem
 /// reads, a 2s TTL collapses the real work by ~2x while being invisible to a
 /// human polling the dashboard.
-fn build_array_cache() -> &'static std::sync::Mutex<(f64, String)> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<(f64, String)>> =
+struct ListSnapshot {
+    /// When the build that produced `json` was entered.
+    stamp: f64,
+    /// The serialized array; empty = no snapshot (cold or invalidated).
+    json: String,
+    /// `SESSIONS_EPOCH` at build start — serving requires it unchanged.
+    epoch: u64,
+    /// `registry_fingerprint()` at build start — see that function.
+    registry: u64,
+}
+
+fn build_array_cache() -> &'static std::sync::Mutex<ListSnapshot> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ListSnapshot>> =
         std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new((0.0, String::new())))
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(ListSnapshot {
+            stamp: 0.0,
+            json: String::new(),
+            epoch: 0,
+            registry: 0,
+        })
+    })
+}
+
+/// Invalidation epoch (AMUX-2960): bumped by [`invalidate_sessions_cache`].
+/// A builder snapshots it before building and only writes its result back if
+/// no invalidation landed mid-build. Without this, a build that STARTED
+/// before a worker create finishes AFTER the create's invalidation and stamps
+/// the pre-create list into the cache — resurrecting exactly the staleness
+/// the invalidation was for.
+static SESSIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Order-independent fingerprint of WHICH workers exist: the set of `*.env`
+/// stems in the sessions dir.
+///
+/// This is the structural half of AMUX-2960. The per-call-site
+/// `invalidate_sessions_cache()` discipline failed twice in one week — the
+/// AMUX-2926 config-write hole, then `create_session_legacy`/`delete_post`
+/// writing the registry with no invalidation, which made the worker-card-counts
+/// e2e flaky-red for a day (the SPA's one post-reload fetch served the
+/// pre-create fleet and SSE never corrected it). A guard on the substrate
+/// covers the NEXT forgotten call site too, and any out-of-band write (a human
+/// `rm`, the bash CLI).
+///
+/// Deliberately the `.env` NAME SET, not the dir mtime: `.meta.json` files in
+/// the same dir churn on every send fleet-wide, so an mtime guard would
+/// invalidate ~every request and resurrect the AR-135 pool-starvation
+/// stampede this cache exists to prevent. Content edits inside an env file
+/// don't move the set — those paths already invalidate explicitly.
+fn registry_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let dir = amux_home().join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut acc = 0u64;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("env") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                stem.hash(&mut h);
+                acc ^= h.finish(); // XOR: order-independent, names are unique
+            }
+        }
+    }
+    acc
 }
 
 /// Drop the cached session list so the very next GET rebuilds (AMUX-2926).
@@ -184,8 +247,12 @@ fn build_array_cache() -> &'static std::sync::Mutex<(f64, String)> {
 /// Cheap by construction — it clears one string; the next reader pays the
 /// rebuild it would have paid 2s later anyway.
 pub fn invalidate_sessions_cache() {
+    // Epoch first: an in-flight builder checks it AFTER building, so bumping
+    // before the clear means no interleaving lets a pre-bump build survive.
+    SESSIONS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut c) = build_array_cache().lock() {
-        *c = (0.0, String::new());
+        c.stamp = 0.0;
+        c.json.clear();
     }
     tracing::debug!(target: "amux::sessions", "sessions list cache invalidated by a config write");
 }
@@ -1015,9 +1082,23 @@ fn load_meta(name: &str) -> serde_json::Value {
 pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<String> {
     let ttl = env_secs("AMUX_SESSIONS_CACHE_TTL_S", 2.0);
     let now = chrono::Utc::now().timestamp() as f64;
+    let epoch_now = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
     if let Ok(c) = build_array_cache().lock() {
-        if now - c.0 < ttl && !c.1.is_empty() {
-            return Ok(c.1.clone());
+        if now - c.stamp < ttl && !c.json.is_empty() && c.epoch == epoch_now {
+            // Substrate guard (AMUX-2960): a fresh-looking snapshot whose
+            // worker SET no longer matches the registry on disk means an
+            // env file was created/deleted by a path that never called
+            // invalidate_sessions_cache(). Rebuild — and say so, because
+            // this line firing is how the next missing call site announces
+            // itself instead of shipping another flaky-stale list.
+            if c.registry == registry_fingerprint() {
+                return Ok(c.json.clone());
+            }
+            tracing::info!(
+                target: "amux::sessions",
+                "sessions registry changed on disk without an API invalidation — rebuilding \
+                 (a write path is missing invalidate_sessions_cache, or an out-of-band env-file write)"
+            );
         }
     }
     // SINGLE-FLIGHT, STALE-WHILE-REVALIDATE (AR-135). The build holds a pooled
@@ -1039,8 +1120,12 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     static FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let Ok(_flight) = FLIGHT.try_lock() else {
         if let Ok(c) = build_array_cache().lock() {
-            if !c.1.is_empty() {
-                return Ok(c.1.clone());
+            // Losers may serve a somewhat-stale snapshot (that is the
+            // stale-while-revalidate trade), but never one from before an
+            // invalidation — post-invalidation the json is empty, so they
+            // fall through and build.
+            if !c.json.is_empty() && c.epoch == epoch_now {
+                return Ok(c.json.clone());
             }
         }
         // Cold start with a builder already in flight: fall through and build
@@ -1055,15 +1140,39 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // Double-check under the flight lock: the previous holder may have just
     // refreshed, and rebuilding immediately would waste its work.
     if let Ok(c) = build_array_cache().lock() {
-        if now - c.0 < ttl && !c.1.is_empty() {
-            return Ok(c.1.clone());
+        if now - c.stamp < ttl
+            && !c.json.is_empty()
+            && c.epoch == epoch_now
+            && c.registry == registry_fingerprint()
+        {
+            return Ok(c.json.clone());
         }
     }
+    // Snapshot both guards BEFORE the build: a create/delete racing the build
+    // then fails the epoch check (API path) or the fingerprint check on the
+    // next read (out-of-band path), instead of hiding inside the snapshot.
+    let epoch_start = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    let registry_start = registry_fingerprint();
     let conn = store.read()?;
     let arr = build_array(&conn)?;
     let json = serde_json::to_string(&arr)?;
-    if let Ok(mut c) = build_array_cache().lock() {
-        *c = (now, json.clone());
+    if SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch_start {
+        if let Ok(mut c) = build_array_cache().lock() {
+            *c = ListSnapshot {
+                stamp: now,
+                json: json.clone(),
+                epoch: epoch_start,
+                registry: registry_start,
+            };
+        }
+    } else {
+        // The write-back race, caught: this build predates an invalidation.
+        // The caller still gets its (self-built, fresh-enough) answer; the
+        // CACHE must not, or the invalidation is undone.
+        tracing::debug!(
+            target: "amux::sessions",
+            "session-list build raced an invalidation — snapshot discarded, not cached"
+        );
     }
     Ok(json)
 }
@@ -1236,6 +1345,13 @@ pub async fn create_session_legacy(
         )
             .into_response();
     }
+    // The worker now exists on disk; the cached list must not outlive that
+    // fact (AMUX-2960). Without this the creator's own next fetch — the
+    // dashboard reloading after its Create dialog, the worker-card-counts
+    // e2e reloading after seeding — served the PRE-create fleet for up to
+    // TTL, and SSE never corrected it (this handler emits no revision
+    // event, a residual noted on the card).
+    invalidate_sessions_cache();
     (
         StatusCode::CREATED,
         Json(json!({

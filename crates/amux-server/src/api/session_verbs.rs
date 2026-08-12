@@ -9204,6 +9204,10 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     let _ = std::fs::remove_file(mem_file(name));
     let _ = std::fs::remove_file(meta_path(name));
     let _ = std::fs::remove_file(log_path(name));
+    // The registry just shrank; drop the cached fleet list so no reader is
+    // served a ghost of this worker for the next TTL (AMUX-2960 — the same
+    // hole create_session_legacy had on the grow side).
+    crate::api::sessions_legacy::invalidate_sessions_cache();
     // DB-side per-session state (Python clears in-memory maps; the durable
     // equivalents here are the steering queue rows).
     let n = name.to_string();

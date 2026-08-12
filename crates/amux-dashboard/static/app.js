@@ -2679,6 +2679,24 @@ function _cardBoardTotal(name) {
   });
   return n;
 }
+// Worker cards embed board-derived figures (the three helpers above), so ANY
+// boardItems ingest must repaint the workers view when those inputs move —
+// the board fetch used to end at renderBoard(), and a board response landing
+// AFTER the workers view painted left every card without its counts until
+// the next SESSIONS render, which in a quiet tab never came (AMUX-2960's e2e
+// residual: the request log showed 200s with correct data the whole time;
+// only the repaint was missing). Signature-guarded so no-change polls stay
+// free, keyed on exactly the fields the helpers read.
+function _nudgeWorkersOnBoardChange() {
+  try {
+    const sig = (boardItems || [])
+      .map(c => `${c.id}:${c.status}:${c.session || ''}:${c.archived ? 1 : 0}${c.deleted ? 'd' : ''}`)
+      .join('|');
+    if (window._boardCountSig === sig) return;
+    window._boardCountSig = sig;
+    if (activeView === 'sessions') render();
+  } catch (e) { /* a render hiccup must not break the ingest that called us */ }
+}
 function _grpMembers(g) {
   const all = (sessions || []).filter(s => !s.archived);
   return all.filter(s => (s.tags || []).includes(g));
@@ -7061,7 +7079,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.602';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.603';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18751,6 +18769,7 @@ async function fetchBoard() {
       }
       _cacheBoardJSON(j);
       renderBoard();
+      _nudgeWorkersOnBoardChange();
     }
   } catch(e) {
     console.error('fetch board:', e);
@@ -20366,7 +20385,7 @@ function _boardEnsureFull() {
   fetch(API + '/api/board?done_limit=0', { headers: _authHeaders() })
     .then(r => r.json())
     .then(d => {
-      if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); }
+      if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); _nudgeWorkersOnBoardChange(); }
     })
     .catch(() => {})
     .finally(() => { _boardFullLoading = false; });
@@ -23372,6 +23391,7 @@ function connectSSE() {
           _idb.set('last_sync_ts', Math.floor(Date.now() / 1000));
           if (activeView === 'board') renderBoard();
           else if (activeView === 'calendar') renderCalendar();
+          _nudgeWorkersOnBoardChange();
         }
       } else if (msg.type === 'logs') {
         // Always accumulate log events even when tab is not active
