@@ -6441,12 +6441,12 @@ function renderPeekIssues() {
     scopeBtn.classList.toggle('primary', allScope);
   }
   // Tab badge always reflects THIS session's count, regardless of view scope.
-  // Badge = ACTIVE work only (Ethan 16:1x: "only show board # for active
-  // (todo, doing)"); the panel below still shows every column for the
-  // session, archived history included.
-  const _sessCount = (boardItems || []).filter(i => !i.deleted && !i.archived
-      && i.session === peekSession
-      && (i.status === 'todo' || i.status === 'doing')).length;
+  // Badge = every NON-TERMINAL card (Ethan 2026-08-11: "the board tab for
+  // workers should show the count of all board items not in a terminal
+  // state" — supersedes the earlier todo/doing-only instruction). Same
+  // predicate as the worker card's active count (_cardBoardActive): one
+  // definition of "still owes work", three surfaces.
+  const _sessCount = _cardBoardActive(peekSession);
   const tabCount = document.getElementById('peek-tab-issues-count');
   if (tabCount) {
     if (_sessCount > 0) { tabCount.textContent = _sessCount; tabCount.classList.add('has-count'); }
@@ -6568,13 +6568,13 @@ async function _peekUpdateTabCounts() {
   };
   {
     const s = sessions.find(s => s.name === sess);
-    const sq = (s && s.steering) || [];
-    setCount('peek-tab-steering-count', sq.length);
+    // Human rows only — the missed twin of _steeringUpdateBadge (07424e3).
+    setCount('peek-tab-steering-count', _steerHumanCount(s));
   }
   {
-    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted && !i.archived
-        && (i.status === 'todo' || i.status === 'doing')).length;
-    setCount('peek-tab-issues-count', n);
+    // Non-terminal count — same predicate as the worker card and the board
+    // panel badge above.
+    setCount('peek-tab-issues-count', _cardBoardActive(sess));
   }
   try {
     const r = await fetch(API + '/api/schedules');
@@ -7061,7 +7061,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.600';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.601';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
