@@ -358,6 +358,18 @@ const RETIRED_PORTS: &[u16] = &[8822];
 /// `canonical_url` instead.** Not "always prefer canonical" — a session
 /// pointing at a dev instance on another port, or at a remote amux, is making a
 /// deliberate choice and must be left alone.
+/// Is `pid` a currently-live process? `kill(pid, 0)` sends no signal but
+/// performs the existence+permission check — Ok/EPERM means alive, ESRCH means
+/// gone. No `/proc` (macOS has none) and no extra crate. A recycled pid is a
+/// negligible risk here: the worst case is declining to overwrite for one
+/// startup, which fails safe (the file just keeps its current contents).
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 is the canonical liveness probe; it touches
+    // no memory and cannot affect the target.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Option<u16>) {
     let body = serde_json::json!({
         "canonical_url": format!("https://localhost:{canonical}"),
@@ -383,6 +395,36 @@ pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Opt
         "consumer_rule": "if your AMUX_URL is https://localhost:<legacy_port>, use canonical_url",
     });
     let path = amux_home.join("endpoint.json");
+    // DO NOT CLOBBER A LIVE FLEET SERVER'S FILE (AMUX-2971). This home's
+    // endpoint.json is the ONE control file every session's git hooks resolve
+    // the server through, and it is shared: a throwaway dev server started on
+    // an alt port but the DEFAULT home (to read the live DB, say) published
+    // its own port here, and when it was killed the file named a dead port —
+    // turning off staged-guard enforcement for every session at once
+    // (measured 2026-08-12: "staged-guard NOT ENFORCED — connection refused").
+    //
+    // The distinguisher is not the port (canonical_port() follows AMUX_RS_PORT,
+    // which the dev instance also set) — it is that a DIFFERENT process is
+    // still alive and already owns this file. If so, that process is the fleet
+    // server for this home; a second instance must not overwrite its pointer.
+    // Our own stale entry (same pid) and a dead predecessor (kickstart restart)
+    // are both fine to overwrite — only a live foreign owner is protected.
+    if let Some(owner) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("pid").and_then(serde_json::Value::as_u64))
+    {
+        let me = std::process::id() as u64;
+        if owner != me && pid_alive(owner as u32) {
+            tracing::warn!(
+                ?path, owner_pid = owner, my_pid = me, canonical,
+                "endpoint.json is owned by a live server (pid {owner}); NOT overwriting it \
+                 from this instance — a non-fleet server must not repoint the shared hook lookup \
+                 (AMUX-2971). Give a dev server its own AMUX_HOME."
+            );
+            return;
+        }
+    }
     // Write-then-rename: a hook reading this file mid-write must never see a
     // truncated JSON document and fall back to the stale env, which is the
     // exact failure it is here to prevent.
