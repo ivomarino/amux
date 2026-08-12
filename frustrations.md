@@ -3176,3 +3176,25 @@ FIX: fe003d5. The hook already had a self-heal for precisely this — endpoint.j
   and self-heals on any known-retired loopback port. A retired address has to stay known
   after it stops being served, because the processes still naming it are the ones that
   cannot be told anything else.
+
+## I shipped three wrong card references in one session, two onto other sessions' cards
+AREA: attribution
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-11
+SESSION: amux
+CARD: AMUX-2950
+SYMPTOM: Wrote card ids into code comments and frustrations entries BEFORE creating the
+  cards, guessing the next number from the last id I had seen. AMUX-2946 did not exist when
+  I cited it in three files. AMUX-2942 was a peer's card about /api/crm p95. AMUX-2949 was
+  tubescience's card about a failing queue invariant. All three shipped.
+COST: Small each time, but two of the three landed on REAL cards owned by other sessions,
+  which is worse than a dangling id: a reader follows the pointer and finds a plausible,
+  unrelated card instead of an obvious error. That is the same shape as a notice naming the
+  wrong card, which this file already carries entries about — I was creating the defect I
+  had spent the evening reporting in other people's systems.
+FIX: Procedural, and written down rather than resolved-to-be-careful: `amux board add`
+  RETURNS the id. Create the card first, then use what it returns. Guessing the next number
+  cannot be made reliable on a board where ~50 sessions file concurrently — between my
+  reading an id and writing my own, several land. All three references corrected (23097b2
+  and earlier).
