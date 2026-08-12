@@ -3746,6 +3746,42 @@ async fn send_text_inner(
             if line.starts_with('\u{276f}') || line.starts_with('>') {
                 let suggested = line.trim_start_matches(['\u{276f}', '>', '\u{a0}', ' ']).trim();
                 if !suggested.is_empty() {
+                    // A NUMBERED OPTION IS A PICKER, NOT A SUGGESTION
+                    // (AMUX-2952, Ethan live: "i keep sending enter when it
+                    // needs input and its not doing anything").
+                    //
+                    // At an AskUserQuestion selector the ❯ line reads
+                    // "❯ 1. Submit answers". Extracting that as a suggestion
+                    // and DELIVERING IT AS TEXT re-types the label into a UI
+                    // that reads KEY EVENTS — and since AMUX-2909 routes
+                    // picker-shaped panes to bracketed PASTE, the whole string
+                    // is swallowed in one piece. Nothing happens, silently,
+                    // every time. The footer guard above ("enter to select")
+                    // does not save us: AskUserQuestion's review screen has no
+                    // such footer.
+                    //
+                    // What accepting a highlighted option actually takes is the
+                    // Enter KEY. Scoped to options that start "N." so a plain
+                    // suggested prompt ("❯ retry the failing test") still goes
+                    // through the text path unchanged.
+                    let is_numbered = suggested
+                        .split_once('.')
+                        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+                    if is_numbered {
+                        let (ok, msg) = send_keys_op(name, "Enter").await;
+                        tracing::info!(
+                            session = %name, ok, detail = %msg,
+                            "[picker-enter/AMUX-2952] empty send at a numbered selector — pressed Enter instead of pasting the label"
+                        );
+                        return (
+                            ok,
+                            if ok {
+                                format!("pressed Enter on the picker (highlighted: {suggested})")
+                            } else {
+                                format!("picker Enter failed: {msg}")
+                            },
+                        );
+                    }
                     text = suggested.to_string();
                     break;
                 }
