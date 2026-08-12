@@ -7079,7 +7079,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.605';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.606';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7417,8 +7417,8 @@ function openPeek(name, opts) {
   // full payload follows and fills in scrollback above.
   refreshPeek(true, true).finally(() => refreshPeek());
   _schedulePeekPoll();
-  setTimeout(_peekFitPane, 350);   // fit the pane to this viewer's width
-  _peekLeaseStart();               // AMUX-2634: hold the pane only while read
+  // resize-on-peek + its lease removed (AMUX-2981); the capture is a fixed
+  // 220-col pane the reader scrolls, so there is nothing to fit or hold.
   _updateSendSplit();   // sync the Send/Queue button label to the current mode
   _savePeekState();
 }
@@ -8485,44 +8485,26 @@ function _peekTogglePlan() {
   document.getElementById('peek-plan-list').style.display = _peekPlanOpen ? '' : 'none';
 }
 
-// ── Responsive peek: fit the tmux pane to the viewer ──
-// The pane is the layout engine: Claude Code reflows the whole transcript on
-// terminal resize, so matching the tmux window to the viewer's measured
-// character width makes peek natively responsive (no double-wrapping at
-// phone widths). The server refuses while a real terminal is attached.
-let _peekSizeSent = { session: null, cols: 0 };
-function _peekMeasureCols() {
-  const body = document.getElementById('peek-body');
-  if (!body || !body.clientWidth) return 0;
-  const probe = document.createElement('span');
-  probe.textContent = 'X'.repeat(100);
-  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;';
-  body.appendChild(probe);
-  const w = probe.getBoundingClientRect().width / 100;
-  probe.remove();
-  if (!w) return 0;
-  return Math.max(50, Math.min(300, Math.floor((body.clientWidth - 16) / w)));
-}
-async function _peekFitPane() {
-  const name = peekSession;
-  if (!name) return;
-  const cols = _peekMeasureCols();
-  if (!cols) return;
-  // Skip near-identical sizes: every resize forces Claude to re-render.
-  if (_peekSizeSent.session === name && Math.abs(_peekSizeSent.cols - cols) <= 4) return;
-  _peekSizeSent = { session: name, cols };
-  try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/resize', {
-      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ cols, rows: 50 })
-    });
-    const d = await r.json();
-    if (d.resized && !/already/.test(d.message || '')) {
-      _peekEtag = null; _peekLiveEtag = null; _lastPeekRaw = null; _peekHistoryRaw = '';   // repaint at the new width (history too)
-      setTimeout(refreshPeek, 450);            // give Claude a beat to reflow
-    }
-  } catch (e) {}
-}
+// ── Peek pane sizing: removed (AMUX-2981) ──
+// Was "fit the tmux pane to the viewer" — measure the reader's column width and
+// POST /resize so the capture matched. Removed with the resize-on-peek machine
+// below (workers are a fixed 220 cols, readers scroll). `_peekMeasureCols` and
+// `_peekSizeSent` went with it; nothing else referenced them.
+// RESIZE-ON-PEEK REMOVED (AMUX-2981, Ethan: "what's with all the resize API
+// calls? … figure out how to remove it"). This used to POST /resize on every
+// peek open, on window resize, and — the real volume — every 30s as a lease
+// heartbeat, to pin the worker's tmux window to the reader's width. But workers
+// spawn at 220 cols (configured_cols) and the server CLAMPS the request to
+// [220, 300] and never shrinks below spawn, so for every reader narrower than
+// 220 (i.e. essentially all of them — a phone, a laptop, a normal monitor) it
+// changed nothing about the width and only churned the heartbeat + pinned
+// `window-size manual`, which then needed a whole lease + background-restore
+// subsystem to undo. Measured: one lane accrued ~3,966 of these. The preview
+// already renders the 220-col capture with overflow-x:auto (the reader
+// scrolls), so removing it costs only the rare 220->300 widen for an
+// ultra-wide (>220 col) monitor — negligible — and deletes the call storm and
+// the terminal-reshaping-on-peek. Kept as a no-op so its callers stay intact.
+async function _peekFitPane() { /* removed — see comment above (AMUX-2981) */ }
 // ── Viewer lease (AMUX-2634) ──
 // `/resize` pins the worker's tmux window to THIS reader's width, and tmux
 // makes that pin permanent (`window-size manual`). The server therefore
@@ -8534,24 +8516,13 @@ async function _peekFitPane() {
 // phone, a killed tab or a dropped connection never runs a teardown, and those
 // are exactly the cases that used to leave a worker stuck at 50 columns
 // forever. A lease expires on its own; a close handler has to be reached.
+// Lease heartbeat REMOVED with resize-on-peek (AMUX-2981) — it existed only to
+// hold the tmux window-size pin the resize created. No pin, nothing to hold.
 let _peekLeaseTimer = null;
 function _peekLeaseStop() { if (_peekLeaseTimer) { clearInterval(_peekLeaseTimer); _peekLeaseTimer = null; } }
-function _peekLeaseStart() {
-  _peekLeaseStop();
-  _peekLeaseTimer = setInterval(() => {
-    if (!peekSession) { _peekLeaseStop(); return; }
-    // Clear the skip-guard so the POST actually goes out; the server answers
-    // "already sized" and nothing repaints.
-    _peekSizeSent = { session: null, cols: 0 };
-    _peekFitPane();
-  }, 30000);   // server lease is 75s — tolerates one missed beat
-}
-let _peekFitTimer = null;
-window.addEventListener('resize', () => {
-  if (!peekSession) return;
-  clearTimeout(_peekFitTimer);
-  _peekFitTimer = setTimeout(_peekFitPane, 600);
-});
+function _peekLeaseStart() { /* removed — no more resize-on-peek to lease (AMUX-2981) */ }
+// window-resize -> re-fit REMOVED with it: the capture is a fixed 220 cols and
+// the reader scrolls, so a browser resize changes nothing server-side.
 
 // ── "Load earlier output" — scrollback for the alt-screen ──
 // tmux keeps zero history for Claude's alternate screen; the pipe-pane log
