@@ -515,7 +515,35 @@ impl FleetSignals {
         let Some(raw) = self.pane_of(name) else {
             return false;
         };
-        crate::api::session_verbs::pane_bar_says_generating(raw)
+        // THE BAR PHRASE ALONE NO LONGER PROVES A GENERATING MAIN TURN
+        // (AMUX-2959, Ethan at 1am: "this worker says working" over an idle
+        // prompt). Claude Code now shows "esc to interrupt" in the status bar
+        // whenever BACKGROUND AGENTS exist — including with the main turn idle
+        // at an empty composer. Three lanes read WORKING that way while their
+        // agents sat "awaiting input" (transcripts quiet, agents_working:false
+        // in the same payload — the response was disagreeing with itself).
+        //
+        // pane_bar_says_generating's own doc records the ambiguity and decides
+        // fail-CLOSED, which is right for its other consumer (steer_decide:
+        // reading ambiguous as busy defers a message; reading it as idle types
+        // into a live turn). For DISPLAY the costs invert: this predicate
+        // feeds the idle->active contradiction, whose contract is UNAMBIGUOUS
+        // work — and an agents-hint bar over an idle composer is ambiguous by
+        // the detector's own documentation. So here the bar phrase only counts
+        // when the bar does NOT carry the agents hint; a generating main turn
+        // with agents still flips via the spinner (detect == "active"), which
+        // the streaming-essay counterexample in that doc block also shows.
+        let bar_generating = crate::api::session_verbs::pane_bar_says_generating(raw);
+        let bar_has_agents = {
+            let clean = crate::backend::adapter::strip_ansi(raw);
+            clean
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rev()
+                .take(3)
+                .any(|l| l.contains("agents") || l.contains("agent ·"))
+        };
+        (bar_generating && !bar_has_agents)
             || crate::api::session_verbs::detect_claude_status(raw) == "active"
     }
 
