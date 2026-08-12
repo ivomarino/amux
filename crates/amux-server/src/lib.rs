@@ -318,6 +318,12 @@ async fn async_main() {
     // whose absence is why the outage went unnoticed for hours.
     drop(runtime_jobs::board_drive::spawn(state.clone()));
 
+    // Automatic accountability (AMUX-2990, Ethan: "the accountability shit needs
+    // to be automatic"). Sweeps for lanes with human messages but no board card
+    // and steers each to open one — server-side, so it reaches any group. One
+    // nudge per lane per 24h. Held like board-drive so the loop is not dropped.
+    drop(api::messages::accountability_spawn(state.clone()));
+
     // Pane-size restoration (AMUX-2634): a peek resizes the worker's tmux
     // window to the READER's viewport and tmux pins `window-size manual`, so
     // one phone glance used to narrow that worker's output permanently — the
