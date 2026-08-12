@@ -64,7 +64,18 @@ def parse(text):
 
 
 def fetch_board():
-    base = os.environ.get("AMUX_URL", "https://localhost:8824")
+    # The DEFAULT here is already correct; the hazard is the ENV VAR overriding it
+    # with a dead address. 8822 was the Python compatibility bind, removed
+    # 2026-08-11, and every session spawned before that still carries the old
+    # AMUX_URL in its process env — which a live process cannot re-read. So the
+    # override has to be ignored when it names the retired port.
+    #
+    # This fails SILENTLY otherwise: fetch_board() raises, main() prints "Structural
+    # checks only" and exits 2, which reads like a deliberate offline mode rather
+    # than a broken probe. It ran that way for a full sweep before anyone noticed.
+    base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
+    if base.rstrip("/").endswith(":8822"):
+        base = "https://localhost:8824"
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
