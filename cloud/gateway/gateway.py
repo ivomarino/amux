@@ -3469,12 +3469,21 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.makedirs(DATA_DIR, exist_ok=True)
     get_db()
-    print(f"[gateway] listening on :{PORT}")
+    # flush=True ON BOTH STARTUP LINES, and it is load-bearing (AMUX-2958).
+    # stdout to a systemd-redirected FILE is block-buffered, so without it
+    # these lines sit in the 8KB buffer for minutes after boot. deploy-cloud's
+    # flip verify waits 30s for a NEW "container hop:" line after
+    # `systemctl restart` — it saw nothing, concluded the restart did not take,
+    # and ROLLED BACK a healthy deploy (run 31556991526; the earlier
+    # tail-1-reads-the-previous-line race amux-cloud hit on the first cutover
+    # was this same buffer). Every other operational print in this file
+    # already passes flush=True; these two predate the convention.
+    print(f"[gateway] listening on :{PORT}", flush=True)
     # Say which scheme this process will use to reach workspaces. A gateway
     # talking http to rust containers fails as "502 / Starting page forever",
     # which reads as a container problem and sends you into docker logs; the
     # one fact that discriminates it is this line (ethos rule 4).
     print(f"[gateway] container hop: {CONTAINER_SCHEME}:// "
           f"(cert verification {'off' if _CTR_SSL else 'n/a'}) — "
-          f"set CONTAINER_SCHEME in /etc/amux/gateway.env")
+          f"set CONTAINER_SCHEME in /etc/amux/gateway.env", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
