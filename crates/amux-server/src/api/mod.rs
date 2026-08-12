@@ -30,6 +30,7 @@ pub mod health;
 pub mod gmail;
 pub mod graph;
 pub mod history;
+pub mod terminal;
 pub mod invariants_api;
 pub mod journal;
 pub mod layout_presets;
@@ -215,6 +216,9 @@ pub fn router(state: AppState) -> Router {
         // Map tab's graph mode: mind-map store + Obsidian import + the fleet
         // org-chart projection (AMUX-2886 — tables existed, routes did not).
         .nest("/api/graph", graph::routes())
+        // Workspace tab web-terminal panes: local-shell PTY over base64 I/O +
+        // long-poll output (AMUX-2885 — every keystroke 404'd since cutover).
+        .nest("/api/terminal", terminal::routes())
         .nest("/api/history", history::routes())
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).

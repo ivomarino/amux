@@ -1007,6 +1007,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/graph/{id}", methods: &["GET"] },
     RouteEntry { path: "/api/graph/{id}/import-vault", methods: &["POST"] },
     RouteEntry { path: "/api/graph/{id}/nodes/{nid}", methods: &["PATCH"] },
+    RouteEntry { path: "/api/terminal/create", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/input", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/resize", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/output", methods: &["GET"] },
+    RouteEntry { path: "/api/terminal/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
     // -- logs (this module)

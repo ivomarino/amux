@@ -139,6 +139,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/slash-commands", "slash commands"),
     ("/api/map", "map + geocoding"),
     ("/api/graph", "Map tab graph mode: mind-map store + Obsidian vault import + fleet org-chart projection (api/graph.rs, AMUX-2886)"),
+    ("/api/terminal", "Workspace tab web-terminal panes: local-shell PTY, base64 I/O, long-poll output (api/terminal.rs, AMUX-2885)"),
     ("/api/history", "command history"),
     ("/api/logs", "SPA Logs tab: python-shape events + raw over the structured request log (_amux_request_log) and the server-rs.log tracing tail (api/request_log.rs, AMUX-2605)"),
     ("/api/settings", "settings"),

@@ -50,6 +50,7 @@ libc.workspace = true
 # Runtime (not just dev): the native dictation engine hands the whisper
 # worker its audio via a named temp file, exactly as the Python engine does.
 tempfile.workspace = true
+portable-pty = "0.9.0"
 
 [dev-dependencies]
 proptest.workspace = true
