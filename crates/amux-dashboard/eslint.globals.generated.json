@@ -343,6 +343,7 @@
  "_copyExplorePathFallback": "writable",
  "_copyFileDeeplink": "writable",
  "_copyFilePath": "writable",
+ "_copyMsgId": "writable",
  "_copySchedId": "writable",
  "_copyTextWithToast": "writable",
  "_copyTextWithToastFallback": "writable",
