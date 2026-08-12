@@ -1423,7 +1423,23 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # Label it as the TAG write it is. Without this the printer rendered the
       # card's unchanged status ("AC-221 -> todo"), which reads as a failed
       # transition (AC-222).
-      echo "$result" | _board_outcome "$id" "" "tagged needs:you"; return $?
+      echo "$result" | _board_outcome "$id" "" "tagged needs:you" || return $?
+      # AND MOVE IT. `needsyou` is also a real board STATUS — the one that
+      # takes the card out of review/todo queues and into the owner's view —
+      # and this verb tagging without moving left cards reading routed-to-
+      # owner while the idle nudge kept re-firing at the agent (frustrations
+      # 2026-08-11: the raw-PATCH workaround it forced is the unaudited path
+      # CLAUDE.md warns about). The tag write above stays: tag carries the
+      # ASK, status carries the QUEUE. If the transition bounces (gate), say
+      # so loudly — a tagged-but-unmoved card is exactly the half-action this
+      # verb used to hide.
+      local tresult
+      tresult=$(_board_transition "$id" "needsyou")
+      echo "$tresult" | _board_outcome "$id" "needsyou" || {
+        echo "amux board needsyou: tag applied but STATUS MOVE was refused (see above) — card is still in its old queue" >&2
+        return 1
+      }
+      return 0
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
