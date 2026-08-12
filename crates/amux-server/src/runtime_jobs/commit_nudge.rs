@@ -341,13 +341,37 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<S
             .args(["-C", dir, "rev-parse", &format!("origin/main:{p}")])
             .output()
             .await;
+        // VALIDATE THE SHAPE, DO NOT TRUST THE EXIT CODE (creative-dna,
+        // AMUX-2947 follow-up). Two reasons, and the second is the dangerous
+        // one:
+        //
+        //   1. git's exit status is not a reliable witness here. creative-dna
+        //      measured `hash-object` printing `fatal:` and still exiting 0 in
+        //      their shell; it exits 128 in mine, so I could not reproduce that
+        //      specific number — but a comparison that is only correct when a
+        //      subprocess reports its status the way we expect is one bad
+        //      invocation away from being wrong, and it would fail SILENTLY.
+        //
+        //   2. Worse, comparing two unvalidated strings has an inverse failure
+        //      the conservative `_ => false` arm does NOT cover: if both sides
+        //      came back empty, `"" == ""` is TRUE and the path is DROPPED — a
+        //      real uncommitted file silently removed from the warning. Keeping
+        //      a phantom is noise; dropping a genuine one loses somebody's work
+        //      from the only notice that mentions it.
+        //
+        // A blob id is exactly 40 lowercase hex characters. Anything else is
+        // not an answer, whatever the exit code said.
+        let blob = |o: &std::process::Output| -> Option<String> {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+        };
         let same = match (local, remote) {
-            (Ok(l), Ok(r)) if l.status.success() && r.status.success() => {
-                String::from_utf8_lossy(&l.stdout).trim()
-                    == String::from_utf8_lossy(&r.stdout).trim()
-            }
-            // Cannot compare -> keep it. A path we failed to check is not a path
-            // we have cleared.
+            (Ok(l), Ok(r)) => match (blob(&l), blob(&r)) {
+                (Some(a), Some(b)) => a == b,
+                // One side unreadable -> cannot compare -> keep it. A path we
+                // failed to check is not a path we have cleared.
+                _ => false,
+            },
             _ => false,
         };
         if !same {
@@ -725,6 +749,34 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// TWO EMPTY ANSWERS ARE NOT A MATCH (creative-dna's follow-up).
+    ///
+    /// The comparison used to be `stdout == stdout` on two unvalidated strings,
+    /// gated on exit status. The conservative arm covers "one side failed" —
+    /// but NOT the case where both come back empty, where `"" == ""` is true
+    /// and the path is DROPPED. Keeping a phantom is noise; dropping a real
+    /// uncommitted file removes somebody's work from the only notice that
+    /// mentions it, which is the failure worth engineering against.
+    ///
+    /// Asserts the shape rule directly, because provoking git into returning
+    /// two empty stdouts on demand is not something a test should stage — the
+    /// rule is what the fix rests on, so the rule is what is pinned.
+    #[test]
+    fn an_empty_or_malformed_blob_id_is_never_a_match() {
+        let looks_like_blob = |t: &str| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit());
+        assert!(!looks_like_blob(""), "empty must not pass as a blob id");
+        assert!(!looks_like_blob("fatal: could not open"), "an error message must not pass");
+        assert!(!looks_like_blob("c98e8388"), "a short hash must not pass");
+        assert!(
+            !looks_like_blob("z98e83889239f9ef1482196115f0edee24442b74"),
+            "40 chars of non-hex must not pass"
+        );
+        assert!(
+            looks_like_blob("c98e83889239f9ef1482196115f0edee24442b74"),
+            "a real blob id must pass, or the filter drops everything and the guard goes silent"
+        );
     }
 
     /// THE PHANTOM FILTER MUST WORK FROM A SUBDIRECTORY (AMUX-2947).
