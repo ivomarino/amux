@@ -93,8 +93,30 @@ const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
 const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 /// py:14514 freshness gate — never auto-run a card nobody has touched in 7 days.
 const PICKUP_FRESHNESS_S: i64 = 7 * 86400;
-/// py:14515 re-claim cooldown (AMUX-1857).
-const RECLAIM_COOLDOWN_S: f64 = 86400.0;
+/// Per-card re-claim cooldown (py:14515 / AMUX-1857), now a knob and much
+/// SHORTER (AMUX-2987). It exempts a card from re-pickup for this long after it
+/// was last claimed — so a card that was dispatched, returned to `todo`, and is
+/// still todo cannot be re-dealt immediately. The inherited value was 86400
+/// (24h), and that is what STALLED idle lanes: the bounce-breaker (the actual
+/// anti-thrash mechanism) fires on 3 returns within 2h, so once a card rolls
+/// out of that 2h window it is no longer a "recent bounce" — but the 24h
+/// per-card cooldown kept it undispatchable for another 22 hours, during which
+/// a running, idle, ready lane sat doing nothing while holding cards it could
+/// not be handed (measured 2026-08-12: backend idle 80min on 8 todo cards, ALL
+/// claimed 1-24h ago; 9 lanes fleet-wide in the same state). Violates the
+/// no-stall guarantee (Invariant 10). Default is now aligned WITH the breaker
+/// window (2h): a card is exempt exactly as long as it still counts as a recent
+/// bounce, and re-dispatchable the moment it stops — the two mechanisms share
+/// one window instead of fighting. A lane that truly cannot do a card moves it
+/// to backlog/review (the honest exits the pickup prompt names), so it never
+/// re-enters this loop; only a card left in `todo` gets another turn.
+fn reclaim_cooldown_s() -> f64 {
+    std::env::var("AMUX_RECLAIM_COOLDOWN_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(7200.0)
+}
 /// Verify-nudge cooldown: once per 24h per session. A session that has no
 /// todo/doing/review work but holds `done` cards gets a batched nudge to
 /// verify them. 24h because verification requires prod evidence, and
@@ -620,7 +642,7 @@ const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
 /// difference, since those are judgments about a card, not queue membership.
 fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
     let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
-    let reclaim_cut = now - RECLAIM_COOLDOWN_S;
+    let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
         &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
         rusqlite::params![session, fresh_cut, reclaim_cut],
@@ -914,7 +936,7 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // only ever WIDENS the exemption, so the first run after the change emits
     // nothing; the opposite direction would have discharged a backlog.
     let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
-    let reclaim_cut = now - RECLAIM_COOLDOWN_S;
+    let reclaim_cut = now - reclaim_cooldown_s();
     let ids: Vec<String> = conn
         .prepare(
             &format!(
@@ -932,9 +954,11 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     if ids.is_empty() {
         return Pickup::None {
             reason: "no-eligible-card",
-            detail: "queue holds nothing dispatchable (needs:you, archived, dormant, \
-                     stale >7d and cards claimed in the last 24h are all exempt)"
-                .into(),
+            detail: format!(
+                "queue holds nothing dispatchable (needs:you, archived, dormant, \
+                 stale >7d and cards claimed in the last {}h are all exempt)",
+                (reclaim_cooldown_s() / 3600.0).round() as i64
+            ),
         };
     }
 
@@ -3184,20 +3208,37 @@ mod tests {
     /// todo after doing the workable prep; without the cooldown auto-pickup
     /// re-claimed the same card at the very next idle — infinite churn.
     #[test]
-    fn a_card_claimed_in_the_last_24h_is_not_reclaimed() {
+    fn a_recently_claimed_card_cools_down_but_the_dead_zone_is_closed() {
+        // The re-claim cooldown is now 2h (AMUX-2987), aligned with the
+        // bounce-breaker window, NOT 24h. Pins both ends: still exempt inside
+        // the window, dispatchable again the moment it passes — which is the
+        // fix for the idle-lane stall (a card claimed 3h ago used to be dead
+        // for another 21 hours while its lane sat idle).
         let conn = board_db();
         add_card(&conn, "T-1", "lane", "todo", "returned", "SCOPE: x\n- [ ] y");
-        conn.execute(
-            "INSERT INTO session_events (ts,session,type,data,source) \
-             VALUES (?1,'lane','task.claimed','{\"issue\": \"T-1\"}','board-drive')",
-            rusqlite::params![now_f64() - 3600.0],
-        )
-        .expect("event");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
-        // ...and it becomes eligible again once the window passes.
-        conn.execute("UPDATE session_events SET ts=?1", rusqlite::params![now_f64() - 90000.0])
-            .expect("age");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        let claim_at = |ts: f64| {
+            conn.execute("DELETE FROM session_events WHERE data LIKE '%T-1%'", []).ok();
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,source) \
+                 VALUES (?1,'lane','task.claimed','{\"issue\": \"T-1\"}','board-drive')",
+                rusqlite::params![ts],
+            )
+            .expect("event");
+        };
+        // 1h ago: inside the 2h window -> still exempt.
+        claim_at(now_f64() - 3600.0);
+        assert!(
+            claimed(&select_pickup(&conn, "lane", now_f64())).is_none(),
+            "a card claimed 1h ago is inside the 2h cooldown and must not re-deal"
+        );
+        // 3h ago: THE DEAD ZONE. Under the old 24h cooldown this was exempt for
+        // 21 more hours and the lane starved; now it is dispatchable.
+        claim_at(now_f64() - 3.0 * 3600.0);
+        assert_eq!(
+            claimed(&select_pickup(&conn, "lane", now_f64())),
+            Some("T-1"),
+            "a card claimed 3h ago (past the 2h window) must be re-dealt — this is the AMUX-2987 fix"
+        );
     }
 
     /// py:14510: fossils get triaged by a human, not silently executed at idle.
