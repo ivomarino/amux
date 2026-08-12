@@ -1502,22 +1502,45 @@ function updateConnectionStatus() {
   if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
   if (offlineQueue.length) parts.push(offlineQueue.length + ' op' + (offlineQueue.length === 1 ? '' : 's'));
   title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(', ') + ' pending';
-  let html = '';
-  html += drafts.map(d => {
-    return '<div class="offline-op">' +
+  const rows = [];
+  drafts.forEach(d => {
+    rows.push('<div class="offline-op">' +
       '<span class="op-action">Create &amp; start ' + esc(d.name) + (d.prompt ? ' + prompt' : '') + '</span>' +
       '<span class="op-time" style="color:var(--yellow)">draft</span>' +
-    '</div>';
-  }).join('');
-  html += offlineQueue.map(item => {
+    '</div>');
+  });
+  offlineQueue.forEach(item => {
     const age = Math.floor((Date.now() - item.timestamp) / 60000);
     const timeStr = age < 1 ? 'just now' : age + 'm ago';
-    return '<div class="offline-op">' +
+    rows.push('<div class="offline-op">' +
       '<span class="op-action">' + esc(describeOp(item)) + '</span>' +
       '<span class="op-time">' + timeStr + '</span>' +
-    '</div>';
-  }).join('');
-  ops.innerHTML = html;
+    '</div>');
+  });
+  // Accordion (Ethan 08:39): once the queued list exceeds 5, collapse it by
+  // default behind a click-to-expand header showing the count, so a long
+  // offline backlog doesn't push the whole board off-screen. <=5 shows inline.
+  if (rows.length > 5) {
+    const expanded = _offlineQueueExpanded;
+    const caret = expanded ? '&#x25BE;' : '&#x25B8;'; // ▾ open / ▸ closed
+    const label = expanded ? 'Hide queued operations'
+                           : 'Show all ' + rows.length + ' queued operations';
+    ops.innerHTML =
+      '<button type="button" class="offline-queue-toggle" aria-expanded="' + expanded +
+        '" onclick="_toggleOfflineQueue()">' + caret + ' ' + label + '</button>' +
+      '<div class="offline-queue-list' + (expanded ? '' : ' collapsed') + '">' + rows.join('') + '</div>';
+  } else {
+    ops.innerHTML = rows.join('');
+  }
+}
+
+// Accordion toggle for the offline queued-ops list (AMUX-2976). State lives
+// module-scope so it survives the frequent connection re-renders; it resets to
+// collapsed on reload, which is the intended "collapsed by default" behaviour.
+let _offlineQueueExpanded = false;
+function _toggleOfflineQueue() {
+  _offlineQueueExpanded = !_offlineQueueExpanded;
+  updateConnectionStatus();
 }
 
 // ── Durable upload queue (AMUX-2317) ────────────────────────────────────────
@@ -7079,7 +7102,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.606';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.607';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

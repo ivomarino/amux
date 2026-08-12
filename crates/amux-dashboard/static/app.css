@@ -2636,6 +2636,20 @@
   .offline-op .op-action { color: var(--text); font-weight: 500; }
   .offline-op .op-time { color: var(--yellow); font-size: 0.65rem; }
   .offline-op .op-stale { color: var(--red); font-size: 0.65rem; font-style: italic; }
+  /* Offline-queue accordion (AMUX-2976) */
+  .offline-queue-toggle {
+    width: 100%; text-align: left; margin-top: 6px;
+    font-size: 0.72rem; font-weight: 600; color: #f87171;
+    background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.25);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer;
+  }
+  .offline-queue-toggle:active { opacity: 0.7; }
+  .offline-queue-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+  .offline-queue-list.collapsed { display: none; }
+  @media (max-width: 600px) {
+    /* 44px min touch target on mobile per css-mobile rule */
+    .offline-queue-toggle { min-height: 44px; padding: 10px 12px; }
+  }
 
   /* Tab bar */
   .tab-bar-outer {
