@@ -123,6 +123,11 @@ pub enum ItemType {
     Doc,
     Tripwire,
     Watch,
+    /// A grouping container: other cards roll up under it via `issues.epic`
+    /// (AMUX-2992, Ethan 2026-08-12 — "epic = a card, children link up"). Not a
+    /// dormant type; its gate is the non-code default ("Outcome recorded"), an
+    /// epic being done when its work is accounted for.
+    Epic,
 }
 
 impl ItemType {
@@ -130,7 +135,7 @@ impl ItemType {
     /// hand-listed. The `is_dormant` comment below records what a re-typed
     /// literal already cost here once; this exists so the next one does not
     /// have to be written at all.
-    pub const ALL: [ItemType; 10] = [
+    pub const ALL: [ItemType; 11] = [
         ItemType::Code,
         ItemType::Escalation,
         ItemType::Blocker,
@@ -141,6 +146,7 @@ impl ItemType {
         ItemType::Doc,
         ItemType::Tripwire,
         ItemType::Watch,
+        ItemType::Epic,
     ];
 
     /// The wire/DB spelling — the same snake_case serde emits, so a value
@@ -157,6 +163,7 @@ impl ItemType {
             ItemType::Doc => "doc",
             ItemType::Tripwire => "tripwire",
             ItemType::Watch => "watch",
+            ItemType::Epic => "epic",
         }
     }
 
@@ -1296,6 +1303,9 @@ pub fn verified_is_meaningful(item_type: ItemType) -> bool {
         | ItemType::Investigation
         | ItemType::Research
         | ItemType::Escalation
+        // An epic is a grouping container — it ships nothing itself, so there is
+        // no prod to confirm; it is done when its children/outcome are recorded.
+        | ItemType::Epic
         | ItemType::Watch => false,
     }
 }

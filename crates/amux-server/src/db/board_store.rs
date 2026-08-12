@@ -129,7 +129,7 @@ pub fn status_to_db(target: TaskStatus, prior_raw: &str) -> String {
 
 /// The Python `_ITEM_TYPES` tuple, verbatim (order preserved for the
 /// `valid_types` field the CLI prints).
-pub const KNOWN_TYPES: [&str; 10] = [
+pub const KNOWN_TYPES: [&str; 11] = [
     "code",
     "escalation",
     "blocker",
@@ -140,6 +140,10 @@ pub const KNOWN_TYPES: [&str; 10] = [
     "doc",
     "tripwire",
     "watch",
+    // Grouping container (AMUX-2992). NOTE: this list duplicates
+    // `ItemType::ALL` and must be kept in step with it by hand — the enum's own
+    // doc calls that out; a future cleanup should derive one from the other.
+    "epic",
 ];
 
 /// Core [`ItemType`] for GATE purposes. Unknown/legacy strings map to `Code`
@@ -158,6 +162,7 @@ pub fn core_item_type(raw: &str) -> ItemType {
         "doc" => ItemType::Doc,
         "tripwire" => ItemType::Tripwire,
         "watch" => ItemType::Watch,
+        "epic" => ItemType::Epic,
         _ => ItemType::Code,
     }
 }
