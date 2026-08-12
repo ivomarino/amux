@@ -381,7 +381,14 @@ pub fn prose_dependency(blob: &str) -> Option<String> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?:blocked\s+(?:by|on)|cannot\s+start\s+until|depends\s+on|waits?\s+(?:for|on))\s+[\s\S]{0,40}?\b([A-Z][A-Z]+-\d+)(?:[^0-9]|$)",
+            // Case-insensitive on the PHRASE ONLY — `(?i:...)` scoped, never
+            // global, because a global flag would also lowercase the id class
+            // and start matching "amux-2948" citations. And `wait(?:s|ing)?`
+            // rather than `waits?`: "waiting on X" is how people actually
+            // write it (AMUX-2950; measured before widening: 19 of 829 open
+            // cards newly block, incl. TG-3195 whose title says "WAITS ON
+            // TG-3193 DEPLOY" in caps and was dispatching anyway).
+            r"(?:(?i:blocked\s+(?:by|on)|cannot\s+start\s+until|depends\s+on|wait(?:s|ing)?\s+(?:for|on)))\s+[\s\S]{0,40}?\b([A-Z][A-Z]+-\d+)(?:[^0-9]|$)",
         )
         .expect("prose dep regex")
     });
@@ -439,22 +446,17 @@ mod prose_direction_tests {
     /// invisible until something ships out of order.
     #[test]
     fn a_real_blocker_still_blocks() {
-        // WRITTEN TO WHAT THE REGEX ACTUALLY MATCHES, after two drafts that
-        // were not. It is case-SENSITIVE ("Cannot start until X" at the head of
-        // a sentence has never matched) and it takes `waits?`, not `waiting`.
-        // Both of my first fixtures asserted capability the code never had, so
-        // the red was mine rather than the fix's — the same "verify the fixture
-        // is actually broken" trap this repo keeps paying for, twice in one
-        // function.
-        //
-        // Both gaps are real and filed (AMUX-2950). Deliberately NOT widened
-        // here: broadening the matcher newly BLOCKS cards that dispatch fine
-        // today, and this change exists to unstall a lane, not to stall more.
+        // AMUX-2950 closed both gaps these fixtures originally mis-asserted:
+        // the phrase match is now case-insensitive (scoped, so the ID class is
+        // not) and takes "waiting" as well as "wait/waits". Widened only after
+        // measuring: 19 of 829 open cards newly block, and the sample includes
+        // a real missed blocker (TG-3195, "WAITS ON TG-3193 DEPLOY", caps).
         for blob in [
-            "this is blocked by BACKE-3276 until the cache lands.",
-            "cannot start until BACKE-3276 ships.",
+            "This is blocked by BACKE-3276 until the cache lands.",
+            "Cannot start until BACKE-3276 ships.",
             "depends on BACKE-3276",
-            "waits on BACKE-3276 to land",
+            "waiting on BACKE-3276 to land",
+            "Waits on BACKE-3276.",
             "blocked on BACKE-3276",
         ] {
             assert_eq!(
