@@ -27,6 +27,7 @@ pub mod crm;
 pub mod speedtest;
 pub mod habits;
 pub mod health;
+pub mod graph;
 pub mod history;
 pub mod invariants_api;
 pub mod journal;
@@ -210,6 +211,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/sql", sql::routes())
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
+        // Map tab's graph mode: mind-map store + Obsidian import + the fleet
+        // org-chart projection (AMUX-2886 — tables existed, routes did not).
+        .nest("/api/graph", graph::routes())
         .nest("/api/history", history::routes())
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).
