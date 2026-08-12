@@ -30,6 +30,7 @@ pub mod health;
 pub mod gmail;
 pub mod graph;
 pub mod history;
+pub mod reports;
 pub mod terminal;
 pub mod invariants_api;
 pub mod journal;
@@ -219,6 +220,9 @@ pub fn router(state: AppState) -> Router {
         // Workspace tab web-terminal panes: local-shell PTY over base64 I/O +
         // long-poll output (AMUX-2885 — every keystroke 404'd since cutover).
         .nest("/api/terminal", terminal::routes())
+        // Metrics tab report cards: CRUD + registry + ops-server refresh
+        // (AMUX-2884 — the table kept its rows, the routes never mounted).
+        .nest("/api/reports", reports::routes())
         .nest("/api/history", history::routes())
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).
