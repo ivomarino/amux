@@ -51,6 +51,7 @@ libc.workspace = true
 # worker its audio via a named temp file, exactly as the Python engine does.
 tempfile.workspace = true
 portable-pty = "0.9.0"
+serde_yaml = "0.9.34"
 
 [dev-dependencies]
 proptest.workspace = true

@@ -27,6 +27,7 @@ pub mod crm;
 pub mod speedtest;
 pub mod habits;
 pub mod health;
+pub mod env_config;
 pub mod gmail;
 pub mod graph;
 pub mod history;
@@ -223,6 +224,9 @@ pub fn router(state: AppState) -> Router {
         // Metrics tab report cards: CRUD + registry + ops-server refresh
         // (AMUX-2884 — the table kept its rows, the routes never mounted).
         .nest("/api/reports", reports::routes())
+        // Declarative environment config: one YAML -> the primitives
+        // (groups, workers; phase 2: schedules/columns/gates/files) — AMUX-2977.
+        .nest("/api/env", env_config::routes())
         .nest("/api/history", history::routes())
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).

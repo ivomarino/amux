@@ -1017,6 +1017,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/reports/{id}", methods: &["DELETE", "PATCH"] },
     RouteEntry { path: "/api/reports/{id}/refresh", methods: &["POST"] },
     RouteEntry { path: "/api/reports/{id}/data", methods: &["GET"] },
+    RouteEntry { path: "/api/env/apply", methods: &["POST"] },
+    RouteEntry { path: "/api/env/schema", methods: &["GET"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
     // -- logs (this module)
