@@ -688,6 +688,29 @@ impl FleetSignals {
         {
             status = "active".into();
         }
+        // A PICKER CONTRADICTS IDLE TOO (AMUX-2952's status half). The rule
+        // above only ever flips idle -> active on a GENERATING pane, so a lane
+        // sitting at an input-required selector kept reading `idle` — measured
+        // live on tubescience 2026-08-11: the pane showed AskUserQuestion's
+        // "Ready to submit your answers?" while the header said IDLE, and
+        // Ethan pressed Enter into a lane nothing had flagged as waiting.
+        // `waiting` is the one state whose whole purpose is to summon a human;
+        // mislabelling it idle is strictly worse than mislabelling work,
+        // because nothing and nobody is coming.
+        //
+        // Same shape as the rule above on purpose: one-way (idle -> waiting),
+        // gated on the same report-age window, evidence from the same
+        // admissible pane. A missed frame costs a late correction, never a
+        // false "waiting".
+        if status == "idle"
+            && idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true)
+        {
+            if let Some(raw) = self.pane_of(name) {
+                if crate::api::session_verbs::detect_claude_status(raw) == "waiting" {
+                    status = "waiting".into();
+                }
+            }
+        }
         // SUBAGENTS ARE THE LANE WORKING TOO (AMUX-2904). Same one-way rule as
         // the pane contradiction above: only ever idle -> active, so a missed
         // signal costs a late correction and never a false "busy".
@@ -1937,9 +1960,24 @@ mod tests {
         // Pane paints a picker; activity fresh so the pane is admissible.
         s.activity.insert("amux-x".into(), 999_970);
         s.panes.insert("x".into(), "Do you trust this directory?\n\u{203a} 1. Yes, continue\n  2. No, quit\n  Press enter to continue".into());
-        s.reports = json!({"x": {"state": "idle", "ts": 985_600.0, "source": "stop-hook"}});
-        // CONTROL: no restart recorded — the old idle report still wins.
+        // CONTROL: a FRESH idle report (inside the contradiction window) with
+        // no restart recorded still wins over the picker on the pane — the
+        // report is the D1 authority and this is the report/repaint race.
+        //
+        // This control used to use a 4h-OLD idle report and expect "idle".
+        // That pinned the exact defect Ethan hit live on tubescience
+        // (2026-08-11): a stale idle outranking a visible AskUserQuestion
+        // picker, with him pressing Enter into a lane nothing had flagged as
+        // waiting. The waiting-contradiction now lets the pane show through
+        // once the report is older than the window, so the control moves
+        // INSIDE the window — which is what "no restart, report wins" was
+        // always supposed to mean.
+        s.reports = json!({"x": {"state": "idle", "ts": 999_970.0, "source": "stop-hook"}});
         assert_eq!(s.derive_status("x", true), "idle");
+        // A STALE idle report (4h) over the same picker: the pane's waiting
+        // shows through — no restart needed. This is tonight's fix.
+        s.reports = json!({"x": {"state": "idle", "ts": 985_600.0, "source": "stop-hook"}});
+        assert_eq!(s.derive_status("x", true), "waiting");
         // The lane restarted AFTER the report (provider switch): the report
         // is void and the pane's waiting shows through.
         s.started.insert("x".into(), 999_000.0);
