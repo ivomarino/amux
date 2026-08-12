@@ -1857,9 +1857,15 @@ def proxy(handler, port, path, qs, user_email="", user_id=None):
         url += "?" + qs
     length = int(handler.headers.get("Content-Length", 0))
     body = handler.rfile.read(length) if length else None
-    # Strip auth headers so container doesn't see them
-    skip = {"host", "content-length", "authorization", "cookie"}
+    # Strip auth headers so container doesn't see them. accept-encoding joins
+    # them (AC-342): without forcing identity the container gzips its reply, we
+    # re-emit those bytes but strip content-encoding on the response below, and
+    # the client gets gzip labelled as plain — "API Error: Failed to parse JSON"
+    # on a proxied error body. Same fix and same reason as the Anthropic proxy
+    # path (~line 1250); the container path simply never got it.
+    skip = {"host", "content-length", "authorization", "cookie", "accept-encoding"}
     fwd = {k: v for k, v in handler.headers.items() if k.lower() not in skip}
+    fwd["accept-encoding"] = "identity"
     if user_email:
         fwd["X-Amux-User-Email"] = user_email
     is_sse = handler.headers.get("Accept", "") == "text/event-stream"
@@ -1868,7 +1874,11 @@ def proxy(handler, port, path, qs, user_email="", user_id=None):
         resp = urllib.request.urlopen(req, timeout=None if is_sse else 60, context=_CTR_SSL)
         handler.send_response(resp.status)
         for k, v in resp.headers.items():
-            if k.lower() not in ("transfer-encoding",):
+            # content-encoding stripped alongside transfer-encoding (AC-342):
+            # we forced identity upstream so the body is uncompressed, and
+            # re-emitting a stale content-encoding: gzip would relabel plain
+            # bytes as compressed — the exact garbling this card is about.
+            if k.lower() not in ("transfer-encoding", "content-encoding"):
                 handler.send_header(k, v)
         handler.end_headers()
         if is_sse:
