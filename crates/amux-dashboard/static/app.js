@@ -3808,6 +3808,21 @@ function _renderTabCustomizerMenu() {
 // other tab was configurable. Order here is the DOM order, so a fresh browser's
 // default matches what it already shows. `terminal` is deliberately absent: it
 // is pinned first by _applyPeekTabVisibility and is not reorderable.
+// The peek tab strip overflows horizontally (measured: ~946px of tabs in a
+// ~761px strip) and hides its scrollbar for looks (scrollbar-width:none). On a
+// desktop that left it un-scrollable: a vertical mouse-wheel does not move a
+// horizontal overflow, and there is no visible bar to drag — "couldn't get it
+// working" (Ethan, AMUX-2995). Touch already pans via touch-action:pan-x; this
+// maps the dominant wheel axis onto scrollLeft so the wheel works too.
+function _peekTabsWheel(e) {
+  const strip = e.currentTarget;
+  if (strip.scrollWidth <= strip.clientWidth) return; // nothing to scroll
+  const dominant = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (!dominant) return;
+  strip.scrollLeft += dominant;
+  e.preventDefault(); // keep the page from scrolling instead of the tabs
+}
+
 const PEEK_TABS = [
   { id: 'steering',   label: 'Steering' },
   { id: 'schedules',  label: 'Schedules' },
@@ -7102,7 +7117,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.607';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.608';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
