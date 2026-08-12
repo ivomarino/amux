@@ -375,6 +375,10 @@
   .sched-cadence-pill { font-size:0.62rem;padding:1px 5px;border-radius:10px;border:1px solid var(--border);color:var(--dim);background:var(--card);font-family:monospace; }
   .sched-id-badge { font-size:0.6rem;padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--accent);font-family:monospace;cursor:pointer;flex-shrink:0;letter-spacing:0.02em; }
   .sched-id-badge:hover { border-color:var(--accent); }
+  /* Copyable message id in the Messages/peek rows (AMUX-2970), same affordance
+     as the scheduler's SCHED-N badge so the two read alike. */
+  .msg-id-badge { font-size:0.6rem;padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--accent);font-family:monospace;cursor:pointer;flex-shrink:0;letter-spacing:0.02em;margin-right:6px; }
+  .msg-id-badge:hover { border-color:var(--accent); }
   .sched-run-dot { display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0; }
   .sched-run-dot.ok { background:var(--green,#4ade80); }
   .sched-run-dot.done { background:var(--accent); }

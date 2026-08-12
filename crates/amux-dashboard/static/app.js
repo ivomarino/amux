@@ -7079,7 +7079,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.604';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.605';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11291,7 +11291,15 @@ function _cmdHistItemHTML(e, ctx) {
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  // Copyable message id, matching the scheduler's SCHED-N badge (Ethan
+  // 2026-08-12). Only when the row has a real id — legacy string entries and
+  // not-yet-delivered offline sends have none, and a copy chip that yields
+  // "undefined" is worse than no chip.
+  const _mid = (typeof e === 'string') ? '' : (e.id !== undefined && e.id !== null ? String(e.id) : '');
+  const idTag = _mid
+    ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
+    : '';
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
   // A MATCHING message is force-expanded while a search is active, even if the
@@ -18153,6 +18161,16 @@ function schedCadence(s) {
 function _copySchedId(id) {
   try { navigator.clipboard.writeText(id); } catch(e) {}
   if (typeof showToast === 'function') showToast(id + ' copied');
+}
+// Message-id copy, mirroring _copySchedId (Ethan, 2026-08-12: "each message row
+// has a message ID that I can copy similar to the schedule ID"). The value is
+// the cmd_history row id; we render it as MSG-<id> so a pasted reference is
+// unambiguous (a bare integer could be anything), and strip the prefix back off
+// on copy so what lands on the clipboard is the raw id the API keys on.
+function _copyMsgId(id) {
+  const raw = String(id).replace(/^MSG-/, '');
+  try { navigator.clipboard.writeText(raw); } catch(e) {}
+  if (typeof showToast === 'function') showToast('MSG-' + raw + ' copied');
 }
 function toggleSchedExpand(id) {
   const el = document.getElementById('sched-cmd-' + id);
