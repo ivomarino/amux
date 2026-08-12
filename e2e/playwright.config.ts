@@ -45,7 +45,12 @@ export default defineConfig({
     // the default would have swallowed it whole (AMUX-2924).
     stdout: 'pipe',
     stderr: 'pipe',
-    timeout: 180_000, // first cargo build is slow; later runs are cached
+    // 10 min, not 3: the HEAD-worktree build now uses its OWN target dir
+    // (AMUX-2961 — sharing the fleet's dir let worktree dep-info poison repo
+    // builds into silent no-ops), so its FIRST local build is fully cold.
+    // Later runs are cached; CI skips the worktree entirely via
+    // AMUX_E2E_WORKING_TREE=1.
+    timeout: 600_000,
     env: {
       AMUX_HOME: home,
       AMUX_RS_PORT: String(PORT),

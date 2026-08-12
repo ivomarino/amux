@@ -78,6 +78,16 @@ setup_worktree() {
 
 if setup_worktree; then
   cd "$WT"
+  # The worktree build gets its OWN target dir (AMUX-2961). Sharing the fleet's
+  # dir looked like the rule — but cargo dep-info records ABSOLUTE source paths,
+  # so after a worktree build, a `cargo build` from the repo compares mtimes of
+  # the WORKTREE's files, sees them unchanged, and no-ops in 0.13s — silently
+  # handing back HEAD's binary while the caller believes they built their tree.
+  # That manufactured three consecutive "my fix doesn't work" verdicts on
+  # 2026-08-12, and would make the auto-builder install a STALE binary for the
+  # next commit while reporting success. One extra bounded cache dir is the
+  # price of the two source trees never sharing fingerprints.
+  export CARGO_TARGET_DIR="${AMUX_E2E_HEAD_TARGET_DIR:-$HOME/.amux/rust-build-target-e2e-head}"
 else
   echo "[e2e] WARNING: could not prepare a HEAD worktree at $WT — falling back to the WORKING TREE."
   echo "[e2e] On CI the tree is HEAD so this is exact; on a shared checkout a peer mid-edit can fail this run."
