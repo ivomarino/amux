@@ -12,14 +12,19 @@ async function appToken(page: Page): Promise<string> {
   return tok;
 }
 
-test('worker card shows total board items on the sched row', async ({ page, request }) => {
+test('worker card shows total board items on the sched row', async ({ page, request }, testInfo) => {
   await page.goto('/');
   await page.waitForLoadState('networkidle');
   const token = await appToken(page);
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   // A worker IS its env file, so create one the fleet list will show.
-  const worker = 'e2e-count-lane';
+  // PER-PROJECT NAME: desktop and mobile run this test CONCURRENTLY against
+  // ONE shared server, so a fixed name had both projects seeding the same
+  // worker — CI read "2 doing · 6 active", every figure exactly doubled. The
+  // first CI run of this spec is what caught it; locally a single project
+  // never collides with itself.
+  const worker = `e2e-count-${testInfo.project.name}`;
   await request.post('/api/sessions', {
     headers: auth,
     data: { name: worker, dir: '/tmp', desc: 'e2e count fixture' },
@@ -44,17 +49,27 @@ test('worker card shows total board items on the sched row', async ({ page, requ
   await expect(meta).toBeVisible();
   const text = (await meta.textContent()) || '';
 
-  // The ASSERTION IS THE NUMBER, not merely that a total is present: a counter
-  // that renders the wrong figure is worse than none, and "contains items"
-  // would pass on any value.
-  expect(text).toContain('3 items');
+  // The ASSERTION IS THE NUMBER, not merely that a badge is present: a counter
+  // that renders the wrong figure is worse than none.
+  //
+  // Asserted against what the renderer actually emits (ffa00e4's predicate):
+  // "N doing · M active[ · T total]", where active counts ALL non-terminal
+  // cards and the total segment is HIDDEN when total === active. The previous
+  // assertions wanted "3 items" and an .mc-total element — text this renderer
+  // has never produced (that was an earlier badge's shape) — so the spec
+  // failed on its first real CI run while the feature worked. With 3
+  // non-terminal seeds (1 doing) and nothing terminal, the badge must read
+  // "1 doing · 3 active" and mc-total must be absent.
   expect(text).toContain('1 doing');
-  expect(await card.locator('.mc-total').textContent()).toBe('3');
+  expect(text).toContain('3 active');
+  await expect(card.locator('.mc-doing')).toHaveText('1');
+  await expect(card.locator('.mc-active')).toHaveText('3');
+  expect(await card.locator('.mc-total').count()).toBe(0);
 
-  // total >= doing must hold by construction (shared predicate).
-  const tot = Number(await card.locator('.mc-total').textContent());
+  // active >= doing must hold by construction (shared predicate).
+  const active = Number(await card.locator('.mc-active').textContent());
   const doing = Number(await card.locator('.mc-doing').textContent());
-  expect(tot).toBeGreaterThanOrEqual(doing);
+  expect(active).toBeGreaterThanOrEqual(doing);
 
   // cleanup
   await request.delete(`/api/sessions/${worker}`, { headers: auth });

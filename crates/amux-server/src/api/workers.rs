@@ -293,7 +293,28 @@ pub struct CreateWorkerBody {
     pub group: Option<String>,
 }
 
+/// Fleet-membership writes drop the legacy session-list cache (AMUX-2957).
+///
+/// The 2s cache on GET /api/sessions (7ca14b5) is invalidated on CONFIG writes
+/// (AMUX-2926) — but a worker CREATE is also a list-shape change, and it was
+/// not covered. Unobservable until tonight: the new worker-card-counts e2e
+/// polls the dashboard in parallel, keeping the cache perpetually warm, so
+/// control-plane's create-then-read (which had always passed) started landing
+/// inside a hot window and reading a list from before its own create —
+/// "legacy array carries the worker: Received: undefined". A cache that is
+/// only cold when nobody is looking is how a passing test and a broken
+/// product trade places. Wrapper, not per-return calls, for the same reason
+/// as config_patch: a dozen exits, and the next one added would miss it.
 pub async fn create_worker(
+    state: State<AppState>,
+    body: Json<CreateWorkerBody>,
+) -> Response {
+    let out = create_worker_inner(state, body).await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    out
+}
+
+async fn create_worker_inner(
     State(state): State<AppState>,
     Json(body): Json<CreateWorkerBody>,
 ) -> Response {
@@ -769,7 +790,13 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
 /// DELETE /api/workers/{id} — soft delete, only from Stopped (a running
 /// worker must be stopped first; 409 otherwise). The row survives for the
 /// audit/session history hanging off it; it just stops resolving.
-pub async fn delete_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn delete_worker(state: State<AppState>, key: Path<String>) -> Response {
+    let out = delete_worker_inner(state, key).await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    out
+}
+
+async fn delete_worker_inner(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let key_w = key.clone();
