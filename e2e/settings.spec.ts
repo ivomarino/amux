@@ -418,6 +418,65 @@ test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
   expect(after.ANTHROPIC_API_KEY).toBe(before.ANTHROPIC_API_KEY);
 });
 
+test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => {
+  // Regression for the settings_api_key_anthropic CI flake (6/8 runs red).
+  // loadApiKeys() runs async when the panel opens and used to do an
+  // unconditional `inp.value = ''` when its GET returned — so on a loaded
+  // runner where the fill BEAT the response, the response then wiped the
+  // typed key and Save hit its empty-value early return: no PATCH was ever
+  // sent, and the sibling test's waitForResponse hung to the 60s budget. The
+  // same race hits a fast human as "my key vanished while I typed".
+  //
+  // This test forces the losing interleaving deterministically: hold the GET
+  // for 800ms, type during the hold, let the delayed response land, and
+  // assert the field still holds the entry — a fast, legible failure
+  // (value '' vs the key) instead of a timeout, on exactly the incident's
+  // ordering.
+  await settle(page);
+  const token = await appToken(page);
+
+  let heldOnce = false;
+  await page.route('**/api/settings/env', async (route) => {
+    if (route.request().method() === 'GET' && !heldOnce) {
+      heldOnce = true;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    await route.continue();
+  });
+
+  const [delayedGet] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'GET',
+    ),
+    (async () => {
+      await openSettings(page);
+      // Type while the GET is still held — the incident's interleaving.
+      await page.locator('#settings-anthropic-key').fill('sk-ant-e2e-race-77zz');
+    })(),
+  ]);
+  expect(delayedGet.ok()).toBeTruthy();
+  // The delayed refresh has landed and run its handler; the entry must survive.
+  await expect(page.locator('#settings-anthropic-key')).toHaveValue('sk-ant-e2e-race-77zz');
+
+  // And Save must actually send it.
+  const [res] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'PATCH',
+    ),
+    page.locator('#settings-apikeys-section button', { hasText: 'Save' }).click(),
+  ]);
+  expect(res.status()).toBe(200);
+
+  // Restore (same route as the sibling test; empty value falls back to
+  // process env).
+  await page.unroute('**/api/settings/env');
+  const restore = await request.patch('/api/settings/env', {
+    headers: authHeaders(token),
+    data: { ANTHROPIC_API_KEY: '' },
+  });
+  expect(restore.status()).toBe(200);
+});
+
 test('settings_commit_guard', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);

@@ -7079,7 +7079,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.603';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.604';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24876,7 +24876,15 @@ async function loadApiKeys() {
     const st = document.getElementById('settings-apikey-status');
     if (!inp) return;
     inp.placeholder = data.ANTHROPIC_API_KEY ? data.ANTHROPIC_API_KEY : 'sk-ant-...';
-    inp.value = '';
+    // Never clear a NON-EMPTY input: this callback is async and can land
+    // AFTER someone started typing into the field — the unconditional
+    // `inp.value = ''` here wiped the entry mid-flight, and Save then hit
+    // its empty-value early return as a silent no-op. That was the
+    // settings_api_key_anthropic CI flake (6/8 runs: fill won the race on a
+    // loaded runner, the refresh wiped it, waitForResponse hung 60s) and is
+    // the same bug a fast human hits as "my key vanished while I typed".
+    // The one writer that needs the field cleared — saveApiKey after a
+    // successful PATCH — clears it itself before calling us.
     if (st) st.textContent = data.ANTHROPIC_API_KEY ? 'Key saved ✓' : 'No key set';
   } catch(e) {}
 }
@@ -24885,7 +24893,14 @@ async function saveApiKey() {
   const inp = document.getElementById('settings-anthropic-key');
   const st = document.getElementById('settings-apikey-status');
   const val = inp ? inp.value.trim() : '';
-  if (!val) return;
+  if (!val) {
+    // Say so instead of silently no-oping: when the refresh race above wiped
+    // the field, Save "doing nothing" was indistinguishable from Save being
+    // broken — the e2e's only symptom was a 60s network wait on a request
+    // that was never sent.
+    if (st) st.textContent = 'Enter a key first';
+    return;
+  }
   st && (st.textContent = 'Saving…');
   try {
     const r = await fetch('/api/settings/env', {method:'PATCH', headers:{'Content-Type':'application/json'},
