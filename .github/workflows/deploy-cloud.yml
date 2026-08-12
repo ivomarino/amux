@@ -209,6 +209,24 @@ jobs:
           ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
             echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
 
+      - name: Snapshot gateway.py + gateway.env BEFORE any writes (restart only if they change)
+        run: |
+          # AMUX-2968 residual (amux-cloud, verified): the gateway restart below
+          # is a ~2s cloud.amux.io blip, and auto-deploy fires it at a moment
+          # nobody picks (any lane's green CI) — a prospect mid-click during a
+          # live demo could hit a 502. The fix is not a demo-window gate; it is
+          # that a restart is only NEEDED when the gateway's own code or secrets
+          # change, and the common auto-deploy (a pure server-binary commit)
+          # changes NEITHER. So snapshot both now, compare after the writes, and
+          # restart only on a real change. The image pull needs no gateway
+          # restart; only gateway.py / gateway.env do.
+          H=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
+          echo "PRE_GW_PY=$(echo "$H" | sed -n 1p)" >> "$GITHUB_ENV"
+          echo "PRE_GW_ENV=$(echo "$H" | sed -n 2p)" >> "$GITHUB_ENV"
+          echo "pre-deploy: gateway.py md5=$(echo "$H" | sed -n 1p) gateway.env md5=$(echo "$H" | sed -n 2p)"
+
       - name: Gateway env — admin emails (idempotent, safe on every deploy)
         run: |
           ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
@@ -307,8 +325,25 @@ jobs:
             "root@$CLOUD_HOST:/opt/amux-cloud/docker/docker-compose.template.yml"
           rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/litestream/litestream.yml \
             "root@$CLOUD_HOST:/opt/amux-cloud/litestream/litestream.yml"
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
-            'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
+          # Restart the gateway ONLY if its code or secrets actually changed
+          # (AMUX-2968 residual). compose.template + litestream are read by
+          # docker/litestream, not the gateway process, so they never justify a
+          # restart. A pure server-binary auto-deploy leaves both hashes equal →
+          # no restart → no cloud.amux.io blip, which is the demo-safety the
+          # residual asked for. A real gateway.py or secret change still restarts
+          # (the blip then is a deploy someone meant to make).
+          NOW=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
+          NPY=$(echo "$NOW" | sed -n 1p); NENV=$(echo "$NOW" | sed -n 2p)
+          if [ "$NPY" != "${PRE_GW_PY:-}" ] || [ "$NENV" != "${PRE_GW_ENV:-}" ]; then
+            echo "gateway changed (py ${PRE_GW_PY:-none}->$NPY, env ${PRE_GW_ENV:-none}->$NENV) — restarting (expect a ~2s blip)"
+            ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
+              'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
+          else
+            echo "gateway.py + gateway.env UNCHANGED — skipping restart, NO proxy blip; verifying still active"
+            ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'systemctl is-active amux-gateway'
+          fi
 
       # GATED WITH THE WRITER IT VERIFIES, and that pairing is the point.
       #
