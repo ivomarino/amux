@@ -2712,16 +2712,21 @@ async fn reactive_pickup(state: &AppState, session: &str) {
     drop(conn);
 
     if let Pickup::Claim { card, prompt } = pickup {
-        crate::runtime_jobs::board_drive::claim_card(state, session, &card).await;
-        crate::api::session_verbs::steer_enqueue(
-            state, session, &prompt, "board-drive:reactive", "",
-        )
-        .await;
-        tracing::info!(
-            session,
-            card = card.as_str(),
-            "reactive pickup: claimed {card} immediately after status change"
-        );
+        // Same compare-and-swap guard as the drive loop (AMUX-2983): only
+        // dispatch if the atomic claim took. This reactive path has the exact
+        // race — select_pickup then drop(conn) then claim — so an unconditional
+        // claim+dispatch could re-open and re-run a card closed in the gap.
+        if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
+            crate::api::session_verbs::steer_enqueue(
+                state, session, &prompt, "board-drive:reactive", "",
+            )
+            .await;
+            tracing::info!(
+                session,
+                card = card.as_str(),
+                "reactive pickup: claimed {card} immediately after status change"
+            );
+        }
     }
 }
 

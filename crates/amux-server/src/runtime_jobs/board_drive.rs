@@ -2176,10 +2176,22 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 
     match pickup.expect("pickup computed whenever advance declined") {
         Pickup::Claim { card, prompt } => {
-            claim_card(state, lane, &card).await;
-            fleet.deliver(lane, &prompt).await;
-            LaneTrace::acted(lane, "assigned", &card, "claimed and prompt queued")
+            // Only dispatch "work it now" if the atomic claim actually took —
+            // the card could have been closed between select_pickup and here
+            // (AMUX-2983). A refused claim is not an error, it is the race being
+            // caught: skip, do not deliver finished work.
+            if claim_card(state, lane, &card).await {
+                fleet.deliver(lane, &prompt).await;
+                LaneTrace::acted(lane, "assigned", &card, "claimed and prompt queued")
+                    .with_counts(eligible, open)
+            } else {
+                LaneTrace::skip(
+                    lane,
+                    "pickup-raced",
+                    format!("{card} left 'todo' before the claim landed — not dispatched"),
+                )
                 .with_counts(eligible, open)
+            }
         }
         Pickup::Decompose { ids, text } => {
             // DURABLE cooldown (py:14627): the in-memory dict was wiped by the
@@ -2474,16 +2486,36 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 /// Claim happens BEFORE delivery, and delivery is a durable queue row, so the
 /// two cannot disagree for long: Python called `send_text` after the UPDATE, so
 /// a failed send left a card claimed with nobody told.
-pub async fn claim_card(state: &AppState, session: &str, card: &str) {
+/// Claim a card for a lane. Returns `true` ONLY if the card was still `todo`
+/// and got moved to `doing` — the caller must not deliver the "work it now"
+/// prompt otherwise.
+///
+/// COMPARE-AND-SWAP ON STATUS (AMUX-2983, gtm-videos). `select_pickup` reads
+/// the card as `todo` but drops its read connection before this write runs, so
+/// the owner can CLOSE the card in the gap. The old UPDATE was unconditional —
+/// `SET status='doing' WHERE id=?` — so it would REOPEN a done/verified/
+/// discarded card back to `doing` and the caller would then dispatch "work it
+/// now", making the lane re-do finished work. For a non-idempotent task
+/// (GV-648: re-push a video already live on Buffer/IG) that is real damage. The
+/// `AND status='todo'` makes the claim atomic: 0 rows affected == the card left
+/// todo == do not claim, do not dispatch, and say so in the trace so the rate
+/// of these races is visible (the API being down and pickup running off a
+/// stale view is the same failure this closes — the write sees the real row).
+pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     let card_s = card.to_string();
-    let _ = state
+    let reply = state
         .store
         .write_async(move |conn| {
             let now = now_f64() as i64;
-            conn.execute(
-                "UPDATE issues SET status='doing', updated=?1 WHERE id=?2",
+            let n = conn.execute(
+                "UPDATE issues SET status='doing', updated=?1 WHERE id=?2 AND status='todo'",
                 rusqlite::params![now, card_s],
             )?;
+            if n == 0 {
+                // Not todo any more (closed, discarded, already doing, or gone):
+                // do NOT touch the log or claim — applied=false tells the caller.
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT log FROM issues WHERE id=?1",
@@ -2501,6 +2533,15 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) {
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
+    let claimed = matches!(reply, Ok(r) if r.applied);
+    if !claimed {
+        tracing::info!(
+            target: "amux::board_drive", %session, %card,
+            "auto-pickup NOT claimed — card left 'todo' between select and claim \
+             (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
+        );
+        return false;
+    }
     crate::api::session_verbs::emit_event(
         state,
         session,
@@ -2514,6 +2555,7 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) {
         "board-drive",
     )
     .await;
+    true
 }
 
 /// Background driver.
@@ -2973,6 +3015,55 @@ mod tests {
         conn.execute("UPDATE issues SET archived=1 WHERE id='T-2'", []).expect("archive");
         assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 1);
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// AMUX-2983 (gtm-videos): the auto-pickup claimed GV-648 while it was
+    /// already `done`, because select_pickup drops its connection and the
+    /// unconditional `SET status='doing'` claim would REOPEN a closed card and
+    /// dispatch "work it now" — re-running finished, non-idempotent work. The
+    /// compare-and-swap (`AND status='todo'`) must refuse the claim AND leave
+    /// the card untouched. Needs a real Store (write path), not board_db().
+    #[tokio::test]
+    async fn claim_refuses_a_closed_card_and_does_not_reopen_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let state = crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let ins = |id: &str, status: &str| {
+            let (id, status) = (id.to_string(), status.to_string());
+            store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+                         VALUES (?1,'t','',?2,'lane',100,100,'agent','code')",
+                        rusqlite::params![id, status],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let status_of = |id: &str| -> String {
+            store
+                .read()
+                .unwrap()
+                .query_row("SELECT status FROM issues WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        // The GV-648 shape: a DONE card. The claim must refuse and not reopen.
+        ins("GV-1", "done");
+        assert!(!claim_card(&state, "lane", "GV-1").await, "claiming a done card must return false");
+        assert_eq!(status_of("GV-1"), "done", "a done card must NOT be reopened to 'doing'");
+        // The control that proves the swap can succeed: a real todo claims.
+        ins("T-1", "todo");
+        assert!(claim_card(&state, "lane", "T-1").await, "a todo card claims");
+        assert_eq!(status_of("T-1"), "doing");
+        // And a second claim of the now-doing card refuses (idempotent).
+        assert!(!claim_card(&state, "lane", "T-1").await, "re-claiming a doing card must refuse");
     }
 
     #[test]
