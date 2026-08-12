@@ -3209,3 +3209,14 @@ CARD: AMUX-2907
 SYMPTOM: backend triaged 16 pickups in one hour, each ending doing->todo with analysis appended and zero execution; every bounce armed the 24h reclaim cooldown, so 19 of 19 todos became undispatchable while the lane read busy and the drive kept dealing. The deep-queue paragraph in the pickup prompt said "say so and re-shape the queue rather than grinding it" and named no honest exit - bouncing WAS the compliant reading (AMUX-2140 class: the sanctioned instruction and the failure were the same action).
 COST: An afternoon of one lane's throughput converted into cooldowns; Ethan asked twice why workers "just stop" / "have so many todo items"; the diagnosis required joining task.claimed events against card logs by hand because no view says "this lane is declining its pickups".
 FIX: 1d3e5aa - the prompt now names the exits (not-ready -> backlog, owner-blocked -> review, never a ready card back to todo with notes) and select_pickup has a self-clearing bounce-loop breaker (3 bounced claims in 2h stop the deal, WARN + trace reason). Residual: the 24h cooldowns on backend's 19 cards expire on their own; nothing re-deals them sooner.
+
+## `cargo build` reported Finished 0.13s and handed back a binary without my code
+AREA: build
+SEVERITY: wrong-conclusion
+STATUS: fixed
+DATE: 2026-08-12
+SESSION: amux
+CARD: AMUX-2961
+SYMPTOM: After serve-head.sh built its persistent HEAD worktree into the shared CARGO_TARGET_DIR, every later repo-tree build was a silent no-op: cargo dep-info records absolute source paths, so freshness was judged against the WORKTREE's unchanged files and my edited repo files were never consulted. Two "working tree" playwright runs and a manual repro all exercised pre-fix code; each red read as "my fix does not work". The tell that broke the loop: a marker string present in the source and absent from the binary the build had just "finished" (grep -ac on the binary, 0 vs the source's 1).
+COST: ~40 minutes and three consecutive false verdicts against a correct fix; the natural next step of each false verdict was to rewrite working code. One step further and the auto-builder would have been suspected too (it is immune - release profile + ephemeral worktrees - but proving that took its own pass).
+FIX: 3426ad7 - the worktree branch of serve-head exports its own bounded target dir (~/.amux/rust-build-target-e2e-head); CI skips the worktree entirely (AMUX_E2E_WORKING_TREE=1 + pinned CARGO_TARGET_DIR, which also stops CI paying a second cold build the old step comment claimed was shared). Verification recipe when a build smells stale: grep the BINARY for a string your edit introduced - "Finished" is a claim about fingerprints, not about your code being in the artifact.
