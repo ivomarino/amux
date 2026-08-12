@@ -283,6 +283,39 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<S
         return (paths, provenance);
     }
 
+    // RESOLVE THE REPO ROOT AND COMPARE FROM THERE (AMUX-2947).
+    //
+    // `git status --porcelain` emits REPO-ROOT-relative paths, but `dir` is the
+    // lane's CC_DIR, which is frequently a SUBDIRECTORY — creative-dna's is
+    // /Users/ethan/Dev/mixpeek/gtm/creative-dna. Run from there,
+    // `git hash-object -- .github/workflows/x.yml` resolves against the CWD and
+    // dies with "could not open 'gtm/.github/workflows/x.yml'". The command
+    // fails, the match arm below cannot compare, and its deliberately
+    // conservative `_ => false` keeps the path.
+    //
+    // So the filter degraded to a NO-OP for every lane not sitting at a repo
+    // root, and it did so silently while the provenance line kept saying
+    // "compared against origin/main (just fetched)". Measured by creative-dna
+    // across all 55 paths in one report: 34 byte-identical to origin, i.e. 62%
+    // false, on a guard whose own text warns the reader those files may be a
+    // peer's mid-edit work. A guard that is wrong most of the time trains
+    // people to skim it, and the 19 real ones were in there.
+    //
+    // `cat-file -e origin/main:<path>` is why it was not obvious: that one
+    // addresses the OBJECT DB and is root-relative, so it succeeds from any
+    // subdir. Existence checks passed, content checks failed, everything was
+    // kept.
+    let root = tokio::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| dir.to_string());
+    let dir = root.as_str();
+
     let mut kept = Vec::new();
     for p in paths {
         // Does the path exist on origin at all? THE TRAP tubescience hit and
@@ -692,6 +725,63 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// THE PHANTOM FILTER MUST WORK FROM A SUBDIRECTORY (AMUX-2947).
+    ///
+    /// `git status --porcelain` emits repo-root-relative paths, but a lane's
+    /// CC_DIR is often a subdir. Run from there, `git hash-object -- <path>`
+    /// resolves against the CWD and fails, the comparison cannot be made, and
+    /// the conservative "keep it" arm keeps EVERYTHING — so the filter became a
+    /// no-op while its provenance line still said "compared against
+    /// origin/main". creative-dna measured 34 of 55 reported paths as
+    /// byte-identical to origin: 62% false.
+    ///
+    /// Drives the real function against a real git repo, because the bug is
+    /// entirely in how git resolves a path relative to a process CWD — a mocked
+    /// git would have reproduced nothing.
+    #[tokio::test]
+    async fn phantom_filter_still_works_when_the_lane_dir_is_a_subdirectory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let sh = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git")
+        };
+        sh(&["init", "-q", "--initial-branch=main"], root);
+        sh(&["config", "user.email", "t@t"], root);
+        sh(&["config", "user.name", "t"], root);
+        std::fs::create_dir_all(root.join("sub/lane")).unwrap();
+        std::fs::write(root.join("tracked.txt"), "original\n").unwrap();
+        sh(&["add", "-A"], root);
+        sh(&["commit", "-qm", "seed"], root);
+        // A local "origin/main" pointing at the same commit: the file is
+        // therefore IDENTICAL to origin and must be filtered out.
+        sh(&["update-ref", "refs/remotes/origin/main", "HEAD"], root);
+        // Dirty the index only — worktree content still matches origin, which
+        // is the phantom shape (a stale index on a graft-push checkout).
+        sh(&["update-index", "--assume-unchanged", "tracked.txt"], root);
+        std::fs::write(root.join("tracked.txt"), "original\n").unwrap();
+
+        let subdir = root.join("sub/lane");
+        let (kept, prov) = drop_paths_identical_to_origin(
+            subdir.to_str().unwrap(),
+            vec!["tracked.txt".to_string()],
+        )
+        .await;
+        assert!(
+            prov.contains("origin/main"),
+            "provenance must still describe the comparison: {prov}"
+        );
+        assert!(
+            kept.is_empty(),
+            "a worktree file identical to origin must be dropped even when the lane dir is a \
+             SUBDIRECTORY — got {kept:?}. Before the fix this kept everything, because \
+             hash-object resolved the root-relative path against the subdir and failed."
+        );
     }
 
     /// THE INCIDENT, rebuilt from its own numbers. 11 dirty files, none mine.
