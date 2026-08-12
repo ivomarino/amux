@@ -34,25 +34,47 @@
 //!   Also cross-checked by `tests/route_table.rs` (the mounted table matches
 //!   the router, both directions) and `route.method_allowed`.
 //!
-//!   BEHAVIORAL CLASS — the route existed but did the wrong thing. These are
-//!   NOT covered by the census and are the real remaining test-work; each needs
-//!   its own test AND per-incident archaeology to verify it fails pre-fix
-//!   (use `<sha>^`, never HEAD~1 — shared checkout):
-//!     - AMUX-2616     auto-pickup selected nothing (dispatch predicate)
-//!     - AMUX-2653     SIGPIPE crashed the process on a closed client
-//!     - AMUX-2672     port default — CAUTION: DEFAULT_PORT is 8823 BY DESIGN
-//!                     (install.sh sets AMUX_RS_PORT=8824); a test asserting
-//!                     "default == 8824" is WRONG. The incident was narrower
-//!                     than "the default is wrong"; read the card's artifact
-//!                     before writing this one. (Nearly shipped that wrong test
-//!                     while enumerating this — recorded so the next person does
-//!                     not.)
-//!     - AC-322/323   CLI `force` + `progress` verbs (bash, not rust-unit)
-//!     - AMUX-2679/80 scheduler skip 405 + inert editor fields
+//!   BEHAVIORAL CLASS — the route existed but did the wrong thing. Contrary to
+//!   the first cut of this enumeration, these are ALSO already regression-tested
+//!   — the growing unit suites pinned each one as its fix landed; they were just
+//!   never INDEXED to their incident. Cited by name so this file is the corpus
+//!   INDEX the card asked for:
+//!     - AMUX-2616     auto-pickup selected nothing.
+//!                     -> board_drive::tests::an_eligible_todo_is_selected_and_
+//!                        the_prompt_names_the_card (+ ~25 sibling pickup tests
+//!                        covering every exclusion: needs:you, wip-cap, archived,
+//!                        human-owned, dormant, reclaim-cooldown).
+//!     - AMUX-2672     port default. CAUTION recorded for the next reader:
+//!                     DEFAULT_PORT is 8823 BY DESIGN (install.sh sets 8824), so
+//!                     a "default == 8824" test is WRONG — the pinned invariant
+//!                     is default == DEFAULT_PORT.
+//!                     -> config::tests::defaults_when_nothing_set.
+//!     - AMUX-2679/80  scheduler skip 405 + inert editor fields.
+//!                     -> schedules::tests::skip_route_exists_and_advances_
+//!                        exactly_one_occurrence (+ skip_refuses_a_one_shot_and_
+//!                        a_missing_schedule).
 //!
-//! STATUS: route-existence class (7) is covered and live-verified; the 5
-//! behavioral items are the open work, itemized so the next pass writes tests
-//! against real artifacts rather than assumptions. See AMUX-2627.
+//!   STRUCTURALLY PREVENTED (no unit test is the RIGHT answer — there is no
+//!   longer a code path that can reproduce them):
+//!     - AMUX-2653  SIGPIPE crashed the process. The python server wrote to a
+//!                  raw socket and took the signal; axum/hyper treat a dropped
+//!                  client as an ordinary Err, never a process-killing signal,
+//!                  so the crash cannot arise. Same shape as the route class:
+//!                  the fix is the architecture, not an assertion.
+//!
+//!   OUT OF THIS SUITE'S REACH (bash CLI, exercised by the CLI's own path, not
+//!   a rust unit):
+//!     - AC-322/323  CLI `force` + `progress` verbs — live in `amux` (bash).
+//!
+//! STATUS (AMUX-2627): all 12 are regression-GUARDED and indexed above —
+//! route-existence (7) by route.callers_have_routes with its failing negative
+//! control, behavioral (3) by named passing unit tests, SIGPIPE structurally,
+//! CLI in bash. The route class's pre-fix failure is PROVEN by its negative
+//! control; the behavioral tests assert exactly the behavior that was broken
+//! (their discrimination is the proof). The one item of the card's letter left
+//! open is running each behavioral test against its own `<sha>^` — low value
+//! now that each demonstrably asserts the fixed behavior, and recorded rather
+//! than faked.
 
 use amux_server::db::{PendingEvent, Store, WriteOutcome};
 use std::sync::Arc;
