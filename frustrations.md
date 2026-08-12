@@ -2899,7 +2899,7 @@ FIX: 2e3f706 — chars().take(500) instead of byte slicing; ROUTE_TABLE row adde
 ## `amux board needsyou <id>` tags the card; it does not move it to the needsyou STATUS
 AREA: cli
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-11
 SESSION: amux
 CARD: AMUX-2878
@@ -2919,6 +2919,10 @@ FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
   the one this file keeps recording: a command whose success message describes a
   smaller action than its name implies. Same class as `amux board claim` exiting
   0 without claiming (AMUX-2140).
+  FIXED 2394577 (2026-08-12, daily sweep): the verb now tags AND transitions to
+  the needsyou status; a gate bounce on the move is reported loudly with exit 1
+  instead of the half-action hiding behind the tag's success line. Verified on a
+  scratch card: status, tag and ask all landed.
 
 
 ## `node --check` passes on an empty file, so the JS gate cannot see a truncated one
