@@ -31,6 +31,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+# THE `amux` CLI IS A BUILD INPUT, NOT ONLY A RUNTIME FILE. It is copied again
+# into the runtime stage below (that copy is what puts it on PATH), but the
+# build needs it FIRST: invariants/monitor.rs:215 does
+#   include_str!("../../../../amux")
+# to scan the shell CLI's calls, so cargo cannot compile amux-server without it.
+# Missing here, the image build dies with
+#   couldn't read crates/amux-server/src/invariants/../../../../amux
+# which reads like a path bug in the source rather than an absent build input —
+# it broke the cloud deploy on 2026-08-12 and the runtime COPY at the bottom
+# makes it look already handled.
+COPY amux ./amux
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from
