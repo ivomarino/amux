@@ -332,6 +332,66 @@ pub fn canonical_port() -> u16 {
 /// after the bind is gone (AMUX-2946).
 const RETIRED_PORTS: &[u16] = &[8822];
 
+/// Running sessions whose `AMUX_URL` still names a retired port — GROUND TRUTH
+/// for "who is stranded", measured by scanning process envs rather than by
+/// counting hits (AMUX-2988, ethos rule 4).
+///
+/// The hit counter above answers "who is CALLING the retired port". Once Ethan
+/// dropped the 8822 bind (2026-08-11, "no more 8822 just rust"), nothing listens
+/// there, so a stranded lane's `curl $AMUX_URL/...` fails at connect and records
+/// NO hit — the hit-based `sessions_still_on_legacy` collapses to `[]` and the
+/// verdict reads CLEAR while 52 lanes are in fact broken. A process-env scan is
+/// independent of hits and therefore still answers the question after the bind
+/// is gone, which is exactly when it matters. This mirrors `/api/debug/tmux`:
+/// discovery from INSIDE the server process, reported as a number.
+///
+/// Recycling those lanes is the owner's call (ethos rule 8 — a restart can
+/// interrupt in-flight customer work); this only makes the count visible.
+fn scan_stranded_sessions() -> Vec<serde_json::Value> {
+    // `ps axeww` appends each process's environment (space-separated KEY=VALUE)
+    // after its command, on both BSD (macOS) and GNU (the Linux container) ps.
+    let output = std::process::Command::new("ps").arg("axeww").output();
+    match output {
+        Ok(o) if o.status.success() => {
+            parse_stranded(&String::from_utf8_lossy(&o.stdout), RETIRED_PORTS)
+        }
+        _ => vec![],
+    }
+}
+
+/// Parse `ps axeww` output for sessions whose `AMUX_URL` names a retired port,
+/// deduped to one row per distinct `AMUX_SESSION`. Pure over the text so the
+/// discriminating logic is tested without depending on what is running
+/// (ethos rule 7 — the `Command` call is the thin untested shell, this is not).
+fn parse_stranded(ps_output: &str, retired: &[u16]) -> Vec<serde_json::Value> {
+    let needles: Vec<String> = retired.iter().map(|p| format!(":{p}")).collect();
+    // session -> (pid, url); dedup by session (a lane's tmux wrapper AND its
+    // claude child both carry the env, so pid-dedup would double-count).
+    let mut seen: std::collections::BTreeMap<String, (Option<i64>, String)> =
+        std::collections::BTreeMap::new();
+    for line in ps_output.lines() {
+        let url = line.split_whitespace().find(|t| t.starts_with("AMUX_URL="));
+        let Some(url_tok) = url else { continue };
+        if !needles.iter().any(|n| url_tok.contains(n.as_str())) {
+            continue;
+        }
+        let session = line
+            .split_whitespace()
+            .find(|t| t.starts_with("AMUX_SESSION="))
+            .map(|t| t.trim_start_matches("AMUX_SESSION=").to_string())
+            .unwrap_or_default();
+        if session.is_empty() {
+            continue; // no session name — not an attributable lane
+        }
+        let pid = line.split_whitespace().next().and_then(|p| p.parse::<i64>().ok());
+        let url = url_tok.trim_start_matches("AMUX_URL=").to_string();
+        seen.entry(session).or_insert((pid, url));
+    }
+    seen.into_iter()
+        .map(|(session, (pid, url))| serde_json::json!({"session": session, "pid": pid, "amux_url": url}))
+        .collect()
+}
+
 /// Publish where this server actually is, into `<amux_home>/endpoint.json`.
 ///
 /// # Why a file, and why the server writes it
@@ -444,6 +504,16 @@ pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Opt
 
 /// Snapshot for the debug surface / the reporter, as JSON.
 pub fn snapshot() -> serde_json::Value {
+    // The host probe (shells out to `ps`) is done HERE, outside the lock, and
+    // passed in — separating it from the JSON builder keeps `snapshot_with`
+    // deterministic in tests, which must not depend on how many lanes this
+    // machine happens to have stranded (ethos rule 7: a test whose verdict
+    // depends on the host is the trap this module already documents).
+    snapshot_with(scan_stranded_sessions())
+}
+
+fn snapshot_with(stranded: Vec<serde_json::Value>) -> serde_json::Value {
+    let stranded_count = stranded.len();
     let Ok(s) = state().lock() else {
         return serde_json::json!({"error": "legacy-port state poisoned"});
     };
@@ -513,6 +583,14 @@ pub fn snapshot() -> serde_json::Value {
         "attributed_hits": attributed,
         "unattributed_hits": unattributed,
         "sessions_still_on_legacy": sessions,
+        // GROUND TRUTH (AMUX-2988): running sessions whose AMUX_URL still names a
+        // retired port, by process-env scan — independent of hits, so this stays
+        // correct after the bind is dropped, when `sessions_still_on_legacy`
+        // above (hit-derived) collapses to [] because a dead port records none.
+        // On a live machine this is the count that tells the owner how many lanes
+        // are running degraded and would benefit from a recycle.
+        "stranded_sessions": stranded,
+        "stranded_count": stranded_count,
         // The wording is deliberately weaker than "this is a defect". Not every
         // unattributed hit is one: a request that carries no X-Amux-Session —
         // /health polls, the SPA shell, a browser — is unattributed even when
@@ -521,12 +599,18 @@ pub fn snapshot() -> serde_json::Value {
         // `curl https://localhost:8822/health` landed in the unattributed
         // bucket. Claiming certainty the key cannot support is how a verdict
         // stops being read.
-        "verdict": if unattributed > 0 {
-            "INVESTIGATE: traffic with no X-Amux-Session. Either code still naming 8822, or header-less requests (/health, the SPA shell) from a pre-cutover lane. Read `paths` — an /api/ path with no session is the defect shape; /health is not"
+        // Strandedness is checked FIRST because it is the only signal that
+        // survives the bind being gone. With nothing listening on the retired
+        // port, `unattributed`/`sessions` are both 0 by construction, so without
+        // this branch a machine with 52 broken lanes reads "CLEAR" (AMUX-2988).
+        "verdict": if stranded_count > 0 {
+            format!("STRANDED: {stranded_count} running session(s) still carry a retired port in AMUX_URL and cannot reach the server via $AMUX_URL — every documented `curl $AMUX_URL/...` recipe fails for them. Clears only when those lanes RESTART; recycling them is the owner's call (could interrupt in-flight work). See `stranded_sessions`")
+        } else if unattributed > 0 {
+            "INVESTIGATE: traffic with no X-Amux-Session. Either code still naming 8822, or header-less requests (/health, the SPA shell) from a pre-cutover lane. Read `paths` — an /api/ path with no session is the defect shape; /health is not".to_string()
         } else if !sessions.is_empty() {
-            "DRAINING: every hit is an attributed pre-cutover lane whose process env cannot be rotated; it clears when those lanes restart, not by waiting"
+            "DRAINING: every hit is an attributed pre-cutover lane whose process env cannot be rotated; it clears when those lanes restart, not by waiting".to_string()
         } else {
-            "CLEAR: no traffic on the retired port this uptime"
+            "CLEAR: no traffic on the retired port this uptime AND no running session env still names it".to_string()
         },
         // PERSISTED across restarts now (AMUX-2769). The old per-uptime
         // counter was chosen so a reset counter could not be misread as a
@@ -556,7 +640,12 @@ pub fn snapshot() -> serde_json::Value {
                         Measured from a PERSISTED last_hit, so restarts no longer reset the \
                         countdown (they used to, several times an hour, which made this \
                         unreachable).",
-        "ready_to_retire": s.clients.is_empty()
+        // A retired port is not fully retired while any live lane still names it
+        // in its env, even at zero hits — those lanes' raw-curl recipes are
+        // silently broken. `stranded_count == 0` is the condition the hit-based
+        // window could never express (AMUX-2988).
+        "ready_to_retire": stranded_count == 0
+            && s.clients.is_empty()
             && match s.last_hit {
                 // Armed, never hit, and observed for a week: the genuine
                 // all-clear. `started_at` is persisted too, so this is real
@@ -626,6 +715,27 @@ pub async fn run_reporter() {
     tick.tick().await; // fires immediately; skip the t=0 tick
     loop {
         tick.tick().await;
+        // Stranded-lane WARN runs EVERY tick, independent of the bind (AMUX-2988).
+        // `take_hour()` returns None once the bind is dropped (port==0), which is
+        // precisely when the fleet is most likely stranded — so keying the only
+        // signal off the hit counter meant a broken fleet emitted nothing. This
+        // makes the next stranding self-announce in `/api/logs` without a human
+        // noticing first ("every fix needs a log signal").
+        let stranded = scan_stranded_sessions();
+        if !stranded.is_empty() {
+            let names = stranded
+                .iter()
+                .filter_map(|s| s["session"].as_str())
+                .take(20)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                stranded_count = stranded.len(),
+                retired_ports = ?RETIRED_PORTS,
+                %names,
+                "sessions STRANDED on a retired port — their $AMUX_URL raw-curl recipes fail; recycle to clear (GET /api/debug/legacy-port)"
+            );
+        }
         let Some(r) = take_hour() else { continue };
         let uptime_hours = format!("{:.1}", r.uptime_secs as f64 / 3600.0);
         if r.still_in_use {
@@ -660,6 +770,30 @@ pub async fn run_reporter() {
 mod tests {
     use super::*;
 
+    /// The stranded-session parser (AMUX-2988). Pure over `ps` text, so it is
+    /// safe as its own test — it never touches the process-global counter that
+    /// forces the lifecycle test below to be a single function. Rebuilt from a
+    /// real `ps axeww` line shape: pid first, env appended as KEY=VALUE tokens.
+    #[test]
+    fn parse_stranded_finds_retired_url_dedups_by_session_and_skips_the_rest() {
+        let ps = "\
+ 5259   ??  Ss   0:01.00 tmux new-session AMUX_SESSION=ts-gke AMUX_URL=https://localhost:8822 TERM=xterm
+ 5260   ??  Ss   0:02.00 claude AMUX_SESSION=ts-gke AMUX_URL=https://localhost:8822 FOO=bar
+ 6001   ??  Ss   0:03.00 claude AMUX_SESSION=amux AMUX_URL=https://localhost:8824 OK=1
+ 6002   ??  Ss   0:04.00 claude AMUX_SESSION=backend AMUX_URL=https://localhost:8822
+ 7000   ??  Ss   0:05.00 some-daemon AMUX_URL=https://localhost:8822
+ 7001   ??  Ss   0:06.00 login -pf ethan";
+        let got = parse_stranded(ps, &[8822]);
+        let names: Vec<&str> = got.iter().filter_map(|r| r["session"].as_str()).collect();
+        // ts-gke deduped to one row despite two matching processes; backend
+        // included; amux EXCLUDED (on the live 8824); the session-less daemon
+        // and the env-less login line both excluded.
+        assert_eq!(names, vec!["backend", "ts-gke"], "got {got:?}");
+        assert!(got.iter().all(|r| r["amux_url"].as_str().unwrap().contains(":8822")));
+        // A machine fully migrated to 8824 yields nothing — no false positives.
+        assert!(parse_stranded(ps, &[9999]).is_empty());
+    }
+
     /// ONE test, not several, on purpose.
     ///
     /// This module's counter is a process-global `OnceLock<Mutex<_>>` — which is
@@ -681,7 +815,7 @@ mod tests {
         // the retirement waits for; it must not render the same as the bind
         // being OFF, or the field the owner reads cannot distinguish "safe to
         // drop" from "already dropped, nothing was ever measured".
-        let off = snapshot();
+        let off = snapshot_with(vec![]);
         assert_eq!(off["enabled"], false, "unarmed must report enabled:false");
         assert_eq!(off["port"], 0);
 
@@ -692,7 +826,7 @@ mod tests {
         std::env::set_var("AMUX_LEGACY_PORT_STATE", tmp.path().join("w.json"));
 
         arm(8822);
-        let on = snapshot();
+        let on = snapshot_with(vec![]);
         assert_eq!(on["enabled"], true, "armed must report enabled:true");
         assert_eq!(on["port"], 8822);
         assert_eq!(on["hits_total"], 0, "arming must not fabricate a hit");
@@ -746,7 +880,7 @@ mod tests {
         // to separate them by path. This assertion fails on the pre-change
         // module (there was no `paths` key at all), which is what makes it a
         // check rather than decoration.
-        let snap = snapshot();
+        let snap = snapshot_with(vec![]);
         let row = snap["clients"]
             .as_array()
             .and_then(|c| c.iter().find(|c| c["user_agent"] == "curl/8"))
@@ -783,7 +917,7 @@ mod tests {
         // THE EXIT DISCRIMINATOR (AMUX-2769). Everything above is unattributed
         // traffic, so the verdict must say BLOCKED — that is code naming the
         // retired port and it is a defect someone has to go and fix.
-        let snap = snapshot();
+        let snap = snapshot_with(vec![]);
         assert_eq!(snap["unattributed_hits"], 3);
         assert_eq!(snap["attributed_hits"], 0);
         assert!(
@@ -798,7 +932,7 @@ mod tests {
         // be reasoned about.
         record("127.0.0.1", "curl/8", "mixpeek-studio", "/api/board");
         record("127.0.0.1", "curl/8", "amux", "/api/board");
-        let snap = snapshot();
+        let snap = snapshot_with(vec![]);
         assert_eq!(snap["attributed_hits"], 2);
         assert_eq!(
             snap["sessions_still_on_legacy"],
@@ -823,7 +957,7 @@ mod tests {
         let long_ago = now().saturating_sub(8 * 24 * 3600);
         save_persisted(long_ago, 42, long_ago);
         arm(8822); // "restart"
-        let back = snapshot();
+        let back = snapshot_with(vec![]);
         assert_eq!(back["hits_total"], 42, "a restart must not forget prior traffic");
         assert_eq!(
             back["window"]["resets_on_restart"], false,
@@ -836,10 +970,30 @@ mod tests {
             "no hit for 8 days and no clients this uptime IS the all-clear"
         );
 
+        // STRANDED overrides the all-clear (AMUX-2988). The SAME zero-traffic,
+        // 8-days-quiet state that just read ready_to_retire:true must flip the
+        // instant a live lane still names the retired port in its env — the
+        // failure the hit-based window could never see, because a dead port
+        // records no hit. This is the discriminating assertion: with the
+        // stranded list non-empty and nothing else changed, verdict and
+        // ready_to_retire must both move.
+        let stranded_snap = snapshot_with(vec![
+            serde_json::json!({"session": "probe", "pid": 1, "amux_url": "https://localhost:8822"}),
+        ]);
+        assert_eq!(stranded_snap["stranded_count"], 1);
+        assert!(
+            stranded_snap["verdict"].as_str().unwrap_or("").starts_with("STRANDED"),
+            "a live lane on a retired port must read STRANDED, not CLEAR/ready"
+        );
+        assert_eq!(
+            stranded_snap["ready_to_retire"], false,
+            "a retired port with a stranded lane is not ready to retire, quiet or not"
+        );
+
         // A fresh hit must revoke it — a one-way latch would be worse than a
         // verdict that never fires.
         record("127.0.0.1", "curl/8", "", "/api/board");
-        let after = snapshot();
+        let after = snapshot_with(vec![]);
         assert_eq!(after["ready_to_retire"], false, "a hit must revoke the all-clear");
         assert!(after["quiet_for_hours"].as_f64().unwrap_or(999.0) < 1.0);
     }
