@@ -7061,7 +7061,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.599';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.600';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8316,9 +8316,41 @@ function linkifyOutput(text) {
   return rewriteLocalhostUrls(html);
 }
 
+// The MARKERS amux stamps on everything it injects into a pane. Structural, not
+// heuristic: each one is a literal prefix the server writes, so matching it is
+// reading amux's own label rather than guessing at prose.
+const _NON_HUMAN_PROMPT_MARKS = [
+  ['[amux-origin:', 'session'],     // a peer worker, server-verified origin
+  ['[amux auto-pickup]', 'amux'],
+  ['[amux staged-guard]', 'amux'],
+  ['[amux]', 'amux'],               // idle nudges, advance nudges, digests
+  ['[amux ', 'amux'],               // any other bracketed amux subsystem
+  ['[Scheduled]', 'schedule'],
+];
+
 function _classifyPromptKind(promptText) {
   const clean = promptText.replace(/^❯\s*/, '').trim();
-  if (!clean || typeof _peekMsgRows === 'undefined') return 'human';
+  if (!clean) return 'human';
+  // STRUCTURE FIRST, BEFORE THE ROW LOOKUP (Ethan, 2026-08-11: the navigator
+  // "should scroll thru human messages not amux/session/system/peer messages
+  // by default").
+  //
+  // The row match below is the precise path and stays the primary one, but it
+  // FAILS OPEN TO 'human': a prompt that matches no known row — because the
+  // rows are not loaded yet, or the window has scrolled past it, or the
+  // terminal wrapped the text so the first line no longer starts with the
+  // message's first 60 chars — was classified as a person typing. So amux's
+  // own nudges and peer relays landed in the human filter, which is exactly
+  // the set the navigator exists to isolate. Observed as "H 3/9" on a pane
+  // whose 9 prompts were mostly system traffic.
+  //
+  // Checking the marker first also makes the classification independent of
+  // whether the message trail happens to be loaded, which is why it goes
+  // BEFORE the lookup rather than into the fallback.
+  for (const [mark, kind] of _NON_HUMAN_PROMPT_MARKS) {
+    if (clean.startsWith(mark)) return kind;
+  }
+  if (typeof _peekMsgRows === 'undefined') return 'human';
   const rows = (_peekMsgRows || _cmdHistory || []);
   for (let i = rows.length - 1; i >= 0; i--) {
     const r = rows[i];
