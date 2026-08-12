@@ -780,12 +780,43 @@ pub async fn staged_guard_inner(
              yours, so this verdict is stricter than it should be"
         ));
     }
-    if !blind.is_empty() {
+    // PARTITION THE BLIND BY LIVENESS (AMUX-2936's measurement, acted on).
+    // The signal below ran for ~5h and answered the card's question with a
+    // number nobody guessed: 881 warnings, dominated by the mixpeek checkout
+    // where THIRTY-TWO cotenants are blind on every commit — nearly all of
+    // them long-retired project lanes. A warning that fires 32 names at every
+    // committer on the busiest repo is alarm fatigue by construction; the one
+    // real signal (a LIVE lane whose transcript cannot be read) drowns in it.
+    //
+    // Liveness is the discriminator because it is checkable without file
+    // mtimes (proven unreliable for this exact question earlier tonight:
+    // amux-helper's env mtime said 98 days idle while it committed the same
+    // day). A RUNNING blind cotenant can be mid-edit right now — that stays
+    // the loud case. A STOPPED one can only contribute pre-stop edits inside
+    // the window; possible, so it is still disclosed, but compactly and
+    // without the per-name klaxon.
+    let mut blind_live: Vec<String> = Vec::new();
+    let mut blind_stopped = 0usize;
+    for b in &blind {
+        if crate::api::session_verbs::is_running(b).await {
+            blind_live.push(b.clone());
+        } else {
+            blind_stopped += 1;
+        }
+    }
+    if blind_stopped > 0 {
+        degraded.push(format!(
+            "{blind_stopped} stopped cotenant(s) with unreadable transcripts — pre-stop edits \
+             inside the window (if any) are invisible; a stopped lane cannot be mid-edit"
+        ));
+    }
+    if !blind_live.is_empty() {
+        let blind = &blind_live;
         // The dangerous direction: their edits are invisible, so the verdict
         // UNDER-reports and a sweep of their work would pass silently.
         degraded.push(format!(
-            "no transcript for cotenant(s) {} — their edits are INVISIBLE to this verdict; \
-             an empty result does not clear their files",
+            "no transcript for RUNNING cotenant(s) {} — their edits are INVISIBLE to this \
+             verdict; an empty result does not clear their files",
             blind.join(", ")
         ));
         // AND SAY SO WHERE IT CAN BE COUNTED (AMUX-2936). Until now this
