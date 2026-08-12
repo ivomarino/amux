@@ -594,16 +594,36 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
     })
 }
 
-/// py:14403 — the count the pickup predicate itself would select over, so the
-/// trace and the mechanism cannot disagree about what is eligible.
-fn eligible_todo_count(conn: &Connection, session: &str) -> i64 {
+/// THE ONE dispatchability predicate, shared verbatim by the counter and the
+/// pickup selection (AMUX-2956). These were two hand-kept copies, and they
+/// drifted exactly as ethos rule 1 predicts: the dispatch query gained
+/// `updated >= fresh_cut` (stale >7d exempt) and the 24h reclaim-cooldown
+/// NOT EXISTS, the counter never did — so 5 lanes reported eligible_todos > 0
+/// while the dispatcher answered "queue holds nothing dispatchable", and the
+/// counter's own docstring claimed the two "cannot disagree". A view that
+/// re-derives its filter from what seems sensible drifts the moment the
+/// mechanism moves; it has to SHARE the text.
+///
+/// Params: ?1 = session, ?2 = fresh_cut (epoch s), ?3 = reclaim_cut (epoch s).
+const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
+     AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+     AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
+     AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                     AND lower(t.tag) LIKE 'needs:you%') \
+     AND i.updated >= ?2 \
+     AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
+                     AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%')";
+
+/// py:14403 — the count over EXACTLY the rows pickup selects from, via
+/// [`DISPATCHABLE_WHERE`]. Per-card refusals (junk shells, prose deps) still
+/// happen inside the loop and surface as `all-candidates-refused` — an honest
+/// difference, since those are judgments about a card, not queue membership.
+fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
+    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let reclaim_cut = now - RECLAIM_COOLDOWN_S;
     conn.query_row(
-        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='todo' \
-         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-         AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
-         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                         AND lower(t.tag) LIKE 'needs:you%')",
-        rusqlite::params![session],
+        &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
+        rusqlite::params![session, fresh_cut, reclaim_cut],
         |r| r.get(0),
     )
     .unwrap_or(0)
@@ -897,16 +917,10 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     let reclaim_cut = now - RECLAIM_COOLDOWN_S;
     let ids: Vec<String> = conn
         .prepare(
-            "SELECT i.id FROM issues i \
-             WHERE i.session=?1 AND i.status='todo' AND i.owner_type='agent' AND i.deleted IS NULL \
-             AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
-                             AND lower(t.tag) LIKE 'needs:you%') \
-             AND COALESCE(i.archived,0)=0 \
-             AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
-             AND i.updated >= ?2 \
-             AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
-                             AND e.ts > ?3 AND e.data LIKE '%\"' || i.id || '\"%') \
-             ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16",
+            &format!(
+                "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
+                 ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+            ),
         )
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
@@ -2071,7 +2085,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // answer was reported as zero. Every trace row now carries the true depth,
     // whatever stopped the lane.
     let (eligible, open) = match state.store.read() {
-        Ok(conn) => (eligible_todo_count(&conn, lane), open_card_count(&conn, lane)),
+        Ok(conn) => (eligible_todo_count(&conn, lane, crate::config::now_f64()), open_card_count(&conn, lane)),
         Err(_) => {
             return LaneTrace::skip(lane, "store-unavailable", "could not open a read connection")
         }
@@ -2548,7 +2562,7 @@ pub async fn debug_board_drive(
     if let Ok(conn) = state.store.read() {
         let lanes = crate::api::session_verbs::all_lane_names();
         for lane in lanes {
-            let n = eligible_todo_count(&conn, &lane);
+            let n = eligible_todo_count(&conn, &lane, crate::config::now_f64());
             if n > 0 {
                 waiting.push(json!({"session": lane, "eligible_todos": n}));
             }
@@ -2873,7 +2887,7 @@ mod tests {
             tag(&conn, "T-1", t, now_f64());
             let p = select_pickup(&conn, "lane", now_f64());
             assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
-            assert_eq!(eligible_todo_count(&conn, "lane"), 0, "{t} must not count as eligible");
+            assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 0, "{t} must not count as eligible");
         }
     }
 
@@ -2957,7 +2971,7 @@ mod tests {
         add_card(&conn, "T-3", "lane", "todo", "human", "SCOPE: x\n- [ ] y");
         tag(&conn, "T-3", "needs:you", now_f64());
         conn.execute("UPDATE issues SET archived=1 WHERE id='T-2'", []).expect("archive");
-        assert_eq!(eligible_todo_count(&conn, "lane"), 1);
+        assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 1);
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
     }
 
@@ -3072,7 +3086,7 @@ mod tests {
         add_card(&conn, "H-1", "lane", "todo", "Ethan: call the bank", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET owner_type='human' WHERE id='H-1'", []).expect("owner");
         assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
-        assert_eq!(eligible_todo_count(&conn, "lane"), 0);
+        assert_eq!(eligible_todo_count(&conn, "lane", now_f64()), 0);
     }
 
     /// py:14515, AMUX-1857: sessions legitimately return owner-blocked cards to
