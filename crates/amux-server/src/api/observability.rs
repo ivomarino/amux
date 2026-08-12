@@ -126,7 +126,23 @@ async fn rollup(State(state): State<AppState>, RawQuery(q): RawQuery) -> Respons
         let sql = format!(
             "SELECT {select} FROM token_ledger WHERE {where_sql} GROUP BY {group_by} ORDER BY {order}"
         );
-        let Ok(mut stmt) = conn.prepare(&sql) else { return vec![] };
+        // SILENCE-VS-ZERO (AMUX-2974): a prepare/query FAILURE renders as an
+        // empty breakdown — indistinguishable from "no spend" — on the Cost
+        // view. We keep the empty-Vec so the UI degrades gracefully (the totals
+        // computed elsewhere still show), but the swallow is now AUDIBLE: a
+        // WARN naming the group makes a broken breakdown visible in
+        // /api/logs/analyze and a log sweep, instead of a Cost view that lies
+        // quiet (ethos rule 4 — the instrument must be able to express the
+        // failure).
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "amux::observability", %group_by, error = %e,
+                    "cost breakdown query failed to PREPARE — the Cost view will show an empty \
+                     '{group_by}' breakdown that looks like no spend");
+                return vec![];
+            }
+        };
         let rows = stmt.query_map(params.as_slice(), |r| {
             let mut out = Vec::new();
             let mut i = 0;
@@ -143,7 +159,15 @@ async fn rollup(State(state): State<AppState>, RawQuery(q): RawQuery) -> Respons
             }
             Ok(out)
         });
-        rows.map(|it| it.flatten().collect()).unwrap_or_default()
+        match rows {
+            Ok(it) => it.flatten().collect(),
+            Err(e) => {
+                tracing::warn!(target: "amux::observability", %group_by, error = %e,
+                    "cost breakdown query failed to RUN — empty '{group_by}' breakdown shown as \
+                     if there were no spend");
+                vec![]
+            }
+        }
     };
 
     let by_session: Vec<Value> = group_rows(
