@@ -737,9 +737,6 @@
   .peek-rule::after { content: ''; width: 14px; border-top: 1px solid rgba(127,148,170,0.35); }
   .peek-rule:not(:has(.peek-rule-tag))::after { display: none; }
   .peek-rule-tag { color: var(--dim); font-size: 0.85em; white-space: nowrap; }
-  .peek-agent-row { cursor: pointer; border-radius: 4px; }
-  .peek-agent-row:hover { background: rgba(88,166,255,0.12); }
-  .peek-agent-row:active { background: rgba(88,166,255,0.25); }
   .overlay-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
   .overlay-body a:active { color: #79c0ff; }
   .overlay-body .file-link { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed var(--cyan); cursor: pointer; }

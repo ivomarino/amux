@@ -5087,94 +5087,6 @@ async fn resize_pane(name: &str, cols: i64, rows: i64) -> (bool, String) {
 // capture; the Background dialog is cancelled, never confirmed.
 // ---------------------------------------------------------------------------
 
-struct AgentRow {
-    cursor: bool,
-    viewed: bool,
-    label: String,
-}
-
-fn agent_panel(clean: &str) -> (bool, Vec<AgentRow>) {
-    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let mut rows: Vec<AgentRow> = Vec::new();
-    let gap_re = cached_re!(r"\s{4,}");
-    let ws_re = cached_re!(r"\s+");
-    let mut i = lines.len() as isize - 1;
-    while i >= 0 {
-        let s = lines[i as usize].trim();
-        let body = s.trim_start_matches(['\u{276f}', ' ', '\u{a0}']).trim();
-        let first = body.chars().next();
-        if matches!(first, Some('\u{23fa}' | '\u{25ef}' | '\u{25cf}' | '\u{25cb}')) {
-            let after: String = body.chars().skip(1).collect();
-            let label = gap_re.split(after.trim()).next().unwrap_or("").to_string();
-            rows.push(AgentRow {
-                cursor: s.starts_with('\u{276f}'),
-                viewed: matches!(first, Some('\u{23fa}' | '\u{25cf}')),
-                label: ws_re.replace_all(&label, " ").into_owned(),
-            });
-            i -= 1;
-            continue;
-        }
-        break;
-    }
-    rows.reverse();
-    let select = rows.iter().any(|r| r.cursor);
-    (select, rows)
-}
-
-async fn agent_nav(name: &str, direction: &str, index: i64) -> (bool, String) {
-    let cap = |name: String| async move { strip_ansi(&tmux_capture(&name, 20).await) };
-    let mut clean = cap(name.to_string()).await;
-    if clean.contains("Background this session?") {
-        send_key(name, "Escape").await;
-        sleep_ms(400).await;
-        clean = cap(name.to_string()).await;
-    }
-    let (mut select, mut rows) = agent_panel(&clean);
-    if rows.is_empty() {
-        return (false, "no agents panel on screen".into());
-    }
-    for _ in 0..3 {
-        if select {
-            break;
-        }
-        send_key(name, "Down").await;
-        sleep_ms(350).await;
-        let c = cap(name.to_string()).await;
-        let (s2, r2) = agent_panel(&c);
-        select = s2;
-        rows = r2;
-    }
-    if !select || rows.is_empty() {
-        return (false, "could not enter agent select mode".into());
-    }
-    let cursor = rows
-        .iter()
-        .position(|r| r.cursor)
-        .or_else(|| rows.iter().position(|r| r.viewed))
-        .unwrap_or(0);
-    let target = match direction {
-        "main" => 0usize,
-        "index" => (index.max(0) as usize).min(rows.len() - 1),
-        "up" => cursor.saturating_sub(1),
-        _ => (cursor + 1).min(rows.len() - 1),
-    };
-    let steps = target.abs_diff(cursor);
-    for _ in 0..steps {
-        send_key(name, if target > cursor { "Down" } else { "Up" }).await;
-        sleep_ms(250).await;
-    }
-    let c = cap(name.to_string()).await;
-    let (s3, _r3) = agent_panel(&c);
-    if !s3 {
-        return (false, "agent panel closed mid-navigation".into());
-    }
-    send_key(name, "Enter").await;
-    sleep_ms(350).await;
-    let c2 = cap(name.to_string()).await;
-    let (_s4, rows4) = agent_panel(&c2);
-    let viewing = rows4.iter().find(|r| r.viewed).map(|r| r.label.clone()).unwrap_or_default();
-    (true, if viewing.is_empty() { "switched".into() } else { viewing })
-}
 
 // ---------------------------------------------------------------------------
 // Saved-log helpers (py:5175-5478).
@@ -8511,24 +8423,11 @@ async fn post_dispatch(
             let (ok, msg) = resize_pane(name, cols, rows).await;
             j200(json!({"ok": true, "resized": ok, "message": msg}))
         }
-        "agent-nav" => {
-            let d = body_str(body, "dir").trim().to_string();
-            if !matches!(d.as_str(), "up" | "down" | "main" | "index") {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "dir must be up|down|main|index"}));
-            }
-            let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if d == "index" && idx < 0 {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "index required for dir=index"}));
-            }
-            if !is_running(name).await {
-                return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
-            }
-            let (ok, msg) = agent_nav(name, &d, idx).await;
-            jresp(
-                if ok { StatusCode::OK } else { StatusCode::CONFLICT },
-                json!({"ok": ok, "viewing": if ok { msg.clone() } else { String::new() }, "message": msg}),
-            )
-        }
+        // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
+        // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
+        // longer renders — 0 of 50 sessions matched, so the verb was wired
+        // end-to-end and reached nobody. The durable replacement is
+        // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
         "memory" => {
             let content = body_str(body, "content");
             let mf = mem_file(name);

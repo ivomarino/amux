@@ -1969,11 +1969,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="peek-body" class="overlay-body" style="position:absolute;inset:0;"></div>
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
       <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
-      <div class="peek-agent-nav" id="peek-agent-nav" style="display:none;">
-        <button onclick="agentNav('main')" title="View main conversation">&#x2302;</button>
-        <button onclick="agentNav('up')" title="View previous agent">&#x25B2;</button>
-        <button onclick="agentNav('down')" title="View next agent">&#x25BC;</button>
-      </div>
+      <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
+           (ARE-7): it keyed on a "⏺ main" panel row Claude Code no longer
+           renders — measured 0 of 50 sessions, always display:none. Its
+           replacement is #peek-subagents-nav below (AMUX-2635), which reads
+           durable transcripts (50 of 50) and needs no visibility gate.
+           Resurrection, if the TUI ever ships a panel again: git log -S agentNav. -->
       <!-- Subagent LIST. Deliberately has no visibility predicate: the three
            buttons above drive the live TUI and really do need its panel open,
            but listing forks reads durable transcripts, which every lane has.

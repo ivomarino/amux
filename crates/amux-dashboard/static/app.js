@@ -7061,7 +7061,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.601';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.602';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7248,7 +7248,7 @@ function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
   _peekHistoryHTML = cached.histHTML || (cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '');
-  _lastLiveHTML = cached.liveHTML || (cached.output ? _markAgentRows(wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output))))) : '');
+  _lastLiveHTML = cached.liveHTML || (cached.output ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output)))) : '');
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -7405,33 +7405,12 @@ function openPeek(name, opts) {
   _savePeekState();
 }
 
-// The agents panel rows rendered at the bottom of the peek terminal are
-// tappable — wrap each ⏺/◯ row (the contiguous glyph block at the very
-// bottom, same structural rule as the server's _agent_panel) in a span that
-// jumps straight to that agent's transcript. Direct manipulation: tap the
-// agent you can already see instead of hunting for the ⌂/▲/▼ buttons.
-function _markAgentRows(html) {
-  const lines = html.split('\n');
-  const textOf = l => l.replace(/<[^>]*>/g, '');
-  let i = lines.length - 1;
-  while (i >= 0 && !textOf(lines[i]).trim()) i--;
-  const rowIdx = [];
-  while (i >= 0) {
-    const t = textOf(lines[i]).trim().replace(/^[❯  ]+/, '');
-    if ('⏺●'.includes(t[0]) || '◯○'.includes(t[0])) { rowIdx.push(i); i--; continue; }
-    break;
-  }
-  if (rowIdx.length < 2) return html;   // a panel always has main + ≥1 agent
-  rowIdx.reverse();   // screen order — index 0 = main, matching the server
-  rowIdx.forEach((li, n) => {
-    // stopPropagation: ANSI color spans can run unclosed across lines, which
-    // nests these row spans in the parsed DOM — without it a click on an
-    // inner row would bubble to the outer row and fire a second nav.
-    lines[li] = '<span class="peek-agent-row" onclick="event.stopPropagation();agentNav(\'index\',' + n +
-      ')" title="Tap to view">' + lines[li] + '</span>';
-  });
-  return lines.join('\n');
-}
+// The pane-driven agent switcher (_markAgentRows + agentNav + the ⌂/▲/▼
+// strip) was DELETED (ARE-7): it keyed on a "⏺ main" panel row Claude Code no
+// longer renders — 0 of 50 sessions matched, so three layers plus a server
+// verb were wired end-to-end and reached nobody, forever. The subagent list
+// (AMUX-2635, below) is the replacement: durable transcripts, 50 of 50, no
+// visibility gate to rot. Resurrection: git log -S agentNav.
 
 // ── Subagent list (AMUX-2635) ───────────────────────────────────────────────
 // Reads DURABLE transcripts via GET /api/sessions/<n>/subagents rather than
@@ -7493,26 +7472,6 @@ async function openSubagents() {
   }).join('');
 }
 
-async function agentNav(dir, index) {
-  // Subagent switcher: server drives the agents panel (↓ select mode,
-  // ↑/↓ cursor, Enter to view) with capture-verified steps.
-  if (!peekSession) return;
-  try {
-    const r = await fetch(API + '/api/sessions/' + peekSession + '/agent-nav', {
-      method: 'POST',
-      headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify(dir === 'index' ? { dir, index } : { dir })
-    });
-    const d = await r.json();
-    if (d.ok) {
-      showToast('Viewing: ' + (d.viewing || 'switched'));
-      _peekEtag = null; _peekLiveEtag = null; _lastPeekRaw = null; _peekHistoryRaw = '';   // force a fresh render (history too)
-      setTimeout(refreshPeek, 200);
-    } else {
-      showToast(d.message || 'Could not switch agent view');
-    }
-  } catch (e) { showToast('Could not switch agent view'); }
-}
 
 function copyPeekContent() {
   const body = document.getElementById('peek-body');
@@ -8696,23 +8655,6 @@ async function refreshPeek(liveOnly, bypassTrim) {
       _peekHistoryHTML = histRaw ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(histRaw)))) : '';
       histChanged = true;
     }
-    // Subagent switcher visibility: the agents panel always includes a
-    // "⏺ main"/"◯ main" row in the bottom lines of the pane. Checking for
-    // that exact row (tail only, ANSI-stripped) avoids false positives from
-    // terminal output that merely QUOTES the panel's hint text.
-    const agentNavEl = document.getElementById('peek-agent-nav');
-    if (agentNavEl) {
-      const _tail = output.replace(/\u001b\[[0-9;?]*[a-zA-Z]/g, '')
-        .split('\n').filter(l => l.trim()).slice(-8);
-      const _hasAgents = _tail.some(l => {
-        const t = l.replace(/^[❯  ]+/, '').trim();
-        // Only a VISIBLE panel row counts. The '← for agents / ↓ to manage'
-        // status-bar hint is not enough: with rows hidden ↓ opens the
-        // background-shells manager, so there is nothing safe to switch.
-        return ['⏺ main', '◯ main', '● main', '○ main'].includes(t);
-      });
-      agentNavEl.style.display = _hasAgents ? 'flex' : 'none';
-    }
     const atBottom = _isScrolledToBottom(body);
     if (atBottom) _peekScrollLocked = false;
     const newHTML = wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(output))));
@@ -8722,7 +8664,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // so the top of the capture is a hard cutoff mid-conversation. Compose a
     // "load earlier output" bar (or the loaded log tail) above the live view
     // so scrollback exists in peek the way it does in a real terminal.
-    _lastLiveHTML = _markAgentRows(newHTML);
+    _lastLiveHTML = newHTML;
     lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
     const hasSearch = peekSearchQuery.trim().length > 0;
     // When user has scrolled up, skip DOM update to avoid fidgeting the view.
