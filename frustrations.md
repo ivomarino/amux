@@ -2400,34 +2400,6 @@ FIX: Partly fixed: the new autofix `disk` detector puts `tmutil listlocalsnapsho
   for long enough to accumulate a full day of local snapshots, which is the actual upstream
   condition and is invisible until it interacts with a disk-full event.
 
-## Fixing a hook's `${AMUX_URL:-...}` DEFAULT cannot fix anything, because the variable is never unset
-AREA: hooks
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2770
-SYMPTOM: The retired port (8822) was being called ~6,000 times an hour and would not drain.
-  Three separate callers had each been "fixed" by correcting a default:
-  `${AMUX_URL:-https://localhost:8824}` in the three ~/.claude/settings.json report hooks,
-  `os.environ.get("AMUX_URL", "https://localhost:8824")` in the tracked pre-commit
-  staged-guard, and the same line twice in ~/.amux/hooks/git-shared-guard.py. Every one of
-  those is dead code on this machine: a `:-` default and a `.get()` fallback only fire when
-  the variable is UNSET, and all 55 live `claude` processes carry
-  `AMUX_URL=https://localhost:8822` in their process env — which is the entire reason the
-  legacy bind exists in the first place. Each fix read as correct in the file, shipped, and
-  moved the number by zero.
-COST: Three rounds of fixes across two sessions that could not have worked, and the
-  retirement decision stalled on a counter nobody could move. The tell was available the
-  whole time and nobody ran it: `ps -E` on any session shows the variable set.
-FIX: The server now publishes `~/.amux/endpoint.json` (canonical_url + legacy_port) at boot,
-  and each hook swaps ONLY a localhost URL sitting on the port the server itself calls
-  retired. Not a hardcoded 8822 -> 8824 rewrite: the two are reversed in the cloud image, so
-  a baked-in swap would break that deployment. A deliberate dev port or a remote amux is
-  left alone (all three cases have assertions). The general lesson is bigger than the port:
-  **a default is not a fix for an inherited value.** Before "fixing" a fallback, check
-  whether the variable is ever actually unset in the population you are trying to fix.
-
 ## Nothing could update an amux git hook outside the amux checkout
 AREA: cli
 SEVERITY: slows
@@ -2896,65 +2868,6 @@ FIX: 2e3f706 — chars().take(500) instead of byte slicing; ROUTE_TABLE row adde
   tool refuses to overwrite a file it has not read — routing around the harness
   removed the guard that would have caught this.
 
-## `amux board needsyou <id>` tags the card; it does not move it to the needsyou STATUS
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2878
-SYMPTOM: `amux board needsyou AMUX-2466` printed "AMUX-2466 → tagged needs:you"
-  and left status at `review`. But `needsyou` is ALSO a real board status — cards
-  sit in it (AMUX-2815, AMUX-2830) and it is what keeps a card out of my review
-  queue and in the owner's view. So one word names two different things and the
-  CLI silently picks the weaker one.
-COST: The card stayed in `review`, where the idle nudge re-fires at me, while
-  reading as routed-to-owner. I only caught it because I re-read the status
-  after the command said success — the output is not wrong, it just answers a
-  question I did not ask. Needed a raw PATCH to actually move it, which is the
-  unaudited path CLAUDE.md warns about.
-FIX: Either `amux board needsyou` should set the STATUS (and a separate verb or
-  flag apply the tag), or it should print what it did NOT do — "tagged
-  needs:you; status unchanged (use --status to move it)". The general shape is
-  the one this file keeps recording: a command whose success message describes a
-  smaller action than its name implies. Same class as `amux board claim` exiting
-  0 without claiming (AMUX-2140).
-  FIXED 2394577 (2026-08-12, daily sweep): the verb now tags AND transitions to
-  the needsyou status; a gate bounce on the move is reported loudly with exit 1
-  instead of the half-action hiding behind the tag's success line. Verified on a
-  scratch card: status, tag and ask all landed.
-
-
-## `node --check` passes on an empty file, so the JS gate cannot see a truncated one
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2635
-SYMPTOM: I emptied `crates/amux-dashboard/static/sw.js` from 6123 bytes to 0 and
-  COMMITTED it. The cause was mine — `open(p,'w').write(open(p).read()...)`
-  truncates when the write handle is created, before the argument is evaluated,
-  so the read returned "". But every gate said yes: the PostToolUse hook runs
-  `node --check`, and an empty program is valid JavaScript, so it passed. The
-  commit shipped a service worker with no install/fetch/push handlers, no shell
-  pre-cache and no offline fallback.
-COST: ~10 minutes to catch and restore, and it was luck — I only looked because
-  a `grep -n "CACHE = "` printed nothing where I expected a line. Had the grep
-  not been in the same command, this ships and the next PWA client to update
-  registers an empty worker. The real cost is the class: every client-JS edit in
-  this repo has been guarded by a check that cannot distinguish "valid" from
-  "present".
-FIX: c5b4b34 — crates/amux-server/tests/dashboard_assets.rs. Size floors plus
-  the named handlers whose absence breaks a PWA, so partial writes are caught as
-  well as total ones; and it enforces the APP_VER/CACHE pairing that CLAUDE.md
-  had only in prose. Verified by reproducing both defects: truncating sw.js
-  passes `node --check` and fails the new suite.
-  The generalisable half is not "be careful with file writes". It is that a
-  SYNTAX check was standing in for a CONTENT check, and the two differ exactly
-  where it matters — deletion. Any gate of the form "does it parse" should be
-  asked what it says about an empty input before it is trusted as the gate.
-
 ## A peer's commit swept my STAGED work into their commit, under their message
 AREA: attribution
 SEVERITY: slows
@@ -3043,98 +2956,6 @@ FIX: forwarder deleted in 5d850fc (registry, answered_by read path and the
   definitions against call sites, which is the same shape ethos rule 7 already
   prescribes for the client JS (enumerate defined vs called, then inspect callers).
 
-## A peer's concurrent commit swept my staged file into their unrelated commit
-AREA: attribution
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2923
-SYMPTOM: `git add e2e/settings.spec.ts && git commit -F -` ran the staged-guard, passed
-  cargo check, then printed "nothing to commit, working tree clean" and left HEAD at
-  446e15e — a peer's commit titled "fix(status): a codex picker reads waiting, not idle".
-  My e2e timeout change was INSIDE it. The same guard run also warned that my commit was
-  about to carry 28 insertions of amux-cloud's session_verbs.rs work, so the sweeping goes
-  both directions in the same few seconds.
-COST: The code survived (the rationale was in a code comment, which is why it is worth
-  writing them there and not only in the message). What was lost is the commit message —
-  five CI runs of evidence for WHY that budget is 60s now sits under a codex-status title,
-  where nobody looking at the e2e change will find it. Also ~10 minutes proving the change
-  was not lost.
-FIX: PARTLY FIXED in 7fb9598 — the guard now also messages the OWNING session when a
-  commit stages paths whose edit records are theirs, naming the committer, the repo, the
-  paths and the git command to check. That closes the "nobody told the victim" half. The
-  window itself is NOT closed: a peer can still absorb a staged file, you now find out
-  promptly instead of by archaeology. Original analysis: the staged-guard already detects the cotenant case and prints the reconcile recipe —
-  but it warns the committer about ABSORBING someone else's work, and is silent about the
-  mirror risk of one's own staged file being absorbed. It cannot see a `git commit -a` that
-  another session is about to run. A pre-commit advisory lock (or simply having the guard
-  refuse when another session's index activity is <60s old) would close the window.
-
-## The e2e harness compiles the shared WORKING TREE, so a peer mid-edit fails my run
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2924
-SYMPTOM: `npx playwright test settings.spec.ts` died with "Process from config.webServer was
-  not able to start. Exit code: 101" / E0425 / "could not compile amux-server (lib) due to 2
-  previous errors". My changes were JS and TS only. `cargo check -p amux-server` passed 40s
-  later — a peer had been mid-edit in session_verbs.rs, which was dirty in the shared tree.
-COST: A few minutes, but the failure mode is the dangerous one: a red e2e run whose cause is
-  a stranger's half-saved file looks exactly like a red e2e run caused by my own change. On
-  a slower day that is a wrong conclusion published against innocent code.
-FIX: FIXED in 7624877 — e2e/serve-head.sh builds a stable HEAD worktree, names any
-  uncommitted rust changes it is excluding (playwright's webServer.stdout defaults to
-  'ignore', so the notice had to be piped or it would have been swallowed), offers
-  AMUX_E2E_WORKING_TREE=1 to opt back in, and falls back to the tree rather than failing
-  to start. Original reasoning: playwright.config.ts ran `cargo run -p amux-server` against the working tree. The
-  builder deploys COMMITTED HEAD, and committed source is what ships (CLAUDE.md), so the
-  harness should build from HEAD too — a detached worktree like scripts/rust-auto-build.sh
-  already uses. That also makes an e2e result mean something reproducible.
-
-## The builder threw away the only line that named a build failure
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2927
-SYMPTOM: `rust-auto-build.sh` piped cargo through `tail -3`, so a failed deploy build
-  logged "For more information about this error..." and "could not compile ... due to N
-  previous errors" and nothing else. The `error[E0432]: unresolved import` line with its
-  file and line number was discarded. Three failures the same day (68d7114, 2acab08,
-  388847f) were each undiagnosable from the log they wrote.
-COST: Three build failures on the fleet's deploy path that nobody could explain without
-  re-running the build by hand, and a wrong initial diagnosis: "concurrent cargo builds"
-  is the obvious reading and is wrong — cargo's own lock already serialises those. The
-  actual culprit was the disk guard's `rm -rf` of the shared target dir, which runs
-  outside cargo's lock and deletes the tree another invocation is building against. A
-  lock around the cargo call alone would have looked correct and fixed nothing.
-FIX: 09cb2d2 — capture the build output and print every error with context on the failing
-  path (success still logs 3 lines); mkdir-based single-instance lock covering the disk
-  guard AND the build; contention logged rather than silent.
-
-## A second `trap ... EXIT` silently replaces the first
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2927
-SYMPTOM: Hit twice in one day in two unrelated shell scripts. In deploy-cloud.yml a
-  `trap rollback ERR` did not fire on explicit `exit 1`, so the rollback was absent on
-  exactly the three failure paths it was written for. In rust-auto-build.sh, adding a lock
-  release before the existing worktree `trap ... EXIT` would have had the worktree trap
-  discard it — leaking the lock every run and blocking every later invocation.
-COST: Nothing shipped, because both were caught by RUNNING the scripts against stubs
-  rather than reading them. That is the point of the entry: neither is visible on a read,
-  both look correct, and both defeat the exact guard they are part of.
-FIX: ce2f1bb and 09cb2d2 — one cleanup function per script, installed once, with an EXIT
-  trap gated on a success flag rather than ERR. Worth a lint: more than one `trap` on the
-  same signal in one script is almost always a bug.
-
 ## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
 AREA: cli
 SEVERITY: blocks
@@ -3155,31 +2976,6 @@ FIX: Two fixes needed: (1) the amux CLI (which resolves port itself) should be t
   all board mutations, not raw curl — it also stamps attribution; (2) curl wrapper or health-check
   pattern that distinguishes empty-response from empty-body: `[ -z "$response" ] && echo DEAD`.
   A session restart picks up the correct AMUX_URL automatically.
-
-## The staged-guard's self-heal was disabled by the change that made it necessary
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2946
-SYMPTOM: One minute after the legacy bind was dropped, my own commit printed
-  "amux staged-guard: NOT ENFORCED — could not reach the amux server ... Connection refused.
-  Cross-session sweep protection is OFF for this commit". Not off for one commit — off for
-  every pre-cutover session at once (~46), which are exactly the sessions sharing this
-  checkout that the guard protects from each other.
-COST: Would have been a silent loss of sweep protection fleet-wide for as long as nobody
-  looked. It cost minutes only because the hook fails LOUDLY and records to
-  staged-guard-unenforced.jsonl. Fail-open plus a record beats fail-open plus silence, and
-  this is the concrete case for it.
-FIX: fe003d5. The hook already had a self-heal for precisely this — endpoint.json publishes
-  canonical_url and it redirects a stale AMUX_URL — but it was gated on `if legacy and
-  canonical`, and dropping the bind made the server publish `legacy_port: null`. The
-  condition went false and it fell back to the dead env. The mechanism built for this moment
-  was disabled BY this moment. Now publishes `retired_ports`, a list that OUTLIVES the bind,
-  and self-heals on any known-retired loopback port. A retired address has to stay known
-  after it stops being served, because the processes still naming it are the ones that
-  cannot be told anything else.
 
 ## I shipped three wrong card references in one session, two onto other sessions' cards
 AREA: attribution
@@ -3213,17 +3009,6 @@ CARD: AMUX-2907
 SYMPTOM: backend triaged 16 pickups in one hour, each ending doing->todo with analysis appended and zero execution; every bounce armed the 24h reclaim cooldown, so 19 of 19 todos became undispatchable while the lane read busy and the drive kept dealing. The deep-queue paragraph in the pickup prompt said "say so and re-shape the queue rather than grinding it" and named no honest exit - bouncing WAS the compliant reading (AMUX-2140 class: the sanctioned instruction and the failure were the same action).
 COST: An afternoon of one lane's throughput converted into cooldowns; Ethan asked twice why workers "just stop" / "have so many todo items"; the diagnosis required joining task.claimed events against card logs by hand because no view says "this lane is declining its pickups".
 FIX: 1d3e5aa - the prompt now names the exits (not-ready -> backlog, owner-blocked -> review, never a ready card back to todo with notes) and select_pickup has a self-clearing bounce-loop breaker (3 bounced claims in 2h stop the deal, WARN + trace reason). Residual: the 24h cooldowns on backend's 19 cards expire on their own; nothing re-deals them sooner.
-
-## `cargo build` reported Finished 0.13s and handed back a binary without my code
-AREA: build
-SEVERITY: wrong-conclusion
-STATUS: fixed
-DATE: 2026-08-12
-SESSION: amux
-CARD: AMUX-2961
-SYMPTOM: After serve-head.sh built its persistent HEAD worktree into the shared CARGO_TARGET_DIR, every later repo-tree build was a silent no-op: cargo dep-info records absolute source paths, so freshness was judged against the WORKTREE's unchanged files and my edited repo files were never consulted. Two "working tree" playwright runs and a manual repro all exercised pre-fix code; each red read as "my fix does not work". The tell that broke the loop: a marker string present in the source and absent from the binary the build had just "finished" (grep -ac on the binary, 0 vs the source's 1).
-COST: ~40 minutes and three consecutive false verdicts against a correct fix; the natural next step of each false verdict was to rewrite working code. One step further and the auto-builder would have been suspected too (it is immune - release profile + ephemeral worktrees - but proving that took its own pass).
-FIX: 3426ad7 - the worktree branch of serve-head exports its own bounded target dir (~/.amux/rust-build-target-e2e-head); CI skips the worktree entirely (AMUX_E2E_WORKING_TREE=1 + pinned CARGO_TARGET_DIR, which also stops CI paying a second cold build the old step comment claimed was shared). Verification recipe when a build smells stale: grep the BINARY for a string your edit introduced - "Finished" is a claim about fingerprints, not about your code being in the artifact.
 
 ## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
 AREA: instruments
