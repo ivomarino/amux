@@ -503,7 +503,9 @@ pub async fn accountability(
         )?;
         let mut q = stmt.query(params![cutoff_ms])?;
         while let Some(r) = q.next()? {
-            let session: String = r.get(0)?;
+            // session is NOT NULL in cmd_history, but read defensively — a NULL
+            // anywhere here 500s the whole endpoint (issues.session IS nullable).
+            let session: String = r.get::<_, Option<String>>(0)?.unwrap_or_default();
             if session.is_empty() {
                 continue;
             }
@@ -533,7 +535,9 @@ pub async fn accountability(
         )?;
         let mut bq = bstmt.query(params![cutoff_s])?;
         while let Some(r) = bq.next()? {
-            let session: String = r.get(0)?;
+            // issues.session is nullable — a NULL here is what 500'd the first
+            // live call. Skip it: an ownerless card is not a worker's tracked work.
+            let Some(session) = r.get::<_, Option<String>>(0)? else { continue };
             if let Some(e) = rows.get_mut(&session) {
                 e.created = r.get::<_, i64>(1)? as u64;
                 e.moved = r.get::<_, i64>(2)? as u64;
@@ -1041,6 +1045,14 @@ mod tests {
                 // A board card w-ok created just now; w-gap has none.
                 conn.execute(
                     "INSERT INTO issues (id,title,status,session,created,updated) VALUES ('I-OK','t','todo','w-ok',?1,?1)",
+                    params![now_s],
+                )
+                .unwrap();
+                // An OWNERLESS card (session NULL) in-window — this 500'd the
+                // first live call (issues.session is nullable). The endpoint must
+                // skip it, not choke on the NULL.
+                conn.execute(
+                    "INSERT INTO issues (id,title,status,session,created,updated) VALUES ('I-NULL','t','todo',NULL,?1,?1)",
                     params![now_s],
                 )
                 .unwrap();
