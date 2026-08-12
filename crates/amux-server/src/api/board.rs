@@ -1408,8 +1408,9 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 18] = [
+const PATCH_WRITABLE: [&str; 19] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
+    "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
     // `amux board <status> --trigger` sends source_ref AND last_verified_at
     // together, but only the first was writable, so the stamp was silently
@@ -1762,6 +1763,7 @@ pub async fn patch_item(
             set_opt("session", &mut next.session, &mut changed);
             set_opt("reviewer", &mut next.reviewer, &mut changed);
             set_opt("shepherd", &mut next.shepherd, &mut changed);
+            set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
             set_opt("source_ref", &mut next.source_ref, &mut changed);

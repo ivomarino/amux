@@ -111,6 +111,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0017_status_gate_custom",
         sql: include_str!("../../migrations/0017_status_gate_custom.sql"),
     },
+    Migration {
+        version: 18,
+        name: "0018_issue_epic",
+        sql: include_str!("../../migrations/0018_issue_epic.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

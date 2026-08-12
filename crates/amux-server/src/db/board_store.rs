@@ -501,6 +501,9 @@ pub struct IssueRow {
     /// Decoded from the JSON-array TEXT column (semantic ids).
     pub depends_on: Vec<String>,
     pub reviewer: Option<String>,
+    /// The epic this card rolls up under: the semantic id of a type=epic card,
+    /// or NULL (AMUX-2992). Not a foreign key — a dangling id reads as no-epic.
+    pub epic: Option<String>,
     /// Append-only history (see [`append_log`]); NULL until first line.
     pub log: Option<String>,
     /// The Python optimistic-concurrency counter (`expect_rev` checks this).
@@ -560,6 +563,7 @@ impl IssueRow {
             "archived": self.archived,
             "depends_on": self.depends_on,
             "reviewer": self.reviewer,
+            "epic": self.epic,
             "log": self.log,
             "source_ref": self.source_ref,
             "last_verified_at": self.last_verified_at,
@@ -641,7 +645,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
-     GROUP_CONCAT(t.tag)";
+     i.epic, GROUP_CONCAT(t.tag)";
 
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
@@ -655,7 +659,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
                 .collect()
         })
         .unwrap_or_default();
-    let tags_csv: Option<String> = r.get(26)?;
+    let tags_csv: Option<String> = r.get(27)?;
     let tags = tags_csv
         .unwrap_or_default()
         .split(',')
@@ -689,6 +693,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         source_ref: r.get(23)?,
         last_verified_at: r.get(24)?,
         version: r.get(25)?,
+        epic: r.get(26)?,
         tags,
     })
 }
@@ -973,8 +978,9 @@ pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
-             rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21 \
-         WHERE id = ?22 AND deleted IS NULL",
+             rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
+             epic = ?22 \
+         WHERE id = ?23 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -997,6 +1003,7 @@ pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize
             row.updated,
             row.source_ref,
             row.last_verified_at,
+            row.epic,
             row.id,
         ],
     )
@@ -1224,7 +1231,7 @@ mod tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                deleted INTEGER);
+                epic TEXT, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
              CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
@@ -1334,6 +1341,7 @@ mod tests {
             archived: 0,
             depends_on: vec![],
             reviewer: None,
+            epic: None,
             log: None,
             rev: 0,
             source_ref: None,
@@ -1438,7 +1446,7 @@ mod configured_gate_tests {
             due: None, created: 0, updated: 0, owner_type: "agent".into(),
             due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
-            archived: 0, depends_on: vec![], reviewer: None, log: None, rev: 0,
+            archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
             source_ref: None, last_verified_at: None, version: 0, tags: vec![],
         }
     }
