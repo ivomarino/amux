@@ -27,6 +27,7 @@ pub mod crm;
 pub mod speedtest;
 pub mod habits;
 pub mod health;
+pub mod gmail;
 pub mod graph;
 pub mod history;
 pub mod invariants_api;
@@ -236,6 +237,9 @@ pub fn router(state: AppState) -> Router {
         // Absolute-path routes (merged, not nested): the gmail callback
         // below is public, and a nest wildcard at /api/gmail would shadow it.
         .merge(gmail_auth::routes())
+        // The mailbox half — labels/inbox/thread/send over GmailClient
+        // (AMUX-2883: the Mail view's calls 404'd since the python retirement).
+        .merge(gmail::routes())
         // AMUX-2599 — three endpoints the SPA calls on EVERY load that 404'd
         // here. Each 404 body deserialized cleanly into the client's success
         // path, so all three failed silently: no branch badges, per-worker

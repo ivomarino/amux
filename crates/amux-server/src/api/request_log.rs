@@ -1056,6 +1056,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/gmail/auth", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/account", methods: &["DELETE"] },
     RouteEntry { path: "/api/gmail/connect", methods: &["POST"] },
+    // Mailbox half (api/gmail.rs, AMUX-2883).
+    RouteEntry { path: "/api/gmail/labels", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/inbox", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/thread/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/send", methods: &["POST"] },
+    // Merged-router routes the census scanner could not see until it learned
+    // to follow `.merge()` (AMUX-2883's table pass): four runtime-jobs debug
+    // surfaces and the workers-spelling of the session verb dispatcher.
+    RouteEntry { path: "/api/debug/steering", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/board-drive", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/autofix", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/storage", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{name}/{*verb}", methods: &["*"] },
 ];
 
 /// Match `path` against an axum-style pattern, returning a specificity score

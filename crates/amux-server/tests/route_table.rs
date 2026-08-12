@@ -385,6 +385,73 @@ fn every_directly_routed_api_path_is_in_the_table() {
         }
     }
 
+    // AND FOLLOW `.merge()` THE SAME WAY. A merged router carries ABSOLUTE
+    // paths (merge adds no prefix), which is exactly why modules use it — the
+    // public gmail callback must not sit under a nest wildcard. But this
+    // scanner only followed `.nest()`, so a whole merged family was invisible:
+    // the gmail mailbox port (AMUX-2883) shipped four routes and this test
+    // stayed green with none of them tabled — found only because the graph
+    // port a day earlier used `.nest` and DID trip it, and the asymmetry
+    // begged the question. gmail_auth's rows exist because someone added them
+    // by hand, which is the discipline this test exists to replace.
+    let mut rest = src;
+    while let Some(i) = rest.find(".merge(") {
+        rest = &rest[i + ".merge(".len()..];
+        let Some(close) = rest.find(')') else { continue };
+        let callee: String = rest[..close].trim().to_string();
+        let segs: Vec<&str> = callee.split("::").map(str::trim).collect();
+        if segs.len() < 2 {
+            continue;
+        }
+        let module = segs[segs.len() - 2];
+        if module.is_empty() || module == "crate" {
+            continue;
+        }
+        // Resolve the FULL module path — `crate::runtime_jobs::autofix::routes()`
+        // lives at src/runtime_jobs/autofix.rs, and the first cut of this
+        // block looked only under src/api/, reporting four readable modules
+        // as unreadable.
+        let mod_segs: Vec<&str> =
+            segs[..segs.len() - 1].iter().copied().filter(|s| *s != "crate").collect();
+        let src_dir = api_dir.parent().unwrap();
+        let joined = mod_segs.join("/");
+        let msrc = std::fs::read_to_string(api_dir.join(format!("{module}.rs")))
+            .or_else(|_| std::fs::read_to_string(api_dir.join(module).join("mod.rs")))
+            .or_else(|_| std::fs::read_to_string(src_dir.join(format!("{joined}.rs"))))
+            .or_else(|_| std::fs::read_to_string(src_dir.join(&joined).join("mod.rs")));
+        let Ok(msrc) = msrc else {
+            missing.push(format!("<unreadable {module}.rs for merge {callee}>"));
+            continue;
+        };
+        // The WHOLE FILE, not the named fn's body — deliberately different
+        // from the nest scanner above. Merged paths carry no prefix, so an
+        // absolute `/api/` literal anywhere in a merged module is a real
+        // route, and fn-body scoping is what let this family hide:
+        // `routes()` delegating to `routes_with(ctx)` has no `.route()` calls
+        // of its own, which is exactly the gmail_auth/gmail shape.
+        let mut mrest = msrc.as_str();
+        while let Some(j) = mrest.find(".route(") {
+            mrest = &mrest[j + ".route(".len()..];
+            let a = mrest.trim_start();
+            let Some(st) = a.strip_prefix('"') else { continue };
+            let Some(e) = st.find('"') else { continue };
+            let sub = &st[..e];
+            // Merged paths are absolute-as-written; anything not under /api/
+            // is not this table's business.
+            if !sub.starts_with("/api/") {
+                continue;
+            }
+            let handler_end = st[e..].find(')').map(|k| e + k).unwrap_or(st.len());
+            let handler = &st[e..handler_end];
+            if handler.contains("not_found") || handler.contains("_404") {
+                continue;
+            }
+            if !tabled.contains(sub) {
+                missing.push(sub.to_string());
+            }
+        }
+    }
+
     missing.sort();
     missing.dedup();
 
