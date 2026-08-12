@@ -345,14 +345,17 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<S
         // AMUX-2947 follow-up). Two reasons, and the second is the dangerous
         // one:
         //
-        //   1. git's exit status is not a reliable witness here. creative-dna
-        //      measured `hash-object` printing `fatal:` and still exiting 0 in
-        //      their shell; it exits 128 in mine, so I could not reproduce that
-        //      specific number — but a comparison that is only correct when a
-        //      subprocess reports its status the way we expect is one bad
-        //      invocation away from being wrong, and it would fail SILENTLY.
+        //   1. NOT because git's exit status is unreliable — it is. That was
+        //      briefly believed here and is now settled: `hash-object` on an
+        //      unreadable path exits 128, loudly and consistently. The 0 came
+        //      from a piped measurement reading `head`'s status rather than
+        //      git's (creative-dna measured it, then re-measured with
+        //      PIPESTATUS and corrected the record). Recorded because a comment
+        //      hinting that a core git command lies is a hazard note someone
+        //      would act on, and it would be wrong.
         //
-        //   2. Worse, comparing two unvalidated strings has an inverse failure
+        //   2. The reason that stands, and it is the serious one: comparing two
+        //      unvalidated strings has an inverse failure
         //      the conservative `_ => false` arm does NOT cover: if both sides
         //      came back empty, `"" == ""` is TRUE and the path is DROPPED — a
         //      real uncommitted file silently removed from the warning. Keeping
