@@ -447,7 +447,7 @@ mod prose_direction_tests {
         // is actually broken" trap this repo keeps paying for, twice in one
         // function.
         //
-        // Both gaps are real and filed (AMUX-2949). Deliberately NOT widened
+        // Both gaps are real and filed (AMUX-2950). Deliberately NOT widened
         // here: broadening the matcher newly BLOCKS cards that dispatch fine
         // today, and this change exists to unstall a lane, not to stall more.
         for blob in [
