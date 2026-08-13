@@ -547,6 +547,120 @@ pub struct LaneTruth {
 }
 
 // ---------------------------------------------------------------------------
+// 5. The report control plane is UP: self-reports are landing at all.
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (2026-08-13): the owner reported worker status "inaccurate/delayed"
+/// fleet-wide. Root cause: `endpoint.json.legacy_port` went `null` when the 8822
+/// bind was dropped, so the Stop/PostToolUse/UserPromptSubmit report hooks baked
+/// into ~48 pre-cutover lanes stopped rewriting their stale inherited `AMUX_URL`
+/// and POSTed every state report to the dead port — silently (`>/dev/null 2>&1;
+/// exit 0`). Measured: 0 of 48 running lanes had a fresh self-report; status
+/// fell back entirely to terminal scraping (the D1 path the report endpoint
+/// exists to demote). NOTHING in amux surfaced it — the human noticed the
+/// symptom, which is exactly the failure the two-fixes rule forbids.
+///
+/// INVARIANT: on a fleet of any real size, SOMEONE is always at a turn boundary,
+/// so the FRESHEST self-report across all running lanes is minutes old, not
+/// hours. The discriminator is the FLEET MINIMUM, not any per-lane age: an idle
+/// lane legitimately reports once on Stop and then goes quiet for hours (the
+/// derivation's asymmetric-freshness rule), so a single stale lane proves
+/// nothing — but the youngest report across the WHOLE fleet being hours old
+/// means the report control plane is down for everyone at once.
+///
+/// Gated on `>= min_lanes` running lanes so a one- or two-lane box, where a
+/// genuine quiet spell is plausible, reads `Unknown` rather than crying wolf.
+pub fn self_reports_landing(
+    lanes: &[LaneReport],
+    min_lanes: usize,
+    max_freshest_s: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "session.self_reports_landing";
+    if lanes.len() < min_lanes {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "only {} running lane(s) (< {min_lanes}) — too few to distinguish a dead \
+                 report hook from a genuinely quiet fleet",
+                lanes.len()
+            ),
+        )];
+    }
+    // Youngest report across the whole fleet, and who it belongs to. A lane with
+    // NO report at all contributes nothing to the minimum (it cannot lower it),
+    // which is correct: one never-reporting lane is not the fleet-wide outage
+    // this catches — a dark fleet minimum is.
+    let mut freshest = f64::INFINITY;
+    let mut freshest_name = String::new();
+    let mut with_report = 0usize;
+    for l in lanes {
+        if let Some(age) = l.report_age_s {
+            with_report += 1;
+            if age < freshest {
+                freshest = age;
+                freshest_name = l.name.clone();
+            }
+        }
+    }
+    if with_report == 0 {
+        // Not one running lane has EVER reported: the control plane is fully
+        // down, not merely quiet.
+        return vec![InvariantResult::fail(
+            ID,
+            format!("at least one of {} running lanes reporting", lanes.len()),
+            format!(
+                "0 of {} running lanes have any self-report — report hooks are not landing",
+                lanes.len()
+            ),
+        )
+        .evidence(json!({
+            "running_lanes": lanes.len(),
+            "lanes_with_report": 0,
+            "class": "report-control-plane-down",
+            "incident": "2026-08-13: endpoint.json.legacy_port went null; baked-in report \
+                         hooks POSTed to the dead 8822 and failed silently",
+            "likely_cause": "endpoint.json legacy_port/retired_ports not naming the port \
+                             pre-cutover sessions carry — status is running blind on pane-scrape",
+        }))];
+    }
+    if freshest > max_freshest_s {
+        return vec![InvariantResult::fail(
+            ID,
+            format!("freshest self-report across the fleet < {max_freshest_s:.0}s"),
+            format!(
+                "youngest report across {} running lanes is {freshest:.0}s old (from {freshest_name}; \
+                 {with_report} lanes carry any report) — report control plane down fleet-wide, \
+                 status is on pane-scrape",
+                lanes.len()
+            ),
+        )
+        .evidence(json!({
+            "running_lanes": lanes.len(),
+            "lanes_with_report": with_report,
+            "freshest_report_age_s": freshest,
+            "freshest_lane": freshest_name,
+            "threshold_s": max_freshest_s,
+            "class": "report-control-plane-down",
+            "incident": "2026-08-13: baked-in report hooks POSTed to the dead 8822 silently; \
+                         0/48 fresh self-reports, worker status inaccurate/delayed",
+        }))];
+    }
+    vec![InvariantResult::pass(ID).evidence(json!({
+        "running_lanes": lanes.len(),
+        "lanes_with_report": with_report,
+        "freshest_report_age_s": freshest,
+        "freshest_lane": freshest_name,
+    }))]
+}
+
+/// One running lane's self-report age, `None` when the lane has never reported.
+#[derive(Debug, Clone)]
+pub struct LaneReport {
+    pub name: String,
+    pub report_age_s: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -812,5 +926,69 @@ mod negative_controls {
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
         );
+    }
+
+    // -- session.self_reports_landing (the 2026-08-13 reporting outage) --------
+
+    /// THE INCIDENT'S OWN ARTIFACT: the 2026-08-13 fleet, freshest report from
+    /// `primis` at 7379s and everything else 40h+. The check must FAIL and name
+    /// the freshest lane and its age — the fleet MINIMUM is what discriminates a
+    /// dead control plane from a legitimately quiet lane.
+    #[test]
+    fn a_fleet_whose_youngest_report_is_hours_old_fails() {
+        // Ages drawn from the real outage: one 2h outlier, the rest ~40h.
+        let mut lanes: Vec<LaneReport> = (0..47)
+            .map(|i| LaneReport {
+                name: format!("lane-{i}"),
+                report_age_s: Some(143_000.0 + i as f64),
+            })
+            .collect();
+        lanes.push(LaneReport { name: "primis".into(), report_age_s: Some(7_379.0) });
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].status, Status::Fail, "youngest 7379s > 3600s must fail: {rs:?}");
+        // Names the freshest lane and age, so the reader does not re-derive it.
+        assert!(rs[0].observed.contains("primis"), "must name freshest lane: {}", rs[0].observed);
+        assert!(rs[0].observed.contains("7379"), "must state the age: {}", rs[0].observed);
+    }
+
+    /// A healthy fleet: someone reported seconds ago, so the minimum is fresh
+    /// even though most lanes are idle-and-quiet. Must PASS — a check that fires
+    /// on the normal steady state gets ignored, and then it is not a check.
+    #[test]
+    fn a_fleet_with_one_fresh_report_passes_even_if_most_are_stale() {
+        let mut lanes: Vec<LaneReport> = (0..40)
+            .map(|i| LaneReport {
+                name: format!("idle-{i}"),
+                report_age_s: Some(30_000.0),
+            })
+            .collect();
+        lanes.push(LaneReport { name: "busy".into(), report_age_s: Some(4.0) });
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a fresh fleet minimum is healthy even behind idle lanes: {rs:?}"
+        );
+    }
+
+    /// Not one lane has ever reported: the control plane is fully down — a
+    /// distinct, louder failure than a merely-stale minimum.
+    #[test]
+    fn a_fleet_with_zero_reports_fails_as_control_plane_down() {
+        let lanes: Vec<LaneReport> = (0..20)
+            .map(|i| LaneReport { name: format!("l-{i}"), report_age_s: None })
+            .collect();
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert_eq!(rs[0].status, Status::Fail);
+        assert!(rs[0].observed.contains("0 of 20"), "{}", rs[0].observed);
+    }
+
+    /// A one- or two-lane box must read Unknown, never fire: a genuine quiet
+    /// spell is plausible there, and a false alarm trains the reader to skim.
+    #[test]
+    fn a_tiny_fleet_is_unknown_not_a_false_alarm() {
+        let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0) }];
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert_eq!(rs[0].status, Status::Unknown, "too-small fleet must be Unknown: {rs:?}");
     }
 }

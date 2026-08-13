@@ -431,21 +431,45 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Option<u16>) {
+    // `legacy_port` NAMES THE SINGLE STALE PORT pre-cutover sessions carry in
+    // their inherited `AMUX_URL`, and it MUST stay non-null while any such
+    // session is alive. This `.or_else(RETIRED_PORTS…)` reverses the `None` that
+    // shipped when the 8822 bind was dropped.
+    //
+    // That earlier change fixed ONE consumer — the git staged-guard resolver,
+    // migrated to read the `retired_ports` array — and silently stranded the
+    // OTHER: the Stop / PostToolUse / UserPromptSubmit state-report hooks baked
+    // into ~48 live `claude` processes. Those hooks rewrite a stale URL by
+    // matching THIS field (`case "$U" in *localhost:$L)`), and cannot be changed
+    // in place — Claude Code loads hook config at session start, so the only
+    // thing that reaches an already-running lane is the file it reads at RUNTIME,
+    // which is this one. With `legacy_port:null` the pattern degenerated to
+    // `*localhost:` and matched nothing, so every one of those lanes POSTed its
+    // state report to the dead 8822 and failed silently. Measured 2026-08-13:
+    // 0 of 48 running lanes with a fresh self-report, status fell back fleet-wide
+    // to terminal scraping — the exact D1 path this file exists to demote, and
+    // the "worker status is inaccurate/delayed" symptom the owner reported.
+    //
+    // The file's own `consumer_rule` (below) still documents `legacy_port` as the
+    // rewrite trigger, so nulling it made the file contradict its own contract.
+    // `retired_ports` is the newer, richer signal for resolvers that can read an
+    // array; `legacy_port` is the original single-value one the baked-in hooks
+    // read — the two must AGREE on the port sessions actually carry. This is the
+    // same countdown shim the bind itself was, one layer down: it returns to null
+    // on its own the day `RETIRED_PORTS` is emptied, which is the day no live
+    // session can still be carrying that port. `session.self_reports_landing`
+    // (invariants/checks.rs) now fails loudly if reporting ever goes dark again,
+    // so the next occurrence self-announces instead of waiting to be noticed.
+    //
+    // Cloud safety (single codebase, no branch): there canonical == 8822 == the
+    // sole retired port, so `legacy_field` is `Some(8822)` and every rewrite is
+    // 8822 -> 8822, a no-op — identical to the `retired_ports` array already
+    // published there today.
+    let legacy_field = legacy.or_else(|| RETIRED_PORTS.first().copied());
     let body = serde_json::json!({
         "canonical_url": format!("https://localhost:{canonical}"),
         "canonical_port": canonical,
-        "legacy_port": legacy,
-        // RETIRED PORTS OUTLIVE THE BIND, and that is the whole point.
-        //
-        // The self-heal in .git/hooks/amux-staged-guard keyed on `legacy_port`
-        // being non-null: "if your AMUX_URL is the legacy port, use
-        // canonical_url". The moment the bind was dropped this began
-        // publishing null, the condition went false, and the hook fell back to
-        // the stale inherited URL — so the mechanism built for exactly this
-        // moment stopped working at exactly this moment. Measured immediately:
-        // "staged-guard: NOT ENFORCED — connection refused", i.e. cross-session
-        // sweep protection off for every pre-cutover session at once.
-        //
+        "legacy_port": legacy_field,
         // A retired address needs to stay KNOWN after it stops being served,
         // because the processes that still name it are precisely the ones that
         // cannot be told anything else.
@@ -493,7 +517,7 @@ pub fn publish_endpoint(amux_home: &std::path::Path, canonical: u16, legacy: Opt
         .and_then(|_| std::fs::rename(&tmp, &path))
         .is_ok();
     if ok {
-        tracing::info!(?path, canonical, ?legacy, "published endpoint.json (stale-URL self-heal)");
+        tracing::info!(?path, canonical, ?legacy_field, "published endpoint.json (stale-URL self-heal)");
     } else {
         // Loud: silently failing here turns every hook's self-heal off with no
         // trace, and the symptom (traffic on the retired port) looks identical
@@ -792,6 +816,44 @@ mod tests {
         assert!(got.iter().all(|r| r["amux_url"].as_str().unwrap().contains(":8822")));
         // A machine fully migrated to 8824 yields nothing — no false positives.
         assert!(parse_stranded(ps, &[9999]).is_empty());
+    }
+
+    /// `legacy_port` in the published `endpoint.json` MUST name the retired port,
+    /// never `null` — the Stop/PostToolUse/UserPromptSubmit report hooks baked
+    /// into pre-cutover sessions self-heal a stale `AMUX_URL` by matching exactly
+    /// this field. A `null` here is not cosmetic: it sent 48 live lanes' state
+    /// reports to the dead 8822 and they failed silently (measured 2026-08-13:
+    /// 0/48 fresh self-reports, worker status fell back fleet-wide to pane
+    /// scraping). The caller passes `None`; `publish_endpoint` fills it from
+    /// `RETIRED_PORTS`, so a future caller cannot re-null it by omission — which
+    /// is precisely how it regressed the first time.
+    #[test]
+    fn published_endpoint_names_the_retired_port_for_baked_in_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // None, exactly as lib.rs passes it — the field must still resolve to the
+        // retired port, because that is what the baked-in report hooks match.
+        publish_endpoint(tmp.path(), 8824, None);
+        let raw = std::fs::read_to_string(tmp.path().join("endpoint.json"))
+            .expect("endpoint.json written");
+        let ep: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(
+            ep["legacy_port"], 8822,
+            "legacy_port must name the retired port so baked-in report hooks \
+             self-heal; a null here IS the 2026-08-13 reporting outage. got {ep}"
+        );
+        assert_eq!(ep["canonical_url"], "https://localhost:8824");
+        // The two stale-port signals must AGREE: retired_ports (array, read by
+        // the git resolver) and legacy_port (scalar, read by the report hooks)
+        // have to name the same port, or a session heals one hook and not the
+        // other.
+        assert_eq!(ep["retired_ports"], serde_json::json!(RETIRED_PORTS));
+        assert!(
+            ep["retired_ports"]
+                .as_array()
+                .unwrap()
+                .contains(&ep["legacy_port"]),
+            "legacy_port must be one of retired_ports, got {ep}"
+        );
     }
 
     /// ONE test, not several, on purpose.

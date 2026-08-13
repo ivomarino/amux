@@ -87,6 +87,9 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 4. status truth: does the card agree with the pane?
     out.extend(status_pane_check(state));
 
+    // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
+    out.extend(self_reports_check(state));
+
     out
 }
 
@@ -130,6 +133,51 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
         })
         .collect();
     checks::status_agrees_with_pane(&lanes)
+}
+
+/// Is the report control plane UP — are self-reports landing at all?
+///
+/// Reads the SAME `FleetSignals.reports` blob the status derivation reads, so
+/// this cannot disagree with the mechanism it audits about what "reported"
+/// means. The discriminator is the FLEET MINIMUM report age, not any per-lane
+/// age: one idle lane going quiet for hours is normal, the youngest report
+/// across the whole fleet being hours old is the control plane down (the
+/// 2026-08-13 outage, where baked-in report hooks POSTed to the dead 8822).
+fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "session.self_reports_landing";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    if signals.running.is_empty() {
+        // Same reasoning as status_pane_check: no fleet is a real state but also
+        // what a failed `tmux list-sessions` looks like. Not a pass.
+        return vec![InvariantResult::unknown(ID, "no running tmux sessions visible")];
+    }
+    let lanes: Vec<checks::LaneReport> = signals
+        .running
+        .iter()
+        .map(|name| {
+            let age = signals
+                .reports
+                .get(name.as_str())
+                .and_then(|r| r["ts"].as_f64())
+                .map(|ts| signals.now - ts);
+            checks::LaneReport { name: name.clone(), report_age_s: age }
+        })
+        .collect();
+    // Policy in config, not baked in (ethos D4). Defaults: a fleet of >=10 lanes
+    // with NObody reporting in an hour is unambiguously broken — a healthy fleet
+    // transitions within minutes, and the incident's freshest was 2h.
+    let min_lanes = std::env::var("AMUX_REPORT_MIN_LANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let max_freshest_s = std::env::var("AMUX_REPORT_FRESHEST_MAX_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600.0);
+    checks::self_reports_landing(&lanes, min_lanes, max_freshest_s)
 }
 
 /// The steering queue, joined against each target's reported state.
