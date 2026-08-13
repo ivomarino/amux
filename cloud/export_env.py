@@ -111,9 +111,14 @@ def export(org, files_dir=None):
             p = entry.get("path") or (files_dir.rstrip("/") + "/" + entry.get("name", ""))
             if entry.get("type") == "dir" or entry.get("is_dir"):
                 continue
-            code, body = seed.gw("GET", f"/api/file?path={p}", org=org)
-            if code == 200 and body is not None:
-                files.append({"path": p, "content": body})
+            # /api/file returns {"content": "<raw>", ...}, NOT the bare bytes.
+            # Storing the whole JSON envelope would write literal `{"content":...}`
+            # into the redeployed doc — extract the field.
+            code, resp = seed.gw_json("GET", f"/api/file?path={p}", org=org)
+            if code == 200 and isinstance(resp, dict) and "content" in resp:
+                files.append({"path": p, "content": resp["content"]})
+            elif code == 200 and isinstance(resp, str):
+                files.append({"path": p, "content": resp})
 
     spec = {
         "_comment": f"Exported from live env {org} by export_env.py — EnvSpec (AMUX-2977). "
