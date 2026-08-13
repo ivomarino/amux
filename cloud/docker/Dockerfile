@@ -209,6 +209,15 @@ RUN mkdir -p /root/.claude \
     && jq -e '.skipDangerousModePermissionPrompt == true' /root/.claude/settings.json > /dev/null \
     && echo "claude skipDangerousModePermissionPrompt seeded (gate-1 suppressed)"
 
+# PER-TENANT: keep the server's OWN health/ops cards off the CUSTOMER board
+# (AMUX-3014). autofix files invariant-failure / disk-floor / dead-route cards
+# for an operator to action — correct on the single local ops box (its board IS
+# the ops board), but each cloud org runs its own server, so those cards land on
+# the customer's board. Same "a deployment property, not a server branch"
+# justification as IS_SANDBOX: the operator reads cloud health from /health +
+# /api/health/invariants, not from cards inside a tenant. Default (unset) is on.
+ENV AMUX_OPS_HEALTH_CARDS=0
+
 # The server ALWAYS serves TLS (crates/amux-server/src/lib.rs — there is no
 # no-tls switch), so the loopback hop from the gateway is https with a
 # self-signed cert minted into /root/.amux/tls on first boot. `curl -k` here is

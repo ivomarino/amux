@@ -93,6 +93,43 @@ fn env_str(key: &str) -> String {
     std::env::var(key).unwrap_or_default().trim().to_string()
 }
 
+/// May autofix FILE its findings as board cards on this instance?
+///
+/// Autofix findings — invariant failures, the disk floor, dead routes, latency
+/// outliers, stale steering — are the SERVER's OWN health/ops concerns. On the
+/// local single-instance box the board IS the ops board, so this is on by
+/// default. But cloud is PER-TENANT: each customer org runs its own server, so
+/// filing them drops the operator's health cards onto the CUSTOMER's board
+/// (AMUX-3014: a customer org carried "disk … below floor" and "invariant …
+/// failing" it never created). The cloud image sets `AMUX_OPS_HEALTH_CARDS=0`;
+/// the operator reads cloud health from `/health` + `/api/health/invariants`
+/// instead of from cards inside a tenant. Single codebase, env-driven, no build
+/// flag — unset means the local default (on).
+fn ops_health_cards_enabled() -> bool {
+    // The explicit knob wins in either direction — an operator can force-on
+    // inside a container, or force-off on a shared box.
+    if let Ok(v) = std::env::var("AMUX_OPS_HEALTH_CARDS") {
+        return parse_ops_health_cards(Some(&v));
+    }
+    // No knob set: ON by default, but OFF in an isolated SINGLE-TENANT container.
+    // Such a container's board IS the customer's, so a cloud image that never
+    // sets the knob still must not leak the operator's health cards onto it.
+    // `IS_SANDBOX=1` is already set by the cloud image (for the root-refusal), so
+    // this defends the fix against a future deployment forgetting the explicit
+    // env — the leak cannot silently recur.
+    std::env::var("IS_SANDBOX").ok().as_deref() != Some("1")
+}
+
+/// Pure parse, split out so the on/off semantics are tested without env races.
+/// Unset (`None`) or any non-falsey value is ON (the local default); only an
+/// explicit falsey value turns it off.
+fn parse_ops_health_cards(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        None => true,
+    }
+}
+
 /// Window each detector looks back over.
 fn window_h() -> f64 {
     env_f64("AMUX_AUTOFIX_WINDOW_H", 6.0).clamp(0.1, 24.0 * 30.0)
@@ -2472,6 +2509,14 @@ pub async fn autofix_tick_with_ci(
 /// card: if the insert fails, no idem row is left claiming a card that does
 /// not exist, and if the idem row exists the card does too.
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
+    // PER-TENANT CLOUD: do not drop the server's own health/ops findings onto a
+    // customer's board (AMUX-3014). Off by env in the cloud image; on locally
+    // where the board is the ops board. Detection still runs — only the card
+    // FILING is suppressed — and the operator reads /health + /api/health/
+    // invariants for cloud health.
+    if !ops_health_cards_enabled() {
+        return Ok(None);
+    }
     {
         let conn = state.store.read()?;
         if already_filed(&conn, &f.signature) {
@@ -2820,6 +2865,20 @@ fn parse_ts(s: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// AMUX-3014: autofix cards must default ON (local ops board) and turn OFF
+    /// only on an explicit falsey value (the cloud image sets 0 so per-tenant
+    /// customer boards do not carry the server's own health cards).
+    #[test]
+    fn ops_health_cards_default_on_off_only_when_explicitly_falsey() {
+        assert!(parse_ops_health_cards(None), "unset -> on (local ops default)");
+        assert!(parse_ops_health_cards(Some("1")), "1 -> on");
+        assert!(parse_ops_health_cards(Some("true")), "true -> on");
+        assert!(parse_ops_health_cards(Some("")), "empty -> on (not an explicit off)");
+        for off in ["0", "false", "off", "no", "OFF", " 0 ", "False"] {
+            assert!(!parse_ops_health_cards(Some(off)), "{off:?} must disable filing");
+        }
+    }
 
     fn state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
