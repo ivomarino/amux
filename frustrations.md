@@ -2901,17 +2901,6 @@ FIX: none yet. CLAUDE.md documents the mirror of this ("a peer's commit can
   I have used the path-scoped form elsewhere today; I did not here, and that is
   the difference.
 
-## A needs:you doing card idled a lane for 31 hours while 28 todos waited
-AREA: board
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux (Ethan-direct lane)
-CARD: AMUX-2907
-SYMPTOM: backend read idle for a day with 28 eligible todos; board-drive trace said "wip-cap: holding 1/1 in doing: BACKE-3249" and the advance trace said the same card was needs:you (31h). The lane could not honestly take work, and nothing anywhere said "this lane is parked because a HUMAN owes an answer" where Ethan looks.
-COST: A full lane-day of throughput on the fleet's largest queue; Ethan concluded "these workers just stop" and spent his attention on delivery theories (auto-continue, message loss) that were all false.
-FIX: ad2429c — doing+needs:you no longer holds WIP (same exemption family as archived/dormant). Residual: the needs:you ask itself still only reaches Ethan via the 3-day re-nag; a parked-on-you card should be visible on the fleet view, not just the card.
-
 ## Everything a renamed lane produced was attributed to its dead name
 AREA: attribution
 SEVERITY: slows
@@ -2998,17 +2987,6 @@ FIX: Procedural, and written down rather than resolved-to-be-careful: `amux boar
   cannot be made reliable on a board where ~50 sessions file concurrently — between my
   reading an id and writing my own, several land. All three references corrected (23097b2
   and earlier).
-
-## The pickup prompt's own re-shape advice manufactured a fleet-visible decline loop
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux (Ethan-direct lane)
-CARD: AMUX-2907
-SYMPTOM: backend triaged 16 pickups in one hour, each ending doing->todo with analysis appended and zero execution; every bounce armed the 24h reclaim cooldown, so 19 of 19 todos became undispatchable while the lane read busy and the drive kept dealing. The deep-queue paragraph in the pickup prompt said "say so and re-shape the queue rather than grinding it" and named no honest exit - bouncing WAS the compliant reading (AMUX-2140 class: the sanctioned instruction and the failure were the same action).
-COST: An afternoon of one lane's throughput converted into cooldowns; Ethan asked twice why workers "just stop" / "have so many todo items"; the diagnosis required joining task.claimed events against card logs by hand because no view says "this lane is declining its pickups".
-FIX: 1d3e5aa - the prompt now names the exits (not-ready -> backlog, owner-blocked -> review, never a ready card back to todo with notes) and select_pickup has a self-clearing bounce-loop breaker (3 bounced claims in 2h stop the deal, WARN + trace reason). Residual: the 24h cooldowns on backend's 19 cards expire on their own; nothing re-deals them sooner.
 
 ## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
 AREA: instruments
