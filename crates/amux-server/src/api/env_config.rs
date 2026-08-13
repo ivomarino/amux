@@ -21,6 +21,7 @@
 
 use super::AppState;
 use crate::db::WriteOutcome;
+use rusqlite::OptionalExtension;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -53,11 +54,35 @@ struct EnvSpec {
     // the SAME path a hand-made schedule uses so `expr`/next_run match exactly.
     #[serde(default)]
     schedules: Vec<ScheduleSpec>,
+    // `cards` (initial board issues — the demo's visible content) is APPLIED
+    // (AMUX-2977, amux-cloud co-design): a vertical's starting work belongs in
+    // the YAML so the whole env round-trips. Idempotent by (worker,title).
+    #[serde(default)]
+    cards: Vec<CardSpec>,
     // Still phase-2, parsed-and-reported so a full spec is not rejected.
     #[serde(default)]
     columns: Vec<Value>,
     #[serde(default)]
     global: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardSpec {
+    /// Owning session (the worker this card is on).
+    worker: String,
+    title: String,
+    #[serde(default)]
+    desc: String,
+    /// Board status; defaults to `backlog` (a seeded card is not auto-dispatched
+    /// until a human/worker moves it).
+    #[serde(default)]
+    status: String,
+    /// Item type; defaults to `code`.
+    #[serde(rename = "type", default)]
+    item_type: String,
+    /// Optional epic (semantic id of a type=epic card) to roll this card under.
+    #[serde(default)]
+    epic: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,16 +133,22 @@ struct WorkerSpec {
     model: String,
     #[serde(default)]
     provider: String,
+    /// First-run task steered to the worker ONLY when it is newly created — a
+    /// re-apply of an existing worker never re-steers (AMUX-2977 co-design).
+    #[serde(default)]
+    prompt: String,
 }
 
 // ---- GET /api/env/schema ---------------------------------------------------
 
 async fn schema() -> Response {
     Json(json!({
-        "applied_now": ["groups", "workers", "files", "schedules"],
+        "applied_now": ["groups", "workers", "files", "schedules", "cards", "worker.prompt"],
         "phase_2": ["columns", "gates", "global"],
         "files_shape": [{"path": "/abs/path/doc.md", "content": "literal file content"}],
         "schedules_shape": [{"worker": "backend-dev", "title": "nightly", "expr": "daily at 02:00", "enabled": false, "command": "the prompt"}],
+        "cards_shape": [{"worker": "backend-dev", "title": "First issue", "desc": "...", "status": "backlog", "type": "code", "epic": ""}],
+        "worker_prompt": "a `prompt` string on each worker — steered as the first task, on create only",
         "example": {
             "groups": [{"name": "engineering", "department": "Engineering", "goal": "Ship the platform"}],
             "workers": [{
@@ -172,6 +203,8 @@ async fn apply(
     // ---- workers: an env file per worker (idempotent write) ----------------
     // Validate first so a dry-run reports the same refusals an apply would hit.
     let mut worker_writes: Vec<(std::path::PathBuf, String, String, &str)> = vec![];
+    // (name, prompt) for workers created THIS apply — steered once, on create.
+    let mut worker_prompts: Vec<(String, String)> = vec![];
     for w in &spec.workers {
         let name = sanitize(&w.name);
         if name.is_empty() {
@@ -189,9 +222,16 @@ async fn apply(
         // "unchanged" if the file already holds this exact config (minus the
         // volatile `# updated:` header line) — so a re-apply reports honestly.
         let action = if existed && same_env_body(&path, &content) { "unchanged" } else { action };
-        report.push(json!({"kind": "worker", "name": name, "action": action, "groups": w.groups}));
+        report.push(json!({"kind": "worker", "name": name, "action": action, "groups": w.groups,
+            "prompt": !w.prompt.trim().is_empty()}));
         if !dry && action != "unchanged" {
             worker_writes.push((path, content, name.clone(), action));
+        }
+        // Steer the first-run prompt ONLY when the worker is newly created —
+        // never on update/unchanged, or a re-apply would re-interrupt a running
+        // lane. Reported (bool) in dry-run so the plan is visible.
+        if !dry && action == "create" && !w.prompt.trim().is_empty() {
+            worker_prompts.push((name.clone(), w.prompt.clone()));
         }
     }
 
@@ -295,6 +335,44 @@ async fn apply(
         }
     }
 
+    // ---- cards: initial board issues, idempotent by (worker,title) ---------
+    let existing_cards: std::collections::HashSet<(String, String)> = state
+        .store
+        .read()
+        .ok()
+        .map(|conn| {
+            let mut set = std::collections::HashSet::new();
+            if let Ok(mut st) = conn.prepare(
+                "SELECT session, title FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0",
+            ) {
+                if let Ok(rows) = st.query_map([], |r| {
+                    Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, String>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        set.insert(row);
+                    }
+                }
+            }
+            set
+        })
+        .unwrap_or_default();
+    let mut card_writes: Vec<(String, String, String, String, String, String)> = vec![];
+    for c in &spec.cards {
+        let (worker, title) = (c.worker.trim(), c.title.trim());
+        if worker.is_empty() || title.is_empty() {
+            report.push(json!({"kind": "card", "action": "error", "detail": "worker and title are required"}));
+            continue;
+        }
+        let exists = existing_cards.contains(&(worker.to_string(), title.to_string()));
+        let action = if exists { "exists" } else { "create" };
+        report.push(json!({"kind": "card", "worker": worker, "title": title, "action": action}));
+        if !dry && !exists {
+            let status = if c.status.trim().is_empty() { "backlog".into() } else { c.status.trim().to_string() };
+            let itype = if c.item_type.trim().is_empty() { "code".into() } else { c.item_type.trim().to_string() };
+            card_writes.push((worker.to_string(), title.to_string(), c.desc.clone(), status, itype, c.epic.trim().to_string()));
+        }
+    }
+
     // Phase-2 stanzas still parsed-and-reported (not silently dropped).
     if !spec.columns.is_empty() {
         report.push(json!({"kind": "columns", "action": "not-yet-applied", "count": spec.columns.len(),
@@ -322,6 +400,14 @@ async fn apply(
     // A worker create/delete changes the fleet registry — invalidate the cache
     // (the AMUX-2960 discipline) so the new workers show up immediately.
     super::sessions_legacy::invalidate_sessions_cache();
+
+    // ---- worker prompts: steer the first-run task to NEW workers only ------
+    // After the env files exist. Delivered at the worker's next turn boundary;
+    // if its session is not up yet (provisioned separately) it queues and lands
+    // when the worker starts. Only newly-created workers are here (see the loop).
+    for (name, prompt) in &worker_prompts {
+        crate::api::session_verbs::steer_enqueue(&state, name, prompt, "env-apply-prompt", "").await;
+    }
 
     // ---- files: write each seed doc to its absolute path -------------------
     for (path, content) in file_writes {
@@ -416,6 +502,60 @@ async fn apply(
             .await;
         if let Err(e) = res {
             errors.push(json!({"kind": "schedule", "error": e.to_string()}));
+        }
+    }
+
+    // ---- cards: create the absent initial board issues ---------------------
+    if !card_writes.is_empty() {
+        let cards = card_writes;
+        let res = state
+            .store
+            .write_async(move |conn| {
+                let now = chrono::Utc::now().timestamp();
+                for (worker, title, desc, status, itype, epic) in &cards {
+                    // Re-check inside the write so a concurrent apply cannot
+                    // both create the same (worker,title).
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM issues WHERE session=?1 AND title=?2 \
+                             AND deleted IS NULL AND COALESCE(archived,0)=0 LIMIT 1",
+                            rusqlite::params![worker, title],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if exists {
+                        continue;
+                    }
+                    let new = crate::db::board_store::NewIssue {
+                        title: title.clone(),
+                        desc: desc.clone(),
+                        status: status.clone(),
+                        session: Some(worker.clone()),
+                        item_type: itype.clone(),
+                        creator: "env-apply".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                    };
+                    let row = crate::db::board_store::create_issue(conn, &new, now)?;
+                    if !epic.is_empty() {
+                        conn.execute(
+                            "UPDATE issues SET epic=?1 WHERE id=?2",
+                            rusqlite::params![epic, row.id],
+                        )?;
+                    }
+                }
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        if let Err(e) = res {
+            errors.push(json!({"kind": "card", "error": e.to_string()}));
         }
     }
 

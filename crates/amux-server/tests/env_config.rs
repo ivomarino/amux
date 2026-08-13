@@ -294,6 +294,92 @@ schedules:
 }
 
 #[tokio::test]
+async fn cards_are_seeded_idempotently_with_defaults() {
+    let (app, store) = app("cards");
+    let yaml = r#"
+cards:
+  - worker: env2977-cards-lane
+    title: env2977 first issue
+    desc: the demo's visible work
+"#;
+    let count = |store: &std::sync::Arc<Store>| -> i64 {
+        store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE session='env2977-cards-lane' AND deleted IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // Dry run: reports create, writes no card.
+    let (st, body) = apply(&app, yaml, true).await;
+    assert_eq!(st, StatusCode::OK);
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "card").unwrap();
+    assert_eq!(row["action"], "create");
+    assert_eq!(count(&store), 0, "dry run wrote a card");
+
+    // Apply: the card lands with default status=backlog, type=code.
+    let (st, _) = apply(&app, yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(count(&store), 1);
+    let (status, itype): (String, String) = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT status, type FROM issues WHERE session='env2977-cards-lane'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "backlog", "a seeded card defaults to backlog, not auto-dispatched");
+    assert_eq!(itype, "code");
+
+    // Re-apply: reports exists, does not duplicate.
+    let (_, body) = apply(&app, yaml, false).await;
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "card").unwrap();
+    assert_eq!(row["action"], "exists");
+    assert_eq!(count(&store), 1, "re-apply must not duplicate the card");
+}
+
+#[tokio::test]
+async fn worker_prompt_steers_once_on_create_never_on_reapply() {
+    let (app, store) = app("prompt");
+    // A tempdir the worker's dir check passes against.
+    let wdir = home().join("prompt-wdir");
+    std::fs::create_dir_all(&wdir).unwrap();
+    let yaml = format!(
+        "workers:\n  - name: env2977-prompt-lane\n    dir: {}\n    prompt: You are the ops pulse. Start by reviewing the docs.\n",
+        wdir.display()
+    );
+    let steers = |store: &std::sync::Arc<Store>| -> i64 {
+        store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE session='env2977-prompt-lane'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // First apply CREATES the worker -> steers the prompt once.
+    let (st, _) = apply(&app, &yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(steers(&store), 1, "a newly-created worker is steered its first-run prompt");
+
+    // Re-apply: the worker already exists (unchanged) -> no re-steer.
+    let (st, body) = apply(&app, &yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "worker").unwrap();
+    assert_eq!(row["action"], "unchanged");
+    assert_eq!(steers(&store), 1, "a re-apply of an existing worker must NOT re-steer the prompt");
+}
+
+#[tokio::test]
 async fn invalid_yaml_is_a_400_not_a_panic() {
     let (app, _store) = app("badyaml");
     let (st, body) = apply(&app, "groups: [unterminated", false).await;
