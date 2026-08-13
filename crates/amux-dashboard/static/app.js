@@ -1865,6 +1865,12 @@ async function _apiErrText(r) {
         // Gate refusals carry the exact command that WOULD work — that is the
         // most actionable thing in the whole response; surface it.
         if (msg && j.cli) msg += ' — try: ' + j.cli;
+        // Same idea, different key (PR #90, Dygreens). The scheduler's
+        // shadow-mode 409 answers "what do I do about it" in `enable`
+        // (AMUX_RS_SCHEDULER=1), and only `cli` was being read — so the
+        // actionable half of that body was the half dropped. Any refusal that
+        // names its own remedy should carry it to the toast.
+        if (msg && j.enable) msg += ' — set ' + j.enable;
       } catch (e) { msg = txt.slice(0, 200); }
     }
   } catch (e) { /* body already consumed or unreadable — status only */ }
@@ -7139,7 +7145,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.616';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.617';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
