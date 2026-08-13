@@ -2951,7 +2951,7 @@ FIX: (proposed, AMUX-2988) legacy-port accounting must not measure strandedness 
 ## Local clippy green is a false proxy for CI green — stale floating toolchain red main for hours
 AREA: ci
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-12
 SESSION: amux
 CARD: AMUX-3013
