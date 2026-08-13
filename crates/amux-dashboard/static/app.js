@@ -7367,7 +7367,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.625';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.626';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8591,6 +8591,12 @@ const _NON_HUMAN_PROMPT_MARKS = [
   ['[amux]', 'amux'],               // idle nudges, advance nudges, digests
   ['[amux ', 'amux'],               // any other bracketed amux subsystem
   ['[Scheduled]', 'schedule'],
+  // amux's AUTO context-low compact (Ethan 2026-08-13: a /compact reminder was
+  // polluting the human navigator). The reminder text ("Context is at N%
+  // remaining … Compacting now keeps you working …") is amux-injected, so the
+  // prefix `/compact Context is at` is the tell — a human's bare `/compact`
+  // still reads as human.
+  ['/compact Context is at', 'amux'],
 ];
 
 function _classifyPromptKind(promptText) {
