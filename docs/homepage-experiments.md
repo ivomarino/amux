@@ -346,6 +346,26 @@
 - **Effort:** XS
 - **Measure after:** 2026-08-19 (7 days minimum)
 
+### EXP-034 — Top-of-page green CTA on /guides/ index
+- **Hypothesis:** The guides index has 157 PVs over 14 days but only 1.3% GitHub CVR — the lowest of any high-traffic page. It has no top-of-page CTA. Adding one will replicate the EXP-015 WIN (+200%) and EXP-020 WIN pattern.
+- **Page:** `/guides/`
+- **KPI:** GitHub stars (PostHog `exp034_guides_index_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-13
+- **Implementation:** Green/teal CTA banner immediately after the page subtitle. "Run a fleet of Claude Code, Codex, and Gemini CLI agents from a single dashboard. amux is free, MIT licensed, and takes 2 minutes to install." with a green GitHub button.
+- **Effort:** XS
+- **Measure after:** 2026-08-20 (7 days minimum)
+
+### EXP-035 — Top-of-page green CTA on new /guides/ai-agent-groups/ page
+- **Hypothesis:** A new guide page targeting "organize AI agents into groups" will attract developers who are already running multiple agents and are evaluating group/namespace management. This audience is high-intent and will respond to a direct "here's how amux handles it" CTA.
+- **Page:** `/guides/ai-agent-groups/`
+- **KPI:** GitHub stars (PostHog `exp035_groups_guide_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-13
+- **Implementation:** Green CTA banner baked into the page at creation. "Organizing your AI engineering team into specialized groups? amux groups give each sub-team its own board view, shared memory, and environment scope — manage dozens of agents with zero coordination overhead."
+- **Effort:** XS (baked in at page creation)
+- **Measure after:** 2026-08-20 (7 days minimum)
+
 ### EXP-019 — Review dashboard PS row on homepage
 - **Hypothesis:** The Review dashboard / Trends view / Fleet org chart (shipped 2026-08-01) represent a new capability class — "understand what your AI team did" — not represented in the homepage PS grid. Adding a dedicated row surfaces this for engineering managers and team leads who are the highest-value audience segment.
 - **Page:** `/` (homepage PS problem/solution grid)

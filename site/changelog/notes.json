@@ -1,5 +1,95 @@
 [
   {
+    "hash": "4a026d1a31d7ab334a8651830177045fc9f17c34",
+    "short": "4a026d1",
+    "title": "CLI warns once when $AMUX_URL points to the dead port",
+    "date": "2026-08-13",
+    "type": "fix",
+    "tags": ["cli", "ux", "port"],
+    "description": "If $AMUX_URL still points to the retired 8822 port, the CLI now prints one warning per session and exits 1 rather than silently returning empty JSON. Sessions started before the port migration get a clear signal — and the fix — instead of unexplained empty responses."
+  },
+  {
+    "hash": "af52446fe8436d1fb91d0381533d47682820f085",
+    "short": "af52446",
+    "title": "Push alerts report delivered only when an endpoint accepts",
+    "date": "2026-08-13",
+    "type": "fix",
+    "tags": ["alerts", "push"],
+    "description": "The alert endpoint previously reported 'sent' even when no configured push endpoint accepted the delivery. The response now accurately reflects whether at least one endpoint received the notification — no more false-green status on missed alerts."
+  },
+  {
+    "hash": "410684f32b1e23fdae47aa1fbe84cb71ea679a9e",
+    "short": "410684f",
+    "title": "EnvSpec apply \u2014 creates each worker's workdir on bootstrap",
+    "date": "2026-08-13",
+    "type": "fix",
+    "tags": [
+      "envspec",
+      "env",
+      "workers",
+      "fix"
+    ],
+    "description": "When applying an EnvSpec on a fresh machine, worker directories did not exist and the apply failed silently. apply now creates each worker's workdir before starting the session \u2014 bootstrap works out of the box on a clean install."
+  },
+  {
+    "hash": "94b1c402ffef098536c08240e9add73d38c6ff3a",
+    "short": "94b1c40",
+    "title": "EnvSpec \u2014 save your entire AI team config, restore it anywhere",
+    "date": "2026-08-12",
+    "type": "feat",
+    "tags": [
+      "envspec",
+      "env",
+      "yaml",
+      "team",
+      "config",
+      "automation"
+    ],
+    "description": "GET /api/envspec/export snapshots your live environment as a single portable YAML: workers with their prompts, schedules, board cards, file seeds, and environment variables. POST /api/envspec/apply recreates the entire team on any amux instance. Clone a working agent setup to a new machine, onboard teammates with the same fleet config, or snapshot a team state before a major change. The exporter and all five appliers (env vars, workers, schedules, cards, files) shipped together across commits e1b8c2a, 59bd282, ba8a0e0, 94b1c40."
+  },
+  {
+    "hash": "d5c6eb80b2e2e516fdda0c2a8a4c59cbe2619cf1",
+    "short": "d5c6eb8",
+    "title": "Accountability sweep \u2014 sessions without active work get a nudge",
+    "date": "2026-08-12",
+    "type": "feat",
+    "tags": [
+      "accountability",
+      "nudge",
+      "automation",
+      "fleet"
+    ],
+    "description": "Every 30 minutes amux identifies sessions that have been idle but hold no board card in doing. Those lanes receive an automated nudge prompting them to pick up a queued card or report their status. Keeps the fleet accountable without manual oversight \u2014 nothing silently idles while the board accumulates stale cards."
+  },
+  {
+    "hash": "d4b0d4b7ed627c92dccf45e7e661bdeda67debed",
+    "short": "d4b0d4b",
+    "title": "Board self-drives its backlog \u2014 stalled cards surface automatically",
+    "date": "2026-08-12",
+    "type": "feat",
+    "tags": [
+      "board",
+      "automation",
+      "nudge",
+      "backlog"
+    ],
+    "description": "The board now nudges the owning session when a todo card has sat without movement past its type's SLA. Instead of a growing backlog that silently rots, cards announce themselves: the session receives a notice naming the stalled card and its waiting time. The board drives itself rather than relying on manual review."
+  },
+  {
+    "hash": "083877dce775e51fbfc5aee984d21ef95481e121",
+    "short": "083877d",
+    "title": "Groups at a glance \u2014 every team, one tap to open",
+    "date": "2026-08-08",
+    "type": "feat",
+    "tags": [
+      "groups",
+      "fleet",
+      "ui",
+      "navigation"
+    ],
+    "description": "The Groups tab now shows every named group as a collapsed card: member count, active/idle/waiting split, board doing/todo counts, and schedule counts \u2014 all visible at once. Click a group to open all its sessions in the dashboard simultaneously. Organize your agent fleet into teams (frontend, infra, gtm, customers) and switch context between them in one tap."
+  },
+  {
     "hash": "412242d474ca7d5917c3a1ca267d71ad5c198a0f",
     "short": "412242d",
     "title": "Copyable message ID on every message row",
