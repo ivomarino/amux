@@ -3416,6 +3416,60 @@ pub(crate) fn lane_has_protocol_path(state: &AppState, name: &str) -> bool {
 /// dir-walks would be two predicates that drift, and a lane visible to one loop
 /// and invisible to the other is precisely how a fleet-wide job silently stops
 /// covering part of the fleet.
+
+/// Card ids named anywhere in a commit's message, newest-first order preserved.
+///
+/// AMUX-40. `commit-report` receives only `sha` and `subject`, and ids live in
+/// the BODY far more often than the subject line — measured over the last 300
+/// commits on origin/main: subject-only 80, anywhere 293. Matching on `subject`
+/// alone would have covered 27% while looking like it covered everything, so the
+/// body is read here from the sha the caller already sent.
+fn commit_mentioned_ids(dir: &str, sha: &str) -> Vec<String> {
+    if dir.is_empty() || sha.is_empty() {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", dir, "log", "-1", "--format=%B", sha])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ids = Vec::new();
+    // Hand-rolled scan rather than a regex dep: <PREFIX>-<digits>, prefix is
+    // 2-6 ascii uppercase letters. Matches AMUX-40, AC-330, AM-5.
+    let bytes: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_uppercase() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+                i += 1;
+            }
+            let plen = i - start;
+            if (2..=6).contains(&plen) && i < bytes.len() && bytes[i] == '-' {
+                let dstart = i + 1;
+                let mut j = dstart;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > dstart {
+                    let id: String = bytes[start..j].iter().collect();
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ids
+}
+
 pub(crate) fn all_lane_names() -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(sessions_dir()) else { return vec![] };
     let mut names: Vec<String> = rd
@@ -8608,21 +8662,65 @@ async fn post_dispatch(
             }
             let session = name.to_string();
             let sha2 = sha.clone();
+            // AMUX-40. The old selection was "whatever this lane touched most
+            // recently" with NO relevance test of any kind, so a docs commit
+            // landed on an unrelated DECISION card that was merely the freshest
+            // `review` row (AM-5). Prefer what the commit SAYS about itself.
+            let mentioned = commit_mentioned_ids(parse_env(name).get("CC_DIR").unwrap_or(""), &sha);
+            // The write closure picks the card; the response must name THAT card,
+            // so it is handed back rather than re-derived by a second query.
+            let chosen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+            let chosen_w = chosen.clone();
             let reply = state
                 .store
                 .write_async(move |conn| {
-                    let row: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [&session],
-                            |r| r.get(0),
-                        )
-                        .ok();
+                    // 1. A card this commit NAMES, owned by this lane and still
+                    //    open. Ordered by the commit's own mention order.
+                    let mut row: Option<String> = None;
+                    for id in &mentioned {
+                        let hit: Option<String> = conn
+                            .query_row(
+                                "SELECT id FROM issues WHERE id=? AND session=? AND deleted IS NULL \
+                                 AND COALESCE(archived,0)=0 AND status NOT IN ('done','verified','discarded')",
+                                rusqlite::params![id, &session],
+                                |r| r.get(0),
+                            )
+                            .ok();
+                        if hit.is_some() {
+                            row = hit;
+                            break;
+                        }
+                    }
+                    // 2. No mention: fall back to a SINGLE `doing` card, and only
+                    //    if it is unambiguous. `review` is dropped deliberately —
+                    //    a card in review is awaiting someone else, so an attach
+                    //    there is phantom progress on a card this lane cannot
+                    //    advance, which is exactly what AM-5 reported. Two or more
+                    //    open cards and no mention means we do not know; attach
+                    //    NOTHING, because a wrong link in the append-only log is
+                    //    worse than an absent one.
+                    if row.is_none() {
+                        let doing: Vec<String> = conn
+                            .prepare(
+                                "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
+                                 AND COALESCE(archived,0)=0 AND status='doing' \
+                                 AND owner_type='agent' ORDER BY updated DESC LIMIT 2",
+                            )
+                            .and_then(|mut st| {
+                                let r = st.query_map([&session], |r| r.get::<_, String>(0))?;
+                                Ok(r.flatten().collect::<Vec<_>>())
+                            })
+                            .unwrap_or_default();
+                        if doing.len() == 1 {
+                            row = doing.into_iter().next();
+                        }
+                    }
                     let Some(issue_id) = row else {
                         return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
                     };
+                    if let Ok(mut g) = chosen_w.lock() {
+                        *g = Some(issue_id.clone());
+                    }
                     let log: String = conn
                         .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
                         .unwrap_or_default();
@@ -8648,16 +8746,11 @@ async fn post_dispatch(
                 Ok(_) => {
                     // Re-read the card id for the response (the write closure
                     // cannot return it through WriteReply).
-                    let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                        conn.query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [name],
-                            |r| r.get(0),
-                        )
-                        .ok()
-                    });
+                    // The card the write actually chose, reported back by the
+                    // same rule the write used. Re-deriving it from a DIFFERENT
+                    // query is how a response comes to name a card the write
+                    // never touched.
+                    let attached: Option<String> = chosen.lock().ok().and_then(|g| g.clone());
                     j200(json!({"ok": true, "attached": attached, "sha": sha}))
                 }
                 Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
@@ -10941,6 +11034,72 @@ fn getrandom_fill(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-40. The parser must read the BODY, not just the subject: measured
+    /// over 300 origin/main commits, ids appear in the subject 80 times and
+    /// anywhere 293 times. A subject-only matcher would cover 27% while looking
+    /// complete.
+    #[test]
+    fn commit_ids_are_read_from_the_whole_message() {
+        let dir = std::env::temp_dir().join(format!("amux-mentions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", d]).args(args).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f"), "x").unwrap();
+        git(&["add", "."]);
+        // id ONLY in the body — the case a subject-only matcher misses.
+        git(&["commit", "-q", "-m", "docs: tidy up", "-m", "Closes AMUX-1234 and AC-7."]);
+        let sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+
+        let ids = commit_mentioned_ids(d, &sha);
+        assert!(ids.contains(&"AMUX-1234".to_string()), "body id missed: {ids:?}");
+        assert!(ids.contains(&"AC-7".to_string()), "second body id missed: {ids:?}");
+
+        // CONTROL: a commit naming nothing yields nothing — a parser that always
+        // returns something would attach confidently to the wrong card.
+        std::fs::write(dir.join("g"), "y").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "chore: no ids here at all"]);
+        let sha2 = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        assert!(commit_mentioned_ids(d, &sha2).is_empty(), "phantom ids parsed");
+
+        // CONTROL: an unreadable dir/sha must be empty, not a panic.
+        assert!(commit_mentioned_ids("", &sha).is_empty());
+        assert!(commit_mentioned_ids(d, "deadbeef").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lowercase and bare numbers must not be mistaken for ids.
+    #[test]
+    fn commit_id_parser_does_not_overmatch() {
+        let dir = std::env::temp_dir().join(format!("amux-mentions2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", d]).args(args).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fix: utf-8 and x-1 and HTTP-2 stay out", "-m", "see amux-9 lowercase"]);
+        let sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        let ids = commit_mentioned_ids(d, &sha);
+        // HTTP-2 is a legitimate 4-letter match; x-1 (1 letter) and amux-9
+        // (lowercase) must not be. Asserting the SHAPE, not zero hits.
+        assert!(!ids.iter().any(|i| i.starts_with("X-")), "1-letter prefix matched: {ids:?}");
+        assert!(!ids.iter().any(|i| i.contains("amux")), "lowercase matched: {ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
     /// explicitly configured. The escapes must be CONFIG — a body flag any
