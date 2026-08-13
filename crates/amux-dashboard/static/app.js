@@ -7117,7 +7117,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.610';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.611';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9348,8 +9348,17 @@ async function sendPeekCmd() {
   // Queue mode: enqueue to the steering queue — no status check. The client's
   // status is a snapshot, and racing it was exactly how queued messages fell
   // through to direct sends. The server delivers at the next turn boundary; an
-  // idle session picks it up within seconds via the fast steering tick. (File
-  // attachments still send directly — steering carries text only.)
+  // idle session picks it up within seconds via the fast steering tick.
+  //
+  // ATTACHMENTS QUEUE TOO (Ethan 2026-08-13: "why are queue messages not queued
+  // here — with a file it sent in the box?"). This used to require
+  // `files.length === 0`, so ANY attached file fell through to the immediate
+  // direct send below — attaching a file silently bypassed the queue. But the
+  // uploaded files persist at their paths and the message that carries them is
+  // just `text @path1 @path2`, which is plain text — exactly what the steering
+  // queue delivers. So build the @path refs (same as the direct path does) and
+  // queue that. "steering carries text only" is true and irrelevant: @path IS
+  // text.
   //
   // EXCEPTION: when the session is at a selector (status 'waiting' = NEEDS
   // INPUT), it is explicitly parked ON your answer. The steering queue only
@@ -9357,18 +9366,25 @@ async function sendPeekCmd() {
   // sit undelivered forever (you "keep sending commands and they don't go
   // through"). Send those DIRECT so they land immediately.
   const _atSelector = (sessions.find(s => s.name === peekSession) || {}).status === 'waiting';
-  if (_sendMode === 'queue' && files.length === 0 && !_atSelector) {
-    cmdHistoryAdd(text, {type:'steering'});
+  if (_sendMode === 'queue' && !_atSelector) {
+    let queuedMsg = text;
+    if (files.length > 0) {
+      const refs = files.map(f => '@' + f.path).join(' ');
+      queuedMsg = text ? `${text} ${refs}` : refs;
+    }
+    cmdHistoryAdd(text || queuedMsg, {type:'steering'});
     inp.value = '';
     inp.style.height = 'auto';
     _draftClear(peekSession);
+    clearPeekFiles();
     const peekSendBtn = document.querySelector('.peek-cmd-bar .send-split-main, .peek-cmd-bar .btn.primary');
     if (peekSendBtn) { peekSendBtn.dataset.prevText = peekSendBtn.textContent; peekSendBtn.textContent = 'Queuing…'; peekSendBtn.disabled = true; peekSendBtn.style.opacity = '0.6'; }
-    await steerSession(peekSession, text);
+    await steerSession(peekSession, queuedMsg);
     if (peekSendBtn) { peekSendBtn.textContent = peekSendBtn.dataset.prevText || 'Queue'; peekSendBtn.disabled = false; peekSendBtn.style.opacity = ''; }
     const sess = sessions.find(s => s.name === peekSession);
     const cnt = _steerHumanCount(sess);
-    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
+    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : '')
+              + (files.length ? ' · ' + files.length + ' file' + (files.length === 1 ? '' : 's') : ''));
     return;
   }
   // 'send' mode + active session sends immediately. The old confirmation dialog
