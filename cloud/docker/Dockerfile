@@ -177,6 +177,38 @@ ENV AMUX_RS_PORT=8822
 # answer that. So the environment declares it here.
 ENV IS_SANDBOX=1
 
+# IS_SANDBOX gets the CLI *past* the root-refusal, but Claude Code v2.1.x then
+# renders a SEPARATE one-time acceptance screen for --dangerously-skip-permissions
+# on every launch ("Claude can make mistakes... only use with code you trust...
+# Press Enter to continue"), and it does NOT persist an acceptance — so a fresh
+# worker pane sits at that screen forever and the steered first-run prompt lands
+# nowhere. (Onboarding is NOT the gate — hasCompletedOnboarding is already true;
+# verified on a live container, AC-346.) `skipDangerousModePermissionPrompt` is
+# the global setting that suppresses it — same "this is an isolated single-tenant
+# container, so accept it up front" justification as IS_SANDBOX above, and like it
+# a deployment property, not a server branch. VERIFIED against the repro: with this
+# flag, `claude --dangerously-skip-permissions` boots straight to the input prompt,
+# no Press-Enter screen. Merge (don't clobber): claude writes `theme` here on first
+# run, and jq -s '.[0] * .[1]' preserves whatever else is present.
+#
+# The OTHER first-run gate — the per-DIRECTORY folder-trust dialog
+# (projects[<dir>].hasTrustDialogAccepted) — has no global flag, so it is seeded
+# at pane spawn by the server (it knows each worker's CC_DIR). This file only
+# handles the global half.
+# No process substitution here: Docker RUN is /bin/sh (dash), so merge via a
+# temp file, not `<(...)`. jq -s '.[0] * .[1]' deep-merges (the flag wins).
+RUN mkdir -p /root/.claude \
+    && printf '{"skipDangerousModePermissionPrompt": true}' > /tmp/skip.json \
+    && if [ -f /root/.claude/settings.json ]; then \
+         jq -s '.[0] * .[1]' /root/.claude/settings.json /tmp/skip.json > /root/.claude/settings.json.tmp \
+         && mv /root/.claude/settings.json.tmp /root/.claude/settings.json ; \
+       else \
+         cp /tmp/skip.json /root/.claude/settings.json ; \
+       fi \
+    && rm -f /tmp/skip.json \
+    && jq -e '.skipDangerousModePermissionPrompt == true' /root/.claude/settings.json > /dev/null \
+    && echo "claude skipDangerousModePermissionPrompt seeded (gate-1 suppressed)"
+
 # The server ALWAYS serves TLS (crates/amux-server/src/lib.rs — there is no
 # no-tls switch), so the loopback hop from the gateway is https with a
 # self-signed cert minted into /root/.amux/tls on first boot. `curl -k` here is
