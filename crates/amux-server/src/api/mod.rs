@@ -16,6 +16,7 @@ pub mod criteria;
 pub mod browser;
 pub mod calendar;
 pub mod dictation;
+pub mod tts;
 pub mod email;
 pub mod file_viewer;
 pub mod files;
@@ -244,6 +245,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(dictation::dictate)
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
+        // Text-to-speech (read-aloud): top-level EXACT paths the SPA calls
+        // (POST /api/tts, GET /api/tts/voices) — mounted flat rather than
+        // nested so `POST /api/tts` matches with no trailing-slash ambiguity.
+        // Default body limit is fine: the body is text, not audio.
+        .route("/api/tts", axum::routing::post(tts::synth))
+        .route("/api/tts/voices", axum::routing::get(tts::voices))
         .nest("/api/torrents", torrents::routes())
         .nest("/api/org", org::routes())
         // Absolute-path routes (merged, not nested): the gmail callback

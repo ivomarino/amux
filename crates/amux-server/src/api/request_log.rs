@@ -1054,6 +1054,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/dictation/config", methods: ANY },
     RouteEntry { path: "/api/dictate", methods: &["POST"] },
+    RouteEntry { path: "/api/tts", methods: &["POST"] },
+    RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
     // -- torrents / org / gmail
     RouteEntry { path: "/api/torrents", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/torrents/config", methods: &["GET", "POST"] },
