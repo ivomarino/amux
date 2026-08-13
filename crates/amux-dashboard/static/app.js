@@ -7313,7 +7313,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.623';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.624';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10400,11 +10400,20 @@ function _abPlay(url, title) {
     return;
   }
   _abCurrentFile = url;
-  _abEls.title.textContent = title || decodeURIComponent(url.split('/').pop().split('?')[0]);
+  // Data/blob URIs are self-contained (a TTS clip is a `data:audio/wav;base64,…`
+  // URI). Auth-wrapping one appends `?_token=…` to the base64 payload and
+  // corrupts it — which is why the Simple-tab read-aloud errored ("Error / 0:00")
+  // in this shared player while the inline read-aloud, which sets `audio.src`
+  // directly, plays fine (Ethan, 2026-08-13). Never auth-wrap them, and skip
+  // position memory (there is no meaningful resume point, and the URI would be a
+  // multi-KB localStorage key).
+  const ephemeral = /^(data|blob):/i.test(url);
+  _abEls.title.textContent = title
+    || (ephemeral ? 'audio' : decodeURIComponent(url.split('/').pop().split('?')[0]));
   _abEls.playBtn.innerHTML = '&#x23F3;'; // hourglass while loading
-  const saved = _abLoadPos(url);
+  const saved = ephemeral ? 0 : _abLoadPos(url);
   audio.preload = 'auto';
-  audio.src = _authUrl(url);
+  audio.src = ephemeral ? url : _authUrl(url);
   // Don't call audio.load() — setting src already triggers load
   audio.playbackRate = _abSpeeds[_abSpeedIdx];
   audio.addEventListener('canplay', function onReady() {
