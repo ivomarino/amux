@@ -5735,25 +5735,94 @@ async function _scopeLoad(scope, targetId) {
   }
 }
 
+// ── Simple tab config (font / size / standing prompt) ──────────────────────
+// Global default + per-worker override (Ethan): resolution merges DEFAULTS, then
+// the global blob, then this worker's overrides. The scope toggle decides which
+// blob a change writes to. All client-side (localStorage) — font/size are pure
+// display; the standing prompt rides to the server as ?prompt= so the summary is
+// generated with it.
+const _SIMPLE_DEFAULTS = { font: '', px: '16', prompt: '' };
+function _simpleCfg(name) {
+  const cfg = { ..._SIMPLE_DEFAULTS };
+  try { Object.assign(cfg, JSON.parse(localStorage.getItem('amux_simple_cfg') || '{}')); } catch (e) {}
+  try { Object.assign(cfg, JSON.parse(localStorage.getItem('amux_simple_cfg_' + name) || '{}')); } catch (e) {}
+  return cfg;
+}
+function _simpleCfgScope() { return localStorage.getItem('amux_simple_cfg_scope') || 'global'; }
+function _simpleCfgSet(field, value) {
+  const key = _simpleCfgScope() === 'worker' ? 'amux_simple_cfg_' + peekSession : 'amux_simple_cfg';
+  let cur = {};
+  try { cur = JSON.parse(localStorage.getItem(key) || '{}'); } catch (e) {}
+  if (value === '' || value == null) delete cur[field]; else cur[field] = value;
+  localStorage.setItem(key, JSON.stringify(cur));
+  _simpleCfgRender();
+  _simpleRender(field === 'prompt');   // a changed standing prompt needs a regenerate
+}
+function _simpleCfgRender() {
+  const el = document.getElementById('peek-simple-cfg');
+  if (!el) return;
+  const name = peekSession;
+  const cfg = _simpleCfg(name);
+  const scope = _simpleCfgScope();
+  el.innerHTML =
+    '<div style="font-size:0.72rem;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Simple view</div>'
+    + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Applies to'
+    +   '<select onchange="localStorage.setItem(\'amux_simple_cfg_scope\',this.value);_simpleCfgRender();_simpleRender()" style="width:100%;margin-top:3px;">'
+    +     '<option value="global"' + (scope === 'global' ? ' selected' : '') + '>All workers (default)</option>'
+    +     '<option value="worker"' + (scope === 'worker' ? ' selected' : '') + '>Just ' + esc(name || 'this worker') + '</option>'
+    +   '</select></label>'
+    + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Font size: ' + esc(cfg.px) + 'px'
+    +   '<input type="range" min="12" max="28" value="' + esc(cfg.px) + '" oninput="_simpleCfgSet(\'px\',this.value)" style="width:100%;"></label>'
+    + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Font'
+    +   '<select onchange="_simpleCfgSet(\'font\',this.value)" style="width:100%;margin-top:3px;">'
+    +     '<option value=""' + (!cfg.font ? ' selected' : '') + '>Default</option>'
+    +     '<option value="system-ui"' + (cfg.font === 'system-ui' ? ' selected' : '') + '>System</option>'
+    +     '<option value="Georgia,serif"' + (cfg.font === 'Georgia,serif' ? ' selected' : '') + '>Serif</option>'
+    +     '<option value="ui-monospace,monospace"' + (cfg.font === 'ui-monospace,monospace' ? ' selected' : '') + '>Mono</option>'
+    +   '</select></label>'
+    + '<label style="display:block;font-size:0.78rem;">Standing prompt'
+    +   '<textarea rows="3" placeholder="Leave blank for the default plain-English prompt" onchange="_simpleCfgSet(\'prompt\',this.value)" style="width:100%;margin-top:3px;font-size:0.75rem;">' + esc(cfg.prompt || '') + '</textarea></label>';
+}
+function _simpleCfgToggle(e) {
+  if (e) e.stopPropagation();
+  const el = document.getElementById('peek-simple-cfg');
+  if (!el) return;
+  if (el.style.display === 'none') {
+    _simpleCfgRender();
+    el.style.display = '';
+    setTimeout(() => document.addEventListener('click', _simpleCfgOutside, true), 0);
+  } else {
+    el.style.display = 'none';
+    document.removeEventListener('click', _simpleCfgOutside, true);
+  }
+}
+function _simpleCfgOutside(e) {
+  const el = document.getElementById('peek-simple-cfg');
+  if (el && !el.contains(e.target) && e.target.id !== 'peek-simple-cfg-btn') {
+    el.style.display = 'none';
+    document.removeEventListener('click', _simpleCfgOutside, true);
+  }
+}
+
 // Peek "Simple" tab (AMUX-3056): a plain-English summary of what this worker
 // just did. The server generates it from the last assistant message via the
 // fast/cheap helper and caches per transcript, so this is usually instant; a
-// fresh turn regenerates on the next fetch. Font/size are client-side config
-// (localStorage; a global default, per-worker override + standing prompt land
-// in the config slice). When the worker is mid-turn the live detail is in the
-// Terminal tab — this view refreshes when it goes idle.
+// fresh turn regenerates on the next fetch. When the worker is mid-turn the live
+// detail is in the Terminal tab — this view refreshes when it goes idle.
 async function _simpleRender(refresh) {
   const name = peekSession;
   const body = document.getElementById('peek-simple-body');
   if (!name || !body) return;
-  const fontPx = localStorage.getItem('amux_simple_font_px') || '16';
-  const fontFam = localStorage.getItem('amux_simple_font') || '';
-  body.style.fontSize = fontPx + 'px';
-  body.style.fontFamily = fontFam || '';
+  const cfg = _simpleCfg(name);
+  body.style.fontSize = (cfg.px || '16') + 'px';
+  body.style.fontFamily = cfg.font || '';
   body.innerHTML = '<div style="color:var(--dim);display:flex;align-items:center;gap:8px;">'
     + '<span class="simple-spin"></span>Putting it in plain English…</div>';
   try {
-    const url = API + '/api/sessions/' + encodeURIComponent(name) + '/simple' + (refresh === true ? '?refresh=1' : '');
+    const params = [];
+    if (refresh === true) params.push('refresh=1');
+    if (cfg.prompt) params.push('prompt=' + encodeURIComponent(cfg.prompt));
+    const url = API + '/api/sessions/' + encodeURIComponent(name) + '/simple' + (params.length ? '?' + params.join('&') : '');
     const r = await fetch(url, { headers: _authHeaders({}) });
     const d = await r.json().catch(() => ({}));
     if (peekSession !== name || _peekTab !== 'simple') return;   // navigated away mid-fetch
@@ -7192,7 +7261,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.619';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.620';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
