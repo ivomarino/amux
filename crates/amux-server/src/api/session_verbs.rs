@@ -7743,6 +7743,20 @@ async fn get_dispatch(
         // a scrape of rendered output, and it improves as Claude Code does
         // rather than breaking on the next glyph change.
         "subagents" => j200(session_subagents(name)),
+        // Peek "Simple" tab (AMUX-3056): a plain-English summary of what this
+        // worker just did, from its last assistant message via the shared
+        // fastest/cheapest helper, cached per transcript+prompt. `?prompt=` is
+        // the client-resolved standing prompt; `?refresh=1` forces regenerate.
+        "simple" => {
+            let prompt = qs_first(qs, "prompt", "");
+            let refresh = qs_flag(qs, "refresh");
+            crate::api::simple::simple_response(
+                name,
+                if prompt.is_empty() { None } else { Some(prompt) },
+                refresh,
+            )
+            .await
+        }
         "peek" => {
             let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
             let live_only = qs_flag(qs, "live");

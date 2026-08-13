@@ -127,6 +127,60 @@ async fn try_local_model(prompt: &str) -> Option<(String, String)> {
     Some((model, answer))
 }
 
+/// Fastest, cheapest one-shot answer for a fully-formed prompt: a resident LOCAL
+/// model when no `AMUX_HELPER_MODEL` is pinned, else the helper CLI (D3 — the one
+/// knob still wins). This is the ONE place the "fastest cheapest model" seam
+/// lives, shared by `/api/lookup` (explain-selection) and
+/// `/api/sessions/<n>/simple` (the plain-English worker summary) so it cannot
+/// drift into two spellings that must be kept in step forever (D6). Returns
+/// `(via, text)` — `via` is `ollama:<model>` or the CLI name — or an HTTP
+/// status + message. The caller supplies the WHOLE prompt (this does not wrap
+/// it), so each caller keeps its own instruction.
+pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (StatusCode, String)> {
+    if std::env::var("AMUX_HELPER_MODEL").map(|m| m.trim().is_empty()).unwrap_or(true) {
+        if let Some((model, answer)) = try_local_model(prompt).await {
+            return Ok((format!("ollama:{model}"), answer));
+        }
+    }
+    let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
+    let mut cmd = tokio::process::Command::new(&cli);
+    cmd.arg("--print").arg(prompt);
+    if let Ok(m) = std::env::var("AMUX_HELPER_MODEL") {
+        if !m.trim().is_empty() {
+            cmd.arg("--model").arg(m.trim());
+        }
+    }
+    cmd.stdin(std::process::Stdio::null());
+    match tokio::time::timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S), cmd.output()).await {
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("{cli} did not answer within {LOOKUP_TIMEOUT_S}s"),
+        )),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not run {cli}: {e}"),
+        )),
+        Ok(Ok(out)) => {
+            // Non-empty stdout wins even on a non-zero exit (the CLI prints its
+            // answer then sometimes exits non-zero); only an EMPTY answer is a
+            // failure — the whole lookup incident was a zero-byte body.
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if stdout.is_empty() {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    if err.is_empty() {
+                        format!("{cli} exited without output")
+                    } else {
+                        err.chars().take(400).collect()
+                    },
+                ));
+            }
+            Ok((cli, stdout))
+        }
+    }
+}
+
 pub async fn lookup(
     State(_state): State<AppState>,
     Json(body): Json<Value>,
@@ -149,90 +203,14 @@ pub async fn lookup(
         );
     }
 
-    // FASTEST, CHEAPEST, ON THIS MACHINE (Ethan, 2026-08-10) — try a LOCAL
-    // model first.
-    //
-    // MEASURED on this machine, same trivial prompt, rather than assumed:
-    //     claude -p, default model      7.4s / 9.5s / 20.3s   (spawn + network)
-    //     claude -p --model haiku       8.1s / 15.1s / 24.5s
-    //     claude -p --model fable       20.2s
-    //     ollama, model cold            19.1s   (weights loading from disk)
-    //     ollama, model resident        2.8s / 3.0s / 3.4s
-    //
-    // The spread WITHIN one claude model (7.4s to 24.5s) is larger than the
-    // spread between models, so the CLI's cost is process boot and network, not
-    // inference — switching `--model` alone would not have fixed the "Looking
-    // up..." hang, and would have looked like a fix. A resident local model
-    // answers in ~3s and costs nothing per call.
-    //
-    // `keep_alive` is what makes that true: without it the model is evicted and
-    // every lookup pays the 19s cold load, which is worse than the CLI.
-    //
-    // Ordering, and it is deliberate: an explicit `AMUX_HELPER_MODEL` still wins
-    // over everything (D3 — the one knob stays authoritative, so this is a
-    // better DEFAULT, not a new pin). A machine with no ollama, or an ollama
-    // with no models pulled, falls through to the CLI exactly as before.
-    if std::env::var("AMUX_HELPER_MODEL").map(|m| m.trim().is_empty()).unwrap_or(true) {
-        if let Some((model, answer)) = try_local_model(&prompt_for(&text)).await {
-            return (
-                StatusCode::OK,
-                Json(json!({"text": answer, "model": model, "via": "ollama"})),
-            );
-        }
-    }
-
-    let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
-    let mut cmd = tokio::process::Command::new(&cli);
-    cmd.arg("--print").arg(prompt_for(&text));
-    // Unset means "the CLI's own default", which is what lets this improve
-    // without a code change.
-    if let Ok(m) = std::env::var("AMUX_HELPER_MODEL") {
-        if !m.trim().is_empty() {
-            cmd.arg("--model").arg(m.trim());
-        }
-    }
-    cmd.stdin(std::process::Stdio::null());
-
-    let run = tokio::time::timeout(
-        std::time::Duration::from_secs(LOOKUP_TIMEOUT_S),
-        cmd.output(),
-    )
-    .await;
-
-    match run {
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(json!({"error": format!("{cli} did not answer within {LOOKUP_TIMEOUT_S}s")})),
-        ),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            // Name the binary. "No such file or directory" alone sent the
-            // reader looking at the server instead of at a missing CLI.
-            Json(json!({"error": format!("could not run {cli}: {e}")})),
-        ),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !out.status.success() && stdout.is_empty() {
-                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": if err.is_empty() {
-                            format!("{cli} exited without output")
-                        } else {
-                            err.chars().take(400).collect::<String>()
-                        }
-                    })),
-                );
-            }
-            if stdout.is_empty() {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{cli} returned an empty answer")})),
-                );
-            }
-            (StatusCode::OK, Json(json!({"text": stdout, "provider": cli})))
-        }
+    // Fastest, cheapest, on this machine — a resident LOCAL model first, else
+    // the CLI. That whole decision (and the measured 3s-ollama vs 7-24s-CLI
+    // rationale, and the `AMUX_HELPER_MODEL` D3 override) now lives in ONE place,
+    // `helper_answer`, shared with the Simple worker-summary endpoint (D6). The
+    // client reads only `text`.
+    match helper_answer(&prompt_for(&text)).await {
+        Ok((via, answer)) => (StatusCode::OK, Json(json!({"text": answer, "via": via}))),
+        Err((code, msg)) => (code, Json(json!({"error": msg}))),
     }
 }
 

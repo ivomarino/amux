@@ -58,6 +58,7 @@ pub mod self_update;
 pub mod session_verbs;
 pub mod board_themes;
 pub mod lookup;
+pub mod simple;
 pub mod config_iac;
 pub mod skin;
 pub mod commit_mentions;
