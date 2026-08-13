@@ -2839,35 +2839,6 @@ FIX: 4340f5a — a scoped query (?session= or ?status=) is no longer capped by
   header. Ethos rule 4's second layer, in an endpoint the whole fleet depends on.
   Before deciding a signal exists, check it exists WHERE THE CONSUMER LOOKS.
 
-## A census row said "not routed"; the endpoint was mounted, answering 500s, and I nearly ported it twice
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2871
-SYMPTOM: The route census reported GET /api/log-search as "no route matches this
-  path". It was mounted in api/mod.rs and answering — with a 500 on every real
-  query, because it byte-sliced scrollback at [..500] and terminal output is
-  mostly box-drawing characters ("byte index 500 is not a char boundary; it is
-  inside '─'"). The census reads ROUTE_TABLE, and the route had no row there.
-COST: I wrote an entire replacement module before a duplicate-module compile
-  error stopped me — and in doing so `cat >` OVERWROTE the existing tracked
-  108-line file, which I then `rm -f`'d while cleaning up. Recovered with git
-  checkout; nothing lost. Two live bugs (the 500, and a search feature dead
-  since the cutover) stayed hidden behind one wrong census row.
-FIX: 2e3f706 — chars().take(500) instead of byte slicing; ROUTE_TABLE row added;
-  and a second test closes the direction that hid it. The table's comment
-  claimed it was "kept honest BOTH directions" while the test iterates
-  `for entry in ROUTE_TABLE` — it catches a table row with no route and is
-  structurally blind to a route with no table row. Comment corrected to what is
-  actually checked.
-  Two things worth carrying: (1) a hand-maintained mirror needs a test in BOTH
-  directions or it silently drifts in the unchecked one, and the claim in the
-  comment is not evidence; (2) `cat > file` has no exists-check, where the Write
-  tool refuses to overwrite a file it has not read — routing around the harness
-  removed the guard that would have caught this.
-
 ## A peer's commit swept my STAGED work into their commit, under their message
 AREA: attribution
 SEVERITY: slows
@@ -2911,39 +2882,6 @@ CARD: AMUX-2904
 SYMPTOM: Token ledger charged the `amux` lane's spend to `amux-rust`; /subagents listed its agents under `amux-rust`; the day-old subagent-activity scan could not credit `amux` with live agents at all. Four separate spellings of "whose conversation is this", three reading the transcript's FIRST line, which keeps the birth name forever (AMUX-2612 documented this and the fix only reached one of the four readers).
 COST: Ethan saw a worker identifying as a session that does not exist; ledger rows misattributed for a month; the fresh agents-status fix (554fa02) silently missed every renamed lane on the day it shipped.
 FIX: dc65d4a — one conversation_owner() (meta claim first, LAST title record second) used by ledger, /subagents and the activity scan. Residual: ledger rows indexed before today still carry the dead name; the pane separator shows the birth name until the lane restarts (the --name-on-resume writer already exists).
-
-## `cargo clippy -D warnings` passed on 437 lines of dead code, including a self-proxy loop
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2910
-SYMPTOM: py_proxy.rs carried an entire python forwarder (forward_built /
-  forward_to_python / forward_handler / passthrough_routes) with ZERO call sites
-  anywhere outside its own file. `cargo clippy --workspace --all-targets -- -D
-  warnings` — the standing pre-push gate, which CI also enforces — passed on it
-  every single run. dead_code never fires because `pub` items in a lib crate are
-  reachable by definition, and amux-server is almost entirely `pub`.
-  The code was not merely dead. `py_base()` defaulted to localhost on the RETIRED
-  legacy port, which since the cutover is THIS SAME PROCESS on its compatibility
-  bind (identical pid and build answering both ports). Adding a `Namespace` row —
-  which the module documented as "the ONLY sanctioned way to cut a family over" —
-  would have forwarded a request to ourselves, re-entered the same passthrough and
-  looped, each hop holding a 600s reqwest timeout and an unbounded buffered body
-  in RAM.
-COST: no incident, because nobody added a row — but that is luck, not a control.
-  The real cost is the class: every dead `pub` API in this crate is invisible to
-  the gate that is supposed to catch exactly this, so "clippy is clean" carries
-  confidence it has not earned. Finding it took a hand-rolled call-site census,
-  and my first census was capped by `head -20` and MISSED a consumer (browser.rs)
-  that clippy then caught at compile time — i.e. the ad-hoc probe was worse than
-  the compiler at the one job I was using it for.
-FIX: forwarder deleted in 5d850fc (registry, answered_by read path and the
-  still-failable !proxied guards kept). The INSTRUMENT gap is AMUX-2910: amux
-  needs a check that can fail here — cargo-udeps, or a test that censuses `pub fn`
-  definitions against call sites, which is the same shape ethos rule 7 already
-  prescribes for the client JS (enumerate defined vs called, then inspect callers).
 
 ## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
 AREA: cli
