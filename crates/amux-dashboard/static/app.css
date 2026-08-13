@@ -522,6 +522,28 @@
   .tts-btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
   .tts-audio-wrap { display: flex; align-items: center; gap: 10px; }
   .tts-audio-wrap audio { flex: 1; height: 36px; }
+  /* Floating "generating audio" indicator — feedback for read-aloud triggers
+     that have no button to spin (ellipsis actions). */
+  .tts-loading { position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(20px + env(safe-area-inset-bottom)); z-index: 10001;
+    background: var(--accent); color: #fff; padding: 8px 16px; border-radius: 20px;
+    font-size: 0.82rem; font-weight: 600; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    display: flex; align-items: center; gap: 8px; }
+  .tts-loading-spin { display: inline-block; animation: tts-spin 0.9s linear infinite; }
+  @keyframes tts-spin { to { transform: rotate(360deg); } }
+  /* Past read-alouds list (replay tab). */
+  .ra-list { display: flex; flex-direction: column; }
+  .ra-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); }
+  .ra-play, .ra-del { flex: 0 0 auto; min-width: 44px; min-height: 44px; display: flex;
+    align-items: center; justify-content: center; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--card); color: var(--text); cursor: pointer; font-size: 0.9rem; }
+  .ra-play { color: var(--accent); }
+  .ra-play:active { background: var(--accent); color: #fff; }
+  .ra-del { color: var(--dim); }
+  .ra-body { flex: 1; min-width: 0; }
+  .ra-meta { font-size: 0.72rem; color: var(--dim); margin-bottom: 3px; }
+  .ra-text { font-size: 0.85rem; color: var(--text); line-height: 1.4; word-break: break-word; }
   .send-row { display: flex; gap: 8px; min-width: 0; overflow: visible; position: relative; }
   .send-input {
     flex: 1; min-width: 0; font-size: 1rem; padding: 10px 14px; border-radius: 8px;

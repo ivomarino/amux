@@ -1934,6 +1934,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
+    <button class="peek-tab" id="peek-tab-readalouds" onclick="setPeekTab('readalouds')" title="Past read-alouds — replay any; auto-clears after 30 days"><span class="tab-ico">&#x1F50A;</span><span class="tab-lbl">Read alouds</span><span class="peek-tab-count" id="peek-tab-readalouds-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
     <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this worker, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
@@ -2021,6 +2022,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();_openSavedMessages()">&#128190; Saved messages</button>
             <button type="button" onclick="_peekMoreClose();_dictOpenPopup()">&#127908; Dictate</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
+            <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
+            <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
           </div>
           <!-- Compact recording popup: live volume bars + timer, right above the
                composer. Stop → transcribe → text lands in the input. -->
@@ -2183,6 +2186,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="dict-outbox-strip"></div>
       <div id="dict-body" class="dict-body"></div>
+  </div>
+  <!-- Past read-alouds: replay any clip; auto-flushes after 30 days (Ethan 2026-08-13). -->
+  <div id="peek-readalouds-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div id="peek-readalouds-list" class="ra-list"></div>
   </div>
   <div id="peek-cost-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">

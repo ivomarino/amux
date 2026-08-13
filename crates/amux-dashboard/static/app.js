@@ -5744,6 +5744,12 @@ function setPeekTab(tab) {
   const memPanel = document.getElementById('peek-memory-panel');
   if (tab === 'memory') { memPanel.classList.add('active'); loadPeekMemory(); }
   else { memPanel.classList.remove('active'); }
+  document.getElementById('peek-tab-readalouds')?.classList.toggle('active', tab === 'readalouds');
+  const raPanel = document.getElementById('peek-readalouds-panel');
+  if (raPanel) {
+    if (tab === 'readalouds') { raPanel.classList.add('active'); _raRender(); }
+    else { raPanel.classList.remove('active'); }
+  }
   document.getElementById('peek-terminal-panel').style.display = tab === 'terminal' ? '' : 'none';
   document.getElementById('peek-split-wrap').style.display = tab === 'terminal' ? '' : 'none';
   const transcript = document.getElementById('peek-transcript-panel');
@@ -7118,7 +7124,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.614';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.615';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10327,13 +10333,34 @@ let _ttsSpeakAudio = null;   // currently-playing one-click clip, so a second pr
 // One-click "read aloud" for a single message — no dialog, just plays. Hits
 // the same /api/tts route as the Text-to-Speech dialog below, so it gets
 // Piper (free, local) when installed and ElevenLabs otherwise.
+// A floating "generating audio…" indicator, so EVERY read-aloud trigger has a
+// loading signal — not just the ones with a button to spin (Ethan 2026-08-13).
+// The button (if any) also spins; this covers the ellipsis-menu actions that
+// pass no button.
+function _ttsLoading(on) {
+  let el = document.getElementById('tts-loading');
+  if (on) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'tts-loading';
+      el.className = 'tts-loading';
+      el.innerHTML = '<span class="tts-loading-spin">◌</span> Generating audio…';
+      document.body.appendChild(el);
+    }
+    el.style.display = 'flex';
+  } else if (el) {
+    el.style.display = 'none';
+  }
+}
+
 async function _ttsSpeak(text, btn) {
   if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
   if (!text) return;
-  // btn is optional — the worker-ellipsis "read latest message" action has no
-  // button to spin, so every btn access is guarded.
+  // btn is optional — the ellipsis "read latest" actions have no button to spin,
+  // so every btn access is guarded and the floating _ttsLoading covers them.
   const orig = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
+  _ttsLoading(true);
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
@@ -10346,11 +10373,106 @@ async function _ttsSpeak(text, btn) {
     _ttsSpeakAudio = audio;
     audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
     await audio.play();
+    _ttsLoading(false);   // audio is playing — done generating
+    // Record for replay (Ethan: a tab of past read-alouds). Fire-and-forget so a
+    // storage hiccup never blocks playback.
+    _raRecord(text, d.url, (typeof peekSession !== 'undefined' && peekSession) || '');
   } catch(e) {
     showToast('Read aloud failed: ' + e.message, 'error');
   } finally {
+    _ttsLoading(false);
     if (btn) { btn.disabled = false; btn.innerHTML = orig; }
   }
+}
+
+// ── Past read-alouds (replay history, 30-day flush) ──────────────────────────
+// Lightweight INDEX in one IDB key (id/text/ts/session — no audio), each clip's
+// audio in its own `ra_<id>` entry loaded on demand for replay. Same split the
+// peek/file caches use, so the list render never pulls megabytes of audio.
+let _raIndex = null;
+const _RA_CAP = 60;                 // keep the most recent N
+const _RA_TTL_MS = 30 * 24 * 3600 * 1000;   // 30-day flush (Ethan)
+
+async function _raLoadIndex() {
+  if (_raIndex) return _raIndex;
+  try { _raIndex = (await _idb.get('read_alouds_index')) || []; } catch(e) { _raIndex = []; }
+  return _raIndex;
+}
+async function _raRecord(text, url, session) {
+  try {
+    await _raLoadIndex();
+    const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    const ts = Date.now();
+    await _idb.set('ra_' + id, { url, text, ts, session });
+    _raIndex.unshift({ id, text: (text || '').slice(0, 240), ts, session });
+    // Trim to cap + drop anything past the 30-day flush, deleting their audio.
+    const cutoff = ts - _RA_TTL_MS;
+    const keep = _raIndex.filter(e => e.ts >= cutoff).slice(0, _RA_CAP);
+    for (const e of _raIndex) { if (!keep.includes(e)) { try { await _idb.del('ra_' + e.id); } catch(_) {} } }
+    _raIndex = keep;
+    await _idb.set('read_alouds_index', _raIndex);
+    if (typeof _peekTab !== 'undefined' && _peekTab === 'readalouds') _raRender();
+    _raUpdateBadge();
+  } catch(e) { /* storage best-effort; never break playback */ }
+}
+async function _raPrune() {   // called at startup, alongside the file pruner
+  try {
+    await _raLoadIndex();
+    const cutoff = Date.now() - _RA_TTL_MS;
+    const stale = _raIndex.filter(e => e.ts < cutoff);
+    if (!stale.length) return;
+    for (const e of stale) { try { await _idb.del('ra_' + e.id); } catch(_) {} }
+    _raIndex = _raIndex.filter(e => e.ts >= cutoff);
+    await _idb.set('read_alouds_index', _raIndex);
+  } catch(e) {}
+}
+function _raUpdateBadge() {
+  const b = document.getElementById('peek-tab-readalouds-count');
+  if (b) { const n = (_raIndex || []).length; b.textContent = n ? String(n) : ''; }
+}
+async function _raReplay(id) {
+  try {
+    const e = await _idb.get('ra_' + id);
+    if (!e || !e.url) { showToast('Clip not found (may have been flushed)'); return; }
+    if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
+    const audio = new Audio(e.url);
+    _ttsSpeakAudio = audio;
+    audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
+    await audio.play();
+  } catch(err) { showToast('Replay failed: ' + err.message, 'error'); }
+}
+async function _raDelete(id) {
+  try {
+    await _raLoadIndex();
+    await _idb.del('ra_' + id);
+    _raIndex = _raIndex.filter(e => e.id !== id);
+    await _idb.set('read_alouds_index', _raIndex);
+    _raRender(); _raUpdateBadge();
+  } catch(e) {}
+}
+async function _raRender() {
+  const el = document.getElementById('peek-readalouds-list');
+  if (!el) return;
+  await _raLoadIndex();
+  if (!_raIndex.length) {
+    el.innerHTML = '<div style="padding:24px 16px;text-align:center;color:var(--dim);font-size:0.85rem;">No read-alouds yet.<br><span style="font-size:0.78rem;">Tap 🔊 on a message, a selection, or a worker to read it aloud — clips land here to replay. They auto-clear after 30 days.</span></div>';
+    return;
+  }
+  el.innerHTML = _raIndex.map(e => {
+    const dtms = Date.now() - e.ts;
+    const when = dtms < 60000 ? 'just now'
+      : dtms < 3600000 ? Math.floor(dtms / 60000) + 'm ago'
+      : dtms < 86400000 ? Math.floor(dtms / 3600000) + 'h ago'
+      : new Date(e.ts).toLocaleDateString();
+    const sess = e.session ? '<span style="color:var(--accent);">' + esc(e.session) + '</span> · ' : '';
+    const snippet = esc((e.text || '').replace(/\s+/g, ' ').slice(0, 180));
+    return '<div class="ra-item">'
+      + '<button class="ra-play" title="Replay" onclick="_raReplay(\'' + escJs(e.id) + '\')">&#x25B6;</button>'
+      + '<div class="ra-body"><div class="ra-meta">' + sess + esc(when) + '</div>'
+      + '<div class="ra-text">' + snippet + (e.text && e.text.length > 180 ? '…' : '') + '</div></div>'
+      + '<button class="ra-del" title="Delete" onclick="_raDelete(\'' + escJs(e.id) + '\')">&#x2715;</button>'
+      + '</div>';
+  }).join('');
 }
 
 // Worker-ellipsis "read latest message" (Ethan: click the ellipsis on a worker
@@ -23398,6 +23520,8 @@ _offlineCapLoad().catch(() => {});
 _idb.pruneFiles(_FILE_CACHE_TTL_MS).then(n => {
   if (n) console.log('[files] evicted ' + n + ' offline file(s) not opened in 30 days');
 });
+// Read-alouds flush at 30 days (Ethan) + prime the index/badge.
+_raPrune().then(() => { _raLoadIndex().then(_raUpdateBadge); });
 
 // IDB fallback: restore statuses from IndexedDB (preserves column order across reloads)
 _idb.getAll('statuses').then(items => {
