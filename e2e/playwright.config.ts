@@ -4,7 +4,7 @@
 // from a deterministic state — the Python gate-contract suite was green for
 // weeks on ambient machine state and red the moment CI ran it clean; this
 // harness builds its own world instead.
-import { defineConfig } from '@playwright/test';
+import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -26,6 +26,12 @@ export default defineConfig({
     // Mobile is a first-class target (amux is mobile-first): 375px must
     // render without overflow.
     { name: 'mobile', use: { viewport: { width: 375, height: 667 } } },
+    // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
+    // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
+    // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
+    // on a phone. WebKit differs on exactly what this UI depends on: position:fixed
+    // inside a transformed ancestor, env(safe-area-inset-*), and dvh/vh behaviour.
+    { name: 'ios-safari', use: { ...devices['iPhone 15'] } },
   ],
   webServer: {
     // Builds from COMMITTED HEAD, not this shared working tree — a peer
