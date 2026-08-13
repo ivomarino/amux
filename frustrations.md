@@ -2984,3 +2984,16 @@ CARD: AMUX-3022
 SYMPTOM: Ethan: "it still appears the status of workers is inaccurate or delayed." Measured: 0 of 48 running lanes had a fresh self_report (youngest 2h, most 40h+). Root: publish_endpoint passes legacy=None, so endpoint.json.legacy_port went null when the 8822 bind was dropped. The Stop/PostToolUse/UserPromptSubmit report hooks baked into ~48 pre-cutover sessions self-heal a stale AMUX_URL by matching that field (`case "$U" in *localhost:$L)`); with L empty they matched nothing and POSTed every state report to the dead 8822 — `>/dev/null 2>&1; exit 0`, silent. Status fell back fleet-wide to terminal scraping (D1). The git staged-guard resolver was migrated to retired_ports when the bind dropped; the report hooks were not, and cannot be (baked into live procs).
 COST: worker status was wrong for the whole fleet for ~40h and no endpoint could say so — GET /api/logs/analyze, /api/debug/*, /health confidence all read fine while the report control plane was down for everyone. Ethan noticed the symptom by eye. This is the exact failure the two-fixes rule forbids: a silent, invisible, fleet-wide outage of the one signal that is supposed to REPLACE terminal scraping.
 FIX: fixed. 38bd18d — publish_endpoint fills legacy_port from RETIRED_PORTS.first() so baked-in hooks self-heal (verified: a stale-8822 hook now resolves to 8824; organic reports landing from amux + refresh-house). And the second fix that makes the CLASS visible: new invariant session.self_reports_landing (checks.rs) fails when the freshest self-report across >=10 running lanes is >1h, or when zero lanes report — so the next reporting outage self-announces in GET /api/health/invariants. Namespace bug in the check itself (looked up amux-<n> in a blob keyed <n>) caught on deploy by reading live output, fixed ae70edf.
+
+---
+
+## Worker header showed IDLE while a subagent was visibly "still thinking with xhigh effort"
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-13
+SESSION: amux
+CARD: AMUX-3030
+SYMPTOM: Ethan screenshot: primis header read IDLE while its pane showed "✻ Crunching… (34s · still thinking with xhigh effort)", "esc to interrupt", "← 2 agents". The self_report was a fresh main-turn stop-hook idle. subagents_working() gated on the 60s contradiction_window, which is the MAIN pane's paint cadence (~6/s). A subagent's transcript is touched only when it emits a message/tool result, so a THINKING subagent (xhigh effort, minutes between writes) has a >60s-old newest mtime while fully working -> subagents_working=false -> the fresh main-turn idle wins -> IDLE.
+COST: a worker that is actively crunching reads IDLE on the header — the exact false-idle that makes an owner think a lane is free when it is mid-work, and the class D1 exists to kill. Ethan had to notice it by eye from the pane.
+FIX: fixed e832f12. Subagents get their own window AMUX_SUBAGENT_WORKING_S (default 240s) sized to the subagent write cadence, not the pane's. Regression test pins a 90s-old subagent write (stale under 60s, working under 240s). Residual limitation: a subagent that thinks for >240s with zero writes is indistinguishable from a finished one on transcript mtime alone — the honest edge of an mtime-based signal; the pane-visible half is caught by status.agrees_with_pane.
