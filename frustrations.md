@@ -3060,3 +3060,60 @@ CARD: AF-46
 SYMPTOM: rust-nightly-deep.yml runs `npx playwright test --project=*${{ matrix.browser }}* || npx playwright test <everything>`. The project names are desktop/mobile/ios-safari, so neither glob matches: `Error: No projects matched. Available projects: "desktop", "mobile", "ios-safari"`. Every leg therefore errored on the filter and fell through the `||` to running ALL projects on whichever single browser it had installed. The chromium leg was green while testing chromium twice; the webkit leg was red for its own unrelated reason. The job name asserted webkit coverage that had never once run.
 COST: No webkit coverage at all for however long the ios-safari-less config stood, while a green nightly said otherwise. Directly: it nearly cost a third red main — adding a real webkit project turned the latent misconfiguration into an immediate failure in two OTHER workflows, discovered only because a peer reviewed the commit before pushing rather than because any check spoke up.
 FIX: ebe18ce — explicit browser->projects matrix mapping, and the `||` fallback DELETED. The fallback is the actual defect: it converts "my selector matched nothing" into a green run of the wrong thing, which is the failure mode a test matrix exists to prevent. Any `<selector> || <run everything>` in CI is this bug waiting; the selector must be allowed to fail loudly.
+
+---
+
+DATE: 2026-08-13
+AREA: instruments
+STATUS: fixed
+SESSION: amux-frustrations
+CARD: AF-46
+SYMPTOM: The e2e harness booted ONE server on ONE AMUX_HOME and pointed every playwright
+  project at it. Projects multiply spec files, so settings.spec.ts — which POSTs global
+  server state (/api/prefs, /api/settings/*) and then asserts the UI reflects the value it
+  just wrote — ran three times CONCURRENTLY against one pref store. The three copies
+  overwrote each other and whichever lost reported a product bug. The failure SET changed
+  between runs (7 tests, then 3, then a different 3), which is the shape that gets called
+  flakiness.
+COST: A real iOS target was pinned to four spec files by a `testMatch` for ~1 day, on the
+  documented belief that WebKit was at fault — the config said so in a comment, in detail,
+  and was wrong. The suite was green the whole time while covering 4 files instead of 15 on
+  the one target that motivated the project. The near-miss is the expensive part: the
+  obvious next move was to "fix" the racing assertions or add retries, which would have
+  bought green by deleting the signal and left the isolation gap for the next person to
+  rediscover the moment they added a fourth project.
+FIX: b31bcac — one server and one AMUX_HOME per project. Control, same command:
+  settings.spec.ts 3 failed/51 passed -> 0 failed/54 passed; full suite 210 passed, 0 failed
+  with ios-safari unscoped. The `testMatch` is deleted.
+  The signal that was missing, and the reason this sat: nothing distinguished "ios-safari
+  passed 4 files" from "ios-safari passed" in any output anyone reads. A green check that
+  covers less than its name promises is invisible by construction — there is no red to
+  investigate. The config now prints each target's coverage every run and names any scoping,
+  verified against a deliberately scoped target so the notice can actually report the bad
+  state. Any future narrowing announces itself.
+
+---
+
+DATE: 2026-08-13
+AREA: instruments
+STATUS: open
+SESSION: amux-frustrations
+CARD: AF-47
+SYMPTOM: Isolation gave each project a CLEAN browser profile, which surfaced two failures the
+  shared one had masked — and both lied about where the fault was. (1) system-jobs.spec.ts
+  stubs /api/system-jobs with page.route; a registered service worker defeats that, because
+  the request passes through the worker's fetch handler where page.route cannot see it. It
+  did not error — it rendered the REAL job list and diffed it against the stub, so it read as
+  "the stalled-row styling is broken under WebKit". (2) sw.js reloads the page on
+  `controllerchange` as soon as a fresh worker claims the client, landing mid-page.evaluate:
+  "Execution context was destroyed" on two specs about CSS geometry.
+COST: Both point at the wrong subsystem by construction. (1) is the dangerous one: a stub
+  that silently does not apply produces a confident, specific, wrong failure about rendering,
+  and the natural response is to go read the CSS. Roughly an hour across the two before the
+  common cause was visible.
+FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the worker, in
+  b31bcac. STILL OPEN as a class: nothing warns that a page.route stub never matched a
+  request. A stub that matches zero requests is almost always a bug and is currently
+  indistinguishable from one that matched — same green-looking machinery, no output either
+  way. The generalisable guard is an assertion that each route was actually hit; amux has no
+  such helper today and every future page.route stub inherits the same silence.
