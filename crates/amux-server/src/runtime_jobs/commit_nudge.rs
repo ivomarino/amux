@@ -122,7 +122,11 @@ pub fn build(
             "You went idle with {n} uncommitted change(s) under {dir} whose OWNERSHIP IS \
              UNKNOWN — no session has an edit record for {}:\n{list}\n\
              Do NOT assume {} yours. `git add -A` here would commit whatever a peer is \
-             mid-edit on. Check `git diff` and stage only what you recognise as your work.",
+             mid-edit on — OR a STALE copy origin/main has moved past, which committing would \
+             silently REVERT (no conflict; the older file just wins, AMUX-3000). For each, \
+             `git diff origin/main -- <path>`: worktree MISSING content origin has = stale, \
+             `git checkout origin/main -- <path>` to restore, do not commit. Stage only what \
+             you both recognise as your work AND can see is genuinely newer than origin.",
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
         );
@@ -144,9 +148,19 @@ pub fn build(
     let mut msg = format!(
         "You went idle with {n} uncommitted change(s) under your working directory ({dir}):\n\
          {sample}\n\
-         Commit completed work now with a clear, descriptive message (group related changes). \
-         If something is intentionally incomplete, commit a WIP checkpoint and say so. \
-         Don't leave the working tree dirty."
+         A DIFFERENCE FROM origin/main IS NOT A DIRECTION (AMUX-3000). Each of these differs \
+         from origin/main, but the guard does not know which side is NEWER — and on this \
+         graft-push checkout the worktree is frequently the OLDER side. A stale worktree copy \
+         is a LOADED REVERT: `git add -A` carries the older version forward and silently undoes \
+         the newer one on origin (no conflict, the older file just wins). So BEFORE staging, for \
+         each path run `git diff origin/main -- <path>` and read the direction:\n\
+         \u{2022} worktree ADDS content origin lacks -> real uncommitted work, commit it;\n\
+         \u{2022} worktree is MISSING content origin has -> STALE, do NOT commit — \
+         `git checkout origin/main -- <path>` to restore;\n\
+         \u{2022} no real diff -> a false positive, leave it.\n\
+         Commit only the paths you can see are genuinely newer, with a clear message; WIP-commit \
+         anything intentionally incomplete and say so. Don't leave the working tree dirty — but \
+         don't commit a revert to clear it, either."
     );
 
     if !unknown.is_empty() {
