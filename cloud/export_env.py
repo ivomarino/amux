@@ -81,6 +81,23 @@ def export(org, files_dir=None):
         for t in tags:
             all_groups.setdefault(t, {"name": t, "department": "", "goal": ""})
 
+    # Enrich groups with department/goal from the group config, so a round-trip is
+    # LOSSLESS (amux's catch: emitting bare names drops department+goal, and the
+    # vertical's org description degrades on every export->apply cycle). GET
+    # /api/groups returns configured groups with department/goal; merge them over
+    # the tag-derived names. Groups a worker references but that have no config
+    # still export as {name, "", ""} so the membership survives.
+    _, groups_raw = seed.gw_json("GET", "/api/groups", org=org)
+    for g in _list(groups_raw, "groups"):
+        name = g.get("name")
+        if not name:
+            continue
+        entry = all_groups.setdefault(name, {"name": name, "department": "", "goal": ""})
+        if g.get("department"):
+            entry["department"] = g["department"]
+        if g.get("goal"):
+            entry["goal"] = g["goal"]
+
     # ---- schedules (worker, title, expr, enabled, command) ----
     _, sched_raw = seed.gw_json("GET", "/api/schedules", org=org)
     schedules = []
