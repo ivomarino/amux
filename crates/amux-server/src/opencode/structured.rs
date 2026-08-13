@@ -411,9 +411,45 @@ impl StructuredCliProtocol {
             for (k, v) in cfg.provider.envs() {
                 cmd.env(k, v);
             }
-            let mut child = cmd.spawn().map_err(|e| {
-                ProtocolError::Transport(format!("spawn {}: {e}", program.display()))
-            })?;
+            // ETXTBSY retry. `cmd.spawn()` of a JUST-WRITTEN executable can fail
+            // with errno 26 ("text file busy") when a CONCURRENT fork elsewhere in
+            // this multithreaded process momentarily inherited an open write-fd to
+            // that file — the classic multithreaded-fork/exec race. It is exactly
+            // why the opencode resume test flaked only on CI (Linux) and never on
+            // macOS, red-maining a commit that never touched opencode and blocking
+            // the cloud deploy (amux-cloud, 2026-08-13). It is transient by
+            // construction (the other fork's exec drops the inherited fd), so a
+            // bounded retry clears it. WARN each retry so a NON-transient prod case
+            // (a genuinely busy binary) still surfaces in the logs (two-fixes rule).
+            //
+            // The wait is a SYNCHRONOUS `thread::sleep`, not an `.await`: this
+            // whole block runs under the per-worker key lock and must not await
+            // (see the block comment above). The sleep is tiny and this path is
+            // rare — usually zero retries — so briefly blocking one worker's own
+            // send is an acceptable cost for not restructuring the spawn lock.
+            let mut child = {
+                let mut tries = 0u32;
+                loop {
+                    match cmd.spawn() {
+                        Ok(c) => break c,
+                        Err(e) if e.raw_os_error() == Some(26) && tries < 25 => {
+                            tries += 1;
+                            tracing::warn!(
+                                program = %program.display(),
+                                tries,
+                                "spawn hit ETXTBSY (text file busy) — retrying"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(4));
+                        }
+                        Err(e) => {
+                            return Err(ProtocolError::Transport(format!(
+                                "spawn {}: {e}",
+                                program.display()
+                            )));
+                        }
+                    }
+                }
+            };
             let stdout = child.stdout.take().ok_or_else(|| {
                 ProtocolError::Transport("child stdout not captured".to_string())
             })?;
