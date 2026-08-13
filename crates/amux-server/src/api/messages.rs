@@ -582,7 +582,7 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
     workers.sort_by(|a, b| {
         b["human_messages"].as_u64().unwrap_or(0).cmp(&a["human_messages"].as_u64().unwrap_or(0))
     });
-    unaccounted.sort_by(|a, b| b.human_messages.cmp(&a.human_messages));
+    unaccounted.sort_by_key(|b| std::cmp::Reverse(b.human_messages));
 
     Ok(Rollup { total_human_messages, total_linked, workers, unaccounted })
 }
