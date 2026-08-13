@@ -905,6 +905,49 @@ pub struct ListParams {
     pub search: Option<String>,
 }
 
+/// Query keys GET /api/board actually consumes. Anything else is dropped
+/// SILENTLY by axum's typed `Query<ListParams>` — which is how `?include_archived=1`
+/// or a mistyped filter returned the DEFAULT view served as if it answered the
+/// query (BACKE-3228; the ethos rule-7 class — a filter that never ran hands back
+/// a confident wrong answer). It bit three sessions: amux-cloud read 13 archived
+/// cards as 0, ts-gke brute-forced the id space, backend reported a working guard
+/// as broken. A blanket 400 on unknown params is unsafe (cache-busters like
+/// `?_=<ts>` are legitimate and any client may append them), so instead we NAME
+/// the ignored ones in a response header + a WARN — non-breaking, and it makes
+/// the silent drop impossible to miss the way `X-Amux-Done-Limit` already
+/// announces the terminal cap. (`q`/`query`/`search` are here because they are
+/// consumed above — refused with a 400 — so they are recognised, not ignored.)
+const RECOGNISED_BOARD_PARAMS: &[&str] = &[
+    "status", "session", "archived", "done_limit", "slim", "limit", "offset", "q", "query",
+    "search",
+];
+/// Cache-buster keys clients legitimately append; never a filter typo, so they
+/// are not surfaced as "ignored" (that would be pure noise on every polled tab).
+const BENIGN_QUERY_KEYS: &[&str] =
+    &["_", "t", "v", "ts", "cb", "_t", "cache", "cachebust", "nocache"];
+
+/// Query keys GET /api/board neither consumes nor treats as a benign
+/// cache-buster — the ones a caller thinks are filtering but that did nothing.
+/// Pure over the raw query so it is tested without an HTTP round-trip.
+fn ignored_board_params(raw_query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pair in raw_query.split('&') {
+        let key = pair.split('=').next().unwrap_or("").trim();
+        if key.is_empty() {
+            continue;
+        }
+        let k = key.to_ascii_lowercase();
+        if RECOGNISED_BOARD_PARAMS.contains(&k.as_str()) || BENIGN_QUERY_KEYS.contains(&k.as_str())
+        {
+            continue;
+        }
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(key)) {
+            out.push(key.to_string());
+        }
+    }
+    out
+}
+
 fn qp_truthy(v: Option<&str>) -> bool {
     // Python lowercases before the membership test (`.lower() in ("1",
     // "true","yes")`), so `slim=TRUE` counts.
@@ -923,8 +966,21 @@ fn qp_truthy(v: Option<&str>) -> bool {
 pub async fn list_board(
     State(state): State<AppState>,
     headers: HeaderMap,
+    raw_query: axum::extract::RawQuery,
     Query(p): Query<ListParams>,
 ) -> Response {
+    // BACKE-3228: name query params we silently dropped, so a caller cannot draw
+    // an absence conclusion from a filter that never ran. Computed from the RAW
+    // query (typed ListParams cannot see keys it does not declare).
+    let ignored = raw_query.0.as_deref().map(ignored_board_params).unwrap_or_default();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            target: "board",
+            ignored = %ignored.join(","),
+            "GET /api/board ignored unrecognised query param(s) — caller may be reading a \
+             default view as a filtered answer (BACKE-3228)"
+        );
+    }
     // ETag based on global_rev — saves 3.5MB on unchanged polls.
     let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
     let etag_val = format!("\"board-{}\"", rev);
@@ -1071,6 +1127,11 @@ pub async fn list_board(
     put(&mut headers, "x-amux-total", total.to_string());
     put(&mut headers, "x-amux-offset", offset.to_string());
     put(&mut headers, "x-amux-returned", items.len().to_string());
+    // BACKE-3228: announce any query params we ignored, so a filter typo cannot
+    // masquerade as an empty/absent result. Non-breaking (informational header).
+    if !ignored.is_empty() {
+        put(&mut headers, "x-amux-params-ignored", ignored.join(","));
+    }
     put(&mut headers, "etag", etag_val);
     (StatusCode::OK, headers, Json(Value::Array(items))).into_response()
 }
@@ -3112,6 +3173,34 @@ async fn append_card_log(
         .await
         .map(|_| ())
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::ignored_board_params;
+
+    /// BACKE-3228: a mistyped/unknown filter must be reported ignored, a real
+    /// filter must NOT, and a cache-buster must not create noise.
+    #[test]
+    fn ignored_params_names_typos_not_real_filters_or_cachebusters() {
+        // The exact case that bit amux-cloud: a plausible-but-wrong name.
+        assert_eq!(ignored_board_params("include_archived=1"), vec!["include_archived"]);
+        assert_eq!(ignored_board_params("done=1&limits=5"), vec!["done", "limits"]);
+        // Real filters are consumed, never flagged.
+        assert!(ignored_board_params("session=amux&status=todo&archived=1&done_limit=0").is_empty());
+        assert!(ignored_board_params("slim=1&limit=10&offset=5").is_empty());
+        // q/query/search are consumed (refused with a 400), so not "ignored".
+        assert!(ignored_board_params("q=nudge").is_empty());
+        // Cache-busters are benign, not surfaced (would be noise on every poll).
+        assert!(ignored_board_params("_=1699999999&session=amux").is_empty());
+        assert!(ignored_board_params("t=123&cb=x").is_empty());
+        // Case-insensitive on the key; de-duplicated.
+        assert_eq!(ignored_board_params("Foo=1&foo=2"), vec!["Foo"]);
+        // Empty / no query -> nothing.
+        assert!(ignored_board_params("").is_empty());
+        // Mixed: only the typo is named, alongside a real filter + cache-buster.
+        assert_eq!(ignored_board_params("session=x&includearchived=1&_=9"), vec!["includearchived"]);
+    }
 }
 
 #[cfg(test)]
