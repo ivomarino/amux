@@ -7225,7 +7225,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // and answers it below, so flagging it would ask a human for something
         // nobody needs to decide.
         let selector_now = !is_rate_limit_menu(&pane) && detect_claude_status(&pane) == "waiting";
-        let selector_was = load_meta(name)["input_required_since"].as_i64().unwrap_or(0) > 0;
+        let selector_was = meta_i64(&load_meta(name), "input_required_since") > 0;
         if selector_now != selector_was {
             update_meta(
                 name,
@@ -11188,6 +11188,19 @@ mod tests {
     #[test]
     fn meta_i64_absent_key_is_zero_not_a_panic() {
         assert_eq!(meta_i64(&pre_cutover_map(), "rate_limited_since"), 0);
+    }
+
+    /// The SECOND key the sweep indexes, and the one that actually panicked in
+    /// production on 2026-08-13 (twice, at session_verbs.rs:7214) AFTER the
+    /// `rate_limited_since` sites were fixed. The first fix converted two call
+    /// sites and left this one, so the incident simply moved keys — which is why
+    /// this test names the key rather than the line.
+    ///
+    /// A pre-cutover meta blob has neither key. Anything reading an integer out
+    /// of meta must go through `meta_i64`; `Map["missing"]` panics.
+    #[test]
+    fn meta_i64_absent_input_required_since_is_zero_not_a_panic() {
+        assert_eq!(meta_i64(&pre_cutover_map(), "input_required_since"), 0);
     }
 
     /// Pins the trap itself, so nobody "simplifies" `meta_i64` back into the
