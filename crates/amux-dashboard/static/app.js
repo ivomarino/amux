@@ -7313,7 +7313,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.622';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.623';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28085,17 +28085,78 @@ function _messagesRender() {
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
   let _prevTs = null;
+  let _prevDay = null;
   // Third copy of the same row markup, now the shared renderer. The burst
   // separator is genuinely this surface's own (it groups a human's rapid
-  // sends), so it stays here and wraps the shared row.
+  // sends), so it stays here and wraps the shared row. The DATE-GROUP header
+  // (sticky, one per calendar day) is the review-by-calendar pattern (Ethan):
+  // rows are newest-first, so each header labels the day of the messages below
+  // it; `data-day` lets the date picker scroll straight to a day.
   list.innerHTML = rows.map(m => {
-    let burst = '';
-    if (_msgsKind === 'human' && _prevTs !== null && (_prevTs - (m.time || m.ts)) > 90000) {
-      burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(m.time || m.ts) + '</div>';
+    const _ts = m.time || m.ts;
+    let dateHdr = '';
+    const _day = _msgDayKey(_ts);
+    if (_day !== _prevDay) {
+      dateHdr = '<div class="msgs-date-header" data-day="' + esc(_day) + '">' + esc(_msgDayLabel(_ts)) + '</div>';
+      _prevDay = _day;
     }
-    _prevTs = (m.time || m.ts);
-    return burst + _cmdHistItemHTML(m, _msgCtxMessages());
+    let burst = '';
+    if (_msgsKind === 'human' && _prevTs !== null && (_prevTs - _ts) > 90000) {
+      burst = '<div style="font-size:0.68rem;color:var(--dim);padding:8px 4px 2px;border-top:1px dashed var(--border);margin-top:4px;">' + _msgsFmtTs(_ts) + '</div>';
+    }
+    _prevTs = _ts;
+    return dateHdr + burst + _cmdHistItemHTML(m, _msgCtxMessages());
   }).join('');
+}
+
+// Calendar/time review helpers for the Messages timeline (Ethan 2026-08-13).
+function _msgDayKey(ts) {
+  if (!ts) return 'unknown';
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function _msgDayLabel(ts) {
+  if (!ts) return 'Unknown date';
+  const d = new Date(ts), now = new Date();
+  const same = (a, b) => a.toDateString() === b.toDateString();
+  const yst = new Date(now); yst.setDate(now.getDate() - 1);
+  if (same(d, now)) return 'Today';
+  if (same(d, yst)) return 'Yesterday';
+  const opts = { weekday: 'long', month: 'long', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString([], opts);
+}
+// Jump the timeline to a chosen day. Rows are newest-first and paged; if the day
+// is older than what's loaded, keep loading older pages until it's in range (or
+// the store is exhausted), then scroll its header into view. The date-review
+// jump (Ethan): easily land on any past day without hand-scrolling.
+async function _msgsJumpToDate(dateStr) {
+  if (!dateStr) return;
+  const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
+  let guard = 0;
+  while (!_msgsDone && guard < 80) {
+    const last = _msgsData[_msgsData.length - 1];
+    const oldest = last ? (last.time || last.ts) : Infinity;
+    if (oldest <= target + 86400000) break;   // loaded into (or past) that day
+    await _messagesLoad(false);
+    guard++;
+  }
+  _messagesRender();
+  requestAnimationFrame(() => {
+    const list = document.getElementById('msgs-list');
+    if (!list) return;
+    const hdrs = [...list.querySelectorAll('.msgs-date-header')];  // newest first
+    let hdr = hdrs.find(h => h.dataset.day === dateStr)
+      || hdrs.find(h => h.dataset.day <= dateStr)  // nearest day on/before target
+      || hdrs[hdrs.length - 1];
+    if (hdr) {
+      hdr.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      hdr.classList.add('msgs-date-flash');
+      setTimeout(() => hdr.classList.remove('msgs-date-flash'), 1500);
+    } else if (typeof showToast === 'function') {
+      showToast('No messages on or before that date');
+    }
+  });
 }
 
 // ── Database workbench tab ──────────────────────────────────────────────────
