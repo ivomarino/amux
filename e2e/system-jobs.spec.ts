@@ -21,6 +21,23 @@
 // deliberately not asked to produce a red row it has no honest way to produce.
 import { test, expect, Page } from '@playwright/test';
 
+// BLOCK THE SERVICE WORKER — this file stubs /api/system-jobs with page.route,
+// and a registered SW silently defeats that (AF-46, measured 2026-08-13).
+//
+// sw.js declines to answer /api/* ("network only"), so it looks irrelevant
+// here. It is not: the request still passes THROUGH the worker's fetch handler,
+// and page.route does not see requests that originate there. The stall test did
+// not error — it rendered the REAL job list and compared it to the stub, so the
+// failure read as "the stalled-row styling is broken under WebKit" when the
+// truth was that the stub never applied. Received ["accountability-nudge",
+// "autofix", ...] against the four stubbed ids is what gave it away.
+//
+// The SW also reloads the page on `controllerchange` (app.js:24253) the moment
+// it takes control, which on a FRESH profile lands mid-test and kills the
+// execution context. That is real product behaviour and sw-fail-bar.spec.ts is
+// where it belongs; here it is just a reload nobody asked for.
+test.use({ serviceWorkers: 'block' });
+
 const SHOT = 'test-results/system-jobs';
 
 async function openScheduler(page: Page) {

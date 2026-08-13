@@ -9,51 +9,81 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 
-// One temp home per run, created eagerly so the server and the tests agree.
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'amux-e2e-'));
-const PORT = 18823; // fixed high port; nothing else in CI binds it
+// ONE SERVER AND ONE AMUX_HOME PER PROJECT — not one shared by all of them
+// (AF-46, measured 2026-08-13).
+//
+// Projects multiply every spec file: with three of them, settings.spec.ts runs
+// three times CONCURRENTLY. That file POSTs global server state (/api/prefs,
+// /api/settings/*) and then asserts the UI reflects the value IT just wrote, so
+// against a shared store the three copies overwrite each other and whichever
+// loses reports a product bug. Under the shared-server config the failures were
+// real, repeatable in aggregate and different every run (7 tests one run, 3 the
+// next); run alone against the SAME WebKit target the same file passed 27/27.
+//
+// The tempting reading is "WebKit is flaky" and the tempting fix is a retry or
+// a skip — which would have bought green by deleting the signal. The defect is
+// that the harness had no isolation boundary between projects at all, and it
+// would have come back the moment anyone added a fourth project or a fourth
+// state-mutating spec. A port and a home each is the boundary; adding a target
+// below now costs nothing and races nothing.
+const TARGETS = [
+  { name: 'desktop', port: 18823, use: { viewport: { width: 1280, height: 800 } } },
+  // Mobile is a first-class target (amux is mobile-first): 375px must
+  // render without overflow.
+  { name: 'mobile', port: 18833, use: { viewport: { width: 375, height: 667 } } },
+  // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
+  // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
+  // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
+  // on a phone. WebKit differs on exactly what this UI depends on: position:fixed
+  // inside a transformed ancestor, env(safe-area-inset-*), and dvh/vh behaviour.
+  //
+  // It runs the WHOLE suite. It briefly did not: a `testMatch` narrowed it to
+  // four layout specs because the cross-project races above were misread as
+  // iOS-specific reds. That scoping was honest about what it covered and still
+  // wrong in effect — a new mobile spec would silently never reach iOS, which
+  // is the one target that motivated the project. Isolation removed the reason
+  // for it, so the list is gone; do not reintroduce one to quiet a red.
+  { name: 'ios-safari', port: 18843, use: { ...devices['iPhone 15'] } },
+];
+
+// One temp home per TARGET, created eagerly so each server and its tests agree.
+const homes: Record<string, string> = Object.fromEntries(
+  TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
+);
+
+// SAY OUT LOUD WHAT EACH TARGET ACTUALLY COVERS, every run.
+//
+// The failure this exists to catch is not a red test — it is a GREEN one that
+// covered less than its name promised. ios-safari carried a `testMatch` listing
+// four spec files, so "ios-safari ✓" meant four files while reading, to anyone
+// scanning CI, like iOS was covered. Nothing in the output distinguished those
+// two states, and the narrowing was invisible in exactly the place people look.
+//
+// So a scoped target now announces itself on every run and names the count. A
+// future narrowing cannot be silent, which is the property that was missing —
+// not a rule telling the next person to remember (CLAUDE.md: a fix owes a
+// signal, or the next instance is just as invisible as this one was).
+for (const t of TARGETS) {
+  const scoped = (t as { testMatch?: unknown }).testMatch;
+  console.log(
+    scoped
+      ? `[e2e] target ${t.name}: SCOPED to ${String(scoped)} — it does NOT run the full suite.`
+      : `[e2e] target ${t.name}: full suite.`,
+  );
+}
 
 export default defineConfig({
   testDir: '.',
   timeout: 30_000,
   retries: 0,
   use: {
-    baseURL: `https://localhost:${PORT}`,
     ignoreHTTPSErrors: true, // self-signed cert is the product behavior
   },
-  projects: [
-    { name: 'desktop', use: { viewport: { width: 1280, height: 800 } } },
-    // Mobile is a first-class target (amux is mobile-first): 375px must
-    // render without overflow.
-    { name: 'mobile', use: { viewport: { width: 375, height: 667 } } },
-    // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
-    // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
-    // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
-    // on a phone. WebKit differs on exactly what this UI depends on: position:fixed
-    // inside a transformed ancestor, env(safe-area-inset-*), and dvh/vh behaviour.
-    // SCOPED to the layout/interaction specs this project exists to protect,
-    // and the scope is a measured decision, not caution.
-    //
-    // Running the WHOLE suite here (the first version of this project) is what
-    // you want in principle — a new mobile test should reach iOS without
-    // anyone remembering this list. It does not work yet, and the reason is
-    // not WebKit: every project shares ONE server and ONE pref store, so specs
-    // that mutate global state race each other across projects. A third
-    // project pushed that over the edge. Measured 2026-08-13: settings.spec.ts
-    // failed 7 tests under the 3-project run and passed 27/27 when run alone
-    // under this same WebKit target. Chasing those reds would have "fixed"
-    // flakiness that is really a missing isolation boundary (AF-46).
-    //
-    // So: narrow claim, honestly true, green — rather than a broad claim that
-    // is red for reasons unrelated to iOS. Widening this to the full suite is
-    // the goal and it is blocked on cross-project isolation, not on effort.
-    {
-      name: 'ios-safari',
-      use: { ...devices['iPhone 15'] },
-      testMatch: /(tab-customizer|sw-fail-bar|phase0|message-resend)\.spec\.ts/,
-    },
-  ],
-  webServer: {
+  projects: TARGETS.map((t) => ({
+    name: t.name,
+    use: { ...t.use, baseURL: `https://localhost:${t.port}` },
+  })),
+  webServer: TARGETS.map((t) => ({
     // Builds from COMMITTED HEAD, not this shared working tree — a peer
     // mid-edit used to fail runs with a Rust error against JS-only changes,
     // and a red run caused by a stranger's half-saved file is
@@ -61,7 +91,7 @@ export default defineConfig({
     // Uncommitted rust changes are announced by name every run;
     // AMUX_E2E_WORKING_TREE=1 opts back in to testing the tree.
     command: `bash ${path.join(__dirname, 'serve-head.sh')}`,
-    url: `https://localhost:${PORT}/health`,
+    url: `https://localhost:${t.port}/health`,
     ignoreHTTPSErrors: true,
     reuseExistingServer: false,
     // PIPE, not the default 'ignore'. serve-head.sh prints which uncommitted
@@ -78,13 +108,13 @@ export default defineConfig({
     // AMUX_E2E_WORKING_TREE=1.
     timeout: 600_000,
     env: {
-      AMUX_HOME: home,
-      AMUX_RS_PORT: String(PORT),
+      AMUX_HOME: homes[t.name],
+      AMUX_RS_PORT: String(t.port),
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every
       // "rejects a bad token" assertion is a check that cannot pass — it was
       // read as an auth regression on 2026-08-09 when the code was correct.
       AMUX_RS_NO_LOOPBACK_BYPASS: '1',
     },
-  },
+  })),
 });

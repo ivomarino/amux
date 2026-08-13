@@ -59,20 +59,68 @@ SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
 # broken harness rather than a git problem. On CI the tree IS HEAD, so the
 # fallback is exact there; locally it is the old behaviour with a loud line
 # saying so. Degrading to the previous behaviour beats refusing to run.
+
+# SERIALIZE THE GIT OPS — this script now runs THREE TIMES CONCURRENTLY, once
+# per playwright project (AF-46 gave each target its own server and AMUX_HOME).
+# The worktree below is deliberately SHARED and stable, so three simultaneous
+# copies would `worktree add` / `checkout --detach` / in the worst case `rm -rf`
+# the same directory at the same moment. That race was already reachable — two
+# sessions running e2e at once on this shared checkout — it was just rare enough
+# to look like nothing.
+#
+# mkdir, not flock: `flock(1)` is util-linux and is NOT on macOS, where most of
+# this fleet runs. mkdir is atomic on every POSIX filesystem.
+#
+# The lock covers ONLY the git operations. The cargo build stays outside it on
+# purpose: cargo has its own build lock, and CLAUDE.md's measurement is that a
+# second builder waits and then finds the work already done (1.48s alone, 1.65s
+# for two). Holding this lock across the build would serialize three cold builds
+# for no gain.
+LOCK="${WT}.lock"
+acquire_lock() {
+  local waited=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    # A run killed by playwright never reaches the release below, so a stale
+    # lock must expire rather than wedge every future run at this line.
+    if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
+      echo "[e2e] stale worktree lock (>5min), reclaiming: $LOCK"
+      rm -rf "$LOCK"
+      continue
+    fi
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 120 ]; then
+      # Proceed unlocked rather than refuse to boot: the common case is the
+      # same SHA, where the git ops are idempotent no-ops. Say so out loud —
+      # a silent degrade here is how a corrupt worktree gets blamed on cargo.
+      echo "[e2e] WARNING: worktree lock held >120s — proceeding WITHOUT it. Concurrent git ops possible."
+      return 1
+    fi
+  done
+  return 0
+}
+
 setup_worktree() {
   [ -n "$SHA" ] || return 1
+  local locked=0
+  acquire_lock && locked=1
+  # Release on ANY exit from this function, including the `return 1` paths —
+  # the caller falls back to the working tree there and must not leave the
+  # lock held for the next two servers booting one second behind it.
+  _unlock() { [ "$locked" = "1" ] && rmdir "$LOCK" 2>/dev/null; locked=0; }
   if [ ! -e "$WT/.git" ]; then
     rm -rf "$WT"
-    git -C "$REPO" worktree add --detach "$WT" "$SHA" >/dev/null 2>&1 || return 1
+    git -C "$REPO" worktree add --detach "$WT" "$SHA" >/dev/null 2>&1 || { _unlock; return 1; }
   else
     # Already exists: move it to this HEAD. Concurrent e2e runs on this
     # checkout share ONE HEAD, so they converge on the same sha rather than
     # fighting over the directory.
     git -C "$WT" checkout --detach "$SHA" >/dev/null 2>&1 || {
       git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
-      git -C "$REPO" worktree add --detach "$WT" "$SHA" >/dev/null 2>&1 || return 1
+      git -C "$REPO" worktree add --detach "$WT" "$SHA" >/dev/null 2>&1 || { _unlock; return 1; }
     }
   fi
+  _unlock
   [ -f "$WT/Cargo.toml" ]
 }
 

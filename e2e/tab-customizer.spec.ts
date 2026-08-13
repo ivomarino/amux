@@ -1,5 +1,14 @@
 import { test, expect } from '@playwright/test';
 
+// BLOCK THE SERVICE WORKER (AF-46). Nothing here tests offline behaviour, but
+// sw.js reloads the page on `controllerchange` (app.js:24253) as soon as a
+// freshly-registered worker claims the client — which, on the clean profile
+// each project now gets, happens right where these tests call page.evaluate.
+// The result was "Execution context was destroyed, most likely because of a
+// navigation" on a spec about CSS geometry: a red that says nothing about the
+// menu it is guarding. sw-fail-bar.spec.ts owns the worker's real behaviour.
+test.use({ serviceWorkers: 'block' });
+
 // Ethan, 2026-08-13: "I still can't view the tabs when I click the box which was
 // historically a drop-down list of all the tabs." The ⊞ button (#peek-tab-customize)
 // opens #peek-tab-customizer-menu — the show/hide/reorder list of every worker tab.
