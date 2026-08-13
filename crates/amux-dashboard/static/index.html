@@ -1932,6 +1932,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
+    <button class="peek-tab" id="peek-tab-workflow" onclick="setPeekTab('workflow')" title="This worker's configured workflow, derived from its schedules, tools, board and scope"><span class="tab-ico">&#9783;</span><span class="tab-lbl">Workflow</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
@@ -2142,6 +2143,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="peek-tasks-list" id="peek-issues-list"></div>
   </div>
 
+  <div id="peek-workflow-panel" class="peek-tasks-panel" style="padding:10px;padding-bottom:max(10px, env(safe-area-inset-bottom));gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div id="peek-workflow-flags" style="font-size:0.82rem;margin-bottom:10px;"></div>
+    <div id="peek-workflow-body" style="font-size:0.82rem;color:var(--dim);">Loading&hellip;</div>
+  </div>
   <div id="peek-scope-panel" class="peek-tasks-panel" style="padding:10px;padding-bottom:max(10px, env(safe-area-inset-bottom));gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
     <div id="peek-scope-body" style="font-size:0.82rem;color:var(--dim);">Loading&hellip;</div>
   </div>
@@ -2699,6 +2704,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <script src="https://cdn.jsdelivr.net/npm/motion@11.11.17/dist/motion.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gridstack@7/dist/gridstack-all.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" crossorigin="anonymous"></script>

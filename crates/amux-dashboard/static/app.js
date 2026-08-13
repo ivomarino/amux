@@ -3827,6 +3827,7 @@ const PEEK_TABS = [
   { id: 'steering',   label: 'Steering' },
   { id: 'schedules',  label: 'Schedules' },
   { id: 'scope',      label: 'Scope' },
+  { id: 'workflow',   label: 'Workflow' },
   { id: 'messages',   label: 'Messages' },
   { id: 'dictation',  label: 'Dictation' },
   { id: 'issues',     label: 'Board' },
@@ -5711,6 +5712,61 @@ async function _scopeLoad(scope, targetId) {
   }
 }
 
+
+// ── Workflow tab (AMUX-39) ───────────────────────────────────────────────────
+// Renders the worker's CONFIGURED workflow, derived server-side from schedules /
+// env / board — never from the prose the user typed when setting the worker up.
+// A diagram drawn from that prose cannot disagree with it, which makes it a check
+// that cannot fail (ethos rule 7); the whole point of this tab is that it CAN
+// disagree. The flags are the feature, so they render above the diagram, not
+// under it.
+let _wfMermaidReady = false;
+async function _workflowLoad() {
+  const body = document.getElementById('peek-workflow-body');
+  const flagsEl = document.getElementById('peek-workflow-flags');
+  if (!body || !peekSession) return;
+  body.textContent = 'Loading…';
+  flagsEl.innerHTML = '';
+  let d;
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(peekSession) + '/workflow');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) {
+    body.textContent = 'Could not load workflow: ' + e.message;
+    return;
+  }
+  const flags = d.flags || [];
+  if (flags.length) {
+    flagsEl.innerHTML = flags.map(f => {
+      const warn = f.level === 'warn';
+      return '<div style="padding:6px 8px;margin-bottom:4px;border-radius:4px;border-left:3px solid ' +
+        (warn ? '#ff9800' : 'var(--dim)') + ';background:' + (warn ? 'rgba(255,152,0,0.08)' : 'transparent') +
+        ';color:' + (warn ? '#ffcc80' : 'var(--dim)') + '">' +
+        (warn ? '⚠ ' : '') + esc(f.text) + '</div>';
+    }).join('');
+  }
+  // mermaid ships from the same CDN as the other 22 libs; if it did not load we
+  // show the source rather than an empty pane, because a blank tab is a silent
+  // failure on the one surface whose job is to show you something.
+  if (typeof mermaid === 'undefined') {
+    body.innerHTML = '<div style="color:var(--dim);margin-bottom:6px;">Diagram renderer unavailable — showing source:</div>' +
+      '<pre style="white-space:pre-wrap;font-size:0.75rem;">' + esc(d.mermaid || '') + '</pre>';
+    return;
+  }
+  if (!_wfMermaidReady) {
+    try { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); _wfMermaidReady = true; }
+    catch (e) { /* fall through to render attempt */ }
+  }
+  try {
+    const { svg } = await mermaid.render('wf-' + Date.now(), d.mermaid);
+    body.innerHTML = svg;
+  } catch (e) {
+    body.innerHTML = '<div style="color:#ff9800;margin-bottom:6px;">Diagram failed to render: ' + esc(e.message || String(e)) + '</div>' +
+      '<pre style="white-space:pre-wrap;font-size:0.75rem;">' + esc(d.mermaid || '') + '</pre>';
+  }
+}
+
 function setPeekTab(tab) {
   _peekTab = tab;
   // The notes tab is gone; this flushed its pending save and called
@@ -5732,6 +5788,10 @@ function setPeekTab(tab) {
   const scopePanel = document.getElementById('peek-scope-panel');
   if (tab === 'scope') { scopePanel.classList.add('active'); _scopeLoad(); }
   else { scopePanel.classList.remove('active'); }
+  document.getElementById('peek-tab-workflow').classList.toggle('active', tab === 'workflow');
+  const wfPanel = document.getElementById('peek-workflow-panel');
+  if (tab === 'workflow') { wfPanel.classList.add('active'); _workflowLoad(); }
+  else { wfPanel.classList.remove('active'); }
   document.getElementById('peek-tab-memory').classList.toggle('active', tab === 'memory');
   document.getElementById('peek-tab-git').classList.toggle('active', tab === 'git');
   document.getElementById('peek-tab-commits').classList.toggle('active', tab === 'commits');
@@ -7117,7 +7177,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.608';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.609';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
