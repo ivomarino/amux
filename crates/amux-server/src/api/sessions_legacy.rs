@@ -1072,6 +1072,34 @@ fn load_meta(name: &str) -> serde_json::Value {
     val
 }
 
+/// Pick the worker's task label and its source from the freshness verdicts.
+///
+/// Pure so the precedence — and especially the SUMMARY freshness gate — can be
+/// tested without a DB or meta files. The gate is the fix for the 2026-08-13
+/// "these task names are out of date" report: `summary` is a point-in-time label
+/// that nothing refreshes, so an ungated `!summary.is_empty()` let an unstamped
+/// relic outrank both the live board card and the honest desc, permanently. Both
+/// `board_fresh` and `summary_fresh` carry the SAME rule (`ts > 0 && age <= 24h`)
+/// so the two time-sensitive sources age out identically; a stale summary falls
+/// through to a stale board title, then to desc.
+fn resolve_task_name(
+    board_title: Option<&str>,
+    board_fresh: bool,
+    summary: &str,
+    summary_fresh: bool,
+    desc: &str,
+) -> (String, &'static str) {
+    if board_fresh {
+        (board_title.unwrap_or_default().to_string(), "board")
+    } else if summary_fresh {
+        (summary.to_string(), "summary")
+    } else if let Some(t) = board_title {
+        (t.to_string(), "board")
+    } else {
+        (desc.to_string(), "desc")
+    }
+}
+
 /// The legacy array as a JSON string, shared by the GET handler and the
 /// SSE `sessions` pushes (one serializer, two transports).
 ///
@@ -1667,16 +1695,29 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let summary_ts = meta["task_summary_ts"].as_i64().unwrap_or(0);
+            // GATE THE SUMMARY BY FRESHNESS, exactly as `board_fresh` above gates
+            // the board card (Ethan, 2026-08-13: "these task names are out of
+            // date"). A summary is a POINT-IN-TIME label that nothing refreshes,
+            // so an ungated `!summary.is_empty()` meant a frozen relic
+            // ("Luke's Wilderness Tales" on the Obsidian lane) outranked the live
+            // board card AND the honest desc, forever. Two things made these
+            // relics: they are unstamped (`task_summary_ts == 0`, written before
+            // AMUX-2676 added the stamp) and there is no automated writer that
+            // re-stamps them. `ts > 0 && age <= 24h` is the SAME rule the board
+            // uses, so a summary now ages out the way a doing card does; an
+            // unstamped one is treated as unknown-age and skipped. A stale
+            // summary falls through to the stale board title, then to desc — the
+            // worker's role, which is honest rather than a wrong task claim.
+            let summary_fresh = !summary.is_empty() && summary_ts > 0 && now - summary_ts <= 86400;
             let desc = v["desc"].as_str().unwrap_or("").to_string();
-            let (tname, tsrc) = if board_fresh {
-                (board.map(|(_, t, _)| t.clone()).unwrap_or_default(), "board")
-            } else if !summary.is_empty() {
-                (summary, "summary")
-            } else if let Some((_, t, _)) = board {
-                (t.clone(), "board")
-            } else {
-                (desc, "desc")
-            };
+            let (tname, tsrc) = resolve_task_name(
+                board.map(|(_, t, _)| t.as_str()),
+                board_fresh,
+                &summary,
+                summary_fresh,
+                &desc,
+            );
             v["task_name"] = json!(tname);
             v["task_source"] = json!(tsrc);
             v["task_board_id"] =
@@ -2020,6 +2061,41 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-08-13 "task names are out of date" bug: a stale, UNSTAMPED
+    /// `task_summary` ("Luke's Wilderness Tales" on the Obsidian lane) outranked
+    /// the honest desc because summary had no freshness gate. The gate must make
+    /// an unstamped/stale summary lose to desc, while a fresh summary still wins.
+    #[test]
+    fn task_name_precedence_gates_a_stale_summary() {
+        // Unstamped/stale summary (summary_fresh=false), no board -> desc, NOT
+        // the frozen relic. This is the exact incident.
+        let (name, src) = resolve_task_name(None, false, "Luke's Wilderness Tales", false, "Ethan's personal notes");
+        assert_eq!(src, "desc", "a stale summary must not be the task name");
+        assert_eq!(name, "Ethan's personal notes");
+
+        // A FRESH summary still wins over desc — the gate does not kill the
+        // feature, only stale values.
+        let (name, src) = resolve_task_name(None, false, "Draft the county reply", true, "role desc");
+        assert_eq!(src, "summary");
+        assert_eq!(name, "Draft the county reply");
+
+        // A fresh board card outranks even a fresh summary (the ledger is truth).
+        let (name, src) = resolve_task_name(Some("AMUX-9 do the thing"), true, "a summary", true, "desc");
+        assert_eq!(src, "board");
+        assert_eq!(name, "AMUX-9 do the thing");
+
+        // Stale board beats desc but loses to a fresh summary; a stale summary
+        // with a stale board falls to the stale board (last resort before desc).
+        let (name, src) = resolve_task_name(Some("old board title"), false, "stale summary", false, "desc");
+        assert_eq!(src, "board");
+        assert_eq!(name, "old board title");
+
+        // Nothing anywhere -> desc, never an empty task claim from a blank summary.
+        let (name, src) = resolve_task_name(None, false, "", false, "just the role");
+        assert_eq!(src, "desc");
+        assert_eq!(name, "just the role");
+    }
 
     /// AMUX-2904. A lane's Stop hook fires when the MAIN turn ends, so a lane
     /// whose background agents are still working self-reports `idle` —
