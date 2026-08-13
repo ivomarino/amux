@@ -5804,6 +5804,31 @@ function _simpleCfgOutside(e) {
   }
 }
 
+// Read the current Simple summary aloud in the SHARED fixed-bottom audio player
+// (`_abPlay` — the same bar that plays audio files from the file viewer:
+// play/pause, scrubber, close), via /api/tts. Ethan wanted the identical player.
+let _simpleText = '';
+async function _simplePlayAudio(btn) {
+  const text = (_simpleText || '').trim();
+  if (!text) { if (typeof showToast === 'function') showToast('Nothing to read yet'); return; }
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
+  try {
+    const r = await fetch(API + '/api/tts', {
+      method: 'POST',
+      headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ text }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.error || !d.url) { if (typeof showToast === 'function') showToast(d.error || 'Read aloud failed'); return; }
+    _abPlay(d.url, 'Simple summary — ' + (peekSession || 'worker'));
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Read aloud failed');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
 // Peek "Simple" tab (AMUX-3056): a plain-English summary of what this worker
 // just did. The server generates it from the last assistant message via the
 // fast/cheap helper and caches per transcript, so this is usually instant; a
@@ -5827,6 +5852,7 @@ async function _simpleRender(refresh) {
     const d = await r.json().catch(() => ({}));
     if (peekSession !== name || _peekTab !== 'simple') return;   // navigated away mid-fetch
     if (d.summary) {
+      _simpleText = d.summary;
       body.innerHTML =
         '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(d.summary) + '</div>'
         + '<div style="margin-top:14px;font-size:0.75rem;color:var(--dim);border-top:1px solid var(--border);padding-top:10px;">'
@@ -5836,6 +5862,7 @@ async function _simpleRender(refresh) {
         +   (d.via ? ' · <span title="model">' + esc(d.via) + '</span>' : '')
         + '</div>';
     } else {
+      _simpleText = '';
       body.innerHTML = '<div style="color:var(--dim);">' + esc(d.reason || d.error || 'No summary yet.') + '</div>';
     }
   } catch (e) {
@@ -7261,7 +7288,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.620';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.621';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
