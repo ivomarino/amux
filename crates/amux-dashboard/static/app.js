@@ -5807,10 +5807,27 @@ function _simpleCfgOutside(e) {
 // Read the current Simple summary aloud in the SHARED fixed-bottom audio player
 // (`_abPlay` — the same bar that plays audio files from the file viewer:
 // play/pause, scrubber, close), via /api/tts. Ethan wanted the identical player.
-let _simpleText = '';
-async function _simplePlayAudio(btn) {
-  const text = (_simpleText || '').trim();
-  if (!text) { if (typeof showToast === 'function') showToast('Nothing to read yet'); return; }
+// Peek "Simple" tab (AMUX-3056): a LIST of plain-English narratives, each
+// synthesizing the work from the worker's last human-sent message through to
+// now (the request + everything the assistant did in response), stamped with
+// when it was generated. GET returns the stored list (generating a first one if
+// empty); the Generate button forces a new narrative for the current span. Live
+// in-flight work stays in the Terminal tab.
+let _simpleEntries = [];
+function _simpleWhen(unix) {
+  if (!unix) return '';
+  const d = new Date(unix * 1000);
+  const diff = (Date.now() - unix * 1000) / 1000;
+  const rel = diff < 60 ? 'just now'
+    : diff < 3600 ? Math.floor(diff / 60) + 'm ago'
+    : diff < 86400 ? Math.floor(diff / 3600) + 'h ago'
+    : d.toLocaleDateString();
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' · ' + rel;
+}
+async function _simplePlayEntry(i, btn) {
+  const e = _simpleEntries[i];
+  const text = e && (e.summary || '').trim();
+  if (!text) { if (typeof showToast === 'function') showToast('Nothing to read'); return; }
   const orig = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
   try {
@@ -5822,51 +5839,59 @@ async function _simplePlayAudio(btn) {
     const d = await r.json().catch(() => ({}));
     if (d.error || !d.url) { if (typeof showToast === 'function') showToast(d.error || 'Read aloud failed'); return; }
     _abPlay(d.url, 'Simple summary — ' + (peekSession || 'worker'));
-  } catch (e) {
+  } catch (e2) {
     if (typeof showToast === 'function') showToast('Read aloud failed');
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = orig; }
   }
 }
-
-// Peek "Simple" tab (AMUX-3056): a plain-English summary of what this worker
-// just did. The server generates it from the last assistant message via the
-// fast/cheap helper and caches per transcript, so this is usually instant; a
-// fresh turn regenerates on the next fetch. When the worker is mid-turn the live
-// detail is in the Terminal tab — this view refreshes when it goes idle.
-async function _simpleRender(refresh) {
+async function _simpleRender(gen) {
   const name = peekSession;
   const body = document.getElementById('peek-simple-body');
   if (!name || !body) return;
   const cfg = _simpleCfg(name);
   body.style.fontSize = (cfg.px || '16') + 'px';
   body.style.fontFamily = cfg.font || '';
-  body.innerHTML = '<div style="color:var(--dim);display:flex;align-items:center;gap:8px;">'
-    + '<span class="simple-spin"></span>Putting it in plain English…</div>';
+  // Spinner on an explicit generate or a first load for this worker; otherwise
+  // keep the list on screen while refetching.
+  if (gen === true || body.dataset.simpleFor !== name) {
+    body.innerHTML = '<div style="color:var(--dim);display:flex;align-items:center;gap:8px;padding:8px 2px;">'
+      + '<span class="simple-spin"></span>'
+      + (gen === true ? 'Writing a new plain-English summary…' : 'Putting it in plain English…')
+      + '</div>';
+  }
   try {
     const params = [];
-    if (refresh === true) params.push('refresh=1');
+    if (gen === true) params.push('generate=1');
     if (cfg.prompt) params.push('prompt=' + encodeURIComponent(cfg.prompt));
     const url = API + '/api/sessions/' + encodeURIComponent(name) + '/simple' + (params.length ? '?' + params.join('&') : '');
     const r = await fetch(url, { headers: _authHeaders({}) });
     const d = await r.json().catch(() => ({}));
     if (peekSession !== name || _peekTab !== 'simple') return;   // navigated away mid-fetch
-    if (d.summary) {
-      _simpleText = d.summary;
-      body.innerHTML =
-        '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(d.summary) + '</div>'
-        + '<div style="margin-top:14px;font-size:0.75rem;color:var(--dim);border-top:1px solid var(--border);padding-top:10px;">'
-        +   'Working right now? Live detail is in the '
-        +   '<a href="#" onclick="event.preventDefault();setPeekTab(\'terminal\')" style="color:var(--accent);">Terminal</a>'
-        +   ' tab — this refreshes when the worker goes idle.'
-        +   (d.via ? ' · <span title="model">' + esc(d.via) + '</span>' : '')
-        + '</div>';
-    } else {
-      _simpleText = '';
-      body.innerHTML = '<div style="color:var(--dim);">' + esc(d.reason || d.error || 'No summary yet.') + '</div>';
+    _simpleEntries = (d && d.entries) || [];
+    body.dataset.simpleFor = name;
+    if (!_simpleEntries.length) {
+      body.innerHTML = '<div style="color:var(--dim);padding:8px 2px;">'
+        + esc(d.reason || d.error || 'No summaries yet — tap Generate.') + '</div>';
+      return;
     }
+    let html = '';
+    _simpleEntries.forEach((e, i) => {
+      html += '<div style="border-bottom:1px solid var(--border);padding:12px 2px;">'
+        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+        +   '<span style="font-size:0.72rem;color:var(--dim);">'
+        +     esc(_simpleWhen(e.generated_at)) + (e.via ? ' · ' + esc(e.via) : '') + '</span>'
+        +   '<span style="flex:1;"></span>'
+        +   '<button class="btn" onclick="_simplePlayEntry(' + i + ',this)" title="Read aloud">&#x25B6;</button>'
+        + '</div>'
+        + '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(e.summary) + '</div>'
+        + '</div>';
+    });
+    html += '<div style="font-size:0.72rem;color:var(--dim);padding:10px 2px;">Newest first. Live in-flight work is in the '
+      + '<a href="#" onclick="event.preventDefault();setPeekTab(\'terminal\')" style="color:var(--accent);">Terminal</a> tab.</div>';
+    body.innerHTML = html;
   } catch (e) {
-    body.innerHTML = '<div style="color:var(--dim);">Couldn’t reach the server — try again.</div>';
+    body.innerHTML = '<div style="color:var(--dim);padding:8px 2px;">Couldn’t reach the server — try again.</div>';
   }
 }
 
@@ -7288,7 +7313,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.621';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.622';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

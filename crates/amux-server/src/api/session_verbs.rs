@@ -7749,11 +7749,11 @@ async fn get_dispatch(
         // the client-resolved standing prompt; `?refresh=1` forces regenerate.
         "simple" => {
             let prompt = qs_first(qs, "prompt", "");
-            let refresh = qs_flag(qs, "refresh");
+            let generate = qs_flag(qs, "generate") || qs_flag(qs, "refresh");
             crate::api::simple::simple_response(
                 name,
                 if prompt.is_empty() { None } else { Some(prompt) },
-                refresh,
+                generate,
             )
             .await
         }
