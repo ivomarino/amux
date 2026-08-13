@@ -190,9 +190,9 @@ groups:
 #[tokio::test]
 async fn phase_2_stanzas_are_reported_not_dropped() {
     let (app, _store) = app("phase2");
+    // columns + global are the REMAINING phase-2 stanzas (schedules and files
+    // now apply). They must still be announced, never silently dropped.
     let spec = r#"
-schedules:
-  - title: nightly
 columns:
   - name: review
 global:
@@ -202,7 +202,6 @@ global:
     assert_eq!(st, StatusCode::OK);
     let report = body["report"].as_array().unwrap();
     let has = |kind: &str| report.iter().any(|e| e["kind"] == kind && e["action"] == "not-yet-applied");
-    assert!(has("schedules"), "schedules stanza must be announced, not silently dropped");
     assert!(has("columns"), "columns stanza must be announced");
     assert!(has("global"), "global stanza must be announced");
 }
@@ -238,6 +237,60 @@ async fn files_are_seeded_idempotently_and_relative_paths_error() {
     let (_, body) = apply(&app, &yaml, false).await;
     let file_row = body["report"].as_array().unwrap().iter().find(|e| e["path"] == doc_s).unwrap();
     assert_eq!(file_row["action"], "unchanged");
+}
+
+#[tokio::test]
+async fn schedules_are_created_disabled_and_idempotent() {
+    let (app, store) = app("sched");
+    let yaml = r#"
+schedules:
+  - worker: env2977-sched-lane
+    title: env2977 nightly sweep
+    expr: daily at 02:00
+    enabled: false
+    command: run the sweep
+"#;
+    let count = |store: &std::sync::Arc<Store>| -> i64 {
+        store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM schedules WHERE session='env2977-sched-lane' AND deleted IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // Dry run: reports create, writes no schedule.
+    let (st, body) = apply(&app, yaml, true).await;
+    assert_eq!(st, StatusCode::OK);
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "schedule").unwrap();
+    assert_eq!(row["action"], "create");
+    assert_eq!(count(&store), 0, "dry run wrote a schedule");
+
+    // Apply: the schedule lands, DISABLED, with the expr re-parsed to recurring.
+    let (st, _) = apply(&app, yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(count(&store), 1);
+    let (enabled, sched_type, expr): (i64, String, String) = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT enabled, sched_type, schedule_expr FROM schedules WHERE session='env2977-sched-lane'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(enabled, 0, "an applied schedule must never be auto-enabled");
+    assert_eq!(sched_type, "recurring");
+    assert_eq!(expr, "daily at 02:00");
+
+    // Re-apply the same spec: reports exists, does NOT duplicate.
+    let (_, body) = apply(&app, yaml, false).await;
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "schedule").unwrap();
+    assert_eq!(row["action"], "exists");
+    assert_eq!(count(&store), 1, "re-apply must not duplicate the schedule");
 }
 
 #[tokio::test]

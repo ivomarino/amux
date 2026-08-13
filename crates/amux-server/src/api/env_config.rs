@@ -48,13 +48,32 @@ struct EnvSpec {
     // work on (amux-cloud's highest-value gap).
     #[serde(default)]
     files: Vec<FileSpec>,
-    // Still phase-2, parsed-and-reported so a full spec is not rejected.
+    // `schedules` is APPLIED (AMUX-2977 phase 2): one per (worker,title),
+    // enabled:false honored HARD (never auto-run — Ethan's rule), created via
+    // the SAME path a hand-made schedule uses so `expr`/next_run match exactly.
     #[serde(default)]
-    schedules: Vec<Value>,
+    schedules: Vec<ScheduleSpec>,
+    // Still phase-2, parsed-and-reported so a full spec is not rejected.
     #[serde(default)]
     columns: Vec<Value>,
     #[serde(default)]
     global: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleSpec {
+    /// The session the schedule fires a command into.
+    worker: String,
+    title: String,
+    /// Human schedule string (e.g. "every weekday at 07:00"), re-parsed by the
+    /// real scheduler — NOT a cron literal (matches the exporter's `expr`).
+    #[serde(default)]
+    expr: String,
+    /// Default FALSE: an applied env never auto-runs; a human arms it.
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    command: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,9 +114,10 @@ struct WorkerSpec {
 
 async fn schema() -> Response {
     Json(json!({
-        "applied_now": ["groups", "workers", "files"],
-        "phase_2": ["schedules", "columns", "gates", "global"],
+        "applied_now": ["groups", "workers", "files", "schedules"],
+        "phase_2": ["columns", "gates", "global"],
         "files_shape": [{"path": "/abs/path/doc.md", "content": "literal file content"}],
+        "schedules_shape": [{"worker": "backend-dev", "title": "nightly", "expr": "daily at 02:00", "enabled": false, "command": "the prompt"}],
         "example": {
             "groups": [{"name": "engineering", "department": "Engineering", "goal": "Ship the platform"}],
             "workers": [{
@@ -233,12 +253,52 @@ async fn apply(
         }
     }
 
-    // Phase-2 stanzas still parsed-and-reported (not silently dropped).
-    for (stanza, items) in [("schedules", spec.schedules.len()), ("columns", spec.columns.len())] {
-        if items > 0 {
-            report.push(json!({"kind": stanza, "action": "not-yet-applied", "count": items,
-                "detail": "phase 2 (AMUX-2977) — parsed and reported, not written"}));
+    // ---- schedules: one per (worker,title), idempotent by skip-if-exists ---
+    // Existing (session,title) pairs, read once for the report. Re-apply of the
+    // same spec converges (no duplicate schedules); editing an existing one's
+    // expr is a follow-up (would need update-in-place, not v1).
+    let existing_scheds: std::collections::HashSet<(String, String)> = state
+        .store
+        .read()
+        .ok()
+        .map(|conn| {
+            crate::runtime_jobs::scheduler::list_schedules(&conn, None)
+                .unwrap_or_default()
+                .iter()
+                .map(|s| (s.str_field("session").to_string(), s.str_field("title").to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sched_writes: Vec<(String, String, String, bool, String)> = vec![];
+    for s in &spec.schedules {
+        let (worker, title) = (s.worker.trim(), s.title.trim());
+        if worker.is_empty() || title.is_empty() {
+            report.push(json!({"kind": "schedule", "action": "error", "detail": "worker and title are required"}));
+            continue;
         }
+        // Validate the expr up front so a dry-run refuses a bad one (the same
+        // grammar the /api/schedules create path enforces).
+        let expr = s.expr.trim();
+        if !expr.is_empty() {
+            if let Err(e) = crate::runtime_jobs::scheduler::ScheduleExpr::parse(expr) {
+                report.push(json!({"kind": "schedule", "title": title, "action": "error",
+                    "detail": format!("unparseable expr: {e}")}));
+                continue;
+            }
+        }
+        let exists = existing_scheds.contains(&(worker.to_string(), title.to_string()));
+        let action = if exists { "exists" } else { "create" };
+        report.push(json!({"kind": "schedule", "worker": worker, "title": title,
+            "action": action, "enabled": s.enabled}));
+        if !dry && !exists {
+            sched_writes.push((worker.to_string(), title.to_string(), expr.to_string(), s.enabled, s.command.clone()));
+        }
+    }
+
+    // Phase-2 stanzas still parsed-and-reported (not silently dropped).
+    if !spec.columns.is_empty() {
+        report.push(json!({"kind": "columns", "action": "not-yet-applied", "count": spec.columns.len(),
+            "detail": "phase 2 (AMUX-2977) — parsed and reported, not written"}));
     }
     if spec.global.is_some() {
         report.push(json!({"kind": "global", "action": "not-yet-applied",
@@ -289,6 +349,74 @@ async fn apply(
                 Ok(WriteOutcome { applied: true, events: vec![] })
             })
             .await;
+    }
+
+    // ---- schedules: create the absent ones via the real scheduler path -----
+    if !sched_writes.is_empty() {
+        let writes = sched_writes;
+        // Capture the result, don't swallow it: a swallowed insert error is
+        // exactly how this shipped creating 0 schedules with a 200 (a NOT NULL
+        // column left unset). A failure now lands in `errors` in the response.
+        let res = state
+            .store
+            .write_async(move |conn| {
+                use crate::runtime_jobs::scheduler as sch;
+                let now = chrono::Local::now();
+                let now_ts = chrono::Utc::now().timestamp();
+                for (worker, title, expr, enabled, command) in &writes {
+                    // Re-check inside the write so two concurrent applies cannot
+                    // both create the same (worker,title).
+                    let already = sch::list_schedules(conn, Some(worker))
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|s| s.str_field("title") == title);
+                    if already {
+                        continue;
+                    }
+                    let (sched_type, next_run) = if expr.is_empty() {
+                        ("once".to_string(), sch::fmt_minute(now))
+                    } else {
+                        match sch::ScheduleExpr::parse(expr) {
+                            Ok(p) => (
+                                "recurring".to_string(),
+                                p.next_run_after(now).map(sch::fmt_minute).unwrap_or_else(|| sch::fmt_minute(now)),
+                            ),
+                            Err(_) => continue, // already reported as error in the dry pass
+                        }
+                    };
+                    let mut m = serde_json::Map::new();
+                    m.insert("title".into(), json!(title));
+                    m.insert("session".into(), json!(worker));
+                    m.insert("command".into(), json!(command));
+                    m.insert("kind".into(), json!("tmux"));
+                    m.insert("sched_type".into(), json!(sched_type));
+                    m.insert("run_at".into(), json!(sch::fmt_minute(now)));
+                    m.insert("next_run".into(), json!(next_run));
+                    m.insert("last_run".into(), Value::Null);
+                    m.insert("enabled".into(), json!(*enabled as i64));
+                    m.insert("run_count".into(), json!(0));
+                    m.insert("schedule_expr".into(), if expr.is_empty() { Value::Null } else { json!(expr) });
+                    m.insert("watch".into(), json!(0));
+                    // These columns are NOT NULL DEFAULT <x> — but insert_schedule
+                    // lists every column explicitly, so an omitted key inserts NULL
+                    // (violating the constraint) rather than falling to the default.
+                    // Set them to the create handler's defaults.
+                    m.insert("watch_timeout".into(), json!(120));
+                    m.insert("done_action".into(), json!("disable"));
+                    m.insert("trigger_cooldown".into(), json!(120));
+                    m.insert("created".into(), json!(now_ts));
+                    m.insert("updated".into(), json!(now_ts));
+                    m.insert("deleted".into(), Value::Null);
+                    let id = sch::mint_schedule_id(conn)?;
+                    m.insert("id".into(), json!(id));
+                    sch::insert_schedule(conn, &sch::DurableSchedule::from_map(m))?;
+                }
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        if let Err(e) = res {
+            errors.push(json!({"kind": "schedule", "error": e.to_string()}));
+        }
     }
 
     Json(json!({
