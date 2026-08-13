@@ -2997,3 +2997,16 @@ CARD: AMUX-3030
 SYMPTOM: Ethan screenshot: primis header read IDLE while its pane showed "✻ Crunching… (34s · still thinking with xhigh effort)", "esc to interrupt", "← 2 agents". The self_report was a fresh main-turn stop-hook idle. subagents_working() gated on the 60s contradiction_window, which is the MAIN pane's paint cadence (~6/s). A subagent's transcript is touched only when it emits a message/tool result, so a THINKING subagent (xhigh effort, minutes between writes) has a >60s-old newest mtime while fully working -> subagents_working=false -> the fresh main-turn idle wins -> IDLE.
 COST: a worker that is actively crunching reads IDLE on the header — the exact false-idle that makes an owner think a lane is free when it is mid-work, and the class D1 exists to kill. Ethan had to notice it by eye from the pane.
 FIX: fixed e832f12. Subagents get their own window AMUX_SUBAGENT_WORKING_S (default 240s) sized to the subagent write cadence, not the pane's. Regression test pins a 90s-old subagent write (stale under 60s, working under 240s). Residual limitation: a subagent that thinks for >240s with zero writes is indistinguishable from a finished one on transcript mtime alone — the honest edge of an mtime-based signal; the pane-visible half is caught by status.agrees_with_pane.
+
+---
+
+## Auto-pickup handed a lane an EPIC to "do" — a container is not a work unit
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-13
+SESSION: amux
+CARD: AMUX-3005
+SYMPTOM: The board_drive auto-pickup claimed AMUX-3005, an `epic`-typed container ("[EPIC] Board command center"), and told the lane to "work it now" — but an epic has no work of its own; its CHILDREN (the 3 views + spine) carry it. The dispatchability predicate, the drain queries, and the WIP-holding counts all excluded tripwire/watch (the other non-work-unit types) but not epic, so an epic sat in the pickup queue as if actionable.
+COST: a full scope-and-decide cycle spent on a card that cannot be "done" as a unit; and any epic in todo/backlog would keep being re-claimed until worked, which it never can be.
+FIX: fixed (see commit) — `epic` added to all five `NOT IN ('tripwire','watch')` exclusions (pickup, drain candidates, drain count, two WIP counts), with a test pinning that an epic is neither dispatchable nor drainable. Class-kill: any container type is now excluded everywhere the work-unit types are.
