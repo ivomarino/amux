@@ -25742,19 +25742,42 @@ async function pullFromRemote(btn) {
   const el = document.getElementById('pull-status');
   btn.disabled = true; btn.textContent = '⏳ Pulling...';
   el.textContent = '';
+  // `r` is declared out here so the catch can tell a transport failure (no response
+  // at all) from a response we could not parse. The old code could not: it reported
+  // BOTH as 'Network error', so a 405 with an empty body — what a build without
+  // /api/pull actually returns — sent the reader to check their wifi.
+  let r = null;
   try {
-    const r = await fetch(API + '/api/pull', { method: 'POST' });
-    const d = await r.json();
-    el.textContent = d.output || (d.ok ? 'Up to date' : 'Failed');
-    el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
-    if (d.ok && !d.output.includes('Already up to date')) {
-      setTimeout(() => forceUpdate(), 1500);
+    r = await fetch(API + '/api/pull', { method: 'POST' });
+    // Read as text first. r.json() throws on an empty body, and that throw is
+    // indistinguishable from a network fault once it reaches the catch.
+    const body = await r.text();
+    let d = null;
+    try { d = JSON.parse(body); } catch (_) { /* handled below, with the status */ }
+
+    if (d) {
+      el.textContent = d.output || (d.ok ? 'Up to date' : 'Failed');
+      el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+      if (d.ok && !(d.output || '').includes('Already up to date')) {
+        setTimeout(() => forceUpdate(), 1500);
+      }
+      return;
     }
-  } catch(e) {
-    el.textContent = 'Network error';
+
+    // Responded, but not with JSON. Say what actually came back.
+    const snippet = body.trim().slice(0, 200);
+    el.textContent = 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
+      (snippet ? ': ' + snippet
+               : ' (empty body) — this build may not serve /api/pull');
     el.style.color = 'var(--red)';
+  } catch (e) {
+    // Only a genuine transport failure can reach here now.
+    el.textContent = (r ? 'Failed reading response: ' : 'Network error: ') + e.message;
+    el.style.color = 'var(--red)';
+  } finally {
+    // finally, because the success path now returns early.
+    btn.disabled = false; btn.textContent = '⬇ Pull from remote';
   }
-  btn.disabled = false; btn.textContent = '⬇ Pull from remote';
 }
 
 // ── DevTools Panel ──────────────────────────────────────────────
