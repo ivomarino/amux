@@ -1188,10 +1188,14 @@ fn stale_backlog_candidates(
 /// because a just-arrived batch is the likeliest thing the worker meant to act
 /// on; the worker's own model picks which to promote.
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
+    // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
+    // the nudge lists are exactly the ones it claims are un-worked: no dormant
+    // types (tripwire/watch) and no card parked on a live source_ref trigger.
     conn.prepare(
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         AND type NOT IN ('tripwire','watch') AND COALESCE(source_ref,'')='' \
          ORDER BY created DESC LIMIT 8",
     )
     .and_then(|mut st| {
@@ -2403,17 +2407,36 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
+                // DRAINABLE backlog is narrower than total backlog: a card
+                // correctly parked in backlog is NOT un-worked and must not be
+                // drain-nudged (mixpeek-autopilot, 2026-08-13 — the nudge fired
+                // 3x on a standing tripwire and two externally-triggered chores,
+                // none of which have an honest path to `todo`). Exclude the same
+                // two things auto-pickup excludes: the dormant/armed types
+                // (tripwire, watch — they fire on an event, `is:armed`), and any
+                // card with a live `source_ref` trigger (parked on an external
+                // condition). If nothing drainable remains, the lane's backlog is
+                // all correctly parked and the drain nudge must stay quiet.
+                let drainable_backlog: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+                         AND type NOT IN ('tripwire','watch') AND COALESCE(source_ref,'')=''",
+                        rusqlite::params![lane],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
                 // TWO shapes of the same "backlog isn't moving" problem:
                 //  * STALE TRIAGE: 10+ cards over 14 days old — archive cruft /
                 //    promote the still-actionable ones (72h cooldown).
                 //  * IDLE DRAIN (Ethan 2026-08-12, the "board doesn't drive to
                 //    completion" bug): the lane is doing NOTHING, has no
-                //    dispatchable todo (`eligible == 0`), and holds backlog of
-                //    ANY age. board-drive dispatches `todo`, never `backlog`, so
-                //    a lane handed only backlog sits idle forever (tubescience:
-                //    51 backlog / 0 todo / 0 doing). Short cooldown so a lane
-                //    that stays idle keeps getting nudged until it drains.
-                let idle_drain = doing_count == 0 && eligible == 0 && total_backlog > 0;
+                //    dispatchable todo (`eligible == 0`), and holds DRAINABLE
+                //    backlog of any age. board-drive dispatches `todo`, never
+                //    `backlog`, so a lane handed only backlog sits idle forever
+                //    (tubescience: 51 backlog / 0 todo / 0 doing). Short cooldown
+                //    so a lane that stays idle keeps getting nudged until it drains.
+                let idle_drain = doing_count == 0 && eligible == 0 && drainable_backlog > 0;
                 let stale_enough = (stale_count as usize) >= BACKLOG_TRIAGE_THRESHOLD;
                 if !idle_drain && !stale_enough {
                     break 'triage None;
@@ -2449,7 +2472,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 }
                 drop(conn);
                 let text = if idle_drain {
-                    backlog_drain_text(&cards, total_backlog)
+                    backlog_drain_text(&cards, drainable_backlog)
                 } else {
                     backlog_triage_text(&cards, stale_count, total_backlog)
                 };
@@ -3084,6 +3107,29 @@ mod tests {
         assert!(
             eligible_todo_count(&conn, "lane2", 1_000_000.0) > 0,
             "a lane with a todo is dispatched by the normal path, not drained"
+        );
+
+        // CORRECTLY-PARKED backlog is NOT drainable (mixpeek-autopilot, AMUX-3006):
+        // a standing tripwire (fires on a condition, no honest path to todo) and a
+        // card armed on a live source_ref trigger must NOT appear as drain
+        // candidates — nudging them churns a compliant lane with no exit but a
+        // false close. Add both to a fresh lane whose ONLY other cards are parked.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+             VALUES ('TW-1','burn>=90% page watch','x','backlog','parked',?1,?1,'agent','tripwire')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref) \
+             VALUES ('CH-1','chore blocked on a credential','x','backlog','parked',?1,?1,'agent','chore','clickhouse://blocked')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let parked = backlog_candidates(&conn, "parked", now as i64);
+        assert!(
+            parked.is_empty(),
+            "a tripwire and a source_ref-triggered card are correctly parked, not drainable: {parked:?}"
         );
     }
 
