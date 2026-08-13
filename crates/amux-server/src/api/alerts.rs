@@ -70,42 +70,55 @@ impl AlertChannels for RealChannels {
             "/",
         )
         .await;
-        // send_all's single synthetic row (host "", status 0) means the
-        // broadcast could not even be attempted (vapid/db) — the equivalent
-        // of the exception Python's handler catches. Per-endpoint push-service
-        // rejections still count as dispatched, like Python.
-        if results.len() == 1 {
-            let r = &results[0];
-            if r.get("host").and_then(Value::as_str) == Some("")
-                && r.get("status").and_then(Value::as_u64) == Some(0)
-            {
-                let detail = r.get("detail").and_then(Value::as_str).unwrap_or("push failed");
-                if detail.starts_with("vapid:") || detail.starts_with("db") {
-                    return Err(detail.to_string());
-                }
-            }
-        }
-        // ZERO SUBSCRIBERS IS NOT A SEND (AMUX-2938). `send_all` returns an
-        // empty vec when `push_subscriptions` is empty, which fell through
-        // every branch above and reported `"push": "sent"`. Measured on this
-        // machine 2026-08-11: 0 rows in that table, and a real
-        // POST /api/alert/owner answered {"channels":{"push":"sent"}}.
-        //
-        // On any other endpoint that would be a cosmetic lie. Here it is the
-        // FIRE ALARM — the one path whose entire job is reaching a human who
-        // is not looking at the screen — and it reported success having
-        // reached nobody. CLAUDE.md tells every session both channels are
-        // "wired and confirmed working"; a session that fires this and reads
-        // "sent" has been told the owner was notified.
-        if results.is_empty() {
-            return Err("no push subscriptions — nobody is registered to receive it".into());
-        }
-        Ok(())
+        push_delivery_verdict(&results)
     }
 
     async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
         send_sms(phone, text).await
     }
+}
+
+/// The FIRE-ALARM honesty rule, pure over `send_all`'s per-endpoint results so
+/// it can be tested without a network or a DB (mixpeek-finances / amux-cloud
+/// AC-347). `Ok(())` — a legitimate "sent" — is returned ONLY when an endpoint
+/// actually ACCEPTED the push (2xx). Everything else is a truthful error:
+///
+///   * broadcast couldn't be attempted (vapid/db) — the synthetic (host="",
+///     status 0) row;
+///   * ZERO subscriptions (AMUX-2938) — `send_all` returns an empty vec, which
+///     the old code let fall through to "sent" while reaching nobody (measured
+///     2026-08-11: 0 rows in `push_subscriptions`, alert answered {"push":"sent"});
+///   * subscriptions EXIST but every endpoint rejected (410 Gone / expired) —
+///     the gap AMUX-2938 left and MF-582 does NOT close: registering a sub does
+///     not help once it lapses, and the old rule ("per-endpoint rejections count
+///     as dispatched") reported "sent" for a page nobody received.
+///
+/// "sent" must mean an endpoint took it, never the send call's self-description.
+fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
+    if results.len() == 1 {
+        let r = &results[0];
+        if r.get("host").and_then(Value::as_str) == Some("")
+            && r.get("status").and_then(Value::as_u64) == Some(0)
+        {
+            let detail = r.get("detail").and_then(Value::as_str).unwrap_or("push failed");
+            if detail.starts_with("vapid:") || detail.starts_with("db") {
+                return Err(detail.to_string());
+            }
+        }
+    }
+    if results.is_empty() {
+        return Err("no push subscriptions — nobody is registered to receive it".into());
+    }
+    let delivered = results.iter().any(|r| {
+        matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s))
+    });
+    if !delivered {
+        return Err(format!(
+            "push not delivered — {} subscription(s), 0 accepted (all rejected/expired)",
+            results.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Python `_send_sms`: Twilio when TWILIO_* is configured, else macOS
@@ -670,6 +683,36 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fire-alarm honesty rule (AC-347 / mixpeek-finances). "sent" is
+    /// legitimate ONLY when an endpoint accepted the push (2xx). The whole
+    /// incident was "sent" reported for a page nobody received — this pins that
+    /// it can't happen again for either shape: zero subs, or subs-all-rejected.
+    #[test]
+    fn push_is_delivered_only_when_an_endpoint_accepts_never_on_zero_or_all_rejected() {
+        let row = |status: u64| json!({"host": "push.example", "status": status, "detail": "x"});
+
+        // ≥1 endpoint accepted (2xx) -> the ONLY legitimate "sent".
+        assert!(push_delivery_verdict(&[row(201), row(410)]).is_ok(), "one 2xx is a real delivery");
+        assert!(push_delivery_verdict(&[row(200)]).is_ok());
+
+        // ZERO subscriptions -> not a send (AMUX-2938).
+        let e = push_delivery_verdict(&[]).unwrap_err();
+        assert!(e.contains("no push subscriptions"), "{e}");
+
+        // Subscriptions EXIST but every endpoint rejected (410 Gone / expired)
+        // -> the gap MF-582 doesn't close. Must be an error, not "sent".
+        let e = push_delivery_verdict(&[row(410), row(404), row(500)]).unwrap_err();
+        assert!(e.contains("not delivered") && e.contains("0 accepted"), "all-rejected must not be sent: {e}");
+
+        // Broadcast couldn't be attempted (vapid/db) -> the synthetic error row.
+        let e = push_delivery_verdict(&[json!({"host":"","status":0,"detail":"vapid: bad key"})]).unwrap_err();
+        assert!(e.starts_with("vapid:"), "{e}");
+
+        // The negative control that proves the check bites: a non-2xx-only set
+        // must NEVER read as delivered, however many rows it has.
+        assert!(push_delivery_verdict(&[row(429), row(429)]).is_err(), "'we called send' is not delivery");
+    }
 
     /// MF-427. The guard was correct and its STATE was fiction: the in-memory
     /// maps are rebuilt by `routes()` and this process re-execs on every commit
