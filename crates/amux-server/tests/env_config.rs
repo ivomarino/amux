@@ -380,6 +380,36 @@ async fn worker_prompt_steers_once_on_create_never_on_reapply() {
 }
 
 #[tokio::test]
+async fn a_workers_dir_is_created_on_apply_not_required_to_preexist() {
+    // The bootstrap bug amux-cloud hit on the cloud round-trip: apply erroring
+    // "dir does not exist" for a fresh workdir meant a single apply skipped every
+    // worker (the dir only appeared after the files loop seeded docs under it, so
+    // a 2nd apply was needed). Applying an env must CREATE the workdir.
+    let (app, _store) = app("bootstrap");
+    let wdir = home().join("bootstrap-fresh-workdir"); // does NOT exist yet
+    assert!(!wdir.exists(), "precondition: the workdir must be absent");
+    let yaml = format!(
+        "workers:\n  - name: env2977-bootstrap\n    dir: {}\n    desc: fresh lane\n",
+        wdir.display()
+    );
+
+    // Dry run reports create, does NOT error on the absent dir, writes nothing.
+    let (st, body) = apply(&app, &yaml, true).await;
+    assert_eq!(st, StatusCode::OK);
+    let row = body["report"].as_array().unwrap().iter().find(|e| e["kind"] == "worker").unwrap();
+    assert_eq!(row["action"], "create", "an absent workdir must NOT be an error: {row}");
+    assert!(!wdir.exists(), "dry run must not create the dir");
+
+    // Apply CREATES the workdir and the worker, in ONE pass (no 2nd apply needed).
+    let (st, body) = apply(&app, &yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["errors"].as_array().map(|a| a.len()), Some(0), "no error: {body}");
+    assert!(wdir.is_dir(), "apply must create the worker's workdir");
+    let env_file = home().join("sessions").join("env2977-bootstrap.env");
+    assert!(env_file.exists(), "and the worker env file, in the same apply");
+}
+
+#[tokio::test]
 async fn invalid_yaml_is_a_400_not_a_panic() {
     let (app, _store) = app("badyaml");
     let (st, body) = apply(&app, "groups: [unterminated", false).await;

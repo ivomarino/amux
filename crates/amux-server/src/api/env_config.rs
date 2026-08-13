@@ -202,7 +202,7 @@ async fn apply(
 
     // ---- workers: an env file per worker (idempotent write) ----------------
     // Validate first so a dry-run reports the same refusals an apply would hit.
-    let mut worker_writes: Vec<(std::path::PathBuf, String, String, &str)> = vec![];
+    let mut worker_writes: Vec<(std::path::PathBuf, String, String, &str, String)> = vec![];
     // (name, prompt) for workers created THIS apply — steered once, on create.
     let mut worker_prompts: Vec<(String, String)> = vec![];
     for w in &spec.workers {
@@ -211,10 +211,12 @@ async fn apply(
             report.push(json!({"kind": "worker", "name": w.name, "action": "error", "detail": "invalid name"}));
             continue;
         }
-        if !w.dir.is_empty() && !std::path::Path::new(&w.dir).is_dir() {
-            report.push(json!({"kind": "worker", "name": name, "action": "error", "detail": format!("dir does not exist: {}", w.dir)}));
-            continue;
-        }
+        // NOTE: the worker's `dir` is NOT required to pre-exist. Applying an env
+        // is a BOOTSTRAP — "redeploy this vertical from a YAML" — so the workdir
+        // is CREATED on apply (below), not demanded. The old is_dir() error ran
+        // BEFORE the files loop that seeds docs UNDER that dir, so a single apply
+        // skipped every worker and a second apply created them (amux-cloud, cloud
+        // round-trip). Only a create FAILURE at apply time is an error now.
         let path = sessions_dir.join(format!("{name}.env"));
         let existed = path.exists();
         let action = if existed { "update" } else { "create" };
@@ -223,9 +225,9 @@ async fn apply(
         // volatile `# updated:` header line) — so a re-apply reports honestly.
         let action = if existed && same_env_body(&path, &content) { "unchanged" } else { action };
         report.push(json!({"kind": "worker", "name": name, "action": action, "groups": w.groups,
-            "prompt": !w.prompt.trim().is_empty()}));
+            "prompt": !w.prompt.trim().is_empty(), "dir": w.dir}));
         if !dry && action != "unchanged" {
-            worker_writes.push((path, content, name.clone(), action));
+            worker_writes.push((path, content, name.clone(), action, w.dir.clone()));
         }
         // Steer the first-run prompt ONLY when the worker is newly created —
         // never on update/unchanged, or a re-apply would re-interrupt a running
@@ -389,7 +391,16 @@ async fn apply(
 
     // ---- APPLY (writes) ----------------------------------------------------
     let mut errors = vec![];
-    for (path, content, name, _action) in worker_writes {
+    for (path, content, name, _action, workdir) in worker_writes {
+        // Create the worker's WORKDIR (the bootstrap — CC_DIR must exist for the
+        // pane to boot into it). A failure here is the real, reportable error the
+        // old pre-existence check was reaching for, but now it fires only when
+        // creation genuinely can't happen (perms/invalid path), not on absence.
+        if !workdir.trim().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(&workdir) {
+                errors.push(json!({"kind": "worker", "name": name, "error": format!("could not create dir {workdir}: {e}")}));
+            }
+        }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
