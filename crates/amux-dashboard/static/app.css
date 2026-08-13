@@ -3108,31 +3108,41 @@
      Never grows here, in either axis. */
   #peek-issues-panel .board-search-wrap { flex: 0 0 auto !important; }
 
-  /* Board controls at phone width. At 390px the row was cramming a scope
-     button, a count, two view toggles and "+ New issue" onto one line, so the
-     count and the button each wrapped to two lines and the toggles were pushed
-     to the screen edge. Give the count its own line and let the buttons sit on
-     one row at full tap size. */
+  /* Board controls at phone width — ONE ROW (Ethan, 2026-08-13: "make all this
+     one row on mobile"). The prior fix gave the count AND the "+ New issue"
+     button each their own line, so the controls spanned three rows. They fit a
+     single row now because the two "+" buttons collapse to their glyph (.pbt-ico,
+     ~44px each instead of ~64–100px) — the same trick the main board's
+     .board-new-btn uses. Measured budget at 375px (~355px content): toggles ~94
+     + scope ~74 + filter-icon 44 + count ~52 + new-icon 44 + gaps 24 = ~332 <
+     355, and tap targets stay 44px. The count stays inline on purpose: it is the
+     live FILTERED total, which the "Board N" tab badge (unfiltered) does not
+     show. Search keeps its own full-width row — at the ~120px it would get
+     inline it was unusable, which is why the earlier fix moved it off. */
   @media (max-width: 600px) {
     #peek-issues-panel .peek-tasks-add {
-      flex-wrap: wrap; row-gap: 6px; align-items: center;
+      flex-wrap: wrap; row-gap: 6px; column-gap: 6px; align-items: center;
     }
     #peek-issues-panel .peek-tasks-add > .board-view-toggle { order: 1; }
     #peek-issues-panel #piv-scope { order: 2; min-height: 44px; white-space: nowrap; }
-    #peek-issues-panel .peek-tasks-add > .btn.primary {
-      order: 3; margin-left: auto; min-height: 44px; white-space: nowrap;
-    }
-    /* Count last and full-width: it is the one item that can wrap harmlessly. */
     #peek-issues-panel #peek-issues-count {
-      order: 4; flex: 1 0 100%; text-align: left; margin: 0;
+      order: 3; flex: 0 0 auto; text-align: left; margin: 0; white-space: nowrap;
     }
+    #peek-issues-panel #piv-filter { order: 4; }
+    #peek-issues-panel .peek-tasks-add > .btn.primary {
+      order: 5; margin-left: auto; white-space: nowrap;
+    }
+    /* Both "+" buttons: 44px tap target, glyph not label. */
+    #peek-issues-panel .pbt-compact {
+      min-height: 44px; min-width: 44px; padding: 6px 9px;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    #peek-issues-panel .pbt-text { display: none; }
+    #peek-issues-panel .pbt-ico { display: inline-flex; align-items: center; justify-content: center; }
     #peek-issues-panel .board-view-toggle .bv-btn { min-width: 44px; min-height: 44px; }
-    /* Search joined this row when the toolbar merged to one line. On a phone
-       it takes its own full-width line rather than competing with four
-       controls for ~120px, which is what made it unusable before. Ordered
-       after the count so the tappable controls stay together at the top. */
+    /* Search: its own full-width row below the controls. */
     #peek-issues-panel .peek-tasks-add > .board-search-wrap {
-      order: 5; flex: 1 0 100% !important;
+      order: 6; flex: 1 0 100% !important;
     }
     #peek-issues-panel .peek-tasks-add > .board-search-wrap .search-input { min-height: 40px; }
   }
@@ -3231,6 +3241,10 @@
   /* ── Board mobile responsive ── */
   .board-new-btn { font-size: 0.8rem; padding: 5px 12px; white-space: nowrap; flex-shrink: 0; }
   .board-new-icon { display: none; }
+  /* Peek board-toolbar "+" buttons (filter/new issue): show the full label on
+     desktop; the @media (max-width:600px) block above swaps to the glyph
+     (.pbt-ico) so the controls fit one row on a phone. */
+  .pbt-ico { display: none; }
   @media (max-width: 640px) {
     .board-toolbar { flex-wrap: wrap; gap: 6px; }
     /* The [+ Filter | search] pair owns the full first row (AMUX-2569).
