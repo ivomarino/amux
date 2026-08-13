@@ -3042,3 +3042,16 @@ CARD: AMUX-3013
 SYMPTOM: Ran `cargo clippy -p amux-server --all-targets -- -D warnings` locally, GREEN, and pushed the accountability endpoint. CI went RED on a clippy lint in the same file (unnecessary_sort_by, messages.rs:585) that local clippy never flagged. Root: no rust-toolchain.toml — CI floats on dtolnay/rust-toolchain@stable (newest), local stable is clippy 0.1.94 (2026-03-25), months behind with a smaller lint set. So local -D warnings green does NOT predict CI.
 COST: main CI red for HOURS; deploy-cloud.yml gates on green CI so it skipped every run, no new cloud image, /api/env/apply never reached cloud, and the live RothCo env round-trip (the point of the env-config work) could not run. amux-cloud caught it, root-caused it, and fixed the lint inline (67b44f7). I also never watched CI go green after pushing, so the red sat.
 FIX: pin the toolchain (rust-toolchain.toml + rust.yml installs it) so CI is deterministic and local == CI. Interim: rustup update stable before the pre-push clippy. Until then, "local clippy passed" must not be trusted as "CI will pass".
+
+---
+
+## Cloud silently froze behind a red main CI — "skipped" reads as "up to date," not "frozen"
+AREA: cloud
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-13
+SESSION: amux-cloud
+CARD: AC-344
+SYMPTOM: Ethan reported "cloud is still behind in versions." A fresh cloud org still booted build 0f2f6e48 (pre-env_config: GET /api/env/schema -> 404, /api/env/apply absent from 213 routes), so the converged seed.py --via-apply 405'd against cloud. Root cause was three layers down: deploy-cloud.yml auto-deploy is gated on GREEN rust.yml (workflow_run), and main CI had been RED for hours on ONE clippy lint (unnecessary_sort_by, messages.rs:585). Every deploy-cloud run showed "skipped" — indistinguishable from "nothing to deploy." Nothing anywhere said "the cloud image is frozen and falling behind main because CI is red."
+COST: Ethan had to notice the version lag by hand. Diagnosing it took several manual steps (fresh provision -> /health build hash -> /api/debug/routes -> gh run list conclusion -> git log timing) to join signals that no single instrument joins. And it is fleet-recurring: ANY lane's red-main break freezes the entire cloud deploy for every customer, invisibly, until a human notices — the busier the fleet, the more often it happens.
+FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main and fires when they diverge (commits or hours), OR make deploy-cloud's skip loud (record "skipped because CI red since <sha>/<time>"). Interim: clippy blocker fixed (67b44f7); steering-test blocker handed to amux; cloud auto-catches-up once CI green. Related: AMUX-3013 (pinned toolchain so local clippy == CI clippy — why the red wasn't caught pre-push).
