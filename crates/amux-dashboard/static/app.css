@@ -747,6 +747,13 @@
   .overlay-body .file-link:active { color: #79ead3; }
   .overlay-body .md-link { color: var(--yellow); text-decoration: none; border-bottom: 1px dashed var(--yellow); cursor: pointer; }
   .overlay-body .md-link:active { color: #e8c547; }
+  /* A markdown link to ANOTHER file — opens IN the viewer (renderMarkdown +
+     _bindMdFileLinks). Distinguished from external links by the accent + a small
+     document glyph, so a reader knows it navigates within, not to the browser. */
+  .md-file-link { color: var(--accent); text-decoration: none; border-bottom: 1px dashed var(--accent); cursor: pointer; }
+  .md-file-link::before { content: "\1F4C4\00A0"; font-size: 0.82em; opacity: 0.75; }
+  .md-file-link:hover { border-bottom-style: solid; }
+  .md-file-link:active { opacity: 0.7; }
   /* Box-drawing tables/frames: keep monospace alignment, scroll sideways instead
      of wrapping (which detached borders and shredded rows on narrow screens). */
   .overlay-body .peek-box { display: block; white-space: pre; overflow-x: auto; overflow-y: hidden; max-width: 100%;

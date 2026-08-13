@@ -7118,7 +7118,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.612';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.613';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13040,7 +13040,8 @@ function _renderFileBody(data, mode) {
     _bindReadPosDiv(body, data.path);
   } else if (data.is_markdown) {
     body.className = 'file-overlay-body markdown md-content';
-    body.innerHTML = renderMarkdown(data.content);
+    body.innerHTML = renderMarkdown(data.content, data.path);
+    _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
   } else if (data.is_html) {
@@ -18889,7 +18890,51 @@ function _sanitizeHtml(html) {
     .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(/(href|src)\s*=\s*("|')?\s*(javascript|data|vbscript):/gi, '$1=$2#blocked:');
 }
-function renderMarkdown(raw) {
+// Resolve a markdown link href to an ABSOLUTE file path, relative to the file
+// being viewed (basePath = that file's absolute path). Returns '' for links that
+// are not local files (http(s)/mailto/anchor) so the caller renders them as-is.
+// Handles ./ ../ and bare relative names, strips #anchor/?query, normalises.
+function _resolveFileLink(basePath, href) {
+  if (!basePath || !href) return '';
+  if (/^(https?:|mailto:|tel:|data:|vbscript:|javascript:|\/\/)/i.test(href)) return '';
+  let r = href.split('#')[0].split('?')[0].trim();
+  if (!r) return '';                 // pure #anchor / query — not a file
+  let abs = r.startsWith('/') ? r : basePath.replace(/\/[^/]*$/, '') + '/' + r;
+  const out = [];
+  for (const seg of abs.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  return '/' + out.join('/');
+}
+
+// Wire clicks on .md-file-link (links to OTHER files, rendered by
+// renderMarkdown) to open that file IN the viewer. Delegated on the container so
+// it covers every link and survives DOMPurify stripping inline onclick; bound
+// once per container (its innerHTML is replaced across renders, but the element
+// and this listener persist, and delegation catches the new links).
+function _bindMdFileLinks(container) {
+  if (!container || container._mdLinksBound) return;
+  container._mdLinksBound = true;
+  container.addEventListener('click', (e) => {
+    const a = e.target.closest && e.target.closest('.md-file-link');
+    if (!a || !container.contains(a) || !a.dataset.file) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (a.dataset.dir && typeof openExplore === 'function') {
+      // Directory link -> the file explorer at that path (carry the session
+      // scope if we have one, so cwd-relative reads keep working).
+      const sess = (typeof _exploreSession !== 'undefined' && _exploreSession)
+        || (typeof peekSession !== 'undefined' && peekSession) || null;
+      openExplore(a.dataset.file, sess);
+    } else {
+      openFilePreview(a.dataset.file);
+    }
+  });
+}
+
+function renderMarkdown(raw, basePath) {
   if (!raw) return '';
   // Use marked.js for full GFM support (tables, task lists, strikethrough, etc.)
   if (typeof marked !== 'undefined') {
@@ -18901,6 +18946,28 @@ function renderMarkdown(raw) {
         const slug = text.replace(/<[^>]+>/g, '').toLowerCase().trim()
           .replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-');
         return '<h' + depth + ' id="' + slug + '">' + text + '</h' + depth + '>\n';
+      };
+      // A link to ANOTHER FILE opens IN the viewer (Ethan 2026-08-13: click a
+      // link in a .md and go to that file — the tubescience master absorption
+      // doc links to many files). Rendered as a data-attr link (onclick is
+      // stripped by DOMPurify); a delegated handler (_bindMdFileLinks) does the
+      // openFilePreview. External links keep normal behaviour (new tab), anchors
+      // stay in-page.
+      renderer.link = function({ href, title, tokens }) {
+        const text = this.parser.parseInline(tokens);
+        const target = _resolveFileLink(basePath, href);
+        if (target) {
+          // A trailing-slash link is a DIRECTORY -> open the explorer, not the
+          // file viewer (the tubescience doc links to `migration/` as well as
+          // files).
+          const isDir = (href || '').split('#')[0].split('?')[0].endsWith('/');
+          return '<a href="#" class="md-file-link" data-file="' + esc(target) + '"' +
+                 (isDir ? ' data-dir="1"' : '') + ' title="' + esc(target) + '">' + text + '</a>';
+        }
+        const isAnchor = (href || '').startsWith('#');
+        const tgt = (!isAnchor && /^https?:/i.test(href || '')) ? ' target="_blank" rel="noopener"' : '';
+        const t = title ? ' title="' + esc(title) + '"' : '';
+        return '<a href="' + esc(href || '#') + '"' + tgt + t + '>' + text + '</a>';
       };
       let html = marked.parse(raw, { gfm: true, breaks: false, renderer });
       html = html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
@@ -18923,6 +18990,11 @@ function renderMarkdown(raw) {
     s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
     s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
     s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
+      const fileTarget = _resolveFileLink(basePath, url);
+      if (fileTarget) {
+        const isDir = url.split('#')[0].split('?')[0].endsWith('/');
+        return '<a href="#" class="md-file-link" data-file="' + esc(fileTarget) + '"' + (isDir ? ' data-dir="1"' : '') + ' title="' + esc(fileTarget) + '">' + text + '</a>';
+      }
       const safe = /^(https?:\/\/|\/|#)/.test(url) ? url : '#';
       const target = safe.startsWith('#') ? '' : ' target="_blank"';
       return '<a href="' + safe + '"' + target + '>' + text + '</a>';
