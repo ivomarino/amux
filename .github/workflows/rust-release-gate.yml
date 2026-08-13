@@ -147,7 +147,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci --ignore-scripts 2>/dev/null || npm install
-      - run: npx playwright install --with-deps chromium
+      # chromium AND webkit: the step below runs every project, and ios-safari
+      # is a webkit project. A missing browser hard-errors (see rust.yml).
+      - run: npx playwright install --with-deps chromium webkit
       - name: SPA static gate
         run: bash scripts/spa-lint.sh
       - run: cargo build -p amux-server

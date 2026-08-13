@@ -31,7 +31,27 @@ export default defineConfig({
     // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
     // on a phone. WebKit differs on exactly what this UI depends on: position:fixed
     // inside a transformed ancestor, env(safe-area-inset-*), and dvh/vh behaviour.
-    { name: 'ios-safari', use: { ...devices['iPhone 15'] } },
+    // SCOPED to the layout/interaction specs this project exists to protect,
+    // and the scope is a measured decision, not caution.
+    //
+    // Running the WHOLE suite here (the first version of this project) is what
+    // you want in principle — a new mobile test should reach iOS without
+    // anyone remembering this list. It does not work yet, and the reason is
+    // not WebKit: every project shares ONE server and ONE pref store, so specs
+    // that mutate global state race each other across projects. A third
+    // project pushed that over the edge. Measured 2026-08-13: settings.spec.ts
+    // failed 7 tests under the 3-project run and passed 27/27 when run alone
+    // under this same WebKit target. Chasing those reds would have "fixed"
+    // flakiness that is really a missing isolation boundary (AF-46).
+    //
+    // So: narrow claim, honestly true, green — rather than a broad claim that
+    // is red for reasons unrelated to iOS. Widening this to the full suite is
+    // the goal and it is blocked on cross-project isolation, not on effort.
+    {
+      name: 'ios-safari',
+      use: { ...devices['iPhone 15'] },
+      testMatch: /(tab-customizer|sw-fail-bar|phase0|message-resend)\.spec\.ts/,
+    },
   ],
   webServer: {
     // Builds from COMMITTED HEAD, not this shared working tree — a peer

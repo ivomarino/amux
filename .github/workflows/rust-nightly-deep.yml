@@ -97,7 +97,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        browser: [chromium, webkit]
+        # browser -> the projects in e2e/playwright.config.ts that USE that
+        # engine, named explicitly. This used to be `browser: [chromium,
+        # webkit]` filtered with --project='*${{ matrix.browser }}*', which
+        # matched NO project ("Available projects: desktop, mobile,
+        # ios-safari") and fell through the `||` to running every project on
+        # whichever single browser was installed. So this job never ran a
+        # webkit scenario despite its name, and its webkit leg was red on its
+        # own (desktop+mobile need chromium). Verified 2026-08-13 with
+        # `--project='*chromium*' --list` -> "No projects matched".
+        include:
+          - browser: chromium
+            projects: --project=desktop --project=mobile
+          - browser: webkit
+            projects: --project=ios-safari
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,7 +124,11 @@ jobs:
       - name: Build server
         run: cargo build -p amux-server
       - name: Golden scenarios
-        run: npx playwright test --config e2e/playwright.config.ts --project='*${{ matrix.browser }}*' || npx playwright test --config e2e/playwright.config.ts
+        # No `|| <run everything>` fallback: that fallback is what hid the
+        # broken filter for weeks, by turning "my selector matched nothing"
+        # into a green run of the wrong thing. If the projects below stop
+        # existing, this must go red.
+        run: npx playwright test --config e2e/playwright.config.ts ${{ matrix.projects }}
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

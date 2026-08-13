@@ -9,7 +9,13 @@
 // exercised at 375px (mobile-first); each test ends with an overflow check.
 import { test, expect, Page } from '@playwright/test';
 
-test.use({ permissions: ['clipboard-write'] });
+// The clipboard permission is granted INSIDE the one test that needs it, not
+// file-wide. WebKit has no 'clipboard-write' permission, and a file-level
+// grant throws at CONTEXT CREATION ("browserContext.newPage: Unknown
+// permission: clipboard-write") — which killed all five tests in this file the
+// moment the ios-safari project was added, before a single page loaded. A
+// per-test grant costs the same and confines the engine gap to the one
+// assertion that depends on it (AMUX-3057).
 
 /** Load '/' and wait for the app shell + its API layer (golden.spec idiom). */
 async function settle(page: Page): Promise<void> {
@@ -99,7 +105,12 @@ test('schedule enable toggle: card visibly re-renders into the disabled lane', a
   await expectNoOverflow(page);
 });
 
-test('schedule id copy button: toast confirms the copy', async ({ page, request }) => {
+test('schedule id copy button: toast confirms the copy', async ({ page, request, context, browserName }) => {
+  // Chromium needs the permission for navigator.clipboard.writeText; WebKit
+  // does not HAVE it as a permission (it allows the write under a user
+  // gesture, which a real click is). Asking anyway is a hard error, so ask
+  // only where the permission exists.
+  if (browserName !== 'webkit') await context.grantPermissions(['clipboard-write']);
   await settle(page);
   const token = await appToken(page);
   const title = `fbk-copy-${Date.now()}`;
