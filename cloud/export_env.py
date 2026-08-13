@@ -48,7 +48,6 @@ def plan_to_envspec(plan):
     groups = {}
     workers = []
     schedules = []
-    prompts = {}
     for s in sessions:
         tags = s.get("tags") or []
         if isinstance(tags, str):
@@ -60,29 +59,59 @@ def plan_to_envspec(plan):
             "desc": s.get("desc", ""),
             "model": s.get("model", "sonnet"),
             "provider": s.get("provider", "claude"),
+            # AMUX-2977: prompt is a bare string on the worker, steered once on
+            # create. Empty when the plan has none.
+            "prompt": s.get("prompt", ""),
         })
         for t in tags:
             groups.setdefault(t, {"name": t, "department": "", "goal": ""})
-        if s.get("prompt"):
-            prompts[s["name"]] = s["prompt"]
         for sc in s.get("schedules", []):
             schedules.append({
                 "worker": s["name"], "title": sc.get("title", ""),
                 "expr": sc.get("expr", ""), "enabled": bool(sc.get("enabled", False)),
                 "command": sc.get("command", ""),
             })
+
+    # cards[] (AMUX-2977). amux's cards require `worker` (the owning session), but a
+    # seed-plan card is COLUMN-attributed (column: Documents/Engagements/...), not
+    # worker-attributed. So infer worker: an explicit session/worker on the card
+    # wins; else the worker whose group/name/desc best matches the column; else the
+    # first worker (surfaced, never silent). On EXPORT from a live env this inference
+    # is unused — live cards carry `session` directly.
+    def _worker_for(card):
+        w = card.get("worker") or card.get("session")
+        if w:
+            return w
+        col = str(card.get("column", "")).lower()
+        for wk in workers:
+            hay = (wk["name"] + " " + wk["desc"] + " " + " ".join(wk["groups"])).lower()
+            if col and any(tok in hay for tok in col.split() if len(tok) > 3):
+                return wk["name"]
+        # No match — fall back to the first worker but WARN, so a bad mapping is
+        # visible (an unowned card is inert; a mis-owned one is worse silent).
+        fb = workers[0]["name"] if workers else ""
+        sys.stderr.write(f"# WARN: card '{card.get('title','')[:40]}' (column '{card.get('column','')}') "
+                         f"could not match a worker — assigned to '{fb}'. Set the card's worker/column.\n")
+        return fb
+    cards = [{
+        "worker": _worker_for(c),
+        "title": c.get("title", ""),
+        "desc": c.get("desc", ""),
+        "status": c.get("status", "backlog"),
+        "type": c.get("type", "code"),
+        "epic": c.get("epic", ""),
+    } for c in plan.get("board", [])]
+
     envspec = {
         "groups": list(groups.values()),
         "workers": workers,
         "files": [{"path": d["path"], "content": d.get("content", "")} for d in plan.get("docs", [])],
         "schedules": schedules,
         "columns": list(plan.get("board_columns", [])),
+        "cards": cards,
     }
-    retained = {
-        "org": plan.get("org"),
-        "board": plan.get("board", []),   # EnvSpec has columns (statuses) but no CARDS stanza
-        "prompts": prompts,               # worker first-run tasks — not an EnvSpec field
-    }
+    # EnvSpec now covers the full env; only org provisioning is seed.py's.
+    retained = {"org": plan.get("org")}
     return envspec, retained
 
 
@@ -132,6 +161,9 @@ def export(org, files_dir=None):
             "desc": s.get("desc") or "",
             "model": model,
             "provider": s.get("provider") or "claude",
+            # A live env does not retain the first-run task, so export empty —
+            # authored-only (the applier steers it once on create; empty = no steer).
+            "prompt": "",
         })
         for t in tags:
             all_groups.setdefault(t, {"name": t, "department": "", "goal": ""})
@@ -165,15 +197,27 @@ def export(org, files_dir=None):
             "command": sc.get("command") or "",
         })
 
-    # ---- board columns ----
+    # ---- board columns + cards ----
     _, board_raw = seed.gw_json("GET", "/api/board", org=org)
     cols = []
     seen = set()
+    cards = []
     for it in _list(board_raw, "items"):
+        if it.get("archived") or it.get("status") == "discarded":
+            continue
         c = it.get("column") or it.get("col")
         if c and c not in seen:
             seen.add(c)
             cols.append(c)
+        # cards[] (AMUX-2977): live cards carry `session` = worker directly.
+        cards.append({
+            "worker": it.get("session") or "",
+            "title": it.get("title", ""),
+            "desc": it.get("desc", ""),
+            "status": it.get("status", "backlog"),
+            "type": it.get("type", "code"),
+            "epic": it.get("epic", ""),
+        })
 
     # ---- files (docs): {path, content}. Read content off the container path. ----
     files = []
@@ -200,6 +244,7 @@ def export(org, files_dir=None):
         "columns": cols,
         "schedules": schedules,
         "files": files,
+        "cards": cards,
     }
     return spec
 
