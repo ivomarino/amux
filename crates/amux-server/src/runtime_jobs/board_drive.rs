@@ -1182,6 +1182,12 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
          Move it to `verified` with evidence of what you checked. If you cannot confirm \
          all four, leave it in `done`. If the work is stale or was superseded, archive \
          it with a note explaining why.\n\n\
+         To see ALL of them (this list is the 8 most recent): \
+         GET /api/board?status=done&done_limit=0 scoped to you. NOTE: the UNSCOPED \
+         /api/board caps terminal (done/verified/discarded) cards at 100, so a done card \
+         of yours can look ABSENT there while it is very much on the board — check by id \
+         (GET /api/board/<id>) or with the scoped query above, not the capped default \
+         (this is the exact trap that read as 'these cards do not exist', 2026-08-13).\n\n\
          Cards that genuinely cannot be verified by you (e.g., they require a human \
          decision or access you lack) should be tagged `needs:you` so they surface \
          in the owner digest rather than sitting here indefinitely."
