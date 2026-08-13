@@ -1647,6 +1647,48 @@ fn tool_result_text(content: &Value) -> String {
 }
 
 /// py:5833 _render_session_transcript — clean ANSI render of the JSONL tail.
+/// The worker's most recent FULL assistant message, text only — no tool calls,
+/// no thinking blocks, no UI chrome. This is what read-aloud sends (Ethan:
+/// "read the most recent full message from the worker ... be intelligent about
+/// what to send"): the last assistant turn that actually SAID something, taken
+/// from the STRUCTURED transcript rather than a scrape of the rendered pane
+/// (which carries spinners and "✻ Churned for 2m" status lines that must never
+/// be read aloud). Reuses the same `session_jsonl_path` + `iter_jsonl_tail` the
+/// transcript renderer uses, so it cannot disagree with it about where the
+/// transcript is or how it is parsed (D1: a real interface, not a scrape).
+fn last_assistant_message(name: &str, max_chars: usize) -> String {
+    let Some(path) = session_jsonl_path(name) else { return String::new() };
+    let mut last = String::new();
+    for o in iter_jsonl_tail(&path, 5_000_000) {
+        if o["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = o.get("message").and_then(|m| m.as_object()) else { continue };
+        let blocks: Vec<Value> = match msg.get("content") {
+            Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+            Some(Value::Array(a)) => a.clone(),
+            _ => continue,
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for b in &blocks {
+            // text only — skip tool_use, tool_result, thinking.
+            if b["type"].as_str() == Some("text") {
+                let t = b["text"].as_str().unwrap_or("").trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        // iter_jsonl_tail is chronological, so overwriting ends on the LAST
+        // assistant turn that had text. A turn that was pure tool_use/thinking
+        // (no text block) is skipped rather than blanking the result.
+        if !parts.is_empty() {
+            last = parts.join("\n\n");
+        }
+    }
+    last.chars().take(max_chars).collect()
+}
+
 fn render_session_transcript(name: &str, max_chars: usize) -> String {
     let Some(path) = session_jsonl_path(name) else { return String::new() };
     let max_read = std::cmp::max(max_chars * 5, 5_000_000) as u64;
@@ -7645,6 +7687,18 @@ async fn get_dispatch(
             } else {
                 j200(json!({"name": name, "output": txt, "source": "transcript"}))
             }
+        }
+        // The worker's most recent full assistant message, clean — what the
+        // "read latest message" ellipsis action speaks (AMUX-3021).
+        "last-message" => {
+            let mx: usize = qs_first(qs, "max", "8000").parse().unwrap_or(8000);
+            let txt = last_assistant_message(name, mx);
+            j200(json!({
+                "name": name,
+                "text": txt,
+                "chars": txt.chars().count(),
+                "empty": txt.is_empty(),
+            }))
         }
         "info" => {
             // py:20461 get_session_info.

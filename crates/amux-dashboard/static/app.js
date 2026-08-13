@@ -2925,6 +2925,7 @@ function render() {
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
           <div class="card-menu-sep"></div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openPeek('${s.name}')"><span class="mi">&#x1F4BB;</span> Peek terminal</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();_readLatestMessage('${s.name}')"><span class="mi">&#x1F50A;</span> Read latest message</div>
           ${s.dir ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openExplore('${s.dir.replace(/'/g,"\\'")}','${s.name.replace(/'/g,"\\'")}')"><span class="mi">&#x1F4C1;</span> Browse files</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();showSessionInfo('${s.name}')"><span class="mi">&#x2139;</span> Info</div>
           <div class="card-menu-item" onclick="event.stopPropagation();togglePin('${s.name}')"><span class="mi">${s.pinned?'&#x1F4CC;':'&#x1F4CC;'}</span> ${s.pinned ? 'Unpin' : 'Pin to top'}</div>
@@ -7117,7 +7118,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.611';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.612';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10329,8 +10330,10 @@ let _ttsSpeakAudio = null;   // currently-playing one-click clip, so a second pr
 async function _ttsSpeak(text, btn) {
   if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
   if (!text) return;
-  const orig = btn.innerHTML;
-  btn.disabled = true; btn.innerHTML = '&#x23F3;';
+  // btn is optional — the worker-ellipsis "read latest message" action has no
+  // button to spin, so every btn access is guarded.
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
@@ -10346,7 +10349,25 @@ async function _ttsSpeak(text, btn) {
   } catch(e) {
     showToast('Read aloud failed: ' + e.message, 'error');
   } finally {
-    btn.disabled = false; btn.innerHTML = orig;
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
+// Worker-ellipsis "read latest message" (Ethan: click the ellipsis on a worker
+// and it reads its most recent full message aloud). The server extracts the last
+// full assistant message from the structured transcript — no spinner/status
+// chrome — so this is "intelligent about what to send" without the client having
+// to parse a rendered pane.
+async function _readLatestMessage(name) {
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders() });
+    const d = await r.json();
+    const t = (d.text || '').trim();
+    if (!t) { showToast('No recent message from ' + name); return; }
+    showToast('Reading ' + name + '’s latest message…');
+    _ttsSpeak(t, null);
+  } catch(e) {
+    showToast('Read failed: ' + e.message, 'error');
   }
 }
 
@@ -15354,7 +15375,7 @@ function _peekShowSelPopover() {
     pop = document.createElement('div');
     pop.id = 'peek-sel-popover';
     pop.style.cssText = 'position:fixed;z-index:10000;background:#1a1a2e;border:1px solid #444;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.5);padding:4px;display:flex;gap:2px;font-size:0.78rem;';
-    pop.innerHTML = '<button id="peek-sel-lookup" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50D; Look up</button><button id="peek-sel-copy" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">Copy</button>';
+    pop.innerHTML = '<button id="peek-sel-lookup" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50D; Look up</button><button id="peek-sel-copy" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">Copy</button><button id="peek-sel-read" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50A; Read aloud</button>';
     document.body.appendChild(pop);
     pop.querySelector('#peek-sel-lookup').onclick = (e) => { e.stopPropagation(); _peekLookupSelection(); };
     pop.querySelector('#peek-sel-copy').onclick = (e) => {
@@ -15362,6 +15383,17 @@ function _peekShowSelPopover() {
       const t = window.getSelection()?.toString() || '';
       if (t) navigator.clipboard?.writeText(t);
       _peekHideSelPopover();
+    };
+    // Read aloud the highlighted text (Ethan: "drag and highlight then I can do
+    // lookup copy or read aloud"). Same /api/tts path as the one-click button;
+    // the audio plays independently, so hiding the popover after kicking it off
+    // is fine (_ttsSpeak's button-state restore is harmless on the hidden node).
+    pop.querySelector('#peek-sel-read').onclick = (e) => {
+      e.stopPropagation();
+      const t = window.getSelection()?.toString() || '';
+      const btn = e.currentTarget;
+      _peekHideSelPopover();
+      if (t) _ttsSpeak(t, btn);
     };
     pop.addEventListener('mousedown', (e) => e.preventDefault()); // don't kill selection
   }
@@ -15371,7 +15403,7 @@ function _peekShowSelPopover() {
   pop.style.display = 'flex';
   // Default above selection; if no room, put below
   const popH = 36;
-  const popW = 160;
+  const popW = 250;   // three buttons: Look up · Copy · Read aloud
   let top = rect.top - popH - 8;
   if (top < 8) top = rect.bottom + 8;
   let left = rect.left + (rect.width / 2) - (popW / 2);
