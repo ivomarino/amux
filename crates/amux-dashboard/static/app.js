@@ -2052,6 +2052,21 @@ window.fetch = function(input, init) {
   return _origFetch(input, init).catch(e => {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
+    // BEACON — this path queues the op and returns a synthetic 202, so the
+    // request never reached the server and left NO request-log row. That is why
+    // a "Run now says it failed" report was undiagnosable: the failing call is
+    // invisible server-side (ethos rule 4). amuxTrack posts a client-debug
+    // beacon so the next occurrence self-announces (two-fixes, AMUX-3049).
+    // Lossy iff the server is fully down at that instant (client-debug is
+    // outbox-skipped) — but a brief blip, and any partial-fleet outage, lands
+    // it; a full restart is separately visible as a moved /health build hash.
+    try {
+      amuxTrack('fetch_unreachable', {
+        url: String(url).split('?')[0],
+        method: ((init && init.method) || 'GET').toUpperCase(),
+        err: String(e).slice(0, 200),
+      });
+    } catch (_) {}
     _queueOp(url, init || {});
     return _outboxAccepted();
   });
@@ -7124,7 +7139,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.615';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.616';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18262,6 +18277,17 @@ function renderSchedulerAudit(rowsIn, liveIdsIn) {
 // reads "queued" and waits is correct, and one who reads "Ran" and waits is
 // the one who presses the button three more times.
 function _schedRunToast(d) {
+  // The offline outbox hands back a synthetic 202 {ok,queued,offline} with NO
+  // `status`, so this used to fall through to `default` and render a QUEUED run
+  // as "Ran · unknown outcome" — a run that has not run, described as if it had.
+  // That is what a Run-now click during a server blip produced (Ethan,
+  // 2026-08-13, clicking during a build-swap restart; the POST threw, the
+  // interceptor queued it and returned this 202). `offline` is set ONLY by
+  // _outboxAccepted — the real server never sets it, and its genuine
+  // RunOutcome::Queued carries status:"queued", handled in the switch below.
+  if (d && d.offline) {
+    return 'Couldn’t reach the server — the run is queued and will fire on reconnect';
+  }
   const note = String(d.note || '').split('\n')[0].slice(0, 90);
   const tail = note ? ' · ' + note : '';
   switch (String(d.status || '')) {
@@ -18816,11 +18842,15 @@ async function runScheduleNow(id) {
       _peekRefreshSchedIfActive();
       if (typeof showToast === 'function') showToast(_schedRunToast(d));
     } else if (typeof showToast === 'function') {
-      // apiCall returns null for BOTH "queued while offline" and "refused".
-      // Calling a queued run a failure would be its own wrong-message bug —
-      // the user would press again, which is the behaviour being fixed.
-      showToast(online ? 'Run failed — the server did not accept it'
-                       : 'Offline — run queued, will fire when reconnected');
+      // apiCall returns null only AFTER it has already toasted the reason: for a
+      // server refusal it shows the server's own error text; a transient
+      // unreachable is captured by the fetch interceptor into a queued 202 that
+      // renders through _schedRunToast above, NOT here. Keying on `online` to
+      // print "the server did not accept it" was the bug — on the first failed
+      // fetch `online` is still true while the op was already queued for replay,
+      // so a queued run read as a rejection and invited a re-click (Ethan,
+      // 2026-08-13, AMUX-3049). Only the pure-offline path is unspoken-for here.
+      if (!online) showToast('Offline — run queued, will fire when reconnected');
     }
   } finally {
     if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
