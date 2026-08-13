@@ -136,6 +136,18 @@ const BACKLOG_TRIAGE_COOLDOWN_S: f64 = 72.0 * 3600.0;
 const BACKLOG_TRIAGE_THRESHOLD: usize = 10;
 /// Cards older than this (created_at) are considered stale backlog.
 const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
+/// Idle-backlog DRAIN nudge cooldown: 2h per session. Distinct from the 72h
+/// stale-triage above — this fires when a lane is idle (no doing) with an empty
+/// todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
+/// completion" case (a lane holding only backlog sits idle forever because
+/// board_drive dispatches `todo`, not `backlog`). Short so a still-idle lane is
+/// re-nudged until it pulls work into todo. Overridable for tests/tuning.
+fn idle_backlog_drain_cooldown_s() -> f64 {
+    std::env::var("AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0 * 3600.0)
+}
 /// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
 const DEFAULT_ITEM_TYPE: &str = "code";
 
@@ -1169,6 +1181,52 @@ fn stale_backlog_candidates(
         .map(|rows| rows.flatten().collect())
     })
     .unwrap_or_default()
+}
+
+/// Backlog cards of ANY age, newest first — the candidates for the idle-drain
+/// nudge (a lane sitting on a fresh backlog with nothing in todo). Newest first
+/// because a just-arrived batch is the likeliest thing the worker meant to act
+/// on; the worker's own model picks which to promote.
+fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
+    conn.prepare(
+        "SELECT id, title, created FROM issues \
+         WHERE session=?1 AND status='backlog' AND deleted IS NULL \
+         AND COALESCE(archived,0)=0 AND owner_type='agent' \
+         ORDER BY created DESC LIMIT 8",
+    )
+    .and_then(|mut st| {
+        st.query_map(rusqlite::params![session], |r| {
+            let created: i64 = r.get(2)?;
+            let age_days = (now - created) / 86400;
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, age_days))
+        })
+        .map(|rows| rows.flatten().collect())
+    })
+    .unwrap_or_default()
+}
+
+/// The idle-drain prompt: a lane is doing nothing while it holds a backlog. The
+/// action is the WORKER'S to choose (which cards, in what order) — amux only
+/// surfaces the stall (D1 exit: the model drives, the harness reports).
+fn backlog_drain_text(cards: &[(String, String, i64)], total_backlog: i64) -> String {
+    let list = cards
+        .iter()
+        .map(|(id, title, _)| {
+            let t: String = title.chars().take(70).collect();
+            format!("  {id}  {t}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[amux] You are idle with {total_backlog} card(s) in `backlog` and nothing in \
+         `todo` or `doing`. board-drive only dispatches `todo`, so this queue will not move \
+         on its own — you have to pull from it.\n\n\
+         {list}\n\n\
+         Pick the next actionable card(s), move them to `todo` (they get dispatched) or \
+         straight to `doing` and start, and for anything that is blocked, done, or no longer \
+         relevant, say so and move it (review / done / archive). Do not leave the whole \
+         backlog sitting while you idle — drain it."
+    )
 }
 
 fn stale_backlog_count(conn: &Connection, session: &str, now: i64) -> i64 {
@@ -2329,25 +2387,6 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 };
                 let now_i = now as i64;
                 let stale_count = stale_backlog_count(&conn, lane, now_i);
-                if (stale_count as usize) < BACKLOG_TRIAGE_THRESHOLD {
-                    break 'triage None;
-                }
-                let recent: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM session_events WHERE session=?1 \
-                         AND type='backlog.triage_nudge' AND ts > ?2 LIMIT 1",
-                        rusqlite::params![lane, now - BACKLOG_TRIAGE_COOLDOWN_S],
-                        |_| Ok(true),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-                if recent {
-                    break 'triage Some(format!(
-                        "has {stale_count} stale backlog card(s) but triage-nudge sent within 72h"
-                    ));
-                }
                 let total_backlog: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
@@ -2356,17 +2395,70 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                let cards = stale_backlog_candidates(&conn, lane, now_i);
+                let doing_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='doing' \
+                         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+                        rusqlite::params![lane],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                // TWO shapes of the same "backlog isn't moving" problem:
+                //  * STALE TRIAGE: 10+ cards over 14 days old — archive cruft /
+                //    promote the still-actionable ones (72h cooldown).
+                //  * IDLE DRAIN (Ethan 2026-08-12, the "board doesn't drive to
+                //    completion" bug): the lane is doing NOTHING, has no
+                //    dispatchable todo (`eligible == 0`), and holds backlog of
+                //    ANY age. board-drive dispatches `todo`, never `backlog`, so
+                //    a lane handed only backlog sits idle forever (tubescience:
+                //    51 backlog / 0 todo / 0 doing). Short cooldown so a lane
+                //    that stays idle keeps getting nudged until it drains.
+                let idle_drain = doing_count == 0 && eligible == 0 && total_backlog > 0;
+                let stale_enough = (stale_count as usize) >= BACKLOG_TRIAGE_THRESHOLD;
+                if !idle_drain && !stale_enough {
+                    break 'triage None;
+                }
+                let (event_type, cooldown_s) = if idle_drain {
+                    ("backlog.drain_nudge", idle_backlog_drain_cooldown_s())
+                } else {
+                    ("backlog.triage_nudge", BACKLOG_TRIAGE_COOLDOWN_S)
+                };
+                let recent: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM session_events WHERE session=?1 \
+                         AND type=?2 AND ts > ?3 LIMIT 1",
+                        rusqlite::params![lane, event_type, now - cooldown_s],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if recent {
+                    break 'triage Some(format!(
+                        "backlog nudge ({event_type}) already sent within cooldown"
+                    ));
+                }
+                let cards = if idle_drain {
+                    backlog_candidates(&conn, lane, now_i)
+                } else {
+                    stale_backlog_candidates(&conn, lane, now_i)
+                };
                 if cards.is_empty() {
                     break 'triage None;
                 }
                 drop(conn);
-                let text = backlog_triage_text(&cards, stale_count, total_backlog);
+                let text = if idle_drain {
+                    backlog_drain_text(&cards, total_backlog)
+                } else {
+                    backlog_triage_text(&cards, stale_count, total_backlog)
+                };
                 crate::api::session_verbs::emit_event(
                     state,
                     lane,
-                    "backlog.triage_nudge",
+                    event_type,
                     Some(json!({
+                        "idle_drain": idle_drain,
                         "stale_count": stale_count,
                         "total_backlog": total_backlog,
                         "cards": cards.iter().map(|(id,_,_)| id.as_str()).collect::<Vec<_>>(),
@@ -2378,9 +2470,13 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 fleet.deliver(lane, &text).await;
                 return LaneTrace::acted(
                     lane,
-                    "backlog-triage",
-                    cards.first().map(|(id,_,_)| id.as_str()).unwrap_or(""),
-                    format!("{stale_count} stale backlog card(s) of {total_backlog} total, triage prompt delivered"),
+                    if idle_drain { "backlog-drain" } else { "backlog-triage" },
+                    cards.first().map(|(id, _, _)| id.as_str()).unwrap_or(""),
+                    if idle_drain {
+                        format!("idle with {total_backlog} backlog / 0 todo — drain prompt delivered")
+                    } else {
+                        format!("{stale_count} stale backlog card(s) of {total_backlog} total, triage prompt delivered")
+                    },
                 )
                 .with_counts(eligible, open);
             };
@@ -2955,6 +3051,40 @@ mod tests {
             assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
             assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 0, "{t} must not count as eligible");
         }
+    }
+
+    /// AMUX-3006 (Ethan: "fix the backlog thing so it drives on its own"). A lane
+    /// holding ONLY backlog with nothing dispatchable in todo is the idle-drain
+    /// case — board-drive dispatches `todo`, so that queue never moves on its own.
+    /// The discriminator is the drain INPUTS: backlog candidates exist AND
+    /// eligible_todo_count is 0. A lane with a todo is dispatched, not drained.
+    #[test]
+    fn a_lane_with_only_backlog_is_a_drain_candidate_a_lane_with_a_todo_is_not() {
+        let conn = board_db();
+        let now = now_f64();
+        // The tubescience shape: fresh backlog, nothing in todo/doing.
+        add_card(&conn, "B-1", "lane", "backlog", "fresh batch item one", "SCOPE: x");
+        add_card(&conn, "B-2", "lane", "backlog", "fresh batch item two", "SCOPE: x");
+        assert_eq!(
+            eligible_todo_count(&conn, "lane", 1_000_000.0),
+            0,
+            "a backlog-only lane has nothing dispatchable — this is what makes it a drain, not a pickup"
+        );
+        let cands = backlog_candidates(&conn, "lane", now as i64);
+        assert_eq!(cands.len(), 2, "both backlog cards are drain candidates: {cands:?}");
+        let text = backlog_drain_text(&cands, 2);
+        assert!(
+            text.contains("idle") && text.contains("B-1") && text.contains("backlog"),
+            "the drain prompt must name the stall and a concrete card: {text}"
+        );
+
+        // Control that proves the discriminator can fail: a todo card is
+        // DISPATCHED (eligible > 0), so the lane is never in the drain branch.
+        add_card(&conn, "T-1", "lane2", "todo", "actionable", "SCOPE: x\n- [ ] y");
+        assert!(
+            eligible_todo_count(&conn, "lane2", 1_000_000.0) > 0,
+            "a lane with a todo is dispatched by the normal path, not drained"
+        );
     }
 
     /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
