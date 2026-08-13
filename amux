@@ -2543,8 +2543,34 @@ cmd_whoami() {
 # `source amux`), $0 is the parent shell's $0 and the guard skips dispatch.
 # This lets the test suite source the script to access helper functions
 # without triggering CLI side effects.
+# One-time-per-session warning when $AMUX_URL points at a DEAD port (mvs-infra,
+# AMUX-2944). A session started before the 8822 compat bind was removed carries
+# the retired value for its whole life — env can't be re-read live — and a raw
+# `curl $AMUX_URL/...` PATCH then exits 0 with an EMPTY body, indistinguishable
+# from a successful write (mvs-infra silently lost a board PATCH this way). This
+# CLI is fine (it resolves AMUX_API=8824); the warning is so the SESSION stops
+# trusting $AMUX_URL for raw curls and repairs its own shell. Cheap: one 2s probe
+# gated by a per-session marker. ALWAYS returns 0 — a hot path 48 lanes run must
+# never break because a diagnostic failed.
+_warn_stale_amux_url() {
+  local api="${AMUX_API:-https://localhost:8824}"
+  local url="${AMUX_URL:-}"
+  if [ -z "$url" ] || [ "$url" = "$api" ]; then return 0; fi
+  local marker="${TMPDIR:-/tmp}/amux-url-warn-${AMUX_SESSION:-unknown}"
+  if [ -f "$marker" ]; then return 0; fi
+  if curl -sk -m 2 -o /dev/null "$url/health" 2>/dev/null; then return 0; fi
+  touch "$marker" 2>/dev/null || true
+  {
+    echo "amux: WARNING — \$AMUX_URL ($url) does not answer; this CLI is fine (it uses $api)."
+    echo "  But raw 'curl \$AMUX_URL/...' will SILENTLY FAIL — exit 0, empty body, looks exactly like a successful write."
+    echo "  Repair your shell for raw curls:  export AMUX_URL=$api"
+  } >&2
+  return 0
+}
+
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   ensure_dirs
+  _warn_stale_amux_url
 
   case "${1:-}" in
     register|reg)     shift; cmd_register "$@" ;;
