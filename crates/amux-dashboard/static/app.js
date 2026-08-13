@@ -1865,6 +1865,13 @@ async function _apiErrText(r) {
         // Gate refusals carry the exact command that WOULD work — that is the
         // most actionable thing in the whole response; surface it.
         if (msg && j.cli) msg += ' — try: ' + j.cli;
+        // Same idea, different key. The scheduler's shadow-mode 409 answers
+        // "what do I do about it" in `enable` (AMUX_RS_SCHEDULER=1), and only
+        // `cli` was being read — so the half of the body that was actionable
+        // was the half dropped. Any refusal that names its own remedy should
+        // carry it to the toast; a reason without a remedy still leaves the
+        // user asking someone.
+        if (msg && j.enable) msg += ' — set ' + j.enable;
       } catch (e) { msg = txt.slice(0, 200); }
     }
   } catch (e) { /* body already consumed or unreadable — status only */ }
@@ -7117,7 +7124,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.608';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.609';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18635,12 +18642,20 @@ async function runScheduleNow(id) {
       renderSchedulerAudit();
       _peekRefreshSchedIfActive();
       if (typeof showToast === 'function') showToast(_schedRunToast(d));
-    } else if (typeof showToast === 'function') {
-      // apiCall returns null for BOTH "queued while offline" and "refused".
-      // Calling a queued run a failure would be its own wrong-message bug —
-      // the user would press again, which is the behaviour being fixed.
-      showToast(online ? 'Run failed — the server did not accept it'
-                       : 'Offline — run queued, will fire when reconnected');
+    } else if (!online && typeof showToast === 'function') {
+      // ONLY the offline case toasts here. apiCall returns null for BOTH
+      // "queued while offline" and "refused" — but on a refusal it has ALREADY
+      // shown the server's own sentence via _apiErrText, and showToast writes
+      // one shared element, so a second call here REPLACES it. That is how
+      // "409: rust scheduler is in shadow mode — set AMUX_RS_SCHEDULER=1"
+      // reached the screen as "Run failed — the server did not accept it", and
+      // the owner had to ask a session why (AMUX-43). The message was never
+      // swallowed in transit; it was overwritten at the last hop by a worse one.
+      //
+      // The offline branch stays: calling a queued run a failure would be its
+      // own wrong-message bug — the user would press again, which is the
+      // behaviour AMUX-2679 fixed.
+      showToast('Offline — run queued, will fire when reconnected');
     }
   } finally {
     if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
