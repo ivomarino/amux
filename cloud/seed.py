@@ -703,7 +703,15 @@ def main():
         print("FATAL: COOKIE_SECRET not set")
         return 1
 
-    plan = json.load(open(a.plan))
+    # Accept YAML or JSON. The convergence (AMUX-2779) is toward ONE format —
+    # the EnvSpec YAML that /api/env/apply reads and export_env.py emits — so a
+    # plan authored or exported as .yaml loads here without a separate converter.
+    # JSON still loads unchanged (superset), so existing plans/*.json keep working.
+    if a.plan.endswith((".yaml", ".yml")):
+        import yaml
+        plan = yaml.safe_load(open(a.plan))
+    else:
+        plan = json.load(open(a.plan))
     print(f"═══ amux workspace seed: {os.path.basename(a.plan)} ═══")
     print(f"    gateway: {GATEWAY}")
 
