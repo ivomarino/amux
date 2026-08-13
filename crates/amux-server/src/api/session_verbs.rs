@@ -4341,6 +4341,72 @@ fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Seed per-directory folder-trust so a freshly-spawned claude in `work_dir`
+/// does not stop at the first-run "Do you trust the files in this folder?"
+/// dialog (AC-346). Claude persists trust as
+/// `projects[<dir>].hasTrustDialogAccepted=true` in `~/.claude.json`; there is
+/// NO global flag (amux-cloud confirmed the config surface — trust is
+/// per-project only), so a static Dockerfile cannot cover future verticals'
+/// dirs. It must be seeded at launch, when CC_DIR is known.
+///
+/// STRICTLY FAIL-OPEN. This runs on the path that spawns EVERY worker, so a
+/// missing / locked / malformed `~/.claude.json` must NEVER block a launch: every
+/// error returns quietly and the worst case is the status quo (the gate is not
+/// bypassed), never a wedged launch. Merge-preserving — the whole document is
+/// read, ONE nested field is set, and it is written back, so `oauthAccount`,
+/// other projects, and the theme are untouched. A present-but-unparseable file
+/// is left ALONE rather than risk clobbering real state. No-op locally where the
+/// dir is already trusted (the common case), so it is a genuine single-codebase
+/// no-op there, not an env branch.
+fn seed_dir_trust(work_dir: &str) {
+    if work_dir.is_empty() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join(".claude.json");
+    let doc: Value = match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return, // malformed: never clobber a file we cannot safely merge
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => return,
+    };
+    let Some(updated) = trust_seed_merge(doc, work_dir) else {
+        // None => already trusted (no write) or an unmergeable shape (left alone).
+        return;
+    };
+    let Ok(body) = serde_json::to_string(&updated) else { return };
+    // Atomic write: temp + rename, so a concurrent reader (another worker's
+    // claude) never sees a truncated document.
+    let tmp = path.with_extension("json.amux-trust-tmp");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Pure merge for [`seed_dir_trust`], split out so the shape handling is tested
+/// without touching `$HOME`. Returns `Some(doc)` with
+/// `projects[dir].hasTrustDialogAccepted=true` folded in, or `None` when it is
+/// already `true` (nothing to write) or the document is not a mergeable object
+/// (leave the real file alone).
+fn trust_seed_merge(mut doc: Value, dir: &str) -> Option<Value> {
+    let root = doc.as_object_mut()?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    let entry = projects
+        .entry(dir.to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    if entry.get("hasTrustDialogAccepted") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+    Some(doc)
+}
+
 async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
@@ -4386,6 +4452,10 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| expanduser(&wd).to_string_lossy().into_owned())
     };
+    // AC-346: seed per-directory folder-trust so the claude about to launch in
+    // work_dir does not stop at the first-run "trust this folder?" dialog. Runs
+    // BEFORE the pane starts claude; strictly fail-open (see seed_dir_trust).
+    seed_dir_trust(&work_dir);
     let mut flags = cfg.get_or("CC_FLAGS", "").to_string();
     #[cfg(unix)]
     {
@@ -10995,6 +11065,39 @@ fn getrandom_fill(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC-346: the folder-trust seed must fold `hasTrustDialogAccepted=true` into
+    /// `projects[dir]` WITHOUT disturbing the rest of `~/.claude.json`, and must
+    /// no-op when it is already set or the shape is not mergeable.
+    #[test]
+    fn trust_seed_merges_without_clobbering_and_is_idempotent() {
+        // Preserves oauthAccount + a sibling project, adds the flag to our dir.
+        let existing = json!({
+            "oauthAccount": {"emailAddress": "x@y.z"},
+            "theme": "dark",
+            "projects": {
+                "/other/dir": {"hasTrustDialogAccepted": true, "history": [1, 2]}
+            }
+        });
+        let got = trust_seed_merge(existing, "/work/dir").expect("a new dir must merge");
+        assert_eq!(got["oauthAccount"]["emailAddress"], "x@y.z", "oauth untouched");
+        assert_eq!(got["theme"], "dark", "theme untouched");
+        assert_eq!(got["projects"]["/other/dir"]["hasTrustDialogAccepted"], true, "sibling untouched");
+        assert_eq!(got["projects"]["/other/dir"]["history"], json!([1, 2]));
+        assert_eq!(got["projects"]["/work/dir"]["hasTrustDialogAccepted"], true, "our dir now trusted");
+
+        // A missing file (empty object) seeds cleanly.
+        let fresh = trust_seed_merge(json!({}), "/work/dir").expect("empty doc must merge");
+        assert_eq!(fresh["projects"]["/work/dir"]["hasTrustDialogAccepted"], true);
+
+        // Already trusted -> None (no pointless rewrite of a large file, and no
+        // race window on the common case).
+        let already = json!({"projects": {"/work/dir": {"hasTrustDialogAccepted": true}}});
+        assert!(trust_seed_merge(already, "/work/dir").is_none(), "no write when already trusted");
+
+        // Unmergeable shape (root is not an object) -> None, leave it alone.
+        assert!(trust_seed_merge(json!("not an object"), "/work/dir").is_none());
+    }
 
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
     /// explicitly configured. The escapes must be CONFIG — a body flag any
