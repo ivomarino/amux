@@ -554,26 +554,36 @@ async fn raw(req: Request) -> Response {
     // for true binaries — or when ?download=1 is explicitly requested. Before
     // this, everything except video/audio got `attachment`, so an HTML report,
     // image, or PDF served by amux DOWNLOADED instead of rendering and the page
-    // stayed about:blank (amax-gtm, 2026-08-13). Streamable media stays inline so
-    // iOS Safari streams a 3GB video instead of downloading it (py:68103).
+    // stayed about:blank (amax-gtm, 2026-08-13).
     let kind = mime.split('/').next().unwrap_or("");
     let force_dl = matches!(qs_get(&qs, "download").unwrap_or(""), "1" | "true" | "yes");
     let renderable = matches!(kind, "video" | "audio" | "image" | "text")
         || mime == "application/pdf"
         || mime.starts_with("application/json");
-    let disp_kind = if force_dl || !renderable { "attachment" } else { "inline" };
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let disp = format!("{disp_kind}; filename=\"{name}\"");
 
     let range_header =
         req.headers().get("range").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let common = [
+    // Content-Disposition is a DOWNLOAD directive — emit it ONLY to force a
+    // download (attachment). For an inline render we send NO disposition at all:
+    // a `Content-Disposition` header (even `inline`, even one that only carries a
+    // filename=) sends Chrome-over-CDP down a download path on navigation, which
+    // commits the tab to a download and leaves it documentless — body null,
+    // ready_state stuck "loading", Page.captureScreenshot times out (amux-gtm,
+    // 2026-08-13, verified: same bytes render over file:// but not via this route
+    // until the header was dropped). With no disposition present the browser
+    // chooses render-vs-download from Content-Type alone, which is exactly what a
+    // renderable type wants. Streamable media stays inline the same way (py:68103
+    // wanted inline so iOS Safari streams a 3GB video instead of downloading it).
+    let mut common: Vec<(&str, String)> = vec![
         ("content-type", mime.to_string()),
-        ("content-disposition", disp),
         ("accept-ranges", "bytes".to_string()),
         ("etag", etag),
         ("cache-control", "private, max-age=3600, immutable".to_string()),
     ];
+    if force_dl || !renderable {
+        common.push(("content-disposition", format!("attachment; filename=\"{name}\"")));
+    }
     if !range_header.is_empty() {
         // Python `re.match(r'bytes=(\d*)-(\d*)')`: absent groups default to
         // 0 / EOF; an UNPARSABLE Range still answers 206 over the full file
@@ -1739,7 +1749,9 @@ pub(crate) mod tests {
         assert_eq!(h["content-length"], "10");
         assert_eq!(h["accept-ranges"], "bytes");
         assert_eq!(h["content-type"], "video/mp4");
-        assert_eq!(h["content-disposition"], "inline; filename=\"clip.mp4\"");
+        // Inline media carries NO Content-Disposition (its presence wedges
+        // Chrome-over-CDP into a download; amux-gtm 2026-08-13).
+        assert!(h.get("content-disposition").is_none());
         assert_eq!(h["etag"], etag.as_str());
         assert_eq!(h["cache-control"], "private, max-age=3600, immutable");
         assert_eq!(body, payload[10..20].to_vec());
@@ -1814,7 +1826,13 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(h["content-type"], "text/html; charset=utf-8");
-        assert_eq!(h["content-disposition"], "inline; filename=\"report.html\"");
+        // No Content-Disposition at all for an inline render — its mere presence
+        // (even `inline`) wedges Chrome-over-CDP into a download (amux-gtm).
+        assert!(
+            h.get("content-disposition").is_none(),
+            "renderable types must not carry a Content-Disposition: {:?}",
+            h.get("content-disposition")
+        );
 
         // ?download=1 forces attachment even for a renderable type.
         let (_, h, _) = send(

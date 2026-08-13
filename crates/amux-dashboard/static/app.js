@@ -7367,7 +7367,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.627';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.628';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -29720,6 +29720,10 @@ let _bwActiveProfile = '';     // profile the current session is running under
 let _bwLive = false;           // live auto-refresh on?
 let _bwLiveTimer = null;
 let _bwShotInFlight = false;   // debounce: skip a screenshot while one is running
+let _bwWantFrame = false;      // we've navigated and EXPECT a live frame — a blank
+                               // viewport now is a failure, not the initial state
+let _bwHasFrame = false;       // a frame has actually painted since the last nav
+let _bwShotFails = 0;          // consecutive silent live-tick failures (for backoff msg)
 let _bwAgentCtl = null;        // AbortController for the running agent task
 
 async function _bwInit() {
@@ -29815,6 +29819,9 @@ async function _bwGo() {
     _bwCurrentUrl = (d.data && d.data.url) || url;
     _bwShowProfile(d.profile, d.auto_profile);
     _bwStatus('Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : ''));
+    // We navigated → we now EXPECT a live frame; a blank viewport from here is a
+    // failure, not the initial state (drives _bwViewportFail).
+    _bwWantFrame = true; _bwHasFrame = false; _bwShotFails = 0;
     _bwViewport = null;
     await _bwFetchViewport();
     // Auto-refresh a couple times, then flip live view on so the page stays current
@@ -29842,26 +29849,57 @@ async function _bwScreenshot(retries, silent) {
     const d = await r.json();
     if (d.path) {
       const img = document.getElementById('bw-img');
+      img.onerror = () => _bwViewportFail('the screenshot could not be loaded');
       img.src = _authUrl('/api/file/raw?path=' + encodeURIComponent(d.path) + '&t=' + Date.now());
       img.style.display = '';
       document.getElementById('bw-placeholder').style.display = 'none';
+      _bwHasFrame = true; _bwShotFails = 0;
       if (!silent) _bwStatus('Updated ' + new Date().toLocaleTimeString());
     } else if (retries > 0) {
       _bwShotInFlight = false;
       setTimeout(() => _bwScreenshot(retries - 1, silent), 1500);
       return;
-    } else if (!silent) {
-      _bwStatus(d.error || 'Screenshot failed');
+    } else {
+      _bwShotFails++;
+      if (!silent) _bwStatus(d.error || 'Screenshot failed');
+      _bwViewportFail(d.error || 'the browser did not return a screenshot');
     }
   } catch(e) {
     if (retries > 0) {
       _bwShotInFlight = false;
       setTimeout(() => _bwScreenshot(retries - 1, silent), 1500);
       return;
-    } else if (!silent) { _bwStatus('Error: ' + e.message); }
+    } else {
+      _bwShotFails++;
+      if (!silent) _bwStatus('Error: ' + e.message);
+      _bwViewportFail(e.message);
+    }
   } finally {
     _bwShotInFlight = false;
   }
+}
+
+// The live view used to fail SILENTLY: after a navigation, if screenshots kept
+// failing (browser closed, tab wedged, CDP capture timed out) the viewport just
+// stayed on the "Enter a URL" placeholder with no error — you could not tell a
+// not-started view from a broken one ("nothing is shown here", Ethan 2026-08-13).
+// Now a failure that happens AFTER we expected a frame, and before any frame has
+// painted, replaces the placeholder with the real reason + a retry. Guarded so a
+// single transient live-tick miss never clobbers a good frame already on screen.
+function _bwViewportFail(reason) {
+  if (!_bwWantFrame || _bwHasFrame) return;   // don't overwrite a working view
+  const ph = document.getElementById('bw-placeholder');
+  const img = document.getElementById('bw-img');
+  if (img) img.style.display = 'none';
+  if (!ph) return;
+  ph.style.display = 'flex';
+  ph.innerHTML = '<div style="max-width:420px;">'
+    + '<div style="font-weight:600;color:var(--fg);margin-bottom:6px;">Live view unavailable</div>'
+    + '<div style="margin-bottom:10px;">' + esc(String(reason || 'the browser did not return a frame'))
+    + '.<br>The page may still be loading, or the browser tab may have closed or wedged'
+    + (_bwShotFails > 1 ? ' (' + _bwShotFails + ' failed attempts)' : '') + '.</div>'
+    + '<button class="bw-btn primary" onclick="_bwScreenshot(2)">Retry</button> '
+    + '<button class="bw-btn" onclick="_bwGo()">Reload page</button></div>';
 }
 
 // ── Live auto-refresh (deliverable #4) ──

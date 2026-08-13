@@ -368,6 +368,11 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
     };
     if let Some(u) = q.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
         if let Err(e) = chrome::navigate_and_settle(&mut cdp, u).await {
+            // Log signal (two-fixes rule): a wedged navigation / capture shows as
+            // a blank live view in the dashboard with no other trace. Surface it
+            // so a log sweep / /api/logs catches "browser session X can't render"
+            // without a human noticing the empty viewport first.
+            tracing::warn!("[browser] navigate failed for session {session:?} → {u}: {e}");
             return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }));
         }
     }
@@ -393,7 +398,13 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
             }))
             .into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => {
+            // e.g. "CDP Page.captureScreenshot timed out after 30s" (amux-gtm,
+            // 2026-08-13) — the tab wedged and the viewport went blank. WARN so
+            // the failure is visible in the logs, not only as an empty view.
+            tracing::warn!("[browser] screenshot capture failed for session {session:?}: {e}");
+            err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
+        }
     }
 }
 
