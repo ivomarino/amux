@@ -57,6 +57,7 @@ pub mod lookup;
 pub mod config_iac;
 pub mod skin;
 pub mod commit_mentions;
+pub mod workflow;
 pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
@@ -253,6 +254,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/board/commit-mentions",
             axum::routing::get(commit_mentions::commit_mentions),
+        )
+        .route(
+            "/api/sessions/{name}/workflow",
+            axum::routing::get(workflow::workflow),
         )
         // The shared-checkout staged-guard's endpoint. UNROUTED since the
         // rust cutover — 405, ~1,147 calls/hour, and the installed
