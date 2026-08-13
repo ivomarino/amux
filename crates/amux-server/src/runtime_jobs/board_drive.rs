@@ -662,10 +662,16 @@ fn last_advance(conn: &Connection, session: &str) -> Option<(f64, Option<String>
 /// re-derives its filter from what seems sensible drifts the moment the
 /// mechanism moves; it has to SHARE the text.
 ///
+/// `epic` joins `tripwire`/`watch` in the type exclusion (AMUX-3005): an epic is
+/// a CONTAINER whose CHILDREN carry the work, so auto-picking it as a unit hands
+/// a lane something it cannot "do" — the epic AMUX-3005 was claimed exactly that
+/// way. Same reason it is excluded from the drain and the WIP-holding count
+/// below; a container is never dispatchable, drainable, or a WIP slot.
+///
 /// Params: ?1 = session, ?2 = fresh_cut (epoch s), ?3 = reclaim_cut (epoch s).
 const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
      AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
-     AND COALESCE(i.type,'') NOT IN ('tripwire','watch') \
+     AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
      AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                      AND lower(t.tag) LIKE 'needs:you%') \
      AND i.updated >= ?2 \
@@ -912,7 +918,7 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     let holding: Vec<String> = conn
         .prepare(
             "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
-             AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+             AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
              AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
                              AND lower(t.tag) LIKE 'needs:you%') \
              ORDER BY id",
@@ -1219,7 +1225,7 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
-         AND type NOT IN ('tripwire','watch') AND COALESCE(source_ref,'')='' \
+         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')='' \
          ORDER BY created DESC LIMIT 8",
     )
     .and_then(|mut st| {
@@ -2451,7 +2457,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     .query_row(
                         "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
                          AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
-                         AND type NOT IN ('tripwire','watch') AND COALESCE(source_ref,'')=''",
+                         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')=''",
                         rusqlite::params![lane],
                         |r| r.get(0),
                     )
@@ -3185,6 +3191,47 @@ mod tests {
         assert!(
             parked.is_empty(),
             "a tripwire and a source_ref-triggered card are correctly parked, not drainable: {parked:?}"
+        );
+    }
+
+    /// AMUX-3005: an EPIC is a container, not a work unit — its children carry
+    /// the work — so it must never be dispatched (auto-picked) or drained. The
+    /// epic AMUX-3005 was auto-claimed as if it were a task; `epic` now joins
+    /// tripwire/watch in the exclusion. Control first (a `code` card on the same
+    /// lane IS dispatchable) so the assertion cannot pass vacuously.
+    #[test]
+    fn an_epic_is_never_dispatched_or_drained() {
+        let conn = board_db();
+        let now = now_f64();
+        // Control: a real code todo on the epic's lane IS dispatchable.
+        add_card(&conn, "C-1", "elane", "todo", "real work", "SCOPE: x\n- [ ] y");
+        assert!(
+            eligible_todo_count(&conn, "elane", 1_000_000.0) > 0,
+            "control: a code todo must be dispatchable, or this test proves nothing"
+        );
+        // An epic in TODO is not dispatchable — the count ignores it, so the lane
+        // is dispatched on C-1 alone, never handed the epic.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+             VALUES ('EP-1','[EPIC] command center','x','todo','elane',?1,?1,'agent','epic')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_todo_count(&conn, "elane", 1_000_000.0),
+            1,
+            "the epic must NOT add to the dispatchable count — only C-1 is"
+        );
+        // An epic in BACKLOG is not a drain candidate on an otherwise-empty lane.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+             VALUES ('EP-2','[EPIC] other','x','backlog','elane2',?1,?1,'agent','epic')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        assert!(
+            backlog_candidates(&conn, "elane2", now as i64).is_empty(),
+            "an epic in backlog is a container, not drainable work"
         );
     }
 

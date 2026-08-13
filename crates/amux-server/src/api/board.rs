@@ -2220,7 +2220,7 @@ pub async fn patch_item(
                                     "SELECT id FROM issues WHERE session = ?1 \
                                      AND status = 'doing' AND id != ?2 \
                                      AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-                                     AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+                                     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
                                      ORDER BY id",
                                 )
                                 .and_then(|mut st| {
