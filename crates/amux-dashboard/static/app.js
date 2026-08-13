@@ -7367,7 +7367,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.626';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.627';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11848,7 +11848,22 @@ function _peekMessagesRender() {
   }).join('');
   const cnt = document.getElementById('peek-messages-count');
   if (cnt) cnt.textContent = (pending.length ? pending.length + ' pending · ' : '') + items.length + (items.length === 1 ? ' message' : ' messages');
-  const histHTML = items.length ? items.map(e => _cmdHistItemHTML(e, _msgCtxPeek())).join('') : '';
+  // Date-group headers (Ethan 2026-08-13: "still has no timestamp thing"): the
+  // per-worker Messages list never got the review-by-calendar pattern the global
+  // Messages tab has. Same helpers, same sticky header, same data-day the picker
+  // scrolls to. Rows are newest-first, so each header labels the day below it;
+  // a string legacy entry has no ts -> _msgDayKey returns 'unknown'.
+  let _pmPrevDay = null;
+  const histHTML = items.length ? items.map(e => {
+    const _ts = (typeof e === 'string') ? null : (e.time || e.ts);
+    const _day = _msgDayKey(_ts);
+    let hdr = '';
+    if (_day !== _pmPrevDay) {
+      hdr = '<div class="msgs-date-header" data-day="' + esc(_day) + '">' + esc(_msgDayLabel(_ts)) + '</div>';
+      _pmPrevDay = _day;
+    }
+    return hdr + _cmdHistItemHTML(e, _msgCtxPeek());
+  }).join('') : '';
   // Empty state must name the active filter. "No messages sent to this session
   // yet" is false when you are simply looking at the Scheduled slice of a
   // session that has plenty of human messages.
@@ -11876,6 +11891,26 @@ function _peekMessagesRender() {
   list.innerHTML = (pendingHTML + histHTML)
     || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`;
   _peekMessagesBadge();
+}
+// Jump the per-worker Messages list to a chosen day. Unlike the global timeline
+// this view loads one 500-row session window at once (no paging), so the jump is
+// pure scroll: land on the day's header, or the nearest one on/before it, and
+// flash it. If the day predates the loaded window there is nothing to page in, so
+// say so rather than silently scrolling to the oldest row.
+function _peekMsgsJumpToDate(dateStr) {
+  if (!dateStr) return;
+  const list = document.getElementById('peek-messages-list');
+  if (!list) return;
+  const hdrs = [...list.querySelectorAll('.msgs-date-header')];  // newest first
+  const hdr = hdrs.find(h => h.dataset.day === dateStr)
+    || hdrs.find(h => h.dataset.day <= dateStr);   // nearest day on/before target
+  if (hdr) {
+    hdr.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    hdr.classList.add('msgs-date-flash');
+    setTimeout(() => hdr.classList.remove('msgs-date-flash'), 1500);
+  } else if (typeof showToast === 'function') {
+    showToast('No messages loaded on or before that date');
+  }
 }
 // The shared _cmdHistory cache is a GLOBAL 500-row window, and on a busy fleet
 // ~90% of it is session + schedule traffic (measured: 452 of 500). Filtering
