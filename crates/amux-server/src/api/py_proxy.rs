@@ -148,6 +148,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/push", "web push"),
     ("/api/dictation", "dictation history/dict CRUD + engine config (native whisper/gemini, api/dictation.rs)"),
     ("/api/dictate", "transcription — native whisper worker + gemini fallback (api/dictation.rs)"),
+    ("/api/tts", "read-aloud synth + voice list — POST /api/tts, GET /api/tts/voices (api/tts.rs)"),
     ("/api/torrents", "torrents"),
     ("/api/org", "org chart"),
     ("/api/gmail", "gmail oauth"),
