@@ -297,8 +297,17 @@ pub fn build_rfc822(spec: &MimeSpec) -> String {
 /// the plain body, signature appended to both alternatives. Returns
 /// `(plain_full, html_full, signature_included)`.
 pub fn compose_bodies(body: &str, sig_html: &str) -> (String, String, bool) {
-    let body_html = html_escape(body).replace('\n', "<br>");
-    let mut html_full = format!("<div style=\"white-space:normal;\">{body_html}</div>");
+    // The HTML alternative must MIRROR the text/plain part, which Gmail renders
+    // only as a fallback (primis, 2026-08-13: a delivered reply came out cramped
+    // — paragraph spacing collapsed, bullet list flattened). The old
+    // `white-space:normal` COLLAPSED the sender's whitespace (indentation, blank
+    // lines) and `\n -> <br>` discarded structure. `white-space:pre-wrap` on the
+    // ESCAPED body — newlines KEPT, not turned into <br> — renders exactly the
+    // spacing the text/plain part has: blank-line paragraph breaks and indented
+    // list items survive. (Rich markdown -> <ul>/<strong> is a separate opt-in;
+    // this faithful-whitespace fix is the safe default and cannot misrender.)
+    let body_html = html_escape(body);
+    let mut html_full = format!("<div style=\"white-space:pre-wrap;\">{body_html}</div>");
     if !sig_html.is_empty() {
         html_full.push_str(&format!("<br><br>{sig_html}"));
     }
@@ -1304,14 +1313,18 @@ mod tests {
     fn compose_bodies_escapes_and_appends_signature() {
         let (plain, html, inc) = compose_bodies("hi <b>\nline2", "<b>Sig</b>");
         assert_eq!(plain, "hi <b>\nline2\n\nSig");
+        // pre-wrap + KEEP the newline (not <br>): the HTML mirrors the plain
+        // part's spacing exactly (BACKE/primis 2026-08-13). A `<br>` here would
+        // DOUBLE the break under pre-wrap.
         assert_eq!(
             html,
-            "<div style=\"white-space:normal;\">hi &lt;b&gt;<br>line2</div><br><br><b>Sig</b>"
+            "<div style=\"white-space:pre-wrap;\">hi &lt;b&gt;\nline2</div><br><br><b>Sig</b>"
         );
+        assert!(html.contains("pre-wrap") && !html.contains("<br>line2"), "newline preserved, not <br>-ified: {html}");
         assert!(inc);
         let (plain2, html2, inc2) = compose_bodies("hi", "");
         assert_eq!(plain2, "hi");
-        assert_eq!(html2, "<div style=\"white-space:normal;\">hi</div>");
+        assert_eq!(html2, "<div style=\"white-space:pre-wrap;\">hi</div>");
         assert!(!inc2);
     }
 
@@ -1682,7 +1695,7 @@ mod tests {
         // Signature reached both alternatives (encoded in base64 parts).
         assert!(decoded.contains(&wrap76(&base64_std("hello\n\nSig".as_bytes()))));
         assert!(decoded.contains(&wrap76(&base64_std(
-            "<div style=\"white-space:normal;\">hello</div><br><br><b>Sig</b>".as_bytes()
+            "<div style=\"white-space:pre-wrap;\">hello</div><br><br><b>Sig</b>".as_bytes()
         ))));
     }
 
