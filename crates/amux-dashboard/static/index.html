@@ -1929,6 +1929,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <!-- Tab bar -->
   <div class="peek-tabs" onwheel="_peekTabsWheel(event)">
     <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
+    <button class="peek-tab" id="peek-tab-simple" onclick="setPeekTab('simple')" title="Plain-English summary of what this worker just did"><span class="tab-ico">◍</span><span class="tab-lbl">Simple</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
@@ -2186,6 +2187,15 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="dict-outbox-strip"></div>
       <div id="dict-body" class="dict-body"></div>
+  </div>
+  <!-- Simple: a plain-English summary of what this worker just did, regenerated
+       on idle via the fast/cheap helper (AMUX-3056, Ethan 2026-08-13). -->
+  <div id="peek-simple-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;align-items:center;">
+      <span style="flex:1;font-size:0.78rem;color:var(--dim);">Plain-English summary of the last thing this worker did.</span>
+      <button class="btn" id="peek-simple-refresh" onclick="_simpleRender(true)" title="Regenerate">&#x21bb;</button>
+    </div>
+    <div id="peek-simple-body" style="padding:16px;line-height:1.6;color:var(--text);"></div>
   </div>
   <!-- Past read-alouds: replay any clip; auto-flushes after 30 days (Ethan 2026-08-13). -->
   <div id="peek-readalouds-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">

@@ -3846,11 +3846,13 @@ function _peekTabsWheel(e) {
 }
 
 const PEEK_TABS = [
+  { id: 'simple',     label: 'Simple' },
   { id: 'steering',   label: 'Steering' },
   { id: 'schedules',  label: 'Schedules' },
   { id: 'scope',      label: 'Scope' },
   { id: 'messages',   label: 'Messages' },
   { id: 'dictation',  label: 'Dictation' },
+  { id: 'readalouds', label: 'Read alouds' },
   { id: 'issues',     label: 'Board' },
   { id: 'cost',       label: 'Cost' },
   { id: 'transcript', label: 'Transcript' },
@@ -5733,6 +5735,45 @@ async function _scopeLoad(scope, targetId) {
   }
 }
 
+// Peek "Simple" tab (AMUX-3056): a plain-English summary of what this worker
+// just did. The server generates it from the last assistant message via the
+// fast/cheap helper and caches per transcript, so this is usually instant; a
+// fresh turn regenerates on the next fetch. Font/size are client-side config
+// (localStorage; a global default, per-worker override + standing prompt land
+// in the config slice). When the worker is mid-turn the live detail is in the
+// Terminal tab — this view refreshes when it goes idle.
+async function _simpleRender(refresh) {
+  const name = peekSession;
+  const body = document.getElementById('peek-simple-body');
+  if (!name || !body) return;
+  const fontPx = localStorage.getItem('amux_simple_font_px') || '16';
+  const fontFam = localStorage.getItem('amux_simple_font') || '';
+  body.style.fontSize = fontPx + 'px';
+  body.style.fontFamily = fontFam || '';
+  body.innerHTML = '<div style="color:var(--dim);display:flex;align-items:center;gap:8px;">'
+    + '<span class="simple-spin"></span>Putting it in plain English…</div>';
+  try {
+    const url = API + '/api/sessions/' + encodeURIComponent(name) + '/simple' + (refresh === true ? '?refresh=1' : '');
+    const r = await fetch(url, { headers: _authHeaders({}) });
+    const d = await r.json().catch(() => ({}));
+    if (peekSession !== name || _peekTab !== 'simple') return;   // navigated away mid-fetch
+    if (d.summary) {
+      body.innerHTML =
+        '<div style="white-space:pre-wrap;word-break:break-word;">' + esc(d.summary) + '</div>'
+        + '<div style="margin-top:14px;font-size:0.75rem;color:var(--dim);border-top:1px solid var(--border);padding-top:10px;">'
+        +   'Working right now? Live detail is in the '
+        +   '<a href="#" onclick="event.preventDefault();setPeekTab(\'terminal\')" style="color:var(--accent);">Terminal</a>'
+        +   ' tab — this refreshes when the worker goes idle.'
+        +   (d.via ? ' · <span title="model">' + esc(d.via) + '</span>' : '')
+        + '</div>';
+    } else {
+      body.innerHTML = '<div style="color:var(--dim);">' + esc(d.reason || d.error || 'No summary yet.') + '</div>';
+    }
+  } catch (e) {
+    body.innerHTML = '<div style="color:var(--dim);">Couldn’t reach the server — try again.</div>';
+  }
+}
+
 function setPeekTab(tab) {
   _peekTab = tab;
   // The notes tab is gone; this flushed its pending save and called
@@ -5770,6 +5811,12 @@ function setPeekTab(tab) {
   if (raPanel) {
     if (tab === 'readalouds') { raPanel.classList.add('active'); _raRender(); }
     else { raPanel.classList.remove('active'); }
+  }
+  document.getElementById('peek-tab-simple')?.classList.toggle('active', tab === 'simple');
+  const simpleP = document.getElementById('peek-simple-panel');
+  if (simpleP) {
+    if (tab === 'simple') { simpleP.classList.add('active'); _simpleRender(); }
+    else { simpleP.classList.remove('active'); }
   }
   document.getElementById('peek-terminal-panel').style.display = tab === 'terminal' ? '' : 'none';
   document.getElementById('peek-split-wrap').style.display = tab === 'terminal' ? '' : 'none';
@@ -7145,7 +7192,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.618';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.619';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
