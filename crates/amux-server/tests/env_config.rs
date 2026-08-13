@@ -208,6 +208,39 @@ global:
 }
 
 #[tokio::test]
+async fn files_are_seeded_idempotently_and_relative_paths_error() {
+    let (app, _store) = app("files");
+    // An absolute path under the temp home so the test never writes outside it.
+    let doc = home().join("seed").join("welcome.md");
+    let doc_s = doc.to_string_lossy().to_string();
+    let yaml = format!(
+        "files:\n  - path: {doc_s}\n    content: |\n      hello vertical\n  - path: relative/nope.md\n    content: x\n"
+    );
+
+    // Dry run: the absolute file reports create, the relative one errors, and
+    // nothing is written.
+    let (st, body) = apply(&app, &yaml, true).await;
+    assert_eq!(st, StatusCode::OK);
+    let report = body["report"].as_array().unwrap();
+    let file_row = report.iter().find(|e| e["path"] == doc_s).unwrap();
+    assert_eq!(file_row["action"], "create");
+    let rel_row = report.iter().find(|e| e["kind"] == "file" && e["action"] == "error").unwrap();
+    assert!(rel_row["detail"].as_str().unwrap().contains("absolute"));
+    assert!(!doc.exists(), "dry run must not write the file");
+
+    // Apply: the file lands with exactly the content.
+    let (st, _) = apply(&app, &yaml, false).await;
+    assert_eq!(st, StatusCode::OK);
+    let written = std::fs::read_to_string(&doc).expect("seed file written");
+    assert_eq!(written, "hello vertical\n");
+
+    // Re-apply the same spec: the file reports unchanged.
+    let (_, body) = apply(&app, &yaml, false).await;
+    let file_row = body["report"].as_array().unwrap().iter().find(|e| e["path"] == doc_s).unwrap();
+    assert_eq!(file_row["action"], "unchanged");
+}
+
+#[tokio::test]
 async fn invalid_yaml_is_a_400_not_a_panic() {
     let (app, _store) = app("badyaml");
     let (st, body) = apply(&app, "groups: [unterminated", false).await;

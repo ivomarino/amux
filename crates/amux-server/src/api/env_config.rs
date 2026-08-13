@@ -43,16 +43,27 @@ struct EnvSpec {
     groups: Vec<GroupSpec>,
     #[serde(default)]
     workers: Vec<WorkerSpec>,
-    // Phase-2 stanzas: parsed (so a spec that includes them is not rejected)
-    // and REPORTED as not-yet-applied rather than silently ignored.
+    // `files` (seeded docs) is APPLIED (AMUX-2977 phase 2): the seeded docs ARE
+    // a vertical's content, so an env without them has workers and nothing to
+    // work on (amux-cloud's highest-value gap).
+    #[serde(default)]
+    files: Vec<FileSpec>,
+    // Still phase-2, parsed-and-reported so a full spec is not rejected.
     #[serde(default)]
     schedules: Vec<Value>,
     #[serde(default)]
     columns: Vec<Value>,
     #[serde(default)]
-    files: Vec<Value>,
-    #[serde(default)]
     global: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileSpec {
+    /// Absolute destination path (a container path on the cloud, a real path
+    /// locally). Relative paths are refused — the destination must be explicit.
+    path: String,
+    #[serde(default)]
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,8 +95,9 @@ struct WorkerSpec {
 
 async fn schema() -> Response {
     Json(json!({
-        "applied_now": ["groups", "workers"],
-        "phase_2": ["schedules", "columns", "gates", "files", "global"],
+        "applied_now": ["groups", "workers", "files"],
+        "phase_2": ["schedules", "columns", "gates", "global"],
+        "files_shape": [{"path": "/abs/path/doc.md", "content": "literal file content"}],
         "example": {
             "groups": [{"name": "engineering", "department": "Engineering", "goal": "Ship the platform"}],
             "workers": [{
@@ -198,12 +210,31 @@ async fn apply(
         report.push(json!({"kind": "group", "name": name, "action": action}));
     }
 
-    // Phase-2 stanzas: announce, don't drop.
-    for (stanza, items) in [
-        ("schedules", spec.schedules.len()),
-        ("columns", spec.columns.len()),
-        ("files", spec.files.len()),
-    ] {
+    // ---- files: seed docs (idempotent write to an absolute path) -----------
+    // Validated up front so a dry-run reports the same create/update/unchanged
+    // an apply would produce (the shape amux-cloud's accounting.yaml round-trips).
+    let mut file_writes: Vec<(std::path::PathBuf, String)> = vec![];
+    for f in &spec.files {
+        let p = f.path.trim();
+        if p.is_empty() || !std::path::Path::new(p).is_absolute() {
+            report.push(json!({"kind": "file", "path": f.path, "action": "error",
+                "detail": "path must be absolute"}));
+            continue;
+        }
+        let path = std::path::PathBuf::from(p);
+        let action = match std::fs::read_to_string(&path) {
+            Ok(existing) if existing == f.content => "unchanged",
+            Ok(_) => "update",
+            Err(_) => "create",
+        };
+        report.push(json!({"kind": "file", "path": p, "action": action, "bytes": f.content.len()}));
+        if !dry && action != "unchanged" {
+            file_writes.push((path, f.content.clone()));
+        }
+    }
+
+    // Phase-2 stanzas still parsed-and-reported (not silently dropped).
+    for (stanza, items) in [("schedules", spec.schedules.len()), ("columns", spec.columns.len())] {
         if items > 0 {
             report.push(json!({"kind": stanza, "action": "not-yet-applied", "count": items,
                 "detail": "phase 2 (AMUX-2977) — parsed and reported, not written"}));
@@ -231,6 +262,16 @@ async fn apply(
     // A worker create/delete changes the fleet registry — invalidate the cache
     // (the AMUX-2960 discipline) so the new workers show up immediately.
     super::sessions_legacy::invalidate_sessions_cache();
+
+    // ---- files: write each seed doc to its absolute path -------------------
+    for (path, content) in file_writes {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, content) {
+            errors.push(json!({"kind": "file", "path": path.to_string_lossy(), "error": e.to_string()}));
+        }
+    }
 
     if !groups_for_write.is_empty() {
         let gw = groups_for_write.clone();
