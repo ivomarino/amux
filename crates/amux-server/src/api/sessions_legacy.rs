@@ -573,9 +573,22 @@ impl FleetSignals {
     /// Has a background agent of this lane written within the contradiction
     /// window? Reported `idle` describes the MAIN turn; this describes the lane.
     fn subagents_working(&self, name: &str) -> bool {
+        // A SUBAGENT'S CADENCE IS NOT THE MAIN PANE'S. The main pane paints ~6/s,
+        // so 60s of silence (contradiction_window) means it went stale. A
+        // subagent transcript is touched ONLY when the subagent emits a message
+        // or tool result — an xhigh-effort THINKING subagent can go minutes
+        // between writes while very much working. Gating on the 60s window read
+        // a lane whose subagent was "still thinking with xhigh effort" as IDLE
+        // while it was visibly crunching (primis, 2026-08-13: header IDLE over a
+        // "✻ Crunching… still thinking" pane with 2 live agents). Use a window
+        // sized to the subagent write cadence, not the pane's. idle -> active is
+        // one-way, so the worst case of a generous window is a bounded LATE
+        // CORRECTION after the agents actually finish — never a false "busy" that
+        // sticks, which is the property this whole derivation protects.
+        let window = env_secs("AMUX_SUBAGENT_WORKING_S", 240.0);
         self.subagent_activity
             .get(name)
-            .is_some_and(|m| self.now - m < self.contradiction_window())
+            .is_some_and(|m| self.now - m < window)
     }
 
     fn pane_says_working(&self, name: &str) -> bool {
@@ -2112,12 +2125,23 @@ mod tests {
         // assertion below proves nothing.
         assert!(!sig.subagents_working("primis"));
 
-        // A write inside the contradiction window contradicts `idle`.
+        // A recent write contradicts `idle`.
         sig.subagent_activity.insert("primis".into(), sig.now - 20.0);
         assert!(sig.subagents_working("primis"), "a 20s-old subagent write must contradict idle");
 
+        // THE INCIDENT (2026-08-13): a subagent "still thinking with xhigh
+        // effort" writes nothing for a stretch, so its newest transcript write is
+        // minutes old while it is very much working. A 90s-old write is PAST the
+        // 60s contradiction_window that used to gate this — the lane read IDLE
+        // while crunching. It must now read as working (subagent cadence window).
+        sig.subagent_activity.insert("primis".into(), sig.now - 90.0);
+        assert!(
+            sig.subagents_working("primis"),
+            "a 90s-old subagent write (a thinking agent between writes) must still contradict idle"
+        );
+
         // Stale activity does NOT. An agent that finished an hour ago is not
-        // evidence the lane is busy now.
+        // evidence the lane is busy now — the window is generous, not unbounded.
         sig.subagent_activity.insert("primis".into(), sig.now - 86_400.0);
         assert!(!sig.subagents_working("primis"), "stale subagent activity must not pin a lane active");
 
