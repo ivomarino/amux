@@ -154,16 +154,25 @@ fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
         // what a failed `tmux list-sessions` looks like. Not a pass.
         return vec![InvariantResult::unknown(ID, "no running tmux sessions visible")];
     }
+    // NAMESPACE: `signals.running` holds the tmux session names, which are the
+    // `amux-<n>` form; `signals.reports` is keyed by the BARE `AMUX_SESSION`
+    // name (`<n>`) the report POST carries. `probed_lanes()` bridges the two
+    // with `format!("amux-{n}")` — do the same here, or every lookup misses and
+    // the check reports "0 of N reporting" against a blob that is actually full
+    // (caught immediately on first deploy, 2026-08-13). `agent_running` also
+    // drops shell-only panes, which are not lanes and never report.
     let lanes: Vec<checks::LaneReport> = signals
         .running
         .iter()
-        .map(|name| {
+        .filter_map(|t| t.strip_prefix("amux-"))
+        .filter(|n| signals.agent_running(&format!("amux-{n}")))
+        .map(|n| {
             let age = signals
                 .reports
-                .get(name.as_str())
+                .get(n)
                 .and_then(|r| r["ts"].as_f64())
                 .map(|ts| signals.now - ts);
-            checks::LaneReport { name: name.clone(), report_age_s: age }
+            checks::LaneReport { name: n.to_string(), report_age_s: age }
         })
         .collect();
     // Policy in config, not baked in (ethos D4). Defaults: a fleet of >=10 lanes
