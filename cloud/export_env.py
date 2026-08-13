@@ -31,6 +31,61 @@ except ImportError:
     sys.exit("pyyaml required: pip3 install pyyaml")
 
 
+def plan_to_envspec(plan):
+    """Convert a seed-plan (org/sessions/docs/board/board_columns) to an EnvSpec
+    (groups/workers/files/schedules/columns) — the convergence toward ONE format.
+
+    Returns (envspec, retained) where `retained` is the seed-plan content EnvSpec
+    has NO stanza for and seed.py must still apply itself: `org` (provisioning),
+    `board` (initial issue cards), and each worker's opening `prompt`. Returning
+    them explicitly is the point — a converter that silently dropped the board
+    cards or the first-run prompts would look lossless and quietly gut the demo.
+    """
+    if "workers" in plan and "sessions" not in plan:
+        # already an EnvSpec — pass through, nothing retained
+        return plan, {}
+    sessions = plan.get("sessions", [])
+    groups = {}
+    workers = []
+    schedules = []
+    prompts = {}
+    for s in sessions:
+        tags = s.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        workers.append({
+            "name": s["name"],
+            "dir": s.get("dir", ""),
+            "groups": list(tags),
+            "desc": s.get("desc", ""),
+            "model": s.get("model", "sonnet"),
+            "provider": s.get("provider", "claude"),
+        })
+        for t in tags:
+            groups.setdefault(t, {"name": t, "department": "", "goal": ""})
+        if s.get("prompt"):
+            prompts[s["name"]] = s["prompt"]
+        for sc in s.get("schedules", []):
+            schedules.append({
+                "worker": s["name"], "title": sc.get("title", ""),
+                "expr": sc.get("expr", ""), "enabled": bool(sc.get("enabled", False)),
+                "command": sc.get("command", ""),
+            })
+    envspec = {
+        "groups": list(groups.values()),
+        "workers": workers,
+        "files": [{"path": d["path"], "content": d.get("content", "")} for d in plan.get("docs", [])],
+        "schedules": schedules,
+        "columns": list(plan.get("board_columns", [])),
+    }
+    retained = {
+        "org": plan.get("org"),
+        "board": plan.get("board", []),   # EnvSpec has columns (statuses) but no CARDS stanza
+        "prompts": prompts,               # worker first-run tasks — not an EnvSpec field
+    }
+    return envspec, retained
+
+
 def _list(v, *keys):
     """A gateway list response may be a bare array or {key: [...]}. Normalize."""
     if isinstance(v, list):
