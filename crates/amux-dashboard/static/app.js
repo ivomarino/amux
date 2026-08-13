@@ -7117,7 +7117,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.609';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.610';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -12927,6 +12927,16 @@ function _renderFileBody(data, mode) {
     body.innerHTML = `<embed src="${data.data_url}" type="application/pdf" style="width:100%;height:100%;min-height:520px;border-radius:4px;">`;
     return;
   }
+  // Spreadsheet (AMUX-44). The server has already parsed the workbook, so this
+  // only lays out rows — no parsing library ships to the phone.
+  //
+  // Placed ABOVE the is_binary branch on purpose: an xlsx is a zip and used to
+  // fall through to the "binary file" placeholder.
+  if (data.is_sheet) {
+    body.className = 'file-overlay-body file-sheet';
+    _renderSheet(body, data);
+    return;
+  }
   // Renderable ebook (EPUB/FB2/CBZ): server already inlined everything into a
   // self-contained HTML doc — render it in a sandboxed (no-script) iframe.
   if (data.is_ebook && data.content && !data.is_binary) {
@@ -13401,6 +13411,112 @@ function _filesUpdateSortHeaders() {
       el.appendChild(span);
     }
   });
+}
+
+
+// ── Spreadsheet viewer (AMUX-44) ─────────────────────────────────────────────
+// The server sends {sheet_names, sheets:[{name,rows,total_rows,total_cols,
+// truncated,error}]}. This renders it; it never parses a workbook.
+//
+// Column letters are generated (A..Z, AA..) rather than assuming row 0 is a
+// header: many real sheets start with a title row or blank rows, and promoting
+// an arbitrary first row to <th> silently relabels the data.
+function _sheetColName(n) {
+  let s = '';
+  n += 1;
+  while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+let _sheetActive = 0;
+function _renderSheet(body, data) {
+  const sheets = data.sheets || [];
+  body.innerHTML = '';
+  if (data.error) {
+    body.innerHTML = `<div class="sheet-msg">${esc(data.error)}</div>`;
+    return;
+  }
+  if (!sheets.length) {
+    body.innerHTML = '<div class="sheet-msg">This workbook has no sheets.</div>';
+    return;
+  }
+  if (_sheetActive >= sheets.length) _sheetActive = 0;
+
+  // Tab strip — EVERY sheet, including empty ones. A workbook that shows sheet 1
+  // and quietly omits sheet 4 is worse than one that renders nothing.
+  const tabs = document.createElement('div');
+  tabs.className = 'sheet-tabs';
+  sheets.forEach((sh, i) => {
+    const b = document.createElement('button');
+    b.className = 'sheet-tab' + (i === _sheetActive ? ' active' : '');
+    const n = sh.total_rows || 0;
+    b.textContent = sh.name + (n ? ` (${n})` : '');
+    b.title = sh.name + ' — ' + n + ' row' + (n === 1 ? '' : 's');
+    b.onclick = () => { _sheetActive = i; _renderSheet(body, data); };
+    tabs.appendChild(b);
+  });
+  body.appendChild(tabs);
+
+  const sh = sheets[_sheetActive];
+  if (sh.error) {
+    const d = document.createElement('div');
+    d.className = 'sheet-msg';
+    d.textContent = sh.error;
+    body.appendChild(d);
+    return;
+  }
+  const rows = sh.rows || [];
+  if (!rows.length) {
+    const d = document.createElement('div');
+    d.className = 'sheet-msg';
+    d.textContent = 'This sheet is empty.';
+    body.appendChild(d);
+    return;
+  }
+
+  // SAY WHAT IS NOT SHOWN. A table that stops at 2000 rows without saying so
+  // reads as the whole file, and the user decides off it.
+  if (sh.truncated) {
+    const w = document.createElement('div');
+    w.className = 'sheet-truncated';
+    const shownR = rows.length, shownC = rows[0] ? rows[0].length : 0;
+    w.textContent = `⚠ Showing ${shownR} of ${sh.total_rows} rows` +
+      (shownC < sh.total_cols ? ` and ${shownC} of ${sh.total_cols} columns` : '') +
+      ' — open the file directly for the rest.';
+    body.appendChild(w);
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'sheet-scroll';
+  const t = document.createElement('table');
+  t.className = 'sheet-table';
+  const nCols = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  hr.appendChild(document.createElement('th'));           // row-number gutter
+  for (let c = 0; c < nCols; c++) {
+    const th = document.createElement('th');
+    th.textContent = _sheetColName(c);
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  t.appendChild(thead);
+  const tb = document.createElement('tbody');
+  rows.forEach((r, ri) => {
+    const tr = document.createElement('tr');
+    const rh = document.createElement('th');
+    rh.className = 'sheet-rownum';
+    rh.textContent = String(ri + 1);
+    tr.appendChild(rh);
+    for (let c = 0; c < nCols; c++) {
+      const td = document.createElement('td');
+      td.textContent = r[c] == null ? '' : r[c];   // textContent, never innerHTML
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  wrap.appendChild(t);
+  body.appendChild(wrap);
 }
 
 function _fileTypeIcon(name, type) {

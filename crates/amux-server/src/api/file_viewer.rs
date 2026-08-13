@@ -298,6 +298,19 @@ async fn view(req: Request) -> Response {
         );
     }
 
+    // Spreadsheets (AMUX-44). MUST sit above the binary sniff: an xlsx is a
+    // zip, so it sniffs binary and fell through to the "binary file"
+    // placeholder — the viewer showed nothing at all.
+    //
+    // Parsed HERE rather than in the client. The viewer already pre-processes
+    // per type server-side (image -> data_url, pdf -> base64), and amux is a
+    // mobile-first PWA: shipping a whole workbook to a phone to parse it there
+    // is the wrong place for the work. It is also the only place a cap can be
+    // applied honestly — see `truncated` below.
+    if matches!(ext.as_str(), ".xlsx" | ".xlsm" | ".xls" | ".xlsb" | ".ods") {
+        return sheet_payload(&p, &ext, meta.len());
+    }
+
     // Binary sniff: NUL byte in the first 8KB (py:68041).
     {
         use std::io::Read;
@@ -2225,5 +2238,194 @@ pub(crate) mod tests {
         // urllib.parse.quote("/a b/ü.png") == '/a%20b/%C3%BC.png'
         assert_eq!(py_quote("/a b/ü.png"), "/a%20b/%C3%BC.png");
         assert_eq!(py_quote("/plain/path.mp4"), "/plain/path.mp4");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Spreadsheet payload (AMUX-44)
+// ---------------------------------------------------------------------------
+
+/// Rows/cols kept per sheet. REPORTED when it bites, never silently applied: a
+/// table that stops at row 2000 with no indication reads as "this is the whole
+/// file", and the user makes decisions off it. Ethos rule 7 — a silent cap is a
+/// confident wrong answer.
+const SHEET_MAX_ROWS: usize = 2_000;
+const SHEET_MAX_COLS: usize = 100;
+
+/// One cell, flattened to what the browser should print.
+///
+/// Formulas are NOT evaluated: xlsx stores the last computed value alongside the
+/// formula and calamine hands us that value. Showing it is both what Excel shows
+/// on open and the only honest option without a formula engine.
+fn cell_text(d: &calamine::Data) -> String {
+    use calamine::Data;
+    match d {
+        Data::Empty => String::new(),
+        Data::String(s) => s.clone(),
+        // Whole floats print as integers — 3, not 3.0 — because a sheet of
+        // counts rendered as "3.0" reads as a different value than the file.
+        Data::Float(f) => {
+            if f.fract() == 0.0 && f.abs() < 1e15 {
+                format!("{}", *f as i64)
+            } else {
+                f.to_string()
+            }
+        }
+        Data::Int(i) => i.to_string(),
+        Data::Bool(b) => b.to_string(),
+        Data::Error(e) => format!("#{e:?}"),
+        Data::DateTime(dt) => dt
+            .as_datetime()
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| dt.to_string()),
+        Data::DateTimeIso(s) => s.clone(),
+        Data::DurationIso(s) => s.clone(),
+    }
+}
+
+fn sheet_payload(p: &Path, ext: &str, size: u64) -> Response {
+    use calamine::Reader;
+    let mut wb = match calamine::open_workbook_auto(p) {
+        Ok(w) => w,
+        // SAY SO. Falling back to the binary placeholder would report a
+        // readable-but-unparsed file as if it were opaque, which is the failure
+        // this change exists to remove.
+        Err(e) => {
+            return j(
+                200,
+                json!({
+                    "path": pystr(p), "is_sheet": true, "ext": ext, "size": size,
+                    "error": format!("could not read spreadsheet: {e}"),
+                    "sheet_names": Vec::<String>::new(),
+                    "sheets": Vec::<Value>::new(),
+                }),
+            )
+        }
+    };
+
+    let names = wb.sheet_names().to_vec();
+    let mut sheets: Vec<Value> = Vec::new();
+    for name in &names {
+        // EVERY sheet is emitted, including empty and unreadable ones. A
+        // workbook that renders sheet 1 and silently omits sheet 4 is worse
+        // than not rendering at all.
+        match wb.worksheet_range(name) {
+            Ok(range) => {
+                let (h, w) = (range.height(), range.width());
+                let keep_r = h.min(SHEET_MAX_ROWS);
+                let keep_c = w.min(SHEET_MAX_COLS);
+                let rows: Vec<Value> = range
+                    .rows()
+                    .take(keep_r)
+                    .map(|r| Value::Array(r.iter().take(keep_c).map(|c| json!(cell_text(c))).collect()))
+                    .collect();
+                sheets.push(json!({
+                    "name": name, "rows": rows,
+                    "total_rows": h, "total_cols": w,
+                    "truncated": h > keep_r || w > keep_c,
+                }));
+            }
+            Err(e) => sheets.push(json!({
+                "name": name, "rows": Vec::<Value>::new(),
+                "total_rows": 0, "total_cols": 0, "truncated": false,
+                "error": format!("sheet could not be read: {e}"),
+            })),
+        }
+    }
+
+    j(
+        200,
+        json!({
+            "path": pystr(p), "is_sheet": true, "ext": ext, "size": size,
+            "sheet_names": names, "sheets": sheets,
+            "max_rows": SHEET_MAX_ROWS, "max_cols": SHEET_MAX_COLS,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::*;
+
+    /// Build a real .xlsx IN RUST. The first version shelled out to python
+    /// openpyxl and skipped when it was missing — which is what happened: the
+    /// test reported `ok` while never running, the exact green-check-that-cannot-
+    /// fail this repo keeps finding. A dev-dependency has no such failure mode.
+    fn make_xlsx(path: &Path, sheets: &[(&str, usize, usize)]) {
+        use rust_xlsxwriter::Workbook;
+        let mut wb = Workbook::new();
+        for (name, nr, nc) in sheets {
+            let ws = wb.add_worksheet().set_name(*name).unwrap();
+            for i in 0..*nr {
+                for k in 0..*nc {
+                    ws.write_string(i as u32, k as u16, format!("r{i}c{k}")).unwrap();
+                }
+            }
+        }
+        wb.save(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_sheet_is_listed_and_truncation_is_reported() {
+        let dir = std::env::temp_dir().join(format!("amux-xlsx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("book.xlsx");
+        // sheet "big" exceeds SHEET_MAX_ROWS; "small" and "empty" do not.
+        make_xlsx(&f, &[("small", 3, 2), ("big", SHEET_MAX_ROWS + 25, 2), ("empty", 0, 0)]);
+        let resp = sheet_payload(&f, ".xlsx", 0);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["is_sheet"], json!(true));
+        let names: Vec<String> = v["sheet_names"].as_array().unwrap().iter()
+            .map(|x| x.as_str().unwrap().to_string()).collect();
+        // EVERY sheet, including the empty one — a workbook that renders sheet 1
+        // and omits sheet 3 is worse than not rendering.
+        assert!(names.contains(&"small".to_string()), "{names:?}");
+        assert!(names.contains(&"big".to_string()), "{names:?}");
+        assert!(names.contains(&"empty".to_string()), "empty sheet dropped: {names:?}");
+
+        let sheets = v["sheets"].as_array().unwrap();
+        let get = |n: &str| sheets.iter().find(|s| s["name"] == json!(n)).unwrap();
+
+        // CONTROL: the small sheet must NOT claim truncation. A flag that is
+        // always true is as useless as one that is never set.
+        assert_eq!(get("small")["truncated"], json!(false), "small wrongly truncated");
+        assert_eq!(get("small")["rows"].as_array().unwrap().len(), 3);
+
+        // The big one must report it, and report the REAL total, not the capped one.
+        assert_eq!(get("big")["truncated"], json!(true), "cap applied silently");
+        assert_eq!(get("big")["rows"].as_array().unwrap().len(), SHEET_MAX_ROWS);
+        assert_eq!(get("big")["total_rows"], json!(SHEET_MAX_ROWS + 25));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is not a workbook must say so, not fall back to "binary".
+    #[tokio::test]
+    async fn an_unreadable_workbook_reports_the_error() {
+        let dir = std::env::temp_dir().join(format!("amux-xlsx-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("not-really.xlsx");
+        std::fs::write(&f, b"this is not a zip").unwrap();
+        let resp = sheet_payload(&f, ".xlsx", 17);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["is_sheet"], json!(true), "must still claim the sheet branch");
+        assert!(v["error"].as_str().unwrap_or("").contains("could not read"),
+                "no error reported: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whole_floats_print_without_a_decimal_tail() {
+        use calamine::Data;
+        assert_eq!(cell_text(&Data::Float(3.0)), "3");
+        assert_eq!(cell_text(&Data::Float(3.5)), "3.5");
+        assert_eq!(cell_text(&Data::Empty), "");
+        assert_eq!(cell_text(&Data::Bool(true)), "true");
     }
 }

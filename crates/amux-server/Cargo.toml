@@ -52,6 +52,8 @@ libc.workspace = true
 tempfile.workspace = true
 portable-pty = "0.9.0"
 serde_yaml = "0.9.34"
+calamine = { version = "0.36", default-features = false, features = ["dates"] }
 
 [dev-dependencies]
 proptest.workspace = true
+rust_xlsxwriter = "0.97.1"
