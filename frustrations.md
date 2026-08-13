@@ -3031,3 +3031,14 @@ CARD: AMUX-2988
 SYMPTOM: Ethan intentionally dropped the 8822 compat bind 2026-08-11 (lib.rs:527, "no more 8822 just rust"). But 52 of 56 running claude procs still carry AMUX_URL=https://localhost:8822 in their process env, which cannot be rotated on a live process. Every documented `curl $AMUX_URL/api/...` recipe (peek, notes, email, schedules, calendar) returns 000 for those 52 lanes. GET /api/debug/legacy-port reports verdict "CLEAR: no traffic on the retired port", ready_to_retire=true, sessions_still_on_legacy=[] — the exact opposite of the truth — because it counts HITS and a port nothing listens on can record none. The one instrument meant to answer "who is still on 8822" is structurally blind to everyone who is.
 COST: I burned several tool calls diagnosing why my own `curl $AMUX_URL` returned 000 and initially misread a deliberate owner decision as a fleet-down regression. Any of the 52 lanes following the CLAUDE.md/memory curl recipes silently fails the same way, and nothing surfaces that 52 lanes are running degraded — so no one recycles them. The `amux` CLI masks it (it uses AMUX_API=8824), which is why this went unnoticed.
 FIX: (proposed, AMUX-2988) legacy-port accounting must not measure strandedness by inbound hits after the bind is gone — derive it by scanning running session process envs for a RETIRED_PORTS match (the /api/debug/tmux pattern: discovery from inside the server process), surface the count on /api/debug/legacy-port and an hourly WARN. Recycling the 52 is the owner's call (ethos rule 8, could interrupt in-flight customer work) — the fix only makes the count visible, it does not restart anything.
+
+## Local clippy green is a false proxy for CI green — stale floating toolchain red main for hours
+AREA: ci
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-12
+SESSION: amux
+CARD: AMUX-3013
+SYMPTOM: Ran `cargo clippy -p amux-server --all-targets -- -D warnings` locally, GREEN, and pushed the accountability endpoint. CI went RED on a clippy lint in the same file (unnecessary_sort_by, messages.rs:585) that local clippy never flagged. Root: no rust-toolchain.toml — CI floats on dtolnay/rust-toolchain@stable (newest), local stable is clippy 0.1.94 (2026-03-25), months behind with a smaller lint set. So local -D warnings green does NOT predict CI.
+COST: main CI red for HOURS; deploy-cloud.yml gates on green CI so it skipped every run, no new cloud image, /api/env/apply never reached cloud, and the live RothCo env round-trip (the point of the env-config work) could not run. amux-cloud caught it, root-caused it, and fixed the lint inline (67b44f7). I also never watched CI go green after pushing, so the red sat.
+FIX: pin the toolchain (rust-toolchain.toml + rust.yml installs it) so CI is deterministic and local == CI. Interim: rustup update stable before the pre-push clippy. Until then, "local clippy passed" must not be trusted as "CI will pass".
