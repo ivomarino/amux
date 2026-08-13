@@ -136,17 +136,41 @@ const BACKLOG_TRIAGE_COOLDOWN_S: f64 = 72.0 * 3600.0;
 const BACKLOG_TRIAGE_THRESHOLD: usize = 10;
 /// Cards older than this (created_at) are considered stale backlog.
 const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
-/// Idle-backlog DRAIN nudge cooldown: 2h per session. Distinct from the 72h
-/// stale-triage above — this fires when a lane is idle (no doing) with an empty
-/// todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
+/// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
+/// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
+/// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
 /// completion" case (a lane holding only backlog sits idle forever because
-/// board_drive dispatches `todo`, not `backlog`). Short so a still-idle lane is
-/// re-nudged until it pulls work into todo. Overridable for tests/tuning.
-fn idle_backlog_drain_cooldown_s() -> f64 {
-    std::env::var("AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S")
+/// board_drive dispatches `todo`, not `backlog`).
+///
+/// A flat 2h drained big idle backlogs far too slowly (Ethan 2026-08-13: backend
+/// 207, mvs-infra 127 "just sit"). A lane idle on 200 un-worked cards should be
+/// re-nudged far more often than one idle on 5, so the cadence scales with the
+/// drainable backlog: base 2h for a small one, down to a 20m floor for a large
+/// one. Still a NUDGE and nothing more — the worker chooses which cards to pull
+/// and in what order (the ethos line: amux surfaces the stall, the model drives);
+/// only the reminder frequency scales, never any server-side auto-promotion.
+/// A hard `AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S` override still wins for tuning.
+fn idle_backlog_drain_cooldown_s(drainable_backlog: i64) -> f64 {
+    if let Some(v) = std::env::var("AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2.0 * 3600.0)
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return v;
+    }
+    drain_cooldown_scaled(
+        drainable_backlog,
+        2.0 * 3600.0,
+        env_f64("AMUX_IDLE_BACKLOG_DRAIN_FLOOR_S", 20.0 * 60.0),
+        env_f64("AMUX_IDLE_BACKLOG_DRAIN_PER", 25.0),
+    )
+}
+
+/// Pure scaling: gentle `base` for a small backlog, halving roughly every `per`
+/// cards, never below `floor`. Split out so the cadence curve is tested without
+/// touching process env (the env-race trap the ethos file records).
+fn drain_cooldown_scaled(drainable_backlog: i64, base: f64, floor: f64, per: f64) -> f64 {
+    let divisor = (drainable_backlog as f64 / per.max(1.0)).max(1.0);
+    (base / divisor).max(floor)
 }
 /// py:15673 `_DEFAULT_ITEM_TYPE` — strictest by default.
 const DEFAULT_ITEM_TYPE: &str = "code";
@@ -1221,15 +1245,21 @@ fn backlog_drain_text(cards: &[(String, String, i64)], total_backlog: i64) -> St
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Ask for a batch proportional to the backlog: a lane idle on 200 cards
+    // should pull a real handful, not one, so a big queue actually moves per
+    // nudge (Ethan: "backlog across EVERY worker turns into work"). Bounded 3..10
+    // so the worker is never asked to bite off more than it can honestly triage.
+    let batch = (total_backlog / 10).clamp(3, 10);
     format!(
         "[amux] You are idle with {total_backlog} card(s) in `backlog` and nothing in \
          `todo` or `doing`. board-drive only dispatches `todo`, so this queue will not move \
          on its own — you have to pull from it.\n\n\
          {list}\n\n\
-         Pick the next actionable card(s), move them to `todo` (they get dispatched) or \
+         Pull the next ~{batch} actionable card(s) into `todo` (they get dispatched) or \
          straight to `doing` and start, and for anything that is blocked, done, or no longer \
-         relevant, say so and move it (review / done / archive). Do not leave the whole \
-         backlog sitting while you idle — drain it."
+         relevant, say so and move it (review / done / archive / backlog with a trigger). Do \
+         not leave the whole backlog sitting while you idle — drain it. This nudge repeats \
+         faster the larger your backlog is, until it moves."
     )
 }
 
@@ -2442,7 +2472,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     break 'triage None;
                 }
                 let (event_type, cooldown_s) = if idle_drain {
-                    ("backlog.drain_nudge", idle_backlog_drain_cooldown_s())
+                    ("backlog.drain_nudge", idle_backlog_drain_cooldown_s(drainable_backlog))
                 } else {
                     ("backlog.triage_nudge", BACKLOG_TRIAGE_COOLDOWN_S)
                 };
@@ -2788,6 +2818,31 @@ pub fn routes() -> axum::Router<AppState> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// The drain cadence must SCALE to the backlog (Ethan 2026-08-13: big idle
+    /// backlogs drained too slowly at a flat 2h). Pure math, no env.
+    #[test]
+    fn drain_cooldown_shortens_as_the_backlog_grows() {
+        let base = 2.0 * 3600.0;
+        let floor = 20.0 * 60.0;
+        let per = 25.0;
+        // Small backlog: the gentle base cadence.
+        assert_eq!(drain_cooldown_scaled(5, base, floor, per), base);
+        assert_eq!(drain_cooldown_scaled(25, base, floor, per), base);
+        // Twice `per` halves it.
+        assert_eq!(drain_cooldown_scaled(50, base, floor, per), base / 2.0);
+        // A big idle backlog (backend's 207) is clamped to the floor, not
+        // spamming, but far more frequent than 2h.
+        assert_eq!(drain_cooldown_scaled(207, base, floor, per), floor);
+        // Monotonic non-increasing: more backlog is never a SLOWER nudge.
+        let mut prev = f64::INFINITY;
+        for n in [1, 10, 25, 40, 60, 100, 200, 500] {
+            let c = drain_cooldown_scaled(n, base, floor, per);
+            assert!(c <= prev, "cadence must not slow as backlog grows: {n} -> {c} > {prev}");
+            assert!(c >= floor, "never below the floor");
+            prev = c;
+        }
+    }
 
     /// AMUX-2903, second pass. `done` must not TRIGGER the nudge.
     ///
