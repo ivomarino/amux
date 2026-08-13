@@ -7117,7 +7117,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.608';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.609';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8829,7 +8829,16 @@ function _peekMsgPrompts() {
   }
   const all = Array.from(body.querySelectorAll('.peek-prompt'));
   if (_peekMsgNavKind === 'all') return all;
-  return all.filter(el => (el.dataset.msgKind || 'human') === _peekMsgNavKind);
+  // Classify FRESH here, not from the render-time `data-msg-kind`. Prompts are
+  // rendered (and their kind stamped) BEFORE `_loadCmdHistoryFromServer`
+  // resolves, so at render time a prompt that matches no marker and no loaded
+  // row FAILS OPEN to 'human' — a scheduled command ("Board push …"), a peer
+  // relay, or an amux nudge then pollutes the human navigator and it never gets
+  // re-stamped. By the time a human presses ↑/↓, cmd_history IS loaded, so
+  // re-running the classifier yields the TRUE kind and the default human filter
+  // shows only real human messages (Ethan 2026-08-13: "simple default scroll
+  // thru + highlight human messages, not amux/session/schedule/peer").
+  return all.filter(el => _classifyPromptKind(el.textContent) === _peekMsgNavKind);
 }
 function _peekMsgUpdate(prompts) {
   const countEl = document.getElementById('peek-msg-count');
