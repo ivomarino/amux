@@ -132,7 +132,14 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
             }
         })
         .collect();
-    checks::status_agrees_with_pane(&lanes)
+    // Both checks read the SAME `lanes` (one capture, one derivation) so they
+    // cannot disagree with each other or with the mechanism they audit. The
+    // first flags a working pane read idle; the second (AMUX-3047) flags the
+    // inverse sharp case — `active` derived over a FRESH idle self-report and a
+    // quiet pane, i.e. the harness's own report being overridden.
+    let mut results = checks::status_agrees_with_pane(&lanes);
+    results.extend(checks::status_contradicts_fresh_idle_report(&lanes));
+    results
 }
 
 /// Is the report control plane UP — are self-reports landing at all?
@@ -529,9 +536,22 @@ mod tests {
         };
         let rs = status_pane_check(&state);
         assert!(!rs.is_empty(), "the binding must always reach a verdict");
+        // status_pane_check now wires TWO checks over the SAME lanes: the
+        // pane-agreement check and its sharper inverse (AMUX-3047,
+        // status.contradicts_fresh_idle_report). Which ids appear is
+        // machine-dependent — a box with no tmux fleet early-returns a single
+        // `status.agrees_with_pane` Unknown before the lanes (and so the second
+        // check) are built, while a box with a live fleet emits both — so this
+        // asserts the binding reaches a verdict with NO id outside the expected
+        // pair (a third id leaking in is the failure). The second check's own
+        // discrimination is proven machine-independently in
+        // `checks::tests::fresh_idle_report_contradiction_*`.
         assert!(
-            rs.iter().all(|r| r.invariant_id == "status.agrees_with_pane"),
-            "wrong invariant id — the sweep contract greps for this exact string"
+            rs.iter().all(|r| {
+                r.invariant_id == "status.agrees_with_pane"
+                    || r.invariant_id == "status.contradicts_fresh_idle_report"
+            }),
+            "unexpected invariant id — the sweep contract greps for these exact strings"
         );
     }
 

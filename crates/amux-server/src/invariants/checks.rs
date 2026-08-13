@@ -530,6 +530,76 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
     out
 }
 
+/// The SHARPER contradiction `status_agrees_with_pane` deliberately declines to
+/// flag. That check won't call `active` over a quiet pane a fault, because a
+/// lane can be legitimately mid-turn with nothing painting (a long tool call, a
+/// subagent). But when the harness ITSELF freshly reported `idle` — the main
+/// turn stopped — and the pane is not generating, a derived `active` is not
+/// "mid-turn with nothing painting": it is amux OVERRIDING the authoritative
+/// self-report, the exact inversion of the D1 rule that a fresh report wins.
+///
+/// INCIDENT (AMUX-3047, 2026-08-13, Ethan "says working but it appears done"):
+/// the subagent contradiction in `derive_status` flipped idle->active off a 240s
+/// subagent-mtime window with NO report-age gate, so a lane whose stop-hook had
+/// posted `idle` ~30s earlier read WORKING for up to four minutes. The root fix
+/// gates that flip on report age like the pane contradictions already were; THIS
+/// is the log-signal that makes the next instance of the class — any path that
+/// derives `active` while a fresh idle self-report AND a non-generating pane both
+/// say otherwise — self-announce in /api/health/invariants, instead of waiting
+/// for a human to notice a stale badge (the two-fixes rule).
+pub fn status_contradicts_fresh_idle_report(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
+    const ID: &str = "status.contradicts_fresh_idle_report";
+    // Same window as the derivation's `contradiction_window` (D4: policy in
+    // config, not baked in). A report younger than this is the authority; a
+    // derived `active` over it, with a quiet pane, means the report was
+    // overridden.
+    let window = std::env::var("AMUX_IDLE_CONTRADICTION_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let mut out = Vec::new();
+    for l in lanes {
+        let fresh_idle = l.report_state == "idle" && l.report_age_s < window;
+        if l.status == "active" && fresh_idle && !l.pane_says_working {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    "a lane with a fresh idle self-report and a quiet pane is derived active",
+                    format!(
+                        "status=active while the harness reported idle {:.0}s ago \
+                         (< {:.0}s window, source={}) and the pane is not generating",
+                        l.report_age_s, window, l.report_source
+                    ),
+                )
+                .entity(&l.name)
+                .evidence(json!({
+                    "session": l.name,
+                    "derived_status": l.status,
+                    "report_state": l.report_state,
+                    "report_age_s": l.report_age_s,
+                    "report_source": l.report_source,
+                    "report_origin": l.report_origin,
+                    "pane_says_working": l.pane_says_working,
+                    "window_s": window,
+                    "class": "derived-status-overrides-fresh-self-report",
+                    "incident": "AMUX-3047: the subagent contradiction flipped \
+                                 idle->active off a 240s mtime window with no \
+                                 report-age gate, so a stopped lane read WORKING \
+                                 for up to four minutes",
+                })),
+            );
+        } else {
+            out.push(InvariantResult::pass(ID).entity(&l.name));
+        }
+    }
+    if out.is_empty() {
+        // Same reasoning as status_agrees_with_pane: no lane painted inside the
+        // probe window is a real answer on a quiet fleet, not a broken probe.
+        out.push(InvariantResult::pass(ID));
+    }
+    out
+}
+
 /// One lane's two sources of truth, side by side.
 #[derive(Debug, Clone)]
 pub struct LaneTruth {
@@ -908,6 +978,66 @@ mod negative_controls {
             report_origin: "amux".into(),
         }];
         assert!(status_agrees_with_pane(&lanes).iter().all(|r| r.status == Status::Pass));
+    }
+
+    /// AMUX-3047, rebuilt from the incident artifact: gtm-engine derived
+    /// `active` while its stop-hook had posted `idle` 30s earlier (inside the
+    /// 60s window) and the pane was a quiet "✻ Crunched for 1m 7s" prompt. The
+    /// log-signal must catch this class — a fresh self-report overridden.
+    #[test]
+    fn fresh_idle_report_contradiction_fires_on_active_over_fresh_idle() {
+        let lanes = vec![LaneTruth {
+            name: "gtm-engine".into(),
+            status: "active".into(),
+            pane_says_working: false,
+            report_state: "idle".into(),
+            report_age_s: 30.0,
+            report_source: "stop-hook".into(),
+            report_origin: "gtm-engine".into(),
+        }];
+        let rs = status_contradicts_fresh_idle_report(&lanes);
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "must flag active derived over a fresh idle self-report + quiet pane"
+        );
+        assert_eq!(rs[0].entity_key, "gtm-engine", "the failure must name the lane");
+    }
+
+    /// Must NOT fire once the idle report ages past the window: a still-writing
+    /// subagent flipping it active then is the bounded late correction, not a
+    /// bug. A check that fires on legitimate behaviour gets switched off.
+    #[test]
+    fn fresh_idle_report_contradiction_silent_on_a_stale_report() {
+        let lanes = vec![LaneTruth {
+            name: "gtm-engine".into(),
+            status: "active".into(),
+            pane_says_working: false,
+            report_state: "idle".into(),
+            report_age_s: 120.0, // past the 60s window
+            report_source: "stop-hook".into(),
+            report_origin: "gtm-engine".into(),
+        }];
+        assert!(status_contradicts_fresh_idle_report(&lanes)
+            .iter()
+            .all(|r| r.status == Status::Pass));
+    }
+
+    /// Must NOT fire when the pane genuinely IS generating — then `active` is
+    /// correct regardless of any report, and this is not an override.
+    #[test]
+    fn fresh_idle_report_contradiction_silent_when_pane_is_working() {
+        let lanes = vec![LaneTruth {
+            name: "gtm-engine".into(),
+            status: "active".into(),
+            pane_says_working: true,
+            report_state: "idle".into(),
+            report_age_s: 30.0,
+            report_source: "stop-hook".into(),
+            report_origin: "gtm-engine".into(),
+        }];
+        assert!(status_contradicts_fresh_idle_report(&lanes)
+            .iter()
+            .all(|r| r.status == Status::Pass));
     }
 
     /// ...and must NOT fire for a deep queue behind a BUSY worker, which is

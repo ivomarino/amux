@@ -819,10 +819,29 @@ impl FleetSignals {
                 }
             }
         }
-        // SUBAGENTS ARE THE LANE WORKING TOO (AMUX-2904). Same one-way rule as
-        // the pane contradiction above: only ever idle -> active, so a missed
-        // signal costs a late correction and never a false "busy".
-        if status == "idle" && self.subagents_working(name) {
+        // SUBAGENTS ARE THE LANE WORKING TOO (AMUX-2904) — but a FRESH idle
+        // self-report outranks the subagent-mtime window, exactly as it does
+        // over a working pane. This is now LITERALLY "the same one-way rule as
+        // the pane contradiction above": same `idle_report_age >
+        // contradiction_window` gate, same admissible evidence, still only ever
+        // idle -> active. The gate was MISSING here while the comment above
+        // claimed sameness (Ethan, 2026-08-13: "says working but it appears
+        // done", over a "✻ Crunched for 1m 7s" idle prompt with a ~30s-old
+        // stop-hook idle report and 2 background agents). A stopped main turn is
+        // a stop-hook idle report, and a stopped main turn means its FOREGROUND
+        // subagents have necessarily finished — so a fresh idle report is the
+        // stronger signal and must win for the window, instead of the 240s
+        // `AMUX_SUBAGENT_WORKING_S` mtime window pinning the header WORKING for
+        // up to four minutes after the turn was done. AMUX-2904 is unchanged: a
+        // main turn ACTIVE with foreground subagents has NOT stopped, so there
+        // is no fresh idle report (`idle_report_age` is None -> `unwrap_or(true)`
+        // -> the flip still fires), and once a real idle report ages past the
+        // window a still-writing subagent flips it active as the bounded late
+        // correction the window was always documented to cost.
+        if status == "idle"
+            && idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true)
+            && self.subagents_working(name)
+        {
             status = "active".into();
         }
         status
@@ -2265,6 +2284,51 @@ mod tests {
         // is void and the pane's waiting shows through.
         s.started.insert("x".into(), 999_000.0);
         assert_eq!(s.derive_status("x", true), "waiting");
+    }
+
+    #[test]
+    fn a_fresh_idle_report_outranks_the_subagent_window() {
+        // gtm-engine, 2026-08-13 (Ethan: "says working but it appears done"):
+        // the main turn ENDED — a stop-hook posted a fresh idle report and the
+        // pane showed "✻ Crunched for 1m 7s" at an empty prompt — but a
+        // BACKGROUND subagent had written 30s ago, inside the 240s
+        // AMUX_SUBAGENT_WORKING_S window. The subagent contradiction flipped
+        // idle->active with NO report-age gate (the pane and waiting
+        // contradictions both have one), so the header read WORKING for up to
+        // 240s after the turn was done. FAILS on the pre-fix code (active),
+        // passes on the gated rule (idle).
+        let mut s = signals();
+        s.reports = json!({"x": {"state": "idle", "ts": s.now - 30.0, "source": "stop-hook"}});
+        s.subagent_activity.insert("x".into(), s.now - 30.0);
+        assert_eq!(
+            s.derive_status("x", true),
+            "idle",
+            "a fresh stop-hook idle report (main turn stopped -> foreground \
+             subagents finished) outranks the subagent-mtime window"
+        );
+
+        // AMUX-2904 PRESERVED: a main turn ACTIVE with foreground subagents has
+        // not stopped, so there is NO fresh idle report (idle_report_age None ->
+        // unwrap_or(true)) and live subagents still flip idle->active.
+        let mut s = signals();
+        s.subagent_activity.insert("x".into(), s.now - 30.0);
+        assert_eq!(
+            s.derive_status("x", true),
+            "active",
+            "with no fresh idle report, live subagents still flip idle->active"
+        );
+
+        // BOUNDED LATE CORRECTION: once the idle report ages past the
+        // contradiction window (60s), a still-writing subagent flips it active —
+        // the generous window's only documented cost, unchanged by the gate.
+        let mut s = signals();
+        s.reports = json!({"x": {"state": "idle", "ts": s.now - 120.0, "source": "stop-hook"}});
+        s.subagent_activity.insert("x".into(), s.now - 30.0);
+        assert_eq!(
+            s.derive_status("x", true),
+            "active",
+            "a stale idle report (past the window) lets live subagents show through"
+        );
     }
 
     #[test]
