@@ -3760,6 +3760,7 @@ function toggleTabCustomizer() {
   if (_tabCustomizerOpen) {
     _renderTabCustomizerMenu();
     menu.style.display = '';
+    _tabCustBeacon(menu, 'global');
   } else {
     menu.style.display = 'none';
   }
@@ -3892,6 +3893,58 @@ function _applyPeekTabVisibility() {
     if (el) el.style.display = peekHiddenTabs.has(t.id) ? 'none' : '';
   });
 }
+// Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
+// tab list does not appear when he taps the box; it renders correctly on
+// desktop Chromium, mobile Chromium at 375px, and WebKit/iPhone-15 under
+// Playwright, with geometry assertions. So the discriminator is not in any
+// target I can run — it is on HIS device, and this reports it.
+//
+// What each field is FOR (a beacon whose fields nobody can act on is the bug
+// this is fixing, not a second copy of it):
+//   ver          — is he even running the fix? A stale SW-cached bundle would
+//                  explain "still" across three CSS fixes, and nothing else I
+//                  can see distinguishes that from a live layout bug.
+//   standalone   — installed PWA vs Safari tab. Every automated target I have
+//                  is a browser tab; standalone has different viewport and
+//                  safe-area behaviour, and it is how he actually uses amux.
+//   mq600        — did the mobile bottom-sheet media query MATCH? If false on a
+//                  phone, the fix never applied and the desktop dropdown (the
+//                  clipped case) is what he is getting.
+//   rect/cs      — where it ACTUALLY landed and whether it is display:none,
+//                  zero-size, transparent, or behind something.
+//   stillOpen    — re-read after 600ms. AMUX-1731 was exactly this: correct at
+//                  open, then the tap's own momentum scroll dismissed it. A
+//                  synthetic Playwright click cannot reproduce that, which is
+//                  why every test I write passes.
+function _tabCustBeacon(menu, which) {
+  try {
+    if (!menu) return;
+    const snap = () => {
+      const r = menu.getBoundingClientRect();
+      const cs = getComputedStyle(menu);
+      return { t: Math.round(r.top), b: Math.round(r.bottom), l: Math.round(r.left),
+               w: Math.round(r.width), h: Math.round(r.height),
+               disp: cs.display, pos: cs.position, vis: cs.visibility, op: cs.opacity, z: cs.zIndex };
+    };
+    requestAnimationFrame(() => { try {
+      const first = snap();
+      setTimeout(() => { try {
+        const vv = window.visualViewport || {};
+        fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: 'tabcust-geo', ver: APP_VER, which: which,
+            standalone: !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+                        || !!window.navigator.standalone,
+            mq600: !!(window.matchMedia && window.matchMedia('(max-width: 600px)').matches),
+            open: first, stillOpen: snap(),
+            items: menu.querySelectorAll('.tab-customizer-item').length,
+            winW: window.innerWidth, winH: window.innerHeight,
+            vvH: Math.round(vv.height || 0), vvTop: Math.round(vv.offsetTop || 0),
+            dpr: window.devicePixelRatio || 0, ua: navigator.userAgent }) });
+      } catch (e) {} }, 600);
+    } catch (e) {} });
+  } catch (e) {}
+}
+
 let _peekTabCustomizerOpen = false, _peekTabMenuSortable = null;
 function _peekCustOutside(e) {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -3909,6 +3962,7 @@ function togglePeekTabCustomizer() {
       menu.style.top = (r.bottom + 4) + 'px';
       menu.style.left = Math.max(8, Math.min(r.left - 160, (document.documentElement.clientWidth||innerWidth) - 230)) + 'px'; }
     menu.style.display = '';
+    _tabCustBeacon(menu, 'peek');
     setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
   } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
 }
@@ -7313,7 +7367,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.624';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.625';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

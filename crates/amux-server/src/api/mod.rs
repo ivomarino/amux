@@ -281,13 +281,25 @@ pub fn router(state: AppState) -> Router {
         // checkout has been unguarded and SILENT about it. See api/git_guard.rs.
         .route("/api/git/staged-guard", axum::routing::post(git_guard::staged_guard))
         // Client diagnostic beacons (AR-128): the SPA sends geometry/tap
-        // traces for mobile layout debugging. Fire-and-forget, logged only.
+        // traces for mobile layout debugging.
+        //
+        // This used to log ONLY `kind`, at debug!, and throw the body away.
+        // Measured 2026-08-13: 299 beacons received — 47 peek-geo, 51 boot-geo,
+        // 31 peek-geo-kbd, 2 card-menu-geo — every one of them from a real
+        // phone, every payload discarded. The numbers these beacons exist to
+        // carry (the rect the menu ACTUALLY landed at, visualViewport offset,
+        // innerHeight) never survived the receiver, so the one instrument built
+        // to answer "why does this render off-screen on Ethan's iPhone but not
+        // in any simulator" could not answer it. A beacon whose payload is
+        // dropped is the same as no beacon, and it costs more, because it
+        // reads as covered (ethos rule 4).
+        //
+        // Now: full payload at INFO (greppable in server-rs.log) AND a bounded
+        // ring readable over HTTP, because "ask the server, do not grep for it"
+        // is this repo's own rule and a grep cannot be pointed at a phone.
         .route(
             "/api/client-debug",
-            axum::routing::post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
-                tracing::debug!(kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("?"), "client-debug beacon");
-                axum::Json(serde_json::json!({"ok": true}))
-            }),
+            axum::routing::post(client_debug_post).get(client_debug_get),
         )
         .route("/api/log-search", axum::routing::get(log_search::search))
         .route(
@@ -417,6 +429,97 @@ pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
         serde_json::Value::Array(a) => !a.is_empty(),
         serde_json::Value::Object(o) => !o.is_empty(),
     }
+}
+
+/// Recent client-debug beacons, newest last. Bounded so a chatty client cannot
+/// grow it without limit.
+///
+/// This ring is VOLATILE and the GET says so in its own response rather than
+/// letting a reader assume otherwise: the builder swaps the running binary
+/// whenever anyone commits, which clears it. That is acceptable HERE and would
+/// not be for state anything decides on — the durable copy is the INFO log line
+/// written on every POST, and this ring exists so a session can ask a question
+/// instead of grepping. Do not promote it to a source of truth without giving
+/// it a table (D1: "in-memory state is fiction").
+static CLIENT_DEBUG_RING: std::sync::Mutex<Vec<serde_json::Value>> =
+    std::sync::Mutex::new(Vec::new());
+const CLIENT_DEBUG_RING_MAX: usize = 500;
+
+async fn client_debug_post(
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let kind = body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // The WHOLE body, at INFO. The payload is the entire point of the beacon;
+    // logging just `kind` is how 299 of these arrived carrying real device
+    // geometry and told us nothing.
+    tracing::info!(kind = %kind, ua = %ua, payload = %body, "client-debug beacon");
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut ring) = CLIENT_DEBUG_RING.lock() {
+        ring.push(serde_json::json!({ "ts": ts, "kind": kind, "ua": ua, "body": body }));
+        let n = ring.len();
+        if n > CLIENT_DEBUG_RING_MAX {
+            ring.drain(0..n - CLIENT_DEBUG_RING_MAX);
+        }
+    }
+    axum::Json(serde_json::json!({"ok": true}))
+}
+
+/// `GET /api/client-debug?kind=<k>&limit=<n>` — read back what real devices
+/// reported. Answers "what did HIS phone actually measure", which no simulator
+/// and no grep on this machine can.
+async fn client_debug_get(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    let want = q.get("kind").cloned();
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .min(CLIENT_DEBUG_RING_MAX);
+
+    let ring = match CLIENT_DEBUG_RING.lock() {
+        Ok(r) => r.clone(),
+        Err(_) => Vec::new(),
+    };
+    let total = ring.len();
+    let mut rows: Vec<serde_json::Value> = ring
+        .into_iter()
+        .filter(|r| match &want {
+            Some(k) => r.get("kind").and_then(|v| v.as_str()) == Some(k.as_str()),
+            None => true,
+        })
+        .collect();
+    let matched = rows.len();
+    if rows.len() > limit {
+        rows.drain(0..matched - limit);
+    }
+
+    axum::Json(serde_json::json!({
+        "beacons": rows,
+        "matched": matched,
+        "held": total,
+        "cap": CLIENT_DEBUG_RING_MAX,
+        // Stated, not implied: an empty result here means "nothing since this
+        // binary started", NOT "the client never sent one". The builder swaps
+        // the binary on any commit. The durable copy is the INFO log line.
+        "volatile": true,
+        "note": "in-memory since process start; durable copy is the 'client-debug beacon' INFO line in ~/.amux/logs/server-rs.log",
+    }))
 }
 
 async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Value> {
