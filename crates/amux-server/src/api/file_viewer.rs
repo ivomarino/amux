@@ -121,6 +121,33 @@ const AUDIO_MIMES: &[(&str, &str)] = &[
 ];
 const PDF_MIME: &[(&str, &str)] = &[(".pdf", "application/pdf")];
 
+/// Text / web types the browser renders in place. Python's raw table
+/// (py:68082-68093) had ONLY media + pdf and fell straight to octet-stream for
+/// these, so navigating the dashboard's file viewer to an HTML report (or .svg,
+/// .json, .csv) DOWNLOADED it and the page stayed about:blank instead of
+/// rendering (amax-gtm, 2026-08-13, Wexus deliverable). This is a native
+/// improvement over the deleted python contract, not a parity port. Code/markdown
+/// go out as text/plain so a direct navigation shows the SOURCE rather than
+/// letting a browser try to execute or reflow it; .html/.json/.csv get their
+/// real types so they render. charset=utf-8 because bytes are served as-is.
+const TEXT_MIMES: &[(&str, &str)] = &[
+    (".html", "text/html; charset=utf-8"),
+    (".htm", "text/html; charset=utf-8"),
+    (".json", "application/json; charset=utf-8"),
+    (".csv", "text/csv; charset=utf-8"),
+    (".tsv", "text/tab-separated-values; charset=utf-8"),
+    (".xml", "text/xml; charset=utf-8"),
+    (".txt", "text/plain; charset=utf-8"),
+    (".md", "text/plain; charset=utf-8"),
+    (".markdown", "text/plain; charset=utf-8"),
+    (".log", "text/plain; charset=utf-8"),
+    (".yml", "text/plain; charset=utf-8"),
+    (".yaml", "text/plain; charset=utf-8"),
+    (".toml", "text/plain; charset=utf-8"),
+    (".css", "text/plain; charset=utf-8"),
+    (".js", "text/plain; charset=utf-8"),
+];
+
 /// Ebook sets (py:156-158).
 const EBOOK_RENDERABLE: &[&str] = &[".epub", ".fb2", ".cbz", ".mobi", ".azw"];
 const EBOOK_DOWNLOAD_ONLY: &[&str] = &[".azw3", ".azw4", ".kfx", ".cbr", ".djvu", ".lit", ".pdb"];
@@ -449,12 +476,16 @@ async fn vtt(method: Method, RawQuery(q): RawQuery) -> Response {
 // GET /api/file/raw — range streaming (py:68069-68140)
 // ---------------------------------------------------------------------------
 
-/// The union MIME table of the raw endpoint (py:68082-68093).
+/// The union MIME table of the raw endpoint. Extended beyond python's
+/// media-only table (py:68082-68093) with TEXT_MIMES so renderable files serve
+/// with a real content-type instead of octet-stream (amax-gtm, 2026-08-13);
+/// octet-stream stays the fallback for genuine binaries only.
 fn raw_mime(ext: &str) -> &'static str {
     mime_of(IMAGE_MIMES, ext)
         .or_else(|| mime_of(PDF_MIME, ext))
         .or_else(|| mime_of(VIDEO_MIMES, ext))
         .or_else(|| mime_of(AUDIO_MIMES, ext))
+        .or_else(|| mime_of(TEXT_MIMES, ext))
         .unwrap_or("application/octet-stream")
 }
 
@@ -519,10 +550,18 @@ async fn raw(req: Request) -> Response {
             .body(Body::empty())
             .expect("static 304");
     }
-    // Streamable media plays in place; attachment makes iOS Safari download
-    // 3GB instead of streaming it (python's comment, py:68103).
+    // Render in place for anything the browser can display; force download only
+    // for true binaries — or when ?download=1 is explicitly requested. Before
+    // this, everything except video/audio got `attachment`, so an HTML report,
+    // image, or PDF served by amux DOWNLOADED instead of rendering and the page
+    // stayed about:blank (amax-gtm, 2026-08-13). Streamable media stays inline so
+    // iOS Safari streams a 3GB video instead of downloading it (py:68103).
     let kind = mime.split('/').next().unwrap_or("");
-    let disp_kind = if kind == "video" || kind == "audio" { "inline" } else { "attachment" };
+    let force_dl = matches!(qs_get(&qs, "download").unwrap_or(""), "1" | "true" | "yes");
+    let renderable = matches!(kind, "video" | "audio" | "image" | "text")
+        || mime == "application/pdf"
+        || mime.starts_with("application/json");
+    let disp_kind = if force_dl || !renderable { "attachment" } else { "inline" };
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let disp = format!("{disp_kind}; filename=\"{name}\"");
 
@@ -786,6 +825,33 @@ async fn prepare(State(state): State<AppState>, req: Request) -> Response {
         Ok(m) if m.is_file() => m,
         _ => return j(404, json!({"error": "file not found"})),
     };
+    // prepare is a VIDEO remux-for-iOS path. Feeding it a non-video (xlsx, pdf,
+    // zip, docx) sent it straight to ffmpeg, which failed with "Invalid data
+    // found when processing input" — a parse error that reads like a corrupt
+    // file rather than "this type can't be prepared" (amax-gtm, 2026-08-13).
+    // Gate on real video extensions and answer honestly for everything else.
+    // The WARN is the log signal (two-fixes rule): the next time prepare is
+    // called on a type it can never handle, a log sweep / /api/logs sees it
+    // instead of an opaque ffmpeg exit code.
+    let ext = py_suffix(&p);
+    if mime_of(VIDEO_MIMES, &ext).is_none() {
+        tracing::warn!(
+            "[media-prep] prepare called on non-video {} (ext '{}') — unsupported, not sent to ffmpeg",
+            pystr(&p), ext
+        );
+        return j(
+            200,
+            json!({
+                "ready": false,
+                "reason": "unsupported type",
+                "detail": format!(
+                    "prepare only remuxes video; '{ext}' cannot be prepared. \
+                     View it directly via /api/file/raw."
+                ),
+                "ext": ext,
+            }),
+        );
+    }
     let Some(ffmpeg) = find_bin("ffmpeg") else {
         return j(500, json!({"error": "ffmpeg not installed"}));
     };
@@ -1735,6 +1801,31 @@ pub(crate) mod tests {
         .await;
         assert_eq!(h["content-type"], "application/octet-stream");
         assert_eq!(h["content-disposition"], "attachment; filename=\"notes.bin\"");
+
+        // Renderable types serve with a real content-type AND inline disposition
+        // so a browser navigation renders instead of downloading (amax-gtm bug 3).
+        let html = dir.path().join("report.html");
+        std::fs::write(&html, b"<h1>hi</h1>").unwrap();
+        let (_, h, _) = send(
+            &app,
+            HttpRequest::builder()
+                .uri(format!("/api/file/raw?path={}", enc(html.to_str().unwrap())))
+                .body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(h["content-type"], "text/html; charset=utf-8");
+        assert_eq!(h["content-disposition"], "inline; filename=\"report.html\"");
+
+        // ?download=1 forces attachment even for a renderable type.
+        let (_, h, _) = send(
+            &app,
+            HttpRequest::builder()
+                .uri(format!("/api/file/raw?path={}&download=1", enc(html.to_str().unwrap())))
+                .body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(h["content-type"], "text/html; charset=utf-8");
+        assert_eq!(h["content-disposition"], "attachment; filename=\"report.html\"");
     }
 
     #[tokio::test]
@@ -2058,6 +2149,29 @@ pub(crate) mod tests {
         assert_eq!(v["error"], "missing path");
         let (status, _) = get(&app, &format!("/api/file/prepare?path={}", enc("/nope/x.mkv"))).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn prepare_non_video_is_honest_not_an_ffmpeg_error() {
+        // A non-video (xlsx/pdf/zip/docx) must NOT be sent to ffmpeg — it used
+        // to fail with "Invalid data found when processing input", which reads
+        // like a corrupt file (amax-gtm bug 3). The gate returns before find_bin,
+        // so this passes with or without ffmpeg on the box.
+        let app = app();
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["deliverable.xlsx", "report.pdf", "bundle.zip", "doc.docx"] {
+            let f = dir.path().join(name);
+            std::fs::write(&f, b"PK\x03\x04 not really media").unwrap();
+            let (status, v) = get(
+                &app,
+                &format!("/api/file/prepare?path={}", enc(f.to_str().unwrap())),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}: {v}");
+            assert_eq!(v["ready"], false, "{name}: {v}");
+            assert_eq!(v["reason"], "unsupported type", "{name}: {v}");
+            assert!(v.get("error").is_none(), "{name} must not surface an ffmpeg error: {v}");
+        }
     }
 
     // -- transcode -----------------------------------------------------------
