@@ -43,6 +43,52 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_history).post(append_history).delete(clear_history))
         .route("/import", axum::routing::post(import_history))
+        // Look up ONE message by its id. `/import` is a literal POST above, so
+        // this GET capture never swallows it.
+        .route("/{id}", get(get_history_item))
+}
+
+/// GET /api/history/{id} — look up ONE message by its id, accepting either a
+/// bare integer or the `MSG-<id>` form the UI shows and people paste.
+///
+/// Ethan 2026-08-13: "msg api isn't obvious to workers" — a worker told to look
+/// at MSG-28003 had NO endpoint to fetch it. The `MSG-<n>` id it sees is a
+/// `cmd_history` ROW id with a display prefix, but `/api/messages/{id}` is a
+/// DIFFERENT table (`_amux_messages`, ULID ids), so the obvious guess 404s. This
+/// is the lookup that matches what the id actually is.
+async fn get_history_item(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let raw = id.trim().trim_start_matches("MSG-").trim_start_matches("msg-").trim();
+    let Ok(nid) = raw.parse::<i64>() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("'{id}' is not a message id — expected MSG-<number> or a number") }),
+        );
+    };
+    let store = state.store.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+        let conn = store.read()?;
+        let sql = "SELECT id, text, type, session, ts, origin, card_id, \
+                   delivery, queued_at, delivered_at, submit_verdict \
+                   FROM cmd_history WHERE id=?1";
+        let refs: Vec<&dyn rusqlite::types::ToSql> = vec![&nid];
+        let mut rows = super::calendar::query_rows_json(&conn, sql, &refs)?;
+        if let Some(d) = rows.first_mut() {
+            let mtype = d.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+            d["kind"] = json!(msg_kind(&mtype));
+            d["queued"] = json!(msg_is_queued(&mtype));
+        }
+        Ok(rows.into_iter().next())
+    })
+    .await;
+    match joined {
+        Ok(Ok(Some(row))) => Json(row).into_response(),
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, json!({ "error": format!("MSG-{nid} not found") })),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
 }
 
 fn err(status: StatusCode, body: Value) -> Response {
