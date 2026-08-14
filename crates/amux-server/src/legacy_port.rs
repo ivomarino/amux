@@ -1,49 +1,43 @@
-//! Legacy-port accounting — turning "can we drop the 8822 bind yet?" into a
-//! number instead of a guess.
+//! Legacy-port accounting — who is still stranded on the retired 8822 address,
+//! now that its bind is gone.
 //!
-//! # Why this exists
+//! # History (why this module exists)
 //!
-//! The server answers a second, historical port (`AMUX_RS_LEGACY_PORT`, 8822
-//! here) because ~60 live fleet sessions carry `AMUX_URL=https://localhost:8822`
-//! in their PROCESS env, and a live process's env cannot be rotated. Every one
-//! of them keeps working only because that bind exists. The address itself is
-//! retired: every config, doc, CLI default and freshly-spawned session now says
-//! 8824.
+//! When the Python server was retired, the Rust server answered a second,
+//! historical port (`AMUX_RS_LEGACY_PORT`, 8822) because ~60 live fleet sessions
+//! carried `AMUX_URL=https://localhost:8822` in their PROCESS env, and a live
+//! process's env cannot be rotated. That bind was pure carry-over, always a
+//! countdown rather than an address, and the only responsible way to decide "is
+//! anything still calling it?" was to measure rather than guess (Ethos rule 4:
+//! if a wrong answer would not be detectable from the data we keep, the missing
+//! instrument IS the bug). So this module counted hits on the legacy listener
+//! BY LAYER (below), turning the retirement decision into a number.
 //!
-//! So the bind is pure carry-over for processes that predate the cutover, and
-//! it should be dropped — but "is anything still calling it?" was answerable
-//! only by guessing at how many old sessions were left. A retirement decision
-//! made from a guess is how you either keep a legacy port forever or break the
-//! fleet at 2am. Ethos rule 4: if a wrong answer would not be detectable from
-//! the data we keep, the missing instrument IS the bug.
+//! # The bind is GONE (Ethan, 2026-08-11: "no more 8822 just rust")
 //!
-//! # THE EXIT CONDITION for deleting the legacy bind
+//! Ethan dropped it ahead of the automatic 7-day-quiet exit; `lib.rs` records
+//! why and forbids re-adding it. Two consequences the rest of this file is
+//! shaped by:
 //!
-//! Drop `AMUX_RS_LEGACY_PORT` from `~/.amux/server.env` (and this module, and
-//! the bind block in `lib.rs`) when BOTH hold:
+//!   1. The hit counter still exists but reads 0 BY CONSTRUCTION — nothing
+//!      listens on 8822, so a stranded lane's `curl $AMUX_URL/...` fails at
+//!      connect and records no hit. Hit-based "still in use" therefore collapses
+//!      to CLEAR while lanes are in fact broken, which is why the LIVE signal is
+//!      now the process-env scan (`scan_stranded_sessions`, AMUX-2988), reported
+//!      hourly (WARN naming the sessions) and by `GET /api/debug/legacy-port` as
+//!      `stranded_count` / `stranded_sessions`.
+//!   2. The remedy for a stranded lane is `$(amux url)` — which reads
+//!      `endpoint.json` and self-heals past the dead env — or restarting the
+//!      lane. NOT restoring the bind (AMUX-3046).
 //!
-//!   1. `GET /api/debug/legacy-port` reports `hits_total: 0` across a window of
-//!      at least **7 days of continuous uptime** (`window.hours_elapsed >= 168`
-//!      with `hits_total == 0`). Seven days because a session can sit parked for
-//!      days and then take one turn; an hour of silence proves nothing.
-//!   2. `clients` is empty — nothing has been seen at all, as opposed to "a
-//!      known caller went quiet". Any entry there names a specific IP and
-//!      user-agent you can go and fix.
-//!
-//! Until then the hourly report is the ticker: a WARN line while anything is
-//! still arriving, an INFO line saying zero once nothing is. `grep 'legacy
-//! port' ~/.amux/logs/server-rs.log | grep WARN` returning nothing for a week
-//! is the same signal as (1), readable without the API.
-//!
-//! # How the count is taken
+//! # How the count was taken (retained for the retired-port guard + tests)
 //!
 //! By LAYER on the legacy listener's router clone, not by sniffing the `Host`
-//! header. The two listeners share one `app`, so the legacy one gets its own
-//! `.layer()` and a request is counted iff it physically arrived on that
-//! socket. A `Host` header is client-supplied and would count a request that
-//! merely *said* 8822 while arriving on 8824 — which, on the one measurement
-//! the retirement decision rests on, is the difference between deleting the
-//! bind and breaking 60 sessions.
+//! header: the two listeners shared one `app`, so a request was counted iff it
+//! physically arrived on that socket. A `Host` header is client-supplied and
+//! would have counted a request that merely *said* 8822 while arriving on 8824.
+//! Kept because `RETIRED_PORTS` and the endpoint contract still drive the
+//! stranded-lane detection and its tests.
 
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;

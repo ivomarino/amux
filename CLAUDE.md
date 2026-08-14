@@ -6,17 +6,24 @@ A **Rust workspace** (`crates/amux-core`, `amux-server`, `amux-cli`, `amux-dashb
 serving a static SPA. **The address is 8824** (`AMUX_RS_PORT`, what `./install.sh`
 sets) — use it everywhere.
 
-The same binary also answers **8822**, the RETIRED port, via a compatibility bind
-(`AMUX_RS_LEGACY_PORT`) that exists for one reason: sessions started before the
-cutover have `AMUX_URL=https://localhost:8822` in their PROCESS env, and a live
-process's env cannot be rotated. Same `pid`, same `build` hash on both;
-`curl -sk https://localhost:8824/health` and `:8822/health` prove it.
+8822 is the RETIRED port and its compatibility bind is **gone** (Ethan dropped it
+2026-08-11: "no more 8822 just rust", `crates/amux-server/src/lib.rs`).
+`curl -sk https://localhost:8824/health` answers; `:8822/health` no longer does.
+Do NOT re-add the bind to fix a symptom — lib.rs records why, and names what
+replaced it (`endpoint.json` self-heal for hooks, canonical-port launch for new
+lanes). `tests/legacy_port_guard.rs` fails the build if the address reappears.
 
-That bind is a countdown, not an address. Do not point anything new at 8822, and
-do not drop the bind on a hunch: `GET /api/debug/legacy-port` reports how many
-requests still arrive there and from which clients, and the server logs an hourly
-WARN naming them. Exit condition (zero hits for 7 days) is in
-`crates/amux-server/src/legacy_port.rs` and docs/rust-migration/server-boundary.md.
+The catch this leaves: lanes started before the cutover still carry
+`AMUX_URL=https://localhost:8822` in their PROCESS env, which a live process cannot
+rotate, so their raw `curl $AMUX_URL/...` fails at connect and reads as "server
+down" (this is AMUX-3046, and it will bite you if THIS session is one of them).
+Two remedies: use **`$(amux url)`** in place of `$AMUX_URL` in any recipe — it
+reads the server-written `~/.amux/endpoint.json`, self-heals past a stale port, and
+survives the next port move too (the `amux` CLI itself is already unaffected); and
+**restart** a stranded lane to clear its env. The strand self-announces — the CLI
+warns once per session, the server logs an hourly WARN naming stranded sessions,
+and `GET /api/debug/legacy-port` enumerates them (`stranded_count`,
+`stranded_sessions`, plus the recycle-vs-resolve decision).
 
 The Python predecessor (`amux-server.py`, single file, inline dashboard) was **deleted
 at commit 792ce1f** (2026-08-09). Git history has it. Nothing here should assume it
@@ -233,8 +240,9 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   ships.** `com.amux.server-rs-builder` (`scripts/rust-auto-build.sh`, every 60s)
   rebuilds when the last commit touching `crates/`/`Cargo.*` moves, installs
   `~/.local/bin/amux-server-rs`, and the running server self-adopts (exits for launchd
-  to relaunch). The same binary also answers the retired 8822 (see the top of this
-  file). To see a change live, commit it, then confirm it took:
+  to relaunch). 8822 is retired and no longer bound (see the top of this file) — if
+  your `$AMUX_URL` still names it, use `$(amux url)`. To see a change live, commit it,
+  then confirm it took:
   ```bash
   # wait for the builder cycle (or force it: bash scripts/rust-auto-build.sh)
   curl -sk https://localhost:8824/health   # `build` hash must move, `server":"amux-rust"`

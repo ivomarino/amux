@@ -2336,6 +2336,9 @@ ${BOLD}Info:${RESET}
   amux ls                        List all workers with status and previews
   amux info <name>               Show worker config details
   amux defaults [show|edit|reset] Manage global default flags
+  amux whoami                    Live worker identity vs inherited env (mismatch warns)
+  amux url [--verify]            Print the canonical API base (use \$(amux url), not
+                                 \$AMUX_URL — self-heals a stale port; --verify probes)
 
 ${BOLD}Dashboard:${RESET}
   amux                           Interactive dashboard (optimized for phone)
@@ -2343,7 +2346,7 @@ ${BOLD}Dashboard:${RESET}
 ${BOLD}Web Dashboard:${RESET}
   amux serve [port]              Start the Rust server (normally launchd's job;
                                  installed service 8824, bare default 8823;
-                                 also answers retired 8822 while it is bound)
+                                 8822 is retired — the compat bind is gone)
 
 ${BOLD}CRM:${RESET}
   amux crm list [query]          List contacts (search name/company/role)
@@ -2553,6 +2556,59 @@ cmd_whoami() {
   return 0
 }
 
+# amux url — print the canonical amux API base, resolved from the server-written
+# ~/.amux/endpoint.json so it self-heals past a STALE $AMUX_URL. AMUX-3046: a lane
+# started before a port move carries the retired address in its PROCESS env for
+# life (env can't be re-read live), so `curl $AMUX_URL/...` fails at connect and
+# reads as "server down". Scripts should use `$(amux url)` in place of $AMUX_URL —
+# it survives the NEXT port move too, unlike hardcoding :8824 in every caller.
+#
+# DEFAULT is a PURE FILE READ (no HTTP probe): probing per-call across ~48 lanes
+# would flood the server to ask where the server is. `--verify` opts into a probe.
+cmd_url() {
+  local literal="https://localhost:8824"   # last-resort floor; appended, never an else-branch
+  local retired_floor="8822"                # only consulted when endpoint.json is unreadable
+  local ep="$HOME/.amux/endpoint.json"
+  local resolved="" src=""
+
+  # 1. endpoint.json is authoritative and self-updating (the server rewrites it
+  #    every boot with canonical_url + retired_ports). Canonical WINS; a stale
+  #    env is ignored whenever the file is present.
+  if [ -r "$ep" ]; then
+    resolved=$(sed -n 's/.*"canonical_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ep" | head -1)
+    [ -n "$resolved" ] && src="endpoint.json"
+  fi
+
+  # 2. File missing/garbled: trust $AMUX_URL only if its port is not the retired
+  #    floor (without the file we cannot read retired_ports).
+  if [ -z "$resolved" ] && [ -n "${AMUX_URL:-}" ]; then
+    local port="${AMUX_URL##*:}"; port="${port%%/*}"
+    case " $retired_floor " in
+      *" $port "*) : ;;                     # retired -> fall through to the literal
+      *) resolved="$AMUX_URL"; src="env" ;;
+    esac
+  fi
+
+  # 3. Unconditional literal — a conditional fallback is not a fallback: it would
+  #    remove the only working candidate exactly when file+env both fail.
+  [ -z "$resolved" ] && { resolved="$literal"; src="literal"; }
+
+  printf '%s\n' "$resolved"
+
+  if [ "${1:-}" = "--verify" ]; then
+    # A dead port returns an EMPTY body, not a connection refusal, so liveness
+    # asserts the /health body looks like an amux server — not merely that the
+    # socket answered (something else may have grabbed the port).
+    if curl -sk -m 3 "$resolved/health" 2>/dev/null | grep -q '"server"'; then
+      printf 'amux url: %s (via %s) — /health responds as an amux server\n' "$resolved" "$src" >&2
+      return 0
+    fi
+    printf 'amux url: %s (via %s) — WARNING: /health did not respond as an amux server (dead/wrong port?)\n' "$resolved" "$src" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ── Main dispatch ────────────────────────────────────────────────────────────
 #
 # Source guard: when this script is run normally as `amux ...`, BASH_SOURCE[0]
@@ -2610,6 +2666,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     alert)            shift; cmd_alert "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
+    url)              shift; cmd_url "$@" ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;
     "")               cmd_dashboard ;;
