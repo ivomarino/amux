@@ -73,6 +73,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/board", "board/tasks CRUD, gates, contract"),
     ("/api/lookup", "explain-selection helper (peek view)"),
     ("/api/tts", "text-to-speech read-aloud synthesis (+ /api/tts/voices)"),
+    ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
     ("/api/skin", "resolved skin (terms/colours/tabs) for a worker"),
     ("/api/config", "declarative instance config: export + idempotent apply"),
     // ---- Mounted in mod.rs but never declared here, so

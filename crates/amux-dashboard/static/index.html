@@ -207,6 +207,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnect()"><span class="mi">&#x1F517;</span> Connect tmux</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnectIterm2()"><span class="mi">&#x1F5A5;</span> Connect iTerm2 pane</div>
         <div class="card-menu-sep"></div>
+        <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();_orchOpen()"><span class="mi">&#x1F399;&#xFE0F;</span> Orchestrate (voice)</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openBulkActions()"><span class="mi">&#x26A1;</span> Bulk actions</div>
       </div>
     </div>
@@ -1744,6 +1745,50 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div class="board-detail-footer">
     <span id="bd-save-status" style="font-size:0.78rem;color:var(--dim);"></span>
     <button class="btn primary" onclick="boardDetailSave()">Save</button>
+  </div>
+</div>
+
+<!-- Voice fleet-orchestrator modal (AMUX-3074): speak one command → fast model
+     routes it to the right workers → review → send. -->
+<div id="orch-overlay" class="edit-overlay" onclick="if(event.target===this)_orchClose()">
+  <div class="edit-box orch-box">
+    <h3 style="display:flex;align-items:center;gap:8px;">&#x1F399;&#xFE0F; Orchestrate the fleet
+      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak once — routed to the right workers</span></h3>
+
+    <!-- Step 1: record -->
+    <div id="orch-step-record" class="orch-step">
+      <button id="orch-mic" class="orch-mic" onclick="_orchToggleRec()" title="Tap to speak">&#x1F399;&#xFE0F;</button>
+      <div class="orch-wave" id="orch-wave">
+        <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+        <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+        <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+        <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
+      </div>
+      <div id="orch-status" class="orch-status">Tap the mic and speak a command for the fleet</div>
+    </div>
+
+    <!-- Step 2: transcript (editable) -->
+    <div id="orch-step-transcript" class="orch-step" style="display:none;">
+      <div class="orch-label">What you said <span style="color:var(--dim);font-weight:400;">— edit if the transcription is off</span></div>
+      <textarea id="orch-transcript" class="orch-textarea" rows="3" spellcheck="true"></textarea>
+      <div class="orch-actions">
+        <button class="btn" onclick="_orchReset()">Re-record</button>
+        <button class="btn primary" onclick="_orchPlan()">Route to workers &rarr;</button>
+      </div>
+    </div>
+
+    <!-- Step 3: routing plan review -->
+    <div id="orch-step-plan" class="orch-step" style="display:none;">
+      <div class="orch-label" id="orch-plan-summary"></div>
+      <div id="orch-plan-list" class="orch-plan-list"></div>
+      <div id="orch-plan-dropped" style="font-size:0.72rem;color:#d29922;margin:4px 0;"></div>
+      <div class="orch-actions">
+        <button class="btn" onclick="_orchReset()">Start over</button>
+        <button class="btn primary" id="orch-send-btn" onclick="_orchSendAll()">Send all</button>
+      </div>
+    </div>
+
+    <div id="orch-result" class="orch-step" style="display:none;"></div>
   </div>
 </div>
 

@@ -58,6 +58,7 @@ pub mod self_update;
 pub mod session_verbs;
 pub mod board_themes;
 pub mod lookup;
+pub mod orchestrate;
 pub mod simple;
 pub mod config_iac;
 pub mod skin;
@@ -164,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         // Uniform per-capability scope read/write — NATIVE (AMUX-2608: the
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
+        .nest("/api/orchestrate", orchestrate::routes())
         // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
         // and the forwarder it fed was deleted in AMUX-2906, so the merge that
         // used to sit here (already a no-op) is gone too — the registry, the

@@ -267,6 +267,47 @@
     max-height: calc(100dvh - 40px); overflow-y: auto;
   }
   .edit-box h3 { font-size: 1rem; margin-bottom: 14px; }
+
+  /* Voice fleet orchestrator (AMUX-3074) */
+  .orch-box { max-width: 460px; }
+  .orch-step { display: flex; flex-direction: column; gap: 10px; }
+  .orch-mic {
+    width: 84px; height: 84px; border-radius: 50%; align-self: center; margin: 8px 0 4px;
+    border: 2px solid var(--accent); background: rgba(88,166,255,0.10); color: var(--accent);
+    font-size: 2rem; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: transform .12s, background .2s; }
+  .orch-mic:hover { background: rgba(88,166,255,0.18); }
+  .orch-mic.recording { background: #f85149; border-color: #f85149; color: #fff; animation: orch-pulse 1.1s infinite; }
+  @keyframes orch-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(248,81,73,0.45); } 50% { box-shadow: 0 0 0 12px rgba(248,81,73,0); } }
+  .orch-wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 34px; }
+  .orch-wave .dict-bar { width: 4px; height: 100%; border-radius: 2px; background: var(--accent);
+    transform: scaleY(0.12); transform-origin: center; transition: transform .06s; }
+  .orch-status { text-align: center; font-size: 0.82rem; color: var(--dim); min-height: 20px; }
+  .orch-label { font-size: 0.8rem; font-weight: 600; color: var(--text); }
+  .orch-textarea { width: 100%; font-size: 0.9rem; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); font-family: inherit;
+    box-sizing: border-box; resize: vertical; }
+  .orch-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+  .orch-actions .btn { min-height: 40px; }
+  .orch-plan-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+  .orch-plan-item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--bg); }
+  .orch-plan-item.excluded { opacity: 0.45; }
+  .orch-plan-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+  .orch-plan-inc { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; }
+  .orch-plan-worker { font-weight: 600; color: var(--accent); }
+  .orch-plan-why { font-size: 0.7rem; color: var(--dim); text-align: right; }
+  .orch-plan-msg { width: 100%; font-size: 0.85rem; padding: 6px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--card); color: var(--text); font-family: inherit;
+    box-sizing: border-box; resize: vertical; }
+  .orch-res-row { font-size: 0.85rem; padding: 4px 2px; }
+  .orch-res-row.ok { color: var(--green, #3fb950); }
+  .orch-res-row.bad { color: #f85149; }
+  @media (max-width: 600px) {
+    .orch-box { max-width: 100%; }
+    .orch-mic { width: 96px; height: 96px; }
+    .orch-plan-list { max-height: 38vh; }
+    .orch-actions .btn { min-height: 44px; flex: 1; }
+  }
   .edit-box input, .edit-box select, .edit-box textarea {
     width: 100%; font-size: 0.95rem; padding: 10px 12px; border-radius: 8px;
     border: 1px solid var(--border); background: var(--bg); color: var(--text);

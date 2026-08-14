@@ -4342,6 +4342,203 @@ function closeAddMenu() {
   addMenuOpen = false;
 }
 
+// ── Voice fleet orchestrator (AMUX-3074) ──────────────────────────────────────
+// Speak ONE command → /api/dictate transcribes → /api/orchestrate/plan asks the
+// fast helper model which workers get which messages → review → send each through
+// the normal human-send path (so every routed message is recorded AND auto-captured
+// as a board card via cmd_hist_record_full). Pure composition: dictation + helper
+// model + workers + messages. A dedicated recorder (not the peek dictation outbox).
+let _orchStream = null, _orchRec = null, _orchChunks = [], _orchRecording = false, _orchStartMs = 0;
+let _orchAudioCtx = null, _orchAnalyser = null, _orchRaf = 0, _orchTick = 0, _orchCancelled = false;
+let _orchPlanData = [];
+
+function _orchOpen() {
+  const ov = document.getElementById('orch-overlay'); if (!ov) return;
+  ov.classList.add('active');
+  _orchReset();
+}
+function _orchClose() {
+  const ov = document.getElementById('orch-overlay'); if (ov) ov.classList.remove('active');
+  if (_orchRecording) _orchStopRec(true);
+  _orchStopMeter();
+}
+function _orchShowStep(step) {
+  ['record', 'transcript', 'plan'].forEach(s => {
+    const el = document.getElementById('orch-step-' + s);
+    if (el) el.style.display = (s === step ? '' : 'none');
+  });
+  const res = document.getElementById('orch-result'); if (res) res.style.display = 'none';
+}
+function _orchReset() {
+  if (_orchRecording) _orchStopRec(true);
+  _orchShowStep('record');
+  _orchStatus('Tap the mic and speak a command for the fleet');
+  document.getElementById('orch-mic')?.classList.remove('recording');
+}
+function _orchStatus(t) { const s = document.getElementById('orch-status'); if (s) s.textContent = t; }
+function _orchToggleRec() { if (_orchRecording) _orchStopRec(false); else _orchStartRec(); }
+
+async function _orchStartRec() {
+  if (_orchRecording) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
+  _orchStatus('Starting mic…');
+  try {
+    _orchStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } } });
+  } catch (e) { showToast('Microphone access denied'); _orchStatus('Microphone access denied'); return; }
+  let mime = '';
+  for (const m of ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/aac'])
+    if (window.MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) { mime = m; break; }
+  const opts = { audioBitsPerSecond: 16000 }; if (mime) opts.mimeType = mime;
+  try { _orchRec = new MediaRecorder(_orchStream, opts); }
+  catch (e) { try { _orchRec = new MediaRecorder(_orchStream); } catch (e2) { showToast('Recorder unavailable'); return; } }
+  _orchChunks = []; _orchCancelled = false;
+  _orchRec.ondataavailable = e => { if (e.data && e.data.size) _orchChunks.push(e.data); };
+  _orchRec.onstop = () => { _orchStopMeter(); if (!_orchCancelled) _orchTranscribe(); };
+  _orchRec.start(); _orchRecording = true; _orchStartMs = Date.now();
+  document.getElementById('orch-mic')?.classList.add('recording');
+  _orchStartMeter(); _orchClock();
+}
+function _orchStopRec(cancel) {
+  if (!_orchRecording) return;
+  _orchCancelled = !!cancel; _orchRecording = false;
+  document.getElementById('orch-mic')?.classList.remove('recording');
+  try { _orchRec && _orchRec.state !== 'inactive' && _orchRec.stop(); } catch (e) {}
+  try { (_orchStream?.getTracks() || []).forEach(t => t.stop()); } catch (e) {}
+  _orchStream = null;
+}
+function _orchClock() {
+  if (!_orchRecording) return;
+  const s = Math.floor((Date.now() - _orchStartMs) / 1000);
+  _orchStatus('Listening… ' + Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0') + ' — tap the mic to stop');
+  _orchTick = setTimeout(_orchClock, 400);
+}
+function _orchStartMeter() {
+  try {
+    _orchAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = _orchAudioCtx.createMediaStreamSource(_orchStream);
+    _orchAnalyser = _orchAudioCtx.createAnalyser(); _orchAnalyser.fftSize = 256; _orchAnalyser.smoothingTimeConstant = 0.75;
+    src.connect(_orchAnalyser);
+  } catch (e) { return; }
+  const data = new Uint8Array(_orchAnalyser.frequencyBinCount);
+  const bars = Array.from(document.querySelectorAll('#orch-wave .dict-bar'));
+  const draw = () => {
+    if (!_orchRecording || !_orchAnalyser) return;
+    _orchAnalyser.getByteFrequencyData(data);
+    const n = bars.length || 1, per = Math.floor(data.length / n) || 1;
+    for (let i = 0; i < n; i++) { let sum = 0; for (let j = 0; j < per; j++) sum += data[i * per + j] || 0; bars[i].style.transform = 'scaleY(' + Math.max(0.12, Math.min(1, (sum / per) / 140)).toFixed(3) + ')'; }
+    _orchRaf = requestAnimationFrame(draw);
+  };
+  draw();
+}
+function _orchStopMeter() {
+  if (_orchTick) { clearTimeout(_orchTick); _orchTick = 0; }
+  if (_orchRaf) cancelAnimationFrame(_orchRaf); _orchRaf = 0; _orchAnalyser = null;
+  try { _orchAudioCtx && _orchAudioCtx.close(); } catch (e) {}
+  _orchAudioCtx = null;
+  document.querySelectorAll('#orch-wave .dict-bar').forEach(b => b.style.transform = 'scaleY(0.12)');
+}
+async function _orchTranscribe() {
+  if (!_orchChunks.length) { _orchStatus('Nothing recorded — tap the mic and speak'); return; }
+  const blob = new Blob(_orchChunks, { type: _orchChunks[0].type || 'audio/webm' });
+  _orchChunks = [];
+  if (blob.size < 1200) { _orchStatus('Too short — hold and speak a bit longer'); return; }
+  const mime = (blob.type || 'audio/webm').split(';')[0];
+  _orchStatus('Transcribing…');
+  try {
+    const url = API + '/api/dictate?dur_ms=' + (Date.now() - _orchStartMs) + '&mime=' + encodeURIComponent(mime);
+    const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime }), body: blob });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const el = document.getElementById('orch-transcript'); if (el) el.value = d.text || '';
+    _orchShowStep('transcript');
+    if ((d.text || '').trim()) _orchPlan();   // auto-route; the transcript stays editable for a re-route
+  } catch (e) { _orchStatus('Transcription failed: ' + (e.message || 'error') + ' — tap the mic to retry'); }
+}
+async function _orchPlan() {
+  const transcript = (document.getElementById('orch-transcript')?.value || '').trim();
+  if (!transcript) { showToast('Say or type a command first'); return; }
+  _orchShowStep('plan');
+  const list = document.getElementById('orch-plan-list');
+  const summary = document.getElementById('orch-plan-summary');
+  document.getElementById('orch-plan-dropped').textContent = '';
+  if (summary) summary.textContent = 'Routing…';
+  if (list) list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">Deciding which workers get what…</div>';
+  try {
+    const r = await fetch(API + '/api/orchestrate/plan', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ transcript }) });
+    const d = await r.json();
+    if (d.error) {
+      if (summary) summary.textContent = 'Routing failed';
+      list.innerHTML = '<div style="color:#f85149;padding:12px;">' + esc(d.error) + (d.raw ? '<pre style="white-space:pre-wrap;font-size:0.7rem;color:var(--dim);margin-top:6px;">' + esc(d.raw) + '</pre>' : '') + '</div>';
+      document.getElementById('orch-send-btn').style.display = 'none';
+      return;
+    }
+    _orchRenderPlan(d);
+  } catch (e) {
+    if (summary) summary.textContent = 'Routing failed';
+    list.innerHTML = '<div style="color:#f85149;padding:12px;">' + esc(e.message || 'error') + '</div>';
+  }
+}
+function _orchRenderPlan(d) {
+  _orchPlanData = (d.plan || []).map((p, i) => ({ worker: p.worker, message: p.message, why: p.why || '', include: true, idx: i }));
+  const summary = document.getElementById('orch-plan-summary');
+  const list = document.getElementById('orch-plan-list');
+  const drop = document.getElementById('orch-plan-dropped');
+  const sendBtn = document.getElementById('orch-send-btn');
+  if (drop) drop.textContent = (d.dropped_unknown_workers && d.dropped_unknown_workers.length)
+    ? '⚠ dropped unknown worker(s): ' + d.dropped_unknown_workers.join(', ') : '';
+  if (!_orchPlanData.length) {
+    if (summary) summary.textContent = 'No workers matched';
+    list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
+    if (sendBtn) sendBtn.style.display = 'none';
+    return;
+  }
+  if (sendBtn) sendBtn.style.display = '';
+  if (summary) summary.innerHTML = _orchPlanData.length + ' message' + (_orchPlanData.length === 1 ? '' : 's')
+    + ' &mdash; review, edit, then send' + (d.via ? ' <span style="color:var(--dim);font-size:0.7rem;">via ' + esc(d.via) + '</span>' : '');
+  list.innerHTML = _orchPlanData.map(p =>
+    '<div class="orch-plan-item" data-idx="' + p.idx + '">'
+    + '<div class="orch-plan-top"><label class="orch-plan-inc"><input type="checkbox" checked onchange="_orchToggleInc(' + p.idx + ',this.checked)"> <span class="orch-plan-worker">' + esc(p.worker) + '</span></label>'
+    + (p.why ? '<span class="orch-plan-why">' + esc(p.why) + '</span>' : '') + '</div>'
+    + '<textarea class="orch-plan-msg" rows="2" oninput="_orchEditMsg(' + p.idx + ',this.value)">' + esc(p.message) + '</textarea>'
+    + '</div>').join('');
+  _orchUpdateSendBtn();
+}
+function _orchToggleInc(idx, on) {
+  const p = _orchPlanData.find(x => x.idx === idx); if (p) p.include = on;
+  document.querySelector('.orch-plan-item[data-idx="' + idx + '"]')?.classList.toggle('excluded', !on);
+  _orchUpdateSendBtn();
+}
+function _orchEditMsg(idx, v) { const p = _orchPlanData.find(x => x.idx === idx); if (p) p.message = v; }
+function _orchUpdateSendBtn() {
+  const n = _orchPlanData.filter(p => p.include && p.message.trim()).length;
+  const b = document.getElementById('orch-send-btn');
+  if (b) { b.textContent = 'Send ' + n + ' message' + (n === 1 ? '' : 's'); b.disabled = n === 0; }
+}
+async function _orchSendAll() {
+  const items = _orchPlanData.filter(p => p.include && p.message.trim());
+  if (!items.length) return;
+  const btn = document.getElementById('orch-send-btn'); if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  const results = [];
+  for (const p of items) {
+    try {
+      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(p.worker) + '/send',
+        { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ text: p.message, record_history: true, deliver_now: true }) });
+      const d = await r.json().catch(() => ({}));
+      results.push({ worker: p.worker, ok: r.ok && d.ok !== false, msg: d.error || (typeof d.msg === 'string' ? d.msg : '') || (r.ok ? 'sent' : 'failed') });
+    } catch (e) { results.push({ worker: p.worker, ok: false, msg: e.message || 'error' }); }
+  }
+  const ok = results.filter(r => r.ok).length;
+  _orchShowStep('');
+  const res = document.getElementById('orch-result');
+  if (res) {
+    res.style.display = '';
+    res.innerHTML = '<div class="orch-label">Sent ' + ok + ' of ' + results.length + '</div>'
+      + results.map(r => '<div class="orch-res-row ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '&#10003;' : '&#10007;') + ' <b>' + esc(r.worker) + '</b> <span style="color:var(--dim);">' + esc(r.msg) + '</span></div>').join('')
+      + '<div class="orch-actions" style="margin-top:12px;"><button class="btn" onclick="_orchReset()">Orchestrate again</button><button class="btn primary" onclick="_orchClose()">Done</button></div>';
+  }
+}
+
 // ── Set default model label from server config ──
 if (window._AMUX_DEFAULT_MODEL) {
   const defOpt = document.getElementById('model-default-opt');
@@ -7360,7 +7557,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.629';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.630';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
