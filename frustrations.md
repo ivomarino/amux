@@ -3155,8 +3155,8 @@ FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come
 ---
 
 DATE: 2026-08-13
-AREA: discoverability
-STATUS: open
+AREA: instruments
+STATUS: fixed
 SESSION: amux-frustrations
 CARD: AMUX-3073
 SYMPTOM: A capability that has shipped for months read as ABSENT to a working lane. amux-gtm
@@ -3183,7 +3183,31 @@ FIX: Not fixed — the missing thing is not the feature. AMUX-3073 carries the t
   is the same failure with no flag involved — the feature was on, default, in the UI, and a
   competent lane still could not see it, so it improved nothing. Nothing in amux tells a
   session what a view can do; discovery is "scroll and notice", which does not survive an
-  agent that is task-focused or a client on a stale cached bundle (unconfirmed but likely
-  here — the SW is cache-first and AF-45 is an open instance of exactly that). Two entries
-  now share this shape; a third makes it an argument for the browser view advertising its own
-  verbs rather than relying on layout.
+  agent that is task-focused.
+
+CORRECTION 2026-08-13, same day, by amux-frustrations after amux-gtm self-reported the
+  actual cause. The paragraph above originally guessed a stale cached SPA bundle, "unconfirmed
+  but likely here", and cited AF-45 as an open instance of the same thing. THAT IS WRONG and
+  the guess is withdrawn. amux-gtm verified against the LIVE served dashboard: four .bw-row
+  divs served, _bwViewportKey/_bwClick/_bwType all present. The server was serving the full
+  UI the whole time.
+  REAL CAUSE, and it reclassifies this entry: they never rendered the dashboard. They ran
+    sed -n '/id="browser-view"/,/^.\{0,200\}<\/div>/p'
+  which terminates at the FIRST </div>, returning row 1 and nothing else — then reported the
+  absence of rows 2-4 as a missing capability. So this is NOT a discoverability defect in the
+  UI. It is another instance of the class ethos.md rule 7 already documents at length: a
+  hand-written probe is a GUESS about where the answer lives, and a guess that misses is
+  indistinguishable from an answer that is absent. The nine instances listed there are now
+  ten, and this one is the most expensive of them, because the truncated extraction did not
+  merely mislead its author — it was reported outward as a structural gap in the platform and
+  was one verification step from becoming a duplicate implementation of a shipped feature.
+  Worth recording precisely because the author had spent the same day building a hard-fail
+  for silent truncation in amux's eval (8000-char cap, 23 of 34 records returned), then made
+  the identical mistake by hand, in the direction of a STRONGER claim. Writing the guard does
+  not install the habit — ethos.md says exactly this about itself, and here it is again.
+  AF-45 IS NOT CORROBORATED BY THIS ENTRY. Do not count it as a stale-bundle data point; its
+  stale-bundle hypothesis stands or falls on Ethan's device alone.
+  What survives as a genuine gap is only AMUX-3073 (no agent-raisable "needs human sign-in",
+  no deep link to the browser view). The "browser view should advertise its own verbs" idea
+  is downgraded to speculation: nobody has yet been shown to miss these controls while
+  actually LOOKING at the rendered page.
