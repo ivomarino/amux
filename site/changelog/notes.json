@@ -1,12 +1,52 @@
 [
   {
+    "sha": "49b880e",
+    "date": "2026-08-13",
+    "type": "feat",
+    "title": "Voice fleet-orchestrator \u2014 dispatch orchestration commands from the + dropdown on your phone"
+  },
+  {
+    "sha": "7707ded",
+    "date": "2026-08-13",
+    "type": "feat",
+    "title": "Simple tab \u2014 see what any worker is doing in plain English, without reading raw terminal output"
+  },
+  {
+    "sha": "1452e17",
+    "date": "2026-08-13",
+    "type": "feat",
+    "title": "Simple tab reads itself aloud \u2014 the summary plays in the shared audio player on iOS"
+  },
+  {
+    "sha": "e0b00ec",
+    "date": "2026-08-13",
+    "type": "feat",
+    "title": "Simple tab is configurable \u2014 font, size, and a standing prompt (e.g. summarize in one sentence)"
+  },
+  {
+    "sha": "b955e88",
+    "date": "2026-08-13",
+    "type": "feat",
+    "title": "Messages: review any worker's history by calendar \u2014 sticky date headers and a date-jump control"
+  },
+  {
+    "sha": "436676c",
+    "date": "2026-08-13",
+    "type": "fix",
+    "title": "Per-worker Messages tab now groups messages by date and lets you jump to any day"
+  },
+  {
     "hash": "4a026d1a31d7ab334a8651830177045fc9f17c34",
     "short": "4a026d1",
     "title": "CLI warns once when $AMUX_URL points to the dead port",
     "date": "2026-08-13",
     "type": "fix",
-    "tags": ["cli", "ux", "port"],
-    "description": "If $AMUX_URL still points to the retired 8822 port, the CLI now prints one warning per session and exits 1 rather than silently returning empty JSON. Sessions started before the port migration get a clear signal — and the fix — instead of unexplained empty responses."
+    "tags": [
+      "cli",
+      "ux",
+      "port"
+    ],
+    "description": "If $AMUX_URL still points to the retired 8822 port, the CLI now prints one warning per session and exits 1 rather than silently returning empty JSON. Sessions started before the port migration get a clear signal \u2014 and the fix \u2014 instead of unexplained empty responses."
   },
   {
     "hash": "af52446fe8436d1fb91d0381533d47682820f085",
@@ -14,8 +54,11 @@
     "title": "Push alerts report delivered only when an endpoint accepts",
     "date": "2026-08-13",
     "type": "fix",
-    "tags": ["alerts", "push"],
-    "description": "The alert endpoint previously reported 'sent' even when no configured push endpoint accepted the delivery. The response now accurately reflects whether at least one endpoint received the notification — no more false-green status on missed alerts."
+    "tags": [
+      "alerts",
+      "push"
+    ],
+    "description": "The alert endpoint previously reported 'sent' even when no configured push endpoint accepted the delivery. The response now accurately reflects whether at least one endpoint received the notification \u2014 no more false-green status on missed alerts."
   },
   {
     "hash": "410684f32b1e23fdae47aa1fbe84cb71ea679a9e",
