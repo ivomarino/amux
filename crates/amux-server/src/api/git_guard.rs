@@ -85,6 +85,17 @@ use super::session_verbs::{
 /// py:19187 `_staged_guard_window` — floor 600s, default 6h.
 const WINDOW_DEFAULT: f64 = 21600.0;
 const WINDOW_FLOOR: f64 = 600.0;
+/// AF-27: a self-edit counts as "strictly fresher" than a peer's only if it beats
+/// it by MORE than this. NOT a tuning knob (ethos would object to one) — it is the
+/// UNIT CONVERSION between the two clocks being compared: the committer's inferred
+/// ts is a file MTIME (disk), the peer's is a transcript ts (process wall-clock),
+/// and below the skew between them the ordering carries no information. Confirmed
+/// by amux-frustrations' forensic: the AF-27 verdicts were bimodal — one coincident
+/// near-tie at 0.2s (which flips sign across the two clocks — a coin toss) and five
+/// real wins at 3462-14331s. Set at the skew floor: comfortably above sub-second
+/// noise, three orders of magnitude below the real gap, so it blocks the near-tie
+/// (762e06e reopens otherwise) without touching a genuine win.
+const RECENCY_SKEW_MARGIN_S: f64 = 5.0;
 /// py `_SHELL_WRITE_SLACK` — how far a file's mtime may sit from a Bash
 /// command's timestamp and still count as that command's write.
 const SHELL_WRITE_SLACK_DEFAULT: f64 = 180.0;
@@ -450,7 +461,12 @@ pub(crate) fn classify(
                 // committer 23.8s vs peer 14,355s) proves the committer edited
                 // AFTER the peer and owns the current content. No self-record at
                 // all (the 399 shape) also blocks.
-                let committer_fresher = inp.mine.get(ap).map(|m| *m > *ts).unwrap_or(false);
+                // Per-path both sides: inp.mine[ap] is the committer's edit ts to
+                // THIS path, ts is the peer's to THIS path (not a set-wide newest —
+                // that asymmetry would under-block). Fresher by MORE than the
+                // clock-skew margin only; a within-skew lead is a coin toss and blocks.
+                let committer_fresher =
+                    inp.mine.get(ap).map(|m| *m > *ts + RECENCY_SKEW_MARGIN_S).unwrap_or(false);
                 if inp.theirs_firsthand.contains(ap) && !committer_fresher {
                     v.foreign.push(json!({
                         "path": rel,
@@ -1089,6 +1105,19 @@ mod tests {
         assert!(v.foreign.is_empty(), "a clearly fresher self-edit must not block: {:?}", v.foreign);
         assert_eq!(v.shared.len(), 1, "it is shared (warned), not foreign");
         assert_eq!(v.shared[0]["peer"], json!(true));
+    }
+
+    /// AF-27 margin (amux-frustrations forensic): the one coincident near-tie was
+    /// 0.2s, a sign that flips across the disk-mtime/transcript-ts clocks. A self
+    /// edit fresher by LESS than the skew margin is not meaningfully fresher and
+    /// must STILL block — else the 762e06e tie reopens on the next coincident write.
+    #[test]
+    fn a_within_skew_fresher_self_edit_still_blocks() {
+        let mut inp = peer_wrote("coincident.rs", "peer-lane", 1000.0);
+        // Fresher by (margin - 1)s — inside the skew, so it does NOT count.
+        inp.mine.insert("/repo/coincident.rs".into(), 1000.0 + RECENCY_SKEW_MARGIN_S - 1.0);
+        let v = classify(&[pair("coincident.rs")], 1600.0, 21600.0, &inp);
+        assert_eq!(v.foreign.len(), 1, "a within-skew freshness lead must still block");
     }
 
     /// The legitimate claim: both sessions really edited it. Warned, never
