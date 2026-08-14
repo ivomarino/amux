@@ -2886,10 +2886,10 @@ FIX: dc65d4a — one conversation_owner() (meta claim first, LAST title record s
 ## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
 AREA: cli
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-11
 SESSION: amux-homepage
-CARD: none
+CARD: AMUX-3046
 SYMPTOM: AMUX_URL was baked as https://localhost:8822 in a long-lived session's process env.
   When 8822 was decommissioned mid-session, `curl -sk $AMUX_URL/...` returned an empty string
   rather than a connection error. Piping the empty response into `python3 -c "...json.load(sys.stdin)"` 
@@ -2898,11 +2898,19 @@ SYMPTOM: AMUX_URL was baked as https://localhost:8822 in a long-lived session's 
   its own PATCH response had no signal that the write was lost.
 COST: ~5 min to diagnose after the amux session flagged it. ts-gke nearly filed a phantom 
   missing-card bug before catching it. All writes in this session happened to land while 8822 
-  was still alive as the compat bind, so no data was lost — this time.
-FIX: Two fixes needed: (1) the amux CLI (which resolves port itself) should be the default for
-  all board mutations, not raw curl — it also stamps attribution; (2) curl wrapper or health-check
-  pattern that distinguishes empty-response from empty-body: `[ -z "$response" ] && echo DEAD`.
-  A session restart picks up the correct AMUX_URL automatically.
+  was still alive as the compat bind, so no data was lost — this time. RECURRED 2026-08-14: the
+  amux session itself burned six diagnostic calls concluding "server down" before spotting its
+  own $AMUX_URL was the retired 8822 — the same trap, one lane deeper.
+FIX: SHIPPED 2026-08-14 (commit 66c8243, AMUX-3046). `amux url` is the durable resolver every
+  recipe can call: it reads the server-written ~/.amux/endpoint.json and prints the canonical
+  base, so `$(amux url)` in place of `$AMUX_URL` self-heals past a stale/retired port AND
+  survives the next port move. `amux url --verify` distinguishes a dead port from a live one by
+  asserting /health parses as the API shape, which answers the empty-response-vs-missing-card
+  ambiguity this entry is about. Guidance + the resolver are now in CLAUDE.md in place of raw
+  `$AMUX_URL`. Already-shipped companions: the CLI warns once/session when $AMUX_URL is dead
+  (AMUX-2944), and the server logs an hourly WARN naming stranded sessions (AMUX-2988). RESIDUAL
+  (owner call, rule 8): the ~46 lanes still holding the dead env clear only by adopting `$(amux
+  url)` going forward or being recycled — restarting a lane picks up the correct base.
 
 ## I shipped three wrong card references in one session, two onto other sessions' cards
 AREA: attribution
