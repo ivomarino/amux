@@ -3151,3 +3151,39 @@ FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come
   interaction that MISSES produces a perfectly plausible product-shaped failure, and the
   natural response is to go read the product's code. Anywhere a test drives a real gesture,
   the miss and the malfunction need to be distinguishable at the assertion.
+
+---
+
+DATE: 2026-08-13
+AREA: discoverability
+STATUS: open
+SESSION: amux-frustrations
+CARD: AMUX-3073
+SYMPTOM: A capability that has shipped for months read as ABSENT to a working lane. amux-gtm
+  reported that the dashboard Browser view is a screenshot feed with no keystroke or click
+  forwarding, and proposed building it. It already exists and did the whole time:
+  #bw-viewport (index.html:1318) carries tabindex=0 + onkeydown=_bwViewportKey, which
+  forwards per-character `type` plus named keys; #bw-img has onclick=_bwClick, which scales
+  display coords to viewport coords and posts {action:click,x,y}; #bw-type is a bulk
+  type-into-page box. Shipped in 3976de4. The report described the toolbar accurately for its
+  FIRST row and concluded the feature was missing; the interaction row is a plain sibling
+  .bw-row, not hidden and not conditional.
+COST: A full day of stall on a customer integration (Wexus/NetSuite), four staged login
+  windows abandoned one keystroke from done, and a NetSuite stand-in built specifically to
+  avoid needing credentials. The reporter concluded the fleet was structurally incapable of
+  remote sign-in and designed around it. Then the near-miss on the other side: taken at face
+  value the report cards as "wire dashboard input through to /api/browser/action" — a second
+  implementation of a shipped feature, which is the re-invent-a-primitive shape CLAUDE.md
+  exists to stop. One verification step separated the two outcomes.
+FIX: Not fixed — the missing thing is not the feature. AMUX-3073 carries the two real gaps
+  (no way for an agent to raise "needs human sign-in", no deep link to the browser view;
+  hash routing has #path= for Files and #bq= for board search but no view route).
+  The frustration worth counting is the CLASS: ethos rule 1 asks whether capability reaches
+  the model or merely exists, and the usual answer is a feature flag nobody enrolled in. This
+  is the same failure with no flag involved — the feature was on, default, in the UI, and a
+  competent lane still could not see it, so it improved nothing. Nothing in amux tells a
+  session what a view can do; discovery is "scroll and notice", which does not survive an
+  agent that is task-focused or a client on a stale cached bundle (unconfirmed but likely
+  here — the SW is cache-first and AF-45 is an open instance of exactly that). Two entries
+  now share this shape; a third makes it an argument for the browser view advertising its own
+  verbs rather than relying on layout.
