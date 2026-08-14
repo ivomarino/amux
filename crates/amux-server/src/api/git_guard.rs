@@ -428,7 +428,30 @@ pub(crate) fn classify(
         // still genuinely shared.
         if !inp.mine_firsthand.contains(ap) {
             if let Some((owner, ts)) = hit {
-                if inp.theirs_firsthand.contains(ap) {
+                // AF-27: a first-hand peer claim outranks an INFERRED self-claim,
+                // but ownership was RECENCY-BLIND — a peer's stale first-hand edit
+                // (measured: 14,355s / 4h old) outranked the committer's OWN edit
+                // made 23.8s ago on the same path, blocking a commit whose every
+                // staged hunk was the committer's (in_mine=true, in_firsthand=false).
+                // The forensic split was decisive: of 405 per-path verdicts, 399 were
+                // true positives (no self-record) and only the 6 with a self-record
+                // AND a fresher self-edit were wrong. So: if the committer HAS an edit
+                // record here and it is NEWER than the peer's, the fresher edit wins —
+                // fall through to `shared` (warned, never blocked). The direction the
+                // card carried was right ("you commit seconds after editing"); the
+                // mechanism was backwards — not "your fresh edit is missing" but "the
+                // peer's stale claim wins anyway". The 399 shape (no self-record, or a
+                // genuinely fresher peer) still blocks.
+                // Block UNLESS the committer's own edit is STRICTLY fresher than
+                // the peer's. Ties block, and that is deliberate: the 762e06e sweep
+                // (AF-19) is a TIE — the committer's inferred claim there is the
+                // peer's own concurrent write caught by the same mtime event, so
+                // the two timestamps coincide. Only a clear gap (AF-27's real case:
+                // committer 23.8s vs peer 14,355s) proves the committer edited
+                // AFTER the peer and owns the current content. No self-record at
+                // all (the 399 shape) also blocks.
+                let committer_fresher = inp.mine.get(ap).map(|m| *m > *ts).unwrap_or(false);
+                if inp.theirs_firsthand.contains(ap) && !committer_fresher {
                     v.foreign.push(json!({
                         "path": rel,
                         "owner": owner,
@@ -1035,16 +1058,37 @@ mod tests {
         assert_eq!(v.foreign.len(), 1, "a staged deletion of a peer's file MUST block");
     }
 
-    /// AF-19, the regression that let 762e06e through: an INFERRED self-claim
-    /// (a Bash command that merely named the file) must not outrank a peer's
-    /// first-hand write.
+    /// AF-19, the regression that let 762e06e through: an INFERRED self-claim (a
+    /// Bash command whose mtime move coincided with the peer's write) must not
+    /// outrank a peer's first-hand write. Reconciled with AF-27: the real 762e06e
+    /// is a TIE — the inferred claim IS the peer's concurrent write, same mtime
+    /// event, so committer_ts == peer_ts. A claim no fresher than the peer's does
+    /// not prove ownership, so the tie still BLOCKS. (The original fixture used a
+    /// clearly-fresher committer, which AF-27 showed is a different case that must
+    /// NOT block — see `a_clearly_fresher_self_edit_beats_a_stale_firsthand_peer`.)
     #[test]
-    fn inferred_self_claim_does_not_suppress_a_firsthand_peer_block() {
+    fn inferred_self_claim_no_fresher_than_the_peer_still_blocks() {
         let mut inp = peer_wrote("test_x.py", "peer-lane", 1000.0);
-        inp.mine.insert("/repo/test_x.py".into(), 1200.0); // inferred only
+        inp.mine.insert("/repo/test_x.py".into(), 1000.0); // inferred, same instant as the peer
         let v = classify(&[pair("test_x.py")], 1600.0, 21600.0, &inp);
-        assert_eq!(v.foreign.len(), 1, "an inferred self-claim must not downgrade the block");
+        assert_eq!(v.foreign.len(), 1, "an inferred self-claim no fresher than the peer must still block");
         assert!(v.foreign[0]["why"].as_str().unwrap().contains("your claim is inferred"));
+    }
+
+    /// AF-27: the committer's OWN edit is clearly fresher than the peer's stale
+    /// first-hand one (real case: committer 23.8s ago, peer 14,355s / 4h ago). The
+    /// committer edited AFTER the peer and owns the current content, so this must
+    /// be SHARED (warned), never foreign. amux-frustrations' per-path forensic
+    /// isolated exactly this shape — 6 of 405 verdicts (in_mine=true,
+    /// in_firsthand=false, committer fresher) — from the 399 true positives.
+    #[test]
+    fn a_clearly_fresher_self_edit_beats_a_stale_firsthand_peer() {
+        let mut inp = peer_wrote("hand_raiser.py", "peer-lane", 1000.0); // peer, older
+        inp.mine.insert("/repo/hand_raiser.py".into(), 1580.0); // committer, clearly fresher
+        let v = classify(&[pair("hand_raiser.py")], 1600.0, 21600.0, &inp);
+        assert!(v.foreign.is_empty(), "a clearly fresher self-edit must not block: {:?}", v.foreign);
+        assert_eq!(v.shared.len(), 1, "it is shared (warned), not foreign");
+        assert_eq!(v.shared[0]["peer"], json!(true));
     }
 
     /// The legitimate claim: both sessions really edited it. Warned, never
