@@ -1443,7 +1443,24 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
+      local id="${1:-}"
+      # An ID that starts with '-' is a FLAG in the id slot, never an issue id.
+      # Without this, `amux board done --help` PATCHed /api/board/--help and the
+      # server answered {"error":"item not found","id":"--help"} — 6 of those in
+      # one 24h window (GET /api/logs/analyze?since_h=24). The help request was
+      # silently spent as a failed write against a nonexistent card, and the
+      # caller got a not-found for a card they never named. `send` already
+      # guards this exact shape (see _send_usage); the board verbs did not.
+      # Checking the CLASS (leading dash) rather than the literal --help, so
+      # `amux board done --checked "x"` with a forgotten id also stops here
+      # instead of PATCHing /api/board/--checked.
+      case "$id" in
+        --help|-h|help) _board_usage 2>/dev/null || true
+                        echo "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" >&2
+                        return 0 ;;
+        -*) die "amux board $status: '$id' looks like a flag, not an ISSUE-ID. Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T]" ;;
+      esac
+      [[ -n "$id" ]] || die "Usage: amux board $status <ISSUE-ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       shift
       local result
       result=$(_board_transition "$id" "$status" "$@")
