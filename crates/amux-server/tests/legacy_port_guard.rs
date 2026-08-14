@@ -75,19 +75,24 @@ const ALLOW: &[(&str, &str)] = &[
         "explains why pre-cutover sessions carry AMUX_URL=https://localhost:8822 in their \
          process env — the hook itself resolves the URL, it does not hardcode one",
     ),
+    (
+        "scripts/test-amux-url.sh",
+        "feeds a retired https://localhost:8822 to `amux url` as TEST INPUT, to prove the \
+         resolver ignores the dead port and returns the canonical one; the literal is the \
+         subject under test (AMUX-3046), not an address this script dials",
+    ),
     // NOTE: crates/amux-cli/tests/url_resolution.rs is deliberately NOT here.
     // It contains `!err.contains(":8822")`, where the quote before the colon
     // means it is not an address — so it needs no exemption. The first draft
     // allowlisted it anyway and `allowlist_rows_are_live_and_reasoned` caught
     // the row as dead, which is that test earning its keep on day one.
-    // -- externally pinned: not ours to change unilaterally --
-    (
-        "crates/amux-server/src/api/gmail_auth.rs",
-        "GMAIL_REDIRECT_URI is registered in Google Cloud Console against this exact \
-         string. Changing it here without changing it there breaks OAuth for every \
-         connected account, and the value must match byte-for-byte. Retiring it is a \
-         coordinated change (update the console, then this constant), NOT a port sweep",
-    ),
+    // NOTE: crates/amux-server/src/api/gmail_auth.rs was allowlisted here while
+    // GMAIL_REDIRECT_URI hardcoded the retired address. AMUX-3026 replaced that
+    // constant with gmail_redirect_uri(), which derives the callback from
+    // canonical_port() (overridable via the GMAIL_REDIRECT_URI env), so the
+    // literal is gone and the row went with it. The console re-registration the
+    // old reason described is now the OWNER step handed off on AMUX-3026, not a
+    // literal frozen into the tree.
     // NOTE: crates/amux-server/src/api/py_proxy.rs was allowlisted here for its
     // `AMUX_PY_URL` fallback, with the reasoning "this default is unreachable;
     // it dies with the module". It did — AMUX-2906 deleted the forwarder, so

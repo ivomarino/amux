@@ -8,7 +8,7 @@
 //!   absent/incomplete config answers an honest 503 naming the missing keys
 //!   (Python answers 500 — the 503 is deliberate: "not configured" is a
 //!   service state, not a server bug).
-//! - Scopes, redirect URI (`http://localhost:8822/api/gmail/callback`),
+//! - Scopes, redirect URI (canonical-port `/api/gmail/callback`),
 //!   `access_type=offline include_granted_scopes=true prompt=consent
 //!   login_hint=<account>` and S256 PKCE match google_auth_oauthlib's Flow.
 //! - Pending state persists to `~/.amux/gmail-pending.json` in Python's
@@ -59,7 +59,30 @@ pub const GMAIL_SCOPES: [&str; 4] = [
     "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/userinfo.email",
 ];
-pub const GMAIL_REDIRECT_URI: &str = "http://localhost:8822/api/gmail/callback";
+/// The OAuth callback URI handed to Google in the auth request and echoed back
+/// in the token exchange. It MUST match a redirect URI registered on the OAuth
+/// client byte-for-byte, so it is overridable via the `GMAIL_REDIRECT_URI` env
+/// (`~/.amux/server.env`) for a deployment whose registered URI is not the
+/// default.
+///
+/// The default follows [`crate::config::canonical_port`] rather than a hardcoded
+/// literal. The old constant hardcoded the retired 8822 address and dead-ended
+/// the moment that bind was dropped (AMUX-2943 / AMUX-3026): Google redirected the
+/// browser to a port nothing answered, so amux never saw the callback and no
+/// account could re-authorize. Deriving it from the canonical port means the
+/// callback is always served where this server actually listens, and a future
+/// port move is a console re-registration rather than a second code change.
+pub fn gmail_redirect_uri() -> String {
+    std::env::var("GMAIL_REDIRECT_URI")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "http://localhost:{}/api/gmail/callback",
+                crate::config::canonical_port()
+            )
+        })
+}
 const DEFAULT_AUTH_URI: &str = "https://accounts.google.com/o/oauth2/auth";
 const PENDING_TTL_S: f64 = 3600.0;
 const HEALTH_TTL_S: u64 = 300;
@@ -242,13 +265,14 @@ pub async fn auth_url(
     let challenge =
         crate::integrations::email::base64url_nopad(&Sha256::digest(verifier.as_bytes()));
     let scope = urlencode(&GMAIL_SCOPES.join(" "));
+    let redirect_uri = gmail_redirect_uri();
     let url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={scope}&state={state}\
          &access_type=offline&include_granted_scopes=true&prompt=consent&login_hint={}\
          &code_challenge={challenge}&code_challenge_method=S256",
         cfg.auth_uri,
         urlencode(&cfg.client_id),
-        urlencode(GMAIL_REDIRECT_URI),
+        urlencode(&redirect_uri),
         urlencode(&account),
     );
     if let Err(e) = pending_save(&ctx.home, &state, &account, &verifier) {
@@ -259,22 +283,32 @@ pub async fn auth_url(
             json!({ "error": format!("could not persist pending auth state: {e}") }),
         );
     }
-    // THE CALLBACK PORT MUST BE ONE WE ANSWER, and since 2026-08-11 it is not
-    // (AMUX-2943). GMAIL_REDIRECT_URI is hardcoded to the retired address; the
-    // compatibility bind that used to answer it was dropped on Ethan's call
-    // ("no more 8822 just rust"), with the Gmail cost accepted knowingly.
+    // THE CALLBACK PORT MUST BE ONE WE ANSWER. redirect_uri now follows
+    // canonical_port() (AMUX-2943 / AMUX-3026), so the default is always served
+    // where this server listens. This check only fires when a GMAIL_REDIRECT_URI
+    // env override names a port this process does NOT answer, a genuine
+    // misconfiguration rather than the old hardcoded-8822 default.
     //
     // WITHOUT THIS CHECK THE FAILURE IS PERFECTLY SILENT: Google serves the
     // consent screen, the user approves, and the browser is redirected to a
     // port nothing listens on. amux never receives the request, so no handler
     // runs, nothing is logged, and the only symptom is a browser error page on
     // a machine that may not be the one running amux. Raised by amux-cloud on
-    // AC-337, which predicted exactly this.
+    // AC-337, which predicted exactly this. The warning is emitted at the one
+    // moment the operator is present and acting: when they ask for the URL.
     //
-    // So the warning is emitted at the ONE moment the operator is present and
-    // acting — when they ask for the URL — rather than after the redirect,
-    // where we have no way to observe anything at all.
-    let redirect_port = GMAIL_REDIRECT_URI
+    // The OTHER failure mode is undetectable here: for a web OAuth client the
+    // redirect_uri must ALSO be registered on the client in the Google Cloud
+    // console, and Google rejects a mismatch before any redirect, so amux never
+    // sees it. The info log below records the exact redirect_uri issued, so a
+    // reauth that keeps failing stays diagnosable from the request log (the
+    // two-fixes rule) instead of silent.
+    tracing::info!(
+        target: "gmail_auth",
+        "[gmail] auth URL issued for {account} with redirect_uri={redirect_uri} \
+         (must be registered on the OAuth client in the Google Cloud console)"
+    );
+    let redirect_port = redirect_uri
         .split("://")
         .nth(1)
         .and_then(|rest| rest.split('/').next())
@@ -283,15 +317,19 @@ pub async fn auth_url(
     let canonical = crate::config::canonical_port();
     if redirect_port.is_some_and(|p| p != canonical) {
         let warning = format!(
-            "This authorization WILL FAIL at the redirect. The registered callback points at port              {} and this server answers {}, so Google will send the browser to a port nothing is              listening on — amux never sees the callback, which is why nothing else will report              an error. FIX (needs the Google Cloud console, which is Ethan's): register              http://localhost:{}/api/gmail/callback for this client_id, then GMAIL_REDIRECT_URI              is changed to match. Card: AMUX-2943.",
+            "This authorization WILL FAIL at the redirect. The GMAIL_REDIRECT_URI override points \
+             at port {} but this server answers {}, so Google would send the browser to a port \
+             nothing is listening on and amux would never see the callback. FIX: unset \
+             GMAIL_REDIRECT_URI in server.env to use the canonical-port default, or set it to a \
+             callback URL on port {}. Card: AMUX-3026.",
             redirect_port.unwrap_or(0),
             canonical,
             canonical
         );
         tracing::warn!(
             target: "gmail_auth",
-            "[gmail/AMUX-2943] auth URL issued for {account} with a callback on port {} that this \
-             server does not answer (canonical {}) — the redirect will dead-end silently",
+            "[gmail/AMUX-3026] auth URL issued for {account} with a callback on port {} that this \
+             server does not answer (canonical {}); the GMAIL_REDIRECT_URI override dead-ends",
             redirect_port.unwrap_or(0),
             canonical
         );
@@ -367,7 +405,7 @@ pub async fn callback(
         ("code".to_string(), code),
         ("client_id".to_string(), cfg.client_id.clone()),
         ("client_secret".to_string(), cfg.client_secret.clone()),
-        ("redirect_uri".to_string(), GMAIL_REDIRECT_URI.to_string()),
+        ("redirect_uri".to_string(), gmail_redirect_uri()),
     ];
     if let Some(v) = verifier {
         form.push(("code_verifier".to_string(), v));
@@ -746,7 +784,7 @@ mod tests {
             qparam(url, "client_id"),
             Some(urlencode("PLACEHOLDER_ID.apps.googleusercontent.com").as_str())
         );
-        assert_eq!(qparam(url, "redirect_uri"), Some(urlencode(GMAIL_REDIRECT_URI).as_str()));
+        assert_eq!(qparam(url, "redirect_uri"), Some(urlencode(&gmail_redirect_uri()).as_str()));
         assert_eq!(qparam(url, "code_challenge_method"), Some("S256"));
 
         // Pending state persisted in Python's file shape, challenge derived
@@ -823,7 +861,7 @@ mod tests {
         let form = http.calls()[0].3.clone().unwrap();
         assert_eq!(form["grant_type"], json!("authorization_code"));
         assert_eq!(form["code"], json!("authcode123"));
-        assert_eq!(form["redirect_uri"], json!(GMAIL_REDIRECT_URI));
+        assert_eq!(form["redirect_uri"], json!(gmail_redirect_uri()));
         assert_eq!(form["code_verifier"], json!(verifier));
 
         // Token file: EXACT Python shape, nothing extra.
