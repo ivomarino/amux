@@ -912,7 +912,16 @@ pub async fn staged_guard_inner(
         let newest = inputs.mine.values().copied().fold(0.0_f64, f64::max);
         tracing::warn!(
             target: "staged_guard",
-            "[staged-guard/AF-27] {} blocked {} in {} — window={}s mine={} (firsthand={}, newest={}) \
+            // `newest_any`, not `newest` (renamed 2026-08-14). It is the newest entry
+            // across the committer's WHOLE claim set, which is NOT what classify()
+            // compares — classify uses inputs.mine[path], per-path on both sides. The
+            // old name invited exactly that conflation: reading these lines, the margin
+            // between a peer's per-path claim and a SET-WIDE newest looked like the
+            // decision the code makes, and a reviewer could not tell from the log alone
+            // whether an under-block was possible. It was not, but confirming that meant
+            // reading the Rust, which is the failure this forensic exists to prevent.
+            // mine_age below is the per-path value the comparison actually uses.
+            "[staged-guard/AF-27] {} blocked {} in {} — window={}s mine={} (firsthand={}, newest_any={}) \
              cotenants={}; per-path: {}",
             if session.is_empty() { "(no session)" } else { &session },
             op,
@@ -929,9 +938,18 @@ pub async fn staged_guard_inner(
                     let rel = f["path"].as_str().unwrap_or("");
                     let ap = realpath(&Path::new(&wd).join(rel));
                     format!(
-                        "{rel} in_mine={} in_firsthand={} owner={} age={}s",
+                        "{rel} in_mine={} in_firsthand={} mine_age={} owner={} age={}s",
                         inputs.mine.contains_key(&ap),
                         inputs.mine_firsthand.contains(&ap),
+                        // THE value classify() weighs against the peer's per-path ts.
+                        // Without it a reader can only see the set-wide newest_any and
+                        // cannot compute the real margin — which is why the 6 defect
+                        // verdicts of 2026-08-14 had to be escalated as a question
+                        // rather than answered from the log.
+                        match inputs.mine.get(&ap) {
+                            Some(ts) => format!("{:.1}s", now - ts),
+                            None => "absent".into(),
+                        },
                         f["owner"].as_str().unwrap_or(""),
                         f["age_secs"].as_i64().unwrap_or(0)
                     )
