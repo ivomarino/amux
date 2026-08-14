@@ -1434,6 +1434,27 @@ cmd_board() {
 This verb takes free prose only:  amux board needsyou $id \"the decision needed\"
 For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       esac
+      # SIGN-IN ASK -> attach a resume deep link into THIS session's live browser
+      # (AMUX-3073). The reported gap was that even after raising needs-you, the
+      # note could not say "click here" — there was no route to a session's
+      # browser view. There is now (#browser=<session>), so a sign-in-shaped ask
+      # gets the link attached automatically: the capability reaches the agent by
+      # DEFAULT rather than requiring it to know the URL shape. Opt-out — if the
+      # agent already supplied its own #browser= link we leave the ask untouched.
+      local _signin_link=""
+      case "$(printf '%s' "$ask" | tr '[:upper:]' '[:lower:]')" in
+        *sign*in*|*signin*|*log*in*|*login*|*authenticat*|*captcha*|*2fa*|*mfa*|*credential*|*password*)
+          case "$ask" in
+            *'#browser='*) : ;;  # agent supplied its own resume link — respect it
+            *) _signin_link="${AMUX_API}/#browser=${AMUX_WORKER:-${AMUX_SESSION:-amux}}"
+               # SAME LINE, not a newline: Focus-mode and the server both extract
+               # the NEEDS-YOU marker with a single-line ([^\n]+) match, so a link
+               # on a second line would be dropped from the triage surface where
+               # Ethan actually reads the ask — it would survive only in the raw
+               # desc. Keep it on the marker line so it reaches Focus mode.
+               ask="${ask} · Resume (click to sign in): ${_signin_link}" ;;
+          esac ;;
+      esac
       local cur result
       cur=$(curl -sk "$AMUX_API/api/board/$id" | python3 -c "import sys,json;d=json.load(sys.stdin);i=d.get('item') or d;print(json.dumps(sorted(set((i.get('tags') or [])+['needs:you']))))" 2>/dev/null)
       [[ -n "$cur" ]] || die "card $id not found"
@@ -1445,6 +1466,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # card's unchanged status ("AC-221 -> todo"), which reads as a failed
       # transition (AC-222).
       echo "$result" | _board_outcome "$id" "" "tagged needs:you" || return $?
+      [[ -n "$_signin_link" ]] && echo "  attached resume link (click to sign in): $_signin_link" >&2
       # AND MOVE IT. `needsyou` is also a real board STATUS — the one that
       # takes the card out of review/todo queues and into the owner's view —
       # and this verb tagging without moving left cards reading routed-to-
@@ -2028,7 +2050,9 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ls [--all]            List open issues (--all includes archived)
   amux board add <title>           Create a new todo issue
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
-  amux board needsyou <ID>         Mark a card as blocked on the human (surfaces in Needs-you)
+  amux board needsyou <ID> [ask]   Mark a card as blocked on the human (surfaces in Needs-you).
+                                   A sign-in/login ask auto-gets a clickable resume link into
+                                   this session's live browser view (Ethan clicks to sign in).
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
   amux board done <ID>             Move issue to done

@@ -11853,6 +11853,24 @@ function _linkifyCardIds(safeHtml) {
         : m);
   } catch (e) { return safeHtml; }
 }
+// Turn bare http(s) URLs in ALREADY-escaped HTML into clickable links, so a
+// resume / sign-in deep link an agent drops in a needs-you ask (AMUX-3073) is
+// clickable rather than dead plain text — the card's whole premise is a
+// notification that can say "click here". Runs on escaped text (so a real URL
+// has no literal '<'/'"'), and the (?![^<]*>) tail-guard — the same one
+// _hlSearch uses — skips a URL that is already inside a tag's attributes, so it
+// composes safely AFTER _linkifyCardIds without corrupting the anchors it made.
+function _linkifyUrls(safeHtml) {
+  try {
+    return String(safeHtml).replace(/(https?:\/\/[^\s<>"'`]+)(?![^<]*>)/g, (m) => {
+      const url = m.replace(/[.,;:!?)]+$/, '');   // trailing punctuation is prose, not URL
+      const tail = m.slice(url.length);
+      return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" '
+        + 'style="color:var(--accent);text-decoration:underline;" onclick="event.stopPropagation();">'
+        + url + '</a>' + tail;
+    });
+  } catch (e) { return safeHtml; }
+}
 function _msgCardChip(cardId) {
   if (!cardId) return '';
   const c = (typeof boardItems !== 'undefined' && Array.isArray(boardItems))
@@ -20663,7 +20681,7 @@ function _focusRender() {
     + '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';">' + esc(item.status || 'todo') + '</span>' + sess + '</div>'
     + '<div class="focus-title">' + esc(item.title || '') + '</div>'
     + '<div class="focus-ask-label">Needs your call:</div>'
-    + '<div class="focus-ask">' + _linkifyCardIds(esc(_focusAsk(item))) + '</div>';
+    + '<div class="focus-ask">' + _linkifyUrls(_linkifyCardIds(esc(_focusAsk(item)))) + '</div>';
   ov.querySelector('.focus-actions').innerHTML =
     '<button class="btn" onclick="_focusPrev()" title="Previous (k)">\u2190</button>'
     + '<button class="btn primary" onclick="_focusAnswer()" title="Answer (e)">\u270E Answer</button>'
@@ -21939,7 +21957,7 @@ function _bdRenderHistory(item) {
     ? '<div class="bd-hist">' + evs.slice().reverse().map(e =>
         '<div class="bd-hist-row bd-hist-' + e.kind + '">'
         + '<span class="bd-hist-ic" style="color:' + (_BD_KIND_COL[e.kind] || 'var(--dim)') + '">' + (_BD_KIND_ICON[e.kind] || '\u00B7') + '</span>'
-        + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyCardIds(esc(e.body)) + '</span>'
+        + '<div class="bd-hist-b"><span class="bd-hist-txt">' + _linkifyUrls(_linkifyCardIds(esc(e.body))) + '</span>'
         + (e.ts ? '<span class="bd-hist-ts">' + esc(e.ts) + '</span>' : '') + '</div></div>').join('')
       + '</div>'
     : '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">No activity recorded yet.</div>';
@@ -21954,7 +21972,7 @@ function _bdRenderStatusBanner(item) {
     el.style.display = '';
     el.innerHTML = '<div class="bd-sb-label">\uD83D\uDCCD Latest status'
       + (last.ts ? ' \u00B7 ' + esc(last.ts) : '') + '</div>'
-      + '<div class="bd-sb-text">' + _linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, ''))) + '</div>'
+      + '<div class="bd-sb-text">' + _linkifyUrls(_linkifyCardIds(esc(last.body.replace(/^STATUS\s*\([^)]*\):\s*/i, '')))) + '</div>'
       + (sess ? '<button class="btn" style="margin-top:8px;font-size:0.74rem;min-height:36px;" onclick="_askCardStatus(\'' + escJs(item.id) + '\',\'' + escJs(sess) + '\')">\uD83D\uDD04 Refresh from ' + esc(sess) + '</button>' : '');
   } else if (sess) {
     el.style.display = '';
@@ -26123,6 +26141,34 @@ async function _handleDeeplink(hash) {
     tryOpen(0);
     return;
   }
+  // #browser=<session> — land in the Browser view focused on a given session's
+  // live browser (AMUX-3073). This is the "click here to sign in" resume link an
+  // agent drops in a needs-you card: there was NO route to a session's browser,
+  // and _bwSession was hardcoded to 'amux' with no setter, so a notification
+  // could never say where to click and an agent's only fallback was to ask in
+  // chat (amux-gtm asked ~6x in one day). Sets the session, opens the tab, and
+  // starts the live view so the human sees the page awaiting sign-in at once.
+  if (hash && hash.startsWith('#browser=')) {
+    const raw = hash.slice(9);
+    const amp = raw.indexOf('&');
+    const sess = decodeURIComponent(amp < 0 ? raw : raw.slice(0, amp));
+    const tryOpen = (attempt) => {
+      // Defer the _bwSession assignment into the poll: at initial page load
+      // _handleDeeplink runs (line ~26113) BEFORE the `let _bwSession` at ~29910
+      // is initialized, so a direct assign here throws in the temporal dead
+      // zone. By the time this setTimeout fires the whole script has executed.
+      if (document.getElementById('browser-view') && document.getElementById('tab-browser')) {
+        if (sess) { try { _bwSession = sess; } catch(e) {} }
+        try { switchView('browser'); } catch(e) {}   // calls _bwInit()
+        try { _bwSessionLabelSync(); } catch(e) {}
+        setTimeout(() => { try { _bwSetLive(true); } catch(e) {} }, 250);
+        return;
+      }
+      if (attempt < 25) setTimeout(() => tryOpen(attempt + 1), 200);
+    };
+    tryOpen(0);
+    return;
+  }
   let dpath = null;
   if (hash && hash.startsWith('#path=')) {
     dpath = decodeURIComponent(hash.slice(6));
@@ -26163,7 +26209,8 @@ function _restoreScreen() {
   // view deeplink on 2026-08-08 — the rig asked for ?view=groups, got last
   // session's Workers tab, and the deeplink looked broken while working fine.
   const _hasDeeplink = (location.hash && (location.hash.startsWith('#path=')
-                                          || location.hash.startsWith('#view=')))
+                                          || location.hash.startsWith('#view=')
+                                          || location.hash.startsWith('#browser=')))
                      || /[?&]view=/.test(location.search);
   // 1. Restore the tab.
   if (!_hasDeeplink) {
@@ -29965,7 +30012,25 @@ async function _bwInit() {
   // and the dropdown showed only "Auto profile". It is one small GET; a stale
   // picker costs far more than re-fetching it.
   _bwInited = true;
+  _bwSessionLabelSync();
   await _bwLoadProfiles();
+}
+
+// Show WHICH session's browser is on screen. The view defaults to 'amux' and
+// there is no session picker, so a human arriving via a #browser=<session>
+// deep link (AMUX-3073) would otherwise have no way to tell they are looking at
+// another session's browser rather than amux's. Named non-amux sessions get a
+// visible chip; the default stays quiet so nothing changes for the common case.
+function _bwSessionLabelSync() {
+  const el = document.getElementById('bw-session');
+  if (!el) return;
+  if (_bwSession && _bwSession !== 'amux') {
+    el.textContent = _bwSession;
+    el.style.display = '';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
+  }
 }
 
 async function _bwLoadProfiles() {
