@@ -987,7 +987,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // Mounted-but-untabled, all found by curling the census's "missing" list
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
-    RouteEntry { path: "/api/client-debug", methods: &["POST"] },
+    RouteEntry { path: "/api/client-debug", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/review/week", methods: &["GET"] },
     RouteEntry { path: "/api/review/digest", methods: &["GET"] },
@@ -1022,6 +1022,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/env/schema", methods: &["GET"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
+    // Nested sub-router routes that were missing from the table (AMUX-3083): they
+    // answer for real (POST /api/orchestrate/plan -> 400 transcript-required, GET
+    // /api/history/{id} -> the row) while /api/debug/routes and the
+    // route.callers_have_routes census read the TABLE and reported them unrouted.
+    // Caught by tests/route_table.rs's completeness scan (both were named).
+    RouteEntry { path: "/api/history/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/orchestrate/plan", methods: &["POST"] },
     // -- logs (this module)
     RouteEntry { path: "/api/logs", methods: &["GET"] },
     // Ported in d177625. Missing from this table meant /api/debug/routes
