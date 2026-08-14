@@ -612,13 +612,30 @@ async fn raw(req: Request) -> Response {
             .body(stream_file(p, start.max(0) as u64, length))
             .expect("206 response")
     } else {
+        // Non-range full-file. Serve small files IN-MEMORY rather than streamed:
+        // a streamed Body::from_stream over HTTP/2 leaves Chrome-over-CDP
+        // navigation stuck at ready_state="loading" — the body commits but never
+        // signals completion, so captureScreenshot times out at 30s and the tab
+        // renders nothing (amux-gtm, 2026-08-13: the identical bytes render over
+        // `python -m http.server` and via the dashboard's own in-memory responses,
+        // and fail ONLY on this streamed route; header delta ruled out). Large
+        // files (media fetched WITHOUT a Range) stay streamed so a 3GB video is
+        // never read into RAM — players always send a Range and take the 206 path
+        // above, so they never reach here.
+        const INMEM_MAX: u64 = 16 * 1024 * 1024;
         let mut b = Response::builder().status(StatusCode::OK);
         for (k, v) in common {
             b = b.header(k, v);
         }
-        b.header("content-length", file_size.to_string())
-            .body(stream_file(p, 0, file_size))
-            .expect("200 response")
+        b = b.header("content-length", file_size.to_string());
+        if file_size <= INMEM_MAX {
+            match std::fs::read(&p) {
+                Ok(bytes) => b.body(Body::from(bytes)).expect("200 response"),
+                Err(e) => j(500, json!({ "error": e.to_string() })),
+            }
+        } else {
+            b.body(stream_file(p, 0, file_size)).expect("200 response")
+        }
     }
 }
 
