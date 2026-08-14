@@ -1794,6 +1794,24 @@ pub fn select_advance(
         // was manufacturing pressure to lie to them (ethos rule 3).
         let dep = dep.expect("dep_session came from dep");
         let dstat = dep.status.to_lowercase();
+        // A blocker parked on a HUMAN — status `needsyou`, or carrying the
+        // `needs:you` tag — cannot be driven by the DEPENDENT card's agent owner.
+        // `needsyou` IS the board's state for "only a human moves this", so telling
+        // its owner to "drive {dep} through its gates" asks for an action no honest
+        // work of theirs can produce (ethos rule 3) — it fired 5+ times at one card
+        // that had been needsyou since it was filed (GCA-91). This is the same
+        // owner-blocked special-case the auto-pickup rule already applies (a
+        // needsyou card routes to review, not todo), missing from this one path.
+        // Distinct reason so a log sweep can count the suppression (two-fixes rule).
+        if dstat == "needsyou" || card_needsyou_asked_at(conn, dep_id).is_some() {
+            return Advance::None {
+                reason: "dep-needsyou",
+                detail: format!(
+                    "{card_id} blocked by {dep_id}, which is parked on a human (needs:you) — \
+                     nudging the agent owner would demand an action only a human can take (GCA-91)"
+                ),
+            };
+        }
         let drev = dep.reviewer.clone().unwrap_or_default();
         let why_stuck = if dstat == "review" {
             Some(if drev.is_empty() {
@@ -3801,6 +3819,28 @@ mod tests {
                 assert!(detail.contains("B-1"), "{detail}");
             }
             Advance::Nudge { text, .. } => panic!("must not nudge an unactionable dependency: {text}"),
+        }
+    }
+
+    /// GCA-91: the dependency nudge told an agent to "drive its blocker through
+    /// the gates" while the blocker was `needsyou` — parked on a human, so no
+    /// action of the agent's could satisfy it. It must be suppressed, like the
+    /// other unactionable-blocker cases. (The code also checks the `needs:you`
+    /// TAG for the window where the blocker's own re-nag is on cooldown; that
+    /// path is not unit-tested in isolation because a same-lane needs:you card is
+    /// otherwise intercepted by its own re-nag before the dependent is reached.)
+    #[test]
+    fn a_dependency_parked_on_a_human_is_not_nudged() {
+        let conn = board_db();
+        add_card(&conn, "B-1", "lane", "needsyou", "waiting on Ethan", "SCOPE: x");
+        add_card(&conn, "D-1", "lane", "doing", "dependent", "SCOPE: x");
+        conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='D-1'", []).expect("dep");
+        match select_advance(&conn, "lane", &[], now_f64()) {
+            Advance::None { reason, detail } => {
+                assert_eq!(reason, "dep-needsyou");
+                assert!(detail.contains("B-1") && detail.contains("needs:you"), "{detail}");
+            }
+            Advance::Nudge { text, .. } => panic!("must not nudge a human-parked dependency: {text}"),
         }
     }
 
