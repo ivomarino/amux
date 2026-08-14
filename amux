@@ -373,7 +373,14 @@ parse_claude_flags() {
 
 cmd_register() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die "usage: amux register <name> [--model opus] [--yolo] [--dir /path] [claude flags...]"
+  # A flag in the name slot is never a worker name (AMUX-3116). `amux register
+  # --help` used to register a worker literally named "--help" in the cwd instead
+  # of printing usage; a leading-dash name is a mistake, not an identifier. Same
+  # guard the board verbs carry (see the `-*) die` case there).
+  case "$name" in
+    ""|-h|--help|help) die "usage: amux register <name> [--model opus] [--yolo] [--dir /path] [claude flags...]" ;;
+    -*) die "amux register: '$name' looks like a flag, not a worker name. Put the name first: amux register <name> [flags]" ;;
+  esac
   shift
 
   parse_claude_flags "$@"
