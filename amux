@@ -1470,6 +1470,18 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
       [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
+      # `archived` is a BOOLEAN FLAG, not a status column. Forwarding it verbatim
+      # PATCHed {status:"archived"} and 400'd ("unknown status") ~22x/day from lanes
+      # confusing the flag with a status (AMUX-3086 producer B / AMUX-3108). Route the
+      # clear intent to the dedicated verb instead of sending a doomed word. Only these
+      # two are intercepted; every real status (blocked/armed/needsyou/...) still passes
+      # through, and the server returns its own valid-status list for any other typo.
+      case "$new_status" in
+        archived|archive)
+          die "amux board status: 'archived' is a boolean flag, not a status. Use:  amux board archive $id" ;;
+        unarchive|unarchived)
+          die "amux board status: 'unarchive' is not a status. Use:  amux board unarchive $id" ;;
+      esac
       shift 2
       local result
       result=$(_board_transition "$id" "$new_status" "$@")
