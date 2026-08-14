@@ -1379,6 +1379,30 @@ pub async fn create_session_legacy(
             m
         }
     };
+    // FLAGS win over MODEL, and MODEL over the configured default (AMUX-3114).
+    // The body may send `flags` (the full CC_FLAGS string, e.g. "--model opus
+    // --dangerously-skip-permissions"); it used to be IGNORED and overwritten
+    // with "--model <default>", so a worker the caller built as opus silently ran
+    // the default model (gtm-engine, 2026-08-14). Honour flags verbatim when
+    // given, else derive from `model`, else the configured default.
+    let explicit_flags = s("flags");
+    let cc_flags = if !explicit_flags.is_empty() {
+        explicit_flags
+    } else if !model.is_empty() {
+        format!("--model {model}")
+    } else {
+        String::new()
+    };
+    // The RESOLVED model, echoed in the response so a defaulted or unpinned model
+    // is visible at create time, not only via a later GET. "" means no --model is
+    // pinned (the worker takes the ambient default, the gap the skip-perms
+    // workers are invisible in, gtm-engine).
+    let resolved_model = cc_flags
+        .split_whitespace()
+        .skip_while(|t| *t != "--model")
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
     let mut pairs: Vec<(&str, String)> = vec![("CC_DIR", dir.clone())];
     let creator = s("creator");
     if !creator.is_empty() {
@@ -1387,12 +1411,24 @@ pub async fn create_session_legacy(
     if provider != "claude" {
         pairs.push(("CC_PROVIDER", provider.clone()));
     }
-    if !model.is_empty() {
-        pairs.push(("CC_FLAGS", format!("--model {model}")));
+    if !cc_flags.is_empty() {
+        pairs.push(("CC_FLAGS", cc_flags.clone()));
     }
-    let tags = s("tags");
+    // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
+    // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
+    // "" and the worker was created with NO groups, the same silent drop the
+    // PATCH handler was already fixed for.
+    let tags = match body.get("tags") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|x| x.as_str().map(str::trim))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => s("tags"),
+    };
     if !tags.is_empty() {
-        pairs.push(("CC_TAGS", tags));
+        pairs.push(("CC_TAGS", tags.clone()));
     }
     let desc = s("desc");
     if !desc.is_empty() {
@@ -1421,6 +1457,13 @@ pub async fn create_session_legacy(
             "provider": provider,
             "running": false,
             "archived": false,
+            // Echo what was actually stored so a dropped or defaulted field is
+            // visible in the create response, not only via a later GET
+            // (AMUX-3114): flags is the effective CC_FLAGS, model the resolved
+            // model ("" = unpinned / ambient default), tags the stored groups.
+            "flags": cc_flags,
+            "model": resolved_model,
+            "tags": tags,
         })),
     )
         .into_response()
