@@ -109,6 +109,38 @@ fn applescript_not_ported(account: &str) -> Response {
     )
 }
 
+/// Refuse a SEND/REPLY whose from-address is not a connected Gmail account, AND
+/// record the attempt where a human already looks (GE-621, prevention-a + its
+/// observability half). Refusing was already correct — the Rust server never had
+/// the silent Mail.app fallback that sent 3 replies from Ethan's personal account
+/// off-ledger. But the refusal wrote NOTHING to /api/email/log or the server log,
+/// so an off-account attempt left no trace: the API did the right thing invisibly.
+/// Now every refused send lands in the audited log (`via: "refused"`, `refused:
+/// true`) and a WARN, so a sweep of /api/email/log catches "someone keeps trying
+/// to send from a non-connected account" — the early-warning signal for the whole
+/// class (two-fixes rule). Read endpoints (inbox/search) keep the quiet refusal:
+/// a read from an unconnected account is benign and frequent, not an incident.
+fn refuse_send(ctx: &EmailCtx, headers: &HeaderMap, endpoint: &str, account: &str) -> Response {
+    tracing::warn!(
+        endpoint, from = %account,
+        "email {endpoint} REFUSED: from-address is not a connected Gmail account \
+         (no silent Mail.app fallback) — recorded to /api/email/log (GE-621)"
+    );
+    email_log(
+        ctx.client.home(),
+        json!({
+            "endpoint": endpoint,
+            "via": "refused",
+            "refused": true,
+            "from": account,
+            "reason": "from-address is not a connected Gmail account; \
+                       Mail.app/AppleScript fallback is not ported",
+            "session": hdr_worker(headers),
+        }),
+    );
+    applescript_not_ported(account)
+}
+
 const ADDR_RE: &str = r"^[^@\s]+@[^@\s]+\.[^@\s]+$";
 
 fn bad_addrs(list: &str) -> Vec<String> {
@@ -272,7 +304,7 @@ pub async fn send(
             }
         };
     }
-    applescript_not_ported(&from_acct)
+    refuse_send(&ctx, &headers, "send", &from_acct)
 }
 
 use super::py_truthy as truthy;
@@ -378,7 +410,7 @@ pub async fn reply(
             }
         };
     }
-    applescript_not_ported(&gmail_from)
+    refuse_send(&ctx, &headers, "reply", &gmail_from)
 }
 
 // ---- GET /api/email/inbox -------------------------------------------------
@@ -727,11 +759,32 @@ mod tests {
             "/api/email/send",
             Some(json!({ "to": "x@y.co", "subject": "s", "body": "b",
                          "from": "other@nowhere.com", "force_new_thread": true })),
-            &[],
+            &[("x-amux-session", "gtm-lane")],
         )
         .await;
         assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
         assert!(e["error"].as_str().unwrap().contains("not ported"), "{e}");
+
+        // GE-621: the refusal must be VISIBLE in the audited log — an off-account
+        // send attempt that leaves no trace is the incident's invisibility. The
+        // refusal now writes a `via:"refused"` entry a sweep of /api/email/log can
+        // find, so "someone keeps trying to send from a non-connected account"
+        // self-announces (two-fixes rule).
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let entries = log["log"].as_array().cloned().unwrap_or_default();
+        let refused = entries
+            .iter()
+            .find(|x| x.get("refused") == Some(&json!(true)))
+            .expect("the refused send must be recorded in the audited email log");
+        assert_eq!(refused["from"], json!("other@nowhere.com"));
+        assert_eq!(refused["endpoint"], json!("send"));
+        assert_eq!(refused["via"], json!("refused"));
+        assert_eq!(refused["session"], json!("gtm-lane"));
+        // A refusal must never be recorded as a successful gmail send.
+        assert!(
+            entries.iter().all(|x| x.get("via") != Some(&json!("gmail"))),
+            "a refused send must not appear as via:gmail"
+        );
     }
 
     #[tokio::test]
