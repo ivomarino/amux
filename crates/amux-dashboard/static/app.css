@@ -2758,6 +2758,25 @@
     color: var(--dim); padding: 4px 2px; transition: color 0.15s;
   }
   .tab-customize-btn:hover { color: var(--fg); }
+  /* AF-45. Ethan, three reports: "I click it and nothing happens. It doesn't show."
+     Measured on his viewport (screenshot 1125x2436 @3x = 375x812) under WebKit: the
+     button's box is 16.5 x 35. The MENU was never the bug — it opens correctly,
+     position:fixed, z-index 4000, 15 rows, unclipped, on screen. The TARGET is.
+     16.5px wide is a third of the 44x44 this repo already requires on mobile
+     (.claude/rules/css-mobile.md), and it sits inside a horizontally scrolling tab
+     strip, where iOS readily interprets a near-miss on a narrow child as a pan of
+     the scroller instead of a tap on the child.
+     Why every test passed anyway, including the ones I wrote to catch this: a
+     synthetic click is a precise point and always lands. A thumb is ~9mm. The check
+     that discriminates is the TARGET SIZE, not whether the menu renders — so that is
+     what the e2e now asserts. */
+  @media (max-width: 600px) {
+    .tab-customize-btn {
+      min-width: 44px; min-height: 44px;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 4px;
+    }
+  }
   .tab-customizer-menu {
     position: absolute; right: 0; top: calc(100% + 2px);
     background: var(--card); border: 1px solid var(--border); border-radius: 6px;
