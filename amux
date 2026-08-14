@@ -389,15 +389,29 @@ cmd_register() {
   esac
 
   local file="$CC_SESSIONS/$name.env"
-  cat > "$file" <<EOF
-# amux session: $name
-# registered: $(date -Iseconds)
-CC_NAME="$name"
-CC_DIR="$resolved_dir"
-CC_FLAGS="${CC_FLAGS_STR}"
-EOF
+  # MERGE, do not truncate (AMUX-3117). Re-registering an existing worker used to
+  # `cat >` the file down to CC_NAME/CC_DIR/CC_FLAGS, SILENTLY WIPING every other
+  # CC_* key it does not manage — CC_DESC and CC_TAGS were lost this way, and
+  # re-register is the only path to set flags (the PATCH-flags gap, AMUX-3115), so
+  # the destructive path was on the happy path (gtm-engine, 2026-08-14). Preserve
+  # every existing CC_* assignment except the three this verb owns, verbatim (no
+  # re-parse, so quoting/JSON values survive intact).
+  local preserved=""
+  if [[ -f "$file" ]]; then
+    preserved=$(grep -E '^CC_[A-Za-z0-9_]+=' "$file" 2>/dev/null \
+                | grep -vE '^(CC_NAME|CC_DIR|CC_FLAGS)=' || true)
+  fi
+  {
+    echo "# amux session: $name"
+    echo "# registered: $(date -Iseconds)"
+    echo "CC_NAME=\"$name\""
+    echo "CC_DIR=\"$resolved_dir\""
+    echo "CC_FLAGS=\"${CC_FLAGS_STR}\""
+    [[ -n "$preserved" ]] && printf '%s\n' "$preserved"
+  } > "$file"
 
   echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $resolved_dir"
+  [[ -n "$preserved" ]] && echo "  ${DIM}preserved: $(printf '%s\n' "$preserved" | sed -E 's/=.*//' | paste -sd, -)${RESET}"
   [[ -n "$CC_FLAGS_STR" ]] && echo "  flags: $CC_FLAGS_STR"
 }
 
