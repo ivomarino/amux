@@ -8,6 +8,7 @@
 // never the live server. Both projects run it, so every action here is also
 // exercised at 375px (mobile-first); each test ends with an overflow check.
 import { test, expect, Page } from '@playwright/test';
+import { clickSnapped } from './helpers';
 
 // The clipboard permission is granted INSIDE the one test that needs it, not
 // file-wide. WebKit has no 'clipboard-write' permission, and a file-level
@@ -130,20 +131,7 @@ test('schedule id copy button: toast confirms the copy', async ({ page, request,
   await expectNoOverflow(page);
 });
 
-test('board: create shows the card; Clear done visibly removes it', async ({ page, browserName }) => {
-  // AF-47: a REAL mobile defect, quarantined rather than papered over. At iPhone
-  // width (393px) #board-view lays out ~1300px wide, so the "Clear done" button
-  // measures x=1001.6 w=322 — about 1000px off-screen — and elementFromPoint at
-  // its centre returns null. The click never reaches clearDone(): no POST
-  // /api/board/clear-done is issued at all, which is why this reads as "Clear
-  // done is broken" rather than "the button is unreachable".
-  //
-  // fixme, not skip, and not a testMatch narrowing the whole project: this is a
-  // known product bug with a card, so it must stay VISIBLE and must start
-  // passing the moment AF-47 is fixed. The 375px Chromium project passes this
-  // same test, which is precisely the Chromium-at-phone-width vs real-WebKit gap
-  // the ios-safari target was added to catch.
-  test.fixme(browserName === 'webkit', 'AF-47: board overflows horizontally at phone width; Clear done is off-screen');
+test('board: create shows the card; Clear done visibly removes it', async ({ page }) => {
   await settle(page);
   const title = `fbk-board-${Date.now()}`;
 
@@ -159,7 +147,14 @@ test('board: create shows the card; Clear done visibly removes it', async ({ pag
   await expect(page.locator('#board-view')).toContainText(title, { timeout: 5_000 });
 
   // Visible response 2: Clear done removes it from the DOM optimistically.
-  await page.locator('#board-view button', { hasText: 'Clear done' }).first().click();
+  // clickSnapped, not .click(): the button lives in the "done" column of a
+  // scroll-snap kanban, ~1000px along at phone width, and a plain click races
+  // the snap under WebKit — it silently misses and this assertion then blames
+  // clearDone() (AF-47).
+  await clickSnapped(
+    page.locator('#board-view button', { hasText: 'Clear done' }).first(),
+    'Clear done',
+  );
   await expect(page.locator('#board-view')).not.toContainText(title, { timeout: 5_000 });
   await expectNoOverflow(page);
 });
