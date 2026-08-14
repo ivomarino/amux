@@ -63,6 +63,50 @@ def parse(text):
     return out
 
 
+def structure_check(text, entries):
+    """Cross-check the entry count against an INDEPENDENT signal, and fail loud.
+
+    Added 2026-08-14 at amux-cloud's suggestion, after their catch. A session
+    (me) audited this file with an ad-hoc parser that split entries on `DATE:`.
+    Field ORDER varies here — plenty of entries put STATUS: above DATE: — so
+    every such entry's STATUS bound to the PREVIOUS entry and it inherited the
+    NEXT one's. The error ran in the only direction that costs something: OPEN
+    entries reading as `fixed`, i.e. proposed for DELETION, which is the single
+    irreversible step in the validate-and-delete loop. An open entry recording a
+    live, thrice-regressed incident was on that list.
+
+    The discriminator existed the whole time and nobody was routed to it: this
+    script said 122 entries, the ad-hoc parse said 127. Both numbers were read in
+    the same session and never compared. So the fix is not "write better
+    parsers" — it is to make the disagreement ANNOUNCE ITSELF from the canonical
+    tool, because the next person will also write an ad-hoc parse and will also
+    have no reason to suspect it.
+
+    One DATE: and one STATUS: per entry is the file's own contract. If either
+    tally drifts from the '## ' heading count, something is malformed OR someone
+    is about to be misled, and both are worth stopping for.
+    """
+    body = text.split("\n---\n", 1)
+    body = body[1] if len(body) > 1 else text
+    problems = []
+    for field in ("DATE", "STATUS"):
+        n = len(re.findall(r'(?m)^%s:' % field, body))
+        if n != len(entries):
+            problems.append(
+                "  %s: %d occurrence(s) vs %d entries (delta %+d)"
+                % (field, n, len(entries), n - len(entries))
+            )
+    if problems:
+        print("STRUCTURE DRIFT — the entry count disagrees with its own fields:")
+        print("\n".join(problems))
+        print("  Entries are '## ' headings. Do NOT split on DATE: — field order")
+        print("  varies, and a DATE-split silently shifts STATUS by one entry")
+        print("  (open -> fixed), which proposes live entries for deletion.")
+        print("  Canonical count from this script: %d" % len(entries))
+        return False
+    return True
+
+
 def fetch_board():
     # The DEFAULT here is already correct; the hazard is the ENV VAR overriding it
     # with a dead address. 8822 was the Python compatibility bind, removed
@@ -103,7 +147,12 @@ def overlap(a, b):
 
 def main():
     quiet = "--quiet" in sys.argv
-    entries = parse(FRUST.read_text())
+    raw = FRUST.read_text()
+    entries = parse(raw)
+    # Before any per-entry finding: does the file's own shape agree with itself?
+    # A structural drift makes every downstream verdict suspect, so it is
+    # reported FIRST rather than buried under 122 lines of per-entry output.
+    structure_ok = structure_check(raw, entries)
     problems, advisories = [], []
 
     for e in entries:

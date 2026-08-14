@@ -3063,8 +3063,10 @@ FIX: ebe18ce — explicit browser->projects matrix mapping, and the `||` fallbac
 
 ---
 
+## e2e projects shared one server and one AMUX_HOME — cross-project races read as WebKit flakiness
 DATE: 2026-08-13
 AREA: instruments
+SEVERITY: slows
 STATUS: fixed
 SESSION: amux-frustrations
 CARD: AF-46
@@ -3094,8 +3096,10 @@ FIX: b31bcac — one server and one AMUX_HOME per project. Control, same command
 
 ---
 
+## A page.route stub defeated by a service worker fails LOUDLY and blames the wrong subsystem
 DATE: 2026-08-13
 AREA: instruments
+SEVERITY: slows
 STATUS: open
 SESSION: amux-frustrations
 CARD: AF-47
@@ -3120,8 +3124,10 @@ FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the w
 
 ---
 
+## A missed click reads as a broken feature — I filed it against the product and was wrong
 DATE: 2026-08-13
 AREA: instruments
+SEVERITY: slows
 STATUS: fixed
 SESSION: amux-frustrations
 CARD: AF-47
@@ -3154,8 +3160,10 @@ FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come
 
 ---
 
+## A shipped capability read as ABSENT to a working lane — from a truncated extraction
 DATE: 2026-08-13
 AREA: instruments
+SEVERITY: blocks
 STATUS: open
 SESSION: amux-frustrations
 CARD: AMUX-3073
@@ -3214,8 +3222,10 @@ CORRECTION 2026-08-13, same day, by amux-frustrations after amux-gtm self-report
 
 ---
 
+## A green lint gate carried no rule for duplicate function declarations
 DATE: 2026-08-13
 AREA: instruments
+SEVERITY: slows
 STATUS: fixed
 SESSION: amux-frustrations
 CARD: AF-48
