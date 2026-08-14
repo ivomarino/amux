@@ -3211,3 +3211,37 @@ CORRECTION 2026-08-13, same day, by amux-frustrations after amux-gtm self-report
   no deep link to the browser view). The "browser view should advertise its own verbs" idea
   is downgraded to speculation: nobody has yet been shown to miss these controls while
   actually LOOKING at the rendered page.
+
+---
+
+DATE: 2026-08-13
+AREA: instruments
+STATUS: fixed
+SESSION: amux-frustrations
+CARD: AF-48
+SYMPTOM: Three functions were declared TWICE at top level in app.js — _fmtBytes, _fmtDur and
+  timeAgo. In a classic script the last declaration silently wins, so half of each pair was
+  dead code that reads as live code. timeAgo was not cosmetic: the earlier copy returns '' for
+  a falsy timestamp and the LATER (governing) copy has no such guard, so every caller without
+  a timestamp rendered "NaNd ago" for undefined and "20679d ago" for null/0. A guard that
+  exists in the file, is correct, and never runs.
+COST: Unknown duration — nothing could have reported it. It surfaced only because amux-gtm
+  reported an unrelated cosmetic bug ("0.0 MB" for a 5707-byte xlsx) and the fix happened to
+  reach for the shared formatter. The dangerous cost is the one not yet paid: editing a
+  shadowed copy changes NOTHING on screen, so the debugging loop is "my fix does not work"
+  against code that reads correctly — the same shape as the worktree dep-info trap that
+  manufactured three consecutive wrong verdicts on 2026-08-12.
+FIX: 9794f6b. Deduped all three (deleted the dead copy where behaviour-preserving; for
+  timeAgo deleted the LATER copy on purpose, which is the behaviour fix), and both file-viewer
+  sites now use _fmtBytes.
+  The signal is the point: scripts/spa-lint.sh already gates this SPA in CI and already
+  carried no-dupe-keys for the OBJECT-literal case. The function case was simply never
+  enabled, so three live instances sat under a green gate. Now no-redeclare with
+  builtinGlobals:false — that option is load-bearing, because this SPA's top-level names are
+  its cross-file API and spa-lint regenerates them into the globals allowlist every run, so
+  the default flags every top-level declaration and buries the 3 real errors under ~700 false
+  ones. A rule tuned wrong here would have been worse than no rule: nobody reads 700 errors.
+  Gate verified able to FAIL (re-added duplicate -> exit 1 naming it), not just observed green.
+  Generalisable: when a lint gate carries a rule for the object-literal form of a defect, ask
+  whether the function/variable form is covered too. no-dupe-keys without no-redeclare is half
+  a guard, and the uncovered half is the one where shadowing can disable a correctness check.
