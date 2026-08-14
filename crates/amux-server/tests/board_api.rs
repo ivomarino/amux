@@ -566,6 +566,64 @@ async fn force_bypasses_the_gate_and_leaves_the_audit_line() {
 // ---- archive / restore (RR-0055) -----------------------------------------
 
 #[tokio::test]
+async fn a_scoped_list_excludes_archived_by_default_but_unscoped_still_includes_it() {
+    // AMUX-3086 / AMUX-3107. A scoped query (session= or status=) with `archived`
+    // absent now defaults to ActiveOnly, so an agent building a discard candidate
+    // set from `?session=X&status=done` never sees an immutable archived card
+    // (which would 409 on the PATCH). The UNSCOPED bare list still includes it (the
+    // SPA text-search corpus relies on that). This test fails in EITHER direction:
+    // if the scoped default regresses to All, or if the unscoped path is filtered.
+    let (app, _dir) = app();
+    let live = create(
+        &app,
+        json!({ "title": "live done", "status": "done", "session": "alpha", "type": "chore" }),
+    )
+    .await;
+    let live_id = live["id"].as_str().unwrap().to_string();
+    let arch = create(
+        &app,
+        json!({ "title": "archived done", "status": "done", "session": "alpha", "type": "chore" }),
+    )
+    .await;
+    let arch_id = arch["id"].as_str().unwrap().to_string();
+    let (st, _, _) = send_with(
+        &app,
+        "POST",
+        &format!("/api/board/{arch_id}/archive"),
+        Some(json!({ "reason": "done and parked" })),
+        &[("X-Amux-Session", "orch")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let ids = |list: &serde_json::Value| -> Vec<String> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // Scoped by session+status: the fix EXCLUDES the archived card.
+    let (_, _, list) = send(&app, "GET", "/api/board?session=alpha&status=done", None).await;
+    let got = ids(&list);
+    assert!(got.contains(&live_id), "live card must be present: {list}");
+    assert!(!got.contains(&arch_id), "archived card must be excluded from a scoped list: {list}");
+
+    // Scoped by session alone: same exclusion.
+    let (_, _, list) = send(&app, "GET", "/api/board?session=alpha", None).await;
+    assert!(!ids(&list).contains(&arch_id), "session-scoped list must exclude archived: {list}");
+
+    // UNSCOPED bare list still includes it (the guard the unscoped default protects).
+    let (_, _, list) = send(&app, "GET", "/api/board", None).await;
+    assert!(ids(&list).contains(&arch_id), "unscoped bare list must still include archived: {list}");
+
+    // Explicit ?archived=1 on a scoped query still finds it (the override wins).
+    let (_, _, list) = send(&app, "GET", "/api/board?session=alpha&archived=1", None).await;
+    assert!(ids(&list).contains(&arch_id), "explicit archived=1 must still return it: {list}");
+}
+
+#[tokio::test]
 async fn archive_restore_round_trip_preserves_every_field() {
     let (app, _dir) = app();
     let card = create(

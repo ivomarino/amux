@@ -1020,23 +1020,27 @@ pub async fn list_board(
     };
     let status_f = split(&p.status);
     let session_f = split(&p.session);
-    // Python's exact `archived` grammar (amux-server.py:68758 + 14025,
-    // ported byte-for-byte — AMUX-2586 fix #5, the tab-counter fetches):
-    //   absent or ""          -> NO filter (the bare list serves everything;
-    //                            the SPA's text-search full fetch
-    //                            `?done_limit=0` relies on archived cards
-    //                            being in it)
-    //   "1"/"true"/"yes" (lowercased) -> archived-only
-    //   any OTHER non-empty value ("0", "false", "all", "2", ...) ->
-    //                            non-archived only. Python has no "all"
-    //                            spelling — the previous mapping of it to
-    //                            no-filter was a Rust invention that
-    //                            answered the opposite of what Python does.
+    // `archived` grammar (amux-server.py:68758 + 14025, ported on AMUX-2586 fix #5):
+    //   "1"/"true"/"yes"          -> archived-only
+    //   any OTHER non-empty value -> non-archived only ("0", "false", "all", "2", ...)
+    //   absent or ""              -> scope-dependent (see below)
+    //
+    // SCOPE-DEPENDENT default (AMUX-3086 / AMUX-3107). A SCOPED list (status= or
+    // session=) with `archived` absent now defaults to ActiveOnly, so the view
+    // agrees with the mutation guard: an archived card is immutable
+    // (amux-core/board.rs:570), and agent cleanup loops were building discard
+    // candidates from `?session=X&status=done`, then PATCHing {status:discarded}
+    // on the ~42 archived cards it mixed in, drawing 409 archived_task_immutable
+    // (ethos rule 1: a view must share the predicate of the mechanism it
+    // describes). The UNSCOPED bare list stays All: the SPA text-search full fetch
+    // (?done_limit=0) relies on archived cards being in the corpus, and
+    // board_api.rs pins that the bare list still includes them.
+    let scoped = !status_f.is_empty() || !session_f.is_empty();
     let archived = match p.archived.as_deref().map(|s| s.to_lowercase()) {
-        None => ArchivedFilter::All,
-        Some(v) if v.is_empty() => ArchivedFilter::All,
         Some(v) if matches!(v.as_str(), "1" | "true" | "yes") => ArchivedFilter::ArchivedOnly,
-        Some(_) => ArchivedFilter::ActiveOnly,
+        Some(v) if !v.is_empty() => ArchivedFilter::ActiveOnly,
+        _ if scoped => ArchivedFilter::ActiveOnly,
+        _ => ArchivedFilter::All,
     };
     // <=0 is uncapped inside cap_terminal, matching Python's `_cap_terminal`.
     //
