@@ -2733,3 +2733,20 @@ FIX: 9794f6b. Deduped all three (deleted the dead copy where behaviour-preservin
   Generalisable: when a lint gate carries a rule for the object-literal form of a defect, ask
   whether the function/variable form is covered too. no-dupe-keys without no-redeclare is half
   a guard, and the uncovered half is the one where shadowing can disable a correctness check.
+
+## Verified gate rejects a cross-group reporter's verification, so the strongest evidence cannot close the card
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-14
+SESSION: amux
+CARD: AMUX-3119
+SYMPTOM: AMUX-3116 and AMUX-3117 (amux CLI fixes) were verified end-to-end by gtm-engine
+  with negative controls, field-level CC_* diffs and a server-API cross-check, which is
+  stronger than a typical same-group review. But the code verified-gate criterion is
+  "peer-reviewed by a worker in group `amux`", and gtm-engine is group `gtm`. Acking it
+  would be untrue, so both stay `done`.
+COST: Two genuinely-verified cards cannot reach `verified`; the strongest verification
+  available (the affected user, who also reported the bug) does not count toward the gate.
+FIX: The verified gate should accept verification by the originating reporter, or by any
+  worker when the card records who plus their evidence (AMUX-3119).
