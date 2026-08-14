@@ -7225,7 +7225,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // and answers it below, so flagging it would ask a human for something
         // nobody needs to decide.
         let selector_now = !is_rate_limit_menu(&pane) && detect_claude_status(&pane) == "waiting";
-        let selector_was = load_meta(name)["input_required_since"].as_i64().unwrap_or(0) > 0;
+        let selector_was = meta_i64(&load_meta(name), "input_required_since") > 0;
         if selector_now != selector_was {
             update_meta(
                 name,
@@ -7275,7 +7275,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             .flatten();
         let stuck_now = typed_pending.is_some();
         let meta_now = load_meta(name);
-        let stuck_was = meta_now["composer_stuck_since"].as_i64().unwrap_or(0) > 0;
+        let stuck_was = meta_i64(&meta_now, "composer_stuck_since") > 0;
         if stuck_now != stuck_was {
             let preview = typed_pending
                 .as_deref()
