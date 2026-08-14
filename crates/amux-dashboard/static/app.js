@@ -617,14 +617,9 @@ function _connEpisodes() {
   if (cur) eps.push(cur);   // still degraded (ongoing)
   return eps.reverse();     // most recent first
 }
-function _fmtDur(ms) {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return s + 's';
-  const m = Math.floor(s / 60), r = s % 60;
-  if (m < 60) return m + 'm' + (r ? ' ' + r + 's' : '');
-  const h = Math.floor(m / 60);
-  return h + 'h ' + (m % 60) + 'm';
-}
+// _fmtDur lives once, further down. A second copy was declared here; the last
+// declaration wins in a classic script, so this one was already dead — the
+// surviving version is kept as-is so nothing on screen changes.
 function _fmtClock(ts) {
   const d = new Date(ts);
   const today = new Date(); today.setHours(0,0,0,0);
@@ -7096,11 +7091,9 @@ function _tryPrettyJson(s) {
   } catch(e) { return s; }
 }
 
-function _fmtBytes(n) {
-  if (n < 1024) return n + 'B';
-  if (n < 1048576) return (n/1024).toFixed(1) + 'KB';
-  return (n/1048576).toFixed(1) + 'MB';
-}
+// _fmtBytes lives once, further down (the B/KB/MB/GB version). A second copy
+// used to be declared here; in a classic script the LAST declaration wins, so
+// this one governed nothing and editing it would have changed nothing on screen.
 
 function _shortUA(ua) {
   if (!ua) return '';
@@ -7367,7 +7360,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.628';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.629';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13408,7 +13401,10 @@ function _renderFileBody(data, mode) {
     _abPlay(rawUrl, fname);
     // Show info in overlay too
     body.className = 'file-overlay-body file-image';
-    const sizeMB = data.size ? (data.size / 1048576).toFixed(1) + ' MB' : '';
+    // _fmtBytes, not hardcoded MB: a 5,707-byte .xlsx rendered as "0.0 MB",
+    // which reads as an empty or corrupt file. Small text/report artifacts are
+    // exactly what agents produce most, so the misleading case was the common one.
+    const sizeMB = data.size ? _fmtBytes(data.size) : '';
     body.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:24px;padding:40px;">
       <div style="font-size:3rem;">🎵</div>
       <div style="font-size:1.05rem;color:var(--text);font-weight:600;">${esc(fname)}</div>
@@ -13420,7 +13416,10 @@ function _renderFileBody(data, mode) {
   if (data.is_binary) {
     body.className = 'file-overlay-body file-image';
     const fname = data.path.split('/').pop();
-    const sizeMB = data.size ? (data.size / 1048576).toFixed(1) + ' MB' : '';
+    // _fmtBytes, not hardcoded MB: a 5,707-byte .xlsx rendered as "0.0 MB",
+    // which reads as an empty or corrupt file. Small text/report artifacts are
+    // exactly what agents produce most, so the misleading case was the common one.
+    const sizeMB = data.size ? _fmtBytes(data.size) : '';
     const rawUrl = API + '/api/file/raw?path=' + encodeURIComponent(data.path) + (peekSessionDir ? '&cwd=' + encodeURIComponent(peekSessionDir) : '');
     // Ebook formats we can't render in-browser (MOBI/AZW/CBR/DJVU…) get a
     // reader-styled card rather than the generic binary blob.
@@ -19295,13 +19294,11 @@ async function fetchBoard() {
   }
 }
 
-function timeAgo(ts) {
-  const diff = Math.floor(Date.now() / 1000) - ts;
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-  return Math.floor(diff / 86400) + 'd ago';
-}
+// timeAgo lives once, further UP — and here the duplicate was not harmless.
+// This copy (the later one, so the one that actually governed) had no falsy
+// guard, while the earlier one returns '' for a missing timestamp. Shadowing
+// killed the guard, so every caller with no timestamp rendered "NaNd ago" for
+// undefined and "20679d ago" for null/0. Deleting this copy restores the guard.
 
 // Sanitize HTML before inserting into the DOM. Notes (which may contain raw
 // Obsidian HTML), rendered markdown, and graph node bodies are attacker-

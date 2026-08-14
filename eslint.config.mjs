@@ -55,6 +55,24 @@ const gateRules = {
   // `catch(e) {}` with unused e is the file's idiom for optional paths.
   'no-unused-vars': ['warn', { vars: 'local', args: 'after-used', caughtErrors: 'none' }],
   'no-dupe-keys': 'error',
+  // A SECOND `function foo()` at top level silently replaces the first — the
+  // last declaration wins in a classic script, and nothing anywhere says so.
+  // Found three live in app.js (2026-08-13): _fmtBytes, _fmtDur, and timeAgo.
+  // timeAgo is why this is an error and not a warning — the surviving copy had
+  // lost the earlier one's falsy guard, so every caller without a timestamp
+  // rendered "NaNd ago" (undefined) or "20679d ago" (null/0) on screen.
+  //
+  // The class is worse than its symptoms: editing the shadowed copy changes
+  // NOTHING, so the natural debugging loop is "my fix does not work", against
+  // code that reads correctly. no-dupe-keys was already here for the object
+  // case; this is the same defect for functions.
+  //
+  // builtinGlobals:false is REQUIRED, not incidental. This SPA is a classic
+  // script whose top-level names are its cross-file API, and spa-lint.sh
+  // regenerates them into the globals allowlist every run — so with the default
+  // (true) the rule flags every top-level declaration as redeclaring "a built-in
+  // global", ~700 false errors that bury the 3 real ones.
+  'no-redeclare': ['error', { builtinGlobals: false }],
   'no-unreachable': 'error',
   // checkLoops:false — while(true) polling loops are intentional in an SPA.
   'no-constant-condition': ['error', { checkLoops: false }],
