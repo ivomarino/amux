@@ -2318,7 +2318,10 @@ impl Delivery {
 
 /// py:8676 _cmd_hist_record — Messages history, origin-tagged, pruned.
 async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &str, origin: &str) {
-    cmd_hist_record_full(state, session, text, ctype, origin, DeliveryMeta::direct()).await
+    // skip_board=false: this wrapper does not pre-strip `[no-board]`, so
+    // title_from_prompt still honours the marker when present (only the send
+    // handler strips it early and must thread the flag explicitly).
+    cmd_hist_record_full(state, session, text, ctype, origin, false, DeliveryMeta::direct()).await
 }
 
 /// A scheduled command that was DELIVERED (py parity: origin = the schedule's
@@ -2331,7 +2334,7 @@ pub(crate) async fn cmd_hist_record_schedule(
     text: &str,
     origin: &str,
 ) {
-    cmd_hist_record_full(state, session, text, "schedule", origin, DeliveryMeta::direct()).await
+    cmd_hist_record_full(state, session, text, "schedule", origin, false, DeliveryMeta::direct()).await
 }
 
 /// The full recorder. `queued_at` is the moment the message entered the
@@ -2370,12 +2373,107 @@ impl DeliveryMeta<'_> {
 /// drain; short enough that "run the same command again" is not flagged.
 const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
 
+/// Mint a ledger card for a HUMAN prompt delivered via the send path and return
+/// its row, or None when the prompt is steering/control (`title_from_prompt`
+/// None: `[no-board]`, control words, bare slash commands, <12 chars) or the
+/// worker already holds an open agent card (the prompt is steering work in
+/// flight, not a new task).
+///
+/// WHY THIS EXISTS (AMUX-3071): the Python server's `_autotask_from_command`
+/// carded every human command and stamped `cmd_history.card_id`. That path was
+/// NOT ported to the Rust send/steer flow at the 792ce1f cutover (2026-08-09) —
+/// only the orchestrator's `_amux_messages` DeliverMessage path got
+/// `capture_prompt_card`, which the tmux fleet's send path never touches. Result:
+/// 330 human prompts from 2026-08-09 onward were recorded with `card_id=NULL` and
+/// left no board trace at all — the "no silent work" ledger discipline silently
+/// stopped working. This restores it for the send path, mirroring
+/// `capture_prompt_card`'s logic (title-from-prompt, open-card dedup, `doing`
+/// mint, `capture: session prompt` log marker, `notified=1`). Runs inside the
+/// caller's write transaction so the card and the `cmd_history.card_id` link are
+/// atomic; the self-description STEER nudge stays orchestrator-only (it needs an
+/// async enqueue), but the durable `needs-self-description` TAG is set here so a
+/// needy card is still findable.
+fn mint_capture_card(
+    conn: &rusqlite::Connection,
+    session_name: &str,
+    body: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Option<crate::db::board_store::IssueRow>> {
+    let Some(title) = amux_core::board::title_from_prompt(body) else {
+        return Ok(None); // steering / control / [no-board] — mint nothing
+    };
+    if session_name.trim().is_empty() {
+        return Ok(None);
+    }
+    // A worker already holding an open agent card is being STEERED, not handed a
+    // new task — no second card (capture_prompt_card parity, and the dedup that
+    // stops a delivered prompt double-carding a lane that is already mid-work).
+    let open: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE session = ?1 AND deleted IS NULL \
+         AND owner_type = 'agent' AND status NOT IN ('done','verified','discarded')",
+        rusqlite::params![session_name],
+        |r| r.get(0),
+    )?;
+    if open > 0 {
+        return Ok(None);
+    }
+    let needs_self = amux_core::board::title_needs_self_description(&title);
+    let desc_body: String = body.chars().take(300).collect();
+    let mut row = crate::db::board_store::create_issue(
+        conn,
+        &crate::db::board_store::NewIssue {
+            title,
+            desc: format!("**Prompt:** {desc_body}"),
+            // `doing`, NOT `todo`: an owned `todo` ledger card is Runnable to the
+            // planner and its prompt was re-dispatched, double-running every
+            // direct prompt (AMUX-2613). `doing` + agent owner is Assigned, never
+            // re-dispatched.
+            status: "doing".into(),
+            session: Some(session_name.to_string()),
+            item_type: "code".into(),
+            creator: "amux".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: if needs_self.is_some() {
+                vec!["needs-self-description".to_string()]
+            } else {
+                vec![]
+            },
+        },
+        now_ms / 1000,
+    )?;
+    let stamp = chrono::Local::now().format("%H:%M").to_string();
+    row.log = Some(crate::db::board_store::append_log(
+        row.log.as_deref(),
+        &stamp,
+        "capture: session prompt",
+    ));
+    if let Some(reason) = needs_self {
+        row.log = Some(crate::db::board_store::append_log(
+            row.log.as_deref(),
+            &stamp,
+            &format!("capture: title needs self-description — {reason}"),
+        ));
+    }
+    crate::db::board_store::save_patched(conn, &row)?;
+    // `notified` is outside save_patched's SET list; set it so the assignment
+    // notifier never re-announces a prompt the worker already received live.
+    conn.execute("UPDATE issues SET notified = 1 WHERE id = ?1", rusqlite::params![row.id])?;
+    Ok(Some(row))
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
     text: &str,
     ctype: &str,
     origin: &str,
+    skip_board: bool,
     meta: DeliveryMeta<'_>,
 ) {
     if session.is_empty() || text.is_empty() {
@@ -2441,6 +2539,12 @@ pub(crate) async fn cmd_hist_record_full(
         .await;
     }
 
+    let is_user = ctype == "user";
+    // Carry the recorded row id out of the write so auto-capture can link the card.
+    let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let msg_row_id_w = msg_row_id.clone();
+    let cap_session = session.clone();
+    let cap_text = text.clone();
     let _ = state
         .store
         .write_async(move |conn| {
@@ -2453,6 +2557,7 @@ pub(crate) async fn cmd_hist_record_full(
                     delivery, queued_at_ms, now_ms, submit_verdict
                 ],
             )?;
+            msg_row_id_w.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
@@ -2461,6 +2566,56 @@ pub(crate) async fn cmd_hist_record_full(
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
+
+    // NO SILENT WORK (AMUX-3071): mint a ledger card for a HUMAN prompt and link
+    // it to the message row. Separate write so a capture failure can never roll
+    // back the message record — the message is the durable entity, the card its
+    // consequence (CLAUDE.md: hang the consequence off the write that happened).
+    // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
+    // messages are not the recipient's task and must not spam the board.
+    if is_user && !skip_board {
+        let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
+        if row_id > 0 {
+            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let minted_w = minted.clone();
+            let sess_log = cap_session.clone();
+            let res = state
+                .store
+                .write_async(move |conn| match mint_capture_card(conn, &cap_session, &cap_text, now_ms)? {
+                    Some(row) => {
+                        conn.execute(
+                            "UPDATE cmd_history SET card_id = ?1 WHERE id = ?2",
+                            rusqlite::params![row.id, row_id],
+                        )?;
+                        *minted_w.lock().unwrap() = Some(row.id.clone());
+                        let ev = crate::db::PendingEvent {
+                            entity_type: amux_core::revision::EntityType::Task,
+                            entity_id: row.id.clone(),
+                            mutation: amux_core::revision::MutationKind::Created,
+                            payload: Some(row.snapshot()),
+                        };
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![ev] })
+                    }
+                    None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+                })
+                .await;
+            match res {
+                // Positive log signal (two-fixes rule): if auto-capture silently
+                // stops again, the absence of these lines while user prompts keep
+                // arriving — plus the cmd_history.card_id NULL rate — is the
+                // detector. grep "ledger: auto-captured".
+                Ok(_) => {
+                    if let Some(cid) = minted.lock().unwrap().take() {
+                        tracing::info!(session = %sess_log, card_id = %cid,
+                            "ledger: auto-captured board card from delivered prompt");
+                    }
+                }
+                Err(e) => tracing::warn!(session = %sess_log, error = %e,
+                    "ledger auto-capture FAILED; prompt recorded without a board card"),
+            }
+        }
+    }
 }
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
@@ -9088,8 +9243,10 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     let deliver_now = body.get("deliver_now").map(py_truthy).unwrap_or(false);
     let defer_busy = !(record_history || deliver_now);
     // [no-board] strip BEFORE anything is sent, and before the origin stamp
-    // (the regex is ^-anchored) — AC-183.
-    let _skip_board = body.get("no_board").map(py_truthy).unwrap_or(false) || no_board_re().is_match(&text);
+    // (the regex is ^-anchored) — AC-183. Captured here (before the strip) so the
+    // ledger auto-capture at record time can honour it (AMUX-3071): orig_text no
+    // longer carries the marker, so the flag must be threaded explicitly.
+    let skip_board = body.get("no_board").map(py_truthy).unwrap_or(false) || no_board_re().is_match(&text);
     if no_board_re().is_match(&text) {
         text = no_board_re().replace(&text, "").trim().to_string();
     }
@@ -9149,9 +9306,9 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         };
         if record_history {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record_full(state, name, &orig_text, "user", email, meta).await;
+            cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
         } else if !origin.is_empty() && origin != name {
-            cmd_hist_record_full(state, name, &orig_text, "session", &origin, meta).await;
+            cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
         }
     } else if !msg_id.is_empty() {
         send_dedup_forget(state, name, &msg_id).await;
@@ -11310,6 +11467,7 @@ mod tests {
             "hello",
             "user",
             "ethan@example.com",
+            false,
             DeliveryMeta {
                 delivery: Some(Delivery::Queued),
                 queued_at_ms: Some(1_000),
@@ -11351,7 +11509,7 @@ mod tests {
     #[tokio::test]
     async fn an_unverified_path_records_null_not_a_guess() {
         let (st, _dir) = state();
-        cmd_hist_record_full(&st, "lane-b", "hi", "user", "", DeliveryMeta::direct()).await;
+        cmd_hist_record_full(&st, "lane-b", "hi", "user", "", false, DeliveryMeta::direct()).await;
         let v: Option<String> = st
             .store
             .read()
@@ -11363,6 +11521,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, None, "an unverified path must record NULL, not a verdict");
+    }
+
+    // AMUX-3071: the send path lost Python's _autotask_from_command at the
+    // 792ce1f cutover (2026-08-09), so 330 human prompts recorded card_id=NULL
+    // and left no board trace. A real task prompt must now mint a `doing` card
+    // and stamp cmd_history.card_id; steering / [no-board] / inter-session must
+    // not. This test would have been RED for the whole regression window.
+    #[tokio::test]
+    async fn a_human_prompt_auto_captures_and_links_a_ledger_card() {
+        let (st, _dir) = state();
+        let q = |sql: &'static str, s: &'static str| -> Option<String> {
+            st.store
+                .read()
+                .unwrap()
+                .query_row(sql, rusqlite::params![s], |r| r.get(0))
+                .unwrap()
+        };
+
+        // 1. A real task prompt mints a card and links it.
+        cmd_hist_record_full(
+            &st, "lane-cap", "Refactor the settings sidebar into a tabbed page",
+            "user", "", false, DeliveryMeta::direct(),
+        )
+        .await;
+        let card_id = q(
+            "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+            "lane-cap",
+        )
+        .expect("a real task prompt must link a board card");
+        let (sess, status): (String, String) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT session, status FROM issues WHERE id=?1",
+                rusqlite::params![card_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the minted card must exist");
+        assert_eq!(sess, "lane-cap");
+        assert_eq!(status, "doing", "capture mints in doing, not todo (AMUX-2613)");
+
+        // 2. A SECOND prompt to a lane that now holds an open card is STEERING,
+        //    not a new task: no card, card_id stays NULL, still exactly one card.
+        cmd_hist_record_full(
+            &st, "lane-cap", "Also make the tabs keyboard-navigable please",
+            "user", "", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-cap")
+                .is_none(),
+            "a lane with an open card is steered, not re-carded"
+        );
+        let n: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-cap'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "exactly one card for the lane");
+
+        // 3. [no-board] (skip_board=true) mints nothing.
+        cmd_hist_record_full(
+            &st, "lane-nb", "Do a big refactor of the whole module right now",
+            "user", "", true, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-nb")
+                .is_none(),
+            "[no-board] mints no card"
+        );
+
+        // 4. Inter-session ("session") messages are not the recipient's task.
+        cmd_hist_record_full(
+            &st, "lane-x", "Coordinate the rollout with the other lane and report back",
+            "session", "peer-lane", false, DeliveryMeta::direct(),
+        )
+        .await;
+        assert!(
+            q("SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1", "lane-x")
+                .is_none(),
+            "inter-session messages must not spam the board"
+        );
     }
 
     async fn call(
