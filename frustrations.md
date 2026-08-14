@@ -3117,3 +3117,37 @@ FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the w
   indistinguishable from one that matched — same green-looking machinery, no output either
   way. The generalisable guard is an assertion that each route was actually hit; amux has no
   such helper today and every future page.route stub inherits the same silence.
+
+---
+
+DATE: 2026-08-13
+AREA: instruments
+STATUS: fixed
+SESSION: amux-frustrations
+CARD: AF-47
+SYMPTOM: A click that silently does not land is indistinguishable from a feature that does
+  not work. e2e feedback-smoke.spec.ts failed on "the card is still on the board" at iPhone
+  width. The button lives in the `done` column of a scroll-snap kanban (.board-col is
+  flex:0 0 86vw under scroll-snap-type:x proximity), and under WebKit the snap animation is
+  still running when playwright computes the click coordinates, so the click lands where the
+  button used to be. clearDone() was never invoked and NO request was issued — measured by
+  wrapping the handler and counting calls: mobile/Chromium 1 call + POST 200, WebKit 0 calls.
+COST: I filed a board card against the PRODUCT — "board overflows horizontally at phone
+  width, Clear done ~1000px off-screen, a phone user must scroll 1000px to reach it" — from
+  the geometry alone, without checking design intent. The layout was correct: 86vw columns
+  in a swipeable kanban put the 4th column at x≈1001 by construction. One wrong card, and a
+  test quarantined via test.fixme for a bug that did not exist. The assertion pointed at the
+  product because that is the only thing it could say.
+FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come to REST
+  inside the viewport, then click, retrying the whole sequence (renderBoard() detaches the
+  node, and scrollIntoViewIfNeeded does not re-resolve its locator the way locator.click()
+  does — the first version of the helper fixed WebKit and broke desktop+mobile exactly that
+  way). The durable part is the failure MESSAGE: it names the scroll-snap container and says
+  "this is a HARNESS problem, do NOT file it against the product", so the next occurrence
+  arrives with the right diagnosis attached instead of inducing the wrong one. Error path
+  verified with a negative control rather than assumed. test.fixme removed; 211 passed, 0
+  failed.
+  The generalisable lesson, and the reason this is logged rather than quietly fixed: an
+  interaction that MISSES produces a perfectly plausible product-shaped failure, and the
+  natural response is to go read the product's code. Anywhere a test drives a real gesture,
+  the miss and the malfunction need to be distinguishable at the assertion.
