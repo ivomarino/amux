@@ -724,83 +724,6 @@ FIX: loadUsage() should accept both "session" and "worker" (the Rust mapper now 
   fixture so endpoint drift fails a test instead of silently unlabeling a bar.
 
 ---
-## Journal `entity_type` stored serde's object form — every tag filter matched nothing
-AREA: journal
-SEVERITY: wrong-conclusion
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2593
-SYMPTOM: `_amux_state_events.entity_type` held the adjacently-tagged serde object
-  (`{"kind":"task"}`) instead of the bare tag (`task`), so every
-  `entity_type = '<tag>'` SQL filter silently matched zero rows: redistribute dedupe,
-  `/api/metrics/fleet` `last()`, and the circuit breaker's `window_stats` (its
-  `completed` was permanently 0 — a breaker that can never see success). Classic
-  ethos-7 silent probe: the queries ran, returned empty, and empty looked like
-  "no events yet". Found only because RR-0111a's replay verifier needed the tag
-  as a join key and its round-trip test could actually fail.
-COST: The circuit breaker judged fleet health on a numerator of zero for as long
-  as the journal existed; fleet metrics under-reported; nothing errored. Two
-  sessions (this one and amux-rust) then fixed the SAME mismatch in opposite
-  directions concurrently — writer-to-bare vs readers-to-object — which is the
-  drift the single-codebase rule exists to prevent; resolved toward bare tags
-  with both-format-tolerant readers since existing DBs hold old rows.
-FIX: Writer stores bare tags; `parse_entity_type` (db/mod.rs) + `entity_tag`
-  (db/replay.rs) + IN-clauses at the two query sites accept both forms. The
-  durable lesson: when a column is written by serde serialization, pin its
-  STORED form with a test that queries it back by literal value — serialization
-  defaults are an implementation detail until SQL depends on them.
-
----
-## Rust and Python servers each minted their own auth token — same claimed file, different names
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (updict/browser parity lane)
-CARD: AMUX-2594
-SYMPTOM: auth.rs's docstring said the token file is "shared with the Python
-  server", but Rust read `~/.amux/auth-token` (dash) while Python owns
-  `~/.amux/auth_token` (underscore). The Rust server minted its own token on
-  first boot, so every client holding the real token (the SPA served by Python,
-  curl recipes, probes) got 401 from 8824 — which presented as a confusing
-  "auth asymmetry" between origins and burned probe time on the wrong theory
-  (that the UI-guard sha was an accepted token form; it never was — Python's
-  localhost bypass was producing the 200s).
-COST: Cross-origin 401s for every valid-token caller; a probe narrative built
-  on two wrong mechanisms before the filename diff was spotted.
-FIX: config.rs reads Python's `auth_token`; AMUX_AUTH_TOKEN env parity
-  ("none" disables); require_bearer is a port of Python's _check_auth
-  (localhost bypass, public paths, `_token=` only, JSON 401). The stale
-  `auth-token` file is left on disk but nothing reads it.
-
----
-## Board card archive via PATCH 500s on the Rust origin — and the harness's fire-and-forget cleanup hid it for three runs
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (rust parity-gaps lane)
-CARD: AMUX-2586
-SYMPTOM: `PATCH /api/board/<id> {"archived":1}` — the exact write the SPA's
-  card-archive and the parity harness's cleanup use — returned 500 on the Rust
-  origin (the field was absent from PATCH_WRITABLE; Python has accepted it
-  since AMUX-2492). The harness's cleanup `.catch(() => {})`ed the response,
-  so each run left an unarchived PARITY- card on the LIVE shared board with
-  no error anywhere: PH-2/PH-3/PH-5 accumulated across days and read as
-  stray unowned todos to every board consumer.
-COST: 3 stray cards polluting the live board's Unowned view across multiple
-  days; the silent-cleanup shape meant nobody knew which side had failed
-  (python vs rust) until the response was actually read.
-FIX: board.rs PATCH now ports Python's archived semantics byte-for-byte
-  (truthy set 1/true/yes/on, cross-lane guard requiring authorized_by,
-  un-archive never gated; test patch_archived_round_trip_with_cross_lane_guard);
-  the harness cleanup checks the PATCH status and prints CLEANUP FAILED with
-  the card id. Strays archived by hand via the Python API. Lesson repeated:
-  a cleanup that cannot report failure is a generator of exactly the debris
-  it exists to remove.
-
----
 ## Group-config PATCH: COALESCE arms are dead code — explicit JSON null 500s on both origins
 AREA: board
 SEVERITY: wrong-conclusion
@@ -819,22 +742,6 @@ COST: A client sending a partial config update silently wipes the other keys; a
   so the fix must land on both or the boundary drifts.
 FIX: Decide the intended semantics (partial-merge vs full-replace), implement on
   both servers, and add a null-body regression test each side.
-
----
-## /api/fs/search error text promises AMUX_SEARCH_RG that Python never reads
-AREA: files
-SEVERITY: annoy
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2597
-SYMPTOM: Python's search error text tells the user to set AMUX_SEARCH_RG
-  (amux-server.py:21056) but no code reads it — a documented knob that does not
-  exist (ethos rule 6 shape: the claim without the implementation).
-COST: Anyone following the error's advice sets an env var that changes nothing.
-FIX: The Rust port implements AMUX_SEARCH_RG for real rather than inheriting the
-  false claim (crates/amux-server/src/api/fs.rs). Python side still carries the
-  dead promise — fix or delete the text there.
 
 ---
 ## Browser profile DELETE can rmtree a real Chrome profile (python, live)
@@ -911,28 +818,6 @@ FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displa
   identity against inherited env — extend it to compare against the pane title, so
   the disagreement is reported instead of discovered.
 
-## Auto-builder script hardcoded the developer's checkout path — any other clone would rebuild the wrong repo
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (AMUX-2608 install-script lane)
-CARD: AMUX-2608
-SYMPTOM: scripts/rust-auto-build.sh (run by com.amux.server-rs-builder every 60s)
-  read `REPO="/Users/ethan/Dev/amux"` and `INSTALL="$HOME/.local/bin/amux-server-rs"`
-  as literals. Found while making ./install.sh write the builder plist for a fresh
-  clone: the plist would point at the cloned script, and the script would then
-  silently build ETHAN'S path, not the clone — or fail on a machine where that path
-  does not exist while exiting 0-shaped from launchd's point of view (log-only).
-COST: None realized here (caught during install.sh work, before any user hit it),
-  but the failure it sets up is the install.sh e2e passing while the auto-upgrade
-  seam serves a different repo's commits — a wrong-build deploy that nothing labels.
-FIX: fixed in the AMUX-2608 change: REPO now derives from the script's own location
-  (`$(dirname "${BASH_SOURCE[0]}")/..`) with AMUX_REPO/AMUX_RS_INSTALL/
-  AMUX_RS_BUILD_STAMP/AMUX_RS_BUILD_LOG env overrides for the temp-prefix e2e.
-  Behavior on this machine is unchanged (script lives at the same path it named).
-
-
 ## Idle nudge told me to commit 11 files I never touched, while the staged-guard said I owned none
 AREA: notices
 SEVERITY: blocks
@@ -985,30 +870,6 @@ FIX: not a request to reverse the protocol - deletion is Ethan's call and he mad
   this before the deletions and was told, correctly, that the call was made; this entry is the
   evidence they asked for rather than a re-litigation.
 
-## Every direct prompt to a rust worker ran TWICE — the ledger card re-dispatched its own prompt
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (AMUX-2613 build lane)
-CARD: AMUX-2613
-SYMPTOM: The full-stack pomegranate E2E's claude transcript carried the same prompt twice:
-  once raw ("Remember the word: pomegranate…"), then again wrapped in an ExecuteTask
-  assignment ("Task tsk_…: Remember the word: pomegranate **Prompt:** …"). The pump
-  delivered the message, capture_prompt_card minted its no-silent-work ledger card as
-  `todo` — and an owned `todo` card is Runnable to the planner (deliberately: the L3
-  380-invisible-todos lesson), so the next tick assigned the card and redelivered the
-  same prompt as new work. Two turns, two token spends, two "OK"s, per prompt.
-COST: one failed E2E verdict (turn-count wait tripped early on the phantom turn) plus the
-  double token spend this would have silently charged EVERY direct prompt to every
-  rust-orchestrated worker; invisible unless you read a provider transcript, since each
-  delivery looks legitimate alone — the board showed one card and the queue two commands.
-FIX: same commit as this entry: the ledger card mints as `doing` (in flight, owner
-  attached), which disposition() reads as Assigned — never re-dispatched; an un-moved
-  card after the turn lands in the stall detector's designed drift cell. Regression:
-  captured_ledger_card_is_not_redispatched_by_the_planner (runtime.rs) fails on the
-  pre-fix mint.
-
 ## The rust request log recorded a ~15-second restart choreography as a 76ms request
 AREA: instruments
 SEVERITY: slows
@@ -1029,32 +890,6 @@ COST: ~30 minutes of incident reconstruction chasing a phantom second actor, bec
   artifacts (env header, session log markers, session_events).
 FIX: request-log middleware should stamp arrival ts and wall-clock latency around the
   WHOLE handler future; a restart choreography should be a visibly long row.
-
-## `amux serve --help` documented two flags that the same command now refuses
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux (python-removal doc sweep subagent)
-CARD: AMUX-2621 (sibling umbrella for python-era doc drift; no dedicated card — this
-  session was scoped to file edits and did not create one)
-SYMPTOM: `cmd_serve` was retargeted from the deleted `amux-server.py` to the Rust
-  binary, which takes NO argv, so it gained `die "amux serve takes only an optional
-  port now"`. Its `--help` block was left untouched and still advertised
-  `--bind host[,host,...]` and `--no-tls`, with four worked examples using them
-  (`amux serve 8822 --bind 127.0.0.1`). Every one of those examples now exits 1.
-  The top-level `amux --help` carried the same dead `[--bind ...]` spelling plus the
-  pre-cutover default port (8822, which is now the LEGACY compat port, not the default).
-COST: no incident yet — caught during the doc sweep. The trap it was set to spring:
-  the sanctioned instruction and the failure are the same action (ethos rule 7's
-  sharpest variant, AMUX-2140), so a session following `--help` literally gets an
-  error and no way to tell "I typed it wrong" from "the help is stale".
-FIX: help rewritten to the Rust reality — positional port only, mapped onto
-  AMUX_RS_PORT, AMUX_RS_LEGACY_PORT documented, and an explicit note that `--bind`
-  and `--no-tls` are GONE (Python-server flags; the binary always binds 0.0.0.0 and
-  always serves HTTPS) so the removal reads as deliberate rather than as a bug.
-  Generalisable: when a verb is retargeted to a new backend, its `--help` is part of
-  the verb — retarget both or the command starts lying.
 
 ## e2e auth tests flip green->red mid-session: the server under test is rebuilt from a shared checkout that moves between runs
 AREA: instruments
@@ -2209,70 +2044,6 @@ FIX: Two halves, neither done. (1) `/health` should report free space on the vol
   that blocked me.
 
 ---
-## The scheduler's Skip button answered 405 with an EMPTY body, so the dashboard toasted its own guess
-AREA: scheduler
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux (sched2 lane)
-CARD: AMUX-2679
-SYMPTOM: `POST /api/schedules/<id>/skip` — the call the dashboard has made since the
-  Python days — was never routed in the Rust API. Against the live server it returns
-  `HTTP 405` with a zero-byte body, and `skipSchedule()` read `d.error || 'Could not
-  skip'`, so the user got a bare "Could not skip" with no reason at any layer. A
-  routing gap therefore presented as a broken SCHEDULE, which is where anyone would
-  look first.
-COST: the button was dead for the whole cutover with nothing in any log — the failure
-  is pure absence, same shape as `run_scheduler` having zero call sites (AMUX-2647).
-  The generic toast is what made it expensive: it named the wrong subsystem.
-FIX: routed `POST /{id}/skip` -> `skip_next` with python's semantics, and moved
-  `skipSchedule()` onto `apiCall` so the server's own sentence is what gets shown
-  instead of a client-side guess.
-
----
-## A client-side fallback string outranked the server's reason, and only for THIS control
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux (sched2 lane)
-CARD: AMUX-2679
-SYMPTOM: every other schedule control goes through `apiCall`, which toasts
-  `_apiErrText(r)` — the server's real refusal text. `skipSchedule()` alone used a
-  bare `fetch` and `showToast(d.error || 'Could not skip')`. When a response has no
-  JSON `error` key (405, 404-from-router, any HTML error page) the `||` silently swaps
-  in a sentence the client invented, and it reads exactly like a server verdict.
-COST: this is the second time in a week a schedules control has shown a confident
-  message over an action that did not happen (AMUX-2647's "Ran · no output" was the
-  first). Both were one call site that had drifted off the shared wrapper.
-FIX: use `apiCall` everywhere; a hand-rolled `fetch` in this dashboard loses BOTH the
-  auth header and the outcome text. Worth a lint: `fetch(API +` outside `apiCall` for
-  a mutating method is the pattern to ban.
-
----
-## Seven schedule fields the editor wrote and the server read NOWHERE
-AREA: scheduler
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux (sched2 lane)
-CARD: AMUX-2680
-SYMPTOM: `watch`, `watch_timeout`, `done_pattern`, `done_action`, `trigger_on`,
-  `trigger_cooldown`, `trigger_sessions` were accepted by POST/PATCH, stored, and
-  returned — and grepped to zero readers across `crates/`. The editor's entire
-  "Trigger" mode and the Loop mode's "Stop when output matches" box saved cleanly and
-  did nothing. The row round-trips unchanged, so a 200 is indistinguishable from a
-  working feature.
-COST: nothing measurable yet, and that is the point — 0 of 113 live schedules set any
-  of them, so the defect was invisible precisely because nobody had reached for it.
-  The next person to try would have written a stop pattern, watched a loop run
-  forever, and debugged their regex.
-FIX: refuse the five ARMING fields at the write path with a 400 that names them and
-  points at `POST /api/sessions/<n>/report`; declare all seven on read via
-  `x-amux-unhonoured-fields`; delete the controls. Not ported, because the watcher was
-  a regex over `tmux capture-pane` guessing whether a model had finished.
-
----
 ## The schedule audit trail is routed, implemented, and reachable from no control
 AREA: instruments
 SEVERITY: annoys
@@ -2400,28 +2171,6 @@ FIX: Partly fixed: the new autofix `disk` detector puts `tmutil listlocalsnapsho
   for long enough to accumulate a full day of local snapshots, which is the actual upstream
   condition and is invisible until it interacts with a disk-full event.
 
-## Nothing could update an amux git hook outside the amux checkout
-AREA: cli
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2769
-SYMPTOM: `amux-staged-guard` is installed in nine checkouts on this machine, but
-  `scripts/install-hooks.sh` resolved its source as `$(git rev-parse --show-toplevel)/scripts/
-  git-hooks/`, which exists only inside amux. After the Python generator that used to write
-  the hook per work_dir was deleted, the other eight checkouts were frozen on whatever the
-  generator last wrote — all eight still addressing the retired port, with no supported way
-  to update them. `grep -L 'GUARD_VERSION'` showed 8 of 9 stale and the installer could
-  reach exactly one.
-COST: Eight checkouts silently running a months-old guard, discovered only because they
-  turned up in a port-drain inventory. Nobody would have found them from the amux repo.
-FIX: `install-hooks.sh <repo>` and `install-hooks.sh --all` (bounded scan that PRINTS its
-  bounds). Foreign mode installs the guard only and NEVER writes another repo's pre-commit —
-  those carry that repo's own checks — reporting the exact shim lines instead when the chain
-  is broken. GUARD_VERSION now bumps on any change to the file, since that number is what
-  the staleness inventory greps; leaving it fixed made stale copies read as current.
-
 ## `cargo test` cannot pass under the target-dir convention the repo itself mandates
 AREA: instruments
 SEVERITY: slows
@@ -2449,43 +2198,6 @@ FIX: Not applied — migrate.rs has another lane's uncommitted work in it and th
   log, `$?` is the exit code of the LAST command in the pipeline, not the one you care
   about.** Capture it immediately after the command, or the "did it pass?" check reports on
   `tail`.
-
-## SUPERSEDES "Two alerts tests pass alone and fail together": the lock was never the problem — the machine's server.env is
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux (subagent, AMUX-2675)
-CARD: AMUX-2675
-SYMPTOM: Supersedes the 2026-08-10 entry above that diagnosed this as `test_env::set_home`
-  racing "whichever sibling is mid-assertion" and proposed a shared `static ENV_LOCK`. That
-  lock ALREADY EXISTS (`test_env::LOCK`) and every failing test already took it, so the
-  proposed fix was a no-op against the real cause and would have read as "fixed" while the
-  flake continued. The dead hypothesis is worth as much as the live one here.
-  The real path: `ServerConfig::load` exports `~/.amux/server.env` into the PROCESS env, and
-  `effective_env` (settings.rs:76) falls back to the process env whenever a key is absent from
-  the TEMP home's file. So the machine's own values are visible inside a temp home no matter
-  what the lock does. `LEAKY_KEYS` cleared exactly ONE key, `AMUX_OWNER_PHONE`, while the same
-  file also sets `AMUX_URGENT_PUSH` and `AMUX_URGENT_SMS` — read through the identical
-  fallback at alerts.rs:254 to decide whether the push channel is attempted at all.
-  That is why the observed failures were all "push missing": `owner_alert_60s_dedupe_and_ledger_visibility`
-  (0 pushes, expected 1), `owner_alert_reports_channel_failures_per_contract` (channels.push
-  Null, expected the vapid error), `config_defaults_patch_and_provider_detection`.
-COST: 24 measured runs at HEAD in a detached worktree to establish the rate: 4 failures in 24
-  (16.7%). It is the named blocker behind ~20 cards stuck at `done` instead of `verified`,
-  because CI cannot go green. Two prior sessions also mis-identified WHICH test flakes —
-  AMUX-2675 names `owner_alert_full_send_shape_channels_and_ledger` as "the actual one"; it
-  did not fail once in 24 runs, while three tests it does not name did. Chasing the named
-  test would have found nothing.
-FIX: Derive the cleared set from the LEAK SOURCE rather than a hand list — `set_home` now
-  clears every key present in the real `~/.amux/server.env` (names only; values never read),
-  over a 3-key floor, cached in a OnceLock. 39 keys covered instead of 1, and the 40th key
-  someone adds is covered without anyone remembering. A hand list and the thing it models are
-  maintained by different people in different files, which is why it recurred twice.
-  Test `a_temp_home_clears_every_key_the_machine_could_leak` asserts the coverage relation and
-  fails against the pre-fix constant (verified by rebuilding the pre-fix specimen).
-  NOTE this is invisible on CI, which has no server.env — nothing leaks there and the tests are
-  green, so CI cannot ever catch a regression of this class. That is the residual risk.
 
 ## Another lane's `git add` swept my uncommitted AC-322 fix into their commit, under their message
 AREA: cli
@@ -2706,139 +2418,6 @@ FIX: The generalisable half is the CORROBORATION, not the bad grep. I confirmed 
   the mechanism could fire — for hooks specifically, resolve core.hooksPath first,
   because the file at the obvious path may not be the one that runs.
 
-## A hook-config change reaches no already-running lane, and nothing says so
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2829
-SYMPTOM: ~/.claude/settings.json was repointed at a reporting hook that extracts
-  the model and context size. Verified working end to end (86-byte rich body).
-  Across 292 report POSTs, every body from a real lane was 37/39/41 bytes — the
-  byte-exact shape of the PREDECESSOR script. 42 lanes reporting, 2 with a model,
-  1 with tokens. Claude Code loads hook config at SESSION START, so ~47 lanes
-  running since before the edit still hold the old command string in memory.
-COST: A correct fix that reached nobody for a day, and auto-compact — whose only
-  input was the same absent field — had never fired once for any lane, which is
-  the behaviour Ethan asked for in as many words. I then spent a further pass on
-  a WRONG fix (converging the two scripts on disk, reasoning that a script is
-  re-read per invocation where a config is not); five lanes reported after it
-  landed, none with a model.
-FIX: 10b31f3 + a5b272e — the server reads model/tokens from each lane's own
-  transcript, which a running lane cannot withhold. Report still preferred. The
-  generalisable rule: NO EDIT ON DISK REACHES A COMMAND STRING ALREADY BAKED
-  INTO A RUNNING PROCESS. When a hook change matters, verify at the RECEIVER
-  (req_bytes on the request log discriminated this in one query) rather than by
-  reading settings.json, which looked correct throughout.
-
-## Two report scripts existed; the fleet used the one that reported less
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2829
-SYMPTOM: ~/.amux/hook-report.sh (extracts model + tokens) and
-  ~/.amux/hooks/amux-report.sh (posts {state, source} only) both existed, doing
-  the same job at different fidelity. Nothing named which was canonical.
-COST: Made the diagnosis above much harder — a bare report body was consistent
-  with three different causes (wrong script, right script failing, payload
-  missing fields) and no artifact distinguished them.
-FIX: The older path is now a delegate that execs the real one, with a comment
-  saying why it still exists and not to re-fork it. Note this did NOT fix the
-  reporting itself (see the entry above — already-running lanes never call
-  either path), but it does mean a lane started from now on cannot get the
-  degraded version.
-
-## Peek "Loading latest..." visible for 300ms+ on cellular despite cached content being ready
-AREA: instruments
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2847
-SYMPTOM: Opening a peek on mobile showed "Loading latest..." spinner for 150ms+
-  even when IDB had cached peek content from a prior open. Two causes:
-  (1) the IDB fallback timer was 150ms, designed for WiFi where live fetch is 18ms
-  but too long on cellular where the fetch is 300-600ms.
-  (2) _paintCachedPeek re-ran the full ansiToHtml pipeline on ~143KB of cached raw
-  ANSI text every open, taking 50-200ms on a phone, when the rendered HTML was
-  already available from the prior render.
-COST: Every peek open on cellular felt sluggish. The first content frame was
-  delayed by both the timer and the re-render, totaling 200-400ms of unnecessary
-  spinner on mobile.
-FIX: Two changes: (a) cache pre-rendered HTML (liveHTML, histHTML) alongside raw
-  in IDB, so _paintCachedPeek skips ansiToHtml when cached HTML exists; (b) reduce
-  the IDB fallback timer from 150ms to 30ms (WiFi live fetch still wins at ~18ms,
-  but cellular gets cached content 120ms sooner).
-
-## A feature shipped, delivered to 22 lanes, then got the constraint its own parent card called non-negotiable
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2866
-SYMPTOM: The verify-nudge (fe44d61) selected every `done` card regardless of
-  type. AMUX-2825, its parent, names calling verified_is_meaningful() as
-  constraint 1 and says a sweep ignoring it "re-creates the make-work this was
-  narrowed to avoid". board_drive.rs called it zero times.
-COST: 22 lanes nudged, 120 cards named, 44 of them (36%) doc/chore/investigation/
-  research/escalation/watch — types that ship nothing and so can never reach
-  `verified`. 13 lanes were told to verify something they cannot; roadtrip's
-  entire 5-card nudge was chore/doc. The fix landed 12 minutes after the send.
-FIX: 1eb0ca2 — type filter DERIVED from verified_is_meaningful (amux-core gains
-  ItemType::ALL + as_str) on both the selector and the count. The reusable part
-  is not "read the parent card": it is that a feature which SENDS PROMPTS TO
-  LANES shipped with no test at all, so nothing could have caught the missing
-  filter either. Tests added in 3c853bf, and the type test splits every variant
-  by the predicate itself so it cannot drift from it.
-
-## "The evidence is a day away" — said without running the one query that disproved it
-AREA: instruments
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2866
-SYMPTOM: I declined to claim `verified` on the grounds that the loop runs on a
-  24h cooldown so no nudge could have been delivered yet. 22 had already fired,
-  hours earlier. `SELECT ... FROM session_events WHERE type='verify.nudge'` took
-  one query and I ran it only after asserting the opposite.
-COST: A wrong statement about my own work in a user-facing summary, and a
-  12-minute-late fix that I described as pre-emptive when it was actually
-  post-delivery. The correction is on the card.
-FIX: The habit that fails here is specific and worth naming: a claim of the form
-  "X cannot have happened yet" is a claim ABOUT DATA, not a piece of caution,
-  and it needs the same query a claim that X did happen would need. Declining to
-  assert something is not the same as being conservative — I asserted a negative
-  and did not check it.
-
-## A list endpoint's truncation was reported only in HTTP headers, so every JSON consumer inherited a confident undercount
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux (reported by ts-gke)
-CARD: AMUX-2870
-SYMPTOM: GET /api/board?session=ts-gke returned 68 done cards; the truth was 94.
-  GET /api/board/<id> returned the missing ones fine. cap_terminal keeps the 100
-  most-recent done|verified|discarded|quarantined rows, and ts-gke had 174 of
-  them, so which cards survived depended on how many OTHER terminal cards sorted
-  above them by `updated`. ?limit=5000 changed nothing — it pages the
-  already-capped set.
-COST: A verification digest built on that list reported 25 where the truth was
-  94. ts-gke published claims derived from it and had to retract them. Two cards
-  compared field-by-field looked identical because the discriminator was in
-  neither card.
-FIX: 4340f5a — a scoped query (?session= or ?status=) is no longer capped by
-  default. The reusable part is NOT "add a cap flag": the cap WAS reported, in
-  x-amux-truncated / x-amux-terminal-total response headers, and that changed
-  nothing because every consumer reads `curl | json.load` and never sees a
-  header. Ethos rule 4's second layer, in an endpoint the whole fleet depends on.
-  Before deciding a signal exists, check it exists WHERE THE CONSUMER LOOKS.
-
 ## A peer's commit swept my STAGED work into their commit, under their message
 AREA: attribution
 SEVERITY: slows
@@ -2872,17 +2451,6 @@ FIX: none yet. CLAUDE.md documents the mirror of this ("a peer's commit can
   I have used the path-scoped form elsewhere today; I did not here, and that is
   the difference.
 
-## Everything a renamed lane produced was attributed to its dead name
-AREA: attribution
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux (Ethan-direct lane)
-CARD: AMUX-2904
-SYMPTOM: Token ledger charged the `amux` lane's spend to `amux-rust`; /subagents listed its agents under `amux-rust`; the day-old subagent-activity scan could not credit `amux` with live agents at all. Four separate spellings of "whose conversation is this", three reading the transcript's FIRST line, which keeps the birth name forever (AMUX-2612 documented this and the fix only reached one of the four readers).
-COST: Ethan saw a worker identifying as a session that does not exist; ledger rows misattributed for a month; the fresh agents-status fix (554fa02) silently missed every renamed lane on the day it shipped.
-FIX: dc65d4a — one conversation_owner() (meta claim first, LAST title record second) used by ledger, /subagents and the activity scan. Residual: ledger rows indexed before today still carry the dead name; the pane separator shows the birth name until the lane restarts (the --name-on-resume writer already exists).
-
 ## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
 AREA: cli
 SEVERITY: blocks
@@ -2912,28 +2480,6 @@ FIX: SHIPPED 2026-08-14 (commit 66c8243, AMUX-3046). `amux url` is the durable r
   (owner call, rule 8): the ~46 lanes still holding the dead env clear only by adopting `$(amux
   url)` going forward or being recycled — restarting a lane picks up the correct base.
 
-## I shipped three wrong card references in one session, two onto other sessions' cards
-AREA: attribution
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-2950
-SYMPTOM: Wrote card ids into code comments and frustrations entries BEFORE creating the
-  cards, guessing the next number from the last id I had seen. AMUX-2946 did not exist when
-  I cited it in three files. AMUX-2942 was a peer's card about /api/crm p95. AMUX-2949 was
-  tubescience's card about a failing queue invariant. All three shipped.
-COST: Small each time, but two of the three landed on REAL cards owned by other sessions,
-  which is worse than a dangling id: a reader follows the pointer and finds a plausible,
-  unrelated card instead of an obvious error. That is the same shape as a notice naming the
-  wrong card, which this file already carries entries about — I was creating the defect I
-  had spent the evening reporting in other people's systems.
-FIX: Procedural, and written down rather than resolved-to-be-careful: `amux board add`
-  RETURNS the id. Create the card first, then use what it returns. Guessing the next number
-  cannot be made reliable on a board where ~50 sessions file concurrently — between my
-  reading an id and writing my own, several land. All three references corrected (23097b2
-  and earlier).
-
 ## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
 AREA: instruments
 SEVERITY: blocks
@@ -2956,19 +2502,6 @@ SYMPTOM: Ethan intentionally dropped the 8822 compat bind 2026-08-11 (lib.rs:527
 COST: I burned several tool calls diagnosing why my own `curl $AMUX_URL` returned 000 and initially misread a deliberate owner decision as a fleet-down regression. Any of the 52 lanes following the CLAUDE.md/memory curl recipes silently fails the same way, and nothing surfaces that 52 lanes are running degraded — so no one recycles them. The `amux` CLI masks it (it uses AMUX_API=8824), which is why this went unnoticed.
 FIX: (proposed, AMUX-2988) legacy-port accounting must not measure strandedness by inbound hits after the bind is gone — derive it by scanning running session process envs for a RETIRED_PORTS match (the /api/debug/tmux pattern: discovery from inside the server process), surface the count on /api/debug/legacy-port and an hourly WARN. Recycling the 52 is the owner's call (ethos rule 8, could interrupt in-flight customer work) — the fix only makes the count visible, it does not restart anything.
 
-## Local clippy green is a false proxy for CI green — stale floating toolchain red main for hours
-AREA: ci
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-12
-SESSION: amux
-CARD: AMUX-3013
-SYMPTOM: Ran `cargo clippy -p amux-server --all-targets -- -D warnings` locally, GREEN, and pushed the accountability endpoint. CI went RED on a clippy lint in the same file (unnecessary_sort_by, messages.rs:585) that local clippy never flagged. Root: no rust-toolchain.toml — CI floats on dtolnay/rust-toolchain@stable (newest), local stable is clippy 0.1.94 (2026-03-25), months behind with a smaller lint set. So local -D warnings green does NOT predict CI.
-COST: main CI red for HOURS; deploy-cloud.yml gates on green CI so it skipped every run, no new cloud image, /api/env/apply never reached cloud, and the live RothCo env round-trip (the point of the env-config work) could not run. amux-cloud caught it, root-caused it, and fixed the lint inline (67b44f7). I also never watched CI go green after pushing, so the red sat.
-FIX: pin the toolchain (rust-toolchain.toml + rust.yml installs it) so CI is deterministic and local == CI. Interim: rustup update stable before the pre-push clippy. Until then, "local clippy passed" must not be trusted as "CI will pass".
-
----
-
 ## Cloud silently froze behind a red main CI — "skipped" reads as "up to date," not "frozen"
 AREA: cloud
 SEVERITY: slows
@@ -2979,45 +2512,6 @@ CARD: AC-344
 SYMPTOM: Ethan reported "cloud is still behind in versions." A fresh cloud org still booted build 0f2f6e48 (pre-env_config: GET /api/env/schema -> 404, /api/env/apply absent from 213 routes), so the converged seed.py --via-apply 405'd against cloud. Root cause was three layers down: deploy-cloud.yml auto-deploy is gated on GREEN rust.yml (workflow_run), and main CI had been RED for hours on ONE clippy lint (unnecessary_sort_by, messages.rs:585). Every deploy-cloud run showed "skipped" — indistinguishable from "nothing to deploy." Nothing anywhere said "the cloud image is frozen and falling behind main because CI is red."
 COST: Ethan had to notice the version lag by hand. Diagnosing it took several manual steps (fresh provision -> /health build hash -> /api/debug/routes -> gh run list conclusion -> git log timing) to join signals that no single instrument joins. And it is fleet-recurring: ANY lane's red-main break freezes the entire cloud deploy for every customer, invisibly, until a human notices — the busier the fleet, the more often it happens. PREDICTION PROVEN 2026-08-14 (author-verified during a frustrations validation): the "until a human notices" line came true VERBATIM, three times in ONE session, all AFTER this entry was written — 67b44f7 (clippy unnecessary_sort_by), 64fd450 (steering restart_persistence test), 9442f77 (opencode ETXTBSY flake + /api/tts unclaimed in the boundary registry). Each red-mained main, each made deploy-cloud SKIP silently, each froze :latest, and each was caught BY HAND via the freshness tick — never by any instrument. A prediction that recurred 3x on the record is the strongest possible argument for finally building the signal.
 FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main and fires when they diverge (commits or hours), OR make deploy-cloud's skip loud (record "skipped because CI red since <sha>/<time>"). Interim: clippy blocker fixed (67b44f7); steering-test blocker handed to amux; cloud auto-catches-up once CI green. Related: AMUX-3013 (pinned toolchain so local clippy == CI clippy — why the red wasn't caught pre-push).
-
----
-
-## Worker status went inaccurate/delayed fleet-wide and NOTHING surfaced it — 0/48 lanes reporting, a human noticed
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux
-CARD: AMUX-3022
-SYMPTOM: Ethan: "it still appears the status of workers is inaccurate or delayed." Measured: 0 of 48 running lanes had a fresh self_report (youngest 2h, most 40h+). Root: publish_endpoint passes legacy=None, so endpoint.json.legacy_port went null when the 8822 bind was dropped. The Stop/PostToolUse/UserPromptSubmit report hooks baked into ~48 pre-cutover sessions self-heal a stale AMUX_URL by matching that field (`case "$U" in *localhost:$L)`); with L empty they matched nothing and POSTed every state report to the dead 8822 — `>/dev/null 2>&1; exit 0`, silent. Status fell back fleet-wide to terminal scraping (D1). The git staged-guard resolver was migrated to retired_ports when the bind dropped; the report hooks were not, and cannot be (baked into live procs).
-COST: worker status was wrong for the whole fleet for ~40h and no endpoint could say so — GET /api/logs/analyze, /api/debug/*, /health confidence all read fine while the report control plane was down for everyone. Ethan noticed the symptom by eye. This is the exact failure the two-fixes rule forbids: a silent, invisible, fleet-wide outage of the one signal that is supposed to REPLACE terminal scraping.
-FIX: fixed. 38bd18d — publish_endpoint fills legacy_port from RETIRED_PORTS.first() so baked-in hooks self-heal (verified: a stale-8822 hook now resolves to 8824; organic reports landing from amux + refresh-house). And the second fix that makes the CLASS visible: new invariant session.self_reports_landing (checks.rs) fails when the freshest self-report across >=10 running lanes is >1h, or when zero lanes report — so the next reporting outage self-announces in GET /api/health/invariants. Namespace bug in the check itself (looked up amux-<n> in a blob keyed <n>) caught on deploy by reading live output, fixed ae70edf.
-
----
-
-## Worker header showed IDLE while a subagent was visibly "still thinking with xhigh effort"
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux
-CARD: AMUX-3030
-SYMPTOM: Ethan screenshot: primis header read IDLE while its pane showed "✻ Crunching… (34s · still thinking with xhigh effort)", "esc to interrupt", "← 2 agents". The self_report was a fresh main-turn stop-hook idle. subagents_working() gated on the 60s contradiction_window, which is the MAIN pane's paint cadence (~6/s). A subagent's transcript is touched only when it emits a message/tool result, so a THINKING subagent (xhigh effort, minutes between writes) has a >60s-old newest mtime while fully working -> subagents_working=false -> the fresh main-turn idle wins -> IDLE.
-COST: a worker that is actively crunching reads IDLE on the header — the exact false-idle that makes an owner think a lane is free when it is mid-work, and the class D1 exists to kill. Ethan had to notice it by eye from the pane.
-FIX: fixed e832f12. Subagents get their own window AMUX_SUBAGENT_WORKING_S (default 240s) sized to the subagent write cadence, not the pane's. Regression test pins a 90s-old subagent write (stale under 60s, working under 240s). Residual limitation: a subagent that thinks for >240s with zero writes is indistinguishable from a finished one on transcript mtime alone — the honest edge of an mtime-based signal; the pane-visible half is caught by status.agrees_with_pane.
-
----
-
-## Auto-pickup handed a lane an EPIC to "do" — a container is not a work unit
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux
-CARD: AMUX-3005
-SYMPTOM: The board_drive auto-pickup claimed AMUX-3005, an `epic`-typed container ("[EPIC] Board command center"), and told the lane to "work it now" — but an epic has no work of its own; its CHILDREN (the 3 views + spine) carry it. The dispatchability predicate, the drain queries, and the WIP-holding counts all excluded tripwire/watch (the other non-work-unit types) but not epic, so an epic sat in the pickup queue as if actionable.
-COST: a full scope-and-decide cycle spent on a card that cannot be "done" as a unit; and any epic in todo/backlog would keep being re-claimed until worked, which it never can be.
-FIX: fixed (see commit) — `epic` added to all five `NOT IN ('tripwire','watch')` exclusions (pickup, drain candidates, drain count, two WIP counts), with a test pinning that an epic is neither dispatchable nor drainable. Class-kill: any container type is now excluded everywhere the work-unit types are.
 
 ---
 
@@ -3033,30 +2527,6 @@ COST: a deep cross-file investigation to establish that a documented, "proven" v
 FIX: open — decision is Ethan's (ethos rule 8: recycling 48 lanes can interrupt in-flight work). Durable root fix surfaced by gtm-engine, who already ships `gtm/engine/amux_endpoint.py::amux_base()`: read the server-written `~/.amux/endpoint.json` (`canonical_url` + `retired_ports`), refuse a retired port even when `$AMUX_URL` names it, liveness-probe before returning. Every script in that lane imports it, which is why its raw curls kept working today. The fleet fix is a shared resolver (a `amux url` subcommand backed by endpoint.json, taught in CLAUDE.md in place of `curl $AMUX_URL/...`) — NOT 48 hardcoded `:8824` literals, which re-teach the exact bug. Interim workaround: use `amux ...` subcommands or `https://localhost:8824` explicitly. Also owed regardless: reconcile CLAUDE.md L9-13/L236 and legacy_port.rs L5-46 to the dropped-bind reality.
 
 ---
-
-## Worker header showed WORKING for up to 4 minutes AFTER the turn was done
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux
-CARD: AMUX-3047
-SYMPTOM: Ethan screenshot: gtm-engine header badge read WORKING over a "✻ Crunched for 1m 7s" idle prompt with "← 2 agents". The API already said `status:idle`, `agents_working:false`, `self_report:{source:stop-hook,state:idle,age_s:315}` — but at screenshot time the stop-hook idle report was ~30s old and a background subagent had written inside the 240s `AMUX_SUBAGENT_WORKING_S` window. `derive_status` has three idle->active/waiting contradiction rules; rules 1&2 (pane-working, pane-waiting) gate on `idle_report_age > contradiction_window(60s)` so a fresh stop-hook idle report wins, but rule 3 (subagents_working, AMUX-2904) had NO such gate despite its comment claiming "same one-way rule as the pane contradiction above". So a stopped main turn was overridden by the subagent-mtime window and the badge (`s.status==='active'`, app.js:2562/2964) read WORKING for up to 240s after the turn ended.
-COST: the exact false-WORKING D1 exists to kill, and the direct MIRROR of AMUX-3030 (whose fix INTRODUCED the 240s window this exploits, and whose "residual limitation" note foreshadowed it). An owner sees a lane as busy when it is free — the inverse of AMUX-3030's false-IDLE, from the same mechanism, same day, same AREA. Ethan had to catch it by eye from the pane.
-FIX: fixed 58bd4f3. Rule 3 now carries the same `idle_report_age > contradiction_window` gate as rules 1&2 — a fresh idle report (main turn stopped -> foreground subagents necessarily finished) outranks the mtime window; AMUX-2904 preserved (active main turn = no fresh idle report = flip still fires); bounded late correction after the window unchanged. Two-fixes: new invariant `status.contradicts_fresh_idle_report` surfaces the class (active over a fresh idle self-report + quiet pane) in `/api/health/invariants`, so the next occurrence self-announces instead of a human noticing a stale badge. Cluster note: instruments now has AMUX-2646/2904/2959/2952/3022/3030/3047 — the mtime-vs-report seam keeps producing wrong badges in BOTH directions; the durable exit is event-driven subagent lifecycle (a SubagentStop hook) so amux stops inferring subagent completion from transcript silence.
-
----
-
-## A Run-now click that failed left NO server-side trace — undiagnosable from the request log
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux
-CARD: AMUX-3049
-SYMPTOM: Ethan: "click run now on a schedule -> says the server did not accept it." Diagnosis stalled because `_amux_request_log` showed EVERY real run-now as 200 and the only 404 was my own test — his click was simply ABSENT from the log. It never reached the server (the POST threw during a builder binary-swap restart), and the window.fetch offline interceptor caught the throw, queued the op, and returned a synthetic 202 SILENTLY — no `amuxTrack` beacon on that path. So a user-visible client failure produced zero server-side evidence. Compounding it, the synthetic 202 body `{ok,queued,offline}` has no `status`, so `_schedRunToast` rendered a queued run as "Ran · unknown outcome", and `runScheduleNow` keyed on the stale `online` flag (still true on the first failure) to print "the server did not accept it" — a rejection message over an op that was actually queued for replay.
-COST: a long forensic pass (widen the log window, enumerate every run-now status, trace three client code paths, unit-test the toast) to establish that the ENDPOINT was fine all along and the failure was purely client-side + invisible. The invisibility is the real defect: ethos rule 4 — a diagnosis being impossible from the data IS the bug — and the two-fixes rule, since the next such report would have been just as trace-less.
-FIX: fixed dc34708. The interceptor's throw path now emits `amuxTrack('fetch_unreachable',{url,method,err})` so the failing call is server-visible (lossy only during a FULL outage, which is separately visible as a moved `/health` build hash). Plus the two UX bugs: `_schedRunToast` handles the offline 202 -> "queued, will fire on reconnect" (unit-tested against the shipped fn), and `runScheduleNow` drops the stale-`online` "did not accept it" (apiCall already toasts a real refusal's reason). Note the irony: the trigger was a routine build-swap restart — every session's commit deploys by swapping the running binary, so ANY user action during that ~5s window hits this class; the beacon + honest messaging make it legible instead of alarming.
 
 ## A CI job named "chromium + webkit" had never run a webkit scenario — its browser filter matched no project and a `|| run-everything` fallback kept it green
 AREA: instruments
