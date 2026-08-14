@@ -86,9 +86,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }))
-}
+use super::internal;
 
 fn route_not_found() -> Response {
     err(StatusCode::NOT_FOUND, json!({ "error": "dictation route not found" }))
@@ -697,12 +695,7 @@ fn dictation_model() -> String {
     std::env::var("AMUX_DICTATION_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".into())
 }
 
-/// `~/.amux` (AMUX_HOME override), same resolution as sessions_legacy.rs.
-fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+use crate::config::amux_home;
 
 /// Env half of the key lookup, override-able in tests (process env reads
 /// are not hermetic under parallel tests).
@@ -1599,14 +1592,78 @@ pub async fn config(State(state): State<AppState>, req: Request) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::api::py_proxy::tests::{fake_python, PY_LOCK};
     use crate::db::Store;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::Arc as StdArc;
     use tower::ServiceExt;
 
+    /// Serializes tests that set the engine-knob overrides below.
+    ///
+    /// Lived in `py_proxy::tests` as `PY_LOCK` until AMUX-2906 deleted that
+    /// module's forwarder. It never had anything to do with the python proxy —
+    /// dictation was borrowing a lock from an unrelated module, so a reader of
+    /// either file had to visit the other to see why.
+    pub(crate) static ENGINE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// One captured request, as the fake upstream saw it.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Seen {
+        pub method: String,
+        pub path_and_query: String,
+        #[allow(dead_code)] // asserted by some engine tests, not all
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    /// Spin a plain-HTTP fake upstream answering `status`/`body` to every
+    /// request and recording what arrived. Returns (base_url, log).
+    ///
+    /// Formerly `py_proxy::tests::fake_python` — a misleading name, since the
+    /// only thing it has ever faked here is the **Gemini API** that the
+    /// dictation fallback calls (pointed at via `GEMINI_BASE_OVERRIDE`).
+    pub(crate) async fn fake_upstream(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, StdArc<Mutex<Vec<Seen>>>) {
+        let log: StdArc<Mutex<Vec<Seen>>> = StdArc::new(Mutex::new(Vec::new()));
+        let log_c = log.clone();
+        let app = Router::new().fallback(move |req: axum::extract::Request| {
+            let log = log_c.clone();
+            async move {
+                let method = req.method().to_string();
+                let path_and_query = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                let headers = req
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                log.lock().expect("seen log").push(Seen {
+                    method,
+                    path_and_query,
+                    headers,
+                    body: bytes.to_vec(),
+                });
+                (status, [("content-type", "application/json")], body)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), log)
+    }
+
     /// Engine-knob overrides: process env / filesystem probes are not
-    /// hermetic under parallel tests. Tests that set these hold PY_LOCK.
+    /// hermetic under parallel tests. Tests that set these hold ENGINE_LOCK.
     pub(crate) static GEMINI_KEY_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static GEMINI_BASE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static WHISPER_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
@@ -1767,9 +1824,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn ai_edit_calls_gemini_natively_and_round_trips_undo() {
-        let _guard = PY_LOCK.lock().await;
+        let _guard = ENGINE_LOCK.lock().await;
         // A Gemini-shaped answer; gemini_generate must join + trim parts.
-        let (base, log) = fake_python(
+        let (base, log) = fake_upstream(
             StatusCode::OK,
             r#"{"candidates": [{"content": {"parts": [{"text": " Edited."}]}}]}"#,
         )
@@ -1834,7 +1891,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn ai_edit_without_any_key_is_pythons_503() {
-        let _guard = PY_LOCK.lock().await;
+        let _guard = ENGINE_LOCK.lock().await;
         set_overrides(Some(false), Some(""), None); // no BYO row, no env key
         let (app, dir) = app();
         seed_python_rows(&dir.path().join("dictation-api-test.db"));
@@ -1925,7 +1982,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn config_native_byte_compatible_and_key_write_only() {
-        let _guard = PY_LOCK.lock().await;
+        let _guard = ENGINE_LOCK.lock().await;
         set_overrides(Some(false), Some(""), None);
         let (app, _dir) = app();
 
@@ -1982,7 +2039,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dictate_validates_natively_and_503s_honestly_without_engines() {
-        let _guard = PY_LOCK.lock().await;
+        let _guard = ENGINE_LOCK.lock().await;
         set_overrides(Some(false), Some(""), None); // no whisper, no key
         let (app, _dir) = app();
 
@@ -2034,8 +2091,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dictate_gemini_fallback_both_upload_shapes() {
-        let _guard = PY_LOCK.lock().await;
-        let (base, log) = fake_python(
+        let _guard = ENGINE_LOCK.lock().await;
+        let (base, log) = fake_upstream(
             StatusCode::OK,
             r#"{"candidates": [{"content": {"parts": [{"text": " testing one two three "}]}}]}"#,
         )
@@ -2100,8 +2157,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dictate_gemini_error_is_a_502_with_pythons_message() {
-        let _guard = PY_LOCK.lock().await;
-        let (base, _log) = fake_python(
+        let _guard = ENGINE_LOCK.lock().await;
+        let (base, _log) = fake_upstream(
             StatusCode::TOO_MANY_REQUESTS,
             r#"{"error": {"message": "quota exceeded"}}"#,
         )

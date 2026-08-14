@@ -349,6 +349,19 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
 });
 
 test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
+  // The only test in this file that calls settle() TWICE — it asserts the key
+  // survives a reload, so it pays the SPA's full boot cost (goto + bootstrap +
+  // walkthrough dismissal) twice where every sibling pays it once. On the 30s
+  // file-wide default that fits locally (measured: whole file, both projects,
+  // 1.7m) and does NOT fit on a CI runner, where 92 tests take 6.5m. It failed
+  // on five consecutive rust.yml runs — always this test, always as
+  // "Test timeout of 30000ms exceeded" surfacing at the longest await rather
+  // than as an assertion failure, which is the signature of a budget that is
+  // too small rather than a product defect.
+  //
+  // Sized to the work, not padded past a flake: same precedent as
+  // golden.spec.ts's heavy scenarios, which declare 120s.
+  test.setTimeout(60_000);
   await settle(page);
   const token = await appToken(page);
 
@@ -403,6 +416,65 @@ test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
     await request.get('/api/settings/env', { headers: authHeaders(token) })
   ).json()) as Record<string, string>;
   expect(after.ANTHROPIC_API_KEY).toBe(before.ANTHROPIC_API_KEY);
+});
+
+test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => {
+  // Regression for the settings_api_key_anthropic CI flake (6/8 runs red).
+  // loadApiKeys() runs async when the panel opens and used to do an
+  // unconditional `inp.value = ''` when its GET returned — so on a loaded
+  // runner where the fill BEAT the response, the response then wiped the
+  // typed key and Save hit its empty-value early return: no PATCH was ever
+  // sent, and the sibling test's waitForResponse hung to the 60s budget. The
+  // same race hits a fast human as "my key vanished while I typed".
+  //
+  // This test forces the losing interleaving deterministically: hold the GET
+  // for 800ms, type during the hold, let the delayed response land, and
+  // assert the field still holds the entry — a fast, legible failure
+  // (value '' vs the key) instead of a timeout, on exactly the incident's
+  // ordering.
+  await settle(page);
+  const token = await appToken(page);
+
+  let heldOnce = false;
+  await page.route('**/api/settings/env', async (route) => {
+    if (route.request().method() === 'GET' && !heldOnce) {
+      heldOnce = true;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    await route.continue();
+  });
+
+  const [delayedGet] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'GET',
+    ),
+    (async () => {
+      await openSettings(page);
+      // Type while the GET is still held — the incident's interleaving.
+      await page.locator('#settings-anthropic-key').fill('sk-ant-e2e-race-77zz');
+    })(),
+  ]);
+  expect(delayedGet.ok()).toBeTruthy();
+  // The delayed refresh has landed and run its handler; the entry must survive.
+  await expect(page.locator('#settings-anthropic-key')).toHaveValue('sk-ant-e2e-race-77zz');
+
+  // And Save must actually send it.
+  const [res] = await Promise.all([
+    page.waitForResponse(
+      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'PATCH',
+    ),
+    page.locator('#settings-apikeys-section button', { hasText: 'Save' }).click(),
+  ]);
+  expect(res.status()).toBe(200);
+
+  // Restore (same route as the sibling test; empty value falls back to
+  // process env).
+  await page.unroute('**/api/settings/env');
+  const restore = await request.patch('/api/settings/env', {
+    headers: authHeaders(token),
+    data: { ANTHROPIC_API_KEY: '' },
+  });
+  expect(restore.status()).toBe(200);
 });
 
 test('settings_commit_guard', async ({ page, request }) => {
@@ -749,27 +821,47 @@ test('settings_usage_meter', async ({ page, request }) => {
   expect(wireText).not.toMatch(/sk-ant|Bearer /);
 });
 
-test('settings_alerts_config', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'missing-endpoint',
-    description:
-      'controls: Urgent alerts "In-app push" (#alert-push-cb), "Text my phone" (#alert-sms-cb), ' +
-      'phone input (#alert-phone) → GET+PATCH /api/alert/config — no alert nest in the Rust router; ' +
-      'Python serves it (amux-server.py:65602) → NEEDS PORTING. Degraded UI today: loadAlertConfig ' +
-      'swallows the HTML-fallback parse error and the toggles silently never persist.',
-  });
-  test.fixme(true, 'GET/PATCH /api/alert/config not implemented in the Rust server (needs porting)');
+// UN-FIXME'd 2026-08-11 (AMUX-2621). Both fixmes asserted these endpoints were
+// "absent in Rust, Python serves it (amux-server.py:...)" — and amux-server.py
+// has been DELETED since 792ce1f. GET /api/debug/routes lists /api/alert/config
+// [GET, PATCH] and /api/alert/owner [GET, POST], both owner=native. A skip
+// justified by a file that no longer exists is a test that can never fail.
+
+test('settings_alerts_config', async ({ page, request }) => {
+  await settle(page);
+  const token = await appToken(page);
+  // The ORIGINAL symptom was not "404": it was loadAlertConfig swallowing an
+  // HTML-fallback parse error, so the toggles silently never persisted. The
+  // discriminating assertion is therefore the CONTENT TYPE and a parseable
+  // body — a GET-only static catch-all answers 200 with text/html, which is
+  // exactly what the old code choked on, so status alone cannot tell them apart.
+  const res = await request.get('/api/alert/config', { headers: authHeaders(token) });
+  expect(res.status()).toBe(200);
+  expect(res.headers()['content-type'] || '').toContain('application/json');
+  const body = await res.json();
+  for (const k of ['push', 'sms', 'phone']) {
+    expect(body).toHaveProperty(k);
+  }
 });
 
-test('settings_send_test_alert', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'missing-endpoint',
-    description:
-      'control: "Send test alert" button → POST /api/alert/owner — absent in Rust; Python serves ' +
-      'POST+GET (amux-server.py:65560/65574) → NEEDS PORTING. Today the POST hits the GET-only ' +
-      'static catch-all → 405, and the button surfaces a JSON parse error in #alert-test-status.',
-  });
-  test.fixme(true, 'POST /api/alert/owner not implemented in the Rust server (needs porting)');
+test('settings_send_test_alert', async ({ request }) => {
+  // DELIBERATELY DOES NOT POST. /api/alert/owner is the fire alarm — a POST
+  // sends a real push AND a real iMessage to Ethan's phone. A test suite that
+  // pages a human on every run is worse than no test, and CI runs this.
+  //
+  // So this asserts the property the fixme actually got wrong: that the route
+  // is registered for POST. The old failure was the POST falling through to the
+  // GET-only SPA catch-all and 405ing, which is precisely a routing-table fact
+  // and needs no delivery to observe. The send PATH is covered by six unit
+  // tests in api::alerts (full shape, dedupe, provenance, junk refusal, channel
+  // config, per-channel failures) against a fake sink.
+  const res = await request.get('/api/debug/routes');
+  expect(res.status()).toBe(200);
+  const routes = await res.json();
+  const list = Array.isArray(routes) ? routes : routes.routes || [];
+  const owner = list.find((r: any) => r.path === '/api/alert/owner');
+  expect(owner, '/api/alert/owner must be routed').toBeTruthy();
+  expect(owner.methods).toContain('POST');
 });
 
 // Team section — /api/org group IS ported (crates/amux-server/src/api/org.rs:
@@ -855,26 +947,33 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   expect(orgRestored.name).toBe('My Workspace');
 });
 
-test('settings_about_token_stats', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'missing-endpoint',
-    description:
-      'control: "About amux & token stats" → #daily-stats fed by GET /api/stats/daily — absent in ' +
-      'Rust; Python serves it (amux-server.py:67813) → NEEDS PORTING. Degraded UI today: the modal ' +
-      'opens (covered green above) but token stats stick on "Loading...".',
-  });
-  test.fixme(true, 'GET /api/stats/daily not implemented in the Rust server (needs porting)');
+// UN-FIXME'd 2026-08-11 (AMUX-2621/AMUX-2587): routed native [GET].
+test('settings_about_token_stats', async ({ page, request }) => {
+  await settle(page);
+  const token = await appToken(page);
+  // The symptom was token stats stuck on "Loading..." — i.e. the fetch never
+  // returned usable JSON. Assert the content type, not just 200: the GET-only
+  // SPA catch-all also answers 200, with text/html, which is what left the
+  // modal spinning.
+  const res = await request.get('/api/stats/daily', { headers: authHeaders(token) });
+  expect(res.status()).toBe(200);
+  expect(res.headers()['content-type'] || '').toContain('application/json');
+  await res.json();
 });
 
-test('settings_about_branding_editor', async ({}, testInfo) => {
-  testInfo.annotations.push({
-    type: 'missing-endpoint',
-    description:
-      'controls: Branding editor in the About modal (#brand-name-input, #brand-tagline-input, ' +
-      '#brand-color-input, icon/logo uploads, "Save branding", "Reset") → GET/POST/DELETE ' +
-      '/api/branding — absent in Rust; Python serves it (amux-server.py:67562) → NEEDS PORTING.',
-  });
-  test.fixme(true, '/api/branding not implemented in the Rust server (needs porting)');
+// UN-FIXME'd 2026-08-11 (AMUX-2621/AMUX-2587): routed native [GET, POST, DELETE].
+test('settings_about_branding_editor', async ({ page, request }) => {
+  await settle(page);
+  const token = await appToken(page);
+  // READ-ONLY on purpose. POST/DELETE here rewrite the workspace's real
+  // branding (name, tagline, colour, uploaded logo), and this suite runs
+  // against the live server — a mutation that fails midway leaves Ethan's
+  // dashboard visibly wrong. The fixme's claim was "absent in Rust", and GET
+  // returning branding JSON refutes exactly that without touching his data.
+  const res = await request.get('/api/branding', { headers: authHeaders(token) });
+  expect(res.status()).toBe(200);
+  expect(res.headers()['content-type'] || '').toContain('application/json');
+  await res.json();
 });
 
 test('settings_notes_folder_row', async ({}, testInfo) => {
@@ -901,18 +1000,27 @@ test('settings_notes_folder_row', async ({}, testInfo) => {
 test('settings_missing_endpoint_probe', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
-  const MISSING: Array<{ path: string; fixme: string }> = [
-    // /api/usage left this list on 2026-08-09: it was already ported, this
-    // probe was firing as designed, and its fixme is now the real
-    // settings_usage_meter UI test above.
-    { path: '/api/alert/config', fixme: 'settings_alerts_config' },
-    { path: '/api/alert/owner', fixme: 'settings_send_test_alert' },
-    // /api/org was on this list until 2026-08-09, when org.rs landed in the
-    // working tree MID-RUN and this probe fired exactly as designed; its fixme
-    // was promoted to the real settings_team_section test above.
-    { path: '/api/stats/daily', fixme: 'settings_about_token_stats' },
-    { path: '/api/branding', fixme: 'settings_about_branding_editor' },
-  ];
+  // EMPTY, and that is the intended end state — every entry has graduated.
+  //
+  // /api/usage left on 2026-08-09, /api/org the same day, both because this
+  // probe fired exactly as designed and their fixmes became real tests.
+  //
+  // The last four left on 2026-08-11: /api/alert/config, /api/alert/owner,
+  // /api/stats/daily and /api/branding are all routed native (verified against
+  // GET /api/debug/routes: [GET,PATCH], [GET,POST], [GET], [GET,POST,DELETE])
+  // and all four return application/json. Their fixmes had ALREADY been
+  // promoted to real tests on 2026-08-11 under AMUX-2621 — see the un-fixme
+  // note above settings_alerts_config — but the paths were left here, so this
+  // probe had been firing against correctly-ported endpoints and rust.yml's e2e
+  // job was RED on main for it (runs of 2026-08-10 onward).
+  //
+  // BE HONEST ABOUT WHAT THIS COSTS: with an empty list the loop below asserts
+  // nothing, so this test cannot currently fail. It is kept, rather than
+  // deleted, because the MECHANISM is what has value — it has caught three
+  // ports mid-flight — and the next endpoint that is genuinely absent in Rust
+  // belongs here. A dormant tripwire with its purpose written down beats
+  // deleting the pattern and rediscovering the need for it.
+  const MISSING: Array<{ path: string; fixme: string }> = [];
   for (const m of MISSING) {
     const res = await request.get(m.path, { headers: authHeaders(token) });
     const ct = res.headers()['content-type'] || '';

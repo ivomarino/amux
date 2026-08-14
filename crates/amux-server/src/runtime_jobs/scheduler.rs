@@ -266,10 +266,13 @@ fn parse_time(s: &str) -> Option<(u32, u32)> {
             c[2].parse::<u32>().ok()?,
             c.get(3).map(|x| x.as_str().to_string()),
         )
-    } else if let Some(c) = RE_TIME_H.captures(&s) {
-        (c[1].parse::<u32>().ok()?, 0, Some(c[2].to_string()))
     } else {
-        return None;
+        // `?` on the capture, not `else { return None }` — same semantics
+        // (no match on either regex -> None), and it is the shape CI's newer
+        // clippy demands (question_mark). Local clippy does not flag the old
+        // form yet; CI failed 3ae607a on it.
+        let c = RE_TIME_H.captures(&s)?;
+        (c[1].parse::<u32>().ok()?, 0, Some(c[2].to_string()))
     };
     let h = match ampm.as_deref() {
         Some("pm") if h < 12 => h + 12,

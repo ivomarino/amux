@@ -31,6 +31,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+# THE `amux` CLI IS A BUILD INPUT, NOT ONLY A RUNTIME FILE. It is copied again
+# into the runtime stage below (that copy is what puts it on PATH), but the
+# build needs it FIRST: invariants/monitor.rs:215 does
+#   include_str!("../../../../amux")
+# to scan the shell CLI's calls, so cargo cannot compile amux-server without it.
+# Missing here, the image build dies with
+#   couldn't read crates/amux-server/src/invariants/../../../../amux
+# which reads like a path bug in the source rather than an absent build input —
+# it broke the cloud deploy on 2026-08-12 and the runtime COPY at the bottom
+# makes it look already handled.
+COPY amux ./amux
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from
@@ -165,6 +176,47 @@ ENV AMUX_RS_PORT=8822
 # "am I in an isolated single-tenant container" is, and only the deployment can
 # answer that. So the environment declares it here.
 ENV IS_SANDBOX=1
+
+# IS_SANDBOX gets the CLI *past* the root-refusal, but Claude Code v2.1.x then
+# renders a SEPARATE one-time acceptance screen for --dangerously-skip-permissions
+# on every launch ("Claude can make mistakes... only use with code you trust...
+# Press Enter to continue"), and it does NOT persist an acceptance — so a fresh
+# worker pane sits at that screen forever and the steered first-run prompt lands
+# nowhere. (Onboarding is NOT the gate — hasCompletedOnboarding is already true;
+# verified on a live container, AC-346.) `skipDangerousModePermissionPrompt` is
+# the global setting that suppresses it — same "this is an isolated single-tenant
+# container, so accept it up front" justification as IS_SANDBOX above, and like it
+# a deployment property, not a server branch. VERIFIED against the repro: with this
+# flag, `claude --dangerously-skip-permissions` boots straight to the input prompt,
+# no Press-Enter screen. Merge (don't clobber): claude writes `theme` here on first
+# run, and jq -s '.[0] * .[1]' preserves whatever else is present.
+#
+# The OTHER first-run gate — the per-DIRECTORY folder-trust dialog
+# (projects[<dir>].hasTrustDialogAccepted) — has no global flag, so it is seeded
+# at pane spawn by the server (it knows each worker's CC_DIR). This file only
+# handles the global half.
+# No process substitution here: Docker RUN is /bin/sh (dash), so merge via a
+# temp file, not `<(...)`. jq -s '.[0] * .[1]' deep-merges (the flag wins).
+RUN mkdir -p /root/.claude \
+    && printf '{"skipDangerousModePermissionPrompt": true}' > /tmp/skip.json \
+    && if [ -f /root/.claude/settings.json ]; then \
+         jq -s '.[0] * .[1]' /root/.claude/settings.json /tmp/skip.json > /root/.claude/settings.json.tmp \
+         && mv /root/.claude/settings.json.tmp /root/.claude/settings.json ; \
+       else \
+         cp /tmp/skip.json /root/.claude/settings.json ; \
+       fi \
+    && rm -f /tmp/skip.json \
+    && jq -e '.skipDangerousModePermissionPrompt == true' /root/.claude/settings.json > /dev/null \
+    && echo "claude skipDangerousModePermissionPrompt seeded (gate-1 suppressed)"
+
+# PER-TENANT: keep the server's OWN health/ops cards off the CUSTOMER board
+# (AMUX-3014). autofix files invariant-failure / disk-floor / dead-route cards
+# for an operator to action — correct on the single local ops box (its board IS
+# the ops board), but each cloud org runs its own server, so those cards land on
+# the customer's board. Same "a deployment property, not a server branch"
+# justification as IS_SANDBOX: the operator reads cloud health from /health +
+# /api/health/invariants, not from cards inside a tenant. Default (unset) is on.
+ENV AMUX_OPS_HEALTH_CARDS=0
 
 # The server ALWAYS serves TLS (crates/amux-server/src/lib.rs — there is no
 # no-tls switch), so the loopback hop from the gateway is https with a

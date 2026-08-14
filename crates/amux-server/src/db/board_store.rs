@@ -129,7 +129,7 @@ pub fn status_to_db(target: TaskStatus, prior_raw: &str) -> String {
 
 /// The Python `_ITEM_TYPES` tuple, verbatim (order preserved for the
 /// `valid_types` field the CLI prints).
-pub const KNOWN_TYPES: [&str; 10] = [
+pub const KNOWN_TYPES: [&str; 11] = [
     "code",
     "escalation",
     "blocker",
@@ -140,6 +140,10 @@ pub const KNOWN_TYPES: [&str; 10] = [
     "doc",
     "tripwire",
     "watch",
+    // Grouping container (AMUX-2992). NOTE: this list duplicates
+    // `ItemType::ALL` and must be kept in step with it by hand — the enum's own
+    // doc calls that out; a future cleanup should derive one from the other.
+    "epic",
 ];
 
 /// Core [`ItemType`] for GATE purposes. Unknown/legacy strings map to `Code`
@@ -158,6 +162,7 @@ pub fn core_item_type(raw: &str) -> ItemType {
         "doc" => ItemType::Doc,
         "tripwire" => ItemType::Tripwire,
         "watch" => ItemType::Watch,
+        "epic" => ItemType::Epic,
         _ => ItemType::Code,
     }
 }
@@ -173,9 +178,9 @@ pub fn core_item_type(raw: &str) -> ItemType {
 /// these on BOTH servers, so a drifted criterion here would make an ack
 /// minted against one server unusable against the other.
 ///
-/// Scoped (worker/group) gate tiers land with RR-0051; until then this is
-/// card-override -> type table -> global status defaults, the same first,
-/// second, and last rungs of Python's `_GATE_PRECEDENCE`.
+/// This is the FLOOR of the precedence ladder — the scoped tiers
+/// (card > worker > group > global column) live in
+/// [`effective_gate_scoped`] and land here only when nothing above matched.
 pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String> {
     let ty = core_item_type(item_type_raw);
     let list: &[&str] = match (ty, target) {
@@ -224,36 +229,107 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// Effective gate criteria for moving `row` into `target`: the card-level
-/// `gate` column override (a JSON array) wins when non-empty, else the
-/// type-derived defaults. Mirrors Python `_effective_gate` minus the
-/// worker/group tiers (RR-0051).
-/// The gate actually enforced for `row` entering `target`, including a column
-/// gate an operator configured in the UI (AMUX-2641).
+/// The gate actually enforced for `row` entering `target` — the full scoped
+/// ladder (worker > group > global; see [`effective_gate_scoped`]), with the
+/// worker's groups resolved from its CC_TAGS.
 ///
-/// Precedence, most specific first:
-///   1. the card's own `gate` override — one card, deliberately special;
-///   2. the CONFIGURED column gate, but only when `gate_custom` says a human
-///      wrote it (see migration 0017 for why a flag and not a comparison);
-///   3. the type-aware defaults.
-///
-/// [`effective_gate`] remains for callers with no DB handle and is the same
-/// function minus step 2. They must not drift: this one delegates rather than
-/// re-deriving, so a change to type defaults cannot land in one and not the
-/// other.
+/// [`effective_gate`] remains for callers with no DB handle and is the ladder
+/// minus every stored tier. They must not drift: this one delegates rather
+/// than re-deriving, so a change to type defaults cannot land in one and not
+/// the other.
 pub fn effective_gate_configured(
     conn: &rusqlite::Connection,
     row: &IssueRow,
     target: TaskStatus,
 ) -> Vec<String> {
+    let groups = row
+        .session
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(crate::api::session_verbs::lane_groups)
+        .unwrap_or_default();
+    effective_gate_scoped(conn, row, target, &groups)
+}
+
+/// The full gate precedence, with the worker's groups passed in so tests can
+/// exercise every tier hermetically (lane_groups reads env files under
+/// AMUX_HOME, which parallel tests cannot safely fake).
+///
+/// Most specific first (RR-0051, Ethan 2026-08-11: "worker takes priority
+/// over all, followed by group, then global"):
+///   1. the card's own `gate` override — one card, deliberately special;
+///   2. WORKER: `session_gates` row for the card's session — this table was
+///      written by the SPA's per-worker gate editor since AMUX-2599 and,
+///      until today, read by NOTHING at enforcement time: a user could author
+///      a worker gate, watch the UI display it, and have every transition
+///      judged by a different one (ethos rule 6 — the claim without the
+///      implementation);
+///   3. GROUP: `session_gates` rows keyed `group:<name>` for each of the
+///      worker's groups (CC_TAGS), unioned in sorted-group order when the
+///      worker is in several — all its groups' bars apply, deterministically;
+///   4. GLOBAL: the operator-authored column gate (`statuses.gate_custom`);
+///   5. the type-aware defaults.
+///
+/// Every tier fails CLOSED to the next: an absent, empty, or malformed row
+/// means "inherit", never "no gate" (an empty gate would silently open the
+/// strictest transitions on the board — same rule as `configured_gate`).
+pub fn effective_gate_scoped(
+    conn: &rusqlite::Connection,
+    row: &IssueRow,
+    target: TaskStatus,
+    groups: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let over = row.gate_criteria();
     if !over.is_empty() {
         return over;
+    }
+    if let Some(session) = row.session.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(g) = scoped_gate(conn, session, target) {
+            return g;
+        }
+        let mut merged: Vec<String> = Vec::new();
+        for group in groups {
+            if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+                for c in list {
+                    if !merged.contains(&c) {
+                        merged.push(c);
+                    }
+                }
+            }
+        }
+        if !merged.is_empty() {
+            return merged;
+        }
     }
     if let Some(cfg) = configured_gate(conn, target) {
         return cfg;
     }
     effective_gate(row, target)
+}
+
+/// One scope's gate row from `session_gates` (scope key is a session name or
+/// `group:<name>`), or None when the row is absent, empty, or unreadable —
+/// every "cannot tell" inherits the next tier rather than opening the gate.
+fn scoped_gate(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    target: TaskStatus,
+) -> Option<Vec<String>> {
+    let id = status_to_db(target, "");
+    let gate: Option<String> = conn
+        .query_row(
+            "SELECT gate FROM session_gates WHERE session = ?1 AND status = ?2",
+            rusqlite::params![scope, id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let list: Vec<String> = serde_json::from_str(&gate?).ok()?;
+    let list: Vec<String> = list
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 /// The operator-authored gate for a column, or None.
@@ -425,6 +501,9 @@ pub struct IssueRow {
     /// Decoded from the JSON-array TEXT column (semantic ids).
     pub depends_on: Vec<String>,
     pub reviewer: Option<String>,
+    /// The epic this card rolls up under: the semantic id of a type=epic card,
+    /// or NULL (AMUX-2992). Not a foreign key — a dangling id reads as no-epic.
+    pub epic: Option<String>,
     /// Append-only history (see [`append_log`]); NULL until first line.
     pub log: Option<String>,
     /// The Python optimistic-concurrency counter (`expect_rev` checks this).
@@ -484,6 +563,7 @@ impl IssueRow {
             "archived": self.archived,
             "depends_on": self.depends_on,
             "reviewer": self.reviewer,
+            "epic": self.epic,
             "log": self.log,
             "source_ref": self.source_ref,
             "last_verified_at": self.last_verified_at,
@@ -565,7 +645,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
-     GROUP_CONCAT(t.tag)";
+     i.epic, GROUP_CONCAT(t.tag)";
 
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
@@ -579,7 +659,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
                 .collect()
         })
         .unwrap_or_default();
-    let tags_csv: Option<String> = r.get(26)?;
+    let tags_csv: Option<String> = r.get(27)?;
     let tags = tags_csv
         .unwrap_or_default()
         .split(',')
@@ -613,6 +693,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         source_ref: r.get(23)?,
         last_verified_at: r.get(24)?,
         version: r.get(25)?,
+        epic: r.get(26)?,
         tags,
     })
 }
@@ -852,6 +933,15 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             params![id, tag, now],
         )?;
     }
+    // A card FILED straight into `needsyou` needs the tag too. The PATCH path
+    // syncs on the status TRANSITION, which a create never produces — so the
+    // sync's own blind spot was the one case that never gets a second chance:
+    // a card created blocked-on-a-human and never touched again. Caught by
+    // running the shipped path rather than the transition I had in mind; 1 of
+    // the 23 cards in the live census got there this way.
+    if parse_status(&new.status) == Some(TaskStatus::NeedsYou) {
+        add_needs_you_tag(conn, &id, now)?;
+    }
     Ok(get_issue(conn, &id)?.expect("row just inserted"))
 }
 
@@ -888,8 +978,9 @@ pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
-             rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21 \
-         WHERE id = ?22 AND deleted IS NULL",
+             rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
+             epic = ?22 \
+         WHERE id = ?23 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -912,6 +1003,7 @@ pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize
             row.updated,
             row.source_ref,
             row.last_verified_at,
+            row.epic,
             row.id,
         ],
     )
@@ -927,6 +1019,51 @@ pub fn set_tags(conn: &Connection, id: &str, tags: &[String], now: i64) -> rusql
         )?;
     }
     Ok(())
+}
+
+/// The canonical "blocked on a human" tag. Every consumer matches it as a
+/// PREFIX (`lower(tag) LIKE 'needs:you%'`), so a sub-tagged ask like
+/// `needs:you:decision` counts — board_drive's re-nag, its pickup exclusion
+/// and its advance-path branch all already use that shape, and the helpers
+/// below exist so a fourth caller cannot spell it a fifth way.
+pub const NEEDS_YOU_TAG: &str = "needs:you";
+
+/// Does this card carry any `needs:you*` tag?
+pub fn has_needs_you_tag(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM issue_tags WHERE issue_id = ?1 \
+         AND lower(tag) LIKE 'needs:you%')",
+        params![id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+}
+
+/// Stamp `needs:you` unless the card already carries one. Returns whether a
+/// row was written.
+///
+/// `added_at` is the ASK CLOCK: board_drive ages the ask from
+/// `MIN(issue_tags.added_at)`, deliberately not from `issues.updated`, because
+/// `updated` is last-touch and the cards carrying the most commentary were
+/// exactly the ones whose stale-ask check could never fire (AC-178). Stamping
+/// at the transition is what makes that clock mean "when the human was asked".
+pub fn add_needs_you_tag(conn: &Connection, id: &str, now: i64) -> rusqlite::Result<bool> {
+    if has_needs_you_tag(conn, id)? {
+        return Ok(false);
+    }
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO issue_tags (issue_id, tag, added_at) VALUES (?1, ?2, ?3)",
+        params![id, NEEDS_YOU_TAG, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Drop every `needs:you*` tag. Returns how many rows went.
+pub fn clear_needs_you_tags(conn: &Connection, id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM issue_tags WHERE issue_id = ?1 AND lower(tag) LIKE 'needs:you%'",
+        params![id],
+    )
 }
 
 /// Would giving `self_id` the dependency set `new_deps` create a cycle?
@@ -1020,6 +1157,123 @@ pub fn depends_on_cycle(
 mod tests {
     use super::*;
 
+    fn tag_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Every consumer matches this family as a PREFIX (`LIKE 'needs:you%'`), so
+    /// a sub-tagged ask must count as already-asked — otherwise a card carrying
+    /// `needs:you:decision` gets a second, duplicate `needs:you` stamped on it
+    /// and the ask clock (`MIN(added_at)`) is silently reset to now.
+    #[test]
+    fn needs_you_helpers_match_the_prefix_every_consumer_uses() {
+        for existing in ["needs:you", "needs:you:decision", "NEEDS:YOU"] {
+            let conn = tag_db();
+            conn.execute(
+                "INSERT INTO issue_tags VALUES ('C-1', ?1, 100.0)",
+                params![existing],
+            )
+            .unwrap();
+            assert!(has_needs_you_tag(&conn, "C-1").unwrap(), "{existing} must count as asked");
+            assert!(
+                !add_needs_you_tag(&conn, "C-1", 999).unwrap(),
+                "{existing} is already an ask — stamping a second resets the clock"
+            );
+            let kept: f64 = conn
+                .query_row("SELECT MIN(added_at) FROM issue_tags WHERE issue_id='C-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(kept, 100.0, "{existing}: the original ask time must survive");
+            assert_eq!(clear_needs_you_tags(&conn, "C-1").unwrap(), 1);
+            assert!(!has_needs_you_tag(&conn, "C-1").unwrap());
+        }
+    }
+
+    /// A card FILED straight into `needsyou` — never PATCHed, so no status
+    /// transition ever fires — must still carry the ask. This is the case with
+    /// no second chance: nothing touches the card again, so if the tag is not
+    /// stamped at creation it is never stamped at all.
+    ///
+    /// Found by exercising the shipped POST path after fixing only the PATCH
+    /// path, which is the ethos-rule-1 nesting trap: after adding a surfacing
+    /// mechanism, ask what the mechanism itself filters out. 1 of the 23 cards
+    /// in the 2026-08-11 live census got there this way.
+    #[test]
+    fn a_card_filed_directly_into_needsyou_carries_the_ask() {
+        for (status, want) in [("needsyou", true), ("needs_you", true), ("todo", false)] {
+            let conn = create_db();
+            let row = create_issue(&conn, &new_card(status), 1000).expect("create");
+            assert_eq!(row.status, status, "the fixture must actually store {status}");
+            assert_eq!(
+                has_needs_you_tag(&conn, &row.id).unwrap(),
+                want,
+                "filed as {status}: expected tagged={want}"
+            );
+        }
+    }
+
+    fn create_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
+                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
+                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
+                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
+                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                epic TEXT, deleted INTEGER);
+             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));
+             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn new_card(status: &str) -> NewIssue {
+        NewIssue {
+            title: "Ask Ethan about pricing".into(),
+            desc: String::new(),
+            status: status.into(),
+            session: Some("lane".into()),
+            item_type: "code".into(),
+            creator: "lane".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+        }
+    }
+
+    /// CONTROL: the helpers must not be matching everything. An unrelated tag is
+    /// neither an ask nor collateral damage when the ask is cleared.
+    #[test]
+    fn needs_you_helpers_leave_unrelated_tags_alone() {
+        let conn = tag_db();
+        conn.execute("INSERT INTO issue_tags VALUES ('C-1','needs:review',100.0)", []).unwrap();
+        assert!(!has_needs_you_tag(&conn, "C-1").unwrap(), "needs:review is not an ask");
+        assert!(add_needs_you_tag(&conn, "C-1", 200).unwrap(), "the first ask must be stamped");
+        assert_eq!(clear_needs_you_tags(&conn, "C-1").unwrap(), 1, "only the ask goes");
+        let left: String =
+            conn.query_row("SELECT tag FROM issue_tags WHERE issue_id='C-1'", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(left, "needs:review", "clearing the ask must not take other tags with it");
+    }
+
     #[test]
     fn a_stale_cycle_elsewhere_does_not_block_an_unrelated_edge() {
         // AC-335. GE-473 <-> MHC-256 is a real cycle between two CLOSED cards
@@ -1087,6 +1341,7 @@ mod tests {
             archived: 0,
             depends_on: vec![],
             reviewer: None,
+            epic: None,
             log: None,
             rev: 0,
             source_ref: None,
@@ -1191,7 +1446,7 @@ mod configured_gate_tests {
             due: None, created: 0, updated: 0, owner_type: "agent".into(),
             due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
-            archived: 0, depends_on: vec![], reviewer: None, log: None, rev: 0,
+            archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
             source_ref: None, last_verified_at: None, version: 0, tags: vec![],
         }
     }
@@ -1264,6 +1519,144 @@ mod configured_gate_tests {
             TaskStatus::Done,
         );
         assert_eq!(got, vec!["This card only"]);
+    }
+
+    // ---- scoped gates: worker > group > global (RR-0051, 2026-08-11) ------
+
+    fn add_session_gates(c: &rusqlite::Connection) {
+        c.execute_batch(
+            "CREATE TABLE session_gates (session TEXT NOT NULL, status TEXT NOT NULL,
+             gate TEXT, PRIMARY KEY (session, status));",
+        )
+        .unwrap();
+    }
+
+    fn scope_gate(c: &rusqlite::Connection, scope: &str, status: &str, gate: &str) {
+        c.execute(
+            "INSERT INTO session_gates (session, status, gate) VALUES (?1, ?2, ?3)",
+            rusqlite::params![scope, status, gate],
+        )
+        .unwrap();
+    }
+
+    fn row_for(session: &str, item_type: &str, gate: Option<&str>) -> IssueRow {
+        let mut r = row(item_type, gate);
+        r.session = Some(session.into());
+        r
+    }
+
+    fn groups(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole ladder in one specimen: worker, group and global all
+    /// configured, worker wins ("worker takes priority over all").
+    #[test]
+    fn a_worker_gate_beats_group_and_global() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["Worker rule"]"#);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Worker rule"]);
+    }
+
+    #[test]
+    fn a_group_gate_applies_when_the_worker_has_none_and_beats_global() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Group rule"]);
+    }
+
+    /// A worker in several groups answers to ALL of them: union, in sorted
+    /// group order, deduplicated — deterministic however the fleet is tagged.
+    #[test]
+    fn multiple_groups_union_deterministically() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Shared rule","Ops rule"]"#);
+        scope_gate(&c, "group:gtm", "done", r#"["Gtm rule","Shared rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops", "gtm"]),
+        );
+        // BTreeSet iterates sorted: gtm's list first, then ops', dedup on merge.
+        assert_eq!(got, vec!["Gtm rule", "Shared rule", "Ops rule"]);
+    }
+
+    /// The card's own override is still the most specific thing on the board.
+    #[test]
+    fn a_card_override_beats_every_scoped_tier() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["Worker rule"]"#);
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", Some(r#"["This card only"]"#)),
+            TaskStatus::Done,
+            &groups(&[]),
+        );
+        assert_eq!(got, vec!["This card only"]);
+    }
+
+    /// UNHAPPY: an empty or malformed scoped row INHERITS the next tier, it
+    /// never opens the gate — same fail-closed rule as the column gate. A
+    /// worker row of `[]` therefore does not exempt the worker from its
+    /// group's bar.
+    #[test]
+    fn a_malformed_or_empty_scoped_row_inherits_not_opens() {
+        for bad in ["not json", "[]", r#"["","  "]"#] {
+            let c = conn_with(None, None);
+            add_session_gates(&c);
+            scope_gate(&c, "backend", "done", bad);
+            scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+            let got = effective_gate_scoped(
+                &c,
+                &row_for("backend", "code", None),
+                TaskStatus::Done,
+                &groups(&["ops"]),
+            );
+            assert_eq!(got, vec!["Group rule"], "worker row {bad:?} must inherit the group tier");
+        }
+    }
+
+    /// UNHAPPY: a DB without the session_gates table (predates AMUX-2599)
+    /// must neither panic nor open the gate — the ladder continues below.
+    #[test]
+    fn a_missing_session_gates_table_inherits_the_global_tier() {
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        let got = effective_gate_scoped(
+            &c,
+            &row_for("backend", "code", None),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(got, vec!["Global column rule"]);
+    }
+
+    /// A sessionless card (no owner lane) skips the scoped tiers entirely —
+    /// there is no worker or group to scope to.
+    #[test]
+    fn a_sessionless_card_uses_the_global_ladder() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let got = effective_gate_scoped(&c, &row("code", None), TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(got, default_gates_for("code", TaskStatus::Done));
     }
 
     /// Every "cannot tell" answer must fall back to the defaults, NEVER to an

@@ -35,16 +35,7 @@ use std::sync::{LazyLock, Mutex};
 /// profile was never flushed (Python `_CHROME_SINGLETONS`).
 pub const CHROME_SINGLETONS: [&str; 3] = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
 
-pub fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .join(".amux")
-        })
-}
+pub use crate::config::amux_home;
 
 /// The user's real Chrome user-data-dir (Python `_chrome_user_data_dir`).
 pub fn chrome_user_data_dir() -> PathBuf {
@@ -456,7 +447,15 @@ pub struct StartedBrowser {
 /// Launch Chrome on a profile. Cleans stale locks first (amux-owned dirs
 /// only — see module docs), waits for the CDP HTTP endpoint to answer so a
 /// returned port is a WORKING port, and records the child for stop().
-pub async fn start(home: &Path, profile: &str, url: &str) -> anyhow::Result<StartedBrowser> {
+/// `session` is the lane this launch belongs to. It exists because of AC-336:
+/// the tab Chrome opens for `url` must be CLAIMED by the caller, or the next
+/// lane to run a driver verb adopts it as an unowned page.
+pub async fn start(
+    home: &Path,
+    profile: &str,
+    url: &str,
+    session: &str,
+) -> anyhow::Result<StartedBrowser> {
     let binary = chrome_binary().ok_or_else(|| {
         anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
     })?;
@@ -526,6 +525,57 @@ pub async fn start(home: &Path, profile: &str, url: &str) -> anyhow::Result<Star
             }
             _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
         }
+    }
+
+    // AC-336: CLAIM THE TAB WE JUST OPENED, FOR THE LANE THAT ASKED FOR IT.
+    //
+    // `resolve_page` treats a page tab as available unless it appears in
+    // NATIVE_TARGETS — i.e. unless some lane has already DRIVEN it through this
+    // API. The tab Chrome opens for this `url` has never been driven, so it was
+    // indistinguishable from an unowned tab, and the next lane to call a driver
+    // verb with no binding of its own adopted it. That is precisely the hijack
+    // `resolve_page`'s own comment promises not to do ("open a fresh one rather
+    // than hijacking a peer's tab"), reached through the one tab kind that was
+    // never registered.
+    //
+    // How it presented: I called /start with url=cloud.amux.io/sign-in, then
+    // /action, and eval ran against localhost:4177/solutions/creative-dna — a
+    // PEER lane's dev server, opened by their own /start. Every response said
+    // ok:true, because from the driver's side adopting an unowned tab is the
+    // documented behaviour. I typed a god-mode credential into it.
+    //
+    // Stale bindings are dropped first: `start` replaces any running browser
+    // (see the stop above), so every target id recorded against the previous
+    // Chrome now names a tab that does not exist. Leaving them is not merely
+    // untidy — they are counted as `claimed_by_others`, so dead ids would make
+    // live tabs look owned.
+    //
+    // A freshly launched Chrome has exactly one page tab, so taking the first
+    // one is right regardless of what `url` redirected to — which is why this
+    // matches on tab TYPE and not on the URL string.
+    // The CDP call happens BEFORE the lock is taken: NATIVE_TARGETS is a
+    // std::sync::Mutex, and holding one across an await deadlocks the runtime.
+    let launch_tab = cdp_list(port).await.ok().and_then(|tabs| {
+        tabs.as_array()
+            .and_then(|ts| ts.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page")))
+            .and_then(|t| t.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+    });
+    {
+        let mut map = NATIVE_TARGETS.lock().expect("native targets poisoned");
+        map.clear();
+        if let Some(id) = &launch_tab {
+            map.insert(session.to_string(), id.clone());
+        }
+    }
+    match &launch_tab {
+        Some(id) => {
+            tracing::info!(session, target = %id, "claimed the launch tab for the starting lane (AC-336)")
+        }
+        // Not fatal: the lane simply has no binding yet and resolve_page will
+        // open it a fresh tab. Logged because a silent miss here is what the
+        // whole card is about.
+        None => tracing::warn!(session, port, "launch tab not claimed — CDP listed no page tab"),
     }
 
     let started_at = chrono::Utc::now().timestamp();
@@ -1485,7 +1535,23 @@ mod tests {
 
     // All tests run against TEMP dirs only — never the live Chrome profiles
     // (repo rule: tests must not touch real profile contents), and never
-    // launch Chrome except the #[ignore]d gated test at the bottom.
+    // launch Chrome except the #[ignore]d gated tests at the bottom.
+
+    /// EVERY live-Chrome test must hold this for its whole body.
+    ///
+    /// `RUNNING` and `NATIVE_TARGETS` are process-global — one browser, one
+    /// binding table — so two live tests running concurrently are two lanes
+    /// fighting over one browser, which is the very bug this file's newest test
+    /// is about. Concretely: `start` stops whatever is running and clears the
+    /// binding table, so a peer test's launch wipes this test's claim mid-body
+    /// and the assertion fails against CORRECT code. That is the worst kind of
+    /// red — it accuses the fix.
+    ///
+    /// It is a tokio Mutex, not a std one, because these bodies await while
+    /// holding it. `--test-threads=1` would also work but cannot be enforced
+    /// from here, and a test that only passes under a flag someone has to
+    /// remember is a test that will go red for the wrong reason.
+    static LIVE_BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn fake_home() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1767,13 +1833,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "launches a real Chrome; run explicitly with -- --ignored"]
     async fn live_chrome_start_stop() {
+        let _serial = LIVE_BROWSER.lock().await;
         if chrome_binary().is_none() {
             eprintln!("no Chrome binary on this machine; skipping");
             return;
         }
         let home = fake_home();
         // Use a scratch profile name so the target dir is amux-owned + temp.
-        let info = start(home.path(), "default", "about:blank").await.expect("start");
+        let info = start(home.path(), "default", "about:blank", "live-smoke").await.expect("start");
         assert!(info.cdp_port > 0);
         let tabs = cdp_list(info.cdp_port).await.expect("cdp /json/list");
         assert!(tabs.is_array());
@@ -1812,6 +1879,72 @@ mod tests {
         assert_eq!(v, json!(2));
 
         NATIVE_TARGETS.lock().unwrap().remove("live-smoke");
+        let report = stop(home.path()).await;
+        assert!(report.stopped);
+    }
+
+    /// AC-336: one lane must not be handed the tab another lane launched.
+    ///
+    /// This is the incident rebuilt from its own artifact rather than a
+    /// convenient case. The reported specimen was a peer's `/start {url}` tab
+    /// being adopted by the next lane to call a driver verb — and it was
+    /// adoptable for exactly one reason: the launch tab was never recorded in
+    /// NATIVE_TARGETS, so `resolve_page` could not tell it from an unowned page.
+    ///
+    /// THE ORDERING IS THE WHOLE TEST, and getting it wrong made an earlier
+    /// draft of this test non-discriminating. The hijack needs the PEER to
+    /// resolve BEFORE the owner has ever driven its own tab — which is exactly
+    /// what happened: a peer lane called `/start {url}` and never drove it, then
+    /// I called a driver verb and was handed their page. If the owner resolves
+    /// first it claims the launch tab under the old code too, so an
+    /// owner-then-peer test passes against the bug and proves nothing.
+    ///
+    /// The launch tab is read from CDP, not from NATIVE_TARGETS, for the same
+    /// reason: asserting on our own bookkeeping would make the test fail at the
+    /// bookkeeping instead of at the behaviour, and the behaviour is the claim.
+    ///
+    /// Falsifiability CHECKED, not assumed: with `map.insert` in `start`
+    /// removed, `peer` is handed the launch tab and the assert_ne below fires.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome; run explicitly with -- --ignored"]
+    async fn a_peers_launch_tab_is_not_adopted_by_another_lane() {
+        let _serial = LIVE_BROWSER.lock().await;
+        if chrome_binary().is_none() {
+            eprintln!("no Chrome binary on this machine; skipping");
+            return;
+        }
+        let home = fake_home();
+        let info = start(home.path(), "default", "about:blank", "owner").await.expect("start");
+
+        // The launch tab as CHROME reports it — the incident's artifact.
+        let launch_tab = cdp_list(info.cdp_port)
+            .await
+            .expect("cdp /json/list")
+            .as_array()
+            .and_then(|ts| {
+                ts.iter()
+                    .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                    .and_then(|t| t.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .expect("a freshly launched Chrome has a page tab");
+
+        // PEER RESOLVES FIRST — the owner has driven nothing yet.
+        let peer_page = resolve_page("peer", None).await.expect("peer resolves");
+        assert_ne!(
+            peer_page.target_id, launch_tab,
+            "peer was handed the tab the owner launched — this is AC-336"
+        );
+        assert_eq!(peer_page.cdp_port, info.cdp_port, "still one shared browser, per-lane tabs");
+
+        // The owner still gets the tab it launched, not the peer's new one.
+        let owner_page = resolve_page("owner", None).await.expect("owner resolves");
+        assert_eq!(owner_page.target_id, launch_tab, "owner keeps the tab it launched");
+        assert_ne!(owner_page.target_id, peer_page.target_id, "two lanes, two tabs");
+
+        for s in ["owner", "peer"] {
+            NATIVE_TARGETS.lock().unwrap().remove(s);
+        }
         let report = stop(home.path()).await;
         assert!(report.stopped);
     }

@@ -298,7 +298,7 @@
     </table>
 
     <p><a href="https://www.latent.space/p/harness-eng" target="_blank" rel="noopener">OpenAI's Symphony project</a> demonstrated this at scale: 1 million lines of code, 1 billion tokens per day, zero human-written code, all driven by agents managed through a harness. <a href="https://www.mindstudio.ai/blog/what-is-harness-engineering-beyond-prompt-context-engineering" target="_blank" rel="noopener">Stripe's "Minions"</a> ship 1,300 AI-generated PRs per week using a harness that separates deterministic nodes (run a linter, push a commit) from agentic nodes (implement a feature, fix CI).</p>
-    <p>You don't need to be Stripe or OpenAI. A solo developer with <a href="https://amux.io" target="_blank" rel="noopener">amux</a> and 5-10 <a href="https://claude.ai/code" target="_blank" rel="noopener">Claude Code</a> sessions has the same harness architecture: orchestration, sensors, guides, memory, and self-healing &mdash; in a single Python file.</p>
+    <p>You don't need to be Stripe or OpenAI. A solo developer with <a href="https://amux.io" target="_blank" rel="noopener">amux</a> and 5-10 <a href="https://claude.ai/code" target="_blank" rel="noopener">Claude Code</a> sessions has the same harness architecture: orchestration, sensors, guides, memory, and self-healing &mdash; in a single Rust binary.</p>
 
     <h2 id="evidence">The Evidence: Harness &gt; Model</h2>
     <p>The most surprising finding of 2026 is that the harness matters more than the model. The data is consistent across benchmarks:</p>
@@ -383,14 +383,14 @@
     <div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:20px 24px;margin:32px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
         <div style="font-weight:600;font-size:1rem;margin-bottom:4px">amux — the open-source harness for AI agent fleets (336★ GitHub)</div>
-        <div style="color:var(--muted);font-size:.9rem">Orchestration, sensors, self-healing watchdog, and mobile monitoring for parallel Claude Code sessions. One Python file.</div>
+        <div style="color:var(--muted);font-size:.9rem">Orchestration, sensors, self-healing watchdog, and mobile monitoring for parallel Claude Code sessions. One Rust binary.</div>
       </div>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp014_guide_github_cta_click',{page:window.location.pathname})" style="background:#6366f1;color:#fff;padding:10px 20px;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View on GitHub ★</a>
     </div>
-    <div class="cta-box"><h3>amux is the harness</h3><p>Orchestration, sensors, guides, memory, and self-healing for your AI agent fleet. Open source. One Python file.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
+    <div class="cta-box"><h3>amux is the harness</h3><p>Orchestration, sensors, guides, memory, and self-healing for your AI agent fleet. Open source. One Rust binary.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # &rarr; https://localhost:8822</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+amux serve  # &rarr; https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">

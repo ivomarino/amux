@@ -1,7 +1,8 @@
 <!DOCTYPE html>
-<!-- EXTRACTED from amux-server.py (Phase 8, RR). This file is the static twin of
-     DASHBOARD_HTML (amux-server.py lines 27923-63729); the Python server keeps its
-     inline copy. (Tag names below are spelled without angle brackets so naive
+<!-- EXTRACTED from the retired Python server's inline DASHBOARD_HTML (deleted at
+     792ce1f, 2026-08-09; git history has it - the line references below are into
+     that historical file). This static file is now the ONLY copy.
+     (Tag names below are spelled without angle brackets so naive
      script/style-tag greps - the AMUX-2331 CI class - never match comment text.)
      Deviations from the inline original, each a judgment call:
      1. The single top-level head style block (lines 28001-32660) now loads via a
@@ -22,11 +23,11 @@
         cannot live in app.js. KEPT INLINE: the two one-line body scripts
         (document.write(location.host); the _cloudEmail pull-btn check) - both are
         parse-position-dependent.
-     4. The window._AMUX_* bootstrap below replaces the Python server's serve-time
-        injection (amux-server.py:65679, which string-replaces the head close tag
-        with a script defining these values). Values here are the unconfigured
-        defaults; a server MAY substitute the block between the AMUX-BOOTSTRAP
-        markers with real values at serve time.
+     4. The window._AMUX_* bootstrap below replaces the retired Python server's
+        serve-time injection (historical amux-server.py:65679, which
+        string-replaced the head close tag with a script defining these values).
+        Values here are the unconfigured defaults; the server MAY substitute the
+        block between the AMUX-BOOTSTRAP markers with real values at serve time.
 -->
 <html lang="en">
 <head>
@@ -600,6 +601,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span style="font-size:0.6rem;transition:transform 0.15s;display:inline-block;" id="sched-runs-arrow">▶</span> Recent Runs
     </summary>
     <div id="scheduler-runs"></div>
+  </details>
+  <!-- AMUX-2755. GET /api/schedules/audit was routed and the SPA referenced it
+       ZERO times — a trail that exists and reaches nobody. It matters most for
+       the case a per-schedule row structurally CANNOT show: a DELETED schedule
+       has no row. 45 of the 151 audited schedules no longer exist, which is the
+       AMUX-1812 shape (8 schedules vanished with no attribution). -->
+  <details id="sched-audit-details" style="border-top:1px solid var(--border);padding:0 12px 10px;">
+    <summary style="cursor:pointer;font-size:0.78rem;font-weight:600;color:var(--dim);padding:8px 0 4px;list-style:none;display:flex;align-items:center;gap:5px;">
+      <span style="font-size:0.6rem;transition:transform 0.15s;display:inline-block;" id="sched-audit-arrow">▶</span> Change history <span id="sched-audit-n" style="color:var(--dim);font-weight:400;"></span>
+    </summary>
+    <div id="scheduler-audit"></div>
   </details>
 </div>
 
@@ -1846,16 +1858,42 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 
 <!-- Peek overlay -->
+<div id="subagents-overlay" class="overlay" onclick="if(event.target===this)closeSubagents()">
+      <div class="overlay-card" style="max-width:640px;">
+        <div class="overlay-head">
+          <span id="subagents-title">Subagents</span>
+          <button class="btn" onclick="closeSubagents()">&#x2715;</button>
+        </div>
+        <div id="subagents-list" style="max-height:60vh;overflow:auto;padding:4px 2px;"></div>
+      </div>
+    </div>
 <div id="peek-overlay" class="overlay">
   <div class="overlay-header" style="flex-direction:column;gap:4px;padding-bottom:6px;">
-    <div id="peek-title-row" style="display:flex;align-items:center;gap:8px;min-width:0;">
-      <h2 id="peek-title" style="margin:0;font-size:0.92rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">peek</h2>
-      <span id="peek-session-status"></span>
-      <span id="peek-model-badge" style="font-size:0.75rem;padding:2px 8px;border-radius:9999px;background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);white-space:nowrap;"></span>
+    <div id="peek-title-row" style="display:flex;align-items:center;justify-content:center;gap:8px;min-width:0;width:100%;overflow:hidden;">
+      <!-- `flex: 0 1 auto` — SHRINK BUT DO NOT GROW, plus min-width:0.
+           min-width:0 is what makes the ellipsis fire at all: a flex item will
+           not shrink below its content width without it, so the name did not
+           truncate, the ROW overflowed, and on a 375px phone that clipped
+           "tubescience" to "escience" and pushed the model chip off the right
+           edge.
+           But the first fix used `flex: 1 1 auto`, which also lets the name
+           GROW — so on a wide desktop it expanded to fill and shoved the
+           badges to the far edge, leaving a metre of white space between the
+           name and the status (Ethan, 2026-08-11: "these can be centered").
+           Growing was never needed; only shrinking was. With 0 1 auto plus
+           justify-content:center the group centres on a wide screen and still
+           ellipsises on a narrow one — the two requirements are not in
+           conflict once the flex-grow is dropped.
+           The badges stay flex-shrink:0 so the name yields space first: status
+           and model are short and fixed, the name is the one that can afford
+           an ellipsis. -->
+      <h2 id="peek-title" style="margin:0;font-size:0.92rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:0;">peek</h2>
+      <span id="peek-session-status" style="flex-shrink:0;display:flex;align-items:center;gap:4px;"></span>
+      <span id="peek-model-badge" style="font-size:0.75rem;padding:2px 8px;border-radius:9999px;background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);white-space:nowrap;flex-shrink:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;"></span>
     </div>
-    <div id="peek-task-row" style="display:none;align-items:center;gap:6px;min-width:0;max-width:100%;">
+    <div id="peek-task-row" style="display:none;align-items:center;justify-content:center;gap:6px;min-width:0;max-width:100%;">
       <span style="font-size:0.72rem;color:var(--dim);flex-shrink:0;">Task:</span>
-      <span id="peek-task-label" style="font-size:0.82rem;font-weight:600;color:var(--text);white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:1;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;touch-action:pan-x;overscroll-behavior-x:contain;cursor:pointer;" onclick="editField(peekSession,'task',this.textContent.trim())" title="Click to edit task label"></span>
+      <span id="peek-task-label" style="font-size:0.82rem;font-weight:600;color:var(--text);white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;touch-action:pan-x;overscroll-behavior-x:contain;cursor:pointer;" onclick="editField(peekSession,'task',this.textContent.trim())" title="Click to edit task label"></span>
     </div>
     <div style="display:flex;gap:6px;align-items:center;">
       <div class="peek-find-wrap" id="peek-search-wrap">
@@ -1867,9 +1905,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="peek-nav-btn" onclick="peekSearchNext()" title="Next match (Enter)">&#x2193;</button>
         <button class="search-clear" onclick="event.stopPropagation();clearPeekSearch()">&#x2715;</button>
       </div>
-      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate user messages">
+      <div class="peek-msg-nav" id="peek-msg-nav" title="Navigate messages (click counter to change kind)">
         <button class="peek-nav-btn" onclick="peekMsgPrev()" title="Previous message">&#x2191;</button>
-        <span class="peek-msg-count" id="peek-msg-count">❯</span>
+        <span class="peek-msg-count" id="peek-msg-count" onclick="_peekMsgNavCycle()" style="cursor:pointer;" title="Click to cycle: Human / Session / Scheduled / amux / All">❯</span>
         <button class="peek-nav-btn" onclick="peekMsgNext()" title="Next message">&#x2193;</button>
       </div>
       <div class="peek-more-wrap">
@@ -1889,13 +1927,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="btn" onclick="closePeek()" style="font-size:1.1rem;line-height:1;padding:4px 8px;">&#x2715;</button>
   </div>
   <!-- Tab bar -->
-  <div class="peek-tabs">
+  <div class="peek-tabs" onwheel="_peekTabsWheel(event)">
     <button class="peek-tab active" id="peek-tab-terminal" onclick="setPeekTab('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="What this worker operates under, and which scope layer set it"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Scope</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
+    <button class="peek-tab" id="peek-tab-readalouds" onclick="setPeekTab('readalouds')" title="Past read-alouds — replay any; auto-clears after 30 days"><span class="tab-ico">&#x1F50A;</span><span class="tab-lbl">Read alouds</span><span class="peek-tab-count" id="peek-tab-readalouds-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
     <button class="peek-tab" id="peek-tab-cost" onclick="setPeekTab('cost')" title="Token usage &amp; cost for this worker, by task"><span class="tab-ico">$</span><span class="tab-lbl">Cost</span></button>
     <button class="peek-tab" id="peek-tab-transcript" onclick="setPeekTab('transcript')" title="Clean conversation transcript (from Claude Code's JSONL — gap-free, never torn)"><span class="tab-ico">☷</span><span class="tab-lbl">Transcript</span></button>
@@ -1931,10 +1970,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div id="peek-body" class="overlay-body" style="position:absolute;inset:0;"></div>
       <button class="peek-copy-btn" id="peek-copy-btn" onclick="copyPeekContent()" title="Copy all">&#x2398; Copy</button>
       <!-- Subagent switcher — appears only when the pane shows Claude's agents panel -->
-      <div class="peek-agent-nav" id="peek-agent-nav" style="display:none;">
-        <button onclick="agentNav('main')" title="View main conversation">&#x2302;</button>
-        <button onclick="agentNav('up')" title="View previous agent">&#x25B2;</button>
-        <button onclick="agentNav('down')" title="View next agent">&#x25BC;</button>
+      <!-- The pane-driven subagent switcher (⌂/▲/▼, agentNav) was DELETED
+           (ARE-7): it keyed on a "⏺ main" panel row Claude Code no longer
+           renders — measured 0 of 50 sessions, always display:none. Its
+           replacement is #peek-subagents-nav below (AMUX-2635), which reads
+           durable transcripts (50 of 50) and needs no visibility gate.
+           Resurrection, if the TUI ever ships a panel again: git log -S agentNav. -->
+      <!-- Subagent SCROLLER (Ethan 2026-08-13: "make sure i can scroll thru sub
+           agents in the terminal … i dont like the list subagents button").
+           Claude Code renders its agents panel again (● main / ○ general-purpose,
+           opened with ←), so this drives it directly: ← opens the panel, ▲/▼
+           move through the subagents in the pane. It sends raw keys via /keys
+           (peekQuickKeys) and lets Claude's native panel do the navigating —
+           NOT the server-side multi-step key choreography the old agentNav used
+           (ARE-7), which broke the moment the TUI's panel changed. The durable
+           transcript list (openSubagents / GET .../subagents) still exists in the
+           code if it's wanted elsewhere; the button here is the live scroller. -->
+      <div class="peek-agent-nav" id="peek-subagents-nav">
+        <button onclick="peekQuickKeys('Left')" title="Open Claude's agents panel (sends ←)">&#x2190;</button>
+        <button onclick="peekQuickKeys('Up')" title="Previous subagent (sends ↑)">&#x25B2;</button>
+        <button onclick="peekQuickKeys('Down')" title="Next subagent (sends ↓)">&#x25BC;</button>
       </div>
     </div>
     <div id="peek-status" class="overlay-status" onclick="_peekGeoDebug()" title="Tap for layout debug"></div>
@@ -1967,6 +2022,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();_openSavedMessages()">&#128190; Saved messages</button>
             <button type="button" onclick="_peekMoreClose();_dictOpenPopup()">&#127908; Dictate</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
+            <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
+            <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
           </div>
           <!-- Compact recording popup: live volume bars + timer, right above the
                composer. Stop → transcribe → text lands in the input. -->
@@ -2075,7 +2132,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <button id="piv-scope" class="btn" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
       <span id="peek-issues-count" style="flex:0 0 auto;font-size:0.78rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
-      <button class="btn" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;">+ Filter</button>
+      <button id="piv-filter" class="btn pbt-compact" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;"><span class="pbt-text">+ Filter</span><span class="pbt-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span></button>
       <span class="board-search-wrap" style="flex:1 1 160px;min-width:0;display:flex;position:relative;">
         <input id="peek-issues-search" class="search-input" type="text" style="width:100%;min-width:0;"
                placeholder="Search or filter: is:rotting, status:doing"
@@ -2084,7 +2141,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button class="search-clear"
                 onclick="document.getElementById('peek-issues-search').value='';_peekIssuesQuery='';_bfRenderChips();renderPeekIssues()">&#x2715;</button>
       </span>
-      <button class="btn primary" style="flex:0 0 auto;font-size:0.78rem;padding:5px 11px;white-space:nowrap;" onclick="openBoardAdd('backlog')">+ New issue</button>
+      <button class="btn primary pbt-compact" style="flex:0 0 auto;font-size:0.78rem;padding:5px 11px;white-space:nowrap;" onclick="openBoardAdd('backlog')"><span class="pbt-text">+ New issue</span><span class="pbt-ico" aria-hidden="true">+</span></button>
     </div>
     <!-- Same query language as the global board (_bqFilter), so is:rotting /
          status:doing / -tag:x behave identically on both surfaces. Scoped by the
@@ -2129,6 +2186,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div id="dict-outbox-strip"></div>
       <div id="dict-body" class="dict-body"></div>
+  </div>
+  <!-- Past read-alouds: replay any clip; auto-flushes after 30 days (Ethan 2026-08-13). -->
+  <div id="peek-readalouds-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div id="peek-readalouds-list" class="ra-list"></div>
   </div>
   <div id="peek-cost-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">

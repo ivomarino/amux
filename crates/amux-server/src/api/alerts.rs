@@ -70,27 +70,55 @@ impl AlertChannels for RealChannels {
             "/",
         )
         .await;
-        // send_all's single synthetic row (host "", status 0) means the
-        // broadcast could not even be attempted (vapid/db) — the equivalent
-        // of the exception Python's handler catches. Per-endpoint push-service
-        // rejections still count as dispatched, like Python.
-        if results.len() == 1 {
-            let r = &results[0];
-            if r.get("host").and_then(Value::as_str) == Some("")
-                && r.get("status").and_then(Value::as_u64) == Some(0)
-            {
-                let detail = r.get("detail").and_then(Value::as_str).unwrap_or("push failed");
-                if detail.starts_with("vapid:") || detail.starts_with("db") {
-                    return Err(detail.to_string());
-                }
-            }
-        }
-        Ok(())
+        push_delivery_verdict(&results)
     }
 
     async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
         send_sms(phone, text).await
     }
+}
+
+/// The FIRE-ALARM honesty rule, pure over `send_all`'s per-endpoint results so
+/// it can be tested without a network or a DB (mixpeek-finances / amux-cloud
+/// AC-347). `Ok(())` — a legitimate "sent" — is returned ONLY when an endpoint
+/// actually ACCEPTED the push (2xx). Everything else is a truthful error:
+///
+///   * broadcast couldn't be attempted (vapid/db) — the synthetic (host="",
+///     status 0) row;
+///   * ZERO subscriptions (AMUX-2938) — `send_all` returns an empty vec, which
+///     the old code let fall through to "sent" while reaching nobody (measured
+///     2026-08-11: 0 rows in `push_subscriptions`, alert answered {"push":"sent"});
+///   * subscriptions EXIST but every endpoint rejected (410 Gone / expired) —
+///     the gap AMUX-2938 left and MF-582 does NOT close: registering a sub does
+///     not help once it lapses, and the old rule ("per-endpoint rejections count
+///     as dispatched") reported "sent" for a page nobody received.
+///
+/// "sent" must mean an endpoint took it, never the send call's self-description.
+fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
+    if results.len() == 1 {
+        let r = &results[0];
+        if r.get("host").and_then(Value::as_str) == Some("")
+            && r.get("status").and_then(Value::as_u64) == Some(0)
+        {
+            let detail = r.get("detail").and_then(Value::as_str).unwrap_or("push failed");
+            if detail.starts_with("vapid:") || detail.starts_with("db") {
+                return Err(detail.to_string());
+            }
+        }
+    }
+    if results.is_empty() {
+        return Err("no push subscriptions — nobody is registered to receive it".into());
+    }
+    let delivered = results.iter().any(|r| {
+        matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s))
+    });
+    if !delivered {
+        return Err(format!(
+            "push not delivered — {} subscription(s), 0 accepted (all rejected/expired)",
+            results.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Python `_send_sms`: Twilio when TWILIO_* is configured, else macOS
@@ -203,6 +231,43 @@ pub(crate) fn urgent_alert_decision(
     (AlertAction::Send, recent, 0.0)
 }
 
+/// Rebuild guard state for one key from the `owner_alerts` LEDGER.
+///
+/// The in-memory maps below are the Python port's shape, and on this server
+/// they are fiction: `AlertGuard::default()` is constructed in `routes()`, and
+/// the process re-execs every time the auto-builder adopts a commit — many
+/// times an hour on a shared checkout. So the storm guard forgot everything
+/// constantly and every alert arrived as a first alert.
+///
+/// MEASURED (MF-427, 2026-08-11): 81 rows in owner_alerts, **0 with deduped=1**
+/// — the guard had never suppressed anything, ever. The reported storm was 38
+/// identical `--help` alerts over 186 minutes at a ~302s cadence;
+/// STORM_THRESHOLD=2 over an 1800s window would have muted it after the second,
+/// had the state survived.
+///
+/// The durable history was already written on every attempt — including
+/// suppressed ones, deliberately, so suppression never hides evidence. Nothing
+/// read it back. This reads it back.
+fn guard_state_from_ledger(
+    conn: &rusqlite::Connection,
+    session: &str,
+    msg: &str,
+) -> (Vec<f64>, Option<f64>) {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT ts FROM owner_alerts WHERE claimed=?1 AND message=?2 ORDER BY ts DESC LIMIT 64",
+    ) else {
+        return (vec![], None);
+    };
+    let ts: Vec<f64> = stmt
+        .query_map(rusqlite::params![session, msg], |r| r.get::<_, f64>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    let last = ts.first().copied();
+    let mut hist = ts;
+    hist.reverse(); // oldest-first, for the storm window filter
+    (hist, last)
+}
+
 /// Per-router guard state (Python's `_urgent_alert_last` / `_hist` / `_mute`
 /// module dicts). Keyed by sha256(claimed_session + "|" + msg)[..16].
 #[derive(Default)]
@@ -286,12 +351,7 @@ fn py_repr(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+use crate::config::now_f64;
 
 /// Best-effort ledger append (Python `_record_owner_alert`): never let a
 /// ledger-write failure block the alarm itself.
@@ -361,6 +421,8 @@ async fn post_owner(
         .into_response();
     }
 
+    let dry_run = body.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+
     let mut msg = m.to_string();
     if !reason.is_empty() {
         msg = format!("{msg}\n({reason})");
@@ -378,22 +440,95 @@ async fn post_owner(
         hex::encode(h.finalize())[..16].to_string()
     };
     let now = now_f64();
+    // Seed from the LEDGER when the in-memory guard has nothing for this key —
+    // i.e. after every restart, which is most of the time on this server. The
+    // in-memory maps stay the hot path; the ledger is what lets the guard
+    // survive the auto-builder swapping the binary underneath it.
+    let (ledger_hist, ledger_last) = match state.store.read() {
+        Ok(conn) => guard_state_from_ledger(&conn, &session, &msg),
+        Err(_) => (vec![], None),
+    };
+    // `simulate_history: N` (dry-run only) — synthesise N prior in-window
+    // attempts so the send->dedupe->mute TRANSITION can be exercised without
+    // writing history or paging anyone.
+    //
+    // mixpeek-frustrations could verify "a first alert still sends" and "dry-run
+    // does not mutate", but NOT the transition, and for a structural reason: a
+    // dry run cannot write history, so repeating it can never cross
+    // threshold=2. Their words, and they are right — without this the claim
+    // "the guard suppresses" stays reasoned-not-measured, which is precisely
+    // the state my own 81-rows-zero-deduped finding shows is dangerous.
+    let simulate: Option<i64> = body.get("simulate_history").and_then(Value::as_i64);
+    let ledger_hist: Vec<f64> = match simulate {
+        // Spread them inside the storm window, oldest first, all strictly
+        // before `now` — the same shape a real burst leaves behind.
+        Some(n) if dry_run && n > 0 => (1..=n.min(64))
+            .map(|i| now - (STORM_WINDOW / (n.min(64) as f64 + 1.0)) * (i as f64))
+            .rev()
+            .collect(),
+        _ => ledger_hist,
+    };
     let (action, hist_len) = {
         let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
+        let mem_hist: Vec<f64> = g.hist.get(&key).cloned().unwrap_or_default();
+        let hist_in: Vec<f64> = if mem_hist.is_empty() { ledger_hist } else { mem_hist };
+        let last_in = g.last.get(&key).copied().or(ledger_last);
         let (action, new_hist, new_mute) = urgent_alert_decision(
             now,
-            g.hist.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+            &hist_in,
             g.mute.get(&key).copied().unwrap_or(0.0),
-            g.last.get(&key).copied(),
+            last_in,
         );
         let hist_len = new_hist.len();
-        g.hist.insert(key.clone(), new_hist);
-        g.mute.insert(key.clone(), new_mute);
-        if matches!(action, AlertAction::Send | AlertAction::StormNotice) {
-            g.last.insert(key.clone(), now);
+        // A DRY RUN MUST NOT MUTATE THE GUARD. Caught on the first live probe of
+        // this very feature: four dry-runs of one message returned send, then
+        // dedupe, dedupe, dedupe — because the first had written `last`. That
+        // means a dry run could suppress a subsequent REAL alert for 60s, and a
+        // rehearsal that quiets the fire alarm is worse than no rehearsal.
+        if !dry_run {
+            g.hist.insert(key.clone(), new_hist);
+            g.mute.insert(key.clone(), new_mute);
+            if matches!(action, AlertAction::Send | AlertAction::StormNotice) {
+                g.last.insert(key.clone(), now);
+            }
         }
         (action, hist_len)
     };
+
+    // DRY RUN (MF-427). Verifying a storm guard used to require FIRING the
+    // channel, which reaches Ethan's phone by push AND iMessage — and because a
+    // storm needs a sustained burst to reproduce, an honest test meant paging
+    // him repeatedly. mixpeek-frustrations correctly refused to make that trade
+    // and stopped. This runs the identical decision against the identical state
+    // and reports the verdict, sending nothing and writing nothing.
+    if dry_run {
+        return Json(json!({
+            "ok": true, "dry_run": true,
+            "would": match action {
+                AlertAction::Send => "send",
+                AlertAction::Dedupe => "suppress (dedupe: same message within 60s)",
+                AlertAction::StormNotice => "send ONE storm notice, then mute",
+                AlertAction::Muted => "suppress (storm mute active)",
+            },
+            // NAMED FOR WHAT IT IS. `hist_len` was ambiguous exactly at the
+            // boundary the guard turns on: it counts in-window history
+            // INCLUDING this hypothetical alert, so a novel message reports 1
+            // and a key with one prior row reports 2 — which is threshold, so
+            // the SECOND alert is the one that mutes. mixpeek-frustrations
+            // caught the ambiguity and inferred the right reading; a field that
+            // needs inferring on the deciding boundary is a bad field.
+            "would_be_attempt_number": hist_len,
+            "prior_attempts_in_window": hist_len.saturating_sub(1),
+            "simulated_history": simulate.filter(|_| dry_run),
+            "storm_threshold": STORM_THRESHOLD,
+            "storm_window_s": STORM_WINDOW,
+            "storm_mute_s": STORM_MUTE,
+            "key": key,
+            "message": msg, "origin": origin, "claimed": session,
+            "note": "no channel was contacted and no ledger row was written",
+        }))
+        .into_response();
+    }
 
     match action {
         AlertAction::Dedupe => {
@@ -434,9 +569,31 @@ async fn post_owner(
             Ok(()) => out_channels.insert("push".into(), json!("sent")),
             Err(e) => out_channels.insert("push".into(), json!(format!("error: {}", truncate(&e, 80)))),
         };
+    } else {
+        // Symmetric with the sms branch below: a channel that was switched off
+        // must SAY it was switched off. Omitting the key made "disabled" and
+        // "never attempted" identical on the wire (AMUX-2938).
+        out_channels.insert("push".into(), json!("disabled (AMUX_URGENT_PUSH=0)"));
     }
     let phone = effective_env(&home, "AMUX_OWNER_PHONE").unwrap_or_default();
-    if effective_env(&home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0" && !phone.is_empty() {
+    let sms_enabled = effective_env(&home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
+    // SAY WHY IT DID NOT TEXT, rather than omitting the key (AMUX-2938). The
+    // response used to carry no `sms` field at all when either condition was
+    // false, so "disabled on purpose", "no phone configured" and "the send was
+    // never attempted" were the same bytes on the wire — and CLAUDE.md
+    // documents the contract as {"channels":{"push":...,"sms":...}}, so a
+    // caller checking `channels.sms` got None and could not tell.
+    //
+    // Both are OFF on this machine right now (AMUX_URGENT_SMS=0, and
+    // AMUX_OWNER_PHONE present but empty), which is very likely a deliberate
+    // response to the 38-SMS night of 2026-08-03 — see cmd_alert in the CLI.
+    // Deliberate or not, the alarm must say so out loud.
+    if !sms_enabled {
+        out_channels.insert("sms".into(), json!("disabled (AMUX_URGENT_SMS=0)"));
+    } else if phone.is_empty() {
+        out_channels.insert("sms".into(), json!("no phone configured (AMUX_OWNER_PHONE is empty)"));
+    }
+    if sms_enabled && !phone.is_empty() {
         // Stamp the originating session so the owner sees WHICH session
         // raised the alarm (the push title already carries it).
         let sms_prefix = if !session.is_empty() {
@@ -526,6 +683,83 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fire-alarm honesty rule (AC-347 / mixpeek-finances). "sent" is
+    /// legitimate ONLY when an endpoint accepted the push (2xx). The whole
+    /// incident was "sent" reported for a page nobody received — this pins that
+    /// it can't happen again for either shape: zero subs, or subs-all-rejected.
+    #[test]
+    fn push_is_delivered_only_when_an_endpoint_accepts_never_on_zero_or_all_rejected() {
+        let row = |status: u64| json!({"host": "push.example", "status": status, "detail": "x"});
+
+        // ≥1 endpoint accepted (2xx) -> the ONLY legitimate "sent".
+        assert!(push_delivery_verdict(&[row(201), row(410)]).is_ok(), "one 2xx is a real delivery");
+        assert!(push_delivery_verdict(&[row(200)]).is_ok());
+
+        // ZERO subscriptions -> not a send (AMUX-2938).
+        let e = push_delivery_verdict(&[]).unwrap_err();
+        assert!(e.contains("no push subscriptions"), "{e}");
+
+        // Subscriptions EXIST but every endpoint rejected (410 Gone / expired)
+        // -> the gap MF-582 doesn't close. Must be an error, not "sent".
+        let e = push_delivery_verdict(&[row(410), row(404), row(500)]).unwrap_err();
+        assert!(e.contains("not delivered") && e.contains("0 accepted"), "all-rejected must not be sent: {e}");
+
+        // Broadcast couldn't be attempted (vapid/db) -> the synthetic error row.
+        let e = push_delivery_verdict(&[json!({"host":"","status":0,"detail":"vapid: bad key"})]).unwrap_err();
+        assert!(e.starts_with("vapid:"), "{e}");
+
+        // The negative control that proves the check bites: a non-2xx-only set
+        // must NEVER read as delivered, however many rows it has.
+        assert!(push_delivery_verdict(&[row(429), row(429)]).is_err(), "'we called send' is not delivery");
+    }
+
+    /// MF-427. The guard was correct and its STATE was fiction: the in-memory
+    /// maps are rebuilt by `routes()` and this process re-execs on every commit
+    /// the auto-builder adopts. Measured on the live ledger: 81 alerts, 0 ever
+    /// deduped, including a 38x `--help` storm at a ~302s cadence that
+    /// STORM_THRESHOLD=2 over 1800s should have muted after the second.
+    ///
+    /// This replays that storm through the pure decision to show the guard
+    /// stops it WHEN IT REMEMBERS — so the defect is provably the persistence,
+    /// not the policy.
+    #[test]
+    fn the_302s_storm_is_muted_once_history_survives_a_restart() {
+        let mut hist: Vec<f64> = vec![];
+        let mut mute = 0.0;
+        let mut last: Option<f64> = None;
+        let mut sent = 0;
+        let mut suppressed = 0;
+        let t0 = 1_000_000.0;
+
+        for i in 0..38 {
+            let now = t0 + (i as f64) * 302.0;
+            let (action, h, m) = urgent_alert_decision(now, &hist, mute, last);
+            hist = h;
+            mute = m;
+            match action {
+                AlertAction::Send | AlertAction::StormNotice => { sent += 1; last = Some(now); }
+                _ => suppressed += 1,
+            }
+        }
+        // 38 attempts, and the owner is paged a handful of times, not 38.
+        assert!(sent < 10, "38 identical alerts paged the owner {sent} times — the guard did not hold");
+        assert_eq!(sent + suppressed, 38);
+
+        // THE CONTROL, and the actual bug: reset the state between every alert,
+        // which is exactly what a restart does. Every one gets through.
+        let mut sent_amnesiac = 0;
+        for i in 0..38 {
+            let now = t0 + (i as f64) * 302.0;
+            let (action, _, _) = urgent_alert_decision(now, &[], 0.0, None);
+            if matches!(action, AlertAction::Send | AlertAction::StormNotice) { sent_amnesiac += 1; }
+        }
+        assert_eq!(
+            sent_amnesiac, 38,
+            "with state reset each time every alert is delivered — this is what the ledger fix prevents"
+        );
+    }
+
     use crate::api::settings::test_env;
     use axum::body::Body;
     use axum::http::Request;
@@ -771,15 +1005,63 @@ mod tests {
     async fn owner_alert_respects_channel_config() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = test_env::set_home(dir.path());
-        // Push disabled, no phone: nothing is attempted, response says so.
+        // Push disabled, no phone: nothing is attempted, and the response SAYS
+        // so per channel. This assertion used to be `json!({})` — an empty
+        // object — directly under a comment claiming "response says so", which
+        // it plainly did not (AMUX-2938). The comment described the intent; the
+        // assertion locked in the opposite, and a caller could not distinguish
+        // "disabled on purpose" from "the alarm silently did nothing".
         set_server_env_key(dir.path(), "AMUX_URGENT_PUSH", "0").unwrap();
         let mock = MockChannels::ok();
         let app = app(mock.clone());
         let (_, v) =
             send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "no channels case" }))).await;
         assert_eq!(v["ok"], json!(true));
-        assert_eq!(v["channels"], json!({}));
+        assert_eq!(
+            v["channels"],
+            json!({
+                "push": "disabled (AMUX_URGENT_PUSH=0)",
+                "sms": "no phone configured (AMUX_OWNER_PHONE is empty)",
+            })
+        );
         assert_eq!(v_len(&mock), 0);
+    }
+
+    /// A FIRE ALARM MUST NOT REPORT SUCCESS HAVING REACHED NOBODY (AMUX-2938).
+    ///
+    /// Measured on the live machine 2026-08-11, while Ethan was asking whether
+    /// the urgent path works: `push_subscriptions` held 0 rows and a real
+    /// POST /api/alert/owner answered `{"channels":{"push":"sent"}}`. `send_all`
+    /// returns an empty vec with no subscribers, which fell through every
+    /// failure branch and landed on Ok(()).
+    ///
+    /// This is the only endpoint whose entire job is reaching a human who is
+    /// not looking at the screen, and it said "sent" to nobody — while
+    /// CLAUDE.md tells every session both channels are "wired and confirmed
+    /// working".
+    #[tokio::test]
+    async fn push_with_no_subscribers_is_not_a_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        // RealChannels, not the mock: the defect lived in RealChannels::push's
+        // reading of send_all, so a mocked push would prove nothing.
+        let store = crate::db::Store::open(&dir.path().join("push-test.db")).unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let out = RealChannels.push(&state, "amux", "drill").await;
+        assert!(
+            out.is_err(),
+            "0 subscriptions must NOT report a send — got {out:?}"
+        );
+        let e = out.unwrap_err();
+        assert!(
+            e.contains("no push subscriptions"),
+            "the reason must name the cause, got {e:?}"
+        );
     }
 
     #[tokio::test]

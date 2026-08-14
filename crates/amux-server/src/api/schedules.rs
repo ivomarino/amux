@@ -181,9 +181,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }))
-}
+use super::internal;
 
 fn not_found() -> Response {
     err(StatusCode::NOT_FOUND, json!({ "error": "not found" }))
@@ -293,6 +291,10 @@ pub struct ListParams {
     /// a schedule bound to a session surfaces for it, not for everyone).
     #[serde(default)]
     pub session: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 pub async fn list(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
@@ -340,20 +342,43 @@ pub async fn list(State(state): State<AppState>, Query(p): Query<ListParams>) ->
     .await;
     match joined {
         Ok(Ok(out)) => {
+            let total = out.len();
+            let offset = p.offset.unwrap_or(0);
+            let page: Vec<Value> = if offset >= out.len() {
+                Vec::new()
+            } else if let Some(lim) = p.limit {
+                out.into_iter().skip(offset).take(lim).collect()
+            } else {
+                out.into_iter().skip(offset).collect()
+            };
+            let mut headers = HeaderMap::new();
+            let put = |h: &mut HeaderMap, k: &str, v: String| {
+                if let Ok(name) = k.parse::<axum::http::header::HeaderName>() {
+                    if let Ok(val) = v.parse() {
+                        h.insert(name, val);
+                    }
+                }
+            };
+            put(&mut headers, "x-amux-total", total.to_string());
+            put(&mut headers, "x-amux-offset", offset.to_string());
+            put(&mut headers, "x-amux-returned", page.len().to_string());
             // Point at the audit from the payload people actually read
             // (AMUX-2416: the trail existed, nobody found it).
-            (
-                [
-                    ("x-amux-audit", "/api/schedules/audit?id=<SCHED-N>&limit=100"),
-                    // Declared on the payload people READ, not only on the
-                    // write that gets refused (ethos rule 4): every row here
-                    // still carries these columns, and a value in a column is
-                    // indistinguishable from a working feature otherwise.
-                    ("x-amux-unhonoured-fields", UNHONOURED_FIELDS_HEADER),
-                ],
-                Json(Value::Array(out)),
-            )
-                .into_response()
+            put(
+                &mut headers,
+                "x-amux-audit",
+                "/api/schedules/audit?id=<SCHED-N>&limit=100".to_string(),
+            );
+            // Declared on the payload people READ, not only on the
+            // write that gets refused (ethos rule 4): every row here
+            // still carries these columns, and a value in a column is
+            // indistinguishable from a working feature otherwise.
+            put(
+                &mut headers,
+                "x-amux-unhonoured-fields",
+                UNHONOURED_FIELDS_HEADER.to_string(),
+            );
+            (StatusCode::OK, headers, Json(Value::Array(page))).into_response()
         }
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),

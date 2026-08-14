@@ -137,7 +137,7 @@ amux is growing into the durable operating system around agents: it owns executi
 ## Resources
 
 - [Getting started](https://amux.io/guides/getting-started/) · [Running 10+ agents](https://amux.io/guides/running-10-plus-agents/) · [Agent-to-agent orchestration](https://amux.io/guides/agent-to-agent-orchestration/) · [REST API reference](https://amux.io/guides/rest-api-reference/)
-- [Board system guide](guide.md) (columns, types, gates, `done` vs `verified`)
+- [Board system guide](docs/guide.md) (columns, types, gates, `done` vs `verified`)
 - [Remote control over Tailscale](REMOTE.md) · [Calendar sync](docs/calendar-sync.md)
 - [How amux compares](https://amux.io/compare/) · [Use cases](https://amux.io/use-cases/) · [FAQ](https://amux.io/faq/)
 - iOS app: [App Store](https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435) · Managed onboarding: [amux.io/concierge](https://amux.io/concierge/)

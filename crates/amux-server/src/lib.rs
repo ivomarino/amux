@@ -117,6 +117,41 @@ async fn async_main() {
     let env_filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
     };
+    /// Is fd 1 the very file we just opened? See the call site for why this is
+    /// (dev, ino) and not a path comparison. Non-unix has no `/dev/fd`, and no
+    /// launchd either, so the tee is correct there.
+    fn stdout_is_same_file(f: &std::fs::File) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            use std::os::unix::fs::MetadataExt;
+            // fstat the DESCRIPTOR, never stat("/dev/fd/1"): on macOS that path
+            // stats the /dev entry itself and reports a character device, so it
+            // never matches a regular file. The first cut of this fix did
+            // exactly that, shipped, and reported tee_to_stdout=true against a
+            // log that was provably still doubling — a probe guessing where the
+            // answer lived and missing by one layer.
+            //
+            // try_clone_to_owned() dups fd 1; dropping the dup does not close
+            // stdout, so this stays safe with no `unsafe` and no mem::forget.
+            let Ok(a) = f.metadata() else { return false };
+            let same = std::io::stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .map(std::fs::File::from)
+                .and_then(|sf| sf.metadata())
+                .map(|b| a.dev() == b.dev() && a.ino() == b.ino())
+                // Unknown: keep the tee. Over-logging is recoverable; losing the
+                // log because a stat failed is not.
+                .unwrap_or(false);
+            same
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = f;
+            false
+        }
+    }
     let log_file = {
         let dir = cfg.amux_home.join("logs");
         std::fs::create_dir_all(&dir).ok();
@@ -129,11 +164,36 @@ async fn async_main() {
     match log_file {
         Some(f) => {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter())
-                .with_ansi(false)
-                .with_writer(std::io::stdout.and(Arc::new(f)))
-                .init()
+            // ...but NOT when stdout ALREADY IS that file, which under launchd
+            // it always is: com.amux.server-rs.plist sets both StandardOutPath
+            // and StandardErrorPath to this exact path. Teeing then writes every
+            // line twice — measured 2026-08-11 on the live log, 1,485 unique
+            // lines out of 3,000.
+            //
+            // That is not merely wasted bytes, it is a CORRUPT INSTRUMENT: this
+            // file is what `GET /api/logs/raw` tails and what the SPA's Logs tab
+            // renders, so every count taken from it — by a human, a sweep, or an
+            // autofix loop — was inflated ~2x, and inflated silently, because
+            // duplicate log lines look exactly like a thing that really happened
+            // twice. It cost me a wrong first reading of my own AMUX-2909 probe
+            // (one delivery, reported by the log as two).
+            //
+            // Compared by (dev, ino) rather than by path: launchd hands us an
+            // already-open fd and the path could be a symlink, a relative spelling
+            // or a rotated file, so string comparison would silently miss.
+            let dup = stdout_is_same_file(&f);
+            let sub = tracing_subscriber::fmt().with_env_filter(env_filter()).with_ansi(false);
+            if dup {
+                sub.with_writer(Arc::new(f)).init()
+            } else {
+                sub.with_writer(std::io::stdout.and(Arc::new(f))).init()
+            }
+            // Say which way it went, once, so "why is my log duplicated / empty"
+            // is answerable from the log itself instead of from this comment.
+            tracing::info!(
+                tee_to_stdout = !dup,
+                "log writer configured (stdout suppressed when it is the same file — AMUX-2906)"
+            );
         }
         None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
     }
@@ -149,7 +209,7 @@ async fn async_main() {
     };
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
-    // Lets scripts/migration-rehearsal.sh exercise the EXACT production
+    // Lets docs/rust-migration/migration-rehearsal.sh exercise the EXACT production
     // migration path against a DB copy without binding ports.
     if cfg.env.get("AMUX_RS_MIGRATE_ONLY").map(|v| v == "1").unwrap_or(false) {
         let conn = store.read().expect("read after migrate");
@@ -258,6 +318,12 @@ async fn async_main() {
     // whose absence is why the outage went unnoticed for hours.
     drop(runtime_jobs::board_drive::spawn(state.clone()));
 
+    // Automatic accountability (AMUX-2990, Ethan: "the accountability shit needs
+    // to be automatic"). Sweeps for lanes with human messages but no board card
+    // and steers each to open one — server-side, so it reaches any group. One
+    // nudge per lane per 24h. Held like board-drive so the loop is not dropped.
+    drop(api::messages::accountability_spawn(state.clone()));
+
     // Pane-size restoration (AMUX-2634): a peek resizes the worker's tmux
     // window to the READER's viewport and tmux pins `window-size manual`, so
     // one phone glance used to narrow that worker's output permanently — the
@@ -292,6 +358,10 @@ async fn async_main() {
     // while those directories were GROWING, so a fleet that stopped transcoding
     // never evicted a transcode.
     drop(runtime_jobs::storage::spawn(state.clone()));
+    // The token_ledger WRITER. Every reader of that table was ported at the
+    // cutover and this was not, so /api/stats/daily served a confident
+    // total_tokens: 0 for 36 hours (AMUX-2892).
+    drop(runtime_jobs::token_ledger::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
@@ -460,61 +530,26 @@ async fn async_main() {
         }
     });
 
-    // LEGACY PORT TAKEOVER (python retirement, 2026-08-09): every running
-    // fleet session carries AMUX_URL=https://localhost:8822 baked into its
-    // process env — env vars in live processes cannot be rotated, so the
-    // moment the python server stopped, the whole fleet's board/API calls
-    // started failing. The rust server therefore answers the OLD port too:
-    // same router, same TLS, same auth. Gated on AMUX_RS_LEGACY_PORT so a
-    // deliberate python resurrection (unset it) gets the port back without a
-    // code change. Set to 8822 in ~/.amux/server.env.
+    // THE LEGACY 8822 BIND IS GONE (Ethan, 2026-08-11: "no more 8822 just rust").
     //
-    // THE ADDRESS IS RETIRED (2026-08-10); only these carried-over processes
-    // keep it alive. Every config, doc, CLI default and newly-spawned session
-    // now uses the canonical port (AMUX_RS_PORT, 8824 locally). This bind is
-    // therefore a countdown, not a feature — see `legacy_port` for the exit
-    // condition and `GET /api/debug/legacy-port` for the number that decides
-    // it. DO NOT drop this bind on the assumption the fleet has rotated; read
-    // the counter, because being wrong breaks ~60 live sessions at once.
-    let legacy_cfg = std::env::var("AMUX_RS_LEGACY_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok());
-
-    // Publish where this server actually is, for the one class of client that
-    // cannot be told any other way: a hook spawned by a pre-cutover `claude`
-    // process, which inherits `AMUX_URL=…:8822` from an env that cannot be
-    // rotated. Fixing those hooks' DEFAULTS did nothing — a default only fires
-    // when the variable is UNSET. See `legacy_port::publish_endpoint`.
-    legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, legacy_cfg);
-
-    if let Some(legacy_port) = legacy_cfg {
-        let legacy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], legacy_port));
-        let legacy_acceptor = tls::RedirectingAcceptor::new(
-            axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg.clone()),
-            format!("localhost:{legacy_port}"),
-        );
-        // Counted by LAYER on this clone, so a hit means the request physically
-        // arrived on the legacy socket — a Host-header sniff would also count
-        // requests that merely SAY 8822 while arriving on the canonical port.
-        let legacy_app = app
-            .clone()
-            .layer(axum::middleware::from_fn(legacy_port::count));
-        legacy_port::arm(legacy_port);
-        jobs::spawn_loop(jobs::ids::LEGACY_PORT, None, legacy_port::run_reporter());
-        tracing::info!(%legacy_addr, "listening on LEGACY port (fleet AMUX_URL compatibility)");
-        tokio::spawn(async move {
-            if let Err(e) = axum_server::bind(legacy_addr)
-                .acceptor(legacy_acceptor)
-                .serve(
-                    legacy_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .await
-            {
-                // Port taken (python running?) — log loudly, keep the primary.
-                tracing::error!(error = %e, port = legacy_port, "legacy port bind failed");
-            }
-        });
-    }
+    // It existed because the python retirement stranded every running lane:
+    // AMUX_URL was baked into live process envs that cannot be rotated, so the
+    // rust server answered the old port too — same router, same TLS, same auth.
+    // It was always a countdown rather than a feature, and this is the owner
+    // calling it, ahead of the automatic 7-day-quiet exit.
+    //
+    // WHAT REPLACED IT, so nobody re-adds the bind to fix the symptom: sessions
+    // are launched with AMUX_URL derived from `config::canonical_port()`
+    // (session_verbs.rs), the CLI defaults to the canonical port, and
+    // `publish_endpoint` below writes the real address for the one client class
+    // that can be told no other way — a hook spawned by a pre-cutover process,
+    // which inherits the stale variable and whose DEFAULT therefore never
+    // fires. Any lane still holding the old address gets connection-refused,
+    // which is loud and fixed by restarting that lane.
+    //
+    // tests/legacy_port_guard.rs fails the build if the retired address
+    // reappears in code, scripts or e2e.
+    legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
     tracing::info!(%addr, "listening (https, plain-http redirected)");

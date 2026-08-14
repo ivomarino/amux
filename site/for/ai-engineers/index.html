@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#1e2330">
   <title>amux for AI Engineers — Workflow Orchestration, Multi-Model Routing &amp; Harness Engineering (2026)</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="AI engineers use amux as their agent control plane — orchestrating multi-model fleets (Claude Code, Codex, Gemini CLI), tracking token spend, integrating MCP servers, and running self-healing pipelines overnight. Open source, single Python file, zero external dependencies.">
+  <meta name="description" content="AI engineers use amux as their agent control plane — orchestrating multi-model fleets (Claude Code, Codex, Gemini CLI), tracking token spend, integrating MCP servers, and running self-healing pipelines overnight. Open source, single Rust binary, zero external dependencies.">
   <meta name="keywords" content="AI engineer tools 2026, AI engineer workflow orchestration, agent control plane AI engineers, multi-model agent routing, harness engineering Claude Code, AI agent observability, MCP server integration, self-healing AI pipeline, amux for AI engineers">
   <link rel="canonical" href="https://amux.io/for/ai-engineers/">
   <meta property="og:title" content="amux for AI Engineers — Workflow Orchestration, Multi-Model Routing &amp; Harness Engineering (2026)">
@@ -63,7 +63,7 @@
         "name": "What makes amux different from other multi-agent orchestration frameworks for AI engineers?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Most orchestration frameworks (LangGraph, CrewAI, AutoGen) require you to express agent topology in Python code and run agents as async tasks inside a single process. amux is a control plane: each agent runs as an independent OS process (tmux session), giving you real isolation, real process supervision, real PID-level resource limits, and a JSONL transcript per agent you can parse, replay, or fork. The amux server exposes a REST API that any agent or external system can call — not a Python-only SDK. And because it's one Python file with no external dependencies, you can read, modify, and deploy it in any environment."
+          "text": "Most orchestration frameworks (LangGraph, CrewAI, AutoGen) require you to express agent topology in Python code and run agents as async tasks inside a single process. amux is a control plane: each agent runs as an independent OS process (tmux session), giving you real isolation, real process supervision, real PID-level resource limits, and a JSONL transcript per agent you can parse, replay, or fork. The amux server exposes a REST API that any agent or external system can call — not a Python-only SDK. And because it's one Rust binary with no external dependencies, you can read, modify, and deploy it in any environment."
         }
       },
       {
@@ -129,7 +129,7 @@
     <h1>amux for AI Engineers</h1>
     <p class="subtitle">The open-source control plane AI engineers deploy once and build their entire agent infrastructure on top of. Updated August 2026.</p>
 
-    <p>AI engineers don't just use agent tools — they build, orchestrate, and operate them. amux is the infrastructure layer: it runs your agent fleet as isolated processes with real supervision, exposes a clean REST API any agent or external system can call, tracks token spend from JSONL transcripts, integrates MCP servers fleet-wide, and self-heals sessions overnight without babysitting. Open source, single Python file, zero external dependencies — you can read the entire source, modify it, and deploy it on any Linux or macOS machine in under five minutes.</p>
+    <p>AI engineers don't just use agent tools — they build, orchestrate, and operate them. amux is the infrastructure layer: it runs your agent fleet as isolated processes with real supervision, exposes a clean REST API any agent or external system can call, tracks token spend from JSONL transcripts, integrates MCP servers fleet-wide, and self-heals sessions overnight without babysitting. Open source, single Rust binary, zero external dependencies — you can read the entire source, modify it, and deploy it on any Linux or macOS machine in under five minutes.</p>
 
     <div style="background:var(--surface-2);border-left:3px solid var(--accent,#c75b2e);padding:1rem 1.25rem;border-radius:0 6px 6px 0;margin:1.5rem 0">
       <strong>For AI engineers specifically:</strong> amux is not a Python orchestration SDK. Each agent is an independent OS process with its own PID, JSONL transcript, tmux window, and resource envelope. The control plane is a REST API. This gives you real isolation, real process supervision, and real observability — not async tasks inside a shared Python event loop.
@@ -491,10 +491,10 @@ jobs:
 
     <div class="cta-box">
       <h3>Deploy your agent control plane</h3>
-      <p>amux is the open-source infrastructure AI engineers deploy once and build their entire agent stack on top of. Single Python file, REST API, JSONL observability, self-healing watchdog, MIT licensed.</p>
+      <p>amux is the open-source infrastructure AI engineers deploy once and build their entire agent stack on top of. Single Rust binary, REST API, JSONL observability, self-healing watchdog, MIT licensed.</p>
       <pre><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-top:0.5rem">
         <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
         <a class="btn" href="/guides/harness-engineering/">Harness engineering guide</a>

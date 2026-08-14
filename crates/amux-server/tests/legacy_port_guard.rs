@@ -35,15 +35,18 @@ use std::path::{Path, PathBuf};
 
 /// Files permitted to contain a literal legacy address, each with the reason.
 /// When the bind is finally dropped, most of these disappear with it.
+///
+/// THE BIND WAS DROPPED 2026-08-11 (Ethan: "no more 8822 just rust"), and
+/// lib.rs's row went with it — exactly as this comment predicted. The mirror
+/// check below is what forced it: it failed with "allowlisted but no longer
+/// contains a legacy address — delete the row so the file is guarded again",
+/// which is the whole point of checking an allowlist in both directions. A
+/// stale exemption is a file quietly outside the guard.
 const ALLOW: &[(&str, &str)] = &[
     // -- the dual-bind implementation itself --
     (
         "crates/amux-server/src/legacy_port.rs",
         "the retirement instrument; it exists to talk about this port",
-    ),
-    (
-        "crates/amux-server/src/lib.rs",
-        "the bind block's own comment, explaining why the port is answered",
     ),
     (
         "crates/amux-server/src/config.rs",
@@ -85,12 +88,13 @@ const ALLOW: &[(&str, &str)] = &[
          connected account, and the value must match byte-for-byte. Retiring it is a \
          coordinated change (update the console, then this constant), NOT a port sweep",
     ),
+    // NOTE: crates/amux-server/src/api/py_proxy.rs was allowlisted here for its
+    // `AMUX_PY_URL` fallback, with the reasoning "this default is unreachable;
+    // it dies with the module". It did — AMUX-2906 deleted the forwarder, so
+    // the literal is gone and this row went with it. That is
+    // `allowlist_rows_are_live_and_reasoned` doing its job a second time: the
+    // row could not outlive the code it excused.
     // -- historical / dead code --
-    (
-        "crates/amux-server/src/api/py_proxy.rs",
-        "AMUX_PY_URL fallback for the retired python proxy. PROXIED_FAMILIES is empty \
-         and asserted empty, so this default is unreachable; it dies with the module",
-    ),
     (
         "crates/amux-server/src/api/request_log.rs",
         "provenance comments recording the URL a golden fixture was captured from — \

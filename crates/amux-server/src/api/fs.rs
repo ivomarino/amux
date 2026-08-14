@@ -6,7 +6,7 @@
 //! `?path=` relative to a root) — both stay mounted; see
 //! docs/rust-migration/server-boundary.md.
 //!
-//! Python source of record (amux-server.py, checked 2026-08-09):
+//! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - path containment  `_is_path_allowed`      py:93-121  (deny sets py:82-91)
 //! - dangerous writes  `_is_dangerous_write`   py:670-698
 //! - POST   /api/fs/mkdir                      py:67883-67899

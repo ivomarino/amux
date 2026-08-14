@@ -760,6 +760,76 @@ cmd_send() {
 # provenance, no record, could interrupt an in-flight turn — which is how the
 # 2026-07-22 ts-gke→mvs-infra→gtm-engine misroute happened (AMUX-1818). Raw
 # tmux is kept only as a loud last-resort fallback when the server is down.
+# ── Unstamped-send ledger (AMUX-2670) ───────────────────────────────────────
+#
+# A raw-tmux fallback happens precisely when the server cannot be told about it,
+# so the record has to be made locally and reconciled later. Otherwise an
+# unaudited send and a send that never happened look identical from the server,
+# which is the gap this ledger closes.
+#
+# Failure here must never break a send: every write is best-effort.
+_unstamped_ledger() { echo "${CC_HOME}/pending-unstamped.jsonl"; }
+
+_record_unstamped_send() {
+  local target="$1" body="$2"
+  local f; f=$(_unstamped_ledger)
+  TGT="$target" BODY="$body" FROM="${AMUX_SESSION:-}" python3 -c "
+import json, os, time, sys
+try:
+    print(json.dumps({
+        'target': os.environ['TGT'],
+        'text': os.environ['BODY'],
+        'from': os.environ.get('FROM', ''),
+        'ts': int(time.time()),
+    }))
+except Exception:
+    sys.exit(1)
+" >> "$f" 2>/dev/null || true
+}
+
+# Flush on reconnect. Called after a send that REACHED the server, which is the
+# only moment we know the server is answering. Each row goes to POST
+# /api/history (records, does not deliver — re-delivering would double-send a
+# message the pane already received) typed `raw-tmux-fallback`, so the audit
+# trail can tell an unstamped injection from an audited send instead of showing
+# neither.
+_flush_unstamped_ledger() {
+  local f; f=$(_unstamped_ledger)
+  [[ -s "$f" ]] || return 0
+  local api="${AMUX_API:-https://localhost:8824}"
+  local tmp; tmp=$(mktemp) || return 0
+  local sent=0 kept=0 line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local body
+    body=$(LINE="$line" python3 -c "
+import json, os, sys
+try:
+    d = json.loads(os.environ['LINE'])
+except Exception:
+    sys.exit(1)   # unparseable row: drop it rather than retry forever
+print(json.dumps({
+    'text': d.get('text', ''),
+    'type': 'raw-tmux-fallback',
+    'session': d.get('target', ''),
+    'ts': d.get('ts'),
+    'origin': 'unstamped-fallback from ' + (d.get('from') or 'unknown'),
+}))" 2>/dev/null) || continue
+    if curl -sk -m 10 -X POST -H 'Content-Type: application/json' \
+         -d "$body" "$api/api/history" >/dev/null 2>&1; then
+      sent=$((sent+1))
+    else
+      # Server went away mid-flush: KEEP the row. Dropping it would lose the
+      # only record that the send happened at all.
+      printf '%s\n' "$line" >> "$tmp"; kept=$((kept+1))
+    fi
+  done < "$f"
+  if [[ "$kept" -eq 0 ]]; then rm -f "$f"; else mv "$tmp" "$f" 2>/dev/null || true; fi
+  rm -f "$tmp" 2>/dev/null || true
+  [[ "$sent" -gt 0 ]] && echo "${GREEN}reconciled${RESET} $sent previously-unstamped send(s) into the audit trail" >&2
+  return 0
+}
+
 _send_via_api() {
   local name="$1" text="$2" nb="${3:-}"
   local tname; tname=$(tmux_name "$name")
@@ -788,7 +858,11 @@ if d.get("error") or d.get("ok") is False:
     sys.exit(2)
 print(f"sent to {tgt} (origin-stamped): {d.get('message', 'ok')}")
 PYEOF
-    [[ $rc -eq 0 ]] && return 0
+    # A send that REACHED the server is the only moment we know it is
+    # answering — so it is the moment to reconcile anything sent unstamped
+    # while it was down (AMUX-2670). Best-effort: never let reconciliation
+    # affect the result of the send the user actually asked for.
+    [[ $rc -eq 0 ]] && { _flush_unstamped_ledger || true; return 0; }
     [[ $rc -eq 2 ]] && return 1   # server understood and refused — do NOT fall back
   fi
   # Retry: the server restarts when the builder installs a new binary (it
@@ -813,7 +887,8 @@ if d.get("error") or d.get("ok") is False:
     sys.exit(2)
 print(f"sent to {tgt} (origin-stamped, retry {os.environ.get('_R','')}): {d.get('message', 'ok')}")
 PYEOF
-      [[ $rc -eq 0 ]] && return 0
+      # Same reconciliation point as the first attempt: the server answered.
+      [[ $rc -eq 0 ]] && { _flush_unstamped_ledger || true; return 0; }
       [[ $rc -eq 2 ]] && return 1
     fi
   done
@@ -847,6 +922,12 @@ PYEOF
     echo "${RED}FAILED${RESET} to send to $name: body typed but Enter was rejected — the message is sitting UNSENT in the pane." >&2
     return 1
   fi
+  # RECORD IT LOCALLY SO IT CAN BE REPORTED LATER (AMUX-2670). Without this a
+  # fallback send is indistinguishable from one that never happened: the server
+  # was unreachable, so nothing server-side can know it occurred, and the only
+  # trace is a stderr line in whatever terminal ran it. The ledger is flushed to
+  # POST /api/history on the next send that reaches the server.
+  _record_unstamped_send "$name" "$text"
   # Deliberately does NOT echo the body, and deliberately does not say "sent".
   echo "${YELLOW}injected${RESET} into $name via raw tmux — DELIVERY UNVERIFIED, no origin stamp, no audit." >&2
   echo "  Keystrokes reached the pane. If a picker/modal was open they went there instead." >&2
@@ -1226,7 +1307,17 @@ raw = sys.stdin.read()
 try:
     d = json.loads(raw)
 except Exception:
-    sys.stderr.write((raw[:300] or "empty response") + "\n")
+    # STRIP FIRST. Every caller reaches this via `echo "$result" | ...`, and
+    # echo appends a newline unconditionally — so on an empty server reply
+    # `raw` was "\n", which is TRUTHY, so `or "empty response"` never fired and
+    # this wrote a bare newline to stderr. The command then exited 1 having
+    # printed nothing on either stream: a silent failure from the sanctioned
+    # path, which is the exact class this whole function exists to end.
+    # Caught 2026-08-11 when `amux board status-update` (a 405 with an empty
+    # body) failed in total silence.
+    body = raw.strip()[:300]
+    sys.stderr.write((body or "empty response from the server — the endpoint "
+                              "may not be routed on this build") + "\n")
     sys.exit(1)
 err = (d.get("error") or "") if isinstance(d, dict) else ""
 ok = isinstance(d, dict) and not err and d.get("ok") is not False
@@ -1332,7 +1423,23 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # Label it as the TAG write it is. Without this the printer rendered the
       # card's unchanged status ("AC-221 -> todo"), which reads as a failed
       # transition (AC-222).
-      echo "$result" | _board_outcome "$id" "" "tagged needs:you"; return $?
+      echo "$result" | _board_outcome "$id" "" "tagged needs:you" || return $?
+      # AND MOVE IT. `needsyou` is also a real board STATUS — the one that
+      # takes the card out of review/todo queues and into the owner's view —
+      # and this verb tagging without moving left cards reading routed-to-
+      # owner while the idle nudge kept re-firing at the agent (frustrations
+      # 2026-08-11: the raw-PATCH workaround it forced is the unaudited path
+      # CLAUDE.md warns about). The tag write above stays: tag carries the
+      # ASK, status carries the QUEUE. If the transition bounces (gate), say
+      # so loudly — a tagged-but-unmoved card is exactly the half-action this
+      # verb used to hide.
+      local tresult
+      tresult=$(_board_transition "$id" "needsyou")
+      echo "$tresult" | _board_outcome "$id" "needsyou" || {
+        echo "amux board needsyou: tag applied but STATUS MOVE was refused (see above) — card is still in its old queue" >&2
+        return 1
+      }
+      return 0
       ;;
     done|doing|todo|backlog|discarded|review|verified)
       local status="$subcmd"
@@ -1816,7 +1923,25 @@ for tag in item.get('tags',[]):
       # `amux board ls --all` for the archived rows too.
       local _lsq="slim=1&archived=0"
       [[ "${1:-}" == "--all" || "${1:-}" == "-a" ]] && _lsq="slim=1"
-      curl -sk "$AMUX_API/api/board?$_lsq" | python3 -c "
+      # --mine: scoped, and a scoped query is UNCAPPED by the server, so this is
+      # the answer to "where are my done cards" rather than a filtered view of a
+      # truncated one.
+      [[ "${1:-}" == "--mine" || "${1:-}" == "-m" ]] && _lsq="slim=1&session=${AMUX_SESSION:-}&done_limit=0"
+      # SAY WHEN THE LIST IS TRUNCATED. This query is UNSCOPED, so the server
+      # caps terminal rows (done/verified/discarded) to the 100 most recently
+      # updated FLEET-WIDE — across ~50 lanes, that can be none of yours. The
+      # cap is right (uncapped is 5620 rows / 19.8MB and `ls` becomes a wall);
+      # the SILENCE was the bug. Three sessions independently reported "my
+      # cards are missing from the board" on 2026-08-11 — ts-gke, social-media
+      # and, downstream, a sweep that judged cards abandoned — and each had to
+      # discover the cap by experiment.
+      #
+      # The server has always sent x-amux-truncated / x-amux-terminal-total;
+      # nobody reads response headers from a pipe, which is ethos rule 4's
+      # second layer: a tag in a store the reader never opens. So read them
+      # here and print one line, in the place the reader is already looking.
+      local _hdr; _hdr=$(mktemp)
+      curl -sk -D "$_hdr" "$AMUX_API/api/board?$_lsq" | python3 -c "
 import sys,json
 items=json.load(sys.stdin)
 for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
@@ -1824,6 +1949,17 @@ for i in sorted(items, key=lambda x: x.get('updated',0), reverse=True):
     tags = ' '.join(f'[{t}]' for t in i.get('tags',[])) if i.get('tags') else ''
     print(f\"{status_sym} {i['id']:12s} {i['title'][:50]:50s} [{i['status']}] {tags}\")
 "
+      # One line, only when rows were actually dropped.
+      if grep -qi '^x-amux-truncated: 1' "$_hdr" 2>/dev/null; then
+        local _tt _tr
+        _tt=$(grep -i '^x-amux-terminal-total:' "$_hdr" | tr -d '\r' | awk '{print $2}')
+        _tr=$(grep -i '^x-amux-terminal-returned:' "$_hdr" | tr -d '\r' | awk '{print $2}')
+        echo "${DIM}— showing ${_tr:-?} of ${_tt:-?} done/verified/discarded cards (newest first, fleet-wide cap)."
+        echo "  YOUR terminal cards may be entirely outside this list. To see them:"
+        echo "    amux board ls --mine        # this session, uncapped"
+        echo "    curl -sk \"\$AMUX_API/api/board?session=\$AMUX_SESSION&done_limit=0\"${RESET}"
+      fi
+      rm -f "$_hdr"
       ;;
     help|*)
       # An UNKNOWN verb must not exit 0. `amux board note X "..."` printed this
@@ -2029,6 +2165,127 @@ USAGE
 }
 
 
+# ── CRM ──────────────────────────────────────────────────────────────────────
+# AMUX-2932. Global ~/.claude/CLAUDE.md has documented `amux crm add` to every
+# session in every project for months; the verb did not exist and the HTTP API
+# behind it did not either (405, no route) until AMUX-2929 ported it.
+#
+# EVERY WRITE CARRIES X-Amux-Session. Python's version of this verb did NOT,
+# and that is the whole reason CLAUDE.md tells agents to prefer `amux <verb>`
+# over a hand-rolled curl: a raw curl is unattributed by construction. Adding
+# the verb without the header would have rebuilt the trap it exists to close.
+cmd_crm() {
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  # key=value pairs -> JSON, bare words -> the name. Done in python so a name
+  # with spaces, quotes or a `$` survives; building this JSON in bash is how
+  # you get a contact called `$(whoami)`.
+  _crm_json() {
+    python3 -c '
+import sys, json
+fields = {}; name = []
+for a in sys.argv[1:]:
+    if "=" in a and not a.startswith("="):
+        k, v = a.split("=", 1); fields[k] = v
+    else:
+        name.append(a)
+if name: fields["name"] = " ".join(name)
+print(json.dumps(fields))' "$@"
+  }
+  case "$sub" in
+    add)
+      [ $# -gt 0 ] || die "Usage: amux crm add \"Name\" [company=X] [email=Y] [role=Z] [phone=P]"
+      local json; json=$(_crm_json "$@")
+      curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("error"): print("error:", d["error"], file=sys.stderr); sys.exit(1)
+print(d.get("id", "?"), "created")'
+      ;;
+    update|set)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm update PPL-1 company=X email=Y"
+      shift 2>/dev/null || true
+      [ $# -gt 0 ] || die "amux crm update: nothing to set. Give key=value pairs."
+      local json; json=$(_crm_json "$@")
+      curl -sk -X PATCH -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts/$cid" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d.get("ok"): print("error:", d.get("error", "failed"), file=sys.stderr); sys.exit(1)
+print("updated")'
+      ;;
+    get|show)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm get PPL-1"
+      curl -sk "$AMUX_API/api/crm/contacts/$cid" | python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+if c.get("error"): print("error:", c["error"], file=sys.stderr); sys.exit(1)
+print(c.get("id"), "-", c.get("name"))
+for f in ("company", "role", "email", "phone", "linkedin", "twitter"):
+    if c.get(f): print("  %-9s %s" % (f + ":", c[f]))
+if c.get("tags"): print("  %-9s %s" % ("tags:", ", ".join(c["tags"])))
+if c.get("notes"): print("  %-9s %s" % ("notes:", c["notes"]))
+for i in c.get("interactions", [])[:5]:
+    print("  %s  %-6s %s" % (i.get("date", ""), i.get("type", ""), (i.get("notes") or "")[:60]))'
+      ;;
+    log)
+      local cid="${1:-}"; [ -n "$cid" ] || die "Usage: amux crm log PPL-1 \"what happened\" [follow_up_date=YYYY-MM-DD]"
+      shift 2>/dev/null || true
+      local json; json=$(python3 -c '
+import sys, json
+fields = {"type": "other"}; notes = []
+for a in sys.argv[1:]:
+    if "=" in a and not a.startswith("="):
+        k, v = a.split("=", 1); fields[k] = v
+    else:
+        notes.append(a)
+if notes: fields["notes"] = " ".join(notes)
+print(json.dumps(fields))' "$@")
+      curl -sk -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+        -d "$json" "$AMUX_API/api/crm/contacts/$cid/interactions" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("error"): print("error:", d["error"], file=sys.stderr); sys.exit(1)
+print("logged", d.get("id", ""))'
+      ;;
+    followups|fu)
+      curl -sk "$AMUX_API/api/crm/followups" | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+if not items: print("No pending follow-ups"); sys.exit(0)
+for i in items:
+    print(i.get("follow_up_date", ""), i.get("name", ""), "-", i.get("follow_up_note", ""))'
+      ;;
+    list|ls|"")
+      curl -sk "$AMUX_API/api/crm/contacts$([ -n "${1:-}" ] && printf '?q=%s' "$1")" | python3 -c '
+import json, sys
+cs = json.load(sys.stdin)
+if not cs: print("No contacts"); sys.exit(0)
+for c in cs:
+    print("%-8s %-28s %s" % (c.get("id", ""), (c.get("name") or "")[:28], c.get("company", "")))'
+      ;;
+    help|--help|-h)
+      cat <<'EOH'
+amux crm — contacts, notes and follow-ups (HTTP: /api/crm/*)
+
+  amux crm list [query]                     List contacts (optional name/company/role search)
+  amux crm get PPL-1                        One contact with tags and recent interactions
+  amux crm add "Name" [company=X email=Y]   Create; extra key=value pairs set fields
+  amux crm update PPL-1 role=CTO            Update whitelisted fields
+  amux crm log PPL-1 "spoke re pricing" [follow_up_date=2026-09-01]
+  amux crm followups                        Pending follow-ups, soonest first
+
+Writes carry X-Amux-Session, so the audit trail names who made them.
+EOH
+      ;;
+    *) die "amux crm: unknown subcommand: $sub  (try: amux crm help)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -2070,6 +2327,14 @@ ${BOLD}Web Dashboard:${RESET}
   amux serve [port]              Start the Rust server (normally launchd's job;
                                  installed service 8824, bare default 8823;
                                  also answers retired 8822 while it is bound)
+
+${BOLD}CRM:${RESET}
+  amux crm list [query]          List contacts (search name/company/role)
+  amux crm get PPL-1             One contact, with tags and recent interactions
+  amux crm add "Name" [k=v ...]  Create a contact (company=, email=, role=, phone=)
+  amux crm update PPL-1 k=v      Update whitelisted fields
+  amux crm log PPL-1 "notes"     Log an interaction (follow_up_date=YYYY-MM-DD)
+  amux crm followups             Pending follow-ups, soonest first
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
@@ -2278,8 +2543,34 @@ cmd_whoami() {
 # `source amux`), $0 is the parent shell's $0 and the guard skips dispatch.
 # This lets the test suite source the script to access helper functions
 # without triggering CLI side effects.
+# One-time-per-session warning when $AMUX_URL points at a DEAD port (mvs-infra,
+# AMUX-2944). A session started before the 8822 compat bind was removed carries
+# the retired value for its whole life — env can't be re-read live — and a raw
+# `curl $AMUX_URL/...` PATCH then exits 0 with an EMPTY body, indistinguishable
+# from a successful write (mvs-infra silently lost a board PATCH this way). This
+# CLI is fine (it resolves AMUX_API=8824); the warning is so the SESSION stops
+# trusting $AMUX_URL for raw curls and repairs its own shell. Cheap: one 2s probe
+# gated by a per-session marker. ALWAYS returns 0 — a hot path 48 lanes run must
+# never break because a diagnostic failed.
+_warn_stale_amux_url() {
+  local api="${AMUX_API:-https://localhost:8824}"
+  local url="${AMUX_URL:-}"
+  if [ -z "$url" ] || [ "$url" = "$api" ]; then return 0; fi
+  local marker="${TMPDIR:-/tmp}/amux-url-warn-${AMUX_SESSION:-unknown}"
+  if [ -f "$marker" ]; then return 0; fi
+  if curl -sk -m 2 -o /dev/null "$url/health" 2>/dev/null; then return 0; fi
+  touch "$marker" 2>/dev/null || true
+  {
+    echo "amux: WARNING — \$AMUX_URL ($url) does not answer; this CLI is fine (it uses $api)."
+    echo "  But raw 'curl \$AMUX_URL/...' will SILENTLY FAIL — exit 0, empty body, looks exactly like a successful write."
+    echo "  Repair your shell for raw curls:  export AMUX_URL=$api"
+  } >&2
+  return 0
+}
+
 if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   ensure_dirs
+  _warn_stale_amux_url
 
   case "${1:-}" in
     register|reg)     shift; cmd_register "$@" ;;
@@ -2297,6 +2588,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     stop-all)         cmd_stop_all ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
+    crm)              shift; cmd_crm "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
     iac)              shift; cmd_config "$@" ;;

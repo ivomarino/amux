@@ -16,30 +16,41 @@ name: Deploy to cloud.amux.io
 # back. Whether to take a customer's sessions down is a human's call, not a
 # push's (ethos rule 8).
 
-# NO `push:` TRIGGER. This is manual-dispatch only, and that is deliberate.
+# AUTO-DEPLOY ON GREEN CI — but ONLY the half that cannot take a customer down.
+# Ethan's call, 2026-08-12 ("cloud automatically gets every update as it passes
+# CI"), reversing the manual-only stance below for the SAFE path and keeping it
+# for the dangerous one. Both halves of that reversal matter, so both are here.
 #
-# AMUX-2809 gated the hop-scheme flip so a push could no longer break every
-# workspace. That fixed the damage but not the shape: a push still ran a real
-# deploy that nobody chose. It reinstalls gateway.py from the repo, rebuilds and
-# republishes ghcr.io/mixpeek/amux:latest, and pulls on the host — with the
-# `paths:` list covering crates/**, Cargo.toml, Cargo.lock, cloud/** and this
-# file, so most commits in the repo qualified. Editing a file was indistinguishable
-# from asking to deploy.
+# What now auto-runs: when the `rust` CI workflow finishes SUCCESSFULLY on main,
+# this deploys image + gateway + `docker pull` (the build/deploy jobs). That is
+# the "gets every update" the request asks for: the freshly-CI'd binary becomes
+# ghcr :latest and the host pulls it.
 #
-# It cost something concrete on 2026-08-10: a hand-deployed gateway fix that god
-# mode depended on would have been silently reverted by the next unrelated push
-# under cloud/**, and the only reason it was not is that two sessions agreed to
-# stop pushing that path by hand.
+# What STILL cannot auto-run: the container RECREATE (the redeploy job). It stops
+# every tmux session in a customer workspace and the rust server does not restore
+# them, so whether to take a customer's sessions down stays a human's call (ethos
+# rule 8). This is enforced structurally, not by discipline: the redeploy job is
+# gated `github.event_name == 'workflow_dispatch'`, and an auto-deploy arrives as
+# `workflow_run` — so it is IMPOSSIBLE for a CI-triggered deploy to recreate. A
+# running container keeps serving its old image until a human dispatches
+# `recreate=yes`; only NEW workspaces start on the fresh image. That is the exact
+# line the old manual-only rule protected, drawn one notch tighter so the safe
+# side can be automatic.
 #
-# The comment directly above already contains the argument — "Whether to take a
-# customer's sessions down is a human's call, not a push's (ethos rule 8)" — and
-# it applied to the whole workflow, not only to the recreate. A prod deploy that
-# an uninvolved lane can arm by editing an unrelated file is the same defect one
-# layer up.
+# Why this is safe where the OLD push-trigger was not (the 2026-08-10 incident):
+# the old trigger fired on ANY push whose paths touched crates/cloud/** — an
+# unreviewed, un-CI'd commit could deploy, and a hand-deployed gateway fix was at
+# risk of silent revert by the next unrelated push. This trigger fires only after
+# CI is GREEN on main, on the exact commit CI passed (`head_sha`, pinned in every
+# checkout + the image tag below), never on a PR (`branches: [main]`), never on a
+# red run (the guard job's `if`). "A deploy nobody chose" is now "a deploy CI
+# chose", which is the gate the old shape lacked.
 #
-# The cost of manual-only is that ghcr :latest goes stale until someone
-# dispatches. That is the intended trade: a stale image is visible and harmless,
-# an unchosen deploy is neither. Ethan's call, 2026-08-10.
+# Caveat, stated so it is not a surprise: a commit that does NOT trigger `rust`
+# (docs, a pure cloud/gateway.py edit, the bash CLI — none match rust.yml's
+# `paths`) does not auto-deploy, because there is no CI pass to gate on and no new
+# server binary to ship. Deploy those with a manual dispatch. This is the trade
+# for gating on CI rather than on push.
 #
 #   gh workflow run deploy-cloud.yml                    # image + gateway, no recreate
 #   gh workflow run deploy-cloud.yml -f recreate=yes    # ALSO stops every session
@@ -52,6 +63,13 @@ on:
         default: 'no'
         type: choice
         options: ['no', 'yes']
+  # Auto-deploy after CI passes on main. Fires on EVERY completion of `rust`
+  # (including failures and PR runs); the guard job's `if` keeps only
+  # success-on-main, and `branches` pre-filters PR branches out.
+  workflow_run:
+    workflows: ['rust']
+    types: [completed]
+    branches: [main]
 
 concurrency:
   group: deploy-cloud
@@ -69,9 +87,21 @@ jobs:
   # running each one against the deleted python Dockerfile
   # (`git show 792ce1f^:cloud/docker/Dockerfile`), where all four trip.
   guard:
+    # The whole cascade (build -> deploy) hangs off this job via `needs`, so
+    # this one `if` is the auto-deploy gate: run on a manual dispatch, or on a
+    # `rust` CI run that SUCCEEDED. A failed or PR CI run leaves this skipped,
+    # which skips build+deploy too (a skipped need does not satisfy `needs`).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
+      # Pin to the exact commit CI passed, not branch-latest: on a workflow_run
+      # event the default ref can drift ahead if another commit landed while CI
+      # ran, which would ship an UN-CI'd binary under a green CI's authority.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - name: The cloud image is a rust build, and nothing here resurrects the python server
         run: |
           fail=0
@@ -111,6 +141,8 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -136,7 +168,7 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ github.event.workflow_run.head_sha || github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -146,6 +178,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up SSH
         run: |
@@ -174,6 +208,24 @@ jobs:
           # authorize this key or replace the secret. No guessing which end is wrong.
           ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
             echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
+
+      - name: Snapshot gateway.py + gateway.env BEFORE any writes (restart only if they change)
+        run: |
+          # AMUX-2968 residual (amux-cloud, verified): the gateway restart below
+          # is a ~2s cloud.amux.io blip, and auto-deploy fires it at a moment
+          # nobody picks (any lane's green CI) — a prospect mid-click during a
+          # live demo could hit a 502. The fix is not a demo-window gate; it is
+          # that a restart is only NEEDED when the gateway's own code or secrets
+          # change, and the common auto-deploy (a pure server-binary commit)
+          # changes NEITHER. So snapshot both now, compare after the writes, and
+          # restart only on a real change. The image pull needs no gateway
+          # restart; only gateway.py / gateway.env do.
+          H=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
+          echo "PRE_GW_PY=$(echo "$H" | sed -n 1p)" >> "$GITHUB_ENV"
+          echo "PRE_GW_ENV=$(echo "$H" | sed -n 2p)" >> "$GITHUB_ENV"
+          echo "pre-deploy: gateway.py md5=$(echo "$H" | sed -n 1p) gateway.env md5=$(echo "$H" | sed -n 2p)"
 
       - name: Gateway env — admin emails (idempotent, safe on every deploy)
         run: |
@@ -213,18 +265,33 @@ jobs:
       #
       # Not-setting it is the safe state: the gateway defaults to http and logs
       # "container hop: http:// (cert verification n/a)".
+      #
+      # ---- 2026-08-11: THE FLIP MOVED OUT OF THIS JOB ENTIRELY --------------
+      # Gating it here was necessary and still not sufficient, because the
+      # ORDER was inverted: this job writes the scheme, and `redeploy` (which
+      # `needs: [build, deploy]`) is what makes the containers rust. So the
+      # gateway was pointed at https BEFORE anything answered https, and the
+      # window between the two jobs was a guaranteed outage rather than a risk.
+      #
+      # Worse, a failure inside that window was unrecoverable by the workflow.
+      # When the verify step below failed on a deploy that was otherwise fine
+      # (see the race it hit, now fixed), `redeploy` never ran — so the scheme
+      # stayed https and the containers stayed python. Measured on a live
+      # workspace port during that run:
+      #     https://127.0.0.1:9056/api/sessions -> 000
+      #     http://127.0.0.1:9056/api/sessions  -> 200
+      # Every workspace hop was down until a human unset the scheme by hand.
+      # A failed deploy must leave the system UNCHANGED; this one left it in
+      # precisely the half-flipped state the gating above was written to
+      # prevent. The gate stopped a PUSH from causing it and did not stop a
+      # legitimate dispatch from causing it.
+      #
+      # The flip now lives in `redeploy`, immediately AFTER the recreate loop
+      # has proved every container answers as rust, and it restores the previous
+      # value on any failure. Both halves of the cutover are in the job that
+      # owns them, in the only order that is safe, and a failed run ends where
+      # it started. Reported by amux-cloud, who restored prod by hand.
       # ---------------------------------------------------------------------
-      - name: Gateway env — container hop scheme (ONLY with a real recreate)
-        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
-        run: |
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
-            set -e
-            touch /etc/amux/gateway.env; chmod 600 /etc/amux/gateway.env
-            grep -v "^CONTAINER_SCHEME=" /etc/amux/gateway.env > /etc/amux/.ge.tmp || true
-            mv /etc/amux/.ge.tmp /etc/amux/gateway.env
-            chmod 600 /etc/amux/gateway.env
-            echo "CONTAINER_SCHEME=https" >> /etc/amux/gateway.env
-            echo "container hop: $(grep ^CONTAINER_SCHEME= /etc/amux/gateway.env)"'
 
       - name: Sync gateway secrets from repo secrets (host-only, never in a container)
         run: |
@@ -258,8 +325,25 @@ jobs:
             "root@$CLOUD_HOST:/opt/amux-cloud/docker/docker-compose.template.yml"
           rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/litestream/litestream.yml \
             "root@$CLOUD_HOST:/opt/amux-cloud/litestream/litestream.yml"
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
-            'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
+          # Restart the gateway ONLY if its code or secrets actually changed
+          # (AMUX-2968 residual). compose.template + litestream are read by
+          # docker/litestream, not the gateway process, so they never justify a
+          # restart. A pure server-binary auto-deploy leaves both hashes equal →
+          # no restart → no cloud.amux.io blip, which is the demo-safety the
+          # residual asked for. A real gateway.py or secret change still restarts
+          # (the blip then is a deploy someone meant to make).
+          NOW=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
+            md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
+          NPY=$(echo "$NOW" | sed -n 1p); NENV=$(echo "$NOW" | sed -n 2p)
+          if [ "$NPY" != "${PRE_GW_PY:-}" ] || [ "$NENV" != "${PRE_GW_ENV:-}" ]; then
+            echo "gateway changed (py ${PRE_GW_PY:-none}->$NPY, env ${PRE_GW_ENV:-none}->$NENV) — restarting (expect a ~2s blip)"
+            ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
+              'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
+          else
+            echo "gateway.py + gateway.env UNCHANGED — skipping restart, NO proxy blip; verifying still active"
+            ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'systemctl is-active amux-gateway'
+          fi
 
       # GATED WITH THE WRITER IT VERIFIES, and that pairing is the point.
       #
@@ -273,20 +357,12 @@ jobs:
       #
       # So: this asserts the hop ONLY on the run that set it. On every other
       # deploy there is nothing to verify, because nothing changed the scheme.
-      - name: Gateway is actually on the https hop (fails if the restart did not take)
-        if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
-        run: |
-          # `systemctl is-active` proves a process exists, not that it read the
-          # new env. The startup line names the scheme; grepping for it is the
-          # only thing that distinguishes "restarted" from "restarted with the
-          # config we just wrote".
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
-            line=$(grep -a "container hop:" /var/log/amux-gateway.log | tail -1)
-            echo "gateway says: ${line:-<no container-hop line — gateway.py is older than this deploy>}"
-            case "$line" in
-              *"container hop: https://"*) exit 0 ;;
-              *) echo "::error::gateway is not on the https container hop"; exit 1 ;;
-            esac'
+      #
+      # ---- 2026-08-11: MOVED, with the flip it verifies ---------------------
+      # It has to travel with its writer — that pairing is the whole argument
+      # above, and it is just as true in the other direction. The assertion now
+      # sits inside the flip step in `redeploy`, where it can also roll back.
+      # -----------------------------------------------------------------------
 
       # The half worth keeping on EVERY deploy: that the gateway came back at
       # all. It is scheme-agnostic on purpose — it must pass both before and
@@ -441,4 +517,92 @@ jobs:
               fi
             done
             exit "$bad"
+          ENDSSH
+
+      # THE OTHER HALF OF THE CUTOVER — and it runs here, last, on purpose.
+      #
+      # The containers above have just PROVEN they answer https as rust. Only
+      # now is it true that pointing the gateway at https:// is safe. The long
+      # comment in the `deploy` job records what this ordering cost when it was
+      # inverted: prod half-flipped, every workspace hop down, restored by hand.
+      #
+      # Two properties this step must have, both learned the hard way:
+      #
+      #   ATOMIC. Any failure restores the previous CONTAINER_SCHEME and
+      #   restarts, so a red run ends where it started. `trap` fires on the
+      #   error path of every command under `set -e`, including the verify.
+      #
+      #   RACE-FREE VERIFY. The old check grepped `tail -1` of the log
+      #   immediately after `systemctl restart` and read the PREVIOUS startup
+      #   line, because the new one had not flushed yet — failing a deploy that
+      #   was fine, which is what triggered the outage. Counting the hop lines
+      #   BEFORE the restart and waiting for the count to grow is what makes
+      #   "the line I am reading is from THIS restart" a fact rather than a
+      #   hope. Waiting for a newer line is the fix; dropping the assertion is
+      #   not (a scheme-agnostic check here cannot fail, ethos rule 7).
+      - name: Flip the gateway to the https hop (atomic — restores on any failure)
+        run: |
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+            set -eu
+            LOG=/var/log/amux-gateway.log
+            ENV=/etc/amux/gateway.env
+            touch "$ENV"; chmod 600 "$ENV"
+
+            PREV=$(grep "^CONTAINER_SCHEME=" "$ENV" || true)
+            echo "previous hop setting: ${PREV:-<unset — http>}"
+
+            write_scheme() {   # $1 = full line, or empty to unset (= http default)
+              grep -v "^CONTAINER_SCHEME=" "$ENV" > /etc/amux/.ge.tmp || true
+              # `if`, not `[ -n "$1" ] && echo`: the latter returns 1 when the
+              # argument is empty, which is precisely the rollback-to-unset
+              # path — the real pre-cutover state — and leaning on set -e's
+              # exemption rules there is not worth the ambiguity.
+              if [ -n "$1" ]; then echo "$1" >> /etc/amux/.ge.tmp; fi
+              mv /etc/amux/.ge.tmp "$ENV"; chmod 600 "$ENV"
+            }
+            rollback() {
+              echo "::error::https flip failed — restoring ${PREV:-<unset — http>} and restarting"
+              write_scheme "$PREV"
+              systemctl restart amux-gateway || true
+              sleep 2
+              systemctl is-active amux-gateway || echo "::error::gateway did not come back after rollback"
+            }
+            # EXIT, not ERR, and it is not a style preference: an ERR trap does
+            # NOT fire on an explicit `exit 1`, so every hand-written failure
+            # path below — the 30s timeout, the wrong-scheme case, the
+            # is-active check — would have skipped the rollback and left prod
+            # in exactly the half-flipped state this step exists to prevent.
+            # A rollback that cannot fire on the failures it was written for is
+            # the purest form of ethos rule 7.
+            SUCCESS=0
+            trap '[ "$SUCCESS" = 1 ] || rollback' EXIT
+
+            # Count BEFORE the restart — this is the race fix.
+            # `grep -c` PRINTS the count and exits 1 when it is zero, so the
+            # obvious `|| echo 0` appends a second line and yields "0\n0",
+            # which then breaks `-gt`. Assign, then correct on failure.
+            BEFORE=$(grep -ac "container hop:" "$LOG" 2>/dev/null) || BEFORE=0
+
+            write_scheme "CONTAINER_SCHEME=https"
+            systemctl restart amux-gateway
+
+            # Wait for a hop line that did not exist before this restart.
+            ok=0
+            for _ in $(seq 1 30); do
+              now=$(grep -ac "container hop:" "$LOG" 2>/dev/null) || now=0
+              if [ "$now" -gt "$BEFORE" ]; then ok=1; break; fi
+              sleep 1
+            done
+            [ "$ok" = 1 ] || { echo "::error::no new 'container hop:' line within 30s of restart (before=$BEFORE)"; exit 1; }
+
+            line=$(grep -a "container hop:" "$LOG" | tail -1)
+            echo "gateway says: $line"
+            case "$line" in
+              *"container hop: https://"*) ;;
+              *) echo "::error::gateway restarted but is not on the https container hop"; exit 1 ;;
+            esac
+
+            systemctl is-active --quiet amux-gateway || { echo "::error::amux-gateway is not active"; exit 1; }
+            SUCCESS=1
+            echo "https hop live, containers on rust — cutover complete"
           ENDSSH

@@ -71,16 +71,34 @@ def amux_base_url():
     try:
         with open(os.path.join(home, "endpoint.json")) as fh:
             ep = json.load(fh)
-        legacy, canonical = ep.get("legacy_port"), (ep.get("canonical_url") or "").rstrip("/")
-        if legacy and canonical:
+        canonical = (ep.get("canonical_url") or "").rstrip("/")
+        # RETIRED ports, not just the currently-bound legacy one (AMUX-2946).
+        # This used to read `if legacy and canonical` — so the self-heal died
+        # the instant the legacy bind was dropped and `legacy_port` began
+        # publishing null, which is the one moment it was needed. Observed
+        # immediately: "staged-guard: NOT ENFORCED — connection refused",
+        # cross-session sweep protection off for every pre-cutover session.
+        # A retired address has to stay KNOWN after it stops being served,
+        # because the processes still naming it cannot be told anything else.
+        stale = list(ep.get("retired_ports") or [])
+        if ep.get("legacy_port"):
+            stale.append(ep["legacy_port"])
+        if canonical and stale:
             from urllib.parse import urlsplit
             sp = urlsplit(url)
-            if sp.hostname in ("localhost", "127.0.0.1", "::1") and sp.port == legacy:
+            # Only loopback, and only a port we KNOW we retired: a session
+            # aimed at a dev instance or a remote amux made a deliberate
+            # choice and is left alone.
+            if sp.hostname in ("localhost", "127.0.0.1", "::1") and sp.port in stale:
                 return canonical
     except Exception:
         # Missing/garbled file is not an error: fall back to the inherited URL,
-        # which is what every version before this one did. The legacy bind still
-        # answers, so the worst case is the status quo, never a broken guard.
+        # which is what every version before this one did. NB the old comment
+        # here reasoned "the legacy bind still answers, so the worst case is the
+        # status quo" — true until 2026-08-11, when the bind went and the worst
+        # case became a guard that cannot reach the server at all. It fails
+        # LOUDLY and records to staged-guard-unenforced.jsonl, which is how this
+        # was caught, but the fallback is no longer harmless.
         pass
     return url or "https://localhost:8824"
 

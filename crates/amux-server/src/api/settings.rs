@@ -33,7 +33,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::AppState;
 
@@ -49,23 +49,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// The amux home for settings/journal/history file access: `$AMUX_HOME`,
-/// legacy `$CC_HOME`, else `~/.amux` — the same resolution as Python's
-/// `_amux_home` and config.rs's `from_process_env`. Resolved per-request so
-/// tests can inject a temp home.
-pub(crate) fn amux_home() -> PathBuf {
-    for var in ["AMUX_HOME", "CC_HOME"] {
-        if let Ok(h) = std::env::var(var) {
-            if !h.is_empty() {
-                return PathBuf::from(h);
-            }
-        }
-    }
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
-        .join(".amux")
-}
+pub(crate) use crate::config::amux_home;
 
 /// Effective value of a server-config key: non-empty `server.env` entry
 /// first (Python's boot loader only overrides `os.environ` with non-empty
@@ -75,10 +59,25 @@ pub(crate) fn amux_home() -> PathBuf {
 /// keys the same way — one resolver, not two spellings of it.
 pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
     let file_env = crate::config::parse_env_file(&home.join("server.env"));
+    // PRESENT-BUT-EMPTY MEANS CLEARED, and it is not the same as ABSENT.
+    //
+    // This used to fall through to the process env whenever the file value was
+    // empty, which made clearing a key impossible: config.rs exports server.env
+    // into the PROCESS env at startup (setdefault), so a key that was ever saved
+    // and survived one restart is in std::env for the life of the process. The
+    // clear then wrote `ANTHROPIC_API_KEY=` to the file — correctly — and the
+    // GET kept serving the old key from the process env.
+    //
+    // Reproduced end to end on a scratch home 2026-08-11: seed a key, GET masks
+    // it, PATCH {"ANTHROPIC_API_KEY":""} returns {"ok":true}, the file is
+    // emptied, and the very next GET still returns *******************wxyz.
+    // Nothing anywhere reported a failure — the write succeeded, the read lied.
+    //
+    // That is a security defect, not a papercut: rotating or revoking a key is
+    // the one operation you must be able to trust, and amux would keep using the
+    // old value while telling you it was gone.
     if let Some(v) = file_env.get(key) {
-        if !v.is_empty() {
-            return Some(v.clone());
-        }
+        return (!v.is_empty()).then(|| v.clone());
     }
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -128,16 +127,7 @@ fn atomic_write_secure(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// JSON truthiness with Python `bool()` semantics — the guard PATCHes run
 /// the body value through `bool(...)`, so `0`, `""`, `[]`, `{}` disable.
-pub(crate) fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
+pub(crate) use super::py_truthy as truthy;
 
 // ---- shlex port (Python shlex.split / shlex.quote, POSIX mode) ------------
 
@@ -685,6 +675,43 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// AMUX-2904. Clearing an API key must actually clear it. `effective_env`
+    /// fell through to the PROCESS env whenever the file value was empty, and
+    /// config.rs exports server.env into the process env at startup — so a key
+    /// that survived one restart could never be removed. The write succeeded,
+    /// the read lied, and nothing anywhere reported a failure.
+    #[test]
+    fn an_emptied_key_reads_as_cleared_even_when_the_process_env_still_has_it() {
+        let _lock = test_env::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path();
+        let key = "AMUX_TEST_EFFECTIVE_ENV_KEY";
+
+        // The process env holds a value — exactly what config.rs's startup
+        // setdefault produces for any key ever saved to server.env.
+        std::env::set_var(key, "from-process-env");
+
+        // 1. ABSENT from the file -> the process env is the answer.
+        std::fs::write(home.join("server.env"), "OTHER=1\n").expect("write");
+        assert_eq!(effective_env(home, key).as_deref(), Some("from-process-env"));
+
+        // 2. PRESENT and non-empty -> the file wins.
+        std::fs::write(home.join("server.env"), format!("{key}=from-file\n")).expect("write");
+        assert_eq!(effective_env(home, key).as_deref(), Some("from-file"));
+
+        // 3. PRESENT but EMPTY -> CLEARED. This is the assertion that fails on
+        //    the pre-fix code, which returned Some("from-process-env").
+        std::fs::write(home.join("server.env"), format!("{key}=\n")).expect("write");
+        assert_eq!(
+            effective_env(home, key),
+            None,
+            "an explicitly emptied key must read as cleared, not fall back to the process env"
+        );
+
+        std::env::remove_var(key);
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;

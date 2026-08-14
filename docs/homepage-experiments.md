@@ -104,7 +104,7 @@
 - **Result:** Pre-period (2026-07-10–12, 3 days): 10 iOS clicks = 3.3/day. Post-period (2026-07-13–21, 9 days): 27 iOS clicks = 3.0/day. Change = -9%. However, the pre-period is only 3 days (PostHog live since 2026-07-09, experiment started 2026-07-13) — insufficient to draw a conclusion. No meaningful signal either way. The badge change is harmless — keeping it in place.
 - **KPI:** iOS downloads (App Store link clicks)
 
-**Upcoming score windows:** EXP-019 → overdue (score now, shipped 2026-08-02) · EXP-021 → 2026-08-11 · EXP-022 → 2026-08-17 · EXP-023 → 2026-08-17 · EXP-024 → 2026-08-17. **Recently concluded: EXP-020 WIN +500% (2026-08-10 — blog/best-terminal top-of-page CTA, 0.14→2.00 GH clicks/day, kept permanently). EXP-016 inconclusive 2026-08-10 (+6.5%, below 10% threshold; CTO framing kept). EXP-018 inconclusive 2026-08-06 (ai-agent-sandboxing, insufficient volume — same pattern as EXP-014). EXP-017 inconclusive 2026-08-04. EXP-015 WIN +200% (2026-07-29). EXP-010 WIN +20.0% (2026-07-31).**
+**Upcoming score windows:** EXP-022 → 2026-08-17 · EXP-023 → 2026-08-17 · EXP-024 → 2026-08-17 · EXP-021 → 2026-08-18 (extended 14d) · EXP-025/026/027/028 → 2026-08-18 · EXP-029/030/031/032/033 → 2026-08-19. **Recently concluded: EXP-019 inconclusive +4.7% (2026-08-11, homepage PS row, kept). EXP-020 WIN +500% (2026-08-10 — blog/best-terminal top-of-page CTA, 0.14→2.00 GH clicks/day, kept permanently). EXP-016 inconclusive 2026-08-10 (+6.5%, below 10% threshold; CTO framing kept). EXP-018 inconclusive 2026-08-06 (ai-agent-sandboxing, insufficient volume — same pattern as EXP-014). EXP-017 inconclusive 2026-08-04. EXP-015 WIN +200% (2026-07-29). EXP-010 WIN +20.0% (2026-07-31).**
 
 ### EXP-006 — GitHub README → iOS CTA
 - **Hypothesis:** Adding an official App Store badge to the README increases iOS installs from GitHub traffic
@@ -243,7 +243,7 @@
 - **Started:** 2026-08-04
 - **Implementation:** Added green/teal top-of-page CTA banner immediately after `<article>` open and before first paragraph. Copy: "Engineering context for a fleet of Claude Code, Codex, and Gemini CLI workers? amux makes every surface — CLAUDE.md, hooks, skills, memory — available to every agent automatically." Button: "View amux on GitHub ★" with `exp021_context_eng_topofpage_cta_click` event. dateModified updated to 2026-08-04. Same compact banner format as EXP-015 WIN and EXP-020.
 - **Effort:** XS
-- **Measure after:** 2026-08-11 (7 days minimum)
+- **Measure after:** 2026-08-18 (extended — 0 GH clicks in 7-day window Aug 4–10; insufficient traffic volume to score; same pattern as EXP-014/EXP-018; extending to 14 days)
 
 ### EXP-020 — Top-of-page CTA on blog/best-terminal-ai-coding-agents-2026
 - **Hypothesis:** The blog post gets 174 PVs / 2 GH clicks (1.2% CVR) — one of the biggest conversion gaps on the site. Visitors are evaluating terminal AI coding agents and are the exact target audience for amux fleet orchestration. Adding a top-of-page green CTA (EXP-015 pattern, +200% on headless) before the TL;DR will catch visitors before they scroll into tool comparisons.
@@ -256,15 +256,126 @@
 - **Effort:** XS
 - **Score (2026-08-10 — final):** Pre (Jul 27 – Aug 2, 7 days): 1 total blog GH click = **0.14/day**. Post (Aug 3–9, 7 days, partial — EXP-020 started Aug 3): 6 total GH clicks = **2.00/day**. Delta: **+500%** (0.14 → 2.00/day). Named `exp020_blog_topofpage_cta_click` events: 6 total. Decisive WIN — 6x click multiplier on the same page. Consistent with EXP-015 pattern (+200% on headless). **Top-of-page CTA placement dramatically outperforms no-CTA baseline.** Change kept permanently. Pattern now confirmed on 2 pages: headless (+200%), blog/terminal-agents (+500%).
 
+### EXP-025 — Top-of-page green CTA on spec-driven-development (45 PVs, 0 GH clicks)
+- **Hypothesis:** /guides/spec-driven-development/ has 45 PVs/14d and 0 GitHub clicks — no CTA of any kind existed. Visitors are writing specs for parallel AI agents and are the exact target for amux fleet orchestration. Adding the EXP-015 WIN pattern CTA before the TOC will convert.
+- **Page:** `/guides/spec-driven-development/`
+- **KPI:** GitHub stars (PostHog `exp025_specdriven_topofpage_cta_click` + autocapture)
+- **Status:** `running`
+- **Started:** 2026-08-11
+- **Implementation:** Added green/teal top-of-page CTA banner after subtitle paragraph and before TOC nav. Copy: "Run your specs across a fleet of parallel agents tonight — amux distributes spec tasks to isolated Claude Code, Codex, or Gemini workers — each agent reads the spec, implements in its own worktree, and reports back. Ship 10 specs overnight." Button: "View amux on GitHub ★" with `exp025_specdriven_topofpage_cta_click` event. dateModified updated 2026-04-10 → 2026-08-11. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-18 (7 days minimum)
+
+### EXP-026 — Top-of-page green CTA on lists/best-ai-coding-agents-2026
+- **Hypothesis:** Lists pages with decent traffic and zero GH clicks need the EXP-015/020 WIN pattern. best-ai-coding-agents-2026 readers are evaluating tools — exact audience for amux.
+- **Page:** `/lists/best-ai-coding-agents-2026/`
+- **KPI:** GitHub stars (PostHog `exp026_best_ai_coding_agents_list_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-11
+- **Implementation:** Top-of-page green banner after subtitle. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-18 (7 days minimum)
+
+### EXP-027 — Top-of-page green CTA on lists/best-claude-code-tools-2026
+- **Hypothesis:** Claude Code tool shoppers are the highest-intent amux audience — anyone seeking "best Claude Code tools" is already running Claude Code and exactly one step from running a fleet.
+- **Page:** `/lists/best-claude-code-tools-2026/`
+- **KPI:** GitHub stars (PostHog `exp027_best_claude_tools_list_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-11
+- **Implementation:** Top-of-page green banner after subtitle. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-18 (7 days minimum)
+
+### EXP-028 — Top-of-page green CTA on lists/ai-agent-frameworks-comparison-2026
+- **Hypothesis:** AI agent framework researchers are evaluating orchestration options — the comparison frame maps directly to amux's positioning as the open-source fleet layer.
+- **Page:** `/lists/ai-agent-frameworks-comparison-2026/`
+- **KPI:** GitHub stars (PostHog `exp028_ai_agent_frameworks_list_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-11
+- **Implementation:** Top-of-page green banner after subtitle. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-18 (7 days minimum)
+
+### EXP-029 — Top-of-page green CTA on blog/ai-coding-tools-pricing-2026
+- **Hypothesis:** Pricing-page readers are in buy-vs-build mode — exactly when "amux is free, pay only for API tokens" resonates hardest. Top-of-page placement (EXP-015/020 pattern) should convert this 34 PV / 0 GH click page.
+- **Page:** `/blog/ai-coding-tools-pricing-2026/`
+- **KPI:** GitHub stars (PostHog `exp029_pricing_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-12
+- **Implementation:** Top-of-page green banner after subtitle, before `<h2>The master pricing table</h2>`. Copy: "The orchestration layer costs $0 — your API tokens do the work." Button: "View amux on GitHub ★". Same compact banner format as EXP-015 WIN and EXP-020 WIN. Page also refreshed to August 2026 (Copilot billing past-tense, Sonnet 5, multi-runtime Scenario 1).
+- **Effort:** XS
+- **Measure after:** 2026-08-19 (7 days minimum)
+
+### EXP-030 — Top-of-page green CTA on guides/claude-code-vs-codex-vs-gemini-cli (new page)
+- **Hypothesis:** "Claude Code vs Codex vs Gemini CLI" is an uncovered three-way comparison query. Creating the page targets the moment a developer is choosing between runtimes — amux as the orchestrator that runs all three is the natural next step. CTA baked into the new page from day one.
+- **Page:** `/guides/claude-code-vs-codex-vs-gemini-cli/` (new)
+- **KPI:** GitHub stars (PostHog `exp030_runtimes_compare_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-12
+- **Implementation:** New guide with 12-row comparison table, per-runtime deep sections, amux as orchestrator close. Top-of-page green CTA banner before comparison table. BreadcrumbList + Article + FAQPage JSON-LD.
+- **Effort:** M (new page)
+- **Measure after:** 2026-08-19 (7 days minimum — wait for search indexing)
+
+### EXP-031 — GitHub CTA banner on concierge/ page
+- **Hypothesis:** Concierge visitors (37 PVs, 0 GH clicks) include developers evaluating the platform before committing to a $5k/month engagement. A low-friction GitHub exit path gives them a conversion route without detracting from the primary "schedule a meeting" CTA.
+- **Page:** `/concierge/`
+- **KPI:** GitHub stars (PostHog `exp031_concierge_github_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-12
+- **Implementation:** Compact green banner between hero section and "AI age" section. Copy: "Concierge runs on open-source amux — explore the platform before you book." Button: "View amux on GitHub ★". Positioned as a secondary conversion path, not competing with the primary "Schedule a meeting" CTA.
+- **Effort:** XS
+- **Measure after:** 2026-08-19 (7 days minimum)
+
+### EXP-032 — Top-of-page green CTA on lists/open-source-ai-coding-tools-2026
+- **Hypothesis:** Open-source tool shoppers are self-hosters — exactly the right audience. amux is on this list already; a CTA pointing to GitHub converts researchers into stars.
+- **Page:** `/lists/open-source-ai-coding-tools-2026/`
+- **KPI:** GitHub stars (PostHog `exp032_oss_list_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-12
+- **Implementation:** Top-of-page green banner after updated subtitle. Also fixed amux language tag (Python → Rust) and updated to August 2026. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-19 (7 days minimum)
+
+### EXP-033 — Top-of-page green CTA on lists/ai-tools-for-solopreneurs-2026
+- **Hypothesis:** Solo founder tool lists attract bootstrappers evaluating cost leverage. "amux replaces a junior engineering team — free and open-source" is the highest-impact framing for this audience.
+- **Page:** `/lists/ai-tools-for-solopreneurs-2026/`
+- **KPI:** GitHub stars (PostHog `exp033_solopreneurs_list_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-12
+- **Implementation:** Top-of-page green banner after updated subtitle. Also updated to August 2026. Same compact banner format as EXP-015 WIN and EXP-020 WIN.
+- **Effort:** XS
+- **Measure after:** 2026-08-19 (7 days minimum)
+
+### EXP-034 — Top-of-page green CTA on /guides/ index
+- **Hypothesis:** The guides index has 157 PVs over 14 days but only 1.3% GitHub CVR — the lowest of any high-traffic page. It has no top-of-page CTA. Adding one will replicate the EXP-015 WIN (+200%) and EXP-020 WIN pattern.
+- **Page:** `/guides/`
+- **KPI:** GitHub stars (PostHog `exp034_guides_index_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-13
+- **Implementation:** Green/teal CTA banner immediately after the page subtitle. "Run a fleet of Claude Code, Codex, and Gemini CLI agents from a single dashboard. amux is free, MIT licensed, and takes 2 minutes to install." with a green GitHub button.
+- **Effort:** XS
+- **Measure after:** 2026-08-20 (7 days minimum)
+
+### EXP-035 — Top-of-page green CTA on new /guides/ai-agent-groups/ page
+- **Hypothesis:** A new guide page targeting "organize AI agents into groups" will attract developers who are already running multiple agents and are evaluating group/namespace management. This audience is high-intent and will respond to a direct "here's how amux handles it" CTA.
+- **Page:** `/guides/ai-agent-groups/`
+- **KPI:** GitHub stars (PostHog `exp035_groups_guide_topofpage_cta_click`)
+- **Status:** `running`
+- **Started:** 2026-08-13
+- **Implementation:** Green CTA banner baked into the page at creation. "Organizing your AI engineering team into specialized groups? amux groups give each sub-team its own board view, shared memory, and environment scope — manage dozens of agents with zero coordination overhead."
+- **Effort:** XS (baked in at page creation)
+- **Measure after:** 2026-08-20 (7 days minimum)
+
 ### EXP-019 — Review dashboard PS row on homepage
 - **Hypothesis:** The Review dashboard / Trends view / Fleet org chart (shipped 2026-08-01) represent a new capability class — "understand what your AI team did" — not represented in the homepage PS grid. Adding a dedicated row surfaces this for engineering managers and team leads who are the highest-value audience segment.
 - **Page:** `/` (homepage PS problem/solution grid)
 - **KPI:** GitHub stars + /guides/ai-agent-team-review/ traffic
-- **Status:** `running`
+- **Status:** `concluded: inconclusive`
 - **Started:** 2026-08-02
+- **Concluded:** 2026-08-11
 - **Implementation:** Added "No idea what your team of agents actually accomplished this week" → "Review dashboard — Trends view groups fleet activity by theme; blockers surface first; Fleet org chart shows who's doing what. Team review guide →" row at the bottom of the PS grid. Links to /guides/ai-agent-team-review/. PostHog event: autocapture on GitHub link + team-review link click.
 - **Effort:** XS
-- **Measure after:** 2026-08-09 (7 days minimum)
+- **Score (2026-08-11):** Pre (Jul 26–Aug 1, 7d): 60 homepage GH clicks = **8.6/day**. Post (Aug 2–8, 7d): 63 GH clicks = **9.0/day**. Delta: **+4.7%** — below the 10% win threshold. Confound: EXP-016 also ran on homepage concurrently (different row, different KPI focus, but overlapping traffic pool). **Verdict: Inconclusive.** Review dashboard row kept in place — no negative signal, adds genuine new capability framing.
 
 ### EXP-018 — Top-of-page CTA rollout to all high-traffic/low-CVR guides
 - **Hypothesis:** EXP-015 proved top-of-page CTAs work (+200% GH clicks on headless). Apply the same green/teal banner pattern to the next highest-traffic, lowest-CVR guides: ai-agent-orchestration-2026 (4 GH clicks, likely 200+ PVs) and ai-agent-sandboxing (1 GH click, 122+ PVs). Each banner should be customized to the guide's topic rather than using generic amux copy.
@@ -319,6 +430,7 @@
 | EXP-020 — Top-of-page CTA on blog/best-terminal-ai-coding-agents-2026 | 2026-08-03 | 2026-08-10 | **+500%** blog GH clicks (pre 0.14/day vs post 2.00/day, 7 days each). 6 named exp020 events. Decisive win — top-of-page pattern now confirmed on 2 pages (headless +200%, terminal blog +500%). **Change kept permanently.** | **win** |
 | EXP-018 — Top-of-page CTA rollout (ai-agent-sandboxing, ai-agent-orchestration, agent-fleet-operations) | 2026-07-30 | 2026-08-06 | Named events: insufficient volume. ai-agent-sandboxing GH clicks: ~1 pre vs ~1–2 post (7 days). Same low-volume pattern as EXP-014/012/007 — guide pages <150 PVs don't have enough click volume for a 7-day pre/post signal. CTAs kept in place (harmless, match EXP-015 pattern). | inconclusive |
 | EXP-016 — CTO/team persona framing in homepage hero | 2026-08-01 | 2026-08-10 | +6.5% homepage GH clicks (pre 8.9/day vs post 9.4/day, 7 days each). Below 10% threshold. EXP-019 confound (also running, different PS row). "Teams" framing kept — harmless, consistent with positioning. | inconclusive |
+| EXP-019 — Review dashboard PS row on homepage | 2026-08-02 | 2026-08-11 | +4.7% homepage GH clicks (pre 8.6/day vs post 9.0/day, 7 days each). Below 10% threshold. EXP-016 confound (also running on homepage). Review dashboard row kept — no negative signal, genuine new capability. | inconclusive |
 | EXP-015 — Top-of-page GitHub CTA on claude-code-headless | 2026-07-22 | 2026-07-29 | **+200%** headless GH clicks (pre 0.29/day vs post 0.86/day, 7 days each). 5 named exp015 events confirmed. Top-of-page placement dramatically outperforms buried EXP-007 block at line 650. **Change kept permanently.** | **win** |
 | EXP-010 — Feature table reorder: phone-first features at top | 2026-07-17 | 2026-07-31 | **+20.0%** iOS clicks (pre 3.6/day vs post 4.3/day, 14-day post window). EXP-011 minimal confound (different KPI: GH clicks not iOS). Phone-first row order kept permanently. | **win** |
 | EXP-001 — Hero CTA button copy | 2026-07-07 | 2026-07-26 | No valid pre-period baseline — PostHog activated 2026-07-09, experiment started 2026-07-07. Change kept ("⭐ Star on GitHub"). | inconclusive |
@@ -363,6 +475,9 @@ _Updated by SCHED-149 Job 9 after each run with PostHog data and experiment resu
 | 2026-08-10 | GitHub stars: **336** (+4 since last run). **EXP-020 CONCLUDED win +500%**: blog/best-terminal-ai-coding-agents-2026 GH clicks, pre 0.14/day (Jul 27–Aug 2) → post 2.00/day (Aug 3–9), 6 named exp020 events. Third consecutive top-of-page CTA WIN (EXP-015 +200%, EXP-020 +500%). Pattern is firmly established: top-of-page green banner on high-traffic pages with high-intent audiences produces decisive lift. **EXP-018 CONCLUDED inconclusive**: ai-agent-sandboxing (+ ai-agent-orchestration, agent-fleet-operations) — insufficient volume, same pattern as EXP-014. CTAs kept in place. **EXP-016 CONCLUDED inconclusive**: +6.5% homepage GH clicks (pre 8.9/day vs post 9.4/day, 7 days). EXP-019 confound. "Teams" framing kept. **EXP-022 SHIPPED**: green top-of-page CTA on harness-engineering (138 PVs, 0 GH clicks — biggest CTA gap by traffic). `exp022_harness_topofpage_cta_click` event. Measure 2026-08-17. **EXP-023 SHIPPED**: green top-of-page CTA on best-self-hosted-ai-coding-tools-2026 (66 PVs, 0 GH clicks). `exp023_selfhosted_topofpage_cta_click` event. Measure 2026-08-17. **AEO Jobs 6–9**: changelog updated (7 new entries: IaC, commit nudge, model/token spend, message verdict, smart tags, gate enforcement, worker status), lists/best-ai-agent-orchestrators-2026 updated (August 2026, star counts refreshed: LangGraph 47k+, CrewAI 31k+, AutoGen 38k+, OpenHands 42k+, amux 336), new guide /guides/declarative-ai-agent-setup/ (amux IaC / YAML agent config). | **EXP-020** marked concluded win. **EXP-018** marked concluded inconclusive. **EXP-016** marked concluded inconclusive. **EXP-022** and **EXP-023** shipped and marked running. Concluded table updated. changelog/notes.json + changelog/index.html updated. lists/best-ai-agent-orchestrators-2026/index.html updated. sitemap.xml lastmod updated for lists page + declarative guide already present. llms.txt already has declarative guide. |
 | 2026-08-04 | GitHub stars: **332** (+2 since last run). **EXP-017 CONCLUDED inconclusive**: 7-day window. Named events: 2 (`exp017_compare_index_multiplexers_callout_click` — Jul 30 + Aug 4). Compare index PVs pre (Jul 21–27): 49; post (Jul 28–Aug 3): 29. Volume too low for a meaningful pre/post GH click comparison — same pattern as EXP-012 (1 named click, 7 days). Callout kept in place. **PostHog 14-day traffic state:** Homepage 941 PVs, best-ai-agent-multiplexers-2026 390 PVs, claude-code-headless 281 PVs, blog/best-terminal-ai-coding-agents-2026 179 PVs (EXP-020 just shipped here), harness-engineering 138 PVs (6th highest, only a buried EXP-014 CTA — biggest CTA gap by traffic). best-self-hosted-ai-coding-tools-2026 64 PVs and spec-driven-development 54 PVs are new high-traffic entrants with no CTAs. **EXP-021 SHIPPED**: top-of-page green CTA added to /guides/context-engineering/ (Job 2 AEO enrichment — group isolation, multi-runtime table, Activity log debugging sections added; dateModified 2026-08-04). Measure 2026-08-11. **EXP-022 QUEUED**: harness-engineering top-of-page banner (138 PVs, highest-traffic page with only buried CTA — replicate EXP-015 WIN pattern). **AEO Jobs 2–6 completed**: context-engineering enriched (31aceb2), debug-ai-coding-agents new page (ba8b124), amux-vs-goose rebuilt (5e39a13), for/business-owners new page (e1bb594), changelog 9 entries (ddb2799). | **EXP-017** marked concluded inconclusive. **EXP-021** shipped and marked running. **EXP-022** added as queued. homepage-experiments.md updated with all EXP-017/021/022 entries + today's learnings log. |
 | 2026-08-10 | GitHub stars: **336** (+4 since last run). **EXP-020 CONCLUDED win +500%**: top-of-page CTA on blog/best-terminal-ai-coding-agents-2026 (started 2026-08-03). Pre (Jul 27–Aug 2, 7d): 1 total GH click = 0.14/day. Post (Aug 3–9, 7d): 7 total GH clicks = 1.0/day. Delta: **+500%** — decisive win. 6 named exp020 events confirmed. Same position-first pattern as EXP-015 (+200%). **EXP-016 CONCLUDED inconclusive**: CTO/team persona framing in homepage .lede (started 2026-08-01). Pre (Jul 25–31, 7d): 8.9 homepage GH clicks/day. Post (Aug 1–7, 7d): 9.4/day. Delta: **+6.5%** — below 10% win threshold. Confound: EXP-019 also running on homepage. Change kept. **PostHog 14-day KPI state:** Homepage ~94 PVs GH clicks (unchanged at ~15% CVR), harness-engineering 94 PVs / 0 GH clicks, best-self-hosted 66 PVs / 0 GH clicks. **EXP-022 SHIPPED**: green top-of-page CTA on harness-engineering (94 PVs, 0 GH clicks, biggest 0-CVR gap by traffic). Measure 2026-08-17. **EXP-023 SHIPPED**: green top-of-page CTA on best-self-hosted-ai-coding-tools-2026 (66 PVs, 0 GH clicks). Measure 2026-08-17. **AEO Jobs completed**: harness-engineering + best-self-hosted enriched (star count 336, new entity framing), new declarative-ai-agent-setup guide (IaC query gap), changelog updated (IaC, commit-nudge, model reporting), lists refreshed (best-ai-agent-orchestrators-2026), sitemap.xml updated. | **EXP-020** marked concluded win. **EXP-016** marked concluded inconclusive. **EXP-022** shipped and marked running (started 2026-08-10). **EXP-023** shipped and marked running (started 2026-08-10). Both added to concluded table. homepage-experiments.md updated with all entries. |
+| 2026-08-13 | GitHub stars: **345** (+3 since last run). No experiments to score today (all running < 7 days; next windows: EXP-022/023/024 → 2026-08-17, EXP-021/025/026/027/028 → 2026-08-18, EXP-029–033 → 2026-08-19). **EXP-034 SHIPPED**: top-of-page green CTA on /guides/ index (157 PVs, 1.3% CVR — lowest-converting high-traffic page, no CTA existed). `exp034_guides_index_topofpage_cta_click` event. Measure 2026-08-20. **EXP-035 SHIPPED**: CTA baked into new /guides/ai-agent-groups/ page at launch. `exp035_groups_guide_topofpage_cta_click` event. Measure 2026-08-20. **Job 2**: best-ai-agent-multiplexers-2026 freshened — dateModified 2026-08-13, groups guide link added to amux feature bullet. **Job 3**: New guide /guides/ai-agent-groups/ created — groups feature AEO guide (commit 083877d, 2026-08-08), HowTo + FAQPage + Article + BreadcrumbList JSON-LD, full comparison table, EXP-035 CTA baked in. **Job 4**: /compare/amux-vs-bolt-new/ rebuilt (background agent). **Job 6**: changelog/notes.json 7 new entries prepended (groups panel, EnvSpec full env, board drain nudge, accountability sweep, env workdir fix, alert push fix, CLI dead-port warning). **Job 8**: Press boilerplate "single-file Python" → "single Rust binary, 345+ GitHub stars" (already updated by prior session's fork). Sitemap + guides index updated with new groups guide URL. | **EXP-034** and **EXP-035** shipped and marked running. /guides/ai-agent-groups/ created and listed. changelog/notes.json + sitemap.xml + guides/index.html updated. AEO_BACKLOG.md entries appended. |
+| 2026-08-12 | GitHub stars: **342** (+4 since last run). No experiments to score today (all running ≤ 2 days). **EXP-029 SHIPPED**: top-of-page CTA on /blog/ai-coding-tools-pricing-2026/ (34 PVs, 0 GH clicks, stale May 2026 → freshened August 2026). `exp029_pricing_topofpage_cta_click` event. Measure 2026-08-19. **EXP-030 SHIPPED**: baked into new guide page /guides/claude-code-vs-codex-vs-gemini-cli/ at launch (query gap: no existing "Claude Code vs Codex vs Gemini CLI" comparison on site). `exp030_runtimes_compare_topofpage_cta_click` event. Measure 2026-08-19. **EXP-031 SHIPPED**: GitHub CTA banner on /concierge/ (37 PVs, 0 GH clicks — no GitHub path existed on a high-intent service page). `exp031_concierge_github_cta_click` event. Measure 2026-08-19. **EXP-032 SHIPPED**: top-of-page CTA on /lists/open-source-ai-coding-tools-2026/ (stale July 2026, no CTA). Also fixed amux language Python → Rust. `exp032_oss_list_topofpage_cta_click` event. Measure 2026-08-19. **EXP-033 SHIPPED**: top-of-page CTA on /lists/ai-tools-for-solopreneurs-2026/ (stale July 2026, no CTA). `exp033_solopreneurs_list_topofpage_cta_click` event. Measure 2026-08-19. **EXP-026/027/028 running** on 3 list pages (best-ai-coding-agents, best-claude-code-tools, ai-agent-frameworks), all started 2026-08-11, measure 2026-08-18. **Job 2**: /blog/ai-coding-tools-pricing-2026/ freshened — August 2026 badge, dateModified updated, Copilot billing updated (moved to past tense: June 1, 2026), multi-agent framing updated to mention Codex and Gemini CLI alongside Claude Code, Sonnet 4 → Sonnet 5. **Job 3**: New guide /guides/claude-code-vs-codex-vs-gemini-cli/ created (3-way runtime comparison, 14-row feature table, per-runtime detail sections, mixed-fleet walkthrough, decision guide by use case, 6-question FAQ, Article + FAQPage + BreadcrumbList JSON-LD). **Job 6**: changelog/notes.json 7 new entries prepended (copyable MSG-ID badge, cloud auto-deploy, Gmail mailbox, needsyou CLI fix, Map/graph tab, settings fix, offline badge); changelog/index.html JSON-LD ItemList updated with newest 5 entries. **Job 7**: 2 stale lists (open-source, solopreneurs) freshened + EXP-032/033. Press stars are dynamic — no update needed (Job 8). | **EXP-029 through EXP-033** shipped and marked running. EXP-026/027/028 added as formal running entries. Score window line updated. changelog/notes.json + index.html updated. 2 stale list pages freshened. Sitemap dates updated: pricing blog, 2 lists, concierge. |
+| 2026-08-11 | GitHub stars: **338** (+2 since last run). **EXP-019 CONCLUDED inconclusive**: Review dashboard PS row on homepage (started 2026-08-02). Pre (Jul 26–Aug 1, 7d): 60 homepage GH clicks = 8.6/day. Post (Aug 2–8, 7d): 63 GH clicks = 9.0/day. Delta: **+4.7%** — below 10% threshold. EXP-016 confound. Row kept. **EXP-021 EXTENDED to 2026-08-18**: context-engineering top-of-page CTA — 0 GH clicks in 7-day window (Aug 4–10), insufficient traffic. Same low-volume pattern as EXP-014/EXP-018. **EXP-025 SHIPPED**: green top-of-page CTA on /guides/spec-driven-development/ (45 PVs, 0 GH clicks — NO CTA of any kind existed; biggest unaddressed gap). `exp025_specdriven_topofpage_cta_click` event. dateModified 2026-04-10→2026-08-11. Measure 2026-08-18. **Changelog**: 8 new entries prepended to notes.json (Cost tab, saved habits, subagent token attribution, reactive pickup, backlog-triage nudge, Connect modals fix, needsyou visibility fix, status-request 405 fix). **Job 3**: amux-vs-openhands rebuilt from 101-line stub to 360-line full compare page (15-row table, 5-question FAQ, "why not both?" section, EXP-007 CTA). **Job 7**: 3 stale list pages refreshed (best-ai-coding-agents, best-claude-code-tools, ai-agent-frameworks) — EXP-026/027/028 CTAs added, August 2026 content updates, star counts updated. | **EXP-019** marked concluded inconclusive + added to Concluded table. **EXP-021** extended to 2026-08-18. **EXP-025** shipped and marked running. **EXP-026/027/028** running on 3 list pages. amux-vs-openhands rebuilt. homepage-experiments.md + changelog/notes.json + AEO_BACKLOG.md + spec-driven-development updated. |
 
 ---
 

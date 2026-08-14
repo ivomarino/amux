@@ -66,12 +66,29 @@ fallback when a finding needs row-level inspection.
 2. **Latency: one call.** `GET /api/logs/stats?since_h=24`
    Per family: count, p50_ms / p95_ms / max_ms (nearest-rank percentiles over
    the window's sorted latencies; the method is named in `percentile_method`),
+   `actual_window_h` + `scan_truncated` — READ THESE BEFORE TRUSTING THE NORM,
    error_count, error_rate, proxy_count (strictly `python-proxy`), `origins`
    (per-`answered_by` counts — the coverage tell above, precomputed),
    distinct_workers, distinct_clients, plus `slow_outliers` (rows > 5x their
    family p50, capped 20) and `totals`. For the trailing norm, call it again
    with `since_h=192` and compare. Finding = today's p95 > ~2x trailing p95
    (use judgment on low-volume families; never conclude from n < 20 requests).
+
+   **The trailing norm is capped, and the cap lies about its size (AR-134).**
+   `stats` scans at most 200,000 rows. Asking for `since_h=192` on a busy day
+   returns `scan_truncated: true` and an `actual_window_h` of ~35, not 192 —
+   identical counts come back for 192h, 336h and 720h, because all three hit the
+   same cap. So "the 8-day norm" can silently be 1.5 days.
+
+   Judge it on `actual_window_h`, NOT by comparing `totals.count` between the two
+   calls. Comparing counts was the first version of this guard and it gives the
+   WRONG answer in both directions: equal counts read as "vacuous" when the log
+   genuinely spans one day, and DIFFERENT counts read as "usable" when the only
+   reason they differ is the cap. On 2026-08-11 that guard reported the norm
+   usable over what was really a 35h window.
+
+   Say the real window in the summary — "p95 vs a 35h norm, not 8 days" — rather
+   than reporting a comparison the reader will assume covers a week.
    Deep-dive fallback: `GET /api/logs?since=$SINCE&family=/api/board&limit=2000`.
 
    Routing questions along the way ("is PATCH mounted at X?") are answered by

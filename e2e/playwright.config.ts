@@ -28,11 +28,29 @@ export default defineConfig({
     { name: 'mobile', use: { viewport: { width: 375, height: 667 } } },
   ],
   webServer: {
-    command: `cargo run -p amux-server`,
+    // Builds from COMMITTED HEAD, not this shared working tree — a peer
+    // mid-edit used to fail runs with a Rust error against JS-only changes,
+    // and a red run caused by a stranger's half-saved file is
+    // indistinguishable from one caused by your own patch (AMUX-2924).
+    // Uncommitted rust changes are announced by name every run;
+    // AMUX_E2E_WORKING_TREE=1 opts back in to testing the tree.
+    command: `bash ${path.join(__dirname, 'serve-head.sh')}`,
     url: `https://localhost:${PORT}/health`,
     ignoreHTTPSErrors: true,
     reuseExistingServer: false,
-    timeout: 180_000, // first cargo build is slow; later runs are cached
+    // PIPE, not the default 'ignore'. serve-head.sh prints which uncommitted
+    // rust changes are NOT under test, and that notice is the only thing
+    // standing between "builds from HEAD" and a developer silently testing
+    // code they did not write. A warning nobody can see is not a warning —
+    // the default would have swallowed it whole (AMUX-2924).
+    stdout: 'pipe',
+    stderr: 'pipe',
+    // 10 min, not 3: the HEAD-worktree build now uses its OWN target dir
+    // (AMUX-2961 — sharing the fleet's dir let worktree dep-info poison repo
+    // builds into silent no-ops), so its FIRST local build is fully cold.
+    // Later runs are cached; CI skips the worktree entirely via
+    // AMUX_E2E_WORKING_TREE=1.
+    timeout: 600_000,
     env: {
       AMUX_HOME: home,
       AMUX_RS_PORT: String(PORT),

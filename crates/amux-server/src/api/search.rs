@@ -37,7 +37,6 @@
 
 use super::AppState;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -97,13 +96,7 @@ pub struct SearchParams {
     offset: Option<usize>,
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": e.to_string() })),
-    )
-        .into_response()
-}
+use super::internal;
 
 // ---------------------------------------------------------------------------
 // Query construction

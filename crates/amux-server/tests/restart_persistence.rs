@@ -456,7 +456,23 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
     // 5. steering queue — rows survive AND keep their queued_at ordering,
     //    which is what makes "oldest first, one per tick" mean anything.
     let (c, v) = rig.get(&format!("/api/sessions/{lane}/steer")).await;
-    let items = v.as_array().cloned().unwrap_or_default();
+    let all = v.as_array().cloned().unwrap_or_default();
+    // The invariant here is the HUMAN steering queue surviving restart, in order.
+    // Post-07424e3 a SYSTEM push (board-drive, schedules, the accountability
+    // sweep — any non-empty guard except `selector-answer`) shares the
+    // steering_queue table but is a SEPARATE surface. On a hard restart the
+    // accountability sweep legitimately fires against this lane (it seeded an
+    // unaccounted cmd_history message with no card) and lands a guarded system
+    // row. Assert on the human subset only, filtered by the SAME guard rule the
+    // server classifies with — so a system push that LEAKED as human (empty
+    // guard when it should be guarded) would still FAIL here, not hide.
+    let items: Vec<&Value> = all
+        .iter()
+        .filter(|i| {
+            let g = i["guard"].as_str().unwrap_or("");
+            g.is_empty() || g == "selector-answer"
+        })
+        .collect();
     let texts: Vec<&str> = items.iter().filter_map(|i| i["text"].as_str()).collect();
     let ordered = texts == vec!["rr0150 queued one", "rr0150 queued two"];
     let have_ts = items.iter().all(|i| i["queued_at"].as_f64().unwrap_or(0.0) > 0.0);

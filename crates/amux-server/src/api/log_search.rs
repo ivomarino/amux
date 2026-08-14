@@ -75,11 +75,18 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
                 if raw.to_lowercase().contains(&ql) {
                     let clean = ansi_re.replace_all(raw, "").trim().to_string();
                     if !clean.is_empty() {
-                        let truncated = if clean.len() > 500 {
-                            clean[..500].to_string()
-                        } else {
-                            clean
-                        };
+                        // BYTE SLICING PANICS ON A MULTI-BYTE BOUNDARY, and
+                        // terminal scrollback is full of box-drawing characters
+                        // — `clean[..500]` landed inside '─' and took the whole
+                        // request down with a 500. Live, on the first real
+                        // query: "byte index 500 is not a char boundary; it is
+                        // inside '─' (bytes 499..502)".
+                        //
+                        // chars().take() is the same cap expressed in a unit
+                        // that cannot split a character. invariants/monitor.rs
+                        // carries the identical note about app.js's box-drawing
+                        // comments; this is that bug in a second file.
+                        let truncated: String = clean.chars().take(500).collect();
                         hits.push(json!({"line": i + 1, "text": truncated}));
                         if hits.len() >= max_per {
                             break;
@@ -104,5 +111,23 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A hit whose text crosses the 500-char cap ON A MULTI-BYTE CHARACTER must
+    /// not panic. Terminal scrollback is mostly box-drawing, so this is the
+    /// common case, not an edge case — it took the endpoint down with a 500 on
+    /// the first real query.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        let line = "─".repeat(400); // 3 bytes each: byte 500 lands mid-character
+        let truncated: String = line.chars().take(500).collect();
+        assert_eq!(truncated.chars().count(), 400, "shorter than the cap: unchanged");
+        let long = "─".repeat(700);
+        let t2: String = long.chars().take(500).collect();
+        assert_eq!(t2.chars().count(), 500, "capped in CHARS, not bytes");
+        assert!(t2.len() > 500, "and the byte length exceeds the cap, which is why byte-slicing panicked");
     }
 }

@@ -1,7 +1,7 @@
 //! /api/groups + /api/tags — NATIVE group list + per-group config
 //! (AMUX-2597 boundary work; previously proxied to Python, AMUX-2594).
 //!
-//! Python source of record (amux-server.py, checked 2026-08-09):
+//! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - alias: `/api/groups/*` rewrites to `/api/tags/*` EXCEPT paths ending in
 //!   `/config` (py:65345-65347) — net effect: both spellings serve the same
 //!   list; only the /api/groups spelling has a `/config` sub-resource, and
@@ -41,7 +41,7 @@ use axum::routing::any;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Nested at /api/groups: the list plus the /config sub-resource. ONE
 /// wildcard route dispatching on the sub-path, exactly like Python's
@@ -87,11 +87,7 @@ async fn not_found() -> Response {
     j(404, json!({"error": "not found"}))
 }
 
-pub(crate) fn amux_home() -> PathBuf {
-    std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+pub(crate) use crate::config::amux_home;
 
 /// Python `_hdr_worker` (py:15100 region): X-Amux-Worker is canonical,
 /// X-Amux-Session still honored. Shared with api/scope.rs (same attribution

@@ -130,7 +130,7 @@
     </div>
     <div class="quick-pick">
       <div class="pick-label">Best for parallel agent fleets</div>
-      <p><strong><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a></strong> &mdash; Open-source control plane for running an AI engineering team from your phone or browser. Orchestrate 10&ndash;50+ Claude Code, Codex, or Gemini CLI agents on your own machine — self-healing watchdog, shared kanban board, cost tracking, and mobile PWA dashboard. 336★ GitHub, MIT licensed, single Python file, zero external dependencies.</p>
+      <p><strong><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a></strong> &mdash; Open-source control plane for running an AI engineering team from your phone or browser. Orchestrate 10&ndash;50+ Claude Code, Codex, or Gemini CLI agents on your own machine — self-healing watchdog, shared kanban board, cost tracking, and mobile PWA dashboard. 336★ GitHub, MIT licensed, single Rust binary, zero external dependencies.</p>
     </div>
     <div class="quick-pick">
       <div class="pick-label">Best all-in-one platform (fully local)</div>
@@ -525,12 +525,12 @@ aider --model claude-3-opus-20240229</code></pre>
         <span>MIT License</span>
         <span>Self-hosted control plane</span>
       </div>
-      <p>The control plane for self-hosted agent fleets. Wraps <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a> with a web dashboard, REST API, self-healing watchdog, per-session cost tracking, shared kanban board, inter-agent messaging, browser automation, and a cron scheduler. Single Python file, zero cloud dependencies.</p>
+      <p>The control plane for self-hosted agent fleets. Wraps <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a> with a web dashboard, REST API, self-healing watchdog, per-session cost tracking, shared kanban board, inter-agent messaging, browser automation, and a cron scheduler. Single Rust binary, zero cloud dependencies.</p>
       <p><strong>How it differs:</strong> <a href="https://github.com/crewAIInc/crewAI" target="_blank" rel="noopener">CrewAI</a>, <a href="https://github.com/microsoft/autogen" target="_blank" rel="noopener">AutoGen</a>, and <a href="https://github.com/langchain-ai/langgraph" target="_blank" rel="noopener">LangGraph</a> are frameworks for building agent systems with code. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> is a ready-to-use tool that manages existing agents (<a href="https://github.com/anthropics/claude-code" target="_blank" rel="noopener">Claude Code</a>, <a href="https://aider.chat" target="_blank" rel="noopener">Aider</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex</a>, anything that runs in a terminal) without writing custom orchestration code. Start agents, monitor health, coordinate via board, track costs &mdash; all from a dashboard or your phone.</p>
       <pre><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # Dashboard at https://localhost:8822</code></pre>
+amux serve  # Dashboard at https://localhost:8824</code></pre>
     </div>
 
     <div class="verdict">
@@ -592,7 +592,7 @@ amux register frontend --dir ~/Dev/frontend --yolo
 # 3. Start agents and serve dashboard
 amux start api-server
 amux start frontend
-amux serve  # → https://localhost:8822
+amux serve  # → https://localhost:8824
 
 # 4. Monitor from your phone (install as PWA)</code></pre>
       <p><strong>Upgrade path:</strong> Add <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vLLM</a> on a GPU server for team-wide local model serving. Route privacy-sensitive tasks to local models, everything else to <a href="https://www.anthropic.com/" target="_blank" rel="noopener">Anthropic</a> API.</p>
@@ -830,7 +830,7 @@ amux serve --host 0.0.0.0  # Accessible to team</code></pre>
       <pre><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
-amux serve  # → https://localhost:8822</code></pre>
+amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a>
     </div>
   </main>

@@ -33,7 +33,9 @@
 //!   panes herdr *detected* as known agents). Attach is session attach +
 //!   workspace focus.
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,6 +61,10 @@ pub struct HerdrBackend {
     /// flag, and fails with code `server_not_running` when that session's
     /// server is down.
     session: String,
+    /// backend_ref → pane_id. Pane IDs are stable for a workspace's lifetime,
+    /// so caching skips the workspace-list + pane-list round-trips (~180ms)
+    /// on every capture. Invalidated on NotFound (workspace was closed).
+    pane_cache: Mutex<HashMap<String, String>>,
 }
 
 impl HerdrBackend {
@@ -66,6 +72,7 @@ impl HerdrBackend {
         Self {
             bin: "herdr".into(),
             session: herdr_session.into(),
+            pane_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -185,6 +192,60 @@ impl HerdrBackend {
             tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
         shell_pid
+    }
+
+    /// Resolve pane id, using the cache to skip workspace-list + pane-list
+    /// (~180ms saved). On NotFound, evicts the cache entry and retries once
+    /// cold in case the workspace was recreated with a new pane id.
+    async fn resolve_pane(&self, backend_ref: &str) -> Result<String> {
+        if let Some(cached) = self.pane_cache.lock().unwrap().get(backend_ref) {
+            return Ok(cached.clone());
+        }
+        let ws = self
+            .find_workspace(backend_ref)
+            .await?
+            .ok_or_else(|| BackendError::NotFound(backend_ref.to_string()))?;
+        let pane = self.root_pane(&ws).await?;
+        self.pane_cache
+            .lock()
+            .unwrap()
+            .insert(backend_ref.to_string(), pane.clone());
+        Ok(pane)
+    }
+
+    fn evict_pane(&self, backend_ref: &str) {
+        self.pane_cache.lock().unwrap().remove(backend_ref);
+    }
+
+    async fn do_pane_read(&self, pane: &str, lines: u32) -> Result<String> {
+        let lines_s = lines.to_string();
+        let out = self
+            .run_raw(
+                &[
+                    "pane", "read", pane, "--lines", &lines_s, "--format", "text",
+                ],
+                CAPTURE_TIMEOUT,
+            )
+            .await?;
+        if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+                if let Some((code, message)) = envelope_error(&v) {
+                    return Err(match code.as_str() {
+                        "pane_not_found" | "workspace_not_found" => {
+                            BackendError::NotFound(message)
+                        }
+                        _ => BackendError::CommandFailed(format!("{code}: {message}")),
+                    });
+                }
+            }
+            return Err(BackendError::CommandFailed(format!(
+                "herdr pane read failed: {} {}",
+                stdout.trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -395,42 +456,16 @@ impl SessionBackend for HerdrBackend {
     }
 
     async fn capture(&self, proc: &ProcessRef, lines: u32) -> Result<String> {
-        let ws = self
-            .find_workspace(&proc.backend_ref)
-            .await?
-            .ok_or_else(|| BackendError::NotFound(proc.backend_ref.clone()))?;
-        let pane = self.root_pane(&ws).await?;
-        let lines_s = lines.to_string();
-        let out = self
-            .run_raw(
-                &[
-                    "pane", "read", &pane, "--lines", &lines_s, "--format", "text",
-                ],
-                CAPTURE_TIMEOUT,
-            )
-            .await?;
-        if !out.status.success() {
-            // Errors come back as a JSON envelope; success is raw terminal
-            // text (never JSON-parse the success path — the hosted program's
-            // own output could look like an envelope).
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
-                if let Some((code, message)) = envelope_error(&v) {
-                    return Err(match code.as_str() {
-                        "pane_not_found" | "workspace_not_found" => {
-                            BackendError::NotFound(message)
-                        }
-                        _ => BackendError::CommandFailed(format!("{code}: {message}")),
-                    });
-                }
+        let pane = self.resolve_pane(&proc.backend_ref).await?;
+        let result = self.do_pane_read(&pane, lines).await;
+        match &result {
+            Err(BackendError::NotFound(_)) => {
+                self.evict_pane(&proc.backend_ref);
+                let pane = self.resolve_pane(&proc.backend_ref).await?;
+                self.do_pane_read(&pane, lines).await
             }
-            return Err(BackendError::CommandFailed(format!(
-                "herdr pane read failed: {} {}",
-                stdout.trim(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            _ => result,
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 

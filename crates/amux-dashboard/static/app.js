@@ -1502,22 +1502,45 @@ function updateConnectionStatus() {
   if (drafts.length) parts.push(drafts.length + ' draft' + (drafts.length === 1 ? '' : 's'));
   if (offlineQueue.length) parts.push(offlineQueue.length + ' op' + (offlineQueue.length === 1 ? '' : 's'));
   title.innerHTML = '&#x26A0; Offline &mdash; ' + parts.join(', ') + ' pending';
-  let html = '';
-  html += drafts.map(d => {
-    return '<div class="offline-op">' +
+  const rows = [];
+  drafts.forEach(d => {
+    rows.push('<div class="offline-op">' +
       '<span class="op-action">Create &amp; start ' + esc(d.name) + (d.prompt ? ' + prompt' : '') + '</span>' +
       '<span class="op-time" style="color:var(--yellow)">draft</span>' +
-    '</div>';
-  }).join('');
-  html += offlineQueue.map(item => {
+    '</div>');
+  });
+  offlineQueue.forEach(item => {
     const age = Math.floor((Date.now() - item.timestamp) / 60000);
     const timeStr = age < 1 ? 'just now' : age + 'm ago';
-    return '<div class="offline-op">' +
+    rows.push('<div class="offline-op">' +
       '<span class="op-action">' + esc(describeOp(item)) + '</span>' +
       '<span class="op-time">' + timeStr + '</span>' +
-    '</div>';
-  }).join('');
-  ops.innerHTML = html;
+    '</div>');
+  });
+  // Accordion (Ethan 08:39): once the queued list exceeds 5, collapse it by
+  // default behind a click-to-expand header showing the count, so a long
+  // offline backlog doesn't push the whole board off-screen. <=5 shows inline.
+  if (rows.length > 5) {
+    const expanded = _offlineQueueExpanded;
+    const caret = expanded ? '&#x25BE;' : '&#x25B8;'; // ▾ open / ▸ closed
+    const label = expanded ? 'Hide queued operations'
+                           : 'Show all ' + rows.length + ' queued operations';
+    ops.innerHTML =
+      '<button type="button" class="offline-queue-toggle" aria-expanded="' + expanded +
+        '" onclick="_toggleOfflineQueue()">' + caret + ' ' + label + '</button>' +
+      '<div class="offline-queue-list' + (expanded ? '' : ' collapsed') + '">' + rows.join('') + '</div>';
+  } else {
+    ops.innerHTML = rows.join('');
+  }
+}
+
+// Accordion toggle for the offline queued-ops list (AMUX-2976). State lives
+// module-scope so it survives the frequent connection re-renders; it resets to
+// collapsed on reload, which is the intended "collapsed by default" behaviour.
+let _offlineQueueExpanded = false;
+function _toggleOfflineQueue() {
+  _offlineQueueExpanded = !_offlineQueueExpanded;
+  updateConnectionStatus();
 }
 
 // ── Durable upload queue (AMUX-2317) ────────────────────────────────────────
@@ -1588,16 +1611,44 @@ async function _upqDrain() {
   _upqRenderBadge();
 }
 
+// ONE pending count over BOTH offline stores (AMUX-2317).
+//
+// Files and dictation keep SEPARATE IDB stores on purpose — reviewer decision,
+// amux-homepage: a file upload lands bytes and is done, while a dictation POST
+// returns a transcript that goes into the composer and whose retry legitimately
+// yields a NEW result for the same audio. One queue would have to special-case
+// that, at which point it is not one queue.
+//
+// What a user needs is not one store, it is one ANSWER to "is anything of mine
+// still unsent". Before this, file uploads were visible only on Files/Explore
+// and clips only inside the peek dictation tab, so each surface confidently
+// showed a partial count and neither said so.
+async function _pendingSummary() {
+  let files = [], clips = [];
+  try { files = await _upqList(); } catch (e) {}
+  try { clips = ((await _idb.get('dict_pending')) || []).filter(x => x.state !== 'done'); } catch (e) {}
+  const bytes = files.reduce((a, x) => a + (x.size || 0), 0)
+              + clips.reduce((a, x) => a + ((x.blob && x.blob.size) || 0), 0);
+  return { files: files.length, clips: clips.length, total: files.length + clips.length, bytes };
+}
+
+function _fmtPendingBytes(b) {
+  return b / 1024 >= 1024 ? (b / 1048576).toFixed(1) + ' MB'
+                          : Math.max(1, Math.round(b / 1024)) + ' KB';
+}
+
 // A pending upload must never be indistinguishable from a lost one.
 async function _upqRenderBadge() {
-  const q = await _upqList();
+  const p = await _pendingSummary();
   document.querySelectorAll('.upq-badge').forEach(el => {
-    if (!q.length) { el.style.display = 'none'; el.textContent = ''; return; }
-    const bytes = q.reduce((a, x) => a + (x.size || 0), 0);
+    if (!p.total) { el.style.display = 'none'; el.textContent = ''; return; }
+    // Name BOTH kinds when both are present. "3 queued uploads" while one of
+    // them is a voice note is the partial-count problem with extra confidence.
+    const parts = [];
+    if (p.files) parts.push(p.files + ' upload' + (p.files === 1 ? '' : 's'));
+    if (p.clips) parts.push(p.clips + ' recording' + (p.clips === 1 ? '' : 's'));
     el.style.display = '';
-    el.textContent = q.length + ' queued upload' + (q.length === 1 ? '' : 's')
-      + ' (' + (bytes / 1024 >= 1024 ? (bytes / 1048576).toFixed(1) + ' MB'
-                                     : Math.max(1, Math.round(bytes / 1024)) + ' KB') + ')'
+    el.textContent = parts.join(' + ') + ' queued (' + _fmtPendingBytes(p.bytes) + ')'
       + (online ? ' \u2014 sending\u2026' : ' \u2014 waiting for connection');
   });
 }
@@ -1648,7 +1699,24 @@ async function runSyncBanner() {
   const rawQueue = [...offlineQueue];
   offlineQueue = [];
   saveQueue();
-  const queue = reconcileQueue(rawQueue);
+  let queue = reconcileQueue(rawQueue);
+  // Drop anything unreplayable that a PREVIOUS client version persisted — the
+  // pre-2026-08-11 apiCall queued GETs (and FormData bodies) that no replay
+  // can honestly re-issue. This is the half of the fix that reaches users who
+  // already have a poisoned localStorage: the enqueue guard stops new ones,
+  // this clears the ones already on disk. Beacons from HERE are the reliable
+  // signal, because replay only ever runs while online.
+  const unreplayable = queue.filter(q => !_outboxQueueable(q.url, q.options || {}));
+  if (unreplayable.length) {
+    queue = queue.filter(q => _outboxQueueable(q.url, q.options || {}));
+    try {
+      amuxTrack('outbox_unreplayable_dropped', {
+        n: unreplayable.length,
+        sample: unreplayable.slice(0, 5).map(q =>
+          ((q.options && q.options.method) || 'GET') + ' ' + String(q.url).split('?')[0]).join(', '),
+      });
+    } catch (e) {}
+  }
   const skipped = rawQueue.length - queue.length;
   const totalOps = draftCount + queue.length;
   if (!totalOps) return;
@@ -1797,6 +1865,12 @@ async function _apiErrText(r) {
         // Gate refusals carry the exact command that WOULD work — that is the
         // most actionable thing in the whole response; surface it.
         if (msg && j.cli) msg += ' — try: ' + j.cli;
+        // Same idea, different key (PR #90, Dygreens). The scheduler's
+        // shadow-mode 409 answers "what do I do about it" in `enable`
+        // (AMUX_RS_SCHEDULER=1), and only `cli` was being read — so the
+        // actionable half of that body was the half dropped. Any refusal that
+        // names its own remedy should carry it to the toast.
+        if (msg && j.enable) msg += ' — set ' + j.enable;
       } catch (e) { msg = txt.slice(0, 200); }
     }
   } catch (e) { /* body already consumed or unreadable — status only */ }
@@ -1852,7 +1926,20 @@ async function apiCall(url, options) {
       amuxTrack('api_error', { url: url.split('?')[0], status: r.status, method: options.method || 'GET' });
       return null;
     }
-    consecutiveFailures = 0;
+    // A LOCALLY-QUEUED 202 IS NOT PROOF OF CONNECTIVITY (AMUX-2585).
+    //
+    // apiCall handles mutations, so while offline every call here is
+    // intercepted by the outbox and handed back a synthetic 202 that never
+    // touched the network. It is `ok`, so this line used to reset the failure
+    // counter — meaning the client's own queued writes perpetually cleared the
+    // evidence that the server was unreachable, and consecutiveFailures could
+    // never climb back to the 2 that latches offline. The more the user did
+    // while offline, the more thoroughly the offline detector was disarmed.
+    //
+    // The GET paths (fetchSessions, the status poll) reset unconditionally and
+    // correctly: the outbox only intercepts POST/PATCH/PUT/DELETE, so a
+    // successful GET really did reach the server.
+    if (!_isLocallyQueued(r)) consecutiveFailures = 0;
     // No _warnIgnoredFields call here: apiCall goes through fetch, which the
     // watch at the top of this file already wraps. Calling it here too would
     // toast twice for every apiCall mutation.
@@ -1868,6 +1955,34 @@ async function apiCall(url, options) {
   }
 }
 function _queueOp(url, options) {
+  // THE SINGLE ENFORCEMENT POINT for what may enter the outbox.
+  //
+  // There are two independent queuing paths — apiCall's `!online` branch and
+  // the window.fetch interceptor — and until 2026-08-11 they applied DIFFERENT
+  // rules: the interceptor screened on method and _OUTBOX_SKIP, apiCall
+  // screened on nothing. So an offline GET went into a durable replay queue,
+  // was counted in the user-visible "N pending ops" badge, and got re-issued
+  // on reconnect. `golden_offline_queue_and_replay` caught it as a stray
+  // "GET /api/board/themes?min_size=4" and rust.yml's e2e job was red on main
+  // for two days over it.
+  //
+  // The guard lives HERE rather than in each caller because a predicate that
+  // has to be re-stated at every call site is one that will disagree with
+  // itself again (ethos rule 1: a view must share the predicate of the
+  // mechanism it describes). It also kills a latent TypeError — apiCall(url)
+  // with no options reached `options.body` below and threw.
+  if (!_outboxQueueable(url, options || {})) {
+    // Self-announcing: this beacon is logged server-side, so the next caller
+    // that tries to persist an unreplayable op shows up in the request log
+    // instead of as a silent count mismatch in one e2e test.
+    try {
+      amuxTrack('outbox_refused', {
+        url: String(url).split('?')[0],
+        method: ((options && options.method) || 'GET').toUpperCase(),
+      });
+    } catch (e) {}
+    return false;
+  }
   // Cap the outbox so localStorage can't overflow — oldest ops drop first
   if (offlineQueue.length >= 200) {
     offlineQueue.shift();
@@ -1889,6 +2004,7 @@ function _queueOp(url, options) {
   saveQueue();
   updateConnectionStatus();
   showToast('Queued (' + offlineQueue.length + ' pending)');
+  return true;
 }
 
 // ═══════ GLOBAL OFFLINE OUTBOX — fetch interceptor ═══════
@@ -1918,8 +2034,19 @@ function _outboxQueueable(url, init) {
   return !_OUTBOX_SKIP.test(url);
 }
 function _outboxAccepted() {
+  // MARKED so connectivity logic can tell it apart (AMUX-2585). This Response
+  // never left the browser; it is manufactured here. A 202 is `ok`, so any
+  // caller treating "response arrived" as "server reachable" draws exactly the
+  // wrong conclusion from it — see the guard in apiCall.
   return new Response(JSON.stringify({ ok: true, queued: true, offline: true }),
-                      { status: 202, headers: { 'Content-Type': 'application/json' } });
+                      { status: 202, headers: { 'Content-Type': 'application/json',
+                                                'X-Amux-Outbox': 'queued' } });
+}
+/** True for a Response this client synthesised for the outbox — i.e. one that
+ *  is NOT evidence of anything about the network. */
+function _isLocallyQueued(r) {
+  try { return !!(r && r.status === 202 && r.headers && r.headers.get('X-Amux-Outbox') === 'queued'); }
+  catch (e) { return false; }
 }
 window.fetch = function(input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -1931,6 +2058,21 @@ window.fetch = function(input, init) {
   return _origFetch(input, init).catch(e => {
     consecutiveFailures++;
     if (consecutiveFailures >= 2) setOnline(false);
+    // BEACON — this path queues the op and returns a synthetic 202, so the
+    // request never reached the server and left NO request-log row. That is why
+    // a "Run now says it failed" report was undiagnosable: the failing call is
+    // invisible server-side (ethos rule 4). amuxTrack posts a client-debug
+    // beacon so the next occurrence self-announces (two-fixes, AMUX-3049).
+    // Lossy iff the server is fully down at that instant (client-debug is
+    // outbox-skipped) — but a brief blip, and any partial-fleet outage, lands
+    // it; a full restart is separately visible as a moved /health build hash.
+    try {
+      amuxTrack('fetch_unreachable', {
+        url: String(url).split('?')[0],
+        method: ((init && init.method) || 'GET').toUpperCase(),
+        err: String(e).slice(0, 200),
+      });
+    } catch (_) {}
     _queueOp(url, init || {});
     return _outboxAccepted();
   });
@@ -2394,6 +2536,31 @@ async function fetchSessions() {
   }
 }
 
+function _waitingLabel(s) {
+  const wr = s.waiting_reason || '';
+  if (wr === 'permission_prompt') return 'permission prompt';
+  if (wr === 'rate_limit') return 'rate limited';
+  // Unsubmitted text is sitting in the composer with no live turn or agents
+  // (AMUX-2904) — a message queued behind phantom background tasks, or an
+  // Enter that never landed. Named distinctly from a generic "needs input"
+  // because the remedy is different: look at the composer, not a picker.
+  if (s.composer_stuck_since) return 'unsubmitted text';
+  if (wr === 'user_input') return 'needs input';
+  return 'needs input';
+}
+// Tooltip for a waiting badge: the stuck composer text, when that is the reason.
+function _waitingTitle(s) {
+  return s.composer_stuck_since && s.composer_preview
+    ? ' title="In composer: ' + esc(s.composer_preview) + '"' : '';
+}
+// "working · N agents"-style suffix: background agents actively writing their
+// transcripts (server-verified from subagent JSONL mtimes, not the status bar).
+function _agentsChip(s) {
+  return s.agents_working
+    ? '<span class="status-badge active" style="margin-left:4px;" title="Background agents are actively writing their transcripts">⚙ agents</span>'
+    : '';
+}
+
 // ═══════ RENDERING ═══════
 function updatePeekStatus() {
   const el = document.getElementById('peek-session-status');
@@ -2401,8 +2568,20 @@ function updatePeekStatus() {
   const s = sessions.find(s => s.name === peekSession);
   if (!s) { el.innerHTML = ''; return; }
   let badge = '';
-  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _liveWorkLine(s);
-  else if (s.status === 'waiting') badge = '<span class="status-badge waiting">needs input</span>';
+  // NAME · STATUS · MODEL, and nothing else (Ethan, 2026-08-11: "top we only
+  // need the task name, status and model"). `_liveWorkLine` used to append the
+  // worker's current progress line — "Perusing… (4m 11s · ↓ 5.4k tokens)" — up
+  // to 60 chars of it, ALWAYS present while a worker is active. At 375px that
+  // pushed the row past the viewport: the worker name was clipped to
+  // "escience" and the model chip fell off the right edge, so the three things
+  // the header exists to show were the three things you could not read.
+  //
+  // It is dropped rather than moved: the terminal pane directly below shows
+  // the same output live, so this was a lossy 60-char summary of something
+  // already on screen. amux is mobile-first — when the phone and a nice-to-have
+  // trade off, the phone wins.
+  if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
+  else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -2528,6 +2707,39 @@ function _cardDoingCount(name) {
     if (!c.deleted && !c.archived && c.session === name && c.status === 'doing') n++;
   });
   return n;
+}
+const _TERMINAL_STATUSES = new Set(['verified', 'discarded']);
+function _cardBoardActive(name) {
+  let n = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && c.session === name && !_TERMINAL_STATUSES.has(c.status)) n++;
+  });
+  return n;
+}
+function _cardBoardTotal(name) {
+  let n = 0;
+  (boardItems || []).forEach(c => {
+    if (!c.deleted && !c.archived && c.session === name) n++;
+  });
+  return n;
+}
+// Worker cards embed board-derived figures (the three helpers above), so ANY
+// boardItems ingest must repaint the workers view when those inputs move —
+// the board fetch used to end at renderBoard(), and a board response landing
+// AFTER the workers view painted left every card without its counts until
+// the next SESSIONS render, which in a quiet tab never came (AMUX-2960's e2e
+// residual: the request log showed 200s with correct data the whole time;
+// only the repaint was missing). Signature-guarded so no-change polls stay
+// free, keyed on exactly the fields the helpers read.
+function _nudgeWorkersOnBoardChange() {
+  try {
+    const sig = (boardItems || [])
+      .map(c => `${c.id}:${c.status}:${c.session || ''}:${c.archived ? 1 : 0}${c.deleted ? 'd' : ''}`)
+      .join('|');
+    if (window._boardCountSig === sig) return;
+    window._boardCountSig = sig;
+    if (activeView === 'sessions') render();
+  } catch (e) { /* a render hiccup must not break the ingest that called us */ }
 }
 function _grpMembers(g) {
   const all = (sessions || []).filter(s => !s.archived);
@@ -2734,6 +2946,7 @@ function render() {
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
           <div class="card-menu-sep"></div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openPeek('${s.name}')"><span class="mi">&#x1F4BB;</span> Peek terminal</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();_readLatestMessage('${s.name}')"><span class="mi">&#x1F50A;</span> Read latest message</div>
           ${s.dir ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();openExplore('${s.dir.replace(/'/g,"\\'")}','${s.name.replace(/'/g,"\\'")}')"><span class="mi">&#x1F4C1;</span> Browse files</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();showSessionInfo('${s.name}')"><span class="mi">&#x2139;</span> Info</div>
           <div class="card-menu-item" onclick="event.stopPropagation();togglePin('${s.name}')"><span class="mi">${s.pinned?'&#x1F4CC;':'&#x1F4CC;'}</span> ${s.pinned ? 'Unpin' : 'Pin to top'}</div>
@@ -2769,13 +2982,13 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' : ''}
-          ${s.status === 'waiting' ? `<span class="status-badge waiting">needs input</span>${_stalledFor(s)}` : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+          ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
           ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
-          ${s.steering && s.steering.length ? `<span class="status-badge steering" title="${s.steering.length} steering message${s.steering.length>1?'s':''} queued">${s.steering.length} queued</span>` : ''}
+          ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
             /* Bare numbers, no chips (Ethan: "just numbers no outline ...
@@ -2785,11 +2998,15 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
                holds. Successor to the counts row 09aa88e removed — this is
                the two-figure version of it. */
             const d = _cardDoingCount(s.name);
+            const active = _cardBoardActive(s.name);
+            const tot = _cardBoardTotal(s.name);
             const parts = [];
             if (s.sched_on || s.sched_off) {
               parts.push(_schedCountHTML(s.sched_on, s.sched_off) + ' sched');
             }
             if (d) parts.push(`<span class="mc-doing">${d}</span> doing`);
+            if (active) parts.push(`<span class="mc-active">${active}</span> active`);
+            if (tot && tot !== active) parts.push(`<span class="mc-total">${tot}</span> total`);
             return parts.length ? `<span class="meta-count">${parts.join(' · ')}</span>` : '';
           })()}
           ${!online ? '<span class="cached-badge">cached</span>' : ''}
@@ -3126,25 +3343,6 @@ const _STALL_MINS = 15;
 // where the question is actually asked. Nothing new is computed or inferred —
 // if the harness is not drawing a progress line, this shows nothing rather than
 // manufacturing reassurance.
-function _liveWorkLine(s) {
-  if (!s || s.status !== 'active') return '';
-  const lines = (s.preview_lines && s.preview_lines.length)
-    ? s.preview_lines
-    : String(s.preview || '').split('\n');
-  // Claude Code's progress line: "· Verb… (2m 6s · ↓ 5.4k tokens)". Match on the
-  // elapsed/token parenthetical rather than the verb — the verb is random.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const l = String(lines[i]).trim();
-    if (/\((?:[\d.]+[smh]\s|\d+m\s\d+s)/.test(l) || /tokens\)/.test(l) || /esc to interrupt/i.test(l)) {
-      // Claude Code cycles spinner glyphs (·, ✽, ✳, …), so strip ANY leading
-      // non-letter rather than a list that goes stale on the next glyph.
-      const txt = l.replace(/^[^\p{L}\p{N}]+/u, '').slice(0, 60);
-      if (txt) return '<span class="live-work" title="Live from the worker\'s terminal — this is what it is doing right now">'
-                  + esc(txt) + '</span>';
-    }
-  }
-  return '';
-}
 
 function _stalledFor(s) {
   if (!s.waiting_since || s.credit_limited || s.rate_limited_until) return '';
@@ -3632,6 +3830,21 @@ function _renderTabCustomizerMenu() {
 // other tab was configurable. Order here is the DOM order, so a fresh browser's
 // default matches what it already shows. `terminal` is deliberately absent: it
 // is pinned first by _applyPeekTabVisibility and is not reorderable.
+// The peek tab strip overflows horizontally (measured: ~946px of tabs in a
+// ~761px strip) and hides its scrollbar for looks (scrollbar-width:none). On a
+// desktop that left it un-scrollable: a vertical mouse-wheel does not move a
+// horizontal overflow, and there is no visible bar to drag — "couldn't get it
+// working" (Ethan, AMUX-2995). Touch already pans via touch-action:pan-x; this
+// maps the dominant wheel axis onto scrollLeft so the wheel works too.
+function _peekTabsWheel(e) {
+  const strip = e.currentTarget;
+  if (strip.scrollWidth <= strip.clientWidth) return; // nothing to scroll
+  const dominant = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (!dominant) return;
+  strip.scrollLeft += dominant;
+  e.preventDefault(); // keep the page from scrolling instead of the tabs
+}
+
 const PEEK_TABS = [
   { id: 'steering',   label: 'Steering' },
   { id: 'schedules',  label: 'Schedules' },
@@ -4913,7 +5126,7 @@ async function sendFromInput(name) {
     inp.style.borderColor = '#a371f7';
     setTimeout(() => { inp.style.borderColor = ''; }, 600);
     const sess = sessions.find(s => s.name === name);
-    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
+    const cnt = _steerHumanCount(sess);
     if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
     return;
   }
@@ -5552,6 +5765,12 @@ function setPeekTab(tab) {
   const memPanel = document.getElementById('peek-memory-panel');
   if (tab === 'memory') { memPanel.classList.add('active'); loadPeekMemory(); }
   else { memPanel.classList.remove('active'); }
+  document.getElementById('peek-tab-readalouds')?.classList.toggle('active', tab === 'readalouds');
+  const raPanel = document.getElementById('peek-readalouds-panel');
+  if (raPanel) {
+    if (tab === 'readalouds') { raPanel.classList.add('active'); _raRender(); }
+    else { raPanel.classList.remove('active'); }
+  }
   document.getElementById('peek-terminal-panel').style.display = tab === 'terminal' ? '' : 'none';
   document.getElementById('peek-split-wrap').style.display = tab === 'terminal' ? '' : 'none';
   const transcript = document.getElementById('peek-transcript-panel');
@@ -5621,29 +5840,51 @@ async function savePeekInstructions(apply) {
 let _steerLastQueueLen = 0;
 let _steerHistLoadedFor = null;
 
+// Human-queued rows only — system pushes (m.system, server-classified) are
+// amux's own drive prompts and never count as "queued" on any surface.
+function _steerHumanCount(sess) {
+  return ((sess && sess.steering) || []).filter(m => !m.system).length;
+}
+
 function _steeringRender() {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
   const queue = (sess && sess.steering) || [];
   const countEl = document.getElementById('peek-steering-count');
   const list = document.getElementById('peek-steering-list');
-  countEl.textContent = queue.length ? queue.length + ' queued' : 'No queued messages';
+  // SYSTEM pushes (board-drive, schedules — server-classified by the guard
+  // every system enqueuer stamps) are a separate surface from the human
+  // queue (Ethan: "board pushes should be system level not queues"). They
+  // do not count as "queued" — that number is what YOU have pending — and
+  // Clear all leaves them alone.
+  const human = queue.filter(m => !m.system);
+  const sys = queue.filter(m => m.system);
+  countEl.textContent = (human.length ? human.length + ' queued' : 'No queued messages')
+    + (sys.length ? ' · ' + sys.length + ' system' : '');
+  const row = m => {
+    const ago = timeAgo(m.queued_at);
+    const sysTag = m.system ? `<span style="font-size:0.68rem;font-weight:600;padding:1px 6px;border-radius:3px;background:rgba(148,163,184,0.15);color:var(--dim);margin-right:6px;">SYSTEM${m.guard ? ' · ' + esc(m.guard) : ''}</span>` : '';
+    return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:${m.system ? 'rgba(255,255,255,0.02)' : 'var(--card-bg)'};border:1px solid var(--border);border-radius:8px;${m.system ? 'opacity:0.85;' : ''}">
+      <div style="flex:1;min-width:0;">
+        ${sysTag ? `<div style="margin-bottom:4px;">${sysTag}</div>` : ''}
+        <div style="font-size:0.85rem;color:${m.system ? 'var(--dim)' : 'var(--fg)'};white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
+        <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0;">
+        <button class="btn primary" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringSendNow('${m.id}')">Send now</button>
+        <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringCancel('${m.id}')">✕</button>
+      </div>
+    </div>`;
+  };
   if (!queue.length) {
     list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:20px 0;text-align:center;">No steering messages queued.<br>Send a message while the worker is active to queue it.</div>';
   } else {
-    list.innerHTML = queue.map(m => {
-      const ago = timeAgo(m.queued_at);
-      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;">
-        <div style="flex:1;min-width:0;">
-          <div style="font-size:0.85rem;color:var(--fg);white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
-          <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
-        </div>
-        <div style="display:flex;gap:4px;flex-shrink:0;">
-          <button class="btn primary" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringSendNow('${m.id}')">Send now</button>
-          <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_steeringCancel('${m.id}')">✕</button>
-        </div>
-      </div>`;
-    }).join('');
+    let html = human.map(row).join('');
+    if (sys.length) {
+      html += `<div style="font-size:0.72rem;color:var(--dim);margin:8px 0 2px;letter-spacing:0.04em;">SYSTEM PUSHES — amux's own drive prompts; delivered at the next turn boundary, not cleared by Clear all</div>`
+        + sys.map(row).join('');
+    }
+    list.innerHTML = html;
   }
   // Refresh the sent-history log when the tab/session was just (re)opened or
   // whenever the queue shrank — a message just left the queue (delivered/sent).
@@ -5688,10 +5929,10 @@ function _steerHistApply() {
 
 function _steeringUpdateBadge() {
   const sess = sessions.find(s => s.name === peekSession);
-  const queue = (sess && sess.steering) || [];
+  const n = _steerHumanCount(sess);
   const badge = document.getElementById('peek-tab-steering-count');
   if (!badge) return;
-  if (queue.length > 0) { badge.textContent = queue.length; badge.classList.add('has-count'); }
+  if (n > 0) { badge.textContent = n; badge.classList.add('has-count'); }
   else { badge.textContent = ''; badge.classList.remove('has-count'); }
 }
 
@@ -5746,14 +5987,18 @@ async function _steeringCancel(msgId) {
 async function _steeringClearAll() {
   if (!peekSession) return;
   const sess = sessions.find(s => s.name === peekSession);
-  const had = sess && sess.steering ? sess.steering.length : 0;
-  if (sess) sess.steering = [];
+  // Optimistic update mirrors the server's rule: Clear all removes HUMAN
+  // rows only; system pushes (board-drive, schedules) stay queued. Per-row ✕
+  // still cancels a system push individually.
+  const had = sess && sess.steering ? sess.steering.filter(m => !m.system).length : 0;
+  if (sess) sess.steering = (sess.steering || []).filter(m => m.system);
   _steeringRender();
   _steeringUpdateBadge();
   render();
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(peekSession) + '/steer', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: '{}' });
     if (had) showToast('Cleared ' + had + ' queued message' + (had > 1 ? 's' : ''));
+    else showToast('Nothing to clear (system pushes are kept)');
     fetchSessions();
   } catch(e) { showToast('Failed to clear queue'); }
 }
@@ -6280,12 +6525,12 @@ function renderPeekIssues() {
     scopeBtn.classList.toggle('primary', allScope);
   }
   // Tab badge always reflects THIS session's count, regardless of view scope.
-  // Badge = ACTIVE work only (Ethan 16:1x: "only show board # for active
-  // (todo, doing)"); the panel below still shows every column for the
-  // session, archived history included.
-  const _sessCount = (boardItems || []).filter(i => !i.deleted && !i.archived
-      && i.session === peekSession
-      && (i.status === 'todo' || i.status === 'doing')).length;
+  // Badge = every NON-TERMINAL card (Ethan 2026-08-11: "the board tab for
+  // workers should show the count of all board items not in a terminal
+  // state" — supersedes the earlier todo/doing-only instruction). Same
+  // predicate as the worker card's active count (_cardBoardActive): one
+  // definition of "still owes work", three surfaces.
+  const _sessCount = _cardBoardActive(peekSession);
   const tabCount = document.getElementById('peek-tab-issues-count');
   if (tabCount) {
     if (_sessCount > 0) { tabCount.textContent = _sessCount; tabCount.classList.add('has-count'); }
@@ -6407,13 +6652,13 @@ async function _peekUpdateTabCounts() {
   };
   {
     const s = sessions.find(s => s.name === sess);
-    const sq = (s && s.steering) || [];
-    setCount('peek-tab-steering-count', sq.length);
+    // Human rows only — the missed twin of _steeringUpdateBadge (07424e3).
+    setCount('peek-tab-steering-count', _steerHumanCount(s));
   }
   {
-    const n = (boardItems || []).filter(i => i.session === sess && !i.deleted && !i.archived
-        && (i.status === 'todo' || i.status === 'doing')).length;
-    setCount('peek-tab-issues-count', n);
+    // Non-terminal count — same predicate as the worker card and the board
+    // panel badge above.
+    setCount('peek-tab-issues-count', _cardBoardActive(sess));
   }
   try {
     const r = await fetch(API + '/api/schedules');
@@ -6900,7 +7145,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.572';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.617';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7086,8 +7331,8 @@ function _offlineCacheInfo() {
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
-  _peekHistoryHTML = cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '';
-  _lastLiveHTML = cached.output ? _markAgentRows(wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output))))) : '';
+  _peekHistoryHTML = cached.histHTML || (cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '');
+  _lastLiveHTML = cached.liveHTML || (cached.output ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output)))) : '');
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -7211,24 +7456,22 @@ function openPeek(name, opts) {
   _syncPeekOverlayToVisualViewport();
   _vvKick();   // keyboard may already be up or mid-animation when peek opens
   setTimeout(_peekGeoBeacon, 1500);   // mobile geometry self-report (once per load)
-  // The cached frame is a FALLBACK for slow/offline opens — NOT something to
-  // flash before the live frame. IndexedDB resolves (~10-30ms) before the live
-  // fetch (~33ms wifi, more on cellular), so painting it eagerly showed a stale
-  // "Cached Xm ago" view for a beat on every open. Give the live fetch a short
-  // head start: only paint cached if the live frame hasn't landed within ~150ms
-  // (slow network / offline). On a normal connection live wins and you open
-  // straight onto the LATEST. (lastPeekHTML is '' until a real frame paints.)
+  // Cached frame is a FALLBACK for slow/offline opens. IDB resolves (~10-30ms)
+  // before the live fetch (~18ms wifi, much more on cellular). The 30ms delay
+  // lets a local live fetch win on WiFi (no stale flash), but on cellular where
+  // the fetch is 300ms+ the cached content — with pre-rendered HTML — paints
+  // almost immediately instead of showing "Loading latest..." for 150ms+.
   _idb.get('peek_' + name).then(cached => {
     if (peekSession !== name || !cached) return;
     setTimeout(() => {
       if (peekSession !== name) return;
-      if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {   // live still hasn't painted
+      if (!lastPeekHTML) {
         if (_paintCachedPeek(cached)) {
           const body = document.getElementById('peek-body');
           body.scrollTop = body.scrollHeight;
         }
       }
-    }, 150);
+    }, 30);
   });
   // Paint the CURRENT terminal instantly from the few-KB live frame, THEN pull the
   // full payload (~138KB, mostly transcript history) to fill in scrollback. Clicking
@@ -7240,60 +7483,79 @@ function openPeek(name, opts) {
   // full payload follows and fills in scrollback above.
   refreshPeek(true, true).finally(() => refreshPeek());
   _schedulePeekPoll();
-  setTimeout(_peekFitPane, 350);   // fit the pane to this viewer's width
-  _peekLeaseStart();               // AMUX-2634: hold the pane only while read
+  // resize-on-peek + its lease removed (AMUX-2981); the capture is a fixed
+  // 220-col pane the reader scrolls, so there is nothing to fit or hold.
   _updateSendSplit();   // sync the Send/Queue button label to the current mode
   _savePeekState();
 }
 
-// The agents panel rows rendered at the bottom of the peek terminal are
-// tappable — wrap each ⏺/◯ row (the contiguous glyph block at the very
-// bottom, same structural rule as the server's _agent_panel) in a span that
-// jumps straight to that agent's transcript. Direct manipulation: tap the
-// agent you can already see instead of hunting for the ⌂/▲/▼ buttons.
-function _markAgentRows(html) {
-  const lines = html.split('\n');
-  const textOf = l => l.replace(/<[^>]*>/g, '');
-  let i = lines.length - 1;
-  while (i >= 0 && !textOf(lines[i]).trim()) i--;
-  const rowIdx = [];
-  while (i >= 0) {
-    const t = textOf(lines[i]).trim().replace(/^[❯  ]+/, '');
-    if ('⏺●'.includes(t[0]) || '◯○'.includes(t[0])) { rowIdx.push(i); i--; continue; }
-    break;
-  }
-  if (rowIdx.length < 2) return html;   // a panel always has main + ≥1 agent
-  rowIdx.reverse();   // screen order — index 0 = main, matching the server
-  rowIdx.forEach((li, n) => {
-    // stopPropagation: ANSI color spans can run unclosed across lines, which
-    // nests these row spans in the parsed DOM — without it a click on an
-    // inner row would bubble to the outer row and fire a second nav.
-    lines[li] = '<span class="peek-agent-row" onclick="event.stopPropagation();agentNav(\'index\',' + n +
-      ')" title="Tap to view">' + lines[li] + '</span>';
-  });
-  return lines.join('\n');
+// The pane-driven agent switcher (_markAgentRows + agentNav + the ⌂/▲/▼
+// strip) was DELETED (ARE-7): it keyed on a "⏺ main" panel row Claude Code no
+// longer renders — 0 of 50 sessions matched, so three layers plus a server
+// verb were wired end-to-end and reached nobody, forever. The subagent list
+// (AMUX-2635, below) is the replacement: durable transcripts, 50 of 50, no
+// visibility gate to rot. Resurrection: git log -S agentNav.
+
+// ── Subagent list (AMUX-2635) ───────────────────────────────────────────────
+// Reads DURABLE transcripts via GET /api/sessions/<n>/subagents rather than
+// inferring from the pane. The predicate this replaces matched 0 of 50 lanes;
+// the transcripts match 50 of 50. Note there is no visibility gate on the
+// button at all — the fix for a predicate that matched nothing is to need no
+// predicate, not to write a better one.
+function closeSubagents() {
+  document.getElementById('subagents-overlay')?.classList.remove('active');
 }
 
-async function agentNav(dir, index) {
-  // Subagent switcher: server drives the agents panel (↓ select mode,
-  // ↑/↓ cursor, Enter to view) with capture-verified steps.
+async function openSubagents() {
   if (!peekSession) return;
+  const ov = document.getElementById('subagents-overlay');
+  const list = document.getElementById('subagents-list');
+  const title = document.getElementById('subagents-title');
+  if (!ov || !list) return;
+  if (title) title.textContent = 'Subagents \u00B7 ' + peekSession;
+  list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:18px;text-align:center;">Loading\u2026</div>';
+  ov.classList.add('active');
+  const sess = peekSession;
+  let d;
   try {
-    const r = await fetch(API + '/api/sessions/' + peekSession + '/agent-nav', {
-      method: 'POST',
-      headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify(dir === 'index' ? { dir, index } : { dir })
-    });
-    const d = await r.json();
-    if (d.ok) {
-      showToast('Viewing: ' + (d.viewing || 'switched'));
-      _peekEtag = null; _peekLiveEtag = null; _lastPeekRaw = null; _peekHistoryRaw = '';   // force a fresh render (history too)
-      setTimeout(refreshPeek, 200);
-    } else {
-      showToast(d.message || 'Could not switch agent view');
-    }
-  } catch (e) { showToast('Could not switch agent view'); }
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(sess) + '/subagents',
+                          { headers: _authHeaders() });
+    d = await r.json();
+    if (!r.ok) throw new Error(d && d.error ? d.error : ('HTTP ' + r.status));
+  } catch (e) {
+    // Say WHICH failure. The old switcher's one message blamed the panel for
+    // every cause, which is what made this unreachable for months.
+    list.innerHTML = '<div style="color:var(--red);font-size:0.85rem;padding:18px;text-align:center;">'
+      + 'Could not load subagents.<br><span style="color:var(--dim);font-size:0.78rem;">' + esc(e.message) + '</span></div>';
+    return;
+  }
+  if (peekSession !== sess) return;   // switched away mid-fetch
+  const subs = (d && d.subagents) || [];
+  if (!subs.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;padding:24px 12px;text-align:center;">'
+      + 'No subagents for this worker yet.<br>'
+      + '<span style="font-size:0.78rem;">Forks it spawns will appear here.</span></div>';
+    return;
+  }
+  list.innerHTML = subs.map(s => {
+    const when = s.last_active ? timeAgo(s.last_active) : '';
+    // An ABSENT description renders as the agent id in dim type — never a
+    // guessed label. 11 of 66 real transcripts carry none, and an invented
+    // one cannot be told from a real one.
+    const label = s.description
+      ? '<span style="color:var(--text);">' + esc(s.description) + '</span>'
+      : '<span style="color:var(--dim);font-style:italic;">' + esc(s.id) + '</span>';
+    const kind = s.type ? '<span class="chip" style="font-size:0.68rem;">' + esc(s.type) + '</span>' : '';
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:8px;">'
+      + '<div style="display:flex;gap:8px;align-items:flex-start;justify-content:space-between;">'
+      +   '<div style="min-width:0;font-size:0.86rem;line-height:1.35;">' + label + '</div>' + kind
+      + '</div>'
+      + '<div style="color:var(--dim);font-size:0.72rem;margin-top:5px;">'
+      +   (s.turns || 0) + ' turns' + (when ? ' \u00B7 ' + esc(when) : '')
+      + '</div></div>';
+  }).join('');
 }
+
 
 function copyPeekContent() {
   const body = document.getElementById('peek-body');
@@ -8097,9 +8359,54 @@ function linkifyOutput(text) {
   return rewriteLocalhostUrls(html);
 }
 
+// The MARKERS amux stamps on everything it injects into a pane. Structural, not
+// heuristic: each one is a literal prefix the server writes, so matching it is
+// reading amux's own label rather than guessing at prose.
+const _NON_HUMAN_PROMPT_MARKS = [
+  ['[amux-origin:', 'session'],     // a peer worker, server-verified origin
+  ['[amux auto-pickup]', 'amux'],
+  ['[amux staged-guard]', 'amux'],
+  ['[amux]', 'amux'],               // idle nudges, advance nudges, digests
+  ['[amux ', 'amux'],               // any other bracketed amux subsystem
+  ['[Scheduled]', 'schedule'],
+];
+
+function _classifyPromptKind(promptText) {
+  const clean = promptText.replace(/^❯\s*/, '').trim();
+  if (!clean) return 'human';
+  // STRUCTURE FIRST, BEFORE THE ROW LOOKUP (Ethan, 2026-08-11: the navigator
+  // "should scroll thru human messages not amux/session/system/peer messages
+  // by default").
+  //
+  // The row match below is the precise path and stays the primary one, but it
+  // FAILS OPEN TO 'human': a prompt that matches no known row — because the
+  // rows are not loaded yet, or the window has scrolled past it, or the
+  // terminal wrapped the text so the first line no longer starts with the
+  // message's first 60 chars — was classified as a person typing. So amux's
+  // own nudges and peer relays landed in the human filter, which is exactly
+  // the set the navigator exists to isolate. Observed as "H 3/9" on a pane
+  // whose 9 prompts were mostly system traffic.
+  //
+  // Checking the marker first also makes the classification independent of
+  // whether the message trail happens to be loaded, which is why it goes
+  // BEFORE the lookup rather than into the fallback.
+  for (const [mark, kind] of _NON_HUMAN_PROMPT_MARKS) {
+    if (clean.startsWith(mark)) return kind;
+  }
+  if (typeof _peekMsgRows === 'undefined') return 'human';
+  const rows = (_peekMsgRows || _cmdHistory || []);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (!r || typeof r === 'string') continue;
+    const t = (r.text || '').trim();
+    if (t && clean.startsWith(t.slice(0, 60))) return _msgKind(r);
+  }
+  return 'human';
+}
 function highlightPrompts(html) {
   const lines = html.split('\n');
   let inPrompt = false;
+  let promptText = '';
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -8108,13 +8415,17 @@ function highlightPrompts(html) {
     const isContinuation = inPrompt && /^  \S/.test(textStart);
     if (isPromptStart) {
       inPrompt = true;
-      out.push('<span class="peek-prompt">' + raw);
+      promptText = textStart;
+      const kind = _classifyPromptKind(textStart);
+      out.push('<span class="peek-prompt peek-prompt-' + kind + '" data-msg-kind="' + kind + '">' + raw);
     } else if (isContinuation) {
+      promptText += '\n' + textStart;
       out.push(raw);
     } else {
       if (inPrompt) {
         out[out.length - 1] += '</span>';
         inPrompt = false;
+        promptText = '';
       }
       out.push(raw);
     }
@@ -8240,44 +8551,26 @@ function _peekTogglePlan() {
   document.getElementById('peek-plan-list').style.display = _peekPlanOpen ? '' : 'none';
 }
 
-// ── Responsive peek: fit the tmux pane to the viewer ──
-// The pane is the layout engine: Claude Code reflows the whole transcript on
-// terminal resize, so matching the tmux window to the viewer's measured
-// character width makes peek natively responsive (no double-wrapping at
-// phone widths). The server refuses while a real terminal is attached.
-let _peekSizeSent = { session: null, cols: 0 };
-function _peekMeasureCols() {
-  const body = document.getElementById('peek-body');
-  if (!body || !body.clientWidth) return 0;
-  const probe = document.createElement('span');
-  probe.textContent = 'X'.repeat(100);
-  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;';
-  body.appendChild(probe);
-  const w = probe.getBoundingClientRect().width / 100;
-  probe.remove();
-  if (!w) return 0;
-  return Math.max(50, Math.min(300, Math.floor((body.clientWidth - 16) / w)));
-}
-async function _peekFitPane() {
-  const name = peekSession;
-  if (!name) return;
-  const cols = _peekMeasureCols();
-  if (!cols) return;
-  // Skip near-identical sizes: every resize forces Claude to re-render.
-  if (_peekSizeSent.session === name && Math.abs(_peekSizeSent.cols - cols) <= 4) return;
-  _peekSizeSent = { session: name, cols };
-  try {
-    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/resize', {
-      method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ cols, rows: 50 })
-    });
-    const d = await r.json();
-    if (d.resized && !/already/.test(d.message || '')) {
-      _peekEtag = null; _peekLiveEtag = null; _lastPeekRaw = null; _peekHistoryRaw = '';   // repaint at the new width (history too)
-      setTimeout(refreshPeek, 450);            // give Claude a beat to reflow
-    }
-  } catch (e) {}
-}
+// ── Peek pane sizing: removed (AMUX-2981) ──
+// Was "fit the tmux pane to the viewer" — measure the reader's column width and
+// POST /resize so the capture matched. Removed with the resize-on-peek machine
+// below (workers are a fixed 220 cols, readers scroll). `_peekMeasureCols` and
+// `_peekSizeSent` went with it; nothing else referenced them.
+// RESIZE-ON-PEEK REMOVED (AMUX-2981, Ethan: "what's with all the resize API
+// calls? … figure out how to remove it"). This used to POST /resize on every
+// peek open, on window resize, and — the real volume — every 30s as a lease
+// heartbeat, to pin the worker's tmux window to the reader's width. But workers
+// spawn at 220 cols (configured_cols) and the server CLAMPS the request to
+// [220, 300] and never shrinks below spawn, so for every reader narrower than
+// 220 (i.e. essentially all of them — a phone, a laptop, a normal monitor) it
+// changed nothing about the width and only churned the heartbeat + pinned
+// `window-size manual`, which then needed a whole lease + background-restore
+// subsystem to undo. Measured: one lane accrued ~3,966 of these. The preview
+// already renders the 220-col capture with overflow-x:auto (the reader
+// scrolls), so removing it costs only the rare 220->300 widen for an
+// ultra-wide (>220 col) monitor — negligible — and deletes the call storm and
+// the terminal-reshaping-on-peek. Kept as a no-op so its callers stay intact.
+async function _peekFitPane() { /* removed — see comment above (AMUX-2981) */ }
 // ── Viewer lease (AMUX-2634) ──
 // `/resize` pins the worker's tmux window to THIS reader's width, and tmux
 // makes that pin permanent (`window-size manual`). The server therefore
@@ -8289,24 +8582,13 @@ async function _peekFitPane() {
 // phone, a killed tab or a dropped connection never runs a teardown, and those
 // are exactly the cases that used to leave a worker stuck at 50 columns
 // forever. A lease expires on its own; a close handler has to be reached.
+// Lease heartbeat REMOVED with resize-on-peek (AMUX-2981) — it existed only to
+// hold the tmux window-size pin the resize created. No pin, nothing to hold.
 let _peekLeaseTimer = null;
 function _peekLeaseStop() { if (_peekLeaseTimer) { clearInterval(_peekLeaseTimer); _peekLeaseTimer = null; } }
-function _peekLeaseStart() {
-  _peekLeaseStop();
-  _peekLeaseTimer = setInterval(() => {
-    if (!peekSession) { _peekLeaseStop(); return; }
-    // Clear the skip-guard so the POST actually goes out; the server answers
-    // "already sized" and nothing repaints.
-    _peekSizeSent = { session: null, cols: 0 };
-    _peekFitPane();
-  }, 30000);   // server lease is 75s — tolerates one missed beat
-}
-let _peekFitTimer = null;
-window.addEventListener('resize', () => {
-  if (!peekSession) return;
-  clearTimeout(_peekFitTimer);
-  _peekFitTimer = setTimeout(_peekFitPane, 600);
-});
+function _peekLeaseStart() { /* removed — no more resize-on-peek to lease (AMUX-2981) */ }
+// window-resize -> re-fit REMOVED with it: the capture is a fixed 220 cols and
+// the reader scrolls, so a browser resize changes nothing server-side.
 
 // ── "Load earlier output" — scrollback for the alt-screen ──
 // tmux keeps zero history for Claude's alternate screen; the pipe-pane log
@@ -8428,23 +8710,6 @@ async function refreshPeek(liveOnly, bypassTrim) {
       _peekHistoryHTML = histRaw ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(histRaw)))) : '';
       histChanged = true;
     }
-    // Subagent switcher visibility: the agents panel always includes a
-    // "⏺ main"/"◯ main" row in the bottom lines of the pane. Checking for
-    // that exact row (tail only, ANSI-stripped) avoids false positives from
-    // terminal output that merely QUOTES the panel's hint text.
-    const agentNavEl = document.getElementById('peek-agent-nav');
-    if (agentNavEl) {
-      const _tail = output.replace(/\u001b\[[0-9;?]*[a-zA-Z]/g, '')
-        .split('\n').filter(l => l.trim()).slice(-8);
-      const _hasAgents = _tail.some(l => {
-        const t = l.replace(/^[❯  ]+/, '').trim();
-        // Only a VISIBLE panel row counts. The '← for agents / ↓ to manage'
-        // status-bar hint is not enough: with rows hidden ↓ opens the
-        // background-shells manager, so there is nothing safe to switch.
-        return ['⏺ main', '◯ main', '● main', '○ main'].includes(t);
-      });
-      agentNavEl.style.display = _hasAgents ? 'flex' : 'none';
-    }
     const atBottom = _isScrolledToBottom(body);
     if (atBottom) _peekScrollLocked = false;
     const newHTML = wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(output))));
@@ -8454,7 +8719,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // so the top of the capture is a hard cutoff mid-conversation. Compose a
     // "load earlier output" bar (or the loaded log tail) above the live view
     // so scrollback exists in peek the way it does in a real terminal.
-    _lastLiveHTML = _markAgentRows(newHTML);
+    _lastLiveHTML = newHTML;
     lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
     const hasSearch = peekSearchQuery.trim().length > 0;
     // When user has scrolled up, skip DOM update to avoid fidgeting the view.
@@ -8495,7 +8760,7 @@ async function refreshPeek(liveOnly, bypassTrim) {
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
     // live frame (sometimes ''), which painted an EMPTY black peek from cache
     // (social, 2026-07-16). Never write an entry with no content.
-    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, time: Date.now() });
+    if (_peekHistoryRaw || _lastPeekRaw) _idb.set('peek_' + peekSession, { output: _lastPeekRaw, history: _peekHistoryRaw, liveHTML: _lastLiveHTML, histHTML: _peekHistoryHTML, time: Date.now() });
   } catch(e) {
     console.error('peek:', e);
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)
@@ -8583,19 +8848,39 @@ function _closePeekMore() {
 
 // ── Peek message navigation ──
 let _peekMsgIndex = -1;
+let _peekMsgNavKind = 'human';
 function _peekMsgPrompts() {
   const body = document.getElementById('peek-body');
-  return body ? Array.from(body.querySelectorAll('.peek-prompt')) : [];
+  if (!body) return [];
+  if (peekSearchQuery) {
+    return Array.from(body.querySelectorAll('.peek-search-match'));
+  }
+  const all = Array.from(body.querySelectorAll('.peek-prompt'));
+  if (_peekMsgNavKind === 'all') return all;
+  // Classify FRESH here, not from the render-time `data-msg-kind`. Prompts are
+  // rendered (and their kind stamped) BEFORE `_loadCmdHistoryFromServer`
+  // resolves, so at render time a prompt that matches no marker and no loaded
+  // row FAILS OPEN to 'human' — a scheduled command ("Board push …"), a peer
+  // relay, or an amux nudge then pollutes the human navigator and it never gets
+  // re-stamped. By the time a human presses ↑/↓, cmd_history IS loaded, so
+  // re-running the classifier yields the TRUE kind and the default human filter
+  // shows only real human messages (Ethan 2026-08-13: "simple default scroll
+  // thru + highlight human messages, not amux/session/schedule/peer").
+  return all.filter(el => _classifyPromptKind(el.textContent) === _peekMsgNavKind);
 }
 function _peekMsgUpdate(prompts) {
   const countEl = document.getElementById('peek-msg-count');
   if (!countEl) return;
-  prompts.forEach(p => p.classList.remove('peek-msg-current'));
-  if (!prompts.length) { countEl.textContent = '❯'; return; }
+  document.querySelectorAll('.peek-prompt.peek-msg-current').forEach(p => p.classList.remove('peek-msg-current'));
+  if (!prompts.length) {
+    countEl.textContent = peekSearchQuery ? '0' : '❯';
+    return;
+  }
   if (_peekMsgIndex < 0 || _peekMsgIndex >= prompts.length) _peekMsgIndex = prompts.length - 1;
   prompts[_peekMsgIndex].classList.add('peek-msg-current');
   prompts[_peekMsgIndex].scrollIntoView({ block: 'center', behavior: 'smooth' });
-  countEl.textContent = (_peekMsgIndex + 1) + '/' + prompts.length;
+  const label = peekSearchQuery ? '' : (_peekMsgNavKind === 'all' ? '' : _peekMsgNavKind.slice(0,1).toUpperCase());
+  countEl.textContent = (label ? label + ' ' : '') + (_peekMsgIndex + 1) + '/' + prompts.length;
 }
 function peekMsgNext() {
   const p = _peekMsgPrompts();
@@ -8608,6 +8893,17 @@ function peekMsgPrev() {
   if (!p.length) return;
   _peekMsgIndex = _peekMsgIndex <= 0 ? p.length - 1 : _peekMsgIndex - 1;
   _peekMsgUpdate(p);
+}
+function _peekMsgNavCycle() {
+  const kinds = ['human', 'session', 'schedule', 'amux', 'all'];
+  const i = kinds.indexOf(_peekMsgNavKind);
+  _peekMsgNavKind = kinds[(i + 1) % kinds.length];
+  _peekMsgIndex = -1;
+  const p = _peekMsgPrompts();
+  const label = _peekMsgNavKind === 'all' ? 'All' : (_MSG_KIND[_peekMsgNavKind] || {}).label || _peekMsgNavKind;
+  const countEl = document.getElementById('peek-msg-count');
+  if (countEl) countEl.textContent = label + ' ' + p.length;
+  showToast('Navigate: ' + label + ' messages (' + p.length + ')');
 }
 
 // ── Peek command bar ──
@@ -8813,7 +9109,30 @@ function renderPeekFiles() {
   const bar = document.getElementById('peek-attach-bar');
   if (!bar) return;
   bar.classList.toggle('has-files', peekFiles.length > 0);
-  bar.innerHTML = peekFiles.map((f, i) => {
+  if (peekFiles.length > 12) {
+    const uploading = peekFiles.filter(f => !f.path).length;
+    const done = peekFiles.length - uploading;
+    const totalMB = peekFiles.reduce((a, f) => a + (parseFloat(f.sizeMB) || 0), 0);
+    const queued = _uploadQueue.length;
+    let status = '';
+    if (uploading > 0) {
+      const avgPct = peekFiles.filter(f => !f.path).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
+      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>`;
+    } else {
+      status = `<span style="color:var(--green)">all uploaded</span>`;
+    }
+    bar.innerHTML = `<div class="peek-attach-summary" onclick="_peekFilesExpanded=!_peekFilesExpanded;renderPeekFiles()">
+      <span>📎 ${peekFiles.length} files${totalMB > 0 ? ' (' + totalMB.toFixed(1) + ' MB)' : ''}</span>
+      ${status}
+      <span class="chip-remove" onclick="event.stopPropagation();clearPeekFiles()" title="Remove all">×</span>
+    </div>` + (_peekFilesExpanded ? _renderPeekFileChips() : '');
+    return;
+  }
+  bar.innerHTML = _renderPeekFileChips();
+}
+let _peekFilesExpanded = false;
+function _renderPeekFileChips() {
+  return peekFiles.map((f, i) => {
     const isUploading = !f.path;
     let thumb = '';
     if (f.isImage && f.previewUrl) {
@@ -8875,6 +9194,35 @@ function _peekFilesRestore(session) {
 
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
 
+// Concurrency-limited upload queue: max 4 simultaneous uploads so bulk drops
+// (80+ files) don't fire 240+ HTTP requests at once and starve the connection pool.
+const _UPLOAD_CONCURRENCY = 4;
+let _uploadQueue = [];
+let _uploadActive = 0;
+function _enqueueUpload(file) {
+  _uploadQueue.push(file);
+  _drainUploadQueue();
+}
+function _drainUploadQueue() {
+  while (_uploadQueue.length && _uploadActive < _UPLOAD_CONCURRENCY) {
+    _uploadActive++;
+    const f = _uploadQueue.shift();
+    uploadAndAttach(f).finally(() => { _uploadActive--; _drainUploadQueue(); });
+  }
+}
+
+// Throttle renderPeekFiles to one repaint per frame — bulk uploads call it after
+// every chunk, which is hundreds of full innerHTML rewrites for 80+ files.
+let _renderPeekFilesRAF = null;
+function _scheduleRenderPeekFiles() {
+  if (!_renderPeekFilesRAF) {
+    _renderPeekFilesRAF = requestAnimationFrame(() => {
+      _renderPeekFilesRAF = null;
+      renderPeekFiles();
+    });
+  }
+}
+
 async function uploadAndAttach(file) {
   const isImage = file.type.startsWith('image/');
   let previewUrl = null;
@@ -8889,8 +9237,8 @@ async function uploadAndAttach(file) {
   // placeholder never gets its .path (send then stalls on "wait for upload").
   const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB, chunk: 0, totalChunks };
   peekFiles.push(placeholder);
-  renderPeekFiles();
-  const _present = () => peekFiles.indexOf(placeholder) >= 0;  // false once the user removes it
+  _scheduleRenderPeekFiles();
+  const _present = () => peekFiles.indexOf(placeholder) >= 0;
 
   try {
     const startR = await fetch(API + '/api/upload/start', {
@@ -8903,7 +9251,7 @@ async function uploadAndAttach(file) {
     const uploadId = startD.id;
 
     for (let i = 0; i < totalChunks; i++) {
-      if (!_present()) return;   // user removed the chip mid-upload — stop cleanly
+      if (!_present()) return;
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const blob = file.slice(start, end);
@@ -8916,29 +9264,27 @@ async function uploadAndAttach(file) {
         const d = await r.json().catch(() => ({}));
         throw new Error(d.error || 'chunk ' + i + ' failed');
       }
-      placeholder.chunk = i + 1;   // mutate the same object, wherever it now sits
-      renderPeekFiles();
+      placeholder.chunk = i + 1;
+      _scheduleRenderPeekFiles();
     }
 
     const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST' });
     const finD = await finR.json();
     if (!finR.ok || finD.error) throw new Error(finD.error || 'finalize failed');
-    if (!_present()) return;   // removed while finishing — don't resurrect it
-    // Mutate in place so the entry stays exactly where it is in the array and
-    // simply gains its path/url (isUploading = !f.path flips to done).
+    if (!_present()) return;
     placeholder.path = finD.path;
     placeholder.url = finD.url;
   } catch(e) {
     console.error('Upload error:', e);
     showToast('Upload failed: ' + e.message);
     const i = peekFiles.indexOf(placeholder);
-    if (i >= 0) peekFiles.splice(i, 1);   // remove THIS file by identity, not a stale index
+    if (i >= 0) peekFiles.splice(i, 1);
   }
-  renderPeekFiles();
+  _scheduleRenderPeekFiles();
 }
 
 function handlePeekFileInput(e) {
-  for (const f of e.target.files) uploadAndAttach(f);
+  for (const f of e.target.files) _enqueueUpload(f);
   e.target.value = '';
 }
 
@@ -8951,7 +9297,7 @@ function handlePeekPaste(e) {
   for (const item of items) {
     if (item.kind === 'file') {
       e.preventDefault();
-      uploadAndAttach(item.getAsFile());
+      _enqueueUpload(item.getAsFile());
       return;
     }
   }
@@ -8982,7 +9328,7 @@ function handlePeekPaste(e) {
     if (!document.getElementById('peek-cmd-row')?.classList.contains('open')) {
       togglePeekCmd(); // auto-open the send bar on drop
     }
-    for (const f of e.dataTransfer.files) uploadAndAttach(f);
+    for (const f of e.dataTransfer.files) _enqueueUpload(f);
   });
 })();
 
@@ -9030,8 +9376,17 @@ async function sendPeekCmd() {
   // Queue mode: enqueue to the steering queue — no status check. The client's
   // status is a snapshot, and racing it was exactly how queued messages fell
   // through to direct sends. The server delivers at the next turn boundary; an
-  // idle session picks it up within seconds via the fast steering tick. (File
-  // attachments still send directly — steering carries text only.)
+  // idle session picks it up within seconds via the fast steering tick.
+  //
+  // ATTACHMENTS QUEUE TOO (Ethan 2026-08-13: "why are queue messages not queued
+  // here — with a file it sent in the box?"). This used to require
+  // `files.length === 0`, so ANY attached file fell through to the immediate
+  // direct send below — attaching a file silently bypassed the queue. But the
+  // uploaded files persist at their paths and the message that carries them is
+  // just `text @path1 @path2`, which is plain text — exactly what the steering
+  // queue delivers. So build the @path refs (same as the direct path does) and
+  // queue that. "steering carries text only" is true and irrelevant: @path IS
+  // text.
   //
   // EXCEPTION: when the session is at a selector (status 'waiting' = NEEDS
   // INPUT), it is explicitly parked ON your answer. The steering queue only
@@ -9039,18 +9394,25 @@ async function sendPeekCmd() {
   // sit undelivered forever (you "keep sending commands and they don't go
   // through"). Send those DIRECT so they land immediately.
   const _atSelector = (sessions.find(s => s.name === peekSession) || {}).status === 'waiting';
-  if (_sendMode === 'queue' && files.length === 0 && !_atSelector) {
-    cmdHistoryAdd(text, {type:'steering'});
+  if (_sendMode === 'queue' && !_atSelector) {
+    let queuedMsg = text;
+    if (files.length > 0) {
+      const refs = files.map(f => '@' + f.path).join(' ');
+      queuedMsg = text ? `${text} ${refs}` : refs;
+    }
+    cmdHistoryAdd(text || queuedMsg, {type:'steering'});
     inp.value = '';
     inp.style.height = 'auto';
     _draftClear(peekSession);
+    clearPeekFiles();
     const peekSendBtn = document.querySelector('.peek-cmd-bar .send-split-main, .peek-cmd-bar .btn.primary');
     if (peekSendBtn) { peekSendBtn.dataset.prevText = peekSendBtn.textContent; peekSendBtn.textContent = 'Queuing…'; peekSendBtn.disabled = true; peekSendBtn.style.opacity = '0.6'; }
-    await steerSession(peekSession, text);
+    await steerSession(peekSession, queuedMsg);
     if (peekSendBtn) { peekSendBtn.textContent = peekSendBtn.dataset.prevText || 'Queue'; peekSendBtn.disabled = false; peekSendBtn.style.opacity = ''; }
     const sess = sessions.find(s => s.name === peekSession);
-    const cnt = (sess && sess.steering) ? sess.steering.length : 0;
-    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
+    const cnt = _steerHumanCount(sess);
+    showToast('Queued for ' + peekSession + (cnt > 1 ? ' (' + cnt + ' in queue)' : '')
+              + (files.length ? ' · ' + files.length + ' file' + (files.length === 1 ? '' : 's') : ''));
     return;
   }
   // 'send' mode + active session sends immediately. The old confirmation dialog
@@ -9992,11 +10354,34 @@ let _ttsSpeakAudio = null;   // currently-playing one-click clip, so a second pr
 // One-click "read aloud" for a single message — no dialog, just plays. Hits
 // the same /api/tts route as the Text-to-Speech dialog below, so it gets
 // Piper (free, local) when installed and ElevenLabs otherwise.
+// A floating "generating audio…" indicator, so EVERY read-aloud trigger has a
+// loading signal — not just the ones with a button to spin (Ethan 2026-08-13).
+// The button (if any) also spins; this covers the ellipsis-menu actions that
+// pass no button.
+function _ttsLoading(on) {
+  let el = document.getElementById('tts-loading');
+  if (on) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'tts-loading';
+      el.className = 'tts-loading';
+      el.innerHTML = '<span class="tts-loading-spin">◌</span> Generating audio…';
+      document.body.appendChild(el);
+    }
+    el.style.display = 'flex';
+  } else if (el) {
+    el.style.display = 'none';
+  }
+}
+
 async function _ttsSpeak(text, btn) {
   if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
   if (!text) return;
-  const orig = btn.innerHTML;
-  btn.disabled = true; btn.innerHTML = '&#x23F3;';
+  // btn is optional — the ellipsis "read latest" actions have no button to spin,
+  // so every btn access is guarded and the floating _ttsLoading covers them.
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
+  _ttsLoading(true);
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
@@ -10009,10 +10394,123 @@ async function _ttsSpeak(text, btn) {
     _ttsSpeakAudio = audio;
     audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
     await audio.play();
+    _ttsLoading(false);   // audio is playing — done generating
+    // Record for replay (Ethan: a tab of past read-alouds). Fire-and-forget so a
+    // storage hiccup never blocks playback.
+    _raRecord(text, d.url, (typeof peekSession !== 'undefined' && peekSession) || '');
   } catch(e) {
     showToast('Read aloud failed: ' + e.message, 'error');
   } finally {
-    btn.disabled = false; btn.innerHTML = orig;
+    _ttsLoading(false);
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+
+// ── Past read-alouds (replay history, 30-day flush) ──────────────────────────
+// Lightweight INDEX in one IDB key (id/text/ts/session — no audio), each clip's
+// audio in its own `ra_<id>` entry loaded on demand for replay. Same split the
+// peek/file caches use, so the list render never pulls megabytes of audio.
+let _raIndex = null;
+const _RA_CAP = 60;                 // keep the most recent N
+const _RA_TTL_MS = 30 * 24 * 3600 * 1000;   // 30-day flush (Ethan)
+
+async function _raLoadIndex() {
+  if (_raIndex) return _raIndex;
+  try { _raIndex = (await _idb.get('read_alouds_index')) || []; } catch(e) { _raIndex = []; }
+  return _raIndex;
+}
+async function _raRecord(text, url, session) {
+  try {
+    await _raLoadIndex();
+    const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    const ts = Date.now();
+    await _idb.set('ra_' + id, { url, text, ts, session });
+    _raIndex.unshift({ id, text: (text || '').slice(0, 240), ts, session });
+    // Trim to cap + drop anything past the 30-day flush, deleting their audio.
+    const cutoff = ts - _RA_TTL_MS;
+    const keep = _raIndex.filter(e => e.ts >= cutoff).slice(0, _RA_CAP);
+    for (const e of _raIndex) { if (!keep.includes(e)) { try { await _idb.del('ra_' + e.id); } catch(_) {} } }
+    _raIndex = keep;
+    await _idb.set('read_alouds_index', _raIndex);
+    if (typeof _peekTab !== 'undefined' && _peekTab === 'readalouds') _raRender();
+    _raUpdateBadge();
+  } catch(e) { /* storage best-effort; never break playback */ }
+}
+async function _raPrune() {   // called at startup, alongside the file pruner
+  try {
+    await _raLoadIndex();
+    const cutoff = Date.now() - _RA_TTL_MS;
+    const stale = _raIndex.filter(e => e.ts < cutoff);
+    if (!stale.length) return;
+    for (const e of stale) { try { await _idb.del('ra_' + e.id); } catch(_) {} }
+    _raIndex = _raIndex.filter(e => e.ts >= cutoff);
+    await _idb.set('read_alouds_index', _raIndex);
+  } catch(e) {}
+}
+function _raUpdateBadge() {
+  const b = document.getElementById('peek-tab-readalouds-count');
+  if (b) { const n = (_raIndex || []).length; b.textContent = n ? String(n) : ''; }
+}
+async function _raReplay(id) {
+  try {
+    const e = await _idb.get('ra_' + id);
+    if (!e || !e.url) { showToast('Clip not found (may have been flushed)'); return; }
+    if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
+    const audio = new Audio(e.url);
+    _ttsSpeakAudio = audio;
+    audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
+    await audio.play();
+  } catch(err) { showToast('Replay failed: ' + err.message, 'error'); }
+}
+async function _raDelete(id) {
+  try {
+    await _raLoadIndex();
+    await _idb.del('ra_' + id);
+    _raIndex = _raIndex.filter(e => e.id !== id);
+    await _idb.set('read_alouds_index', _raIndex);
+    _raRender(); _raUpdateBadge();
+  } catch(e) {}
+}
+async function _raRender() {
+  const el = document.getElementById('peek-readalouds-list');
+  if (!el) return;
+  await _raLoadIndex();
+  if (!_raIndex.length) {
+    el.innerHTML = '<div style="padding:24px 16px;text-align:center;color:var(--dim);font-size:0.85rem;">No read-alouds yet.<br><span style="font-size:0.78rem;">Tap 🔊 on a message, a selection, or a worker to read it aloud — clips land here to replay. They auto-clear after 30 days.</span></div>';
+    return;
+  }
+  el.innerHTML = _raIndex.map(e => {
+    const dtms = Date.now() - e.ts;
+    const when = dtms < 60000 ? 'just now'
+      : dtms < 3600000 ? Math.floor(dtms / 60000) + 'm ago'
+      : dtms < 86400000 ? Math.floor(dtms / 3600000) + 'h ago'
+      : new Date(e.ts).toLocaleDateString();
+    const sess = e.session ? '<span style="color:var(--accent);">' + esc(e.session) + '</span> · ' : '';
+    const snippet = esc((e.text || '').replace(/\s+/g, ' ').slice(0, 180));
+    return '<div class="ra-item">'
+      + '<button class="ra-play" title="Replay" onclick="_raReplay(\'' + escJs(e.id) + '\')">&#x25B6;</button>'
+      + '<div class="ra-body"><div class="ra-meta">' + sess + esc(when) + '</div>'
+      + '<div class="ra-text">' + snippet + (e.text && e.text.length > 180 ? '…' : '') + '</div></div>'
+      + '<button class="ra-del" title="Delete" onclick="_raDelete(\'' + escJs(e.id) + '\')">&#x2715;</button>'
+      + '</div>';
+  }).join('');
+}
+
+// Worker-ellipsis "read latest message" (Ethan: click the ellipsis on a worker
+// and it reads its most recent full message aloud). The server extracts the last
+// full assistant message from the structured transcript — no spinner/status
+// chrome — so this is "intelligent about what to send" without the client having
+// to parse a rendered pane.
+async function _readLatestMessage(name) {
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders() });
+    const d = await r.json();
+    const t = (d.text || '').trim();
+    if (!t) { showToast('No recent message from ' + name); return; }
+    showToast('Reading ' + name + '’s latest message…');
+    _ttsSpeak(t, null);
+  } catch(e) {
+    showToast('Read failed: ' + e.message, 'error');
   }
 }
 
@@ -10750,6 +11248,13 @@ function _msgKind(e) {
   if (t === 'session') return 'session';
   if (t === 'schedule') return 'schedule';
   if (t === 'system') return 'amux';   // amux's own nudges, not a person
+  // A send that went in via raw tmux while the server was unreachable, and was
+  // reconciled into the trail afterwards by the CLI (AMUX-2670). It MUST NOT
+  // fall through to 'human': that is the card's whole complaint — an unstamped
+  // injection rendering identically to an audited send. Its delivery was never
+  // verified (keystrokes reached a pane; a picker may have eaten them) and its
+  // origin is the CLI's word, not a server-side stamp.
+  if (t === 'raw-tmux-fallback') return 'unstamped';
   return 'human';   // direct / steering / user / '' — all a person typing
 }
 // Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
@@ -10984,12 +11489,17 @@ function _cmdHistItemHTML(e, ctx) {
   const tag = `<span style="display:inline-block;font-size:0.7rem;font-weight:600;padding:1px 7px;border-radius:3px;background:${km.bg};color:${km.color};margin-right:6px;">${km.label}${originTxt}</span>`;
   const sessTag = session ? `<span style="color:var(--dim);font-size:0.7rem;margin-right:6px;">${session.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</span>` : '';
   const tsTag = ts ? `<span style="color:var(--dim);font-size:0.7rem;">${ts}</span>` : '';
-  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
+  // Copyable message id, matching the scheduler's SCHED-N badge (Ethan
+  // 2026-08-12). Only when the row has a real id — legacy string entries and
+  // not-yet-delivered offline sends have none, and a copy chip that yields
+  // "undefined" is worse than no chip.
+  const _mid = (typeof e === 'string') ? '' : (e.id !== undefined && e.id !== null ? String(e.id) : '');
+  const idTag = _mid
+    ? `<code class="msg-id-badge" title="Message id — click to copy" onclick="event.stopPropagation();_copyMsgId('${esc(_mid)}')">MSG-${esc(_mid)}</code>`
+    : '';
+  const meta = tag + _msgDeliveryChip(e) + _msgSubmitChip(e) + sessTag + tsTag + idTag + _msgCardChip(typeof e === 'string' ? '' : (e.card_id || ''));
   const locSess = (session || (typeof peekSession !== 'undefined' ? peekSession : '') || '').replace(/'/g,'');
   const _target = ctx.target(e) || locSess;
-  const copyBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Copy message text" onclick="event.stopPropagation();_msgCopyBtn(this,'${enc}')">&#x1F4CB;</button>`;
-  const speakBtn = `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;min-width:44px;min-height:28px;" title="Read aloud" onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent('${enc}'),this)">&#x1F50A;</button>`;
-  const locate = locSess ? `<button class="btn" style="flex-shrink:0;align-self:center;font-size:0.7rem;padding:3px 9px;" title="Open the peek and scroll to where this was sent" onclick="event.stopPropagation();_msgLocate('${locSess}','${enc}')">&#x2316;</button>` : '';
   // A MATCHING message is force-expanded while a search is active, even if the
   // user collapsed it earlier. Otherwise the search highlights the term inside
   // a clamped body and the hit is invisible — a result you cannot see is not a
@@ -10998,7 +11508,7 @@ function _cmdHistItemHTML(e, ctx) {
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button></div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyCardIds(safe), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 function _peekMessagesFor() {
   if (!peekSession) return [];
@@ -11494,6 +12004,9 @@ async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
   const n = q.filter(x => x.state !== 'done').length;
+  // Repaint the shared badge too: a clip added or drained changes the ONE
+  // pending count, and the Files/Explore surfaces have no other trigger for it.
+  try { _upqRenderBadge(); } catch (e) {}
   const el = document.getElementById('dict-pending');
   if (el) el.textContent = n ? n + ' pending' : '';
   const dot = document.getElementById('dict-outbox-dot');
@@ -12670,7 +13183,8 @@ function _renderFileBody(data, mode) {
     _bindReadPosDiv(body, data.path);
   } else if (data.is_markdown) {
     body.className = 'file-overlay-body markdown md-content';
-    body.innerHTML = renderMarkdown(data.content);
+    body.innerHTML = renderMarkdown(data.content, data.path);
+    _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
   } else if (data.is_html) {
@@ -14406,7 +14920,15 @@ async function openConnectIterm2() {
     const d = await r.json();
     const panes = d.panes || [];
     if (!panes.length) {
-      list.innerHTML = '<div style="color:var(--dim);font-size:0.85rem;text-align:center;padding:20px;">No open iTerm2 panes found.<br>Make sure iTerm2 is running.</div>';
+      // "Make sure iTerm2 is running" was this arm's ONLY message, and it was
+      // wrong for every cause that isn't that: a missing route (this endpoint
+      // 404'd until AMUX-2871) and, on this machine, osascript blocking on a
+      // macOS Automation consent that never gets answered from a launchd
+      // process. The server now says which it was — show it rather than
+      // re-guessing at the user's machine.
+      list.innerHTML = d.error
+        ? `<div style="color:var(--red);font-size:0.85rem;text-align:center;padding:20px;">Could not list iTerm2 panes.<br><span style="color:var(--dim);font-size:0.78rem;">${esc(d.error)}</span><br><span style="color:var(--dim);font-size:0.78rem;">If iTerm2 is running, grant Automation access to amux in System Settings → Privacy &amp; Security.</span></div>`
+        : '<div style="color:var(--dim);font-size:0.85rem;text-align:center;padding:20px;">No open iTerm2 panes found.<br>Make sure iTerm2 is running.</div>';
       return;
     }
     list.innerHTML = panes.map(p => `
@@ -14997,7 +15519,7 @@ function _peekShowSelPopover() {
     pop = document.createElement('div');
     pop.id = 'peek-sel-popover';
     pop.style.cssText = 'position:fixed;z-index:10000;background:#1a1a2e;border:1px solid #444;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.5);padding:4px;display:flex;gap:2px;font-size:0.78rem;';
-    pop.innerHTML = '<button id="peek-sel-lookup" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50D; Look up</button><button id="peek-sel-copy" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">Copy</button>';
+    pop.innerHTML = '<button id="peek-sel-lookup" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50D; Look up</button><button id="peek-sel-copy" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">Copy</button><button id="peek-sel-read" style="background:none;border:none;color:#c7d2fe;padding:6px 10px;cursor:pointer;border-radius:5px;">&#x1F50A; Read aloud</button>';
     document.body.appendChild(pop);
     pop.querySelector('#peek-sel-lookup').onclick = (e) => { e.stopPropagation(); _peekLookupSelection(); };
     pop.querySelector('#peek-sel-copy').onclick = (e) => {
@@ -15005,6 +15527,17 @@ function _peekShowSelPopover() {
       const t = window.getSelection()?.toString() || '';
       if (t) navigator.clipboard?.writeText(t);
       _peekHideSelPopover();
+    };
+    // Read aloud the highlighted text (Ethan: "drag and highlight then I can do
+    // lookup copy or read aloud"). Same /api/tts path as the one-click button;
+    // the audio plays independently, so hiding the popover after kicking it off
+    // is fine (_ttsSpeak's button-state restore is harmless on the hidden node).
+    pop.querySelector('#peek-sel-read').onclick = (e) => {
+      e.stopPropagation();
+      const t = window.getSelection()?.toString() || '';
+      const btn = e.currentTarget;
+      _peekHideSelPopover();
+      if (t) _ttsSpeak(t, btn);
     };
     pop.addEventListener('mousedown', (e) => e.preventDefault()); // don't kill selection
   }
@@ -15014,7 +15547,7 @@ function _peekShowSelPopover() {
   pop.style.display = 'flex';
   // Default above selection; if no room, put below
   const popH = 36;
-  const popW = 160;
+  const popW = 250;   // three buttons: Look up · Copy · Read aloud
   let top = rect.top - popH - 8;
   if (top < 8) top = rect.bottom + 8;
   let left = rect.left + (rect.width / 2) - (popW / 2);
@@ -15111,7 +15644,7 @@ document.addEventListener('paste', function(e) {
     for (const item of e.clipboardData.items) {
       if (item.kind === 'file') {
         e.preventDefault();
-        uploadAndAttach(item.getAsFile());
+        _enqueueUpload(item.getAsFile());
         return;
       }
     }
@@ -15225,7 +15758,7 @@ function _pwaCb(e) {
             item.getType(imgType).then(blob => {
               const ext = imgType.split('/')[1] || 'png';
               const file = new File([blob], 'pasted-image.' + ext, { type: imgType });
-              uploadAndAttach(file);
+              _enqueueUpload(file);
             });
             return;
           }
@@ -15904,7 +16437,7 @@ async function _ensureArchived() {
   })();
   return _archivedLoading;
 }
-let boardStatuses = [{id:'backlog',label:'Backlog'},{id:'todo',label:'To Do'},{id:'doing',label:'In Progress'},{id:'review',label:'In Review'},{id:'done',label:'Done'},{id:'verified',label:'Verified'},{id:'discarded',label:'Discarded'}];
+let boardStatuses = [{id:'backlog',label:'Backlog'},{id:'todo',label:'To Do'},{id:'doing',label:'In Progress'},{id:'review',label:'In Review'},{id:'done',label:'Done'},{id:'verified',label:'Verified',terminal:true},{id:'discarded',label:'Discarded',terminal:true}];
 // Per-session gate overrides: { session: { status: [items] } }. Layer between the
 // global status default and the per-card override.
 let sessionGates = {};
@@ -16178,7 +16711,8 @@ function switchView(view) {
     // Only poll if SSE is not active (SSE pushes board updates)
     if (_sseFallback && !boardTimer) boardTimer = setInterval(fetchBoard, 5000);
   } else if (view === 'scheduler') {
-    Promise.all([fetchSchedules(), fetchSchedulerRuns()]).then(() => renderScheduler());
+    Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()])
+      .then(() => { renderScheduler(); renderSchedulerAudit(); });
     // amux's own background jobs live under the user's schedules. Fetched
     // separately because they are a separate thing (see renderSystemJobs), and
     // refreshed on a timer because a frozen age is the exact failure the
@@ -16209,11 +16743,28 @@ async function _habitsLoad() {
 }
 
 async function _habitsSave() {
-  await fetch(API + '/api/habits', {
-    method: 'PUT',
-    headers: _authHeaders({'Content-Type':'application/json'}),
-    body: JSON.stringify(_habits)
-  });
+  // This awaited a response and read none. The route was unmounted from the
+  // Rust cutover until AMUX-2871, so every tick, add and rename PUT a 404 and
+  // rendered as saved — the file on disk had not moved since 2026-07-04 and
+  // nothing anywhere said so. A whole-array PUT means one unnoticed failure
+  // loses every habit and every day of history, so this is the one call that
+  // must never fail quietly.
+  try {
+    const r = await fetch(API + '/api/habits', {
+      method: 'PUT',
+      headers: _authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify(_habits)
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showToast('Habits NOT saved: ' + (d.error || ('HTTP ' + r.status)));
+      return false;
+    }
+    return true;
+  } catch(e) {
+    showToast('Habits NOT saved: ' + e.message);
+    return false;
+  }
 }
 
 function _habitsRender() {
@@ -17642,6 +18193,75 @@ async function fetchSchedulerRuns() {
   }
 }
 
+let _schedulerAudit = [];
+async function fetchSchedulerAudit() {
+  try {
+    const r = await fetch(API + '/api/schedules/audit?limit=200');
+    if (r.ok) {
+      _schedulerAudit = await r.json();
+      try { localStorage.setItem('amux_sched_audit_cache', JSON.stringify(_schedulerAudit)); } catch(e) {}
+    }
+  } catch(e) {
+    try { var c = localStorage.getItem('amux_sched_audit_cache'); if (c) _schedulerAudit = JSON.parse(c); } catch(e2) {}
+  }
+}
+
+/// The change history panel (AMUX-2755).
+//
+// GET /api/schedules/audit was routed and the SPA referenced it ZERO times.
+// The trail existed and reached nobody — ethos rule 1, in the subsystem whose
+// own incident (AMUX-1812: eight schedules vanished with no attribution) is the
+// reason it was built.
+//
+// DELETED SCHEDULES ARE THE POINT. A per-schedule row cannot show one: the row
+// is gone. Measured 2026-08-11: 151 schedules have audit rows, 118 still exist,
+// so 45 are visible ONLY here. Rendering this as an annotation on live rows
+// would have reproduced the original blindness with a new coat of paint.
+// Params are a TEST SEAM with production defaults. `_schedulerAudit` and
+// `schedules` are top-level `let`s, and in a classic script those do NOT become
+// window properties — so a test assigning window._schedulerAudit is writing to
+// a different binding than this function reads, and the panel renders empty
+// while every assertion still runs. That failure looks exactly like a broken
+// renderer. Taking the data as arguments makes the test drive the real code
+// path instead of a lookalike.
+function renderSchedulerAudit(rowsIn, liveIdsIn) {
+  const el = document.getElementById('scheduler-audit');
+  const nEl = document.getElementById('sched-audit-n');
+  if (!el) return;
+  const rows = (rowsIn || _schedulerAudit || []).slice(0, 60);
+  if (nEl) nEl.textContent = rows.length ? '(' + rows.length + ')' : '';
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty" style="font-size:0.75rem;">No recorded schedule changes.</div>';
+    return;
+  }
+  const live = liveIdsIn || new Set((schedules || []).map(s => s.id));
+  el.innerHTML = rows.map(r => {
+    const gone = !live.has(r.schedule_id);
+    const del = r.field === 'deleted' || r.source === 'api-delete';
+    const who = r.by_who || 'unattributed';
+    const label = del ? 'deleted' : (r.source === 'api-create' ? 'created' : 'changed ' + esc(r.field || '?'));
+    // An unattributed write is the failure this trail exists to make visible,
+    // so it is called out rather than rendered as a blank.
+    const whoHtml = r.by_who
+      ? '<span style="color:var(--accent);">' + esc(who) + '</span>'
+      : '<span style="color:var(--red);" title="No X-Amux-Session on the write — this is the gap AMUX-1812 was about">unattributed</span>';
+    const gonePill = gone
+      ? ' <span style="font-size:0.62rem;color:var(--red);border:1px solid var(--red);border-radius:4px;padding:0 4px;" title="This schedule no longer exists — visible only here">gone</span>'
+      : '';
+    const diff = (r.old_value || r.new_value)
+      ? '<div style="color:var(--dim);font-size:0.66rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
+        + (r.old_value ? esc(String(r.old_value).slice(0, 60)) + ' \u2192 ' : '')
+        + esc(String(r.new_value || '').slice(0, 60)) + '</div>'
+      : '';
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:0.72rem;">'
+      + '<div style="display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;">'
+      + '<span style="font-weight:600;">' + esc(r.title || r.schedule_id || '?') + '</span>' + gonePill
+      + '<span style="color:var(--dim);">' + label + ' by </span>' + whoHtml
+      + '<span style="color:var(--dim);margin-left:auto;">' + timeAgo(Number(r.ts) || 0) + '</span>'
+      + '</div>' + diff + '</div>';
+  }).join('');
+}
+
 // WHAT A RUN DOT MEANS (AMUX-2647). Before the delivery verdict existed there
 // were two states — `ok` and everything-else-is-red — and every rust run row
 // said `ok`, including the ones that delivered nothing at all. Mapping the new
@@ -17663,6 +18283,17 @@ async function fetchSchedulerRuns() {
 // reads "queued" and waits is correct, and one who reads "Ran" and waits is
 // the one who presses the button three more times.
 function _schedRunToast(d) {
+  // The offline outbox hands back a synthetic 202 {ok,queued,offline} with NO
+  // `status`, so this used to fall through to `default` and render a QUEUED run
+  // as "Ran · unknown outcome" — a run that has not run, described as if it had.
+  // That is what a Run-now click during a server blip produced (Ethan,
+  // 2026-08-13, clicking during a build-swap restart; the POST threw, the
+  // interceptor queued it and returned this 202). `offline` is set ONLY by
+  // _outboxAccepted — the real server never sets it, and its genuine
+  // RunOutcome::Queued carries status:"queued", handled in the switch below.
+  if (d && d.offline) {
+    return 'Couldn’t reach the server — the run is queued and will fire on reconnect';
+  }
   const note = String(d.note || '').split('\n')[0].slice(0, 90);
   const tail = note ? ' · ' + note : '';
   switch (String(d.status || '')) {
@@ -17674,7 +18305,11 @@ function _schedRunToast(d) {
     case 'error':     return 'Failed' + (tail || ' · delivery failed');
     // Shell schedules: `ok` genuinely means the command ran to completion, and
     // "no output" is a real, common answer for them (`exit 0 [noop] quiet`).
-    case 'ok':        return 'Ran' + (note ? ' · ' + note : ' · no output');
+    // Say the QUIET part too (AMUX-2899): "Ran · exit 0 [noop] ..." never told
+    // anyone that nothing was sent to the worker named on the row, which is why
+    // the button got pressed three times.
+    case 'ok':        return 'Ran on the host' + (note ? ' · ' + note : ' · no output')
+      + (d.session ? ' · nothing sent to ' + d.session + ' (shell schedule)' : '');
     default:          return 'Ran · ' + (d.status || 'unknown outcome') + tail;
   }
 }
@@ -17748,6 +18383,16 @@ function _copySchedId(id) {
   try { navigator.clipboard.writeText(id); } catch(e) {}
   if (typeof showToast === 'function') showToast(id + ' copied');
 }
+// Message-id copy, mirroring _copySchedId (Ethan, 2026-08-12: "each message row
+// has a message ID that I can copy similar to the schedule ID"). The value is
+// the cmd_history row id; we render it as MSG-<id> so a pasted reference is
+// unambiguous (a bare integer could be anything), and strip the prefix back off
+// on copy so what lands on the clipboard is the raw id the API keys on.
+function _copyMsgId(id) {
+  const raw = String(id).replace(/^MSG-/, '');
+  try { navigator.clipboard.writeText(raw); } catch(e) {}
+  if (typeof showToast === 'function') showToast('MSG-' + raw + ' copied');
+}
 function toggleSchedExpand(id) {
   const el = document.getElementById('sched-cmd-' + id);
   if (!el) return;
@@ -17816,9 +18461,25 @@ function renderScheduler(opts) {
         return `<span class="sched-run-dot ${cls}" title="${esc(bits.join(' · '))}"></span>`;
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
-      const sessLink = s.session
-        ? `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
-        : `<span style="color:var(--dim);">(shell)</span>`;
+      // KIND, not the presence of a session (AMUX-2899). This keyed on
+      // `s.session` being empty, so a shell schedule that HAS a session — 4 of
+      // the 7 shell schedules do — rendered byte-identically to a prompt
+      // schedule pointed at that worker. Ethan pressed Run Now on SCHED-99
+      // three times because nothing reached ts-gke; nothing was ever going to,
+      // and the row said the opposite. A view must key on the same field the
+      // mechanism does (ethos rule 1).
+      const isShell = s.kind === 'shell';
+      const kindChip = isShell
+        ? `<code class="sched-cadence-pill" style="color:var(--yellow,#fbbf24);" title="Runs a command on the host and routes on its exit code. It does NOT prompt a worker.">shell</code>`
+        : '';
+      const sessLink = !s.session
+        ? `<span style="color:var(--dim);">(no worker)</span>`
+        : isShell
+          // The worker is who OWNS/gets alerted, not where the command goes.
+          // Still linked — you want to reach the owner — but labelled so the
+          // row cannot be read as a delivery target.
+          ? `<span class="sched-sess-dot ${sessStatus}" title="${esc(s.session)}: ${sessStatus} — owner / alert routing, NOT a delivery target"></span><span style="color:var(--dim);">owner </span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`
+          : `<span class="sched-sess-dot ${sessStatus}" title="${s.worker}: ${sessStatus}"></span><span style="color:var(--accent);cursor:pointer;" onclick="switchView('workers');openPeek('${esc(s.session)}')">${esc(s.session)}</span>`;
       const nextRel = s.next_run ? `▶ <strong style="color:var(--text);" title="${s.next_run}">${relTime(s.next_run)}</strong>` : '';
       // Measured cost badge (MG audit #1): fires last 24h + fleet share; red
       // when one schedule dominates — 51% of wake-ups sat invisible until
@@ -17847,7 +18508,7 @@ function renderScheduler(opts) {
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
               <code class="sched-id-badge" title="Schedule id — click to copy" onclick="event.stopPropagation();_copySchedId('${esc(s.id)}')">${esc(s.id)}</code>
               <span style="font-weight:600;font-size:0.84rem;cursor:pointer;" onclick="toggleSchedExpand('${esc(s.id)}')">${esc(s.title)}</span>
-              <code class="sched-cadence-pill">${esc(recLabel)}</code>${fireBadge}
+              <code class="sched-cadence-pill">${esc(recLabel)}</code>${kindChip}${fireBadge}
             </div>
             <div style="font-size:0.72rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dim);">
               <span style="display:flex;align-items:center;gap:3px;">${sessLink}</span>
@@ -18181,16 +18842,21 @@ async function runScheduleNow(id) {
     });
     if (r) {
       const d = (typeof r.json === 'function') ? await r.json().catch(() => ({})) : (r || {});
-      await Promise.all([fetchSchedules(), fetchSchedulerRuns()]);
+      await Promise.all([fetchSchedules(), fetchSchedulerRuns(), fetchSchedulerAudit()]);
       renderScheduler();
+      renderSchedulerAudit();
       _peekRefreshSchedIfActive();
       if (typeof showToast === 'function') showToast(_schedRunToast(d));
     } else if (typeof showToast === 'function') {
-      // apiCall returns null for BOTH "queued while offline" and "refused".
-      // Calling a queued run a failure would be its own wrong-message bug —
-      // the user would press again, which is the behaviour being fixed.
-      showToast(online ? 'Run failed — the server did not accept it'
-                       : 'Offline — run queued, will fire when reconnected');
+      // apiCall returns null only AFTER it has already toasted the reason: for a
+      // server refusal it shows the server's own error text; a transient
+      // unreachable is captured by the fetch interceptor into a queued 202 that
+      // renders through _schedRunToast above, NOT here. Keying on `online` to
+      // print "the server did not accept it" was the bug — on the first failed
+      // fetch `online` is still true while the op was already queued for replay,
+      // so a queued run read as a rejection and invited a re-click (Ethan,
+      // 2026-08-13, AMUX-3049). Only the pure-offline path is unspoken-for here.
+      if (!online) showToast('Offline — run queued, will fire when reconnected');
     }
   } finally {
     if (btn && btn.tagName === 'BUTTON') { btn.disabled = false; }
@@ -18260,7 +18926,20 @@ async function fetchBoard() {
     const [r, rs, rsg] = await Promise.all([
       // ?archived=0 (AMUX-2271): 4.7MB -> 129KB. Archived cards load lazily,
       // only when something actually asks to see them.
-      fetch(API + '/api/board?archived=0', _boardEtag ? { headers: boardHeaders } : undefined),
+      //
+      // &slim=1 (AMUX-2840): 3,574,524 B -> 690,122 B on EVERY poll. desc and
+      // log are 81% of the payload and the list renders neither — it renders
+      // derivations of them, which the server now ships directly (desc_head,
+      // folded_n, desc_len, needsyou_note).
+      //
+      // FLIPPED LAST, deliberately, and only after enumerating every consumer
+      // that reads desc/log rather than trusting the list of known ones. There
+      // were SEVEN; four were unlisted, and every one fails SILENTLY — a blank
+      // preview, a filter that selects nothing, an empty history, a disarmed
+      // save guard. The edit modal is the one that mattered: it filled its
+      // textarea from the list item and saved that back, so flipping this line
+      // first would have blanked the description of every card anyone opened.
+      fetch(API + '/api/board?archived=0&slim=1', _boardEtag ? { headers: boardHeaders } : undefined),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
@@ -18333,6 +19012,7 @@ async function fetchBoard() {
       }
       _cacheBoardJSON(j);
       renderBoard();
+      _nudgeWorkersOnBoardChange();
     }
   } catch(e) {
     console.error('fetch board:', e);
@@ -18368,7 +19048,51 @@ function _sanitizeHtml(html) {
     .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(/(href|src)\s*=\s*("|')?\s*(javascript|data|vbscript):/gi, '$1=$2#blocked:');
 }
-function renderMarkdown(raw) {
+// Resolve a markdown link href to an ABSOLUTE file path, relative to the file
+// being viewed (basePath = that file's absolute path). Returns '' for links that
+// are not local files (http(s)/mailto/anchor) so the caller renders them as-is.
+// Handles ./ ../ and bare relative names, strips #anchor/?query, normalises.
+function _resolveFileLink(basePath, href) {
+  if (!basePath || !href) return '';
+  if (/^(https?:|mailto:|tel:|data:|vbscript:|javascript:|\/\/)/i.test(href)) return '';
+  let r = href.split('#')[0].split('?')[0].trim();
+  if (!r) return '';                 // pure #anchor / query — not a file
+  let abs = r.startsWith('/') ? r : basePath.replace(/\/[^/]*$/, '') + '/' + r;
+  const out = [];
+  for (const seg of abs.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  return '/' + out.join('/');
+}
+
+// Wire clicks on .md-file-link (links to OTHER files, rendered by
+// renderMarkdown) to open that file IN the viewer. Delegated on the container so
+// it covers every link and survives DOMPurify stripping inline onclick; bound
+// once per container (its innerHTML is replaced across renders, but the element
+// and this listener persist, and delegation catches the new links).
+function _bindMdFileLinks(container) {
+  if (!container || container._mdLinksBound) return;
+  container._mdLinksBound = true;
+  container.addEventListener('click', (e) => {
+    const a = e.target.closest && e.target.closest('.md-file-link');
+    if (!a || !container.contains(a) || !a.dataset.file) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (a.dataset.dir && typeof openExplore === 'function') {
+      // Directory link -> the file explorer at that path (carry the session
+      // scope if we have one, so cwd-relative reads keep working).
+      const sess = (typeof _exploreSession !== 'undefined' && _exploreSession)
+        || (typeof peekSession !== 'undefined' && peekSession) || null;
+      openExplore(a.dataset.file, sess);
+    } else {
+      openFilePreview(a.dataset.file);
+    }
+  });
+}
+
+function renderMarkdown(raw, basePath) {
   if (!raw) return '';
   // Use marked.js for full GFM support (tables, task lists, strikethrough, etc.)
   if (typeof marked !== 'undefined') {
@@ -18380,6 +19104,28 @@ function renderMarkdown(raw) {
         const slug = text.replace(/<[^>]+>/g, '').toLowerCase().trim()
           .replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-');
         return '<h' + depth + ' id="' + slug + '">' + text + '</h' + depth + '>\n';
+      };
+      // A link to ANOTHER FILE opens IN the viewer (Ethan 2026-08-13: click a
+      // link in a .md and go to that file — the tubescience master absorption
+      // doc links to many files). Rendered as a data-attr link (onclick is
+      // stripped by DOMPurify); a delegated handler (_bindMdFileLinks) does the
+      // openFilePreview. External links keep normal behaviour (new tab), anchors
+      // stay in-page.
+      renderer.link = function({ href, title, tokens }) {
+        const text = this.parser.parseInline(tokens);
+        const target = _resolveFileLink(basePath, href);
+        if (target) {
+          // A trailing-slash link is a DIRECTORY -> open the explorer, not the
+          // file viewer (the tubescience doc links to `migration/` as well as
+          // files).
+          const isDir = (href || '').split('#')[0].split('?')[0].endsWith('/');
+          return '<a href="#" class="md-file-link" data-file="' + esc(target) + '"' +
+                 (isDir ? ' data-dir="1"' : '') + ' title="' + esc(target) + '">' + text + '</a>';
+        }
+        const isAnchor = (href || '').startsWith('#');
+        const tgt = (!isAnchor && /^https?:/i.test(href || '')) ? ' target="_blank" rel="noopener"' : '';
+        const t = title ? ' title="' + esc(title) + '"' : '';
+        return '<a href="' + esc(href || '#') + '"' + tgt + t + '>' + text + '</a>';
       };
       let html = marked.parse(raw, { gfm: true, breaks: false, renderer });
       html = html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
@@ -18402,6 +19148,11 @@ function renderMarkdown(raw) {
     s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
     s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
     s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
+      const fileTarget = _resolveFileLink(basePath, url);
+      if (fileTarget) {
+        const isDir = url.split('#')[0].split('?')[0].endsWith('/');
+        return '<a href="#" class="md-file-link" data-file="' + esc(fileTarget) + '"' + (isDir ? ' data-dir="1"' : '') + ' title="' + esc(fileTarget) + '">' + text + '</a>';
+      }
       const safe = /^(https?:\/\/|\/|#)/.test(url) ? url : '#';
       const target = safe.startsWith('#') ? '' : ' target="_blank"';
       return '<a href="' + safe + '"' + target + '>' + text + '</a>';
@@ -18841,13 +19592,25 @@ function _bqIs(item, val, ix) {
                         && (!item.last_verified_at
                             || (Date.now()/1000 - item.last_verified_at) > 86400);
     case 'needsyou': return _bqIs(item, 'open', ix) && (
+                       // The CANONICAL status says exactly this ("stuck on the
+                       // user, with the exact question" — core's Doing->NeedsYou).
+                       // It was missing here, so a card parked by the documented
+                       // transition surfaced NOWHERE: the status also excludes it
+                       // from auto-pickup and from the advance path, and the 3-day
+                       // re-nag JOINs issue_tags, so nothing handed it out and
+                       // nothing brought it back. Measured 2026-08-11: 23 of 38
+                       // open needsyou cards were invisible to this view, incl.
+                       // four SLA breaches aged 127-194h. The server now stamps
+                       // the tag on the transition too; this arm is what surfaces
+                       // the ones already sitting in that state, without a sweep.
+                       st === 'needsyou'
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
                        // owner:human card, which is the standing backlog and
                        // floods the queue (306 -> the real blocked set). Own
                        // filed work lives in the Mine view; needs-you is only
                        // what is actively stopped ON you.
-                       (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
+                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
                        || (!!sess && (sess.status === 'waiting'
                                       || !!sess.credit_limited || !!sess.rate_limited_until)));
     case 'offline':  return !!item.session && (!sess || !sess.running);
@@ -18855,7 +19618,13 @@ function _bqIs(item, val, ix) {
     case 'archived': return !!item.archived;
     case 'pinned':   return !!item.pinned;
     case 'overdue':  return !!item.due && (item.due * (item.due > 1e11 ? 0.001 : 1)) < Date.now() / 1000;
-    case 'folded':   return (((item.desc || '') + '\n' + (item.log || '')).match(/New task:/g) || []).length > 0;
+    // folded_n is the slim counterpart; under slim desc AND log are absent, so
+    // the local count is 0 for every card and `is:folded` would quietly select
+    // nothing — a filter that matches nothing looks identical to a board with
+    // no folded cards (AMUX-2840 consumer sweep).
+    case 'folded':   return item.folded_n !== undefined
+                            ? item.folded_n > 0
+                            : (((item.desc || '') + '\n' + (item.log || '')).match(/New task:/g) || []).length > 0;
     default:         return false;
   }
 }
@@ -19078,11 +19847,56 @@ function _bfOpenMenu(ev, target) {
   setTimeout(() => document.addEventListener('click', _bfOutside, true), 0);
 }
 
+// FREE-TEXT SEARCH NEEDS desc AND log, WHICH slim=1 DOES NOT SHIP (AMUX-2840
+// step 2). The card's plan was to move this to /api/search. Measured
+// 2026-08-11, that endpoint is not a substitute for THIS matcher:
+//
+//   query    /api/search   this matcher
+//   ansi              4              60   FTS tokenises, so it misses the
+//                                         intra-word substrings a person
+//                                         actually types (ansiToHtml)
+//   nudge           348              67   different corpus/semantics entirely
+//   sw-fail           2               2   agree
+//
+// and it is paginated (20 of 348 returned), so a board view cannot be filtered
+// from its results without paging the whole corpus. Swapping it in would have
+// silently changed what the board's primary surface finds, in both directions.
+//
+// So: keep this matcher authoritative and byte-identical, and pay for desc/log
+// ONLY while a text query is active. The poll — the thing that runs every few
+// seconds forever — stays slim; a search costs one full fetch, cached. That
+// inverts the cost onto the rare action instead of the constant one.
+//
+// INERT until the poll actually flips to slim: if the loaded items already
+// carry desc, nothing here fires.
+let _bqFullAt = 0;
+let _bqFullPending = false;
+function _bqEnsureFullText(items) {
+  if (!items.length || items[0].desc !== undefined) return;   // not slim — nothing to do
+  if (_bqFullPending || Date.now() - _bqFullAt < 60000) return;
+  _bqFullPending = true;
+  fetch(API + '/api/board?archived=0')
+    .then(r => (r.ok ? r.json() : null))
+    .then(full => {
+      if (!Array.isArray(full)) return;
+      const by = new Map(full.map(i => [i.id, i]));
+      boardItems.forEach(i => {
+        const f = by.get(i.id);
+        if (f) { i.desc = f.desc; i.log = f.log; i.gate_note = f.gate_note; }
+      });
+      _bqFullAt = Date.now();
+      renderBoard();
+    })
+    .catch(() => {})
+    .finally(() => { _bqFullPending = false; });
+}
+
 function _bqFilter(items, q) {
   const s = (q || '').trim();
   if (!s) return items;
   const ast = _bqParse(s);
   if (!ast.terms.length && !ast.text.length) return items;
+  if (ast.text.length) _bqEnsureFullText(items);
   const ix = _bqSessionIndex();
   const out = items.filter(i => _bqMatch(i, ast, ix));
   // If the query names a card exactly, that card goes first. Searching an id
@@ -19217,13 +20031,25 @@ function _focusRebuild() {
 // The card's ASK: an explicit NEEDS-YOU marker line in the log wins; else the
 // first line of desc; else the title. Never guesses beyond the marker.
 function _focusAsk(item) {
+  // PREFER THE SERVER'S DERIVATION (AMUX-2840 step 3). Under slim=1 the list
+  // carries neither desc nor log, so the local scan below has nothing to read
+  // and every card would fall through to its title — the marker would appear
+  // to stop working the moment the poll flips, with no error anywhere.
+  //
+  // needsyou_note is derived server-side from the SAME haystack (desc + log)
+  // with the same last-wins rule and, as of 2026-08-11, the same nine
+  // spellings; a test pins that the two accept the same set, because a view
+  // and the mechanism it describes must share a predicate or they drift.
+  if (item.needsyou_note) return String(item.needsyou_note).slice(0, 400);
   // The explicit ask wins wherever it lives (desc or log) — take the LAST
   // NEEDS-YOU marker so a re-marked card shows its freshest question. Only
   // then fall back to the desc's first meaningful line, then the title.
   const hay = (item.desc || '') + '\n' + (item.log || '');
   const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|ETHAN|HUMAN):\s*([^\n]+)/ig)];
   if (ms.length) return ms[ms.length - 1][1].trim().slice(0, 400);
-  const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim());
+  // desc_head is the slim counterpart of "first meaningful line of desc".
+  const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim())
+            || (item.desc_head || '').replace(/^\*\*Prompt:\*\*\s*/i, '');
   return (d || item.title || '').slice(0, 400);
 }
 function _focusClose() {
@@ -19477,7 +20303,12 @@ function _issueRowHTML(item, opts) {
 
 function _renderBoardCard(item) {
   const groups = item.tags || [];
-  const firstLine = (item.desc || '').split('\n')[0].slice(0, 80);
+  // desc_head is the same first-line derivation, computed server-side, and it
+  // is ALL slim ships of the description. Without this the card preview goes
+  // blank for every card the moment the poll flips — the exact regression
+  // list_body's own doc records from the last slimming attempt.
+  const firstLine = (item.desc !== undefined ? item.desc : (item.desc_head || ''))
+                      .split('\n')[0].slice(0, 80);
   const pinned = item.pinned ? 1 : 0;
   // LIVE emphasis: this card is what its owning session is working on right now
   // (item in doing + that session's terminal is actively generating).
@@ -19501,7 +20332,7 @@ function _renderBoardCard(item) {
   // card with nothing highlighted and no visible reason for being in the
   // results. Same class as the peek-board wrong-query bug: the filter was
   // right and the feedback was missing.
-  if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + ((item.desc || '').length > 80 ? '\u2026' : '') + '</div>';
+  if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + (((item.desc !== undefined ? item.desc.length : (item.desc_len || 0)) > 80) ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
   if (boardViewMode !== 'worker' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
   if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + esc(item.shepherd) + '</span>';
@@ -19666,6 +20497,9 @@ function _renderBoardColumnsInto(host, items, scope) {
       html += '<button class="board-col-collapse" onclick="toggleColCollapse(\'' + st + '\')" title="' + (collapsed ? 'Expand' : 'Collapse') + '">' + (collapsed ? '&#x25B8;' : '&#x25BE;') + '</button>';
     }
     html += '<span style="color:' + sty.color + '">' + esc(stObj.label) + '</span>';
+    if (stObj.terminal) {
+      html += '<span class="col-terminal-chip" title="Terminal state — cards here are finished">terminal</span>';
+    }
     if (stObj.stray) {
       html += '<span class="col-stray-flag" title="Cards carry the status &quot;' + esc(st)
         + '&quot; but the board has no column for it. They used to display as To Do. '
@@ -19865,7 +20699,7 @@ function _boardEnsureFull() {
   fetch(API + '/api/board?done_limit=0', { headers: _authHeaders() })
     .then(r => r.json())
     .then(d => {
-      if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); }
+      if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); _nudgeWorkersOnBoardChange(); }
     })
     .catch(() => {})
     .finally(() => { _boardFullLoading = false; });
@@ -20453,10 +21287,56 @@ function _boardDraftsPersist() {
   try { localStorage.setItem('amux_board_drafts', JSON.stringify(_boardDrafts)); } catch (e) {}
 }
 
+// Set false on every open, true once GET /api/board/<id> has filled desc/log.
+// The SAVE path refuses to write a desc while this is false and the card is
+// known to have one — see the guard in the save handler (AMUX-2840).
+let _bdHydrated = false;
+
+/// Fetch the authoritative card and fill desc/log, WITHOUT clobbering anything
+/// the user has typed.
+///
+/// The modal has always read desc off the LIST item. That is stale by however
+/// long the poll interval is, and under `slim=1` (which the poll is moving to,
+/// 3.5MB -> 554KB) it is absent entirely — so the textarea would open empty and
+/// saving would BLANK the description. This makes the modal read from the one
+/// place that always has it.
+async function _bdHydrate(id) {
+  try {
+    const r = await apiCall(API + '/api/board/' + id);
+    if (!r || !r.ok) return;
+    const full = await r.json();
+    if (!full || full.id !== id || boardDetailId !== id) return;  // modal moved on
+    const idx = boardItems.findIndex(i => i.id === id);
+    if (idx >= 0) boardItems[idx] = Object.assign({}, boardItems[idx], full);
+    if (_boardDrafts[id]) { _bdHydrated = true; return; }  // user's draft wins
+    const d = document.getElementById('bd-desc');
+    // Only fill if the user has not started typing into it.
+    if (d && (d.value === '' || d.value === (full.desc || ''))) d.value = full.desc || '';
+    const l = document.getElementById('bd-log');
+    if (l && full.log !== undefined) l.textContent = full.log || '';
+    // RE-RENDER THE HISTORY TAB with the hydrated record. It was rendered at
+    // open time from the LIST item, and under slim that item carries no `log`
+    // — so the tab would show an empty history and a 0 count for every card,
+    // which reads as "nothing ever happened here" rather than as still
+    // loading. Same class as the blank desc, one surface over.
+    if (boardDetailId === id) {
+      const merged = idx >= 0 ? boardItems[idx] : full;
+      _bdRenderHistory(merged);
+      if (typeof _bdRenderStatusBanner === 'function') _bdRenderStatusBanner(merged);
+    }
+    _bdHydrated = true;
+  } catch (e) { /* leave unhydrated; the save guard covers it */ }
+}
+
 function openBoardDetail(id) {
   const item = boardItems.find(i => i.id === id);
   if (!item) return;
   boardDetailId = id;
+  // Render instantly from cache, then correct it from the server. Blocking the
+  // modal on a fetch would make every card open feel slow for a field most
+  // opens never edit.
+  _bdHydrated = (item.desc !== undefined);
+  _bdHydrate(id);
   const draft = _boardDrafts[id];
   boardDetailStatus = draft ? draft.status : (item.status || 'todo');
   const titleEl = document.getElementById('bd-title');
@@ -20698,6 +21578,33 @@ async function boardDetailSave() {
   const title = document.getElementById('bd-title').value.trim();
   if (!title) return;
   const desc = document.getElementById('bd-desc').value.trim();
+
+  // NEVER WRITE AN EMPTY DESC OVER A CARD THAT HAS ONE (AMUX-2840).
+  //
+  // The modal used to fill this textarea from the LIST item. Once the poll
+  // moves to `slim=1` the list carries no desc, so the box would open empty and
+  // this save would blank the card — silently, irreversibly, and it would look
+  // like the board eating people's notes. _bdHydrate normally beats the user to
+  // it, but a slow or failed fetch must not turn into data loss.
+  //
+  // BOTH TERMS BELOW ARE LOAD-BEARING, one per mode, and neither alone is
+  // enough. Measured 2026-08-11: `desc_len` is served ONLY under slim=1, and
+  // `desc` only WITHOUT it — this comment previously claimed desc_len was in
+  // both, which would invite someone to simplify the test down to desc_len and
+  // silently disarm it in full mode, today's default. The failure that follows
+  // is not a crash, it is a blanked description.
+  //
+  // If either says the card has a description and we are about to send an empty
+  // one without having hydrated, refuse and retry the fetch.
+  {
+    const cur = boardItems.find(i => i.id === boardDetailId);
+    const hadDesc = cur && ((cur.desc_len || 0) > 0 || (cur.desc || '').length > 0);
+    if (!_bdHydrated && !desc && hadDesc) {
+      showToast && showToast('Still loading this card — not saving yet');
+      _bdHydrate(boardDetailId);
+      return;
+    }
+  }
   const sel = document.getElementById('bd-session');
   const worker = sel ? sel.value : undefined;
   const gateEl = document.getElementById('bd-gate');
@@ -22452,7 +23359,10 @@ function _cacheBoardJSON(j) {
         id: i.id, title: i.title, status: i.status, session: i.session,
         type: i.type, owner_type: i.owner_type, archived: i.archived,
         updated: i.updated, tags: i.tags, groups: i.groups,
-        desc_len: (i.desc || '').length,
+        // Prefer the SERVED desc_len: under slim there is no desc to measure,
+        // and recomputing would cache 0 for every card — which the save guard
+        // reads as "this card has no description" and would stop protecting.
+        desc_len: (i.desc_len !== undefined ? i.desc_len : (i.desc || '').length),
       })));
     } catch (e) { /* unparseable — fall back to storing what we were given */ }
     localStorage.setItem('amux_board_cache', slim);
@@ -22646,6 +23556,8 @@ _offlineCapLoad().catch(() => {});
 _idb.pruneFiles(_FILE_CACHE_TTL_MS).then(n => {
   if (n) console.log('[files] evicted ' + n + ' offline file(s) not opened in 30 days');
 });
+// Read-alouds flush at 30 days (Ethan) + prime the index/badge.
+_raPrune().then(() => { _raLoadIndex().then(_raUpdateBadge); });
 
 // IDB fallback: restore statuses from IndexedDB (preserves column order across reloads)
 _idb.getAll('statuses').then(items => {
@@ -22795,6 +23707,7 @@ function connectSSE() {
           _idb.set('last_sync_ts', Math.floor(Date.now() / 1000));
           if (activeView === 'board') renderBoard();
           else if (activeView === 'calendar') renderCalendar();
+          _nudgeWorkersOnBoardChange();
         }
       } else if (msg.type === 'logs') {
         // Always accumulate log events even when tab is not active
@@ -23007,8 +23920,37 @@ async function _swOfferGoodOrigin() {
     + (good && good !== here
         ? '<button onclick="location.href=' + JSON.stringify(good) + '" style="flex-shrink:0;min-height:44px;padding:0 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.5);background:transparent;color:#fff;font-weight:600;cursor:pointer;">Open</button>'
         : '')
-    + '<button onclick="this.parentNode.remove()" style="flex-shrink:0;min-height:44px;min-width:44px;border:none;background:transparent;color:#fff;font-size:1.1rem;cursor:pointer;">&#215;</button>';
-  const attach = () => document.body && document.body.appendChild(bar);
+    + '<button onclick="window._swFailDismiss&&window._swFailDismiss()" style="flex-shrink:0;min-height:44px;min-width:44px;border:none;background:transparent;color:#fff;font-size:1.1rem;cursor:pointer;">&#215;</button>';
+  // PUBLISH THE BAR'S HEIGHT so overlays can clear it (AMUX-2584).
+  //
+  // The bar is position:fixed bottom:0 at z-index 9999; .board-edit-overlay is
+  // 600. So it lands ON TOP of the modal, and the modal's Save/Cancel row is
+  // `position:sticky; bottom:0` INSIDE the box — i.e. pinned to exactly the
+  // strip the bar occupies. At 375px the bar wraps to three or four lines and
+  // swallows the whole action row: the modal opens, looks fine, and Save cannot
+  // be tapped. Raising the modal's z-index would be wrong — the bar says
+  // offline mode is off, which the user needs to keep seeing.
+  //
+  // A CSS variable rather than a fixed offset because the height is not
+  // knowable up front: it depends on which of the two messages is shown, on
+  // whether the Open button is present, on the wrap at this width, and on
+  // env(safe-area-inset-bottom). Measured after attach, so it is the real one.
+  const publishHeight = () => {
+    const h = bar.offsetHeight || 0;
+    document.documentElement.style.setProperty('--sw-fail-h', h + 'px');
+  };
+  window._swFailDismiss = () => {
+    bar.remove();
+    document.documentElement.style.setProperty('--sw-fail-h', '0px');
+  };
+  const attach = () => {
+    if (!document.body) return;
+    document.body.appendChild(bar);
+    publishHeight();
+    // Re-measure on rotate/resize: the message re-wraps and the height changes.
+    if (window.ResizeObserver) new ResizeObserver(publishHeight).observe(bar);
+    else window.addEventListener('resize', publishHeight);
+  };
   if (document.body) attach(); else document.addEventListener('DOMContentLoaded', attach);
 }
 
@@ -24250,7 +25192,15 @@ async function loadApiKeys() {
     const st = document.getElementById('settings-apikey-status');
     if (!inp) return;
     inp.placeholder = data.ANTHROPIC_API_KEY ? data.ANTHROPIC_API_KEY : 'sk-ant-...';
-    inp.value = '';
+    // Never clear a NON-EMPTY input: this callback is async and can land
+    // AFTER someone started typing into the field — the unconditional
+    // `inp.value = ''` here wiped the entry mid-flight, and Save then hit
+    // its empty-value early return as a silent no-op. That was the
+    // settings_api_key_anthropic CI flake (6/8 runs: fill won the race on a
+    // loaded runner, the refresh wiped it, waitForResponse hung 60s) and is
+    // the same bug a fast human hits as "my key vanished while I typed".
+    // The one writer that needs the field cleared — saveApiKey after a
+    // successful PATCH — clears it itself before calling us.
     if (st) st.textContent = data.ANTHROPIC_API_KEY ? 'Key saved ✓' : 'No key set';
   } catch(e) {}
 }
@@ -24259,7 +25209,14 @@ async function saveApiKey() {
   const inp = document.getElementById('settings-anthropic-key');
   const st = document.getElementById('settings-apikey-status');
   const val = inp ? inp.value.trim() : '';
-  if (!val) return;
+  if (!val) {
+    // Say so instead of silently no-oping: when the refresh race above wiped
+    // the field, Save "doing nothing" was indistinguishable from Save being
+    // broken — the e2e's only symptom was a 60s network wait on a request
+    // that was never sent.
+    if (st) st.textContent = 'Enter a key first';
+    return;
+  }
   st && (st.textContent = 'Saving…');
   try {
     const r = await fetch('/api/settings/env', {method:'PATCH', headers:{'Content-Type':'application/json'},
@@ -25431,9 +26388,21 @@ function _costRender(d, opts) {
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
     <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
     <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
+    ${d.delegated_turns ? `<div class="cost-card" title="Subagent turns, charged to the lane that delegated them. Counted since 2026-08-11 (AMUX-2894) \u2014 before that they were invisible, so a lane that delegates looked cheaper than one working inline."><div class="cost-card-v">${_fmtUsd(d.delegated_cost)}</div><div class="cost-card-l">of which delegated</div></div>` : ''}
   </div>`;
+  // The ledger's own freshness, not this slice's. A rollup over a STALE ledger
+  // renders perfectly and shows small numbers, and small is indistinguishable
+  // from quiet — which is exactly how token_ledger sat 36h dead behind a
+  // confident zero (AMUX-2892). Say it where the numbers are read.
+  const staleS = d.ledger_stale_s;
+  const staleBanner = (typeof staleS === 'number' && staleS > 3600)
+    ? `<div style="margin:0 0 10px;padding:8px 10px;border:1px solid var(--red);border-radius:8px;font-size:0.78rem;color:var(--red);">
+         These figures stop ${staleS >= 86400 ? Math.round(staleS/86400) + 'd' : Math.round(staleS/3600) + 'h'} ago \u2014 the token-ledger indexer has not run since.
+         <span style="color:var(--dim);">Everything below is real but INCOMPLETE; check the token-ledger job.</span>
+       </div>`
+    : '';
   const sec = (title, body) => `<div class="cost-section"><div class="cost-section-h">${title}</div>${body}</div>`;
-  let html = cards;
+  let html = staleBanner + cards;
   html += sec('By task', _costBars(d.by_task, 'title', { limit: 20, emptyLabel: 'Ambient (untasked)' }));
   if (!opts.perSession) html += sec('By worker', _costBars(d.by_session, 'session', { limit: 20, onSession: true, emptyLabel: '(ad-hoc)' }));
   html += sec('By model', _costBars(d.by_model, 'model', { limit: 8 }));
@@ -26746,7 +27715,13 @@ function _msgsFmtTs(ts) {
 function _msgLocate(session, encText) {
   if (!session) { showToast('No worker recorded for this message'); return; }
   const text = decodeURIComponent(encText);
-  const snippet = (text.split('\n')[0] || '').slice(0, 32).trim();
+  // FIRST NON-EMPTY line, not line[0]. A message that opens with a blank line
+  // yielded an empty query, and openPeek treats an empty query as "no search" —
+  // so Find silently did nothing and looked like the message was not in the
+  // log. A locate that no-ops is worse than one that says it found nothing.
+  const line = text.split('\n').map(l => l.trim()).find(l => l.length > 0) || '';
+  const snippet = line.slice(0, 32);
+  if (!snippet) { showToast('Nothing searchable in this message'); return; }
   if (typeof closeCmdHistoryModal === 'function') closeCmdHistoryModal();
   openPeek(session, { query: snippet });
 }
@@ -27357,8 +28332,15 @@ const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="1
 
 // The CRM / People view was removed (AMUX-2590, Ethan 2026-08-09): its tab,
 // markup, styles and every _crm* function are gone from this client. The
-// /api/crm endpoints still exist for agents; the serve-time AMUX-FEATURE-FLAGS
-// CSS in static_files.rs stays as the one greppable line to reverse.
+// serve-time AMUX-FEATURE-FLAGS CSS in static_files.rs stays as the one
+// greppable line to reverse.
+//
+// This comment used to add "the /api/crm endpoints still exist for agents".
+// That was FALSE when written: the routes went with the python server at
+// 792ce1f, so POST /api/crm/contacts answered 405 and GET /api/crm answered
+// 404, while 308 contacts sat in the tables migrations kept maintaining. It is
+// true now only because AMUX-2929 ported them back — the comment was a claim
+// about another file, and nothing checks those (ethos rule 6).
 
 // ── Gmail Inbox tab ────────────────────────────────────────────────────────────
 let _gmailAccounts = [];

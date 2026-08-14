@@ -1,7 +1,7 @@
 //! /api/scope — NATIVE port of the uniform scope contract (AMUX-2608: the
 //! LAST `PROXIED_FAMILIES` row; its retirement empties the registry).
 //!
-//! Python source of record (amux-server.py, checked 2026-08-09):
+//! Ported from the deleted Python server (historical amux-server.py, deleted at 792ce1f; line refs are into git history):
 //! - descriptors: `_SCOPE_CAPS` (py:16076) — one row per scopable capability
 //!   (memory/rules/env/gates/status_mode), each naming its storage, its
 //!   settable levels and its OWN precedence order. The UI renders one widget

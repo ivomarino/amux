@@ -681,6 +681,48 @@ async fn circular_depends_on_is_rejected_with_the_cycle_path() {
 // ---- no-op PATCH: applied:false, rev unmoved (Invariant 37) --------------
 
 #[tokio::test]
+async fn a_card_is_assigned_to_an_epic_and_can_be_cleared() {
+    // AMUX-2992: epic = a type=epic card, children link up via the epic field.
+    let (app, _dir) = app();
+    let epic = create(&app, json!({ "title": "TubeScience search reliability", "type": "epic" })).await;
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    assert_eq!(epic["type"], json!("epic"), "epic is a real card type now");
+
+    let child = create(&app, json!({ "title": "fix unsearchable docs" })).await;
+    let child_id = child["id"].as_str().unwrap().to_string();
+
+    // Assign the child to the epic. `epic` must be a WRITABLE field, not ignored.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{child_id}"),
+        Some(json!({ "epic": epic_id })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["applied"], json!(true));
+    let ignored = v["ignored_fields"].as_array().cloned().unwrap_or_default();
+    assert!(!ignored.contains(&json!("epic")), "epic must be writable, not ignored: {v}");
+
+    // It rolls up: the child's detail carries the epic id.
+    let (st, _, detail) = send(&app, "GET", &format!("/api/board/{child_id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["epic"], json!(epic_id), "child must report its epic: {detail}");
+
+    // Clearing it (empty string) removes the link.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{child_id}"),
+        Some(json!({ "epic": "" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{child_id}"), None).await;
+    assert!(detail["epic"].is_null(), "cleared epic must read null: {detail}");
+}
+
+#[tokio::test]
 async fn noop_patch_reports_applied_false_and_moves_nothing() {
     let (app, _dir) = app();
     let card = create(&app, json!({ "title": "steady", "desc": "d" })).await;

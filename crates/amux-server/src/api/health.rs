@@ -35,6 +35,17 @@ pub struct Health {
     /// server can still say it. `None` when unmeasurable, which is honestly
     /// different from zero.
     pub fds: Option<FdHealth>,
+    /// Invariant-monitor confidence (AMUX-2625): healthy | degraded | unknown |
+    /// unhealthy, from the last monitor roll-up. `unknown` when the monitor has
+    /// not run yet OR its evidence is stale — the four states this card is
+    /// about, on the endpoint every consumer already polls. Separate from
+    /// `status` on purpose: `status` gates request health (store/fds), this
+    /// carries the fleet-invariant verdict, and one must not mask the other.
+    pub confidence: &'static str,
+    /// Age of the evidence behind `confidence`, seconds. `None` if the monitor
+    /// has never recorded a verdict. A growing age with `confidence:unknown` is
+    /// a wedged monitor — visible instead of a frozen `healthy`.
+    pub confidence_age_s: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +96,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
     // on a warning. `status` is the field that carries the warning; `store` is
     // the one that gates the code.
     let fd_tight = fds.as_ref().is_some_and(|f| f.ratio >= fd_ceiling());
+    // Cheap read of the monitor's last cached verdict — no DB, no re-run, and
+    // correct (unknown) even if the monitor is dead (AMUX-2625).
+    let (conf, conf_age) =
+        crate::invariants::health_confidence(chrono::Utc::now().timestamp() as f64);
     (
         code,
         Json(Health {
@@ -102,6 +117,8 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             pid: std::process::id(),
             server: "amux-rust",
             fds,
+            confidence: conf.as_str(),
+            confidence_age_s: conf_age,
         }),
     )
 }

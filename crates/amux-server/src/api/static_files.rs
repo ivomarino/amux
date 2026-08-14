@@ -54,6 +54,19 @@ fn ical_subscribe_url() -> String {
     )
 }
 
+/// The SPA catch-all. **This `/{*path}` route out-competes a NESTED router's
+/// `.fallback()` in the full app composition** — a lesson that cost two live
+/// incidents and is recorded here, at the catch-all itself, because it stays
+/// true for anything mounted alongside it.
+///
+/// A nested router that handles its unmatched paths via `.fallback()` will
+/// silently serve index.html instead: that is how the SPA's group picker broke
+/// (AMUX-2594) and how an auth probe was misled into reporting an
+/// unauthenticated 200 on /api/fs. Any router that must answer arbitrary
+/// sub-paths needs EXPLICIT `/` + `/{*rest}` routes, not a fallback.
+///
+/// (Carried over from py_proxy's passthrough router, whose forwarder was
+/// deleted in AMUX-2906 — the code went, the hazard did not.)
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(index))

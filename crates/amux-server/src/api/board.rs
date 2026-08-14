@@ -60,6 +60,10 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}", get(get_item).patch(patch_item).delete(delete_item))
         .route("/{id}/archive", post(archive_item))
         .route("/{id}/restore", post(restore_item))
+        // The D1-exit pair — see the handlers below for why their 405 was the
+        // most expensive shape available.
+        .route("/{id}/status-request", post(status_request))
+        .route("/{id}/status-update", post(status_update))
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
@@ -91,6 +95,65 @@ async fn get_contract() -> Response {
             "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
             "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
             "wrong_type": "If the item has no code, set its type first — the gate is DERIVED from the type.",
+        },
+        // AMUX-2933 (ts-gke). The list filters WORK and were documented
+        // NOWHERE — "discoverable only by guessing", and the cap was worse than
+        // undocumented: silent. A lane auditing its own board got the 100
+        // most-recent terminal rows fleet-wide and no signal that it was a
+        // sample, so `GET /api/board` could return FEWER of its done cards than
+        // `?session=<lane>` did. That reads as data, not as truncation.
+        "list": {
+            "endpoint": "GET /api/board",
+            "returns": "a bare JSON array of items (NOT an envelope) — kept that way \
+                        because every caller and the SPA index it directly",
+            "filters": {
+                "session": "comma-separated worker names",
+                "status": "comma-separated statuses",
+                "archived": "absent/\"\" = no filter · 1|true|yes = archived ONLY · \
+                             any other value (0, false, …) = non-archived only",
+                "done_limit": "cap on TERMINAL items (done/verified/discarded), keeping the \
+                               most recently updated. 0 or negative = uncapped",
+                "limit": "page size, applied AFTER done_limit",
+                "offset": "page offset",
+                "slim": "1 = trimmed item bodies",
+            },
+            "not_a_filter": {
+                "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
+                                       return the entire board. Use /api/search?q=",
+            },
+            "terminal_cap": {
+                "default_unscoped": 100,
+                "default_scoped": 0,
+                "scoped_means": "session= or status= is present — a bounded QUESTION is answered \
+                                 in full; only the unbounded list is sampled",
+                "why": "the unfiltered board is ~4.5MB at a cap of 100 and ~19.8MB uncapped \
+                        (1186 vs 5576 items, measured 2026-08-11). amux is mobile-first, so the \
+                        default stays capped — the defect was never the cap, it was the silence",
+                "detect_truncation": "response headers x-amux-truncated (1|0), \
+                                      x-amux-terminal-total, x-amux-terminal-returned, \
+                                      x-amux-done-limit",
+                "to_get_everything": "?done_limit=0 (or scope the query with session=/status=)",
+                // CORRECTED by ts-gke's reconciliation, 2026-08-11. The first
+                // version of this line said `?session=<worker>` full stop, and
+                // that is the query for "everything I own" — NOT for "what do I
+                // still have to act on". Their three counts, all correct once
+                // understood: bare list 8 (capped), ?session&status=done 101,
+                // the same +archived=0 → 59. The 42-card difference is archived
+                // cards, which are TERMINAL AND IMMUTABLE — a status PATCH on
+                // one is refused with `archived_task_immutable`
+                // ("task is archived; restore it first", amux-core/src/board.rs).
+                // So an audit built on 101 counts 42 cards nobody can act on,
+                // and the auto-continue nudge that said 60 was right the whole
+                // time: it counts the actionable set.
+                "auditing_your_own_cards": "GET /api/board?session=<worker>&status=done&archived=0 \
+                                            — scoped queries are uncapped, and archived=0 drops \
+                                            cards that are terminal AND immutable (a status PATCH \
+                                            on an archived card is refused with \
+                                            archived_task_immutable). Dropping archived=0 answers \
+                                            'everything I own', which is a different question and \
+                                            the one that inflates a verification backlog. The bare \
+                                            list answers neither.",
+            },
         },
     }))
     .into_response()
@@ -134,7 +197,8 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
                     .and_then(|g| serde_json::from_str(g).ok())
                     .unwrap_or_else(|| json!([]));
                 let mode = mode.filter(|m| !m.is_empty()).unwrap_or_else(|| "implicit".into());
-                out.push(json!({ "id": id, "label": label, "mode": mode, "gate": gate }));
+                let terminal = matches!(id.as_str(), "verified" | "discarded");
+                out.push(json!({ "id": id, "label": label, "mode": mode, "gate": gate, "terminal": terminal }));
             }
         }
     }
@@ -143,7 +207,10 @@ async fn list_statuses(State(state): State<AppState>) -> Response {
         // mode/gate keys on defaults — the SPA tolerates their absence.
         out = DEFAULTS
             .iter()
-            .map(|(id, label)| json!({ "id": id, "label": label }))
+            .map(|(id, label)| {
+                let terminal = matches!(*id, "verified" | "discarded");
+                json!({ "id": id, "label": label, "terminal": terminal })
+            })
             .collect();
     }
     Json(Value::Array(out)).into_response()
@@ -563,12 +630,7 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    err(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({ "error": e.to_string() }),
-    )
-}
+use super::internal;
 
 fn not_found(id: &str) -> Response {
     err(
@@ -699,25 +761,87 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
             .map(|l| l.lines().filter(|x| !x.trim().is_empty()).count())
             .unwrap_or(0);
         obj.insert("log_n".into(), json!(log_n));
+
+        // SHIP THE DERIVED FACTS, NOT THE RAW FIELDS (AMUX-2840).
+        //
+        // The comment above records that an earlier slimming attempt "silently
+        // blanked both in the dashboard", because the SPA reads `desc` and
+        // `log` straight off the LIST payload. It does — but not for their
+        // content. It needs exactly two things from them in a list:
+        //   app.js:19488  the first line of desc, as the card preview
+        //   app.js:18866  whether desc+log contain "New task:", for the folded badge
+        // Both are tiny derivations over fields that together are 81% of a
+        // 4.7MB response. Computing them here costs bytes in the low hundreds
+        // and lets the client stop carrying 3.5MB of prose it never renders.
+        //
+        // Full-text SEARCH is the third consumer and is deliberately NOT served
+        // here: /api/search already indexes these cards and returns ranked hits
+        // with snippets, so shipping every desc to re-implement it client-side
+        // is duplicated work in the expensive direction.
+        let head: String = row
+            .desc
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        obj.insert("desc_head".into(), json!(head));
+        let folded_n = row.desc.matches("New task:").count()
+            + row.log.as_deref().map(|l| l.matches("New task:").count()).unwrap_or(0);
+        obj.insert("folded_n".into(), json!(folded_n));
+
+        // The third derivation the list makes over desc+log (app.js:19231): the
+        // LAST "NEEDS-YOU:" marker, which is what a card shows when it is
+        // waiting on a human. Last rather than first — a re-marked card should
+        // show its freshest question, which is the client's own rule.
+        let ny = {
+            let hay = format!("{}\n{}", row.desc, row.log.as_deref().unwrap_or(""));
+            let mut found: Option<String> = None;
+            for line in hay.lines() {
+                let l = line.trim();
+                let low = l.to_lowercase();
+                // EVERY SPELLING THE CLIENT REGEX ACCEPTS, or the two disagree
+                // about the same card. app.js's _focusAsk uses
+                // /NEEDS[- ]?(?:YOU|ETHAN|HUMAN):/i, which admits the space and
+                // no-separator forms for ETHAN and HUMAN too — this list had
+                // only the hyphenated ones, so a card marked "NEEDS ETHAN:"
+                // produced a note in the client and none here. Under slim the
+                // client reads THIS field, so the divergence would have shown
+                // up as the marker silently ceasing to work for those spellings
+                // the moment the poll flipped.
+                for m in [
+                    "needs-you:", "needs you:", "needsyou:",
+                    "needs-ethan:", "needs ethan:", "needsethan:",
+                    "needs-human:", "needs human:", "needshuman:",
+                ] {
+                    if let Some(p) = low.find(m) {
+                        let v = l[p + m.len()..].trim();
+                        if !v.is_empty() {
+                            found = Some(v.chars().take(400).collect());
+                        }
+                    }
+                }
+            }
+            found
+        };
+        if let Some(n) = ny {
+            obj.insert("needsyou_note".into(), json!(n));
+        }
+
+        // Detail-only fields the list never renders. The SPA fetches the
+        // full card on demand when the detail panel opens, so these are
+        // pure payload waste on the list/SSE path. Keeps depends_on
+        // (is:blocked filter) and folded_n (is:folded filter).
+        for k in ["source_ref", "last_verified_at", "reviewer", "due_time", "gate"] {
+            obj.remove(k);
+        }
     }
     if stale {
         obj.insert("stale".into(), json!(true));
     }
     v
-}
-
-/// Python `_board_slim_desc` (amux-server.py:13958) — the SSE board channel
-/// ships the first desc line (200 chars) + `desc_truncated`; the full desc
-/// stays REST/detail-only. Applied by the SSE serializer, never the GET.
-pub fn apply_sse_desc_slim(v: &mut Value, desc: &str) {
-    if desc.chars().count() <= 200 {
-        return;
-    }
-    let first: String = desc.split('\n').next().unwrap_or("").chars().take(200).collect();
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("desc".into(), json!(first));
-        obj.insert("desc_truncated".into(), json!(true));
-    }
 }
 
 /// Python `_board_item_stale` (amux-server.py:15671): an in-progress card
@@ -751,9 +875,80 @@ pub struct ListParams {
     pub done_limit: Option<i64>,
     #[serde(default)]
     pub slim: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    // SEARCH-INTENT PARAMS, RECOGNISED ONLY TO BE REFUSED (2026-08-11).
+    //
+    // axum drops unknown query params silently, so `/api/board?q=nudge`
+    // returned THE WHOLE BOARD — 1382 rows that look exactly like search
+    // results. That is the failure mode ethos rule 7 names: a filter that
+    // silently matches everything hands you a confident wrong answer instead of
+    // silence, and nothing about the response prompts a recheck.
+    //
+    // It cost a real one here: two different queries returned byte-identical
+    // lists, and only comparing them by accident revealed the param was inert.
+    // One query alone reads as "no such card exists" — which is how a duplicate
+    // gets filed against a board that already had the card.
+    //
+    // Not silently honoured either, because /api/search is the real one and it
+    // returns a different (ranked, typed) shape. Naming it in a 400 routes the
+    // caller to the working endpoint, the same way the gate 409 publishes its
+    // escape. Nothing in the SPA or CLI sends these — verified before making
+    // them loud — so this cannot break a client holding a stale service worker.
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
 }
 
-fn truthy(v: Option<&str>) -> bool {
+/// Query keys GET /api/board actually consumes. Anything else is dropped
+/// SILENTLY by axum's typed `Query<ListParams>` — which is how `?include_archived=1`
+/// or a mistyped filter returned the DEFAULT view served as if it answered the
+/// query (BACKE-3228; the ethos rule-7 class — a filter that never ran hands back
+/// a confident wrong answer). It bit three sessions: amux-cloud read 13 archived
+/// cards as 0, ts-gke brute-forced the id space, backend reported a working guard
+/// as broken. A blanket 400 on unknown params is unsafe (cache-busters like
+/// `?_=<ts>` are legitimate and any client may append them), so instead we NAME
+/// the ignored ones in a response header + a WARN — non-breaking, and it makes
+/// the silent drop impossible to miss the way `X-Amux-Done-Limit` already
+/// announces the terminal cap. (`q`/`query`/`search` are here because they are
+/// consumed above — refused with a 400 — so they are recognised, not ignored.)
+const RECOGNISED_BOARD_PARAMS: &[&str] = &[
+    "status", "session", "archived", "done_limit", "slim", "limit", "offset", "q", "query",
+    "search",
+];
+/// Cache-buster keys clients legitimately append; never a filter typo, so they
+/// are not surfaced as "ignored" (that would be pure noise on every polled tab).
+const BENIGN_QUERY_KEYS: &[&str] =
+    &["_", "t", "v", "ts", "cb", "_t", "cache", "cachebust", "nocache"];
+
+/// Query keys GET /api/board neither consumes nor treats as a benign
+/// cache-buster — the ones a caller thinks are filtering but that did nothing.
+/// Pure over the raw query so it is tested without an HTTP round-trip.
+fn ignored_board_params(raw_query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pair in raw_query.split('&') {
+        let key = pair.split('=').next().unwrap_or("").trim();
+        if key.is_empty() {
+            continue;
+        }
+        let k = key.to_ascii_lowercase();
+        if RECOGNISED_BOARD_PARAMS.contains(&k.as_str()) || BENIGN_QUERY_KEYS.contains(&k.as_str())
+        {
+            continue;
+        }
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(key)) {
+            out.push(key.to_string());
+        }
+    }
+    out
+}
+
+fn qp_truthy(v: Option<&str>) -> bool {
     // Python lowercases before the membership test (`.lower() in ("1",
     // "true","yes")`), so `slim=TRUE` counts.
     matches!(
@@ -768,7 +963,52 @@ fn truthy(v: Option<&str>) -> bool {
 /// `-Terminal-Returned`) — a silent cap manufactured wrong absence claims
 /// twice in one week (AC-291, AC-301), so the two counts come from
 /// `cap_terminal` itself, never re-derived from list lengths.
-pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
+pub async fn list_board(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    raw_query: axum::extract::RawQuery,
+    Query(p): Query<ListParams>,
+) -> Response {
+    // BACKE-3228: name query params we silently dropped, so a caller cannot draw
+    // an absence conclusion from a filter that never ran. Computed from the RAW
+    // query (typed ListParams cannot see keys it does not declare).
+    let ignored = raw_query.0.as_deref().map(ignored_board_params).unwrap_or_default();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            target: "board",
+            ignored = %ignored.join(","),
+            "GET /api/board ignored unrecognised query param(s) — caller may be reading a \
+             default view as a filtered answer (BACKE-3228)"
+        );
+    }
+    // ETag based on global_rev — saves 3.5MB on unchanged polls.
+    let rev = state.store.current_rev().map(|r| r.0).unwrap_or(0);
+    let etag_val = format!("\"board-{}\"", rev);
+    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+        if inm == etag_val || inm == format!("W/{etag_val}") {
+            let mut h = HeaderMap::new();
+            if let Ok(v) = etag_val.parse() {
+                h.insert("etag", v);
+            }
+            return (StatusCode::NOT_MODIFIED, h).into_response();
+        }
+    }
+
+    if let Some(term) = p.q.as_deref().or(p.query.as_deref()).or(p.search.as_deref()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": "/api/board does not search — it would have returned the ENTIRE board",
+                "you_sent": term,
+                "use_instead": format!("/api/search?q={term}"),
+                "why": "This param was silently ignored until 2026-08-11, so the full board came \
+                        back looking like ranked results. Refusing loudly beats answering wrongly.",
+                "board_filters": ["status", "session", "archived", "done_limit", "slim", "limit", "offset"],
+            })),
+        )
+            .into_response();
+    }
     let split = |s: &Option<String>| -> Vec<String> {
         s.as_deref()
             .unwrap_or("")
@@ -799,8 +1039,32 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
         Some(_) => ArchivedFilter::ActiveOnly,
     };
     // <=0 is uncapped inside cap_terminal, matching Python's `_cap_terminal`.
-    let done_limit = p.done_limit.unwrap_or(100);
-    let slim = truthy(p.slim.as_deref());
+    //
+    // A SCOPED QUERY IS NOT CAPPED BY DEFAULT (ts-gke, 2026-08-11).
+    //
+    // The cap exists so the UNFILTERED board payload stays renderable — the
+    // dashboard does not draw 1300 terminal cards. But `?session=X` or
+    // `?status=done` is a bounded QUESTION, and answering it with the 100
+    // most-recent terminal rows produces a confident wrong number with nothing
+    // in the body to say so.
+    //
+    // Measured on the report: ts-gke holds 174 terminal cards (94 done, 60
+    // verified, 20 discarded). Capping to the 100 most-recently-updated left 68
+    // that happened to be `done`, so `?session=ts-gke` answered 68 where the
+    // truth is 94 — and a digest built on it reported 25. Four cards named in
+    // that digest were absent from the list while GET /api/board/<id> returned
+    // them fine: same store, two endpoints, different answers.
+    //
+    // The truncation WAS reported, in x-amux-truncated / x-amux-terminal-total
+    // headers. That is ethos rule 4's second layer: a tag in a store the reader
+    // never opens is the same failure as no tag. Every consumer here reads
+    // `curl | json.load`, which sees a bare array and no headers at all.
+    //
+    // An explicit ?done_limit= still wins in both cases — a caller who asks for
+    // a bound gets exactly that.
+    let scoped = p.session.is_some() || p.status.is_some();
+    let done_limit = p.done_limit.unwrap_or(if scoped { 0 } else { 100 });
+    let slim = qp_truthy(p.slim.as_deref());
 
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -825,8 +1089,19 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
         Err(e) => return internal(e),
     };
     let (kept, term_total, term_kept) = bs::cap_terminal(rows, done_limit);
+    let total = kept.len();
     let now = now_secs();
-    let items: Vec<Value> = kept
+
+    let offset = p.offset.unwrap_or(0);
+    let page: &[bs::IssueRow] = if offset >= kept.len() {
+        &[]
+    } else if let Some(lim) = p.limit {
+        &kept[offset..(offset + lim).min(kept.len())]
+    } else {
+        &kept[offset..]
+    };
+
+    let items: Vec<Value> = page
         .iter()
         .map(|r| list_body(r, slim, is_stale(r, now, &working)))
         .collect();
@@ -849,6 +1124,15 @@ pub async fn list_board(State(state): State<AppState>, Query(p): Query<ListParam
         "x-amux-terminal-returned",
         term_kept.to_string(),
     );
+    put(&mut headers, "x-amux-total", total.to_string());
+    put(&mut headers, "x-amux-offset", offset.to_string());
+    put(&mut headers, "x-amux-returned", items.len().to_string());
+    // BACKE-3228: announce any query params we ignored, so a filter typo cannot
+    // masquerade as an empty/absent result. Non-breaking (informational header).
+    if !ignored.is_empty() {
+        put(&mut headers, "x-amux-params-ignored", ignored.join(","));
+    }
+    put(&mut headers, "etag", etag_val);
     (StatusCode::OK, headers, Json(Value::Array(items))).into_response()
 }
 
@@ -1185,8 +1469,9 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 18] = [
+const PATCH_WRITABLE: [&str; 19] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
+    "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
     // `amux board <status> --trigger` sends source_ref AND last_verified_at
     // together, but only the first was writable, so the stamp was silently
@@ -1219,7 +1504,14 @@ enum PatchOut {
     Refused(StatusCode, Value),
     /// Invariant 37: nothing changed; `rev` unmoved.
     Noop { body: Value, ignored: Vec<String> },
-    Applied { body: Value, ignored: Vec<String> },
+    Applied {
+        body: Value,
+        ignored: Vec<String>,
+        /// (session, from_status, to_status) when a status change happened,
+        /// for reactive pickup: if the transition freed the lane (done/verified/
+        /// discarded), fire an immediate pickup instead of waiting 60s.
+        status_transition: Option<(String, String, String)>,
+    },
 }
 
 /// Map a (from, to) pair onto the core transition vocabulary. `None` means
@@ -1532,6 +1824,7 @@ pub async fn patch_item(
             set_opt("session", &mut next.session, &mut changed);
             set_opt("reviewer", &mut next.reviewer, &mut changed);
             set_opt("shepherd", &mut next.shepherd, &mut changed);
+            set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
             set_opt("source_ref", &mut next.source_ref, &mut changed);
@@ -1988,7 +2281,7 @@ pub async fn patch_item(
                                     "SELECT id FROM issues WHERE session = ?1 \
                                      AND status = 'doing' AND id != ?2 \
                                      AND deleted IS NULL AND COALESCE(archived,0) = 0 \
-                                     AND COALESCE(type,'') NOT IN ('tripwire','watch') \
+                                     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
                                      ORDER BY id",
                                 )
                                 .and_then(|mut st| {
@@ -2332,6 +2625,48 @@ pub async fn patch_item(
             if let Some(tags) = &tags_change {
                 bs::set_tags(conn, &next.id, tags, next.updated)?;
             }
+            // KEEP THE `needsyou` STATUS AND THE `needs:you` TAG IN STEP.
+            //
+            // They are two spellings of one fact and the readers are split
+            // across them: the status is what EXCLUDES a card (auto-pickup
+            // takes `status='todo'`, the advance path takes `status IN
+            // ('doing','review')`), while every mechanism that SURFACES a
+            // human-blocked card keys on the TAG — the dashboard's
+            // `is:needsyou` view and Focus mode, the 3-day re-nag (which
+            // JOINs issue_tags), and board_drive's "the human owes the
+            // answer, not the lane" branch.
+            //
+            // So setting the canonical status alone parked the card where
+            // nothing hands it out AND nothing brings it back — strictly
+            // worse than leaving it in `todo`, and reached by taking the
+            // DOCUMENTED transition (core: `Doing -> NeedsYou`, "stuck on the
+            // user, with the exact question"). Measured on the live board
+            // 2026-08-11: 23 of 38 open `needsyou` cards carried no tag,
+            // across six sessions, including four SLA breaches aged 127-194h
+            // that the re-nag structurally could not see.
+            //
+            // Syncing here rather than teaching each reader both spellings is
+            // deliberate: one write fixes five consumers, and there is no
+            // second predicate left to drift.
+            if let Some((from_raw, to_raw)) = &status_event {
+                let was = bs::parse_status(from_raw);
+                let now_st = bs::parse_status(to_raw);
+                let is_ny = |s: Option<TaskStatus>| s == Some(TaskStatus::NeedsYou);
+                // An explicit `tags` in the same PATCH is the caller stating
+                // intent; it wins over this sync either way.
+                let caller_set_ny = tags_change.as_ref().is_some_and(|t| {
+                    t.iter().any(|x| x.to_lowercase().starts_with("needs:you"))
+                });
+                if is_ny(now_st) && !is_ny(was) {
+                    bs::add_needs_you_tag(conn, &next.id, next.updated)?;
+                } else if is_ny(was) && !is_ny(now_st) && !caller_set_ny {
+                    // The answer landed (`NeedsYou -> Doing` is core's
+                    // "the user answered"). Leaving the tag on would re-nag
+                    // the lane about a question that is no longer open —
+                    // the re-nag only skips done/verified/discarded.
+                    bs::clear_needs_you_tags(conn, &next.id)?;
+                }
+            }
             let mutation = match &status_event {
                 Some((f, t)) => MutationKind::StatusChanged {
                     from: f.clone(),
@@ -2340,11 +2675,19 @@ pub async fn patch_item(
                 None => MutationKind::Updated,
             };
             let event = ev_snap(&next, mutation);
+            let st = status_event.as_ref().map(|(f, t)| {
+                (
+                    next.session.clone().unwrap_or_default(),
+                    f.clone(),
+                    t.clone(),
+                )
+            });
             finish(
                 &slot_w,
                 PatchOut::Applied {
                     body: detail_body(&next),
                     ignored,
+                    status_transition: st,
                 },
                 WriteOutcome {
                     applied: true,
@@ -2374,7 +2717,7 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Some(PatchOut::Applied { mut body, ignored }) => {
+        Some(PatchOut::Applied { mut body, ignored, status_transition }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
             if !ignored.is_empty() {
@@ -2384,7 +2727,68 @@ pub async fn patch_item(
                      the rest of this response reflects the card as stored"
                 );
             }
+            // REACTIVE PICKUP: when a card transitions to a terminal state,
+            // immediately check if the lane has a next todo card and claim it.
+            // This removes the up-to-60s wait for the board-drive tick. The
+            // delivery still goes through steer_enqueue (turn-boundary gated),
+            // so this cannot interrupt a mid-turn session.
+            if let Some((session, _from, to)) = status_transition {
+                if matches!(to.as_str(), "done" | "verified" | "discarded")
+                    && !session.is_empty()
+                {
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        reactive_pickup(&st, &session).await;
+                    });
+                }
+            }
             (StatusCode::OK, Json(body)).into_response()
+        }
+    }
+}
+
+// ---- Reactive pickup (AMUX board-drive latency fix) -----------------------
+//
+// When a card transitions to done/verified/discarded, fire an immediate pickup
+// for the same session instead of waiting for the 60s board-drive tick. Uses the
+// SAME select_pickup + claim_card + deliver path as the drive loop, so every
+// guard (WIP cap, junk filter, freshness, cooldowns) applies identically.
+//
+// This is a SUPPLEMENT, not a replacement. The drive tick remains the backstop
+// (a crashed reactive path is invisible; the tick is visible in the trace). The
+// trace does NOT record reactive pickups — they are not part of the sweep — but
+// the `task.claimed` event they emit IS what the drive tick reads to avoid
+// re-claiming.
+
+async fn reactive_pickup(state: &AppState, session: &str) {
+    use crate::runtime_jobs::board_drive::{select_pickup, Pickup};
+
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let pickup = select_pickup(&conn, session, now);
+    drop(conn);
+
+    if let Pickup::Claim { card, prompt } = pickup {
+        // Same compare-and-swap guard as the drive loop (AMUX-2983): only
+        // dispatch if the atomic claim took. This reactive path has the exact
+        // race — select_pickup then drop(conn) then claim — so an unconditional
+        // claim+dispatch could re-open and re-run a card closed in the gap.
+        if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
+            crate::api::session_verbs::steer_enqueue(
+                state, session, &prompt, "board-drive:reactive", "",
+            )
+            .await;
+            tracing::info!(
+                session,
+                card = card.as_str(),
+                "reactive pickup: claimed {card} immediately after status change"
+            );
         }
     }
 }
@@ -2584,5 +2988,362 @@ pub async fn delete_item(
             body["global_rev"] = json!(reply.rev.0);
             (StatusCode::OK, Json(body)).into_response()
         }
+    }
+}
+
+// ---- POST /api/board/{id}/status-request · /status-update ----------------
+//
+// The D1-exit pair (AMUX-2174), and the ethos inverse of terminal scraping:
+// amux does not INFER a card's status, it routes a request and the owning
+// session's own model AUTHORS the answer onto the card. ethos.md records this
+// as the reason the board is the source of truth.
+//
+// Both were lost in the Rust cutover and answered 405 with an EMPTY body, which
+// is the worst available failure for this pair, because every layer that
+// mentions them kept telling the fleet to use them:
+//   - `amux board ask` / `amux board status-update` (the CLI's own help)
+//   - the SPA card menu's "ask for status" (`_askCardStatus`, app.js)
+//   - the advance nudge: "post a status-update / mark its blocker"
+//   - the board contract's `board_is_source_of_truth` clause
+// This is AMUX-2140's shape a second time: following the sanctioned instruction
+// exactly is what produced the failure. It also escaped the route census,
+// because that enumerates SPA and CLI call sites and the CLI reaches these by
+// hand-rolled curl — so the endpoint the CLI most depends on is exactly the one
+// the "does every caller have a route" invariant could not see.
+
+/// The size cap Python applied (py:69770). A status update is a summary; the
+/// card log is not a transcript sink.
+const STATUS_UPDATE_MAX: usize = 1200;
+
+async fn status_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let question: String = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("question"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(400)
+        .collect();
+    let (_actor, requester) = actor_from_headers(&headers);
+    let requester = if requester.is_empty() || requester == "api-anonymous" {
+        headers
+            .get("X-Amux-User-Email")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("Ethan")
+            .to_string()
+    } else {
+        requester
+    };
+
+    let (session, title) = {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return internal(e),
+        };
+        match bs::get_issue(&conn, &id) {
+            Ok(Some(row)) => (row.session.clone().unwrap_or_default(), row.title.clone()),
+            Ok(None) => return not_found(&id),
+            Err(e) => return internal(e),
+        }
+    };
+    let session = session.trim().to_string();
+    if session.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "delivered": false,
+                        "reason": "card has no owning session to ask"})),
+        )
+            .into_response();
+    }
+    if !crate::api::session_verbs::is_running(&session).await {
+        // Honest offline path (ethos rule 7): never fake a live answer, and say
+        // plainly that nothing was queued, so the caller knows to ask again
+        // rather than waiting on a delivery that will not happen.
+        return Json(json!({
+            "ok": false, "delivered": false,
+            "reason": format!("session '{session}' is not running"),
+            "hint": "the request is not queued; ask again when the session runs",
+        }))
+        .into_response();
+    }
+
+    let q_part = if question.is_empty() {
+        String::new()
+    } else {
+        format!(": {question}")
+    };
+    let prompt = format!(
+        "[amux status request on {id}: {}] {requester} asks for a status update{q_part}.\n\
+         Reply by running:  amux board status-update {id} \"<what's done, what's next, any blocker>\"\n\
+         That posts to the BOARD, which is the source of truth — a chat reply alone does not update the card.",
+        title.chars().take(80).collect::<String>()
+    );
+    // Delivered at the next TURN BOUNDARY via the one steering queue, never a
+    // direct send: the decision recorded in ethos.md ("Board state changes are
+    // delivered at turn boundaries") is that a running agent cannot consume an
+    // event faster than its next turn anyway.
+    crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
+        .await;
+
+    let line = if question.is_empty() {
+        format!("status requested by {requester} (routed to {session})")
+    } else {
+        format!("status requested by {requester} — \"{question}\" (routed to {session})")
+    };
+    if let Err(e) = append_card_log(&state, &id, &line).await {
+        return internal(e);
+    }
+    Json(json!({"ok": true, "delivered": true, "session": session,
+                "message": format!("asked {session} to post a status update to {id}")}))
+    .into_response()
+}
+
+async fn status_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let text: String = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(STATUS_UPDATE_MAX)
+        .collect();
+    if text.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "text required"}))).into_response();
+    }
+    let (_actor, actor_name) = actor_from_headers(&headers);
+    let actor = if actor_name.is_empty() || actor_name == "api-anonymous" {
+        "session".to_string()
+    } else {
+        actor_name
+    };
+    {
+        let conn = match state.store.read() {
+            Ok(c) => c,
+            Err(e) => return internal(e),
+        };
+        match bs::get_issue(&conn, &id) {
+            Ok(Some(_)) => {}
+            // Python appended to a card it never checked existed, so a typo'd
+            // id reported {"ok": true} and wrote nothing anyone could find.
+            Ok(None) => return not_found(&id),
+            Err(e) => return internal(e),
+        }
+    }
+    if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
+        return internal(e);
+    }
+    Json(json!({"ok": true, "id": id, "actor": actor, "chars": text.chars().count()}))
+        .into_response()
+}
+
+/// Append one stamped line to a card's log. Both handlers above write only
+/// here — a status update must never move the card, and reusing the PATCH path
+/// would put a status report one typo away from a status TRANSITION.
+async fn append_card_log(
+    state: &AppState,
+    id: &str,
+    line: &str,
+) -> Result<(), rusqlite::Error> {
+    let (id, line, stamp) = (id.to_string(), line.to_string(), hhmm());
+    state
+        .store
+        .write_async(move |conn| {
+            let existing: Option<String> = conn
+                .query_row("SELECT log FROM issues WHERE id=?1", [&id], |r| r.get(0))
+                .unwrap_or(None);
+            let next = bs::append_log(existing.as_deref(), &stamp, &line);
+            conn.execute(
+                "UPDATE issues SET log=?1 WHERE id=?2",
+                rusqlite::params![next, id],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::ignored_board_params;
+
+    /// BACKE-3228: a mistyped/unknown filter must be reported ignored, a real
+    /// filter must NOT, and a cache-buster must not create noise.
+    #[test]
+    fn ignored_params_names_typos_not_real_filters_or_cachebusters() {
+        // The exact case that bit amux-cloud: a plausible-but-wrong name.
+        assert_eq!(ignored_board_params("include_archived=1"), vec!["include_archived"]);
+        assert_eq!(ignored_board_params("done=1&limits=5"), vec!["done", "limits"]);
+        // Real filters are consumed, never flagged.
+        assert!(ignored_board_params("session=amux&status=todo&archived=1&done_limit=0").is_empty());
+        assert!(ignored_board_params("slim=1&limit=10&offset=5").is_empty());
+        // q/query/search are consumed (refused with a 400), so not "ignored".
+        assert!(ignored_board_params("q=nudge").is_empty());
+        // Cache-busters are benign, not surfaced (would be noise on every poll).
+        assert!(ignored_board_params("_=1699999999&session=amux").is_empty());
+        assert!(ignored_board_params("t=123&cb=x").is_empty());
+        // Case-insensitive on the key; de-duplicated.
+        assert_eq!(ignored_board_params("Foo=1&foo=2"), vec!["Foo"]);
+        // Empty / no query -> nothing.
+        assert!(ignored_board_params("").is_empty());
+        // Mixed: only the typo is named, alongside a real filter + cache-buster.
+        assert_eq!(ignored_board_params("session=x&includearchived=1&_=9"), vec!["includearchived"]);
+    }
+}
+
+#[cfg(test)]
+mod slim_tests {
+    /// A SCOPED query must answer completely (ts-gke, 2026-08-11).
+    ///
+    /// The terminal cap made `?session=X` under-report by 26 of 94 done cards
+    /// while the body carried no sign of it, and a digest built on that list
+    /// reported 25. This pins the DEFAULT, which is the thing that was wrong:
+    /// unfiltered caps, scoped does not, and an explicit ?done_limit always
+    /// wins so a caller who asks for a bound still gets one.
+    #[test]
+    fn a_scoped_query_is_not_capped_by_default() {
+        let d = |session: Option<&str>, status: Option<&str>, explicit: Option<i64>| {
+            let scoped = session.is_some() || status.is_some();
+            explicit.unwrap_or(if scoped { 0 } else { 100 })
+        };
+        assert_eq!(d(None, None, None), 100, "the unfiltered board still caps — the dashboard cannot draw 1300 terminal cards");
+        assert_eq!(d(Some("ts-gke"), None, None), 0, "?session= must answer completely");
+        assert_eq!(d(None, Some("done"), None), 0, "?status= must answer completely");
+        assert_eq!(d(Some("ts-gke"), Some("done"), None), 0, "both together too");
+        // An explicit bound is honoured in BOTH shapes — otherwise this change
+        // would have taken away a caller's ability to ask for a small page.
+        assert_eq!(d(Some("ts-gke"), None, Some(5)), 5, "explicit done_limit wins when scoped");
+        assert_eq!(d(None, None, Some(5)), 5, "and when unfiltered");
+        assert_eq!(d(None, None, Some(0)), 0, "an explicit 0 still means uncapped");
+    }
+
+    use super::*;
+    use crate::db::board_store::IssueRow;
+
+    /// SLIM MUST CARRY WHAT THE LIST ACTUALLY RENDERS (AMUX-2840).
+    ///
+    /// This is pinned because the same slimming was tried before and reverted:
+    /// `list_body`'s own doc says an earlier first-line-desc + `log_n` version
+    /// "silently blanked both in the dashboard". It blanked them because it
+    /// removed the fields without replacing what the SPA derives FROM them.
+    /// A payload diet that drops a rendered value is a regression wearing a
+    /// performance win, and it fails silently — the card just looks empty.
+    #[test]
+    fn slim_drops_the_prose_but_keeps_the_two_things_the_list_renders() {
+        let row = IssueRow {
+            id: "T-1".into(),
+            title: "a card".into(),
+            desc: "First line is the preview.\nNew task: folded one\nNew task: folded two".into(),
+            log: Some("`10:00` did a thing\n`10:01` New task: folded three".into()),
+            item_type: "code".into(),
+            ..Default::default()
+        };
+
+        let full = list_body(&row, false, false);
+        assert!(full["desc"].is_string(), "the plain list still serves full desc");
+        assert!(full["log"].is_string(), "and full log");
+
+        let slim = list_body(&row, true, false);
+        // The diet itself.
+        assert!(slim["desc"].is_null(), "slim must not ship the prose");
+        assert!(slim["log"].is_null());
+        // ...and the two derivations that make it safe to drop them.
+        assert_eq!(
+            slim["desc_head"], "First line is the preview.",
+            "app.js:19488 renders the first line as the card preview"
+        );
+        assert_eq!(
+            slim["folded_n"], 3,
+            "app.js:18866 counts 'New task:' across desc AND log for the folded badge"
+        );
+        assert_eq!(slim["desc_len"], row.desc.chars().count());
+    }
+
+    /// The third derivation (app.js:19231). LAST marker wins, not first — a
+    /// re-marked card must show its freshest question, which is the client's own
+    /// rule and the reason a naive `find` would be wrong.
+    #[test]
+    fn slim_carries_the_latest_needsyou_marker() {
+        let row = IssueRow {
+            desc: "NEEDS-YOU: the stale one\nsome prose".into(),
+            log: Some("`10:00` moved\nNEEDS-YOU: the fresh one".into()),
+            ..Default::default()
+        };
+        assert_eq!(list_body(&row, true, false)["needsyou_note"], "the fresh one");
+
+        // Spelling variants the client accepts, case-insensitively.
+        for spelling in ["NEEDS-YOU:", "needs you:", "NEEDSYOU:", "Needs-Ethan:", "needs-human:"] {
+            let r = IssueRow { desc: format!("{spelling} answer me"), ..Default::default() };
+            assert_eq!(
+                list_body(&r, true, false)["needsyou_note"], "answer me",
+                "spelling {spelling} must be recognised"
+            );
+        }
+
+        // ABSENT means ABSENT: the key is omitted rather than served as an empty
+        // string, so a client can distinguish "no marker" from "a blank marker".
+        let plain = IssueRow { desc: "ordinary card".into(), ..Default::default() };
+        assert!(list_body(&plain, true, false).get("needsyou_note").is_none());
+    }
+
+    /// Every spelling app.js's /NEEDS[- ]?(?:YOU|ETHAN|HUMAN):/i accepts must
+    /// produce a note here, or the slim client and the full client disagree
+    /// about the same card. The three ETHAN/HUMAN space and no-separator forms
+    /// were missing until 2026-08-11.
+    #[test]
+    fn needsyou_matches_every_spelling_the_client_regex_accepts() {
+        for spelling in [
+            "NEEDS-YOU:", "NEEDS YOU:", "NEEDSYOU:",
+            "NEEDS-ETHAN:", "NEEDS ETHAN:", "NEEDSETHAN:",
+            "NEEDS-HUMAN:", "NEEDS HUMAN:", "NEEDSHUMAN:",
+            "needs-you:", "needs ethan:",
+        ] {
+            let row = IssueRow {
+                id: "X-1".into(),
+                title: "a card".into(),
+                desc: format!("{spelling} answer me"),
+                item_type: "code".into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                list_body(&row, true, false)["needsyou_note"], "answer me",
+                "spelling {spelling:?} must yield a note — the client regex accepts it"
+            );
+        }
+        // A marker with nothing after it is not a marker.
+        let empty = IssueRow { desc: "NEEDS-YOU:   ".into(), ..Default::default() };
+        assert!(list_body(&empty, true, false).get("needsyou_note").is_none());
+    }
+
+    /// The preview must be bounded and must not panic on multi-byte text — it
+    /// is built with `chars().take()`, not a byte slice, and an empty desc is
+    /// ordinary rather than an error.
+    #[test]
+    fn the_preview_is_bounded_and_multibyte_safe() {
+        let long = IssueRow { desc: "é".repeat(400), ..Default::default() };
+        let v = list_body(&long, true, false);
+        assert_eq!(v["desc_head"].as_str().unwrap().chars().count(), 120);
+
+        let empty = IssueRow { desc: String::new(), ..Default::default() };
+        let v = list_body(&empty, true, false);
+        assert_eq!(v["desc_head"], "");
+        assert_eq!(v["folded_n"], 0);
+
+        // Leading blank lines are skipped: the preview is the first line with
+        // CONTENT, not the first line.
+        let padded = IssueRow { desc: "\n\n  \nreal content here".into(), ..Default::default() };
+        assert_eq!(list_body(&padded, true, false)["desc_head"], "real content here");
     }
 }

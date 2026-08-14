@@ -159,18 +159,36 @@ Both are server-side and both were checked against the running rust build:
 
 ## Deploying
 
-`.github/workflows/deploy-cloud.yml`, on push to `main` touching `crates/**`,
-`Cargo.toml`, `Cargo.lock`, `cloud/**`, or the workflow itself.
+`.github/workflows/deploy-cloud.yml`. Two triggers (AMUX-2968, Ethan
+2026-08-12):
 
-1. **guard** — the image is a rust build and nothing resurrects the python server.
-2. **build** — `ghcr.io/mixpeek/amux:{latest,<sha>}`, `linux/amd64`, gha cache.
+- **Automatic** — after the `rust` CI workflow finishes **successfully on
+  `main`** (`workflow_run`). This runs the safe jobs only (guard → build →
+  deploy): the CI-passed binary becomes `ghcr :latest` and the host pulls it.
+  It builds from the **exact commit CI passed** (`head_sha`, pinned in every
+  checkout and the image tag), never a PR, never a red run.
+- **Manual** — `gh workflow run deploy-cloud.yml`, and the ONLY way to reach
+  the recreate job below.
+
+A commit that does not trigger `rust` (docs, a pure `cloud/gateway.py` edit,
+the bash CLI — none match rust.yml's `paths`) does not auto-deploy: there is no
+CI pass to gate on and no new binary to ship. Deploy those manually.
+
+1. **guard** — the image is a rust build and nothing resurrects the python
+   server. This job carries the auto-deploy `if` (dispatch, or a *successful*
+   `rust` run); the whole cascade hangs off it via `needs`, so a red/PR CI run
+   leaves everything skipped.
+2. **build** — `ghcr.io/mixpeek/amux:{latest,<head_sha>}`, `linux/amd64`, gha cache.
 3. **deploy** — gateway secrets, `ADMIN_EMAILS`, `CONTAINER_SCHEME=https`,
    `gateway.py` + compose template + litestream config, `docker pull`,
    regenerate each tenant's compose, `docker compose up -d --no-recreate`, then
    **name every workspace still on the old image**.
-4. **redeploy** — only on `workflow_dispatch` with `recreate=yes`. Recreates
-   running workspaces and then proves each one answers `/health` with
-   `"server":"amux-rust"` on the new image digest.
+4. **redeploy** — only on `workflow_dispatch` with `recreate=yes`. Because it is
+   gated on `github.event_name == 'workflow_dispatch'`, an auto-deploy (which
+   arrives as `workflow_run`) can **never** reach it — taking a customer's
+   sessions down stays a human's explicit choice. Recreates running workspaces
+   and then proves each one answers `/health` with `"server":"amux-rust"` on the
+   new image digest.
 
 ### Cutting a live workspace over
 

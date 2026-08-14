@@ -214,8 +214,8 @@
     padding: 8px 11px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--card); font-size: 0.8rem;
   }
-  .archived-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; }
-  .archived-card-name { font-weight: 600; color: var(--text); flex-shrink: 0; cursor: pointer; }
+  .archived-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .archived-card-name { font-weight: 600; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .archived-card-name:hover { color: var(--accent); }
   .archived-card-chip {
     font-size: 0.63rem; padding: 1px 6px; border-radius: 9px; flex-shrink: 0;
@@ -229,7 +229,7 @@
     color: var(--dim); font-size: 0.7rem; display: flex; gap: 5px 10px; flex-wrap: wrap;
     align-items: center; min-width: 0;
   }
-  .archived-card-meta code { font-size: 0.68rem; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; color: var(--text); }
+  .archived-card-meta code { font-size: 0.68rem; background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; color: var(--text); word-break: break-all; }
   .archived-card-tag { color: var(--accent); font-size: 0.68rem; }
   .archived-card-preview {
     color: var(--dim); font-size: 0.72rem; line-height: 1.4; min-width: 0;
@@ -246,6 +246,14 @@
     color: var(--dim); background: transparent; cursor: pointer; min-height: 28px;
   }
   .archived-del-btn:hover { border-color: var(--red); color: var(--red); }
+  @media (max-width: 600px) {
+    .archived-card { padding: 10px 12px; gap: 6px; }
+    .archived-card-top { gap: 6px; }
+    .archived-card-name { font-size: 0.85rem; max-width: calc(100% - 120px); }
+    .archived-wake-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
+    .archived-del-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
+    .archived-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
 
   /* Edit modal */
   .edit-overlay {
@@ -367,6 +375,10 @@
   .sched-cadence-pill { font-size:0.62rem;padding:1px 5px;border-radius:10px;border:1px solid var(--border);color:var(--dim);background:var(--card);font-family:monospace; }
   .sched-id-badge { font-size:0.6rem;padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--accent);font-family:monospace;cursor:pointer;flex-shrink:0;letter-spacing:0.02em; }
   .sched-id-badge:hover { border-color:var(--accent); }
+  /* Copyable message id in the Messages/peek rows (AMUX-2970), same affordance
+     as the scheduler's SCHED-N badge so the two read alike. */
+  .msg-id-badge { font-size:0.6rem;padding:1px 5px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--accent);font-family:monospace;cursor:pointer;flex-shrink:0;letter-spacing:0.02em;margin-right:6px; }
+  .msg-id-badge:hover { border-color:var(--accent); }
   .sched-run-dot { display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0; }
   .sched-run-dot.ok { background:var(--green,#4ade80); }
   .sched-run-dot.done { background:var(--accent); }
@@ -510,6 +522,28 @@
   .tts-btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
   .tts-audio-wrap { display: flex; align-items: center; gap: 10px; }
   .tts-audio-wrap audio { flex: 1; height: 36px; }
+  /* Floating "generating audio" indicator — feedback for read-aloud triggers
+     that have no button to spin (ellipsis actions). */
+  .tts-loading { position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(20px + env(safe-area-inset-bottom)); z-index: 10001;
+    background: var(--accent); color: #fff; padding: 8px 16px; border-radius: 20px;
+    font-size: 0.82rem; font-weight: 600; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    display: flex; align-items: center; gap: 8px; }
+  .tts-loading-spin { display: inline-block; animation: tts-spin 0.9s linear infinite; }
+  @keyframes tts-spin { to { transform: rotate(360deg); } }
+  /* Past read-alouds list (replay tab). */
+  .ra-list { display: flex; flex-direction: column; }
+  .ra-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); }
+  .ra-play, .ra-del { flex: 0 0 auto; min-width: 44px; min-height: 44px; display: flex;
+    align-items: center; justify-content: center; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--card); color: var(--text); cursor: pointer; font-size: 0.9rem; }
+  .ra-play { color: var(--accent); }
+  .ra-play:active { background: var(--accent); color: #fff; }
+  .ra-del { color: var(--dim); }
+  .ra-body { flex: 1; min-width: 0; }
+  .ra-meta { font-size: 0.72rem; color: var(--dim); margin-bottom: 3px; }
+  .ra-text { font-size: 0.85rem; color: var(--text); line-height: 1.4; word-break: break-word; }
   .send-row { display: flex; gap: 8px; min-width: 0; overflow: visible; position: relative; }
   .send-input {
     flex: 1; min-width: 0; font-size: 1rem; padding: 10px 14px; border-radius: 8px;
@@ -729,15 +763,19 @@
   .peek-rule::after { content: ''; width: 14px; border-top: 1px solid rgba(127,148,170,0.35); }
   .peek-rule:not(:has(.peek-rule-tag))::after { display: none; }
   .peek-rule-tag { color: var(--dim); font-size: 0.85em; white-space: nowrap; }
-  .peek-agent-row { cursor: pointer; border-radius: 4px; }
-  .peek-agent-row:hover { background: rgba(88,166,255,0.12); }
-  .peek-agent-row:active { background: rgba(88,166,255,0.25); }
   .overlay-body a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
   .overlay-body a:active { color: #79c0ff; }
   .overlay-body .file-link { color: var(--cyan); text-decoration: none; border-bottom: 1px dashed var(--cyan); cursor: pointer; }
   .overlay-body .file-link:active { color: #79ead3; }
   .overlay-body .md-link { color: var(--yellow); text-decoration: none; border-bottom: 1px dashed var(--yellow); cursor: pointer; }
   .overlay-body .md-link:active { color: #e8c547; }
+  /* A markdown link to ANOTHER file — opens IN the viewer (renderMarkdown +
+     _bindMdFileLinks). Distinguished from external links by the accent + a small
+     document glyph, so a reader knows it navigates within, not to the browser. */
+  .md-file-link { color: var(--accent); text-decoration: none; border-bottom: 1px dashed var(--accent); cursor: pointer; }
+  .md-file-link::before { content: "\1F4C4\00A0"; font-size: 0.82em; opacity: 0.75; }
+  .md-file-link:hover { border-bottom-style: solid; }
+  .md-file-link:active { opacity: 0.7; }
   /* Box-drawing tables/frames: keep monospace alignment, scroll sideways instead
      of wrapping (which detached borders and shredded rows on narrow screens). */
   .overlay-body .peek-box { display: block; white-space: pre; overflow-x: auto; overflow-y: hidden; max-width: 100%;
@@ -1684,9 +1722,16 @@
   /* Peek search highlight */
   .peek-highlight { background: rgba(210,153,34,0.35); color: #fff; border-radius: 2px; }
   .peek-highlight.current { background: rgba(210,153,34,0.85); color: #000; }
-  /* Prompt lines keep their span (block) but no added decoration — the peek
-     should render what tmux renders, not restyle it (user feedback). */
-  .peek-prompt { display: block; }
+  .peek-prompt { display: block; border-left: 3px solid transparent; padding-left: 4px; margin-left: -7px; }
+  .peek-prompt-human    { border-left-color: #58a6ff; }
+  .peek-prompt-session  { border-left-color: #8957e5; }
+  .peek-prompt-schedule { border-left-color: #3fb950; }
+  .peek-prompt-amux     { border-left-color: #8b949e; }
+  /* Reconciled raw-tmux injection (AMUX-2670): delivery UNVERIFIED and the
+     origin is the CLI's claim, not a server stamp. Amber and dashed so it
+     cannot be mistaken for an audited send at a glance — which is the exact
+     failure the card names. */
+  .peek-prompt-unstamped { border-left-color: #d29922; border-left-style: dashed; }
 
   /* Peek overlay — flush to the true screen bottom. In a toolbar-less standalone
      webview window.innerHeight IS the full visible height, so fixed bottom:0 already
@@ -1764,6 +1809,14 @@
   .peek-attach-chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
   .peek-attach-chip .chip-remove { cursor: pointer; color: var(--dim); flex-shrink: 0; font-size: 1.1rem; line-height: 1; opacity: 0.7; }
   .peek-attach-chip .chip-remove:hover { color: var(--red); opacity: 1; }
+  .peek-attach-summary {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    font-size: 0.78rem; width: 100%; cursor: pointer; user-select: none;
+  }
+  .peek-attach-summary:hover { border-color: var(--accent); }
+  .peek-attach-summary .chip-remove { cursor: pointer; color: var(--dim); margin-left: auto; font-size: 1.1rem; }
+  .peek-attach-summary .chip-remove:hover { color: var(--red); }
   .peek-attach-btn { background: none; border: 1px solid var(--border); border-radius: 6px;
     color: var(--dim); cursor: pointer; padding: 0 8px; font-size: 1.1rem; min-height: 36px;
     display: flex; align-items: center; flex-shrink: 0; }
@@ -1848,6 +1901,12 @@
   /* In-progress board issues for this worker: informational, so accent rather
      than a success/failure colour — it is a count, not a verdict. */
   .meta-count .mc-doing { color: var(--accent); font-weight: 700; }
+  /* Total board items: deliberately DIMMER than .mc-doing. Both sit in the same
+     bare-number row, and if the larger number (total is always >= doing) were
+     the brighter one it would read as the more urgent figure. Doing is what
+     wants attention. */
+  .meta-count .mc-active { color: var(--green, #4ade80); font-weight: 700; }
+  .meta-count .mc-total { color: var(--dim); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
   /* ── Dictation: compact recording popup (above the composer) ── */
@@ -2606,6 +2665,20 @@
   .offline-op .op-action { color: var(--text); font-weight: 500; }
   .offline-op .op-time { color: var(--yellow); font-size: 0.65rem; }
   .offline-op .op-stale { color: var(--red); font-size: 0.65rem; font-style: italic; }
+  /* Offline-queue accordion (AMUX-2976) */
+  .offline-queue-toggle {
+    width: 100%; text-align: left; margin-top: 6px;
+    font-size: 0.72rem; font-weight: 600; color: #f87171;
+    background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.25);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer;
+  }
+  .offline-queue-toggle:active { opacity: 0.7; }
+  .offline-queue-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+  .offline-queue-list.collapsed { display: none; }
+  @media (max-width: 600px) {
+    /* 44px min touch target on mobile per css-mobile rule */
+    .offline-queue-toggle { min-height: 44px; padding: 10px 12px; }
+  }
 
   /* Tab bar */
   .tab-bar-outer {
@@ -3064,31 +3137,41 @@
      Never grows here, in either axis. */
   #peek-issues-panel .board-search-wrap { flex: 0 0 auto !important; }
 
-  /* Board controls at phone width. At 390px the row was cramming a scope
-     button, a count, two view toggles and "+ New issue" onto one line, so the
-     count and the button each wrapped to two lines and the toggles were pushed
-     to the screen edge. Give the count its own line and let the buttons sit on
-     one row at full tap size. */
+  /* Board controls at phone width — ONE ROW (Ethan, 2026-08-13: "make all this
+     one row on mobile"). The prior fix gave the count AND the "+ New issue"
+     button each their own line, so the controls spanned three rows. They fit a
+     single row now because the two "+" buttons collapse to their glyph (.pbt-ico,
+     ~44px each instead of ~64–100px) — the same trick the main board's
+     .board-new-btn uses. Measured budget at 375px (~355px content): toggles ~94
+     + scope ~74 + filter-icon 44 + count ~52 + new-icon 44 + gaps 24 = ~332 <
+     355, and tap targets stay 44px. The count stays inline on purpose: it is the
+     live FILTERED total, which the "Board N" tab badge (unfiltered) does not
+     show. Search keeps its own full-width row — at the ~120px it would get
+     inline it was unusable, which is why the earlier fix moved it off. */
   @media (max-width: 600px) {
     #peek-issues-panel .peek-tasks-add {
-      flex-wrap: wrap; row-gap: 6px; align-items: center;
+      flex-wrap: wrap; row-gap: 6px; column-gap: 6px; align-items: center;
     }
     #peek-issues-panel .peek-tasks-add > .board-view-toggle { order: 1; }
     #peek-issues-panel #piv-scope { order: 2; min-height: 44px; white-space: nowrap; }
-    #peek-issues-panel .peek-tasks-add > .btn.primary {
-      order: 3; margin-left: auto; min-height: 44px; white-space: nowrap;
-    }
-    /* Count last and full-width: it is the one item that can wrap harmlessly. */
     #peek-issues-panel #peek-issues-count {
-      order: 4; flex: 1 0 100%; text-align: left; margin: 0;
+      order: 3; flex: 0 0 auto; text-align: left; margin: 0; white-space: nowrap;
     }
+    #peek-issues-panel #piv-filter { order: 4; }
+    #peek-issues-panel .peek-tasks-add > .btn.primary {
+      order: 5; margin-left: auto; white-space: nowrap;
+    }
+    /* Both "+" buttons: 44px tap target, glyph not label. */
+    #peek-issues-panel .pbt-compact {
+      min-height: 44px; min-width: 44px; padding: 6px 9px;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    #peek-issues-panel .pbt-text { display: none; }
+    #peek-issues-panel .pbt-ico { display: inline-flex; align-items: center; justify-content: center; }
     #peek-issues-panel .board-view-toggle .bv-btn { min-width: 44px; min-height: 44px; }
-    /* Search joined this row when the toolbar merged to one line. On a phone
-       it takes its own full-width line rather than competing with four
-       controls for ~120px, which is what made it unusable before. Ordered
-       after the count so the tappable controls stay together at the top. */
+    /* Search: its own full-width row below the controls. */
     #peek-issues-panel .peek-tasks-add > .board-search-wrap {
-      order: 5; flex: 1 0 100% !important;
+      order: 6; flex: 1 0 100% !important;
     }
     #peek-issues-panel .peek-tasks-add > .board-search-wrap .search-input { min-height: 40px; }
   }
@@ -3187,6 +3270,10 @@
   /* ── Board mobile responsive ── */
   .board-new-btn { font-size: 0.8rem; padding: 5px 12px; white-space: nowrap; flex-shrink: 0; }
   .board-new-icon { display: none; }
+  /* Peek board-toolbar "+" buttons (filter/new issue): show the full label on
+     desktop; the @media (max-width:600px) block above swaps to the glyph
+     (.pbt-ico) so the controls fit one row on a phone. */
+  .pbt-ico { display: none; }
   @media (max-width: 640px) {
     .board-toolbar { flex-wrap: wrap; gap: 6px; }
     /* The [+ Filter | search] pair owns the full first row (AMUX-2569).
@@ -3352,6 +3439,11 @@
     -webkit-tap-highlight-color: transparent; }
   .col-gate-btn:hover, .col-gate-btn:active { opacity: 1; color: var(--accent); border-color: var(--border); }
   .col-gate-btn.has-gate { color: var(--accent); opacity: 0.95; }
+  .col-terminal-chip {
+    font-size: 0.58rem; padding: 1px 5px; border-radius: 8px;
+    background: rgba(139,148,158,0.15); color: var(--dim); white-space: nowrap;
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+  }
   @media (max-width: 600px) { .col-gate-btn { font-size: 0.9rem; padding: 5px 8px; } }
   /* Entry criteria shown ON the column (AMUX-2313) — deliberately always
      visible, not behind the Gate button. Kept visually quiet so it reads as
@@ -3768,7 +3860,15 @@
   .board-edit-overlay {
     position: fixed; inset: 0; z-index: 600;
     background: rgba(0,0,0,0); align-items: center; justify-content: center;
-    padding: 16px; display: flex; pointer-events: none;
+    /* Bottom padding clears the sw-fail-bar (AMUX-2584). That bar is fixed at
+       bottom:0 with z-index 9999, above this overlay, and the box's Save row is
+       sticky bottom:0 INSIDE the box — so without this the bar covers exactly
+       the strip Save lives in, and at 375px it wraps to 3-4 lines and hides the
+       action row entirely. --sw-fail-h is published by the bar itself after it
+       measures, and reset to 0px when dismissed; the fallback keeps this inert
+       on every origin that installs its service worker normally. */
+    padding: 16px 16px calc(16px + var(--sw-fail-h, 0px));
+    display: flex; pointer-events: none;
     transition: background 0.25s;
   }
   .board-edit-overlay.active { background: rgba(0,0,0,0.6); pointer-events: auto; }
@@ -3780,7 +3880,9 @@
   .board-edit-box {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; padding: 16px; width: 100%; max-width: 400px;
-    max-height: calc(100dvh - 32px); overflow-y: auto;
+    /* Same subtraction as the overlay padding: the box must shrink, not just
+       shift, or a tall card still runs its sticky footer under the bar. */
+    max-height: calc(100dvh - 32px - var(--sw-fail-h, 0px)); overflow-y: auto;
   }
   .board-edit-box input, .board-edit-box textarea, .board-edit-box select {
     width: 100%; padding: 8px 10px; border-radius: 8px;
@@ -4752,23 +4854,7 @@
   }
 
 
-/* The live progress line beside the "working" badge (AMUX-2676). Muted and
-   monospace so it reads as machine output, not a label — it is the worker's own
-   terminal line, quoted. Truncates rather than wrapping: on a phone the badge
-   row must stay one line. */
-.live-work {
-  display: inline-block;
-  margin-left: 6px;
-  max-width: 46vw;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: middle;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.66rem;
-  color: var(--dim);
-}
-@media (max-width: 600px) { .live-work { max-width: 38vw; } }
+
 
 /* Why a tag is being suggested (AMUX-2677): the cluster size behind it. Muted
    and small so it reads as evidence attached to the chip, not part of the tag

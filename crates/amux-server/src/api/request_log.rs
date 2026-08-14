@@ -36,7 +36,6 @@
 use super::AppState;
 use crate::db::{SharedStore, WriteOutcome};
 use axum::extract::{ConnectInfo, Query, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -750,13 +749,7 @@ fn raw_payload(log_path: &Path, lines_n: usize, state: &AppState) -> anyhow::Res
     }))
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": e.to_string()})),
-    )
-        .into_response()
-}
+use super::internal;
 
 // ---------------------------------------------------------------------------
 // ROUTE_TABLE — the routing truth (AMUX-2610)
@@ -810,6 +803,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/debug/boundary", methods: &["GET"] },
     RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },
     RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/duplicate-deliveries", methods: &["GET"] },
     RouteEntry { path: "/api/system-jobs", methods: &["GET"] },
     RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
     RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
@@ -838,6 +832,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/memories/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/messages", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/messages/accountability", methods: &["GET"] },
     RouteEntry { path: "/api/messages/{id}", methods: &["GET"] },
     RouteEntry { path: "/api/messages/{id}/ack", methods: &["POST"] },
     RouteEntry { path: "/api/messages/{id}/acted", methods: &["POST"] },
@@ -938,14 +933,93 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/journal/{id}/media", methods: &["POST"] },
     RouteEntry { path: "/api/layout-presets", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/layout-presets/{name}", methods: &["DELETE"] },
+    // -- New Worker / Connect modals (api/worker_create.rs, AMUX-2871)
+    RouteEntry { path: "/api/templates", methods: &["GET"] },
+    RouteEntry { path: "/api/git-check", methods: &["GET"] },
+    RouteEntry { path: "/api/git-branches", methods: &["GET"] },
+    RouteEntry { path: "/api/suggest-branch", methods: &["POST"] },
+    RouteEntry { path: "/api/tmux-sessions", methods: &["GET"] },
+    RouteEntry { path: "/api/iterm2/sessions", methods: &["GET"] },
+    // -- saved messages / habits / token-baseline reset (AMUX-2871)
+    RouteEntry { path: "/api/saved-messages", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/saved-messages/{id}", methods: &["DELETE", "PATCH"] },
+    RouteEntry { path: "/api/habits", methods: &["GET", "PUT"] },
+    // CRM (AMUX-2929). Mounted via .nest("/api/crm", crm::routes()), which the
+    // completeness test could not see until AMUX-2917 taught it to follow
+    // nests — so these answered 200 while the census called them unrouted.
+    // Nested-router capabilities that were never tabled (AMUX-2937). All eight
+    // answer JSON from their handlers — probed live, not the SPA catch-all's
+    // HTML — so the census was calling real routes unrouted. Found once the
+    // completeness test learned to follow .nest() (AMUX-2917); it previously
+    // scanned only api/mod.rs's own .route() calls.
+    RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
+    RouteEntry { path: "/api/search", methods: &["GET"] },
+    RouteEntry { path: "/api/search/status", methods: &["GET"] },
+    RouteEntry { path: "/api/search/reindex", methods: &["POST"] },
+    RouteEntry { path: "/api/why", methods: &["GET"] },
+    RouteEntry { path: "/api/why/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/why/{kind}/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/crm/contacts", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/crm/contacts/{id}", methods: &["GET", "PATCH", "DELETE"] },
+    RouteEntry { path: "/api/crm/contacts/{id}/interactions", methods: &["POST"] },
+    RouteEntry { path: "/api/crm/interactions/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/crm/followups", methods: &["GET"] },
+    // Speedtest (AMUX-2890): the Metrics tab's Run-speed-test button, unrouted
+    // since the python retirement — clicks errored against the SPA catch-all.
+    RouteEntry { path: "/api/speedtest/download", methods: &["GET"] },
+    RouteEntry { path: "/api/speedtest/upload", methods: &["POST"] },
+    RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
+    RouteEntry { path: "/api/observability", methods: &["GET"] },
+    RouteEntry { path: "/api/pull", methods: &["POST"] },
+    RouteEntry { path: "/api/proxies", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },
+    RouteEntry { path: "/api/proxies/{id}/stop", methods: &["POST"] },
+    // The D1-exit pair. Reached by the bash CLI's own curl, which the caller
+    // census does not enumerate — so these 405'd for the whole cutover while
+    // every layer that mentions them kept routing sessions at them.
+    RouteEntry { path: "/api/board/{id}/status-request", methods: &["POST"] },
+    RouteEntry { path: "/api/board/{id}/status-update", methods: &["POST"] },
     // -- skills / slash-commands / map / history
+    RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
+    // Mounted-but-untabled, all found by curling the census's "missing" list
+    // against the live server (AMUX-2871). Each was reported as unrouted while
+    // answering, because the census reads this table.
+    RouteEntry { path: "/api/client-debug", methods: &["POST"] },
+    RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/review/week", methods: &["GET"] },
+    RouteEntry { path: "/api/review/digest", methods: &["GET"] },
+    RouteEntry { path: "/api/channels", methods: &["GET"] },
+    RouteEntry { path: "/api/channels/{a}/{b}/messages", methods: &["GET", "POST", "DELETE"] },
+    RouteEntry { path: "/api/log-search", methods: &["GET"] },
+    RouteEntry { path: "/api/sql", methods: &["POST"] },
+    RouteEntry { path: "/api/sql/schema", methods: &["GET"] },
+    RouteEntry { path: "/api/sql/rows", methods: &["GET"] },
     RouteEntry { path: "/api/skills", methods: &["GET"] },
-    RouteEntry { path: "/api/skills/{name}", methods: &["GET"] },
+    RouteEntry { path: "/api/skills/{name}", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/slash-commands", methods: &["GET"] },
     RouteEntry { path: "/api/slash-commands/{name}", methods: &["GET"] },
     RouteEntry { path: "/api/map", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/map/pins", methods: &["POST"] },
     RouteEntry { path: "/api/map/search", methods: &["GET"] },
+    RouteEntry { path: "/api/graph/fleet", methods: &["GET"] },
+    RouteEntry { path: "/api/graph/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/graph/{id}/import-vault", methods: &["POST"] },
+    RouteEntry { path: "/api/graph/{id}/nodes/{nid}", methods: &["PATCH"] },
+    RouteEntry { path: "/api/terminal/create", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/input", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/resize", methods: &["POST"] },
+    RouteEntry { path: "/api/terminal/{id}/output", methods: &["GET"] },
+    RouteEntry { path: "/api/terminal/{id}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/reports/types", methods: &["GET"] },
+    RouteEntry { path: "/api/reports", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/reports/{id}", methods: &["DELETE", "PATCH"] },
+    RouteEntry { path: "/api/reports/{id}/refresh", methods: &["POST"] },
+    RouteEntry { path: "/api/reports/{id}/data", methods: &["GET"] },
+    RouteEntry { path: "/api/env/apply", methods: &["POST"] },
+    RouteEntry { path: "/api/env/schema", methods: &["GET"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
     // -- logs (this module)
@@ -980,6 +1054,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/dictation/config", methods: ANY },
     RouteEntry { path: "/api/dictate", methods: &["POST"] },
+    RouteEntry { path: "/api/tts", methods: &["POST"] },
+    RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
     // -- torrents / org / gmail
     RouteEntry { path: "/api/torrents", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/torrents/config", methods: &["GET", "POST"] },
@@ -995,6 +1071,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/gmail/auth", methods: &["GET"] },
     RouteEntry { path: "/api/gmail/account", methods: &["DELETE"] },
     RouteEntry { path: "/api/gmail/connect", methods: &["POST"] },
+    // Mailbox half (api/gmail.rs, AMUX-2883).
+    RouteEntry { path: "/api/gmail/labels", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/inbox", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/thread/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/gmail/send", methods: &["POST"] },
+    // Merged-router routes the census scanner could not see until it learned
+    // to follow `.merge()` (AMUX-2883's table pass): four runtime-jobs debug
+    // surfaces and the workers-spelling of the session verb dispatcher.
+    RouteEntry { path: "/api/debug/steering", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/board-drive", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/autofix", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/storage", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{name}/{*verb}", methods: &["*"] },
 ];
 
 /// Match `path` against an axum-style pattern, returning a specificity score
@@ -1597,6 +1686,7 @@ pub async fn debug_routes() -> axum::Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;   // lib no longer needs it; these tests do
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;

@@ -55,6 +55,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Compile-once regex at the use site: each expansion gets its own static.
+///
+/// This file's pane detectors run on the steering tick, the status sweep and
+/// every peek — measured 2026-08-11 (AMUX-2906 survey): 41 `Regex::new`
+/// compiles per call on those paths while 25 other sites in the same file
+/// already used the OnceLock idiom by hand. One spelling, zero per-call
+/// compiles. Only for STATIC patterns — a dynamic pattern would cache its
+/// first value forever and silently ignore every later one.
+macro_rules! cached_re {
+    ($pat:expr) => {{
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new($pat).unwrap())
+    }};
+}
+
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Python: MAX_LOG_BYTES = 10MB (py:892).
@@ -66,7 +81,7 @@ const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 // AppState-captured-home refactor is a named deviation there.
 // ---------------------------------------------------------------------------
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
     })
@@ -210,6 +225,65 @@ impl EnvFile {
 
 pub(crate) fn parse_env(name: &str) -> EnvFile {
     EnvFile::load(&env_path(name))
+}
+
+/// One setting for a lane, resolved WORKER > GROUP > GLOBAL (AMUX-2930).
+///
+/// `parse_env` reads a single file — the worker's own env — which is right for
+/// per-worker facts like CC_DIR or CC_PROVIDER. It is wrong for POLICY, and
+/// standing-order switches are policy: `/api/scope` has advertised `env` at
+/// `["global", "group", "worker"]` since the cutover, backed by real files
+/// (`~/.amux/amux.env`, `~/.amux/env/<group>.env`,
+/// `~/.amux/sessions/<worker>.env`), and the scope UI writes all three. But
+/// every consumer read the worker file only, so turning a standing order off
+/// globally or for a group wrote a file that nothing consulted — the setting
+/// appeared to save and changed nothing.
+///
+/// That is ethos rule 1's exact shape: a view that does not share the predicate
+/// of the mechanism it describes. The mechanism is fixed here rather than the
+/// view narrowed, because the scoped view is what Ethan asked for.
+///
+/// GLOBAL is the amux.env that lane shells already source at startup, so this
+/// does not introduce a new file or a new spelling — it makes the gates read
+/// the layer that was always there. Worker wins over group, group over global;
+/// first match wins, so an explicit `=1` at worker level overrides a `=0` set
+/// fleet-wide, which is the direction a per-worker exception has to run.
+/// The resolution itself, over an explicit home.
+///
+/// Parameterised for the same reason `config::resolve_home` is: `AMUX_HOME` is
+/// process-global and `cargo test` runs a binary's tests in PARALLEL, so tests
+/// that set it race each other over ONE `amux.env` — three of these tests
+/// failed exactly that way on the first run, each having its global layer
+/// rewritten mid-assertion by a sibling. Serialising them with a mutex or
+/// `--test-threads=1` would have made them green while quietly making them
+/// order-dependent.
+pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -> Option<String> {
+    fn nonempty(v: &str) -> Option<String> {
+        let t = v.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+    let worker = EnvFile::load(&home.join("sessions").join(format!("{lane}.env")));
+    if let Some(v) = worker.get(key).and_then(nonempty) {
+        return Some(v);
+    }
+    // Groups come from the worker's own CC_TAGS — the same source
+    // `lane_groups` uses, not a second spelling of "which groups is this in".
+    let groups: Vec<String> = worker
+        .get("CC_TAGS")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_matches('"').to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for g in groups {
+        let path = home.join("env").join(format!("{g}.env"));
+        if let Some(v) = EnvFile::load(&path).get(key).and_then(nonempty) {
+            return Some(v);
+        }
+    }
+    EnvFile::load(&home.join("amux.env")).get(key).and_then(nonempty)
 }
 
 fn provider_of(cfg: &EnvFile) -> String {
@@ -423,9 +497,9 @@ fn herdr_agent_name(name: &str) -> String {
     }
     // Python persists the mapping back into the env file (py:4779); reading
     // side only here — the write happens on herdr start, which stays a gap.
-    let re = regex::Regex::new(r"[^a-z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-z0-9_-]");
     let mut mapped = re.replace_all(&name.to_lowercase(), "-").into_owned();
-    let re2 = regex::Regex::new(r"-{2,}").unwrap();
+    let re2 = cached_re!(r"-{2,}");
     mapped = re2.replace_all(&mapped, "-").trim_matches('-').chars().take(32).collect();
     mapped = mapped.trim_matches('-').to_string();
     if mapped.is_empty() || !mapped.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) {
@@ -517,7 +591,7 @@ fn strip_scroll_pill(text: &str) -> String {
     if !text.contains("Jump to bottom") {
         return text.to_string();
     }
-    let re = regex::Regex::new(r"\s*Jump to bottom \(click\)\s*[↓]?\s*").unwrap();
+    let re = cached_re!(r"\s*Jump to bottom \(click\)\s*[↓]?\s*");
     re.replace_all(text, " ").into_owned()
 }
 
@@ -550,7 +624,7 @@ fn strip_launch_noise(text: &str) -> String {
     {
         return text.to_string();
     }
-    let bare_prompt = regex::Regex::new(r"^[A-Za-z0-9._-]{1,24}\$$").unwrap();
+    let bare_prompt = cached_re!(r"^[A-Za-z0-9._-]{1,24}\$$");
     let lines: Vec<&str> = text.split('\n').collect();
     let mut last: isize = -1;
     for (i, ln) in lines.iter().enumerate() {
@@ -599,12 +673,11 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
     }
     fn norm(s: &str) -> String {
         let s = strip_ansi(s);
-        let re = regex::Regex::new(
-            "[*#`_|\u{2502}\u{250c}\u{2510}\u{2514}\u{2518}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}\u{2500}=>\u{2022}\u{00b7}\u{00bb}\u{276f}\u{23bf}\u{23fa}\u{273b}\u{2726}\u{25cf}]+",
-        )
-        .unwrap();
+        let re = cached_re!(
+            "[*#`_|\u{2502}\u{250c}\u{2510}\u{2514}\u{2518}\u{251c}\u{2524}\u{252c}\u{2534}\u{253c}\u{2500}=>\u{2022}\u{00b7}\u{00bb}\u{276f}\u{23bf}\u{23fa}\u{273b}\u{2726}\u{25cf}]+"
+        );
         let s = re.replace_all(&s, " ");
-        let ws = regex::Regex::new(r"\s+").unwrap();
+        let ws = cached_re!(r"\s+");
         ws.replace_all(s.trim(), " ").to_lowercase()
     }
     let tlines: Vec<&str> = transcript.split('\n').collect();
@@ -661,7 +734,7 @@ fn is_prompt_line(s: &str) -> bool {
 /// py:8229 _claude_ui_visible (claude + codex + gemini markers).
 fn claude_ui_visible(clean_output: &str) -> bool {
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let shell_prompt = regex::Regex::new(r"^.*[$%]\s").unwrap();
+    let shell_prompt = cached_re!(r"^.*[$%]\s");
     let n = lines.len();
     for l in &lines[n.saturating_sub(3)..] {
         let ls = l.trim().to_lowercase();
@@ -686,7 +759,7 @@ fn claude_ui_visible(clean_output: &str) -> bool {
             }
         }
     }
-    let gpt_re = regex::Regex::new(r"gpt-\d|o[34][-m]").unwrap();
+    let gpt_re = cached_re!(r"gpt-\d|o[34][-m]");
     for l in &lines[n.saturating_sub(12)..] {
         let s = l.trim();
         let sl = s.to_lowercase();
@@ -745,8 +818,8 @@ fn at_shell_prompt(clean_output: &str) -> bool {
         return false;
     }
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let ends = regex::Regex::new(r"[$%]\s*$").unwrap();
-    let leaks = regex::Regex::new(r"^\S+[$%]\s").unwrap();
+    let ends = cached_re!(r"[$%]\s*$");
+    let leaks = cached_re!(r"^\S+[$%]\s");
     for l in &lines[lines.len().saturating_sub(5)..] {
         let ls = l.trim();
         if ends.is_match(ls) && !ls.contains('\u{276f}') {
@@ -821,7 +894,7 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return String::new();
     }
     let n = lines.len();
-    let reading_re = regex::Regex::new(r"^Reading \d+ file").unwrap();
+    let reading_re = cached_re!(r"^Reading \d+ file");
     // 0. Active spinner, wide window.
     for l in lines[n.saturating_sub(30)..].iter().rev() {
         let s = l.trim();
@@ -830,6 +903,16 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         }
         if let Some(c) = s.chars().next() {
             if ('\u{2700}'..='\u{27bf}').contains(&c) && s.contains('\u{2026}') {
+                return "active".into();
+            }
+            // GEMINI/CODEX spin with BRAILLE glyphs (U+2800-28FF), not the
+            // dingbat range above — found live 2026-08-11 (AMUX-2913): a
+            // gemini tool turn (`⠙ Thinking... (esc to cancel, 9s)`) read as
+            // not-active for its entire run, and a stale picker stamp showed
+            // through as `waiting` while the lane was demonstrably working.
+            // A line STARTING with a braille char is spinner chrome; prose
+            // does not start mid-word with braille.
+            if ('\u{2800}'..='\u{28ff}').contains(&c) {
                 return "active".into();
             }
         }
@@ -858,7 +941,7 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         }
     }
     // 2. Bottom-up scan of the last 12 lines.
-    let completed_re = regex::Regex::new(r" for \d+\s*[hms]\b").unwrap();
+    let completed_re = cached_re!(r" for \d+\s*[hms]\b");
     for l in lines[n.saturating_sub(12)..].iter().rev() {
         let s = l.trim();
         let sl = s.to_lowercase();
@@ -888,6 +971,25 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         }
     }
     if clean.contains("\u{276f} 1.") || (clean.contains("\u{2502} \u{276f} 1.") ) {
+        return "waiting".into();
+    }
+    // CODEX spells its selector cursor `›` (U+203A), not `❯` (U+276F) — found
+    // live 2026-08-11 (AMUX-2913): a codex lane parked on its trust-directory
+    // picker read `idle`, the exact needs-input-invisible failure AMUX-2834
+    // fixed for Claude Code. Requires the footer hint alongside the cursor so
+    // prose that merely QUOTES a numbered list cannot read as a picker (the
+    // AMUX-2642 self-block class).
+    let lower = clean.to_lowercase();
+    if clean.contains("\u{203a} 1.")
+        && (lower.contains("press enter to continue") || lower.contains("enter to select"))
+    {
+        return "waiting".into();
+    }
+    // GEMINI's picker cursor is `●` (U+25CF) inside a `│`-bordered box —
+    // third provider, third selector spelling, found on the same day as the
+    // codex one. The border char on the cursor's own line is the chrome
+    // anchor prose cannot fake (same trick as the `│ ❯ 1.` claude form).
+    if clean.contains("\u{2502} \u{25cf} 1.") {
         return "waiting".into();
     }
     if clean.contains('\u{276f}') {
@@ -1095,6 +1197,160 @@ fn transcript_display_name(jf: &Path) -> Option<String> {
     pick(&serde_json::from_str::<Value>(&first).ok()?)
 }
 
+/// conv-id (transcript file stem) -> owning lane, from every session meta's
+/// `cc_conversation_id` claim. TTL-cached: it reads ~113 small meta files and
+/// its consumers run per fleet pass.
+///
+/// This is the CLAIM side of conversation ownership — a decision amux
+/// recorded — as opposed to the transcript's own title records, which are
+/// labels that go stale across a rename (session `amux` still titled
+/// 'amux-rust' 20k lines later). AMUX-2612 established the precedence for
+/// `session_jsonl_path`; `conversation_owner` below applies the same order to
+/// every other reader so there is one answer to "whose conversation is this",
+/// not four.
+pub(crate) fn conversation_claims() -> std::collections::BTreeMap<String, String> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = (f64, std::collections::BTreeMap<String, String>);
+    static C: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let now = now_f64();
+    let cache = C.get_or_init(|| Mutex::new((0.0, std::collections::BTreeMap::new())));
+    if let Ok(g) = cache.lock() {
+        if now - g.0 < 30.0 && !g.1.is_empty() {
+            return g.1.clone();
+        }
+    }
+    let mut map = std::collections::BTreeMap::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("env") {
+                continue;
+            }
+            let Some(lane) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            let cid = meta_str(&load_meta(lane), "cc_conversation_id");
+            if !cid.is_empty() {
+                map.insert(cid, lane.to_string());
+            }
+        }
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = (now, map.clone());
+    }
+    map
+}
+
+/// The owning lane of a conversation transcript: the meta CLAIM first, the
+/// transcript's LAST title record second, "" for an ad-hoc conversation amux
+/// does not own.
+///
+/// Every reader of "which lane does this transcript belong to" goes through
+/// here. Before this there were four spellings and three of them read the
+/// FIRST line — reintroducing the staleness AMUX-2612 fixed, which is how the
+/// `amux` lane's subagents, tokens and model were all being attributed to
+/// `amux-rust`, its pre-rename name (Ethan, 2026-08-11: "ensure they're
+/// always in sync").
+pub(crate) fn conversation_owner(
+    conv: &Path,
+    claims: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if let Some(stem) = conv.file_stem().and_then(|s| s.to_str()) {
+        if let Some(lane) = claims.get(stem) {
+            return lane.clone();
+        }
+    }
+    transcript_display_name(conv).unwrap_or_default()
+}
+
+/// Model + total context tokens read straight out of a lane's own transcript.
+///
+/// WHY THE SERVER DOES THIS ITSELF (2026-08-11, AMUX-2829/AMUX-2676): the
+/// reporting hook DOES extract both, correctly — verified end to end, an 86-byte
+/// rich body with model and tokens. It reaches nobody. Every real lane posts a
+/// 37/39/41-byte `{state, source}` body, which is the byte-exact shape of the
+/// PREDECESSOR script, because CLAUDE CODE LOADS HOOK CONFIG AT SESSION START
+/// and all ~47 lanes were started before settings.json was repointed. Measured
+/// over 292 report POSTs: 0 rich bodies from a real session, 3 from my own
+/// synthetic tests. Editing files on disk cannot fix that — the command string
+/// is already baked into each running process.
+///
+/// So the evidence has to come from somewhere a running lane cannot withhold.
+/// The transcript is the harness's own structured record, the server can already
+/// resolve it per session, and reading it is not the terminal-scraping D1 warns
+/// about: no rendered UI, no regex over a pane, just the JSONL the harness
+/// writes. A REPORT still wins when one carries these fields — this only fills
+/// the gap, so the D1 direction (the model reporting its own state) is intact
+/// and this quietly stops being load-bearing as lanes restart.
+///
+/// Tail-bounded and TTL-cached: /api/sessions is polled hard and there are ~47
+/// lanes, so an uncached full read would be a file scan per lane per poll.
+pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = HashMap<String, (f64, Option<String>, Option<u64>)>;
+    static EV: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let ttl = std::env::var("AMUX_TRANSCRIPT_EVIDENCE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(15.0);
+    let now = now_f64();
+    let cache = EV.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some((at, m, t)) = g.get(name) {
+            if now - at < ttl {
+                return (m.clone(), *t);
+            }
+        }
+    }
+    let (mut model, mut tokens) = (None, None);
+    if let Some(path) = session_jsonl_path(name) {
+        if let Ok(f) = std::fs::File::open(&path) {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            // Tail only. A long-running lane's transcript reaches hundreds of
+            // MB; the last records are the only ones that describe NOW.
+            const TAIL: u64 = 512_000;
+            let mut buf = String::new();
+            let mut rdr = std::io::BufReader::new(f);
+            if len > TAIL {
+                use std::io::Seek;
+                let _ = rdr.seek(std::io::SeekFrom::Start(len - TAIL));
+            }
+            use std::io::Read;
+            let _ = rdr.read_to_string(&mut buf);
+            // Backwards: the LAST record that carries each field wins, and
+            // stopping early avoids parsing the whole tail once both are found.
+            for line in buf.lines().rev() {
+                if model.is_some() && tokens.is_some() {
+                    break;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let msg = &v["message"];
+                if model.is_none() {
+                    if let Some(m) = msg["model"].as_str().filter(|m| !m.is_empty()) {
+                        model = Some(m.to_string());
+                    }
+                }
+                if tokens.is_none() {
+                    let u = if msg["usage"].is_object() { &msg["usage"] } else { &v["usage"] };
+                    if u.is_object() {
+                        let g = |k: &str| u[k].as_u64().unwrap_or(0);
+                        let t = g("input_tokens")
+                            + g("cache_read_input_tokens")
+                            + g("cache_creation_input_tokens")
+                            + g("output_tokens");
+                        if t > 0 {
+                            tokens = Some(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.insert(name.to_string(), (now, model.clone(), tokens));
+    }
+    (model, tokens)
+}
+
 /// Newest JSONL for a session (py:5590 _session_jsonl_path_uncached): meta
 /// conv-id first, then title match, then the single unclaimed candidate.
 pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
@@ -1125,7 +1381,7 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     if files.is_empty() {
         return None;
     }
@@ -1222,9 +1478,9 @@ fn md_render_table(block: &[&str], max_width: usize) -> String {
         r.split('|').map(|c| c.trim().to_string()).collect()
     }
     fn strip_md(s: &str) -> String {
-        let re1 = regex::Regex::new(r"`([^`]+)`").unwrap();
-        let re2 = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-        let re3 = regex::Regex::new(r"__([^_]+)__").unwrap();
+        let re1 = cached_re!(r"`([^`]+)`");
+        let re2 = cached_re!(r"\*\*([^*]+)\*\*");
+        let re3 = cached_re!(r"__([^_]+)__");
         let s = re1.replace_all(s, "$1");
         let s = re2.replace_all(&s, "$1");
         re3.replace_all(&s, "$1").into_owned()
@@ -1331,7 +1587,7 @@ fn md_render_table(block: &[&str], max_width: usize) -> String {
 
 fn md_to_ansi(text: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
-    let header_re = regex::Regex::new(r"^(#{1,6})\s+(.*)$").unwrap();
+    let header_re = cached_re!(r"^(#{1,6})\s+(.*)$");
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -1405,16 +1661,58 @@ fn tool_result_text(content: &Value) -> String {
 }
 
 /// py:5833 _render_session_transcript — clean ANSI render of the JSONL tail.
+/// The worker's most recent FULL assistant message, text only — no tool calls,
+/// no thinking blocks, no UI chrome. This is what read-aloud sends (Ethan:
+/// "read the most recent full message from the worker ... be intelligent about
+/// what to send"): the last assistant turn that actually SAID something, taken
+/// from the STRUCTURED transcript rather than a scrape of the rendered pane
+/// (which carries spinners and "✻ Churned for 2m" status lines that must never
+/// be read aloud). Reuses the same `session_jsonl_path` + `iter_jsonl_tail` the
+/// transcript renderer uses, so it cannot disagree with it about where the
+/// transcript is or how it is parsed (D1: a real interface, not a scrape).
+fn last_assistant_message(name: &str, max_chars: usize) -> String {
+    let Some(path) = session_jsonl_path(name) else { return String::new() };
+    let mut last = String::new();
+    for o in iter_jsonl_tail(&path, 5_000_000) {
+        if o["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = o.get("message").and_then(|m| m.as_object()) else { continue };
+        let blocks: Vec<Value> = match msg.get("content") {
+            Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+            Some(Value::Array(a)) => a.clone(),
+            _ => continue,
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for b in &blocks {
+            // text only — skip tool_use, tool_result, thinking.
+            if b["type"].as_str() == Some("text") {
+                let t = b["text"].as_str().unwrap_or("").trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        // iter_jsonl_tail is chronological, so overwriting ends on the LAST
+        // assistant turn that had text. A turn that was pure tool_use/thinking
+        // (no text block) is skipped rather than blanking the result.
+        if !parts.is_empty() {
+            last = parts.join("\n\n");
+        }
+    }
+    last.chars().take(max_chars).collect()
+}
+
 fn render_session_transcript(name: &str, max_chars: usize) -> String {
     let Some(path) = session_jsonl_path(name) else { return String::new() };
     let max_read = std::cmp::max(max_chars * 5, 5_000_000) as u64;
     let mut out: Vec<String> = Vec::new();
-    let sysrem = regex::Regex::new(r"(?s)<system-reminder>.*?</system-reminder>").unwrap();
-    let tasknote = regex::Regex::new(r"(?s)<task-notification>.*?</task-notification>").unwrap();
-    let caveat = regex::Regex::new(r"(?s)<local-command-caveat>.*?</local-command-caveat>").unwrap();
-    let cmd_re = regex::Regex::new(r"(?s)<command-name>(.*?)</command-name>").unwrap();
-    let arg_re = regex::Regex::new(r"(?s)<command-args>(.*?)</command-args>").unwrap();
-    let out_re = regex::Regex::new(r"(?s)<local-command-stdout>(.*?)</local-command-stdout>").unwrap();
+    let sysrem = cached_re!(r"(?s)<system-reminder>.*?</system-reminder>");
+    let tasknote = cached_re!(r"(?s)<task-notification>.*?</task-notification>");
+    let caveat = cached_re!(r"(?s)<local-command-caveat>.*?</local-command-caveat>");
+    let cmd_re = cached_re!(r"(?s)<command-name>(.*?)</command-name>");
+    let arg_re = cached_re!(r"(?s)<command-args>(.*?)</command-args>");
+    let out_re = cached_re!(r"(?s)<local-command-stdout>(.*?)</local-command-stdout>");
     for o in iter_jsonl_tail(&path, max_read) {
         let t = o["type"].as_str().unwrap_or("");
         if t != "user" && t != "assistant" {
@@ -1734,7 +2032,7 @@ fn validate_model_name(value: &Value) -> Result<String, String> {
     if normalized.chars().count() > MODEL_ID_MAX_LEN {
         return Err(format!("model name too long (max {MODEL_ID_MAX_LEN} chars)"));
     }
-    let re = regex::Regex::new(r"^[A-Za-z0-9._:\[\]@/+][A-Za-z0-9._:\[\]@/+\-]*$").unwrap();
+    let re = cached_re!(r"^[A-Za-z0-9._:\[\]@/+][A-Za-z0-9._:\[\]@/+\-]*$");
     if !normalized.is_empty() && !re.is_match(&normalized) {
         return Err("invalid model name (allowed: alphanumeric and ._:[]@/+-, no leading hyphen)".into());
     }
@@ -1775,7 +2073,7 @@ fn strip_provider_yolo_flags(flags: &str) -> String {
         for f in PROVIDER_YOLO_FLAGS {
             out = out.replace(f, "");
         }
-        let re = regex::Regex::new(r"--approval-mode(?:=|\s+)yolo\b").unwrap();
+        let re = cached_re!(r"--approval-mode(?:=|\s+)yolo\b");
         return re.replace_all(&out, "").trim().to_string();
     };
     let mut filtered = Vec::new();
@@ -1800,10 +2098,62 @@ fn strip_provider_yolo_flags(flags: &str) -> String {
     filtered.iter().map(|t| sh_quote(t)).collect::<Vec<_>>().join(" ")
 }
 
+/// Standing order (Ethan 2026-08-11: "whenever idle, take care of any
+/// non-terminal board task"): the board-drive continue-nudge is ON by
+/// default; CC_AUTO_CONTINUE=0 opts a lane out. Ethos rule 1 — prefer
+/// opt-out for anything that expands what a session can do; the opt-in
+/// version reached 2 lanes of ~50.
+///
+/// ONE predicate for the mechanism (board_drive) and the view
+/// (/api/sessions `auto_continue`): a view that disagrees with the
+/// mechanism it describes is worse than no view.
+pub(crate) fn auto_continue_on(val: Option<&str>) -> bool {
+    !matches!(
+        val.map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// Is a standing order live for this lane? Scoped worker > group > global,
+/// with `CC_STANDING_ORDERS` as the master off-switch (AMUX-2930).
+///
+/// Ethan, 2026-08-11: "I should be able to shut off standing orders like 'Hey
+/// you have stuff in your to-do. Keep going.' … on the group, global, or
+/// individual worker level … configurable but also obviously have defaults."
+///
+/// TWO LEVELS ON PURPOSE, and no more. `CC_STANDING_ORDERS=0` silences every
+/// board-drive nudge at whatever scope it is set — one knob, the one to reach
+/// for. The per-class keys (`CC_AUTO_PICKUP`, `CC_AUTO_CONTINUE`) stay for the
+/// finer cut, and are checked only when the master has not already said no.
+/// A third spelling would be a second way to express the same thing, which is
+/// how the board keeps growing predicates that disagree.
+///
+/// DEFAULT IS ON, at every level, and that is deliberate rather than inherited:
+/// ethos rule 1 — the opt-IN version of auto-continue reached 2 lanes out of
+/// ~50, so a capability nobody is enrolled in is decoration. Off must be a
+/// choice someone made, and now it is a choice they can make once, for
+/// everyone, instead of 50 times.
+pub fn standing_orders_on(lane: &str, key: &str) -> bool {
+    standing_orders_on_in(&home(), lane, key)
+}
+
+/// Same, over an explicit home — see [`scoped_setting_in`] for why.
+pub fn standing_orders_on_in(home: &std::path::Path, lane: &str, key: &str) -> bool {
+    if !auto_continue_on(scoped_setting_in(home, lane, "CC_STANDING_ORDERS").as_deref()) {
+        return false;
+    }
+    auto_continue_on(scoped_setting_in(home, lane, key).as_deref())
+}
+
 fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {
     PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f))
         || flags.contains("--approval-mode=yolo")
         || flags.contains("--approval-mode yolo")
+        // The EXPLICIT flag, deliberately NOT auto_continue_on(): setting
+        // CC_AUTO_CONTINUE=1 asks for a worker that never stops, which
+        // implies skip-permissions. The DEFAULT-on nudge must not — routing
+        // the default through here would flip the whole fleet to YOLO as a
+        // side effect of a scheduling change.
         || matches!(cfg.get("CC_AUTO_CONTINUE"), Some("1" | "true" | "yes"))
 }
 
@@ -1882,12 +2232,7 @@ fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+use crate::config::now_f64;
 fn now_i64() -> i64 {
     now_f64() as i64
 }
@@ -2033,6 +2378,12 @@ impl DeliveryMeta<'_> {
     }
 }
 
+/// How recently an identical message must have been recorded for the second
+/// one to count as a duplicate DELIVERY rather than a person repeating
+/// themselves. Two minutes: long enough to span a retry, a restart and a queue
+/// drain; short enough that "run the same command again" is not flagged.
+const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -2052,6 +2403,58 @@ pub(crate) async fn cmd_hist_record_full(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let now_ms = now_i64() * 1000;
+
+    // DUPLICATE-DELIVERY DETECTOR (Ethan's standing rule, 2026-08-11: fix the
+    // bug AND make the next one surface in the logs).
+    //
+    // send_dedup only catches a retry carrying the SAME msg_id, its rows are
+    // pruned after 600s, and a dedupe hit writes nothing anywhere — so "was
+    // this delivered twice?" had no answer in amux at all. Establishing that
+    // ONE report was a false alarm took grepping a 1.6MB pane log and
+    // hand-deduping redraw captures, because a pipe-pane log re-captures a
+    // visible line on every repaint ("53 occurrences" meant one delivery).
+    //
+    // This does NOT suppress the second delivery. Two identical sends can be
+    // deliberate, and silently dropping one would turn a visible annoyance into
+    // an invisible data-loss bug — strictly worse. It announces, and lets a
+    // human or a sweep decide.
+    let dup_prior: Option<(i64, i64)> = {
+        let session_q = session.clone();
+        let text_q = text.clone();
+        match state.store.read() {
+            Ok(conn) => conn
+                .query_row(
+                    "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
+                     AND ts > ?3 ORDER BY ts DESC LIMIT 1",
+                    rusqlite::params![session_q, text_q, now_ms - DUP_DELIVERY_WINDOW_MS],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok(),
+            Err(_) => None,
+        }
+    };
+    if let Some((prior_id, prior_ts)) = dup_prior {
+        let age_s = (now_ms - prior_ts) as f64 / 1000.0;
+        tracing::warn!(
+            session = %session, prior_id, age_s,
+            preview = %chars_truncate(&text, 80),
+            "duplicate delivery: identical text already recorded for this lane"
+        );
+        emit_event(
+            state,
+            &session,
+            "message.duplicate",
+            Some(json!({
+                "prior_id": prior_id, "age_s": age_s, "type": ctype,
+                "chars": text.chars().count(),
+                "preview": chars_truncate(&text, 120),
+            })),
+            None,
+            "cmd-history",
+        )
+        .await;
+    }
+
     let _ = state
         .store
         .write_async(move |conn| {
@@ -3114,6 +3517,20 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
     }
 }
 
+/// Which delivery mode a send takes: `true` = tmux paste-buffer, `false` =
+/// `send-keys -l` (typing).
+///
+/// Pure, and separated from `send_text_inner` on purpose. The decision
+/// otherwise sits in the middle of a ~400-line async fn that needs a live tmux
+/// pane to reach, which is precisely the shape that ships untested — and this
+/// one shipped wrong (AMUX-2909: short text typed into a generating lane, the
+/// mode measured as lossy 1/1).
+pub(crate) fn must_paste(generating: bool, chars: usize, picker_shaped: bool) -> bool {
+    // `generating` first because it is the one that was missing: mid-turn, paste
+    // is the only mode measured as non-lossy, regardless of size or shape.
+    generating || chars > 400 || picker_shaped
+}
+
 pub(crate) async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
     send_text_inner(state, name, text, defer_if_busy, false, false, false).await
 }
@@ -3385,6 +3802,42 @@ async fn send_text_inner(
             if line.starts_with('\u{276f}') || line.starts_with('>') {
                 let suggested = line.trim_start_matches(['\u{276f}', '>', '\u{a0}', ' ']).trim();
                 if !suggested.is_empty() {
+                    // A NUMBERED OPTION IS A PICKER, NOT A SUGGESTION
+                    // (AMUX-2952, Ethan live: "i keep sending enter when it
+                    // needs input and its not doing anything").
+                    //
+                    // At an AskUserQuestion selector the ❯ line reads
+                    // "❯ 1. Submit answers". Extracting that as a suggestion
+                    // and DELIVERING IT AS TEXT re-types the label into a UI
+                    // that reads KEY EVENTS — and since AMUX-2909 routes
+                    // picker-shaped panes to bracketed PASTE, the whole string
+                    // is swallowed in one piece. Nothing happens, silently,
+                    // every time. The footer guard above ("enter to select")
+                    // does not save us: AskUserQuestion's review screen has no
+                    // such footer.
+                    //
+                    // What accepting a highlighted option actually takes is the
+                    // Enter KEY. Scoped to options that start "N." so a plain
+                    // suggested prompt ("❯ retry the failing test") still goes
+                    // through the text path unchanged.
+                    let is_numbered = suggested
+                        .split_once('.')
+                        .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+                    if is_numbered {
+                        let (ok, msg) = send_keys_op(name, "Enter").await;
+                        tracing::info!(
+                            session = %name, ok, detail = %msg,
+                            "[picker-enter/AMUX-2952] empty send at a numbered selector — pressed Enter instead of pasting the label"
+                        );
+                        return (
+                            ok,
+                            if ok {
+                                format!("pressed Enter on the picker (highlighted: {suggested})")
+                            } else {
+                                format!("picker Enter failed: {msg}")
+                            },
+                        );
+                    }
                     text = suggested.to_string();
                     break;
                 }
@@ -3479,7 +3932,9 @@ async fn send_text_inner(
     // below safe for the three of amux's five queued messages that carry an
     // `@`, which under the old branch could never be delivered to a busy lane
     // at all.
-    let use_paste = text.chars().count() > 400 || at_picker_text(&text);
+    //
+    // `use_paste` is computed BELOW, after the generating re-check, because
+    // being mid-turn is itself a reason to paste (AMUX-2909).
     let mut esc_at: Option<std::time::Instant> = None;
     // Exclusive use of the pane for the whole type+Enter+verify choreography.
     // Without it a second send (or the ghost-rescue sweep) can fire an Enter
@@ -3511,6 +3966,42 @@ async fn send_text_inner(
             esc_at = Some(std::time::Instant::now());
             sleep_ms(50).await;
         }
+    }
+    // A GENERATING LANE ALWAYS GETS THE PASTE PATH (AMUX-2909). Ethan's report:
+    // a message typed into a lane that is visibly working. The delivery MODE is
+    // the whole defect — the measurement recorded a few lines above is amux's
+    // own, on a live pane: typed mid-turn, the text was LOST 1/1 (the composer
+    // held it and the turn ended without it); the SAME text pasted mid-turn was
+    // accepted 4/4, each recorded by Claude Code as `queue-operation: enqueue`
+    // and folded into the turn. That evidence was already in this file, and the
+    // paste path was still gated on length/picker-shape alone, so every SHORT
+    // human message — the dashboard composer's whole output — took the lossy
+    // mode precisely when the lane was busiest.
+    //
+    // Note what this deliberately is NOT: a deferral to the next turn boundary.
+    // Claude Code already has a queue and enqueues pasted text itself, so
+    // holding the message would add latency and duplicate a queue the harness
+    // owns — amux's job is to hand the text over in the form the harness
+    // accepts, not to build a second queue in front of it. Idle lanes are
+    // untouched: they still type, with no added latency.
+    let use_paste = must_paste(generating, text.chars().count(), at_picker_text(&text));
+    if generating {
+        // Mid-turn delivery is the risky case, so make every instance
+        // self-announcing rather than reconstructable (ethos rule 4 / the
+        // two-fix rule): before this, nothing recorded WHICH MODE a message was
+        // delivered in, so "was it typed or pasted, and was the lane mid-turn?"
+        // — the exact question this bug turns on — could not be answered from
+        // anything amux kept. A sweep can now count mid-turn deliveries, and
+        // `mode="type"` here should be structurally impossible.
+        tracing::warn!(
+            session = %name,
+            mode = if use_paste { "paste" } else { "type" },
+            chars = text.chars().count(),
+            from_steering,
+            allow_mid_turn,
+            "delivering to a GENERATING lane — paste is the only mode measured as \
+             non-lossy mid-turn (AMUX-2909); mode=type here is a regression"
+        );
     }
     send_key(name, "C-u").await;
     sleep_ms(40).await;
@@ -3864,6 +4355,72 @@ fn session_op_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// Seed per-directory folder-trust so a freshly-spawned claude in `work_dir`
+/// does not stop at the first-run "Do you trust the files in this folder?"
+/// dialog (AC-346). Claude persists trust as
+/// `projects[<dir>].hasTrustDialogAccepted=true` in `~/.claude.json`; there is
+/// NO global flag (amux-cloud confirmed the config surface — trust is
+/// per-project only), so a static Dockerfile cannot cover future verticals'
+/// dirs. It must be seeded at launch, when CC_DIR is known.
+///
+/// STRICTLY FAIL-OPEN. This runs on the path that spawns EVERY worker, so a
+/// missing / locked / malformed `~/.claude.json` must NEVER block a launch: every
+/// error returns quietly and the worst case is the status quo (the gate is not
+/// bypassed), never a wedged launch. Merge-preserving — the whole document is
+/// read, ONE nested field is set, and it is written back, so `oauthAccount`,
+/// other projects, and the theme are untouched. A present-but-unparseable file
+/// is left ALONE rather than risk clobbering real state. No-op locally where the
+/// dir is already trusted (the common case), so it is a genuine single-codebase
+/// no-op there, not an env branch.
+fn seed_dir_trust(work_dir: &str) {
+    if work_dir.is_empty() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join(".claude.json");
+    let doc: Value = match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return, // malformed: never clobber a file we cannot safely merge
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => return,
+    };
+    let Some(updated) = trust_seed_merge(doc, work_dir) else {
+        // None => already trusted (no write) or an unmergeable shape (left alone).
+        return;
+    };
+    let Ok(body) = serde_json::to_string(&updated) else { return };
+    // Atomic write: temp + rename, so a concurrent reader (another worker's
+    // claude) never sees a truncated document.
+    let tmp = path.with_extension("json.amux-trust-tmp");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Pure merge for [`seed_dir_trust`], split out so the shape handling is tested
+/// without touching `$HOME`. Returns `Some(doc)` with
+/// `projects[dir].hasTrustDialogAccepted=true` folded in, or `None` when it is
+/// already `true` (nothing to write) or the document is not a mergeable object
+/// (leave the real file alone).
+fn trust_seed_merge(mut doc: Value, dir: &str) -> Option<Value> {
+    let root = doc.as_object_mut()?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    let entry = projects
+        .entry(dir.to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    if entry.get("hasTrustDialogAccepted") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    entry.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+    Some(doc)
+}
+
 async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
@@ -3909,6 +4466,10 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| expanduser(&wd).to_string_lossy().into_owned())
     };
+    // AC-346: seed per-directory folder-trust so the claude about to launch in
+    // work_dir does not stop at the first-run "trust this folder?" dialog. Runs
+    // BEFORE the pane starts claude; strictly fail-open (see seed_dir_trust).
+    seed_dir_trust(&work_dir);
     let mut flags = cfg.get_or("CC_FLAGS", "").to_string();
     #[cfg(unix)]
     {
@@ -3919,7 +4480,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     }
     let mut meta = load_meta(name);
     let provider = provider_of(&cfg);
-    let uuid_re = regex::Regex::new(r"^[0-9a-fA-F-]{36}$").unwrap();
+    let uuid_re = cached_re!(r"^[0-9a-fA-F-]{36}$");
     // Resume strategy (py:24250-24295). The Rust origin resolves via the
     // conversation UUID (deterministic, hook-reported); the name-indexed
     // lookup Python layers on top needs its session-name index, which is a
@@ -4268,6 +4829,53 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             }
         }
     }
+    // CODEX SELF-UPDATE EXIT (AMUX-2921, observed live 2026-08-11): on a
+    // version bump codex updates itself via npm, prints "🎉 Update ran
+    // successfully! Please restart Codex." and EXITS — the launch watch
+    // times out on a bare shell and the lane is dead while start_session
+    // reports started. Relaunch ONCE, gated on the positive marker AND a
+    // childless shell — never on the timeout alone, which is the same
+    // no-blind-retype rule the claude fallback above follows (a retype into
+    // a live TUI is a garbage prompt to the model).
+    if !launched && provider == "codex" {
+        let o = strip_ansi(&tmux_capture(name, 30).await);
+        if o.contains("Update ran successfully")
+            && at_shell_prompt(&o)
+            && pane_has_live_child(name).await != Some(true)
+        {
+            tracing::warn!(session = %name,
+                "codex self-updated and exited on launch — relaunching once");
+            emit_event(
+                state,
+                name,
+                "session.codex_update_relaunch",
+                Some(json!({"detected_by": "start_session"})),
+                None,
+                "start_session",
+            )
+            .await;
+            let _ = send_literal(name, &cmd).await;
+            sleep_ms(150).await;
+            send_key(name, "Enter").await;
+            let mut relaunched = false;
+            for _ in 0..20 {
+                sleep_ms(500).await;
+                let o2 = strip_ansi(&tmux_capture(name, 10).await);
+                if claude_ui_visible(&o2) {
+                    relaunched = true;
+                    break;
+                }
+            }
+            if !relaunched {
+                // The one relaunch did not take either — say so durably
+                // instead of reporting a started lane that is a dead shell.
+                tracing::warn!(session = %name,
+                    "codex relaunch after self-update did not reach the UI");
+                meta.insert("start_error".into(), json!("codex exited after self-update; relaunch did not reach the UI"));
+                save_meta(name, &meta);
+            }
+        }
+    }
     // Stream output to the session log (py:24800).
     let _ = std::fs::create_dir_all(logs_dir());
     let lp = log_path(name);
@@ -4605,94 +5213,6 @@ async fn resize_pane(name: &str, cols: i64, rows: i64) -> (bool, String) {
 // capture; the Background dialog is cancelled, never confirmed.
 // ---------------------------------------------------------------------------
 
-struct AgentRow {
-    cursor: bool,
-    viewed: bool,
-    label: String,
-}
-
-fn agent_panel(clean: &str) -> (bool, Vec<AgentRow>) {
-    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let mut rows: Vec<AgentRow> = Vec::new();
-    let gap_re = regex::Regex::new(r"\s{4,}").unwrap();
-    let ws_re = regex::Regex::new(r"\s+").unwrap();
-    let mut i = lines.len() as isize - 1;
-    while i >= 0 {
-        let s = lines[i as usize].trim();
-        let body = s.trim_start_matches(['\u{276f}', ' ', '\u{a0}']).trim();
-        let first = body.chars().next();
-        if matches!(first, Some('\u{23fa}' | '\u{25ef}' | '\u{25cf}' | '\u{25cb}')) {
-            let after: String = body.chars().skip(1).collect();
-            let label = gap_re.split(after.trim()).next().unwrap_or("").to_string();
-            rows.push(AgentRow {
-                cursor: s.starts_with('\u{276f}'),
-                viewed: matches!(first, Some('\u{23fa}' | '\u{25cf}')),
-                label: ws_re.replace_all(&label, " ").into_owned(),
-            });
-            i -= 1;
-            continue;
-        }
-        break;
-    }
-    rows.reverse();
-    let select = rows.iter().any(|r| r.cursor);
-    (select, rows)
-}
-
-async fn agent_nav(name: &str, direction: &str, index: i64) -> (bool, String) {
-    let cap = |name: String| async move { strip_ansi(&tmux_capture(&name, 20).await) };
-    let mut clean = cap(name.to_string()).await;
-    if clean.contains("Background this session?") {
-        send_key(name, "Escape").await;
-        sleep_ms(400).await;
-        clean = cap(name.to_string()).await;
-    }
-    let (mut select, mut rows) = agent_panel(&clean);
-    if rows.is_empty() {
-        return (false, "no agents panel on screen".into());
-    }
-    for _ in 0..3 {
-        if select {
-            break;
-        }
-        send_key(name, "Down").await;
-        sleep_ms(350).await;
-        let c = cap(name.to_string()).await;
-        let (s2, r2) = agent_panel(&c);
-        select = s2;
-        rows = r2;
-    }
-    if !select || rows.is_empty() {
-        return (false, "could not enter agent select mode".into());
-    }
-    let cursor = rows
-        .iter()
-        .position(|r| r.cursor)
-        .or_else(|| rows.iter().position(|r| r.viewed))
-        .unwrap_or(0);
-    let target = match direction {
-        "main" => 0usize,
-        "index" => (index.max(0) as usize).min(rows.len() - 1),
-        "up" => cursor.saturating_sub(1),
-        _ => (cursor + 1).min(rows.len() - 1),
-    };
-    let steps = target.abs_diff(cursor);
-    for _ in 0..steps {
-        send_key(name, if target > cursor { "Down" } else { "Up" }).await;
-        sleep_ms(250).await;
-    }
-    let c = cap(name.to_string()).await;
-    let (s3, _r3) = agent_panel(&c);
-    if !s3 {
-        return (false, "agent panel closed mid-navigation".into());
-    }
-    send_key(name, "Enter").await;
-    sleep_ms(350).await;
-    let c2 = cap(name.to_string()).await;
-    let (_s4, rows4) = agent_panel(&c2);
-    let viewing = rows4.iter().find(|r| r.viewed).map(|r| r.label.clone()).unwrap_or_default();
-    (true, if viewing.is_empty() { "switched".into() } else { viewing })
-}
 
 // ---------------------------------------------------------------------------
 // Saved-log helpers (py:5175-5478).
@@ -5082,7 +5602,7 @@ fn get_claude_stats(work_dir: &str) -> Value {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     let Some((_, newest)) = files.first() else {
         return json!({"tokens": 0, "last_active": ""});
     };
@@ -5465,7 +5985,7 @@ fn backup_session_jsonl(name: &str, reason: &str) -> Option<String> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     let (_, src) = files.first()?;
     let dest_dir = transcripts_dir().join(name);
     std::fs::create_dir_all(&dest_dir).ok()?;
@@ -5480,7 +6000,7 @@ fn backup_session_jsonl(name: &str, reason: &str) -> Option<String> {
             .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
             .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
             .collect();
-        backups.sort_by(|a, b| a.0.cmp(&b.0));
+        backups.sort_by_key(|e| e.0);
         let excess = backups.len().saturating_sub(20);
         for (_, old) in backups.into_iter().take(excess) {
             let _ = std::fs::remove_file(old);
@@ -5498,7 +6018,7 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     files
         .into_iter()
         .filter_map(|(_, f)| {
@@ -5531,7 +6051,7 @@ const MEM_TOPIC_FILE: &str = "amux-api.md";
 ///
 /// Excludes archived lanes and the reader itself — "who else is out there" is
 /// the question, and 50 rows of which one is you is noise.
-fn fleet_roster(me: &str) -> String {
+fn fleet_roster() -> String {
     let mut rows: Vec<(String, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
         let mut names: Vec<String> = rd
@@ -5542,9 +6062,17 @@ fn fleet_roster(me: &str) -> String {
             .collect();
         names.sort();
         for other in names {
-            if other == me {
-                continue;
-            }
+            // NO SELF-EXCLUSION (AMUX-2831). MEMORY.md is keyed on the PROJECT
+            // DIRECTORY, not the lane, so a shared checkout has ONE file for
+            // every lane in it — 17 lanes share ~/Dev/mixpeek. A roster that
+            // omitted "me" was therefore correct for exactly one reader (the
+            // lane that wrote last) and wrong for the other sixteen, who read a
+            // list including themselves and omitting the writer. Last-writer-wins,
+            // which is this card's subject, and my own feature was an instance.
+            //
+            // Listing everyone is the only shape true for every reader of a
+            // shared file. A lane identifies itself by $AMUX_SESSION, which it
+            // always has; the file cannot know who is reading it.
             let env = crate::config::parse_env_file(&sessions_dir().join(format!("{other}.env")));
             if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
                 continue;
@@ -5567,7 +6095,9 @@ fn fleet_roster(me: &str) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
+        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
+this directory, so it cannot omit the reader. You are the one whose name matches $AMUX_SESSION.\n\n\
+Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
     );
     for (n, g, d) in rows.iter().take(120) {
         let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
@@ -5615,6 +6145,32 @@ pub(crate) fn refresh_fleet_rosters() -> usize {
     n
 }
 
+/// The worker-memory block as it appears in Claude's MEMORY.md, NAMED with the
+/// lane that wrote it. Empty when the lane has recorded nothing — a header over
+/// nothing is itself a claim.
+///
+/// AMUX-2831. The content is PER-WORKER (mem_file(name)); the destination is
+/// PER-CWD. Measured 2026-08-11: 40 of 113 lanes share a cwd, 18 share
+/// ~/Dev/mixpeek and 6 share ~/Dev/amux, all reading ONE MEMORY.md. The harm
+/// the card names is not that the file is shared — that is Claude Code's keying
+/// and amux cannot change it — but that a lane "READS A PEER'S MEMORY AND
+/// CANNOT TELL". An unlabelled block implicitly claims to be the reader's own
+/// notes, which is false for every lane except the last writer.
+///
+/// Same rule fleet_roster follows: content in a shared file must be true for
+/// EVERY reader, because the file cannot know who is reading it.
+fn compose_worker_block(name: &str, session_content: &str) -> String {
+    if session_content.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Worker memory — `{name}`\n\n         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
+         memory: useful context, not your own notes. Your own is at \
+         ~/.amux/memory/<your-worker>.md and reaches this file when you write it. -->\n\n{}",
+        session_content.trim()
+    )
+}
+
 fn write_claude_memory(name: &str, work_dir: &str) {
     let pname = project_name(work_dir);
     let session_file = mem_file(name);
@@ -5632,8 +6188,9 @@ fn write_claude_memory(name: &str, work_dir: &str) {
         ));
     }
     parts.push(MEM_MARKER.to_string());
-    if !session_content.trim().is_empty() {
-        parts.push(session_content.trim().to_string());
+    let worker_block = compose_worker_block(name, &session_content);
+    if !worker_block.is_empty() {
+        parts.push(worker_block);
     }
     let composed = parts.join("\n\n") + "\n";
 
@@ -5651,7 +6208,7 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     }
     // The roster rides on the SAME write, so it is refreshed whenever the
     // session's memory is — no separate job to fall behind the fleet.
-    let composed = composed + &fleet_roster(name);
+    let composed = composed + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 
@@ -6631,6 +7188,11 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
     let dir = sessions_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
     let mut found = 0usize;
+    // One fleet-wide pass, shared with the status derivation — the stuck-
+    // composer gate below must agree with derive_status about whether a
+    // lane's background agents are live, or a lane reads `active` on the
+    // fleet list and `stuck` here in the same breath.
+    let sub_activity = crate::api::sessions_legacy::scan_subagent_activity();
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("env") {
@@ -6645,6 +7207,102 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             continue;
         }
         let pane = tmux_capture(name, 30).await;
+
+        // INPUT-REQUIRED IS A DISTINCT STATE, and the dashboard has always been
+        // able to show it (app.js:2405 renders `needs input`, and there is a
+        // filter for it) — no lane ever reached it. The fleet listing derives
+        // status from self-reports and tmux activity, neither of which can see a
+        // PICKER; only a pane capture can, and this sweep is the one place that
+        // already pays for one (AMUX-2834).
+        //
+        // A lane sitting on an AskUserQuestion is BLOCKED ON A HUMAN and is the
+        // opposite of idle: nothing will move it, no deadline will force it, and
+        // amux must not answer it (typing there rejects the pending tool — the
+        // 2026-07-15 kill). Reading as `idle` is exactly backwards, and it hid
+        // mvs-infra behind a menu for 400s+ earlier today.
+        //
+        // A rate-limit menu is EXCLUDED: it is also a selector, but amux owns it
+        // and answers it below, so flagging it would ask a human for something
+        // nobody needs to decide.
+        let selector_now = !is_rate_limit_menu(&pane) && detect_claude_status(&pane) == "waiting";
+        let selector_was = load_meta(name)["input_required_since"].as_i64().unwrap_or(0) > 0;
+        if selector_now != selector_was {
+            update_meta(
+                name,
+                &[("input_required_since", json!(if selector_now { now_i64() } else { 0 }))],
+            );
+            if selector_now {
+                emit_event(
+                    state,
+                    name,
+                    "session.input_required",
+                    Some(json!({"detected_by": "sweep"})),
+                    Some(format!("inputreq:{name}:{}", now_i64() / 3600)),
+                    "status",
+                )
+                .await;
+            }
+        }
+
+        // STUCK COMPOSER (AMUX-2904). Genuinely TYPED text sits under `❯`
+        // while the main loop is idle and no background agent is live —
+        // an Enter that never landed, or a human's committed-but-unsubmitted
+        // command. The lane read `idle` throughout, which is how unsubmitted
+        // text sits invisible for hours: ghost-rescue presses Enter for
+        // amux-prefixed text, but deliberately leaves everything else alone
+        // (a false rescue submits a human's half-written thought), and until
+        // now "left alone" also meant "invisible". This stamp is the visible
+        // half: surface it as `waiting`, decide nothing.
+        //
+        // MUST go through composer_state().typed(), never a stripped-ANSI
+        // read of the ❯ line: Claude Code paints a dim SUGGESTION in the
+        // empty composer, and attribute-blind reading of it is exactly the
+        // 2026-08-09 incident where 13 idle lanes were reported as holding
+        // stuck text ("push it", "continue with the queue", …) and three
+        // people pressed Enter on frames with nothing to submit. The
+        // composer_state_tests pin that discrimination; this caller inherits
+        // it. Text while GENERATING or while agents are hot is the legitimate
+        // queue doing its job and is not stamped.
+        let agents_live = sub_activity
+            .get(name)
+            .is_some_and(|m| now_f64() - m < 180.0);
+        let typed_pending = (!is_rate_limit_menu(&pane)
+            && !selector_now
+            && !pane_bar_says_generating(&pane)
+            && detect_claude_status(&pane) != "active"
+            && !agents_live)
+            .then(|| composer_state(&pane).typed().map(|t| t.to_string()))
+            .flatten();
+        let stuck_now = typed_pending.is_some();
+        let meta_now = load_meta(name);
+        let stuck_was = meta_now["composer_stuck_since"].as_i64().unwrap_or(0) > 0;
+        if stuck_now != stuck_was {
+            let preview = typed_pending
+                .as_deref()
+                .map(|t| chars_truncate(t, 120))
+                .unwrap_or_default();
+            update_meta(
+                name,
+                &[
+                    ("composer_stuck_since", json!(if stuck_now { now_i64() } else { 0 })),
+                    ("composer_preview", json!(if stuck_now { preview.clone() } else { String::new() })),
+                ],
+            );
+            if stuck_now {
+                tracing::warn!(session = %name, preview = %preview,
+                    "unsubmitted text is stuck in the composer with no live turn or agents — the lane will read `waiting` until it is submitted or cleared");
+                emit_event(
+                    state,
+                    name,
+                    "session.composer_stuck",
+                    Some(json!({"preview": preview, "detected_by": "sweep"})),
+                    Some(format!("composerstuck:{name}:{}", now_i64() / 3600)),
+                    "status",
+                )
+                .await;
+            }
+        }
+
         if !is_rate_limit_menu(&pane) {
             // Recovered on its own (or was never limited): clear a stale stamp
             // so the fleet view does not stay red after the fact.
@@ -6718,6 +7376,10 @@ pub async fn steer_deliver_loop(state: AppState) {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions/{name}", any(session_root_handler))
+        // A WARN nobody can query is the same gap one layer out: this is
+        // where a sweep or an autofix loop asks "did anything get delivered
+        // twice, and to whom" without grepping a pane log.
+        .route("/api/debug/duplicate-deliveries", axum::routing::get(debug_duplicate_deliveries))
         .route("/api/sessions/{name}/{*verb}", any(session_verb_handler))
         // Why steering is or is not moving. See `steering_debug`.
         .route("/api/debug/steering", axum::routing::get(steering_debug))
@@ -6851,7 +7513,14 @@ async fn dispatch(
         return post_dispatch(&state, &name, &action, &headers, &body).await;
     }
     if method == Method::PATCH {
-        return patch_dispatch(&state, &name, &action, &body).await;
+        // Bare PATCH on the resource aliases the config verb — the fourth
+        // instance of the reach-for-the-obvious-verb class documented on the
+        // DELETE alias below (found live 2026-08-11: a tags edit sent to
+        // PATCH /api/sessions/<n> answered a bare 404 that named nothing,
+        // while /config sat one path segment away). Same rule as DELETE: an
+        // alias to the SAME function, so the two spellings cannot drift.
+        let act = if action.is_empty() { "config" } else { action.as_str() };
+        return patch_dispatch(&state, &name, act, &body).await;
     }
     // DELETE on the RESOURCE — the conventional REST spelling (AMUX-2665).
     //
@@ -6873,6 +7542,169 @@ async fn dispatch(
         return delete_post(&state, &name, &headers).await;
     }
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
+}
+
+
+/// A lane's subagents, from `~/.claude/projects/<proj>/<conv-uuid>/subagents/`.
+///
+/// The parent conversation's owner resolves through [`conversation_owner`] —
+/// meta claim first, last title record second — the same resolution the
+/// token-ledger indexer and the fleet's subagent-activity scan use,
+/// deliberately not a second one (it WAS a first-line read here, which
+/// attributed the `amux` lane's subagents to its pre-rename name).
+///
+/// A subagent's own first record is a `fork-context-ref` (agentId,
+/// parentSessionId, contextLength); the handed-down task carries
+/// `subagent_type` and a human-readable `description`. Both are reported when
+/// present and omitted when not — a made-up label is worse than none in a
+/// switcher, because it cannot be told from a real one.
+fn session_subagents(name: &str) -> Value {
+    let projects = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/projects");
+    let mut out: Vec<Value> = Vec::new();
+    let Ok(projs) = std::fs::read_dir(&projects) else {
+        return json!({"session": name, "subagents": [], "source": "transcripts"});
+    };
+    let claims = conversation_claims();
+    for proj in projs.flatten() {
+        let Ok(convs) = std::fs::read_dir(proj.path()) else { continue };
+        for c in convs.flatten() {
+            let conv = c.path();
+            if conv.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if conversation_owner(&conv, &claims) != name {
+                continue;
+            }
+            let stem = conv.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = conv.with_extension("").join("subagents");
+            let Ok(agents) = std::fs::read_dir(&dir) else { continue };
+            for a in agents.flatten() {
+                let p = a.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let meta = p.metadata().ok();
+                let modified = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let (kind, description, turns) = subagent_head(&p);
+                out.push(json!({
+                    "id": p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    "conversation": stem,
+                    "type": kind,
+                    "description": description,
+                    "turns": turns,
+                    "last_active": modified,
+                    "bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                }));
+            }
+        }
+    }
+    // Most recently active first: a switcher is read to jump to what is moving.
+    out.sort_by_key(|v| -(v["last_active"].as_i64().unwrap_or(0)));
+    json!({"session": name, "subagents": out, "source": "transcripts"})
+}
+
+/// (subagent_type, description, turn count). Scans only the head of the file —
+/// the fork boilerplate is in the first few records and some of these are tens
+/// of MB.
+fn subagent_head(path: &Path) -> (Value, Value, i64) {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return (Value::Null, Value::Null, 0) };
+    let mut kind = Value::Null;
+    let mut desc = Value::Null;
+    let mut turns = 0i64;
+    for (i, line) in std::io::BufReader::new(f).lines().enumerate() {
+        let Ok(line) = line else { break };
+        turns += 1;
+        if i > 12 || (!kind.is_null() && !desc.is_null()) {
+            // Keep counting turns cheaply once the head is parsed.
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let blob = v.to_string();
+        for key in ["subagent_type", "subagentType", "agentType"] {
+            if kind.is_null() {
+                if let Some(x) = json_str_after(&blob, key) {
+                    kind = json!(x);
+                }
+            }
+        }
+        if desc.is_null() {
+            if let Some(x) = json_str_after(&blob, "description") {
+                desc = json!(x);
+            }
+        }
+    }
+    (kind, desc, turns)
+}
+
+/// `"key": "value"` out of a serialized record. The task metadata is nested
+/// inside tool-use content blocks whose shape Claude Code changes freely, so a
+/// typed struct here would silently stop matching; this degrades to None
+/// instead, which the caller reports as an absent label rather than a wrong one.
+fn json_str_after(blob: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let i = blob.find(&pat)? + pat.len();
+    let rest = blob[i..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let v = &rest[..end];
+    (!v.is_empty() && v.len() <= 200).then(|| v.to_string())
+}
+
+
+/// GET /api/debug/duplicate-deliveries?hours=24 — every lane that received the
+/// SAME text twice inside the detector's window, newest first.
+///
+/// Reads `session_events` rows the detector writes, so it reports what actually
+/// happened rather than re-deriving a heuristic. `window_ms` is echoed so a
+/// reader knows what "duplicate" meant without going to the source.
+async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): RawQuery) -> Response {
+    let params = parse_qs(q.as_deref().unwrap_or(""));
+    let hours: f64 = qs_get(&params, "hours").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let since = now_f64() - hours * 3600.0;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    let rows: Vec<Value> = conn
+        .prepare(
+            "SELECT ts, session, data FROM session_events \
+             WHERE type='message.duplicate' AND ts > ?1 ORDER BY ts DESC LIMIT 200",
+        )
+        .and_then(|mut st| {
+            let it = st.query_map(rusqlite::params![since], |r| {
+                let data: Option<String> = r.get(2)?;
+                Ok(json!({
+                    "ts": r.get::<_, f64>(0)?,
+                    "session": r.get::<_, String>(1)?,
+                    "detail": data
+                        .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                        .unwrap_or(Value::Null),
+                }))
+            })?;
+            Ok(it.flatten().collect())
+        })
+        .unwrap_or_default();
+    let mut by_session: BTreeMap<String, i64> = BTreeMap::new();
+    for r in &rows {
+        *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
+    }
+    j200(json!({
+        "hours": hours,
+        "window_ms": DUP_DELIVERY_WINDOW_MS,
+        "total": rows.len(),
+        "by_session": by_session,
+        "events": rows,
+        "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
+                 Deliveries are never suppressed on this signal — two identical sends can be \
+                 deliberate, and dropping one would turn a visible annoyance into silent loss.",
+    }))
 }
 
 fn qs_first<'a>(qs: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
@@ -6914,6 +7746,17 @@ async fn get_dispatch(
             }
         }
         "tasks" => j200(session_cc_tasks(name).await),
+        // GET /api/sessions/<n>/subagents — this lane's forks/subagents, read
+        // from their DURABLE transcripts rather than inferred from the pane
+        // (AMUX-2635).
+        //
+        // The pane-glyph predicate this replaces matched 0 of 50 lanes, twice,
+        // confirmed in both directions. The transcripts matched 50 of 50 — same
+        // question, opposite answer, because the instrument was wrong and not
+        // the feature. That is D1's documented exit: a real interface instead of
+        // a scrape of rendered output, and it improves as Claude Code does
+        // rather than breaking on the next glyph change.
+        "subagents" => j200(session_subagents(name)),
         "peek" => {
             let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
             let live_only = qs_flag(qs, "live");
@@ -6928,6 +7771,18 @@ async fn get_dispatch(
             } else {
                 j200(json!({"name": name, "output": txt, "source": "transcript"}))
             }
+        }
+        // The worker's most recent full assistant message, clean — what the
+        // "read latest message" ellipsis action speaks (AMUX-3021).
+        "last-message" => {
+            let mx: usize = qs_first(qs, "max", "8000").parse().unwrap_or(8000);
+            let txt = last_assistant_message(name, mx);
+            j200(json!({
+                "name": name,
+                "text": txt,
+                "chars": txt.chars().count(),
+                "empty": txt.is_empty(),
+            }))
         }
         "info" => {
             // py:20461 get_session_info.
@@ -7302,7 +8157,7 @@ async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
             let fmt_arg = format!("--format={fmt}");
             let mut commits = vec![];
             if let Some(out) = git_out(&wd, &["log", &count_arg, &fmt_arg], Duration::from_secs(10)).await {
-                let sess_re = regex::Regex::new(r"(?m)^Amux-Session:\s*(.+)$").unwrap();
+                let sess_re = cached_re!(r"(?m)^Amux-Session:\s*(.+)$");
                 for entry in out.split('\u{1E}') {
                     let entry = entry.trim();
                     if entry.is_empty() {
@@ -7358,7 +8213,7 @@ async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
             let staged = qs_first(qs, "staged", "0") == "1";
             let base = qs_first(qs, "base", "").to_string();
             if !base.is_empty() {
-                let base_re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,120}$").unwrap();
+                let base_re = cached_re!(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,120}$");
                 if !base_re.is_match(&base) {
                     return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid base"}));
                 }
@@ -7430,7 +8285,7 @@ fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
     };
     if *method == Method::POST {
         let conv_id = body_str(body, "conversation_id").trim().to_string();
-        let conv_re = regex::Regex::new(r"^[0-9a-fA-F-]{8,64}$").unwrap();
+        let conv_re = cached_re!(r"^[0-9a-fA-F-]{8,64}$");
         if !conv_id.is_empty() && conv_re.is_match(&conv_id) {
             let owner = conversation_owned_by_other(&conv_id, name);
             if owner.is_empty() {
@@ -7461,6 +8316,24 @@ fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
 // steer POST/DELETE (py:75463-75533).
 // ---------------------------------------------------------------------------
 
+/// Was this queue row enqueued by AMUX ITSELF (board-drive, a schedule,
+/// commit-nudge, auto-compact, status-request…) rather than by a human?
+///
+/// Ethan 2026-08-11, on a scheduler board-push sitting in tubescience's
+/// user-facing queue as "1 queued": "board pushes should be system level not
+/// queues". The delivery mechanism is the same (turn-boundary steering); the
+/// SURFACE must not be — a system push counted with human messages reads as
+/// something a person queued, and "Clear all" could silently discard the
+/// fleet's own drive prompts alongside a stray draft.
+///
+/// The discriminator is the guard every system enqueuer already stamps.
+/// Human paths enqueue with guard "" — or "selector-answer", which is human
+/// INTENT (their answer to a picker) wearing a dedupe guard. The SQL
+/// predicate in the clear-all below must stay the mirror of this.
+pub(crate) fn steer_guard_is_system(guard: &str) -> bool {
+    !guard.is_empty() && guard != "selector-answer"
+}
+
 async fn steer_mutate(
     state: &AppState,
     name: &str,
@@ -7471,6 +8344,7 @@ async fn steer_mutate(
     if *method == Method::DELETE {
         let msg_id = body_str(body, "id");
         let sent = body.get("sent").map(py_truthy).unwrap_or(false);
+        let include_system = body.get("include_system").map(py_truthy).unwrap_or(false);
         let session = name.to_string();
         let id2 = msg_id.clone();
         let reply = state
@@ -7488,8 +8362,19 @@ async fn steer_mutate(
                         )
                         .ok();
                     removed = conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])? as i64;
-                } else {
+                } else if include_system {
                     removed = conn.execute("DELETE FROM steering_queue WHERE session=?", [&session])? as i64;
+                } else {
+                    // Clear-all spares SYSTEM rows (board pushes, schedules —
+                    // mirror of steer_guard_is_system): a human clearing their
+                    // queue is discarding THEIR drafts, not amux's drive
+                    // prompts. Per-row ✕ still removes anything by id, and
+                    // include_system:true asks for the full sweep explicitly.
+                    removed = conn.execute(
+                        "DELETE FROM steering_queue WHERE session=? \
+                         AND (COALESCE(guard,'')='' OR guard='selector-answer')",
+                        [&session],
+                    )? as i64;
                 }
                 if let Some((text, queued_at)) = sent_row.filter(|_| sent) {
                     let hid = id2.clone();
@@ -7594,17 +8479,7 @@ async fn steer_mutate(
     jresp(StatusCode::METHOD_NOT_ALLOWED, json!({"error": "method not allowed"}))
 }
 
-/// Python truthiness over JSON (mirrors api/mod.rs's private helper).
-fn py_truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
+use super::py_truthy;
 
 // ---------------------------------------------------------------------------
 // POST verbs (py:75534-76326).
@@ -7686,24 +8561,11 @@ async fn post_dispatch(
             let (ok, msg) = resize_pane(name, cols, rows).await;
             j200(json!({"ok": true, "resized": ok, "message": msg}))
         }
-        "agent-nav" => {
-            let d = body_str(body, "dir").trim().to_string();
-            if !matches!(d.as_str(), "up" | "down" | "main" | "index") {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "dir must be up|down|main|index"}));
-            }
-            let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if d == "index" && idx < 0 {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "index required for dir=index"}));
-            }
-            if !is_running(name).await {
-                return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
-            }
-            let (ok, msg) = agent_nav(name, &d, idx).await;
-            jresp(
-                if ok { StatusCode::OK } else { StatusCode::CONFLICT },
-                json!({"ok": ok, "viewing": if ok { msg.clone() } else { String::new() }, "message": msg}),
-            )
-        }
+        // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
+        // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
+        // longer renders — 0 of 50 sessions matched, so the verb was wired
+        // end-to-end and reached nobody. The durable replacement is
+        // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
         "memory" => {
             let content = body_str(body, "content");
             let mf = mem_file(name);
@@ -7729,7 +8591,7 @@ async fn post_dispatch(
             if branch.is_empty() {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
             }
-            let re = regex::Regex::new(r"^[a-zA-Z0-9_./@\-]+$").unwrap();
+            let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
             if !re.is_match(&branch) {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
             }
@@ -7843,7 +8705,7 @@ async fn post_dispatch(
             if new_name.is_empty() {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
             }
-            let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+            let re = cached_re!(r"[^a-zA-Z0-9_-]");
             let new_name = re.replace_all(&new_name, "-").into_owned();
             let new_file = env_path(&new_name);
             if new_file.exists() {
@@ -7941,15 +8803,30 @@ async fn post_dispatch(
         }
         "report" => report_post(state, name, headers, body).await,
         "apply-template" => {
-            let re = regex::Regex::new(r"[^a-z0-9\-]").unwrap();
+            let re = cached_re!(r"[^a-z0-9\-]");
             let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
             let work_dir = body_str(body, "dir").trim().to_string();
+            // Two different failures, two different messages. They shared one
+            // string until 2026-08-11, and that is precisely why a dead
+            // templates_dir() went unnoticed: "template not found" reads as
+            // "you asked for a template that doesn't exist", so nobody
+            // suspected the ROOT was missing. Name which one it is.
             let Some(tmpl_root) = templates_dir() else {
-                return jresp(StatusCode::NOT_FOUND, json!({"error": "template not found"}));
+                return jresp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error": "no templates directory on this machine",
+                           "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
+                           "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
+                                     home().join("templates").display().to_string()]}),
+                );
             };
             let tmpl_path = tmpl_root.join(&tmpl_id);
             if tmpl_id.is_empty() || !tmpl_path.is_dir() {
-                return jresp(StatusCode::NOT_FOUND, json!({"error": "template not found"}));
+                return jresp(
+                    StatusCode::NOT_FOUND,
+                    json!({"error": format!("no template '{tmpl_id}'"),
+                           "templates_dir": tmpl_root.display().to_string()}),
+                );
             }
             if !work_dir.is_empty() {
                 let work = expanduser(&work_dir);
@@ -8006,23 +8883,24 @@ async fn post_dispatch(
     }
 }
 
-/// Templates live beside amux-server.py (py:143 TEMPLATES_DIR). The rust
-/// binary resolves them via AMUX_TEMPLATES_DIR, then the installed
-/// amux-server.py symlink's parent, then ~/.amux/templates.
-fn templates_dir() -> Option<PathBuf> {
+/// Where the worker templates live: `AMUX_TEMPLATES_DIR`, else
+/// `~/.amux/templates` (install.sh syncs the repo's `templates/` there).
+///
+/// This used to carry a middle rung that canonicalized
+/// `~/.local/bin/amux-server.py` and looked beside it — py:143's
+/// `TEMPLATES_DIR = Path(__file__).parent / "templates"`. That symlink went
+/// away with the Python server at 792ce1f, and nothing replaced the rung, so
+/// ALL THREE resolved to nothing and this returned None on every call. The
+/// visible effect was `apply-template` answering "template not found" for a
+/// perfectly real id — indistinguishable, from the client, from a typo'd one,
+/// which is why it sat unnoticed. Verified 2026-08-11 with a control: the real
+/// `software-project` and a bogus `zzz-does-not-exist` returned byte-identical
+/// 404s.
+pub(crate) fn templates_dir() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("AMUX_TEMPLATES_DIR") {
         let p = PathBuf::from(v);
         if p.is_dir() {
             return Some(p);
-        }
-    }
-    let installed = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin/amux-server.py");
-    if let Ok(target) = std::fs::canonicalize(&installed) {
-        if let Some(parent) = target.parent() {
-            let t = parent.join("templates");
-            if t.is_dir() {
-                return Some(t);
-            }
         }
     }
     let fallback = home().join("templates");
@@ -8033,11 +8911,174 @@ fn templates_dir() -> Option<PathBuf> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Group scoping for worker-to-worker sends (Ethan, 2026-08-11)
+// ---------------------------------------------------------------------------
+
+/// A lane's groups, from `CC_TAGS` in its env file.
+pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
+    parse_env(lane)
+        .get("CC_TAGS")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_matches('"').to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Did `them` send to `us` recently? The evidence is a cmd_history row written
+/// at delivery time, so a lane cannot manufacture a reply window for itself.
+fn recently_contacted_by(them: &str, us: &str) -> bool {
+    let Some(home) = dirs_home() else { return false };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        home.join("amux.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    let cutoff = (now_i64() - REPLY_WINDOW_S) * 1000;
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT 1 FROM cmd_history WHERE session=?1 AND origin=?2 AND ts > ?3 LIMIT 1",
+        rusqlite::params![us, them, cutoff],
+        |_| Ok(true),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// How long a lane may answer an inbound cross-group message. A working day:
+/// long enough for a real exchange, short enough that it is not a standing
+/// permission earned once.
+const REPLY_WINDOW_S: i64 = 24 * 3600;
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var("AMUX_HOME").ok().map(std::path::PathBuf::from).or_else(|| {
+        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".amux"))
+    })
+}
+
+/// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
+///
+/// Ethan's rule: "worker to worker communication should be limited to intra
+/// group unless explicitly stated." The escapes are CONFIG, never something the
+/// sending agent can assert about itself in a request body — a flag any caller
+/// could set would make the rule advisory.
+///
+/// - same group (or a self-send)          -> allowed
+/// - sender's `CC_SEND_ALLOW`             -> groups it may reach, or `*`
+/// - receiver's `CC_RECEIVE_ANY=1`        -> a documented fleet-wide routing
+///   target. `amux` is one by construction: the worker roster tells every lane
+///   to route amux platform bugs here, which IS the explicit statement, and
+///   683 of the 908 worker-to-worker sends in the 24h before this shipped were
+///   cross-group — mostly bug reports inbound to this lane. Blocking those
+///   would have severed the fleet's only bug channel to fix a broadcast problem.
+fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+    if origin.is_empty() || origin == target {
+        return Ok("self-or-human");
+    }
+    let (og, tg) = (lane_groups(origin), lane_groups(target));
+    if !og.is_disjoint(&tg) {
+        return Ok("same-group");
+    }
+    let env_t = parse_env(target);
+    if matches!(
+        env_t.get("CC_RECEIVE_ANY").map(|v| v.trim().trim_matches('"').to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    ) {
+        return Ok("receiver-open");
+    }
+    // REPLY EXEMPTION. Ethan's objection was to a lane BROADCASTING across groups
+    // unsolicited — ts-gke reaching 9 lanes in 5 groups, twice. A reply is not
+    // that, and blocking one makes the rule worse than no rule: within minutes
+    // of shipping this gate it refused MY OWN answer to a cross-group lane that
+    // had just reported a bug to me, leaving the channel one-way — reports in,
+    // answers impossible.
+    //
+    // So: you may answer a lane that contacted you inside the window. It cannot
+    // be used to initiate, only to respond, and the evidence is the durable
+    // cmd_history row of THEIR send to YOU — not something the replier asserts.
+    if recently_contacted_by(target, origin) {
+        return Ok("reply-to-inbound");
+    }
+    let allow: Vec<String> = parse_env(origin)
+        .get("CC_SEND_ALLOW")
+        .map(|v| v.split(',').map(|t| t.trim().trim_matches('"').to_lowercase()).filter(|t| !t.is_empty()).collect())
+        .unwrap_or_default();
+    if allow.iter().any(|a| a == "*") || allow.iter().any(|a| tg.contains(a)) {
+        return Ok("sender-allowlist");
+    }
+    let fmt = |g: &std::collections::BTreeSet<String>| {
+        if g.is_empty() { "(untagged)".to_string() } else { g.iter().cloned().collect::<Vec<_>>().join(",") }
+    };
+    Err(format!(
+        "cross-group send refused: {origin} [{}] -> {target} [{}]. Worker-to-worker \
+         messaging is intra-group unless explicitly configured. To allow it: set \
+         CC_SEND_ALLOW on {origin} (comma-separated groups, or *), or CC_RECEIVE_ANY=1 \
+         on {target} if it is a fleet-wide routing target. A human send is never \
+         restricted — this applies only to sends carrying a worker origin.",
+        fmt(&og), fmt(&tg)
+    ))
+}
+
+/// The message id a send answers with (Ethan 2026-08-11: "we should have all
+/// messages with an idempotent id"). DERIVED from the caller's msg_id when
+/// one is supplied — not stored — so the original send and every deduped
+/// retry of it answer the SAME id with no lookup and no row to expire.
+/// Without a msg_id there is nothing to be idempotent against; the
+/// timestamp form at least remains unique.
+fn send_response_id(name: &str, msg_id: &str) -> String {
+    if msg_id.is_empty() {
+        format!("msg-{}-{}", name, (now_f64() * 1000.0) as i64)
+    } else {
+        format!("msg-{name}-{msg_id}")
+    }
+}
+
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // GROUP SCOPING, before anything is delivered or recorded. The origin is the
+    // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
+    // cannot talk its way across a group boundary.
+    let send_origin: String = hdr_worker(headers).trim().chars().take(64).collect();
+    if std::env::var("AMUX_GROUP_SEND_ENFORCE")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
+        .unwrap_or(true)
+    {
+        if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+            // LOUD AND QUERYABLE, per CLAUDE.md's two-fixes rule: a refusal that
+            // leaves no trace is a rule nobody can audit or tune.
+            tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+            emit_event(
+                state,
+                name,
+                "send.cross_group_refused",
+                Some(json!({"origin": send_origin, "target": name})),
+                None,
+                "group-scope",
+            )
+            .await;
+            return jresp(
+                StatusCode::FORBIDDEN,
+                json!({"ok": false, "error": reason, "blocked": "cross_group"}),
+            );
+        }
+    }
     let mut text = body_str(body, "text");
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if !msg_id.is_empty() && send_dedup_seen(state, name, &msg_id).await {
-        return j200(json!({"ok": true, "deduped": true, "message": "duplicate retry ignored (already delivered)"}));
+        // Same `id` as the original response — see send_response_id. A retry
+        // that answers with a DIFFERENT id (or none, as this arm did until
+        // 2026-08-11) breaks the caller's correlation exactly when it is
+        // retrying, which is the one moment idempotency is for.
+        return j200(json!({
+            "ok": true, "deduped": true, "id": send_response_id(name, &msg_id),
+            "message": "duplicate retry ignored (already delivered)"
+        }));
     }
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
@@ -8125,7 +9166,8 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     } else {
         send_failure_status(&msg)
     };
-    let mut resp = json!({"ok": ok, "message": msg});
+    let send_id = send_response_id(name, &msg_id);
+    let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
     }
@@ -8168,7 +9210,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     if new_name.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
     }
-    let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
     let new_name = re.replace_all(&new_name, "-").into_owned();
     let new_file = env_path(&new_name);
     if new_file.exists() {
@@ -8256,7 +9298,7 @@ fn find_latest_session_id(work_dir: &str) -> String {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .filter_map(|p| p.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     for (_, f) in files {
         for entry in iter_jsonl_tail(&f, u64::MAX) {
             if matches!(entry["type"].as_str(), Some("user") | Some("assistant")) {
@@ -8300,6 +9342,10 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     let _ = std::fs::remove_file(mem_file(name));
     let _ = std::fs::remove_file(meta_path(name));
     let _ = std::fs::remove_file(log_path(name));
+    // The registry just shrank; drop the cached fleet list so no reader is
+    // served a ghost of this worker for the next TTL (AMUX-2960 — the same
+    // hole create_session_legacy had on the grow side).
+    crate::api::sessions_legacy::invalidate_sessions_cache();
     // DB-side per-session state (Python clears in-memory maps; the durable
     // equivalents here are the steering queue rows).
     let n = name.to_string();
@@ -8312,6 +9358,54 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
         })
         .await;
     j200(json!({"ok": true, "message": "deleted"}))
+}
+
+/// The model's context window, in tokens. `AMUX_CONTEXT_WINDOW`.
+///
+/// A knob rather than a constant because it is the one number here amux cannot
+/// observe: the harness reports tokens USED and never the ceiling. The default
+/// is set from measurement, not a guess — this session's own transcript carried
+/// 817,201 tokens, so the window is at least that, and 1M is the smallest round
+/// figure consistent with it. Wrong in the LOW direction only costs an early
+/// compact; wrong in the HIGH direction means the lane hits the wall, which is
+/// the failure this whole card exists to stop, so the default errs low.
+pub(crate) fn context_window() -> u64 {
+    std::env::var("AMUX_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1_000_000)
+}
+
+/// Tokens out of a report payload, accepting both shapes seen in the wild: a
+/// bare integer (what the hook sends) and `{input,output,total}` (what the
+/// usage path writes). Returns None rather than 0 for "not reported" — a lane
+/// with no token data must not read as an empty context, which would look like
+/// 100% remaining and silently disable compaction for it.
+pub(crate) fn tokens_used(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(o) = v.as_object() {
+        if let Some(t) = o.get("total").and_then(Value::as_u64) {
+            return Some(t);
+        }
+        let i = o.get("input").and_then(Value::as_u64).unwrap_or(0);
+        let out = o.get("output").and_then(Value::as_u64).unwrap_or(0);
+        if i + out > 0 {
+            return Some(i + out);
+        }
+    }
+    None
+}
+
+/// Percent of the context window still free, clamped to 0..=100.
+pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
+    if window == 0 {
+        return 100;
+    }
+    let used_pct = (used.saturating_mul(100) / window).min(100);
+    (100 - used_pct) as u8
 }
 
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
@@ -8400,6 +9494,40 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
         let m: String = m.trim().chars().take(60).collect();
         (!m.is_empty()).then_some(m)
     };
+    // Captured BEFORE the writer closure moves `tokens_opt` — the compaction
+    // check below runs after the write and would otherwise borrow a moved value.
+    // FALL BACK TO THE TRANSCRIPT when the report body carries no tokens.
+    //
+    // This is the line that decided AMUX-2829. The whole auto-compact chain was
+    // live and correct — pref on, compaction_action implemented, thresholds
+    // tested — and it never fired once, because its ONE input came from a
+    // report body that no lane sends. Measured: 292 report POSTs, 0 carrying
+    // tokens; every real lane still runs the predecessor hook, whose body is
+    // {state, source}, and hook config is loaded at session start so no edit on
+    // disk can change that for a running process.
+    //
+    // Populating /api/sessions from the transcript (the sibling fix) makes the
+    // DASHBOARD honest and does nothing for the trigger — the badge and the
+    // decision read different inputs. That split is exactly the "producer with
+    // no consumer" shape this repo keeps finding, so the fallback belongs on
+    // both or the fix is cosmetic.
+    //
+    // AND THE REPORTED VALUE IS SANITY-CHECKED AGAINST THE WINDOW, because a
+    // wrong token count here does not produce a wrong badge, it produces a
+    // FORCED COMPACTION of a healthy lane — a lossy, user-visible action taken
+    // on bad evidence. Found while wiring this: the stored report for my own
+    // session said 3,156,510 tokens while its transcript said 217,359. Whatever
+    // produced the first, a "current context" larger than the whole window is
+    // not a context size, and feeding it to context_pct_remaining yields 0%
+    // remaining and ForceCompact. So an over-window report is treated as
+    // UNKNOWN and the transcript answers instead; if neither is plausible,
+    // nothing fires, which is the correct default for a destructive action.
+    let used_tokens: Option<u64> = body
+        .get("tokens")
+        .and_then(tokens_used)
+        .filter(|t| *t <= context_window())
+        .or_else(|| transcript_evidence(name).1)
+        .filter(|t| *t <= context_window());
     let tokens_opt: Option<Value> = body.get("tokens").and_then(|t| {
         let get = |k: &str| t.get(k).and_then(Value::as_i64).unwrap_or(0).max(0);
         let (i, o) = (get("input"), get("output"));
@@ -8486,6 +9614,51 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                 tokio::spawn(async move {
                     steer_deliver_for_session(&st_clone, &name_clone).await;
                 });
+            }
+
+            // AUTO-COMPACT (AMUX-2829). Ethan: "theres no reason amux should
+            // ever stop." It stopped because this consumer did not exist.
+            //
+            // orchestrator/compaction.rs has held the POLICY since the rust
+            // port — four tiers keyed on percent remaining — and had ZERO
+            // callers outside its own tests. Nothing emitted ContextLow because
+            // nothing knew any lane's context size, because the hooks reported
+            // tokens:None. That half shipped earlier today; this is the other.
+            //
+            // Sent as STEERING rather than typed directly: the queue already
+            // delivers at a turn boundary, which is the only moment /compact is
+            // meaningful, and it already refuses to type at a selector. The
+            // `auto-compact` guard makes it at-most-one-pending per lane — a
+            // second report before the first is consumed replaces it rather
+            // than stacking, which is what stops this becoming the nag that
+            // got the `done` tier removed from the advance loop.
+            if let Some(used) = used_tokens {
+                let pct = context_pct_remaining(used, context_window());
+                let action = crate::orchestrator::compaction::compaction_action(pct);
+                use crate::orchestrator::compaction::CompactionAction as CA;
+                if matches!(action, CA::Compact | CA::ForceCompact) {
+                    let msg = format!(
+                        "/compact\n\nContext is at {pct}% remaining ({used} tokens of a \
+                         {} window). Compacting now keeps you working — running out is not a \
+                         reason to stop. If you are mid-task, compact and continue where you \
+                         left off.",
+                        context_window()
+                    );
+                    steer_enqueue(state, name, &msg, "auto-compact", "").await;
+                    tracing::warn!(
+                        session = %name, pct, used, ?action,
+                        "auto-compact queued — context low"
+                    );
+                    emit_event(
+                        state,
+                        name,
+                        "session.auto_compact",
+                        Some(json!({"pct_remaining": pct, "tokens": used, "action": format!("{action:?}")})),
+                        Some(format!("compact:{name}:{}", now_i64() / 1800)),
+                        "compaction",
+                    )
+                    .await;
+                }
             }
             j200(json!({"ok": true, "state": st}))
         }
@@ -8599,7 +9772,7 @@ async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool 
 static RENAME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn sanitize_session_name(raw: &str) -> String {
-    let re = regex::Regex::new(r"[^a-zA-Z0-9_-]").unwrap();
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
     re.replace_all(raw.trim(), "-").into_owned()
 }
 
@@ -9076,7 +10249,7 @@ fn config_switch_confirm_key(pane: &str) -> Option<String> {
     if !clean.contains(CC_CONFIG_CONFIRM_BODY) {
         return None;
     }
-    let re = regex::Regex::new(r"(?i)(?:^|\s)(\d+)\.\s*yes\b").unwrap();
+    let re = cached_re!(r"(?i)(?:^|\s)(\d+)\.\s*yes\b");
     clean
         .lines()
         .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
@@ -9330,7 +10503,25 @@ async fn apply_live_config_change(
     }
 }
 
+/// Every config write drops the cached session list (AMUX-2926).
+///
+/// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
+/// dozen places — one per field — so invalidating inside it would mean adding
+/// the same line to each, and the next field added would silently not get it.
+/// One choke point cannot be missed.
+///
+/// Deliberately unconditional, including on the error paths. A 400 usually
+/// means nothing was written, but "usually" is doing load-bearing work there:
+/// several branches write one field and then reject a second. Clearing a cache
+/// that did not need clearing costs one rebuild; NOT clearing one that did is
+/// the bug this fixes.
 async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+    let out = config_patch_inner(state, name, body).await;
+    crate::api::sessions_legacy::invalidate_sessions_cache();
+    out
+}
+
+async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Response {
     if !body.is_object() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "payload must be a JSON object"}));
     }
@@ -9635,14 +10826,75 @@ async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
         return j200(json!({"ok": true, "message": "branch updated"}));
     }
 
-    // Tags (py:76685). Python invalidates its sessions cache here; this
-    // origin computes the list per request, so the write IS the refresh.
+    // Tags (py:76685). Python invalidates its sessions cache here, and so do
+    // we now — see config_patch's wrapper.
+    //
+    // This comment used to say the opposite: "this origin computes the list per
+    // request, so the write IS the refresh". That was TRUE when written and was
+    // falsified by a LATER commit (7ca14b5, a 2s cache on GET /api/sessions)
+    // which had no reason to look here. Nothing broke loudly — the list just
+    // served the pre-write value for up to 2s, while the group-isolation gate
+    // read the new tags immediately, so the two disagreed about the same fact
+    // (AMUX-2926). A comment asserting the ABSENCE of a mechanism elsewhere is
+    // a claim that ages badly; this one is now pointed at the wrapper that
+    // makes it true instead.
+    //
+    // ACCEPT AN ARRAY, WHICH IS WHAT THE DASHBOARD SENDS. This was
+    // `tv.as_str().unwrap_or("")`: on the `{"tags":["amux"]}` the client
+    // actually sends, `as_str()` on an Array is None, so it wrote CC_TAGS=""
+    // and answered {"ok":true,"message":"tags updated"}. Every group edit from
+    // the UI silently CLEARED the worker's groups and reported success —
+    // Ethan, 2026-08-11: "i just tried to add a group but nothing happened".
+    // Worse than a no-op, because groups are DERIVED from CC_TAGS
+    // (GET /api/groups: "derived_from: CC_TAGS across workers"), so a wiped
+    // tag removes the worker from every group it belonged to.
+    //
+    // An unrecognised shape is now a 400 rather than a silent clear. Clearing
+    // stays reachable, but only by ASKING for it (`[]`, `""` or null) — the
+    // rule being that destroying data must be requested, never inferred from a
+    // type the handler failed to understand.
     if let Some(tv) = body.get("tags") {
-        cfg.set("CC_TAGS", tv.as_str().unwrap_or("").trim());
+        let joined = match tv {
+            Value::Array(items) => {
+                let mut bad = None;
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|x| match x.as_str() {
+                        Some(s) => Some(s.trim().to_string()),
+                        None => {
+                            bad = Some(x.clone());
+                            None
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if let Some(b) = bad {
+                    return jresp(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": format!("tags must be strings; got {b}"), "wrote": false}),
+                    );
+                }
+                parts.join(",")
+            }
+            Value::String(s) => s.trim().to_string(),
+            Value::Null => String::new(),
+            other => {
+                return jresp(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!("tags must be an array of strings, a comma-separated string, or null; got {other}"),
+                        "wrote": false,
+                    }),
+                );
+            }
+        };
+        cfg.set("CC_TAGS", &joined);
         if cfg.write(&f).is_err() {
             return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
         }
-        return j200(json!({"ok": true, "message": "tags updated"}));
+        // Echo what was stored: the caller sent an array and a bare "ok" is what
+        // let the silent clear go unnoticed for as long as it did.
+        return j200(json!({"ok": true, "message": "tags updated", "tags": joined}));
     }
 
     // MCP config (py:76731).
@@ -9827,6 +11079,82 @@ fn getrandom_fill(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC-346: the folder-trust seed must fold `hasTrustDialogAccepted=true` into
+    /// `projects[dir]` WITHOUT disturbing the rest of `~/.claude.json`, and must
+    /// no-op when it is already set or the shape is not mergeable.
+    #[test]
+    fn trust_seed_merges_without_clobbering_and_is_idempotent() {
+        // Preserves oauthAccount + a sibling project, adds the flag to our dir.
+        let existing = json!({
+            "oauthAccount": {"emailAddress": "x@y.z"},
+            "theme": "dark",
+            "projects": {
+                "/other/dir": {"hasTrustDialogAccepted": true, "history": [1, 2]}
+            }
+        });
+        let got = trust_seed_merge(existing, "/work/dir").expect("a new dir must merge");
+        assert_eq!(got["oauthAccount"]["emailAddress"], "x@y.z", "oauth untouched");
+        assert_eq!(got["theme"], "dark", "theme untouched");
+        assert_eq!(got["projects"]["/other/dir"]["hasTrustDialogAccepted"], true, "sibling untouched");
+        assert_eq!(got["projects"]["/other/dir"]["history"], json!([1, 2]));
+        assert_eq!(got["projects"]["/work/dir"]["hasTrustDialogAccepted"], true, "our dir now trusted");
+
+        // A missing file (empty object) seeds cleanly.
+        let fresh = trust_seed_merge(json!({}), "/work/dir").expect("empty doc must merge");
+        assert_eq!(fresh["projects"]["/work/dir"]["hasTrustDialogAccepted"], true);
+
+        // Already trusted -> None (no pointless rewrite of a large file, and no
+        // race window on the common case).
+        let already = json!({"projects": {"/work/dir": {"hasTrustDialogAccepted": true}}});
+        assert!(trust_seed_merge(already, "/work/dir").is_none(), "no write when already trusted");
+
+        // Unmergeable shape (root is not an object) -> None, leave it alone.
+        assert!(trust_seed_merge(json!("not an object"), "/work/dir").is_none());
+    }
+
+    /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
+    /// explicitly configured. The escapes must be CONFIG — a body flag any
+    /// caller could set would make the rule advisory.
+    #[test]
+    fn cross_group_sends_are_refused_unless_configured() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let write = |n: &str, body: &str| {
+            std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+        };
+        write("ts-gke", "CC_TAGS=\"customers\"\n");
+        write("tubescience", "CC_TAGS=\"customers\"\n");
+        write("gtm-engine", "CC_TAGS=\"gtm\"\n");
+        write("amux", "CC_TAGS=\"amux\"\nCC_RECEIVE_ANY=1\n");
+        write("broadcaster", "CC_TAGS=\"customers\"\nCC_SEND_ALLOW=\"gtm\"\n");
+        write("lonely", "\n"); // untagged
+
+        // THE REPORTED CASE: different groups, no config -> refused.
+        let err = cross_group_send_ok("ts-gke", "gtm-engine").expect_err("must refuse");
+        assert!(err.contains("cross-group send refused"), "{err}");
+        // The refusal must NAME both escapes, or it is a wall rather than a rule.
+        assert!(err.contains("CC_SEND_ALLOW"), "{err}");
+        assert!(err.contains("CC_RECEIVE_ANY"), "{err}");
+
+        // Same group is untouched.
+        assert_eq!(cross_group_send_ok("ts-gke", "tubescience").unwrap(), "same-group");
+        // A human send carries no worker origin and is never restricted.
+        assert_eq!(cross_group_send_ok("", "gtm-engine").unwrap(), "self-or-human");
+        // Self-send.
+        assert_eq!(cross_group_send_ok("ts-gke", "ts-gke").unwrap(), "self-or-human");
+        // Documented fleet-wide routing target: bug reports to amux still work.
+        assert_eq!(cross_group_send_ok("ts-gke", "amux").unwrap(), "receiver-open");
+        // Sender allowlisted for that specific group.
+        assert_eq!(cross_group_send_ok("broadcaster", "gtm-engine").unwrap(), "sender-allowlist");
+        // ...but not for a group it did not name.
+        assert!(cross_group_send_ok("broadcaster", "lonely").is_err());
+        // An untagged lane shares no group with anyone — including other
+        // untagged lanes. Consistent with "untagged sees itself".
+        assert!(cross_group_send_ok("lonely", "gtm-engine").is_err());
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -10259,6 +11587,32 @@ mod tests {
         // Resume picker needs the ⌕ search glyph.
         assert!(at_resume_picker("Resume Session \u{2315}\nEnter to select"));
         assert!(!at_resume_picker("Enter to select"));
+    }
+
+    /// Codex's trust-directory picker, byte shape captured live 2026-08-11
+    /// (AMUX-2913): selector cursor is `›` (U+203A), not Claude's `❯`, so a
+    /// lane blocked on it read `idle` — needs-input invisible, the AMUX-2834
+    /// class on a second provider. The control half: prose QUOTING a numbered
+    /// list with the same cursor but no footer hint must not read as waiting
+    /// (the AMUX-2642 self-block class).
+    #[test]
+    fn a_codex_picker_is_waiting_not_idle() {
+        let trust = "> You are in /Users/ethan/Dev/board-exp3\n\
+             Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.\n\
+             \u{203a} 1. Yes, continue\n  2. No, quit\n  Press enter to continue";
+        assert_eq!(detect_claude_status(trust), "waiting");
+        let quoted = "the doc says codex renders \u{203a} 1. Yes, continue as its cursor";
+        assert_ne!(detect_claude_status(quoted), "waiting");
+        // Gemini, captured live the same day: `●` cursor in a `│` box.
+        let gemini = " \u{2502} \u{25cf} 1. Yes\n \u{2502}   2. Yes, and remember the directories as trusted\n \u{2502}   3. No";
+        assert_eq!(detect_claude_status(gemini), "waiting");
+        let gemini_prose = "gemini renders \u{25cf} 1. Yes as its cursor";
+        assert_ne!(detect_claude_status(gemini_prose), "waiting");
+        // Gemini mid-tool-turn, live frame: braille spinner = ACTIVE. This
+        // read as waiting for an entire 20s shell run (a stale picker stamp
+        // showed through because nothing recognised the spinner).
+        let gemini_working = "\u{2502} \u{22b7}  Shell sleep 15 && echo ROUND2\n \u{2819} Thinking... (esc to cancel, 9s)\n YOLO Ctrl+Y";
+        assert_eq!(detect_claude_status(gemini_working), "active");
     }
 
     // ---- AMUX-2612: session identity survives a resume --------------------
@@ -11720,6 +13074,107 @@ mod steer_max_age_tests {
         assert!(!answers_visible_picker("1", ""));
     }
 
+    /// AMUX-2834: which selectors mean "a human must act". Both are pickers to
+    /// detect_claude_status; only one of them is anybody's problem.
+    #[test]
+    fn a_real_question_flags_input_required_but_a_rate_limit_menu_does_not() {
+        let ask = "\
+   Which database should I migrate?
+
+   ❯ 1. production
+     2. staging
+     3. Cancel
+
+   Enter to confirm · Esc to cancel";
+        let limit = "\
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Switch to usage credits
+     3. Switch to Team plan
+
+   Enter to confirm · Esc to cancel";
+
+        // The sweep's predicate, verbatim: a selector that is NOT the rate-limit
+        // menu is a human's to answer.
+        let flags = |p: &str| !is_rate_limit_menu(p) && detect_claude_status(p) == "waiting";
+
+        assert!(flags(ask), "an AskUserQuestion blocks on a human and must read `needs input`");
+        assert!(!flags(limit), "amux answers the rate-limit menu itself — flagging it would ask a \
+                                human for something nobody needs to decide");
+
+        // A working lane is not waiting for anyone, so it must never be flagged —
+        // this is the assertion that keeps `needs input` meaningful. A badge that
+        // fires on a busy fleet is one nobody reads.
+        let busy = "⏺ Running…\n  ⏵⏵ bypass permissions on · esc to interrupt";
+        assert!(!flags(busy));
+        let idle = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!flags(idle));
+    }
+
+    /// AUTO-COMPACT'S ARITHMETIC (AMUX-2829). This decides when amux interrupts
+    /// a working lane, so the boundaries are pinned rather than left to a
+    /// reading of the policy file.
+    #[test]
+    fn context_arithmetic_and_the_tiers_it_feeds() {
+        use crate::orchestrator::compaction::{compaction_action, CompactionAction as CA};
+        let w = 1_000_000u64;
+
+        // Percent REMAINING, not used — the policy is keyed on headroom.
+        // An over-window "current context" is not a context size. Before the
+        // filter, a report of 3.15M against a 1M window read as 0% remaining
+        // and force-compacted a lane sitting at ~22%.
+        assert_eq!(context_pct_remaining(3_156_510, w), 0, "over-window reads as empty — why it must be rejected upstream");
+        assert_eq!(context_pct_remaining(0, w), 100);
+        assert_eq!(context_pct_remaining(700_000, w), 30);
+        assert_eq!(context_pct_remaining(850_000, w), 15);
+        assert_eq!(context_pct_remaining(950_000, w), 5);
+        // Over-full clamps to 0 instead of underflowing — a lane past its window
+        // is the case that MOST needs a compact, so this must not wrap to 100.
+        assert_eq!(context_pct_remaining(2_000_000, w), 0);
+        assert_eq!(context_pct_remaining(1, 0), 100, "unknown window must not force a compact");
+
+        // The tiers this session actually acts on.
+        assert_eq!(compaction_action(context_pct_remaining(500_000, w)), CA::None);
+        assert!(matches!(compaction_action(context_pct_remaining(900_000, w)), CA::Compact));
+        assert!(matches!(
+            compaction_action(context_pct_remaining(990_000, w)),
+            CA::ForceCompact
+        ));
+        // THIS SESSION'S OWN MEASURED LOAD, and the assertion is not the one I
+        // first wrote. 817,201 of 1M is 18% remaining, which the policy calls
+        // PrepareIndicator — NOT Compact. I asserted Compact, the test failed,
+        // and the test was right: the session that prompted this card would not
+        // have been auto-compacted by it.
+        //
+        // Left as the truth rather than bent to pass. Two things follow and both
+        // are recorded on AMUX-2829 rather than fixed by widening a threshold
+        // here: PrepareIndicator has NO consumer either (same producer-without-
+        // consumer shape one tier up), and 1M is a floor for the window, not a
+        // measurement — if it is really larger, 817k is a smaller fraction and
+        // the tier is even further away.
+        assert_eq!(
+            compaction_action(context_pct_remaining(817_201, w)),
+            CA::PrepareIndicator,
+            "18% remaining is the prepare tier; amux acts on Compact and below"
+        );
+    }
+
+    /// A lane with NO token data must read as unknown, never as an empty
+    /// context. Returning 0 would compute 100% remaining and silently disable
+    /// compaction for exactly the lanes whose harness is not reporting — the
+    /// hardcoded-empty failure this repo has now hit five times.
+    #[test]
+    fn missing_tokens_are_unknown_not_zero() {
+        assert_eq!(tokens_used(&json!(null)), None);
+        assert_eq!(tokens_used(&json!({})), None);
+        assert_eq!(tokens_used(&json!("nonsense")), None);
+        // Both shapes seen in the wild.
+        assert_eq!(tokens_used(&json!(817_201u64)), Some(817_201));
+        assert_eq!(tokens_used(&json!({"total": 12345})), Some(12345));
+        assert_eq!(tokens_used(&json!({"input": 100, "output": 23})), Some(123));
+    }
+
     /// THE DISTINCTION, IN BOTH DIRECTIONS. Getting it wrong one way deadlocks a
     /// lane forever; getting it wrong the other way re-enables the 2026-07-15
     /// AskUserQuestion kill, where typing at a picker REJECTS a pending tool.
@@ -11952,6 +13407,40 @@ mod pipe_reconcile_tests {
 // ---------------------------------------------------------------------------
 // AMUX-2681 — a refusal is not a server error.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod delivery_mode_tests {
+    use super::*;
+
+    /// AMUX-2909, pinned. Ethan's report: a message typed into a lane that was
+    /// visibly working. This FAILS against the pre-fix predicate
+    /// (`chars > 400 || picker_shaped`), which is the whole point — a short
+    /// plain message to a generating lane is the exact case that shipped wrong,
+    /// and it is also the case that looks least alarming.
+    #[test]
+    fn a_generating_lane_is_never_typed_into() {
+        assert!(
+            must_paste(true, 12, false),
+            "a SHORT plain message to a generating lane must paste — typed \
+             mid-turn was measured lost 1/1, pasted was accepted 4/4"
+        );
+        // Size and shape must not rescue it either.
+        assert!(must_paste(true, 0, false), "even empty-ish text");
+        assert!(must_paste(true, 5000, true));
+    }
+
+    /// The control, without which the test above passes for a `must_paste` that
+    /// simply returned true — an unfailable check is worse than none (rule 7).
+    /// An IDLE lane keeps typing: that path is unchanged and adds no latency.
+    #[test]
+    fn an_idle_lane_still_types_short_plain_text() {
+        assert!(!must_paste(false, 12, false), "the fix must not paste everything");
+        assert!(!must_paste(false, 400, false), "400 is the boundary, not over it");
+        // The two pre-existing reasons to paste still hold on an idle lane.
+        assert!(must_paste(false, 401, false), "long text still pastes");
+        assert!(must_paste(false, 12, true), "picker-shaped text still pastes");
+    }
+}
 
 #[cfg(test)]
 mod refusal_status_tests {
@@ -12206,25 +13695,61 @@ mod refusal_status_tests {
 
 #[cfg(test)]
 mod roster_tests {
+    use super::*;
     /// The roster is DERIVED from the session env files, so these assertions
     /// are about shape rather than content — the fleet changes hourly and a
     /// fixture would be a second source of truth (the thing the roster exists
     /// to avoid).
+    /// SUPERSEDES `a_worker_never_lists_itself`, which asserted the OPPOSITE and
+    /// was wrong (AMUX-2831). Excluding the reader is only expressible when each
+    /// reader gets its own file, and they do not: MEMORY.md is keyed on the
+    /// PROJECT DIRECTORY, so 17 lanes share the one under ~/Dev/mixpeek. A
+    /// self-excluding roster is therefore correct for whichever lane wrote last
+    /// and wrong for the other sixteen — they read a list that includes
+    /// themselves and omits the writer. That is the last-writer-wins bug this
+    /// card is about, and the roster was an instance of it.
+    /// Anything written into Claude's MEMORY.md must be true for EVERY reader,
+    /// because the file is keyed on the project DIRECTORY and up to 18 lanes
+    /// share one. The roster obeys this by listing everyone; the worker-memory
+    /// block obeys it by NAMING ITS OWNER (AMUX-2831).
     #[test]
-    fn a_worker_never_lists_itself() {
-        let me = "amux";
-        let r = super::fleet_roster(me);
+    fn propagated_worker_memory_names_the_lane_that_wrote_it() {
+        let b = compose_worker_block("amux", "remember: the thing");
+        assert!(b.contains("Worker memory — `amux`"), "must name its owner; got:\n{b}");
         assert!(
-            !r.contains(&format!("| `{me}` |")),
-            "\"who else is out there\" must exclude the reader: {r}"
+            b.contains("If you are not amux"),
+            "a peer reading this must be told it is not theirs; got:\n{b}"
         );
+        assert!(b.contains("remember: the thing"), "content must survive labelling");
+    }
+
+    /// A header over nothing is itself a claim ("this lane recorded nothing").
+    #[test]
+    fn no_worker_memory_block_when_the_lane_recorded_nothing() {
+        assert_eq!(compose_worker_block("amux", "   \n  "), "");
+        assert_eq!(compose_worker_block("amux", ""), "");
+    }
+
+    #[test]
+    fn the_roster_lists_every_live_worker_because_the_file_is_shared() {
+        let r = super::fleet_roster();
+        if r.is_empty() {
+            return; // no live workers on this machine; nothing to assert
+        }
+        // It must say so, or a reader seeing its own name concludes the roster
+        // is buggy — which is what a correct shared roster looks like.
+        assert!(
+            r.contains("INCLUDING YOU"),
+            "a shared roster must tell the reader it lists them too: {r}"
+        );
+        assert!(r.contains("$AMUX_SESSION"), "and how to identify themselves in it: {r}");
     }
 
     /// Empty means EMPTY — a single-worker install must not get a table header
     /// with no rows under it, which reads as "the fleet is broken".
     #[test]
     fn a_roster_with_no_peers_is_the_empty_string() {
-        let r = super::fleet_roster("__no_such_session_anywhere__");
+        let r = super::fleet_roster();
         assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
     }
 }

@@ -1,6 +1,22 @@
 #!/bin/bash
 # amux-staged-guard  (see the block below for why this call is HERE now)
 g="$(dirname -- "$0")/amux-staged-guard"
+# SELF-HEAL RATHER THAN WARN (AMUX-2663). The guard BLOCKS a commit that touches
+# another lane's in-flight files — that is the whole protection — and it was one
+# file mode away from being inert: the tracked copy was 100644, so every path
+# that PRESERVES mode (git checkout of a fresh clone, cp -p, tar) landed a
+# non-executable guard, `[ -x ]` failed, and this branch printed one line to
+# stderr and let the commit through. A protection that announces it is off and
+# proceeds is the incident this card records, not a warning about it.
+#
+# Mode is fixed at the source too, but self-healing here covers the checkouts
+# that already have the bad copy and will never run install-hooks.sh again.
+if [ ! -x "$g" ]; then
+  _src="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/git-hooks/amux-staged-guard"
+  if [ -f "$_src" ]; then
+    install -m 0755 "$_src" "$g" 2>/dev/null       && echo "amux: staged-guard was not executable - reinstalled from $_src" >&2
+  fi
+fi
 if [ -x "$g" ]; then "$g" || exit 1; else echo "amux: staged-guard MISSING at $g - cross-session sweep protection is OFF (AMUX-1730)" >&2; fi
 # Pre-commit hook: security scan + Rust/client-JS syntax
 set -e
@@ -206,8 +222,31 @@ if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
   # Measured on this machine, warm cache: 3.75s -> 13.75s. Ten seconds a commit
   # against four fleet-wide blockages in one afternoon. If that trade ever stops
   # being worth it, drop the flag — but drop it knowing what it was buying.
-  cargo check --workspace --all-targets --quiet
-  echo "cargo check passed (including test targets)."
+  # CLIPPY, NOT CHECK — it SUBSUMES check (it compiles) and adds the lints, so
+  # this is a swap and not an extra gate. Measured warm on this machine:
+  # check --all-targets 0s, clippy --all-targets 1s. One second.
+  #
+  # Added 2026-08-11 after TWO peer test files reached main with clippy denials
+  # in one day (tests/opencode_battle.rs, tests/autofix_e2e.rs), each turning
+  # `clippy --workspace --all-targets -D warnings` red for every lane on this
+  # shared checkout and queued to fail CI on the next push of main — which on a
+  # shared checkout is whoever pushes next, not the author.
+  #
+  # The class reached main BY DESIGN: `cargo check` does not lint, and clippy
+  # without --all-targets does not compile tests, so a lint denial in a test
+  # file passed every gate an author would naturally run. It was caught only by
+  # whoever ran the full command next, hours later, on someone else's work.
+  #
+  # Falls back to check where clippy is absent: a missing component must not
+  # block commits, and check is what this gate did before.
+  if cargo clippy --version >/dev/null 2>&1; then
+    cargo clippy --workspace --all-targets --quiet -- -D warnings
+    echo "cargo clippy passed (test targets + lints)."
+  else
+    echo "clippy not installed - falling back to cargo check (lints NOT enforced)" >&2
+    cargo check --workspace --all-targets --quiet
+    echo "cargo check passed (including test targets)."
+  fi
 fi
 
 JS_STAGED=$(echo "$STAGED" | grep -E '^crates/amux-dashboard/static/.*\.(js|mjs)$' || true)

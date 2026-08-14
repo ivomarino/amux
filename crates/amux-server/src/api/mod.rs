@@ -16,6 +16,7 @@ pub mod criteria;
 pub mod browser;
 pub mod calendar;
 pub mod dictation;
+pub mod tts;
 pub mod email;
 pub mod file_viewer;
 pub mod files;
@@ -23,8 +24,16 @@ pub mod fs;
 pub mod git_guard;
 pub mod gmail_auth;
 pub mod groups;
+pub mod crm;
+pub mod speedtest;
+pub mod habits;
 pub mod health;
+pub mod env_config;
+pub mod gmail;
+pub mod graph;
 pub mod history;
+pub mod reports;
+pub mod terminal;
 pub mod invariants_api;
 pub mod journal;
 pub mod layout_presets;
@@ -32,16 +41,20 @@ pub mod log_search;
 pub mod map;
 pub mod memories;
 pub mod metrics;
+pub mod observability;
 pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod proxies;
 pub mod py_proxy;
 pub mod request_log;
 pub mod review;
+pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
 pub mod search;
+pub mod self_update;
 pub mod session_verbs;
 pub mod board_themes;
 pub mod lookup;
@@ -51,7 +64,9 @@ pub mod commit_mentions;
 pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
+pub mod mcp;
 pub mod skills;
+pub mod sql;
 pub mod sse;
 pub mod static_files;
 pub mod sync;
@@ -59,12 +74,14 @@ pub mod torrents;
 pub mod upload;
 pub mod verify;
 pub mod why;
+pub mod worker_create;
 pub mod workers;
 pub mod workers_deadletters;
 
 use crate::db::SharedStore;
 use axum::Router;
 use std::time::Instant;
+use tower_http::compression::CompressionLayer;
 
 /// Shared application state for handlers.
 #[derive(Clone)]
@@ -114,6 +131,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
         .route("/api/stats/daily", axum::routing::get(stats::daily))
+        // The writer for the baseline `daily` already reads (AMUX-2871).
+        .route("/api/stats/reset", axum::routing::post(stats::reset))
         .route("/api/branding", axum::routing::get(branding::get_branding)
             .post(branding::post_branding).delete(branding::delete_branding))
         // base64 icons: the handler's own 5MB check must answer (Python's
@@ -144,14 +163,12 @@ pub fn router(state: AppState) -> Router {
         // Uniform per-capability scope read/write — NATIVE (AMUX-2608: the
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
-        // Any python-proxied mount derives from py_proxy's PROXIED_FAMILIES
-        // table (AMUX-2597: the rust/python boundary is a registry, not
-        // scattered mounts). The table is EMPTY post-AMUX-2608 and must stay
-        // that way — this merge (now a no-op) plus the registry, the
-        // /api/debug/boundary view and tests/proxy_composition.rs are the
+        // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
+        // and the forwarder it fed was deleted in AMUX-2906, so the merge that
+        // used to sit here (already a no-op) is gone too — the registry, the
+        // /api/debug/boundary view and tests/proxy_composition.rs remain the
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
-        .merge(py_proxy::family_routes())
         .nest("/api/browser", browser::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
@@ -180,11 +197,37 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/groups", groups::routes())
         .nest("/api/tags", groups::tags_routes())
         .nest("/api/journal", journal::routes())
+        // CRM: a PORT of the python contract, not a new feature — the schema and
+        // 308 live contacts survived the cutover with no routes to reach them
+        // (AMUX-2929).
+        .nest("/api/crm", crm::routes())
+        .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
+        // The New Worker / Connect modals' supporting reads (AMUX-2871).
+        .merge(worker_create::routes())
+        .nest("/api/saved-messages", saved_messages::routes())
+        .merge(habits::routes())
+        .merge(observability::routes())
+        .merge(self_update::routes())
+        .nest("/api/proxies", proxies::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
+        .nest("/api/mcp", mcp::routes())
+        .nest("/api/sql", sql::routes())
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
+        // Map tab's graph mode: mind-map store + Obsidian import + the fleet
+        // org-chart projection (AMUX-2886 — tables existed, routes did not).
+        .nest("/api/graph", graph::routes())
+        // Workspace tab web-terminal panes: local-shell PTY over base64 I/O +
+        // long-poll output (AMUX-2885 — every keystroke 404'd since cutover).
+        .nest("/api/terminal", terminal::routes())
+        // Metrics tab report cards: CRUD + registry + ops-server refresh
+        // (AMUX-2884 — the table kept its rows, the routes never mounted).
+        .nest("/api/reports", reports::routes())
+        // Declarative environment config: one YAML -> the primitives
+        // (groups, workers; phase 2: schedules/columns/gates/files) — AMUX-2977.
+        .nest("/api/env", env_config::routes())
         .nest("/api/history", history::routes())
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).
@@ -202,11 +245,20 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(dictation::dictate)
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
+        // Text-to-speech (read-aloud): top-level EXACT paths the SPA calls
+        // (POST /api/tts, GET /api/tts/voices) — mounted flat rather than
+        // nested so `POST /api/tts` matches with no trailing-slash ambiguity.
+        // Default body limit is fine: the body is text, not audio.
+        .route("/api/tts", axum::routing::post(tts::synth))
+        .route("/api/tts/voices", axum::routing::get(tts::voices))
         .nest("/api/torrents", torrents::routes())
         .nest("/api/org", org::routes())
         // Absolute-path routes (merged, not nested): the gmail callback
         // below is public, and a nest wildcard at /api/gmail would shadow it.
         .merge(gmail_auth::routes())
+        // The mailbox half — labels/inbox/thread/send over GmailClient
+        // (AMUX-2883: the Mail view's calls 404'd since the python retirement).
+        .merge(gmail::routes())
         // AMUX-2599 — three endpoints the SPA calls on EVERY load that 404'd
         // here. Each 404 body deserialized cleanly into the client's success
         // path, so all three failed silently: no branch badges, per-worker
@@ -302,6 +354,12 @@ pub fn router(state: AppState) -> Router {
     // router. Auth is inside the wrapper — legacy paths are exactly as
     // protected as canonical ones.
     let app = aliases::alias_layer(app);
+
+    // Transparent gzip compression for every response whose client sends
+    // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
+    // sessions from 149KB to 21KB, and the SPA shell from 215KB to 46KB.
+    let app = app.layer(CompressionLayer::new());
+
     // Structured request log (AMUX-2605): the OUTERMOST wrap, so every
     // request — including alias-rewritten and fallback paths — is recorded
     // with the RAW path the client sent. Never blocks or fails a request
@@ -329,6 +387,23 @@ const PLACEHOLDER_API_KEYS: &[&str] = &[
     "xxx", "xxxx",
     "sk-ant-xxx", "sk-ant-your-key", "sk-ant-example", "sk-ant-placeholder",
 ];
+
+/// The 500 every API module was spelling for itself (AMUX-2919).
+///
+/// Fourteen identical private copies, in two spellings — half via a local
+/// `err()`, half constructing the tuple inline — all producing exactly
+/// `500 {"error": "<display>"}`. Identical output, so unlike `truthy` below
+/// this one really was duplication rather than divergence. Shared so the error
+/// SHAPE cannot drift per-module: a client parsing `.error` should not have to
+/// care which family answered.
+pub(crate) fn internal(e: impl std::fmt::Display) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
 
 /// Python truthiness for a JSON value ({} , "" , [] , 0 falsy) — identity's
 /// `oauthAccount` check and scope's `if items:` gate share it.
@@ -433,5 +508,28 @@ async fn global_memory_post(
             axum::Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod truthy_reachability {
+    /// Does `Number::as_f64()` EVER return None in this build?
+    ///
+    /// The whole premise of AMUX-2928 was that py_truthy and calendar/email's
+    /// truthy disagree on a number that does not fit f64. Worth confirming such
+    /// a number can exist here before "fixing" anything — without the
+    /// `arbitrary_precision` feature, serde_json stores every number as
+    /// u64/i64/f64 and `as_f64()` casts lossily rather than failing.
+    #[test]
+    fn as_f64_never_none_without_arbitrary_precision() {
+        for s in ["18446744073709551615", "-9223372036854775808", "0", "1", "1.5"] {
+            let v: serde_json::Value = serde_json::from_str(s).unwrap();
+            let n = v.as_number().expect("parsed as a number");
+            assert!(
+                n.as_f64().is_some(),
+                "{s} produced as_f64() == None — the truthy divergence IS reachable, \
+                 and AMUX-2928's fix is a behaviour change after all"
+            );
+        }
     }
 }

@@ -297,8 +297,17 @@ pub fn build_rfc822(spec: &MimeSpec) -> String {
 /// the plain body, signature appended to both alternatives. Returns
 /// `(plain_full, html_full, signature_included)`.
 pub fn compose_bodies(body: &str, sig_html: &str) -> (String, String, bool) {
-    let body_html = html_escape(body).replace('\n', "<br>");
-    let mut html_full = format!("<div style=\"white-space:normal;\">{body_html}</div>");
+    // The HTML alternative must MIRROR the text/plain part, which Gmail renders
+    // only as a fallback (primis, 2026-08-13: a delivered reply came out cramped
+    // — paragraph spacing collapsed, bullet list flattened). The old
+    // `white-space:normal` COLLAPSED the sender's whitespace (indentation, blank
+    // lines) and `\n -> <br>` discarded structure. `white-space:pre-wrap` on the
+    // ESCAPED body — newlines KEPT, not turned into <br> — renders exactly the
+    // spacing the text/plain part has: blank-line paragraph breaks and indented
+    // list items survive. (Rich markdown -> <ul>/<strong> is a separate opt-in;
+    // this faithful-whitespace fix is the safe default and cannot misrender.)
+    let body_html = html_escape(body);
+    let mut html_full = format!("<div style=\"white-space:pre-wrap;\">{body_html}</div>");
     if !sig_html.is_empty() {
         html_full.push_str(&format!("<br><br>{sig_html}"));
     }
@@ -790,6 +799,151 @@ impl GmailClient {
         self.api(account, "GET", &url, None).await.ok()
     }
 
+    /// Python `_gmail_list_messages` (AMUX-2883): header-level summaries for
+    /// the Mail view. `q` overrides `label` (python's exact precedence). The
+    /// N metadata fetches after the id list are python's own shape — one
+    /// round trip per message — kept for contract fidelity; a batch endpoint
+    /// exists but changes error semantics per message.
+    pub async fn list_messages(
+        &self,
+        account: &str,
+        label: &str,
+        page_token: &str,
+        q: &str,
+        max_results: usize,
+    ) -> Value {
+        let mut url = format!("{GMAIL_BASE}/messages?maxResults={max_results}");
+        if !q.is_empty() {
+            url.push_str(&format!("&q={}", urlencode(q)));
+        } else {
+            url.push_str(&format!("&labelIds={}", urlencode(label)));
+        }
+        if !page_token.is_empty() {
+            url.push_str(&format!("&pageToken={}", urlencode(page_token)));
+        }
+        let listed = match self.api(account, "GET", &url, None).await {
+            Ok(v) => v,
+            Err(e) => return self.gmail_error_shape(account, &e),
+        };
+        let empty = vec![];
+        let ids = listed.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+        let next = listed.get("nextPageToken").and_then(Value::as_str).unwrap_or("");
+        let mut summaries = vec![];
+        for m in ids {
+            let Some(mid) = m.get("id").and_then(Value::as_str) else { continue };
+            let murl = self.metadata_url(mid, &["From", "To", "Subject", "Date"]);
+            let Ok(hdr) = self.api(account, "GET", &murl, None).await else { continue };
+            let h = header_map(&hdr);
+            let lids: Vec<&str> = hdr
+                .get("labelIds")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            summaries.push(json!({
+                "id": mid,
+                "thread_id": hdr.get("threadId").and_then(Value::as_str).unwrap_or(mid),
+                "from": h.get("from").cloned().unwrap_or_default(),
+                "to": h.get("to").cloned().unwrap_or_default(),
+                "subject": h.get("subject").cloned().unwrap_or_else(|| "(no subject)".into()),
+                "date": h.get("date").cloned().unwrap_or_default(),
+                "snippet": hdr.get("snippet").and_then(Value::as_str).unwrap_or(""),
+                "unread": lids.contains(&"UNREAD"),
+                "starred": lids.contains(&"STARRED"),
+                "internal_date": internal_date(&hdr),
+            }));
+        }
+        json!({ "messages": summaries, "next_page_token": next })
+    }
+
+    /// Python `_gmail_get_thread`: full thread with decoded bodies; every
+    /// unread message in it is marked read (python's read-on-open behavior,
+    /// best-effort — a failed modify never fails the read).
+    pub async fn get_thread(&self, account: &str, thread_id: &str) -> Value {
+        let url = format!("{GMAIL_BASE}/threads/{}?format=full", urlencode(thread_id));
+        let thread = match self.api(account, "GET", &url, None).await {
+            Ok(v) => v,
+            Err(e) => return self.gmail_error_shape(account, &e),
+        };
+        let empty = vec![];
+        let msgs = thread.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+        let mut out = vec![];
+        let mut unread_ids = vec![];
+        for msg in msgs {
+            let payload = msg.get("payload").cloned().unwrap_or(json!({}));
+            let h = header_map_of(&payload);
+            let (html_body, text_body) = decode_body(&payload);
+            let lids: Vec<&str> = msg
+                .get("labelIds")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mid = msg.get("id").and_then(Value::as_str).unwrap_or("");
+            if lids.contains(&"UNREAD") {
+                unread_ids.push(mid.to_string());
+            }
+            out.push(json!({
+                "id": mid,
+                "thread_id": msg.get("threadId").and_then(Value::as_str).unwrap_or(""),
+                "from": h.get("from").cloned().unwrap_or_default(),
+                "to": h.get("to").cloned().unwrap_or_default(),
+                "cc": h.get("cc").cloned().unwrap_or_default(),
+                "subject": h.get("subject").cloned().unwrap_or_else(|| "(no subject)".into()),
+                "date": h.get("date").cloned().unwrap_or_default(),
+                "message_id_header": h.get("message-id").cloned().unwrap_or_default(),
+                "html_body": html_body,
+                "text_body": text_body,
+                "unread": lids.contains(&"UNREAD"),
+                "labels": lids,
+                "internal_date": internal_date(msg),
+            }));
+        }
+        for uid in unread_ids {
+            let murl = format!("{GMAIL_BASE}/messages/{uid}/modify");
+            let _ = self
+                .api(account, "POST", &murl, Some(&json!({"removeLabelIds": ["UNREAD"]})))
+                .await;
+        }
+        json!({ "thread_id": thread_id, "messages": out })
+    }
+
+    /// Python `_gmail_list_labels`: system labels first (INBOX, STARRED,
+    /// SENT, DRAFTS, SPAM, TRASH — python's exact order), then user labels
+    /// alphabetically. `[]` on any failure (python parity — the Mail view
+    /// renders an empty label rail rather than an error).
+    pub async fn list_labels(&self, account: &str) -> Vec<Value> {
+        let url = format!("{GMAIL_BASE}/labels");
+        let Ok(v) = self.api(account, "GET", &url, None).await else { return vec![] };
+        let mut labels: Vec<Value> =
+            v.get("labels").and_then(Value::as_array).cloned().unwrap_or_default();
+        const PRIO: [&str; 6] = ["INBOX", "STARRED", "SENT", "DRAFTS", "SPAM", "TRASH"];
+        labels.sort_by_key(|l| {
+            let n = l.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            match PRIO.iter().position(|p| *p == n) {
+                Some(i) => (0, i.to_string()),
+                None => (1, n.to_lowercase()),
+            }
+        });
+        labels
+    }
+
+    /// Python's undifferentiated `{"error": str(e)}` sent readers to check
+    /// whether the account was connected when it WAS — this is the improved
+    /// shape python later grew for list_messages, applied to every entry
+    /// point: name the state, and when it is re-authable, name the fix.
+    fn gmail_error_shape(&self, account: &str, err: &str) -> Value {
+        if err.contains("invalid_grant") {
+            json!({
+                "error": "needs_reauth",
+                "account": account,
+                "fix": format!("GET /api/gmail/auth?account={account} — open the url and approve"),
+            })
+        } else if err.contains("not_connected") {
+            json!({ "error": "not_connected", "account": account })
+        } else {
+            json!({ "error": err, "account": account })
+        }
+    }
+
     /// Python `_gmail_reply_send`: reply in-thread (clean body + signature,
     /// correct In-Reply-To/References/threadId) to the message identified by
     /// its RFC822 Message-ID. Cross-account: a thread living on another
@@ -992,6 +1146,67 @@ fn header_map(msg: &Value) -> HashMap<String, String> {
     out
 }
 
+/// Same map from a bare PAYLOAD object (a thread's per-message payloads have
+/// no `/payload` prefix — `header_map` above reads a full message resource).
+fn header_map_of(payload: &Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some(hs) = payload.get("headers").and_then(Value::as_array) {
+        for h in hs {
+            if let (Some(n), Some(v)) =
+                (h.get("name").and_then(Value::as_str), h.get("value").and_then(Value::as_str))
+            {
+                out.insert(n.to_lowercase(), v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Gmail sends `internalDate` as a STRING of epoch millis; python coerced
+/// with int(). Accept both encodings.
+fn internal_date(msg: &Value) -> i64 {
+    match msg.get("internalDate") {
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Python `_gmail_decode_body`: recursively extract (html, text) from a
+/// message payload — first text/html and first text/plain part win.
+fn decode_body(payload: &Value) -> (String, String) {
+    let mime = payload.get("mimeType").and_then(Value::as_str).unwrap_or("");
+    let data = |p: &Value| -> String {
+        let d = p.pointer("/body/data").and_then(Value::as_str).unwrap_or("");
+        if d.is_empty() {
+            return String::new();
+        }
+        base64url_decode(d)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default()
+    };
+    if mime == "text/html" {
+        return (data(payload), String::new());
+    }
+    if mime == "text/plain" {
+        return (String::new(), data(payload));
+    }
+    let mut html = String::new();
+    let mut text = String::new();
+    if let Some(parts) = payload.get("parts").and_then(Value::as_array) {
+        for part in parts {
+            let (h, t) = decode_body(part);
+            if !h.is_empty() && html.is_empty() {
+                html = h;
+            }
+            if !t.is_empty() && text.is_empty() {
+                text = t;
+            }
+        }
+    }
+    (html, text)
+}
+
 // ---------------------------------------------------------------------------
 // Send-audit ledger (Python `_email_log` / GET /api/email/log, AMUX-1897)
 // ---------------------------------------------------------------------------
@@ -1098,14 +1313,18 @@ mod tests {
     fn compose_bodies_escapes_and_appends_signature() {
         let (plain, html, inc) = compose_bodies("hi <b>\nline2", "<b>Sig</b>");
         assert_eq!(plain, "hi <b>\nline2\n\nSig");
+        // pre-wrap + KEEP the newline (not <br>): the HTML mirrors the plain
+        // part's spacing exactly (BACKE/primis 2026-08-13). A `<br>` here would
+        // DOUBLE the break under pre-wrap.
         assert_eq!(
             html,
-            "<div style=\"white-space:normal;\">hi &lt;b&gt;<br>line2</div><br><br><b>Sig</b>"
+            "<div style=\"white-space:pre-wrap;\">hi &lt;b&gt;\nline2</div><br><br><b>Sig</b>"
         );
+        assert!(html.contains("pre-wrap") && !html.contains("<br>line2"), "newline preserved, not <br>-ified: {html}");
         assert!(inc);
         let (plain2, html2, inc2) = compose_bodies("hi", "");
         assert_eq!(plain2, "hi");
-        assert_eq!(html2, "<div style=\"white-space:normal;\">hi</div>");
+        assert_eq!(html2, "<div style=\"white-space:pre-wrap;\">hi</div>");
         assert!(!inc2);
     }
 
@@ -1476,7 +1695,7 @@ mod tests {
         // Signature reached both alternatives (encoded in base64 parts).
         assert!(decoded.contains(&wrap76(&base64_std("hello\n\nSig".as_bytes()))));
         assert!(decoded.contains(&wrap76(&base64_std(
-            "<div style=\"white-space:normal;\">hello</div><br><br><b>Sig</b>".as_bytes()
+            "<div style=\"white-space:pre-wrap;\">hello</div><br><br><b>Sig</b>".as_bytes()
         ))));
     }
 

@@ -87,14 +87,47 @@ use std::collections::BTreeMap;
 /// that runs hot competes with the traffic it is measuring.
 pub const AUTOFIX_TICK_SECS: u64 = 120;
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
-}
+use crate::config::env_f64;
+use crate::config::env_i64;
 fn env_str(key: &str) -> String {
     std::env::var(key).unwrap_or_default().trim().to_string()
+}
+
+/// May autofix FILE its findings as board cards on this instance?
+///
+/// Autofix findings — invariant failures, the disk floor, dead routes, latency
+/// outliers, stale steering — are the SERVER's OWN health/ops concerns. On the
+/// local single-instance box the board IS the ops board, so this is on by
+/// default. But cloud is PER-TENANT: each customer org runs its own server, so
+/// filing them drops the operator's health cards onto the CUSTOMER's board
+/// (AMUX-3014: a customer org carried "disk … below floor" and "invariant …
+/// failing" it never created). The cloud image sets `AMUX_OPS_HEALTH_CARDS=0`;
+/// the operator reads cloud health from `/health` + `/api/health/invariants`
+/// instead of from cards inside a tenant. Single codebase, env-driven, no build
+/// flag — unset means the local default (on).
+fn ops_health_cards_enabled() -> bool {
+    // The explicit knob wins in either direction — an operator can force-on
+    // inside a container, or force-off on a shared box.
+    if let Ok(v) = std::env::var("AMUX_OPS_HEALTH_CARDS") {
+        return parse_ops_health_cards(Some(&v));
+    }
+    // No knob set: ON by default, but OFF in an isolated SINGLE-TENANT container.
+    // Such a container's board IS the customer's, so a cloud image that never
+    // sets the knob still must not leak the operator's health cards onto it.
+    // `IS_SANDBOX=1` is already set by the cloud image (for the root-refusal), so
+    // this defends the fix against a future deployment forgetting the explicit
+    // env — the leak cannot silently recur.
+    std::env::var("IS_SANDBOX").ok().as_deref() != Some("1")
+}
+
+/// Pure parse, split out so the on/off semantics are tested without env races.
+/// Unset (`None`) or any non-falsey value is ON (the local default); only an
+/// explicit falsey value turns it off.
+fn parse_ops_health_cards(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        None => true,
+    }
 }
 
 /// Window each detector looks back over.
@@ -1102,9 +1135,21 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
                     "{rollup_at} distinct entities (AMUX_INVARIANT_ROLLUP_AT)"
                 )),
             ],
+            // READS `failures` AND `invariant_id` — the shape the endpoint
+            // actually returns. This said `.get('results',[])` and `r.get('id')`
+            // and the endpoint has NEITHER key, so it printed `[]` no matter
+            // what was failing. Every auto-filed invariant card shipped a
+            // re-check that reported CLEAN unconditionally, as its own first
+            // instruction — the AMUX-2140 shape, where following the sanctioned
+            // step exactly is what produces the wrong answer. Verified against
+            // the live endpoint: it returns {checks, confidence, failures,
+            // live_incidents, note, unknowns}, and failure rows carry
+            // `invariant_id`, not `id`.
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 print([r for r in json.load(sys.stdin).get('results',[]) if r.get('id')=='{id}'])\""
+                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
+                 if r.get('invariant_id')=='{id}']; \
+                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
             ),
             owner: None,
             count: filing.len() as u64,
@@ -1138,9 +1183,21 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
                 ("last_seen".into(), rl::local_when(last)),
                 ("occurrences".into(), occ.to_string()),
             ],
+            // READS `failures` AND `invariant_id` — the shape the endpoint
+            // actually returns. This said `.get('results',[])` and `r.get('id')`
+            // and the endpoint has NEITHER key, so it printed `[]` no matter
+            // what was failing. Every auto-filed invariant card shipped a
+            // re-check that reported CLEAN unconditionally, as its own first
+            // instruction — the AMUX-2140 shape, where following the sanctioned
+            // step exactly is what produces the wrong answer. Verified against
+            // the live endpoint: it returns {checks, confidence, failures,
+            // live_incidents, note, unknowns}, and failure rows carry
+            // `invariant_id`, not `id`.
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 print([r for r in json.load(sys.stdin).get('results',[]) if r.get('id')=='{id}'])\""
+                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
+                 if r.get('invariant_id')=='{id}']; \
+                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
             ),
             owner: None,
             count: occ as u64,
@@ -2530,6 +2587,14 @@ pub async fn autofix_tick_with_ci(
 /// card: if the insert fails, no idem row is left claiming a card that does
 /// not exist, and if the idem row exists the card does too.
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
+    // PER-TENANT CLOUD: do not drop the server's own health/ops findings onto a
+    // customer's board (AMUX-3014). Off by env in the cloud image; on locally
+    // where the board is the ops board. Detection still runs — only the card
+    // FILING is suppressed — and the operator reads /health + /api/health/
+    // invariants for cloud health.
+    if !ops_health_cards_enabled() {
+        return Ok(None);
+    }
     {
         let conn = state.store.read()?;
         if already_filed(&conn, &f.signature) {
@@ -2773,11 +2838,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
     }))
 }
 
-pub fn amux_home() -> std::path::PathBuf {
-    std::env::var("AMUX_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    })
-}
+pub use crate::config::amux_home;
 
 /// `GET /api/debug/autofix` — the answer to "why didn't it file?" in one
 /// request. Carries the toggle state, every threshold, every signature seen,
@@ -2934,6 +2995,20 @@ mod tests {
         let got = du_top(&[dir.path().to_path_buf()], 8);
         assert_eq!(got.len(), 1, "expected the tempdir to be measured: {got:?}");
         assert!(got[0].1 > 0, "measured size should be non-zero: {got:?}");
+    }
+
+    /// AMUX-3014: autofix cards must default ON (local ops board) and turn OFF
+    /// only on an explicit falsey value (the cloud image sets 0 so per-tenant
+    /// customer boards do not carry the server's own health cards).
+    #[test]
+    fn ops_health_cards_default_on_off_only_when_explicitly_falsey() {
+        assert!(parse_ops_health_cards(None), "unset -> on (local ops default)");
+        assert!(parse_ops_health_cards(Some("1")), "1 -> on");
+        assert!(parse_ops_health_cards(Some("true")), "true -> on");
+        assert!(parse_ops_health_cards(Some("")), "empty -> on (not an explicit off)");
+        for off in ["0", "false", "off", "no", "OFF", " 0 ", "False"] {
+            assert!(!parse_ops_health_cards(Some(off)), "{off:?} must disable filing");
+        }
     }
 
     fn state() -> (AppState, tempfile::TempDir) {
