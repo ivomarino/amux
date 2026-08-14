@@ -3156,7 +3156,7 @@ FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come
 
 DATE: 2026-08-13
 AREA: instruments
-STATUS: fixed
+STATUS: open
 SESSION: amux-frustrations
 CARD: AMUX-3073
 SYMPTOM: A capability that has shipped for months read as ABSENT to a working lane. amux-gtm
