@@ -2927,7 +2927,10 @@ function render() {
   function _renderSessionCard(s) {
     const isExp = expanded.has(s.name);
     const flags = s.flags || '';
-    const isYolo = flags.includes('--dangerously-skip-permissions') || flags.includes('--dangerously-bypass-approvals-and-sandbox') || flags.includes('--yolo') || !!s.auto_continue;
+    // Server verdict, not a re-derivation: see session_verbs::yolo_enabled.
+    // The old local form ORed in `s.auto_continue`, which is default-ON, so it
+    // badged lanes YOLO that would still stop and ask for approval.
+    const isYolo = !!s.yolo;
     const provider = sessionProvider(s);
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
@@ -4646,13 +4649,17 @@ async function toggleYolo(session) {
       const claudeFlag = '--dangerously-skip-permissions';
       const codexFlag = '--dangerously-bypass-approvals-and-sandbox';
       const geminiFlag = '--yolo';
-      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(geminiFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
+      // Same server verdict the badge uses — the toggle must not disagree with
+      // what the card shows, or one tap appears to do nothing.
+      const wasYolo = !!s.yolo;
       if (wasYolo) {
         s.flags = stripProviderYoloFlags(s.flags || '');
         s.auto_continue = false;
+        s.yolo = false;   // the field the badge reads — the server will confirm
       } else {
         s.flags = ((s.flags || '') + ' ' + providerYoloFlag(s.provider)).trim();
         s.auto_continue = true;
+        s.yolo = true;
       }
       lastSessionsJSON = '';
       render();

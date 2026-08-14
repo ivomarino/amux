@@ -2145,7 +2145,24 @@ pub fn standing_orders_on_in(home: &std::path::Path, lane: &str, key: &str) -> b
     auto_continue_on(scoped_setting_in(home, lane, key).as_deref())
 }
 
-fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {
+/// THE predicate for "is this lane in YOLO mode". Public so the sessions
+/// payload can serialize the very verdict the toggle acts on, instead of the
+/// SPA re-deriving it — a view that re-derives a predicate drifts from it the
+/// moment either side changes, and this one did.
+///
+/// The bug that made this public: the SPA computed its badge as
+/// `flags.includes(skipPermissions) || !!s.auto_continue`, and `auto_continue`
+/// in the payload is `standing_orders_on(...)`, which is DEFAULT-ON at every
+/// level. So a lane with no skip-permissions flag at all rendered a YOLO badge,
+/// and a worker sat blocked on "This command requires approval" for 11 hours
+/// while its card claimed it would never stop to ask.
+///
+/// Note the comment below already forbade exactly that, server-side, and was
+/// right: the default-on nudge must never imply skip-permissions. The client
+/// did it anyway, through a field carrying the default-on value. That is why
+/// the fix is to SHARE the predicate rather than to restate it correctly in a
+/// second place.
+pub fn yolo_enabled(flags: &str, cc_auto_continue: Option<&str>) -> bool {
     PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f))
         || flags.contains("--approval-mode=yolo")
         || flags.contains("--approval-mode yolo")
@@ -2154,7 +2171,11 @@ fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {
         // implies skip-permissions. The DEFAULT-on nudge must not — routing
         // the default through here would flip the whole fleet to YOLO as a
         // side effect of a scheduling change.
-        || matches!(cfg.get("CC_AUTO_CONTINUE"), Some("1" | "true" | "yes"))
+        || matches!(cc_auto_continue, Some("1" | "true" | "yes"))
+}
+
+fn is_yolo_enabled(flags: &str, cfg: &EnvFile) -> bool {
+    yolo_enabled(flags, cfg.get("CC_AUTO_CONTINUE"))
 }
 
 fn default_model_for_provider(provider: &str) -> String {
@@ -11741,6 +11762,34 @@ mod tests {
 
     /// The file/DB-backed verbs, exercised through the full router shape on a
     /// hermetic fleet home — the same dispatch the live composition mounts.
+    /// THE INVARIANT the badge bug broke: the value the sessions payload ships
+    /// must be the value the toggle acts on. The SPA used to derive its own,
+    /// ORing in `auto_continue` — which the payload fills from
+    /// `standing_orders_on`, DEFAULT-ON at every level — so a lane with no
+    /// skip-permissions flag badged YOLO and then stopped to ask for approval.
+    ///
+    /// The control is the third case: default-on standing orders must NOT read
+    /// as YOLO. Without it this test passes against the very bug it exists for.
+    #[test]
+    fn yolo_verdict_ignores_default_on_standing_orders() {
+        use super::yolo_enabled;
+        // A real bypass flag is YOLO.
+        assert!(yolo_enabled("--model opus --dangerously-skip-permissions", None));
+        // An EXPLICIT CC_AUTO_CONTINUE=1 is YOLO — a worker that never stops
+        // implies skip-permissions, which is the documented intent.
+        assert!(yolo_enabled("--model opus", Some("1")));
+        // CONTROL — the reported bug. No flag, and auto-continue merely
+        // default-on (absent from the env, which is what default-on looks like
+        // to this function): NOT yolo.
+        assert!(
+            !yolo_enabled("--model opus", None),
+            "a lane with no bypass flag must not read as YOLO — this is the \
+             personal-planner case that sat blocked on an approval prompt for 11h"
+        );
+        // And an explicit off is not yolo either.
+        assert!(!yolo_enabled("--model opus", Some("0")));
+    }
+
     #[tokio::test]
     async fn file_backed_verbs_roundtrip_hermetically() {
         let home = tempfile::tempdir().unwrap();
