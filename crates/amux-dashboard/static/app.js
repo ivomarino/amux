@@ -7557,7 +7557,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.631';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.633';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10809,6 +10809,27 @@ async function _ttsSpeak(text, btn) {
   const orig = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '&#x23F3;'; }
   _ttsLoading(true);
+  // CLAIM THE USER GESTURE NOW, BEFORE ANY await (Ethan, iOS PWA, 2026-08-14).
+  //
+  // This function used to `new Audio(d.url)` and `play()` AFTER awaiting /api/tts.
+  // That request takes 3-11s (measured: 3676ms, 10747ms, 10864ms), and iOS discards
+  // the user-activation that a tap grants long before it returns — so play() rejected
+  // with NotAllowedError and the toast read "Read aloud failed: The request is not
+  // allowed by the user agent or the platform in the current context, possibly
+  // because the user denied permission." Nothing was actually denied and no
+  // permission exists to grant; that string is WebKit's wording for "no gesture".
+  //
+  // The element is therefore created and unlocked synchronously, inside the tap:
+  // playing a 44-byte silent WAV marks THIS element as user-activated, and the
+  // activation survives a later src swap. Desktop is unaffected (it would have
+  // allowed the play either way).
+  const audio = new Audio();
+  audio.playsInline = true;
+  try {
+    audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    const warm = audio.play();
+    if (warm && warm.catch) warm.catch(() => {});   // a rejection here is not fatal
+  } catch (e) { /* unlock is best-effort; the real play below still reports */ }
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
@@ -10817,7 +10838,8 @@ async function _ttsSpeak(text, btn) {
     });
     const d = await r.json();
     if (d.error) { showToast(d.error, 'error'); return; }
-    const audio = new Audio(d.url);
+    try { audio.pause(); } catch (e) {}
+    audio.src = d.url;
     _ttsSpeakAudio = audio;
     audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
     await audio.play();
@@ -10826,7 +10848,22 @@ async function _ttsSpeak(text, btn) {
     // storage hiccup never blocks playback.
     _raRecord(text, d.url, (typeof peekSession !== 'undefined' && peekSession) || '');
   } catch(e) {
-    showToast('Read aloud failed: ' + e.message, 'error');
+    // NotAllowedError is not a permission the user can grant — it means the tap's
+    // user-activation expired. Say something actionable instead of WebKit's
+    // "possibly because the user denied permission", which sends people hunting
+    // for a setting that does not exist.
+    const msg = (e && e.name === 'NotAllowedError')
+      ? 'Read aloud blocked by iOS — tap again to play'
+      : 'Read aloud failed: ' + ((e && e.message) || e);
+    showToast(msg, 'error');
+    // Make the next occurrence visible without a screenshot (this one cost three
+    // reports and two wrong hypotheses before the error text was seen).
+    try {
+      if (typeof _clientDebug === 'function') _clientDebug('tts-error', { name: e && e.name, msg: e && e.message });
+      else navigator.sendBeacon && navigator.sendBeacon('/api/client-debug',
+        new Blob([JSON.stringify({ kind: 'tts-error', name: e && e.name, msg: e && e.message })],
+                 { type: 'application/json' }));
+    } catch (_) {}
   } finally {
     _ttsLoading(false);
     if (btn) { btn.disabled = false; btn.innerHTML = orig; }
