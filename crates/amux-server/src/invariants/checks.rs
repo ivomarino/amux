@@ -430,24 +430,58 @@ pub fn queue_has_live_consumer(items: &[QueuedItem], now: f64, stale_after_s: f6
     let mut out = Vec::new();
     for it in items {
         let age = now - it.queued_at;
-        // Only an item whose target is idle proves the consumer is absent.
-        if it.target_idle && age > stale_after_s {
-            out.push(
-                InvariantResult::fail(
-                    ID,
-                    format!("queued item delivered within {stale_after_s:.0}s of the target going idle"),
-                    format!("undelivered for {age:.0}s while target is IDLE"),
-                )
-                .entity(&it.target)
-                .evidence(json!({
-                    "target": it.target, "age_s": age, "queue": it.queue,
-                    "class": "producer-without-consumer",
-                    "incident": "steering queue had 3 producers and no consumer; auto-pickup \
-                                 died with the python retirement",
-                })),
-            );
-        } else {
+        if age <= stale_after_s {
+            // Recently queued: a normal delivery tick has not elapsed yet.
             out.push(InvariantResult::pass(ID).entity(&it.target));
+            continue;
+        }
+        match it.block_reason.as_deref() {
+            // The target is not a live consumer at all (no env file, not
+            // running, archived). The message is UNROUTABLE, not merely late:
+            // no delivery tick will ever land it, so this is a distinct, louder
+            // fact than an idle consumer with lagging delivery, and it was
+            // misread as the latter because the invariant did not consult
+            // lane_block_reason (AMUX-3084 / AMUX-3111, ethos rule 4: the
+            // instrument could not express the discriminator). The cure is a
+            // dead-letter path (AMUX-3110), not waiting for a consumer that will
+            // never exist.
+            Some(reason) => {
+                out.push(
+                    InvariantResult::fail(
+                        ID,
+                        format!("queued item delivered or dead-lettered within {stale_after_s:.0}s"),
+                        format!("undelivered for {age:.0}s; target is UNROUTABLE ({reason})"),
+                    )
+                    .entity(&it.target)
+                    .evidence(json!({
+                        "target": it.target, "age_s": age, "queue": it.queue,
+                        "class": "unroutable-target",
+                        "block_reason": reason,
+                        "fix": "dead-letter unreachable rows (AMUX-3110); do not wait for a \
+                                consumer that will never exist",
+                    })),
+                );
+            }
+            // A live consumer sitting IDLE with an old item in front of it is
+            // the original producer-without-consumer incident: it is not draining.
+            None if it.target_idle => {
+                out.push(
+                    InvariantResult::fail(
+                        ID,
+                        format!("queued item delivered within {stale_after_s:.0}s of the target going idle"),
+                        format!("undelivered for {age:.0}s while target is IDLE"),
+                    )
+                    .entity(&it.target)
+                    .evidence(json!({
+                        "target": it.target, "age_s": age, "queue": it.queue,
+                        "class": "producer-without-consumer",
+                        "incident": "steering queue had 3 producers and no consumer; auto-pickup \
+                                     died with the python retirement",
+                    })),
+                );
+            }
+            // A deep queue behind a BUSY worker (routable, not idle) is correct.
+            None => out.push(InvariantResult::pass(ID).entity(&it.target)),
         }
     }
     if out.is_empty() {
@@ -462,6 +496,12 @@ pub struct QueuedItem {
     pub target: String,
     pub queued_at: f64,
     pub target_idle: bool,
+    /// Why the target is not a deliverable consumer right now, taken from the
+    /// SHARED delivery predicate `lane_block_reason` (`no-env-file` /
+    /// `not-running` / `archived`), or `None` when the target is a live lane.
+    /// Without it the check could not tell an unroutable ghost from an
+    /// idle-but-lagging consumer (AMUX-3084 / AMUX-3111).
+    pub block_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -920,9 +960,43 @@ mod negative_controls {
             target: "amux-rust".into(),
             queued_at: 0.0,
             target_idle: true,
+            block_reason: None,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
+    }
+
+    /// AMUX-3084 / AMUX-3111: a target that is not a live consumer at all (its
+    /// env file is gone after the amux-rust->amux rename) must read as
+    /// UNROUTABLE, not as an idle consumer with lagging delivery. Before this the
+    /// invariant branched only on target_idle and reported the ghost as
+    /// producer-without-consumer, sending the reader to "wait for the consumer"
+    /// when the truth was "this consumer will never exist".
+    #[test]
+    fn a_ghost_target_reads_as_unroutable_not_a_dead_consumer() {
+        let items = vec![QueuedItem {
+            queue: "steering".into(),
+            target: "amux-rust".into(),
+            queued_at: 0.0,
+            target_idle: true, // carries a stale, never-decaying idle report (AMUX-2646)
+            block_reason: Some("no-env-file".into()),
+        }];
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0);
+        let f = rs
+            .iter()
+            .find(|r| r.status == Status::Fail)
+            .expect("an 18h-stuck row must still fail");
+        assert_eq!(
+            f.evidence["class"].as_str(),
+            Some("unroutable-target"),
+            "a ghost target must be classed unroutable, not producer-without-consumer: {}",
+            f.evidence
+        );
+        assert!(
+            f.observed.contains("UNROUTABLE"),
+            "the observed sentence must name the routability fault: {}",
+            f.observed
+        );
     }
 
     /// NEGATIVE CONTROL, rebuilt from the incident's own artifact: the exact
@@ -1050,6 +1124,7 @@ mod negative_controls {
             target: "amux-rust".into(),
             queued_at: 0.0,
             target_idle: false, // mid-turn: queueing is the POINT
+            block_reason: None,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0);
         assert!(

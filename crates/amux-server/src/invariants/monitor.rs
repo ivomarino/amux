@@ -203,44 +203,54 @@ fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
 /// ethos rule about a view sharing the predicate of the mechanism it describes.
 async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "queue.has_live_consumer";
-    let Ok(conn) = state.store.read() else {
-        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    // Read everything from the store in a scope that ENDS before any await: the
+    // rusqlite Connection guard and Statement are !Send, so they must be fully
+    // out of scope (not merely dropped) before lane_block_reason's tmux await,
+    // or the whole invariant future stops being Send. This also releases the
+    // read lock before that terminal I/O rather than holding it across the await.
+    let (reports, rows): (serde_json::Value, Vec<(String, f64)>) = {
+        let Ok(conn) = state.store.read() else {
+            return vec![InvariantResult::unknown(ID, "store unreadable")];
+        };
+        let reports = conn
+            .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT session, MIN(queued_at) FROM steering_queue GROUP BY session",
+        ) else {
+            // The table not existing is a real answer (nothing queued), but an
+            // unreadable one is not; do not turn a failed read into a clean pass.
+            return vec![InvariantResult::unknown(ID, "steering_queue unreadable")];
+        };
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        (reports, rows)
     };
-    let reports: serde_json::Value = conn
-        .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
 
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT session, MIN(queued_at) FROM steering_queue GROUP BY session",
-    ) else {
-        // The table not existing is a real answer (nothing queued), but an
-        // unreadable one is not — do not turn a failed read into a clean pass.
-        return vec![InvariantResult::unknown(ID, "steering_queue unreadable")];
-    };
-    let items: Vec<checks::QueuedItem> = stmt
-        .query_map([], |r| {
-            let session: String = r.get(0)?;
-            let queued_at: f64 = r.get(1)?;
-            Ok((session, queued_at))
-        })
-        .map(|it| {
-            it.flatten()
-                .map(|(session, queued_at)| {
-                    let idle = reports[&session]["state"].as_str() == Some("idle");
-                    checks::QueuedItem {
-                        queue: "steering".into(),
-                        target: session,
-                        queued_at,
-                        target_idle: idle,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut items: Vec<checks::QueuedItem> = Vec::with_capacity(rows.len());
+    for (session, queued_at) in rows {
+        let idle = reports[&session]["state"].as_str() == Some("idle");
+        // block_reason is the SAME predicate the delivery loop gates on
+        // (session_verbs::lane_block_reason), so the check cannot disagree with
+        // the mechanism about ROUTABILITY either, which is the missing half that
+        // made a renamed-away ghost target read as a dead consumer (AMUX-3084).
+        let block_reason = crate::api::session_verbs::lane_block_reason(&session)
+            .await
+            .map(str::to_string);
+        items.push(checks::QueuedItem {
+            queue: "steering".into(),
+            target: session,
+            queued_at,
+            target_idle: idle,
+            block_reason,
+        });
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
