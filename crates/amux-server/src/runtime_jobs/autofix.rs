@@ -1371,7 +1371,11 @@ fn du_one(p: &std::path::Path, deadline: std::time::Instant) -> Option<u64> {
                     // very FDs the neighbouring FdPressure detector counts.
                     let _ = child.kill();
                     let _ = child.wait();
-                    tracing::warn!(path = %p.display(), "disk: du timed out — path skipped in the size ranking");
+                    // debug, not warn: `du_top` reports every skip ONCE per run and
+                    // names the paths. This line fired per attempt on the same
+                    // unchanging path (~/Library/Caches), which made it 78% of the
+                    // server log in a 30-minute window and buried a per-minute panic.
+                    tracing::debug!(path = %p.display(), "disk: du timed out — path skipped in the size ranking");
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1407,23 +1411,31 @@ fn du_top(paths: &[std::path::PathBuf], limit: usize) -> Vec<(String, u64)> {
     let total_budget = std::time::Duration::from_secs_f64(du_total_timeout_s());
     let per_path = std::time::Duration::from_secs_f64(du_path_timeout_s());
     let mut sized: Vec<(String, u64)> = Vec::new();
-    let mut skipped = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     for p in paths.iter().filter(|p| p.exists()) {
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            skipped += 1;
+            skipped.push(p.display().to_string());
             continue;
         }
         let deadline = std::time::Instant::now() + per_path.min(remaining);
         match du_one(p, deadline) {
             Some(bytes) => sized.push((p.display().to_string(), bytes)),
-            None => skipped += 1,
+            None => skipped.push(p.display().to_string()),
         }
     }
     // Rule 4: a truncated ranking that does not say it was truncated reads as a
     // complete one. Whoever acts on this report must see that paths are missing.
-    if skipped > 0 {
-        tracing::warn!(skipped, "disk: size ranking is INCOMPLETE — some paths exceeded the du budget");
+    if !skipped.is_empty() {
+        // Rule 4 still applies — a truncated ranking must say so. But it must say
+        // it ONCE per run, naming the paths, rather than once per attempt: the
+        // per-attempt spelling reported the same unchanging path thousands of
+        // times and drowned the log it shares with real faults.
+        tracing::warn!(
+            skipped = skipped.len(),
+            paths = %skipped.join(", "),
+            "disk: size ranking is INCOMPLETE — these paths exceeded the du budget"
+        );
     }
     sized.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
     sized.truncate(limit);
