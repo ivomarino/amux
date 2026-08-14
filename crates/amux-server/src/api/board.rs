@@ -3015,9 +3015,18 @@ pub async fn delete_item(
 // hand-rolled curl — so the endpoint the CLI most depends on is exactly the one
 // the "does every caller have a route" invariant could not see.
 
-/// The size cap Python applied (py:69770). A status update is a summary; the
-/// card log is not a transcript sink.
-const STATUS_UPDATE_MAX: usize = 1200;
+/// The size cap for a status update. Python applied 1200 (py:69770) on the theory
+/// that an update is a SUMMARY, not a transcript sink. But 1200 chars silently
+/// amputated real cross-group HANDOFFS mid-sentence and still returned
+/// {"ok":true} (AMUX-3079), so the default is raised, made configurable, and any
+/// truncation is now reported loudly by the handler rather than being silent.
+fn status_update_max() -> usize {
+    std::env::var("AMUX_STATUS_UPDATE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8000)
+}
 
 async fn status_request(
     State(state): State<AppState>,
@@ -3114,17 +3123,29 @@ async fn status_update(
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    let text: String = body
+    let cap = status_update_max();
+    let full: String = body
         .as_ref()
         .and_then(|Json(v)| v.get("text"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
-        .chars()
-        .take(STATUS_UPDATE_MAX)
-        .collect();
+        .to_string();
+    let original_chars = full.chars().count();
+    let truncated = original_chars > cap;
+    let text: String = full.chars().take(cap).collect();
     if text.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "text required"}))).into_response();
+    }
+    if truncated {
+        // Never silent again (AMUX-3079): the caller and a log sweep must both
+        // see that a handoff was stored as a fragment.
+        tracing::warn!(
+            target: "board",
+            id = %id, original_chars, cap,
+            "status-update TRUNCATED to the cap and stored a fragment; raise \
+             AMUX_STATUS_UPDATE_MAX or split the update",
+        );
     }
     let (_actor, actor_name) = actor_from_headers(&headers);
     let actor = if actor_name.is_empty() || actor_name == "api-anonymous" {
@@ -3148,8 +3169,18 @@ async fn status_update(
     if let Err(e) = append_card_log(&state, &id, &format!("STATUS ({actor}): {text}")).await {
         return internal(e);
     }
-    Json(json!({"ok": true, "id": id, "actor": actor, "chars": text.chars().count()}))
-        .into_response()
+    let mut resp = Json(json!({
+        "ok": true, "id": id, "actor": actor,
+        "chars": text.chars().count(),
+        "original_chars": original_chars,
+        "truncated": truncated,
+    }))
+    .into_response();
+    if truncated {
+        resp.headers_mut()
+            .insert("x-amux-truncated", axum::http::HeaderValue::from_static("1"));
+    }
+    resp
 }
 
 /// Append one stamped line to a card's log. Both handlers above write only
