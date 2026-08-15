@@ -26,7 +26,22 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
-rust-embed = "8"
+# debug-embed: embed the dashboard assets at COMPILE time in debug builds too,
+# not just release (AF-60). Without it rust-embed falls back to reading
+# static/ from disk at runtime in debug, so on this 50-lane shared checkout a
+# peer saving app.js mid-run made four unrelated tests fail -- branding, sse,
+# static_files and the invariants extractor -- pointing at subsystems the
+# author never touched. Reproduced deterministically: truncate app.js without
+# rebuilding and those tests fail; with this feature they pass even if app.js
+# is DELETED, because the binary carries its own copy.
+#
+# It costs the debug hot-reload of dashboard assets, which nothing here uses:
+# the auto-builder ships `cargo build --release` (scripts/rust-auto-build.sh),
+# so what deploys has always embedded at compile time. CLAUDE.md states the
+# rule this restores -- "editing the working tree changes nothing that is
+# live; COMMITTED source is what ships" -- which the debug fallback was
+# quietly contradicting.
+rust-embed = { version = "8", features = ["debug-embed"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
