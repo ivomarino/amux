@@ -2652,3 +2652,74 @@ FIX: c7fe156 — the message now spells out `amux board <status> <id> --trigger 
   the misnamed `total_backlog` param; the call site already passed the drainable count). The
   exclusion behavior was already correct; this makes the honest path discoverable (ethos rule
   6). Underlying nudge friction is the same family as [[amux-project-reference]] board churn.
+
+## `amux start <worker>` dies on "AMUX_API: unbound variable" at real launch, but dry-run works
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-15
+SESSION: amux-cloud
+CARD: AMUX-3145
+SYMPTOM: `amux start qwen-eval` printed `/Users/ethan/.local/bin/amux: line 600: AMUX_API:
+  unbound variable` and never launched the worker. `amux start qwen-eval --dry-run` a moment
+  earlier had worked and printed the correct command — so the CLI looked fine right up until a
+  real start. cmd_start references `$AMUX_API` bare on the tmux `-e AMUX_URL=$AMUX_API` inject
+  but never declares it local (the way _api_start / _api_stop / send all do), so under `set -u`
+  it is unbound whenever AMUX_API is not exported — which is the normal case (AMUX_URL is the
+  var that is set). Dry-run returns before that line, which is exactly why the break hid.
+COST: A launch that failed with a message pointing at an env var, not at the real cause (a
+  missing local). ~10 min dogfooding the ollama worker before spotting that dry-run and real
+  start diverge at the `set -u` line. A worker that silently never started.
+FIX: 7584a1f — declare `local AMUX_API="${AMUX_API:-${AMUX_URL:-https://localhost:8824}}"` at
+  the top of cmd_start. Log-signal follow-up (two-fix rule): `bash -n` cannot catch an unbound
+  var (runtime, not parse) and CI does not shellcheck the `amux` script — a shellcheck gate
+  would have flagged this as SC2154 (referenced but not assigned). That lint is the durable
+  surface for the next one; filed as a follow-up on AMUX-3145.
+
+## amux send to a bare REPL worker: origin header is submitted as its own message, prompt body is not
+AREA: notices
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-cloud
+CARD: AC-354
+SYMPTOM: Driving a qwen3.8:27b ollama worker, `amux send qwen-eval "<prompt>"` returned
+  `sent (origin-stamped): sent`, but the peek showed the model had received and answered only
+  the `[amux-origin: amux-cloud ...]` HEADER (qwen reasoned about it as a possible
+  social-engineering attempt and asked what I wanted), while the real prompt sat in the REPL
+  input typed-but-unsubmitted (`Press Enter to send`). I had to `tmux send-keys Enter` by hand
+  to get an answer. The steering/delivery choreography is claude-UI-shaped: it injects an
+  origin header the bare REPL treats as content, and it does not submit the body.
+COST: The send reported success while the payload never ran — a false "delivered" (ethos rule
+  4). Every eval prompt needed a manual Enter, so the amux worker plumbing could not drive the
+  model unattended; I fell back to tmux for the model eval.
+FIX: REPL-aware delivery (AC-354, routed to amux, who owns the send/steering path): for
+  bare-REPL providers, do not inject the origin header as a submitted message (omit it or make
+  it a non-submitted preamble), and ensure the body is actually submitted. Verify by peeking
+  that the model answered, not by trusting `sent`. Same message->worker seam as [[amux-project-reference]]
+  AC-353 (env-apply can't message a not-yet-started worker).
+
+## A peer's `git commit -a` swept my uncommitted feature edits into their unrelated commit
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-cloud
+CARD: AC-355
+SYMPTOM: Mid-edit on session_verbs.rs (14 lines enabling ollama as a provider, AMUX-3145),
+  another lane committed `13d66f4 fix(ledger)` with a `git commit -a`-shaped `git add
+  <file>`, which staged the WHOLE shared file — sweeping my uncommitted ollama edits into
+  their ledger-fix commit. `git diff` went empty under me mid-`git add`; `git status` showed
+  the file clean while `grep -c ollama` still found my lines — they were committed, under a
+  peer's authorship, in a commit whose message is about the ledger. The CLAUDE.md documents
+  this exact class (2026-08-09) and it recurred here.
+COST: ~8 min diagnosing where my edits went (were they reverted? committed? by whom?),
+  splitting my remaining work into a second commit (b992c99), and a commit whose message does
+  not describe half its diff. No code lost, but the attribution + commit-message coherence is
+  wrong and only a manual peer heads-up reconciled it.
+FIX: The durable fix is not "remember not to `git add <sharedfile>`" — it is per-lane
+  isolation for in-flight edits (worktrees), or a pre-commit guard that refuses to stage a
+  file another live session has uncommitted hunks in (the staged-guard already KNOWS cotenant
+  edits — it warned about env_config.rs minutes earlier — but it warns the committer, not the
+  victim, and does not block). Filed AC-355. Same family as [[amux-project-reference]]
+  shared-checkout races; three attribution entries now share this seam.
