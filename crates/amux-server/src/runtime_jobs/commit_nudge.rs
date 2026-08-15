@@ -277,9 +277,21 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          the newer one on origin (no conflict, the older file just wins). So BEFORE staging, for \
          each path run `git diff origin/main -- <path>` and read the direction:\n\
          \u{2022} worktree ADDS content origin lacks -> real uncommitted work, commit it;\n\
-         \u{2022} worktree is MISSING content origin has -> STALE, do NOT commit — \
-         `git checkout origin/main -- <path>` to restore;\n\
+         \u{2022} worktree is MISSING content origin has AND adds nothing -> stale;\n\
          \u{2022} no real diff -> a false positive, leave it.\n\
+         THESE ARE NOT MUTUALLY EXCLUSIVE, and that is where the remedy bites (AMUX-3172, \
+         gtm-ticker). A diff can BOTH add novel content AND lack origin's — a worktree that is \
+         AHEAD, not stale — and it matches the middle bullet too. \
+         `git checkout origin/main -- <path>` on that path DELETES the novel work, \
+         irreversibly, and the same warning fires in both directions. So before restoring \
+         ANYTHING, prove the direction:\n\
+         \u{2022} `git cat-file -e $(git hash-object <path>) 2>/dev/null` — if the object \
+         EXISTS, this exact content was committed before, so it is an older revision and \
+         restoring is safe;\n\
+         \u{2022} if it does NOT exist, the content has never been committed anywhere: it is \
+         NOVEL, `checkout` destroys it, and the safe action is COMMIT, not restore.\n\
+         When the check is ambiguous or you cannot run it, commit — a redundant commit is \
+         recoverable and a restore is not.\n\
          Commit only the paths you can see are genuinely newer, with a clear message; WIP-commit \
          anything intentionally incomplete and say so. Don't leave the working tree dirty — but \
          don't commit a revert to clear it, either."
