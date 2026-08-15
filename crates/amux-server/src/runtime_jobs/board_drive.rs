@@ -863,13 +863,23 @@ fn promotable_deps(conn: &Connection, row: &bs::IssueRow) -> Option<Vec<String>>
 /// Is this card parked on a live `source_ref` trigger? A non-empty `source_ref`
 /// is an explicit, owner-set wake condition ("re-check when a namespace holds
 /// both an archive- and a competitor-shaped collection") that the OWNING session
-/// re-evaluates by hand — it is NOT "deps terminal". The drive-to-verified
-/// promotion pass must leave such a card parked even when its `depends_on` are
-/// all terminal, exactly as the drain and rot sweeps already do (their DELETE
-/// guards carry `COALESCE(source_ref,'')=''`).
+/// re-evaluates by hand, NOT "deps terminal". The drive-to-verified promotion
+/// pass must leave such a card parked even when its `depends_on` are all terminal.
+///
+/// This predicate TRIMS: a whitespace-only `source_ref` ("   ") counts as NO live
+/// trigger, because whitespace is not a real wake condition. That is DELIBERATELY
+/// different from the drain and rot DELETE guards, which test the raw
+/// `COALESCE(source_ref,'')=''` (no trim) and so treat "   " as a trigger and skip
+/// it. The divergence is principled, not an oversight (AF-56, amux-frustrations'
+/// review of af1f301): promotion is NON-destructive, so it errs liberal and
+/// promotes an ambiguous card; drain and rot are DESTRUCTIVE, so they err
+/// conservative and let an ambiguous `source_ref` shield a card from deletion.
+/// Each is conservative in the direction that avoids the costly mistake for its
+/// own operation, so do NOT "unify" them by copying one predicate into the
+/// other's site. (The T-blank test asserts this promotion-trim behaviour.)
 ///
 /// Without this, a card carrying a satisfied dependency AND a live trigger is
-/// dragged out of `backlog` every tick — the promotion sees terminal deps and
+/// dragged out of `backlog` every tick: the promotion sees terminal deps and
 /// fires, fighting the owner's park. MG-1388 was re-activated five times in two
 /// hours against mixpeek-general's explicit re-parks (2026-08-15); that is ethos
 /// rule 8, the harness deciding what was the owning session's to decide.
