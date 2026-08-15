@@ -396,13 +396,50 @@ async fn apply(
     // ---- messages: seeded inbox — reported here, delivered in the write phase
     // through the SAME create-message path (ethos D6). Idempotent by
     // (recipient, text), so a re-applied env does not re-send.
-    for m in &spec.messages {
+    //
+    // Recipients are RESOLVED up-front (read pass) so the report is HONEST — a
+    // message the durable worker registry (`_amux_workers`) can't resolve is
+    // reported "skipped", never a phantom "create" (ethos rule 4: a dropped
+    // stanza must not look like it worked). This is the worker-model duality
+    // (D6): env-apply writes `.env` workers, and a `.env` worker becomes
+    // message-addressable only once STARTED and registered in `_amux_workers`.
+    // So a kickoff to a not-yet-started worker is surfaced here — the write
+    // phase's `continue` on the same None is now visible, not silent. "human",
+    // a group, or an already-running worker resolve immediately.
+    let msg_resolves: Vec<bool> = state
+        .store
+        .read()
+        .ok()
+        .map(|conn| {
+            spec.messages
+                .iter()
+                .map(|m| {
+                    let to = m.to.trim();
+                    !to.is_empty()
+                        && matches!(super::messages::resolve_recipient(&conn, to), Ok(Some(_)))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false; spec.messages.len()]);
+    for (m, resolves) in spec.messages.iter().zip(&msg_resolves) {
         let (to, text) = (m.to.trim(), m.text.trim());
         if to.is_empty() || text.is_empty() {
             report.push(json!({"kind": "message", "action": "error", "detail": "to and text are required"}));
             continue;
         }
-        report.push(json!({"kind": "message", "to": to, "action": "create"}));
+        if *resolves {
+            report.push(json!({"kind": "message", "to": to, "action": "create"}));
+        } else {
+            report.push(json!({"kind": "message", "to": to, "action": "skipped",
+                "detail": "recipient not found in worker registry — a .env worker is message-addressable only once started; \"human\", a group, or a running worker resolve"}));
+            // Log signal (every-fix-needs-a-log-signal): the NEXT dropped
+            // env-apply message self-announces in server-rs.log, so a sweep
+            // catches the worker-model gap without a human noticing first.
+            if !dry {
+                tracing::warn!(target: "env_apply", to = %to,
+                    "env-apply message skipped: recipient not in _amux_workers (worker-model duality D6)");
+            }
+        }
     }
 
     // Phase-2 stanzas still parsed-and-reported (not silently dropped).
