@@ -1248,7 +1248,7 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
 /// The idle-drain prompt: a lane is doing nothing while it holds a backlog. The
 /// action is the WORKER'S to choose (which cards, in what order) — amux only
 /// surfaces the stall (D1 exit: the model drives, the harness reports).
-fn backlog_drain_text(cards: &[(String, String, i64)], total_backlog: i64) -> String {
+fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String {
     let list = cards
         .iter()
         .map(|(id, title, _)| {
@@ -1257,21 +1257,27 @@ fn backlog_drain_text(cards: &[(String, String, i64)], total_backlog: i64) -> St
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // Ask for a batch proportional to the backlog: a lane idle on 200 cards
-    // should pull a real handful, not one, so a big queue actually moves per
-    // nudge (Ethan: "backlog across EVERY worker turns into work"). Bounded 3..10
-    // so the worker is never asked to bite off more than it can honestly triage.
-    let batch = (total_backlog / 10).clamp(3, 10);
+    // `drainable` is the DRAINABLE count (source_ref-parked, dormant and epic
+    // cards already excluded — same predicate as the list), NOT the raw backlog.
+    // Ask for a batch proportional to it: a lane idle on 200 cards should pull a
+    // real handful, not one (Ethan: "backlog across EVERY worker turns into
+    // work"). Bounded 3..10 so the worker is never asked to bite off more than it
+    // can honestly triage.
+    let batch = (drainable / 10).clamp(3, 10);
     format!(
-        "[amux] You are idle with {total_backlog} card(s) in `backlog` and nothing in \
+        "[amux] You are idle with {drainable} drainable card(s) in `backlog` and nothing in \
          `todo` or `doing`. board-drive only dispatches `todo`, so this queue will not move \
          on its own — you have to pull from it.\n\n\
          {list}\n\n\
          Pull the next ~{batch} actionable card(s) into `todo` (they get dispatched) or \
          straight to `doing` and start, and for anything that is blocked, done, or no longer \
-         relevant, say so and move it (review / done / archive / backlog with a trigger). Do \
-         not leave the whole backlog sitting while you idle — drain it. This nudge repeats \
-         faster the larger your backlog is, until it moves."
+         relevant, say so and move it (review / done / archive). A card genuinely parked on a \
+         condition (a dependency, an owner decision, a dedicated focused turn) belongs in \
+         `backlog` WITH a trigger: `amux board <status> <id> --trigger \"what unblocks it\"` \
+         records the condition and EXCLUDES the card from this nudge, so escalation counts only \
+         un-parked work — reach for it instead of leaving a parked card to be re-listed. Do not \
+         leave the whole backlog sitting while you idle — drain it. This nudge repeats faster \
+         the larger your DRAINABLE backlog is, until it moves."
     )
 }
 
