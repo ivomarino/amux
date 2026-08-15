@@ -518,7 +518,26 @@ fn decoded_error_body(bytes: &[u8], content_encoding: &str) -> String {
             );
         }
     };
-    truncate_chars(&String::from_utf8_lossy(&raw), ERROR_BODY_CHARS)
+    let text = String::from_utf8_lossy(&raw);
+    let n = text.chars().count();
+    if n <= ERROR_BODY_CHARS {
+        return text.into_owned();
+    }
+    // SAY that it was cut (AF-59). Error bodies are JSON, so a bare truncation
+    // produces a string that is INVALID JSON and indistinguishable from a
+    // malformed response — a consumer calling serde_json::from_str just fails,
+    // and the natural conclusion is "the endpoint returned garbage" rather than
+    // "the log trimmed it". Measured 2026-08-15: 6 of 277 bodies in 24h sat at
+    // the cap, every one unparseable, including two gate-409s minutes old.
+    //
+    // AMUX-3132 already hit this and raised the cap 500 -> 2000, which moved the
+    // threshold without changing the failure: anything over the new number is
+    // silently invalid in exactly the same way. A cap that announces itself
+    // stops being a trap at every size, which is why this is the fix rather than
+    // a third number.
+    let kept: String = text.chars().take(ERROR_BODY_CHARS).collect();
+    format!("{kept}\u{2026}<truncated by the request log: kept {ERROR_BODY_CHARS} of {n} chars; \
+             this string is deliberately NOT valid JSON>")
 }
 
 /// Cap on DECOMPRESSED error-body bytes. A compressed body is an amplification
@@ -2011,7 +2030,20 @@ mod tests {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        assert_eq!(err_body.chars().count(), ERROR_BODY_CHARS, "first 500 chars only");
+        // AF-59 changed this contract deliberately: the KEPT payload is still
+        // exactly ERROR_BODY_CHARS, but an over-cap body now carries a marker
+        // saying so, because a bare truncation is invalid JSON that reads as a
+        // malformed response. Assert the kept prefix, not the total length —
+        // asserting the total would make the marker's own text load-bearing.
+        assert!(
+            err_body.starts_with(&"E".repeat(ERROR_BODY_CHARS)),
+            "exactly ERROR_BODY_CHARS of payload are kept, unaltered"
+        );
+        assert!(
+            err_body.contains("<truncated by the request log"),
+            "an over-cap body must announce the cut: {}",
+            &err_body[err_body.len().saturating_sub(140)..]
+        );
         assert_eq!(resp_bytes, 10_000, "exact buffered size recorded");
     }
 
@@ -2085,6 +2117,24 @@ mod tests {
 
         // Case-insensitive: hyper does not promise a canonical casing.
         assert!(decoded_error_body(&gz, "GZIP").contains("captureScreenshot"));
+
+        // AF-59: an over-cap body must SAY it was cut. A bare truncation yields
+        // invalid JSON that reads as a malformed response, which is how
+        // AMUX-3132 got "fixed" by raising the cap 500 -> 2000 — moving the
+        // threshold without changing the failure. Live specimen: 6 of 277
+        // bodies in 24h sat exactly at the cap, all unparseable.
+        let over = format!(r#"{{"error":"{}"}}"#, "z".repeat(ERROR_BODY_CHARS + 500));
+        let cut = decoded_error_body(over.as_bytes(), "");
+        assert!(cut.contains("<truncated by the request log"), "must announce the cut: {}", &cut[cut.len()-120..]);
+        assert!(cut.contains(&format!("kept {ERROR_BODY_CHARS} of")), "must name both sizes");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&cut).is_err(),
+            "still not valid JSON — the marker is honest about that, it does not repair it"
+        );
+        // A body UNDER the cap must be untouched: no marker, and still parseable.
+        let small = decoded_error_body(br#"{"error":"nope"}"#, "");
+        assert_eq!(small, r#"{"error":"nope"}"#, "under-cap bodies must not gain a marker");
+        assert!(serde_json::from_str::<serde_json::Value>(&small).is_ok());
     }
 
     #[tokio::test]
