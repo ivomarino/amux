@@ -7596,7 +7596,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.644';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.645';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10817,6 +10817,29 @@ let _ttsVoices = null;
 let _ttsSelectedVoice = '';
 let _ttsSpeakAudio = null;   // currently-playing one-click clip, so a second press stops the first
 
+// Claim the tap's user-activation for the SHARED player element, synchronously.
+//
+// iOS discards user-activation across an await, and /api/tts takes 3-11s
+// (measured 3676/10747/10864ms), so play() afterwards rejects with
+// NotAllowedError — WebKit words that as "the user denied permission", which is
+// misleading enough that it cost three reports and two wrong hypotheses before
+// the error text was read (2026-08-14). Playing a 44-byte silent WAV inside the
+// gesture marks the element as activated, and that survives a later src swap.
+//
+// It must be _abAudio specifically: read-aloud now plays through _abPlay so it
+// gets the bottom player bar, and activation is per-ELEMENT. Unlocking a private
+// Audio would leave the element that actually plays still locked — the fix and
+// the feature would each look correct in isolation and fail together.
+function _ttsClaimGesture() {
+  try {
+    if (!_abAudio) return;
+    _abAudio.playsInline = true;
+    _abAudio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    const warm = _abAudio.play();
+    if (warm && warm.catch) warm.catch(() => {});   // a rejection here is not fatal
+  } catch (e) { /* best-effort; the real play still reports its own failure */ }
+}
+
 // One-click "read aloud" for a single message — no dialog, just plays. Hits
 // the same /api/tts route as the Text-to-Speech dialog below, so it gets
 // Piper (free, local) when installed and ElevenLabs otherwise.
@@ -10862,13 +10885,8 @@ async function _ttsSpeak(text, btn) {
   // playing a 44-byte silent WAV marks THIS element as user-activated, and the
   // activation survives a later src swap. Desktop is unaffected (it would have
   // allowed the play either way).
-  const audio = new Audio();
-  audio.playsInline = true;
-  try {
-    audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-    const warm = audio.play();
-    if (warm && warm.catch) warm.catch(() => {});   // a rejection here is not fatal
-  } catch (e) { /* unlock is best-effort; the real play below still reports */ }
+  // Unlock the SHARED player element, not a private one — see _ttsClaimGesture.
+  _ttsClaimGesture();
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
@@ -10877,11 +10895,14 @@ async function _ttsSpeak(text, btn) {
     });
     const d = await r.json();
     if (d.error) { showToast(d.error, 'error'); return; }
-    try { audio.pause(); } catch (e) {}
-    audio.src = d.url;
-    _ttsSpeakAudio = audio;
-    audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
-    await audio.play();
+    // Play through the SHARED bottom player (Ethan, 2026-08-15: a read-aloud
+    // "should show the player thing at the bottom like if i were playing an
+    // audio file from within the dir viewer"). It was playing on a detached
+    // Audio element, so it had no bar, no scrubber, no pause and no speed —
+    // the file viewer got all of that for free from _abPlay and read-aloud,
+    // the feature people actually listen to for minutes at a time, did not.
+    _abPlay(d.url, 'Read aloud' + (peekSession ? ' — ' + peekSession : ''));
+    _ttsSpeakAudio = _abAudio;   // so a second press still stops the first
     _ttsLoading(false);   // audio is playing — done generating
     // Record for replay (Ethan: a tab of past read-alouds). Fire-and-forget so a
     // storage hiccup never blocks playback.
@@ -10955,14 +10976,17 @@ function _raUpdateBadge() {
   if (b) { const n = (_raIndex || []).length; b.textContent = n ? String(n) : ''; }
 }
 async function _raReplay(id) {
+  // BEFORE the await, not after — see _ttsClaimGesture. The idb read is short,
+  // but iOS does not measure the gesture window in milliseconds, it measures it
+  // in awaits, and this function is entered from a tap.
+  _ttsClaimGesture();
   try {
     const e = await _idb.get('ra_' + id);
     if (!e || !e.url) { showToast('Clip not found (may have been flushed)'); return; }
-    if (_ttsSpeakAudio) { _ttsSpeakAudio.pause(); _ttsSpeakAudio = null; }
-    const audio = new Audio(e.url);
-    _ttsSpeakAudio = audio;
-    audio.onended = () => { if (_ttsSpeakAudio === audio) _ttsSpeakAudio = null; };
-    await audio.play();
+    if (_ttsSpeakAudio) { try { _ttsSpeakAudio.pause(); } catch(_) {} _ttsSpeakAudio = null; }
+    // Same bottom player as a fresh read-aloud.
+    _abPlay(e.url, 'Read aloud' + (e.session ? ' — ' + e.session : ''));
+    _ttsSpeakAudio = _abAudio;
   } catch(err) { showToast('Replay failed: ' + err.message, 'error'); }
 }
 async function _raDelete(id) {
