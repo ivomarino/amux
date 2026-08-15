@@ -3952,10 +3952,35 @@ function togglePeekTabCustomizer() {
   if (_peekTabCustomizerOpen) {
     _renderPeekTabCustomizer();
     const btn = document.getElementById('peek-tab-customize');
-    if (btn) { const r = btn.getBoundingClientRect();
-      menu.style.top = (r.bottom + 4) + 'px';
-      menu.style.left = Math.max(8, Math.min(r.left - 160, (document.documentElement.clientWidth||innerWidth) - 230)) + 'px'; }
+    // DISPLAY FIRST, THEN MEASURE, THEN PLACE. The old order positioned the menu
+    // while it was still display:none, so it could not measure itself and clamped
+    // against a HARDCODED 230px assumed width. The menu is not 230px — it measured
+    // 359px on Ethan's phone (tabcust-geo beacon) and wider on a tablet — so the
+    // right-edge clamp under-reserved by ~130px+ and the menu ran off screen.
+    // A guessed width is the bug; offsetWidth is the fix.
+    menu.style.visibility = 'hidden';
     menu.style.display = '';
+    if (btn) {
+      const r = btn.getBoundingClientRect();
+      const vw = document.documentElement.clientWidth || window.innerWidth;
+      const vh = document.documentElement.clientHeight || window.innerHeight;
+      const PAD = 8;
+      const mw = menu.offsetWidth || 230;
+      // LEFT-ANCHORED under the button (Ethan, 2026-08-14: "fixed to the left
+      // dropdown ... always visible on the screen"), then clamped so the right
+      // edge can never leave the viewport. Both clamps use the MEASURED width.
+      let left = Math.min(r.left, vw - mw - PAD);
+      if (left < PAD) left = PAD;
+      menu.style.left = left + 'px';
+      // Vertical: keep it on screen too. Cap the height to what is actually below
+      // the button and let the list scroll, rather than letting 15 rows run off
+      // the bottom where the last ones are unreachable.
+      const top = r.bottom + 4;
+      menu.style.top = top + 'px';
+      menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
+      menu.style.overflowY = 'auto';
+    }
+    menu.style.visibility = '';
     _tabCustBeacon(menu, 'peek');
     setTimeout(() => document.addEventListener('click', _peekCustOutside, true), 0);
   } else { menu.style.display = 'none'; document.removeEventListener('click', _peekCustOutside, true); }
@@ -7556,7 +7581,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.636';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.637';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
