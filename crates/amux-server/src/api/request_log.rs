@@ -51,7 +51,17 @@ use std::path::Path;
 const USER_AGENT_CHARS: usize = 300;
 const QUERY_CHARS: usize = 500;
 const CONTENT_TYPE_CHARS: usize = 120;
-const ERROR_BODY_CHARS: usize = 500;
+// AMUX-3132: 500 cut the gate-not-acknowledged 409 body mid-object. That body
+// carries the DISCRIMINATOR — `gate` (required), `missing` (the unmet subset),
+// and `you_sent` (the caller's own gate_checked) — but a full gate refusal with
+// its `how_to_ack` block runs ~600-900 chars, so `missing`/`you_sent` were
+// truncated away and a log reader saw only the required gate and concluded the
+// CLIENT was right and the server refused wrongly (109 such 409s/day, and the
+// next reader reaches the same wrong verdict). Widened so the whole refusal —
+// including what the caller sent — survives; the response already echoes the
+// submission via `you_sent`, so this needs no request-body recording (which
+// would carry content and privacy that this cap-bounded log deliberately avoids).
+const ERROR_BODY_CHARS: usize = 2000;
 /// Bounded channel: if the writer falls behind, rows are DROPPED (with a
 /// warn), never queued unboundedly and never back-pressured onto requests.
 const QUEUE_CAP: usize = 10_000;
