@@ -1,5 +1,53 @@
 [
   {
+    "sha": "ec031ce",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "Settings organized into 5 tabs: General, Workers, Sessions, Board, and Integrations"
+  },
+  {
+    "sha": "b39cb60",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "PDFs preview in-app on iOS: agent reports and documents render with pdf.js without leaving amux"
+  },
+  {
+    "sha": "5021244",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "Subagent count shown live in the session panel: see how many child tasks each worker has spawned"
+  },
+  {
+    "sha": "aa436ca",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "Ollama model updated to qwen3.8:27b: stronger code reasoning for local-LLM users"
+  },
+  {
+    "sha": "e7d26f1",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "Messages tab opens on Human view: your most recent message to the agent is always front and center"
+  },
+  {
+    "sha": "a98b99b",
+    "date": "2026-08-15",
+    "type": "fix",
+    "title": "Copying a message ID now includes the MSG- prefix so it pastes correctly into logs and searches"
+  },
+  {
+    "sha": "1ed50c9",
+    "date": "2026-08-15",
+    "type": "feat",
+    "title": "Read-aloud plays through the shared audio player: Simple tab summaries stay audible as you navigate"
+  },
+  {
+    "sha": "c0e0e3a",
+    "date": "2026-08-15",
+    "type": "fix",
+    "title": "Browser live-view error panel now shows the recovery option that actually works"
+  },
+  {
     "sha": "49b880e",
     "date": "2026-08-13",
     "type": "feat",

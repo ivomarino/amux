@@ -45,7 +45,7 @@
     "description": "Compare amux tunnel with ngrok for exposing localhost to the internet. amux gives you a stable public URL built into your agent orchestrator. ngrok wins on TCP, request inspection, and free tier. Honest side-by-side.",
     "url": "https://amux.io/compare/amux-vs-ngrok/",
     "datePublished": "2026-07-09",
-    "dateModified": "2026-07-12",
+    "dateModified": "2026-08-15",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io", "logo": {"@type": "ImageObject", "url": "https://amux.io/icon.png"}},
     "image": "https://amux.io/og-image.png"
@@ -107,6 +107,14 @@
       },
       {
         "@type": "Question",
+        "name": "Does amux tunnel support rate limiting?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. amux v0.9.96 added built-in per-tunnel rate limiting — configure request caps directly in the amux dashboard without any extra tooling. ngrok also supports rate limiting on paid plans. Both tools now offer this; amux includes it as part of the subscription without a separate paid upgrade."
+        }
+      },
+      {
+        "@type": "Question",
         "name": "What is a real use case where amux tunnel is better than ngrok?",
         "acceptedAnswer": {
           "@type": "Answer",
@@ -134,7 +142,7 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs ngrok</span></div>
 
     <h1>amux vs ngrok</h1>
-    <p class="subtitle">ngrok is the industry-standard localhost tunnel — a dedicated tool, free tier, full-featured, excellent for debugging. amux tunnel is built into the amux agent orchestrator and gives you a stable public URL without paying for ngrok Pro. Now includes built-in rate limiting (v0.9.96) and a Proxies management tab (v0.9.95). Here is the honest comparison. <em>Updated July 2026.</em></p>
+    <p class="subtitle">ngrok is the industry-standard localhost tunnel — a dedicated tool, free tier, full-featured, excellent for debugging. amux tunnel is built into the amux agent orchestrator and gives you a stable public URL without paying for ngrok Pro. Now includes built-in rate limiting (v0.9.96) and a Proxies management tab (v0.9.95). Here is the honest comparison. <em>Updated August 2026.</em></p>
 
     <!-- EXP-007: compare pages GitHub CTA -->
     <div style="display:flex;align-items:center;gap:1rem;background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:0.875rem 1.125rem;margin:1.5rem 0;flex-wrap:wrap">
@@ -311,6 +319,11 @@ amux tunnel stop         # stop tunneling</code></pre>
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem;margin:0.8rem 0;">
       <summary style="cursor:pointer;font-weight:600;">Is the amux tunnel client open source?</summary>
       <p style="margin:0.8rem 0 0;">Yes. The tunnel client lives inside <code>amux-server-rs</code>, which is open source (MIT + Commons Clause). The amux cloud gateway that terminates the tunnel is the paid piece — it requires an active amux cloud subscription. The client code is auditable and ships with the rest of amux.</p>
+    </details>
+
+    <details style="border:1px solid var(--border);border-radius:6px;padding:1rem;margin:0.8rem 0;">
+      <summary style="cursor:pointer;font-weight:600;">Does amux tunnel support rate limiting?</summary>
+      <p style="margin:0.8rem 0 0;">Yes. amux v0.9.96 added built-in per-tunnel rate limiting — configure request caps directly in the amux dashboard without any extra tooling. ngrok also supports rate limiting on paid plans. Both tools now offer this; amux includes it as part of the subscription, so there is no separate upgrade needed. The amux Proxies tab (v0.9.95) shows active tunnels and traffic at a glance.</p>
     </details>
 
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem;margin:0.8rem 0;">
