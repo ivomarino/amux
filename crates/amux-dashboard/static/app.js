@@ -7596,7 +7596,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.645';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.646';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -30383,13 +30383,36 @@ function _bwViewportFail(reason) {
   if (img) img.style.display = 'none';
   if (!ph) return;
   ph.style.display = 'flex';
-  ph.innerHTML = '<div style="max-width:420px;">'
-    + '<div style="font-weight:600;color:var(--fg);margin-bottom:6px;">Live view unavailable</div>'
-    + '<div style="margin-bottom:10px;">' + esc(String(reason || 'the browser did not return a frame'))
-    + '.<br>The page may still be loading, or the browser tab may have closed or wedged'
-    + (_bwShotFails > 1 ? ' (' + _bwShotFails + ' failed attempts)' : '') + '.</div>'
-    + '<button class="bw-btn primary" onclick="_bwScreenshot(2)">Retry</button> '
-    + '<button class="bw-btn" onclick="_bwGo()">Reload page</button></div>';
+  const attempts = _bwShotFails > 1 ? ' (' + _bwShotFails + ' failed attempts)' : '';
+  const render = (running) => {
+    // NOT-RUNNING and WEDGED are different states with different fixes, and this
+    // panel used to describe both as the second one (Ethan, 2026-08-15: a
+    // "WebSocket protocol error / the tab may have closed or wedged" panel while
+    // GET /api/browser/status said {"running":false}). Retry is _bwScreenshot,
+    // which cannot succeed with no browser to screenshot — so the PRIMARY button
+    // was the one guaranteed to fail, and the one that works (_bwGo, which POSTs
+    // /api/browser/start) was labelled "Reload page" and demoted to secondary.
+    // Diagnose from the server's own state rather than from the symptom.
+    ph.innerHTML = running === false
+      ? '<div style="max-width:420px;">'
+        + '<div style="font-weight:600;color:var(--fg);margin-bottom:6px;">No browser is running</div>'
+        + '<div style="margin-bottom:10px;">Nothing is open to show. The last error was: '
+        + esc(String(reason || 'no frame returned')) + attempts + '.</div>'
+        + '<button class="bw-btn primary" onclick="_bwGo()">Start browser</button> '
+        + '<button class="bw-btn" onclick="_bwScreenshot(2)">Retry frame</button></div>'
+      : '<div style="max-width:420px;">'
+        + '<div style="font-weight:600;color:var(--fg);margin-bottom:6px;">Live view unavailable</div>'
+        + '<div style="margin-bottom:10px;">' + esc(String(reason || 'the browser did not return a frame'))
+        + '.<br>The browser IS running, so the page may still be loading or the tab may have wedged'
+        + attempts + '.</div>'
+        + '<button class="bw-btn primary" onclick="_bwScreenshot(2)">Retry</button> '
+        + '<button class="bw-btn" onclick="_bwGo()">Restart browser</button></div>';
+  };
+  render(null);                       // paint immediately; never block on the probe
+  fetch(API + '/api/browser/status')  // then correct it once the truth is known
+    .then(r => r.json())
+    .then(s => { if (!_bwHasFrame) render(s && s.running === true); })
+    .catch(() => {});
 }
 
 // ── Live auto-refresh (deliverable #4) ──
