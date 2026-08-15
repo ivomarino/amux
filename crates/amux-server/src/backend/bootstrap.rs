@@ -770,11 +770,41 @@ mod tests {
 
     #[tokio::test]
     async fn provider_without_structured_cli_is_hosted_but_not_registered() {
+        // Build a registry that includes a non-structured adapter ("bare-repl")
+        // to exercise the "terminal-hosted but not protocol-registered" path.
+        // ("ollama" was the representative before 2026-08-15; it now uses
+        // `codex --oss --local-provider ollama` and IS a structured CLI.)
+        #[derive(Debug)]
+        struct BareReplAdapter;
+        #[async_trait::async_trait]
+        impl crate::provider::ProviderAdapter for BareReplAdapter {
+            fn id(&self) -> amux_core::provider::ProviderId {
+                amux_core::provider::ProviderId::new("bare-repl")
+            }
+            fn capabilities(&self) -> amux_core::provider::ProviderCapabilities {
+                amux_core::provider::ProviderCapabilities::default() // all false
+            }
+            async fn usage(&self) -> amux_core::provider::ProviderUsage {
+                amux_core::provider::ProviderUsage::unknown(self.id())
+            }
+            async fn models(&self) -> Vec<String> { vec![] }
+            fn build_command(&self, _m: crate::provider::PromptMode) -> Vec<String> {
+                vec!["bare-repl".into()]
+            }
+        }
+        let mut reg = crate::provider::default_registry();
+        reg.register(std::sync::Arc::new(BareReplAdapter));
+
         let (store, _dir) = store();
-        let (id, bref) = seed(&store, WorkerState::Starting, "herdr", "ollama", true);
+        let (id, bref) = seed(&store, WorkerState::Starting, "herdr", "bare-repl", true);
         let backend = Arc::new(FakeBackend::default());
         let registrar = Arc::new(RecordingRegistrar::default());
-        let boot = bootstrap(store.clone(), backend.clone(), registrar.clone());
+        let boot = Bootstrap {
+            store: store.clone(),
+            backends: vec![backend],
+            registry: std::sync::Arc::new(reg),
+            registrar: registrar.clone(),
+        };
 
         let report = boot.pass_once().await.unwrap();
         // Terminal hosting is real...

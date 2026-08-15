@@ -112,6 +112,10 @@ pub fn router(state: AppState) -> Router {
             "/api/workers",
             workers::routes().merge(workers_deadletters::routes()),
         )
+        .route(
+            "/api/ollama/models",
+            axum::routing::get(workers::ollama_models),
+        )
         .nest("/api/memories", memories::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())

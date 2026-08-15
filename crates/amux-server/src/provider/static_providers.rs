@@ -153,9 +153,14 @@ impl ProviderAdapter for OllamaAdapter {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        // All false — the conservative default IS the measured truth here
-        // (spike: "raw LLM server only; no coding agent features").
-        ProviderCapabilities::default()
+        // ollama workers now run codex --oss --local-provider ollama, which
+        // emits structured JSONL events identical to the codex provider.
+        ProviderCapabilities {
+            structured_events: true,
+            hooks: true,
+            reports_usage: false,
+            hot_model_switch: false,
+        }
     }
 
     async fn usage(&self) -> ProviderUsage {
@@ -182,12 +187,27 @@ impl ProviderAdapter for OllamaAdapter {
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
-        // Both modes launch `ollama run <model>`: interactively it is a REPL;
-        // headless (piped stdin) it answers and exits. There is no structured
-        // argv mode — ollama's structured surface is its REST API, which is a
-        // protocol concern, not a spawn command (spike: not an agent CLI).
-        let _ = prompt_mode;
-        vec!["ollama".into(), "run".into(), self.default_model.clone()]
+        // ollama workers run codex with --oss --local-provider ollama so they
+        // get a full coding agent (file editing, hooks, structured events) backed
+        // by the local Ollama daemon instead of the OpenAI API.
+        match prompt_mode {
+            PromptMode::Interactive => vec![
+                "codex".into(),
+                "--oss".into(),
+                "--local-provider".into(),
+                "ollama".into(),
+                "--model".into(),
+                self.default_model.clone(),
+            ],
+            PromptMode::HeadlessStructured => vec![
+                "codex".into(),
+                "--oss".into(),
+                "--local-provider".into(),
+                "ollama".into(),
+                "--model".into(),
+                self.default_model.clone(),
+            ],
+        }
     }
 }
 
@@ -233,23 +253,22 @@ mod tests {
         assert!(CodexAdapter.capabilities().structured_events);
         assert!(!CodexAdapter.capabilities().reports_usage);
         let ollama = OllamaAdapter::default().capabilities();
-        assert!(!ollama.structured_events);
-        assert!(!ollama.hooks);
+        // ollama now uses codex --oss --local-provider ollama, so it inherits
+        // codex's structured-event and hook capabilities.
+        assert!(ollama.structured_events);
+        assert!(ollama.hooks);
         assert!(!ollama.reports_usage);
         assert!(!ollama.hot_model_switch);
     }
 
     #[test]
-    fn ollama_interactive_is_run_model() {
+    fn ollama_builds_codex_oss_command() {
         let a = OllamaAdapter::with_model("qwen3.8:27b");
-        assert_eq!(
-            a.build_command(PromptMode::Interactive),
-            vec!["ollama", "run", "qwen3.8:27b"]
-        );
-        assert_eq!(
-            a.build_command(PromptMode::HeadlessStructured),
-            vec!["ollama", "run", "qwen3.8:27b"]
-        );
+        let expected = vec![
+            "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
+        ];
+        assert_eq!(a.build_command(PromptMode::Interactive), expected);
+        assert_eq!(a.build_command(PromptMode::HeadlessStructured), expected);
     }
 
     #[test]

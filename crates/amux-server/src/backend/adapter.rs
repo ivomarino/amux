@@ -153,21 +153,10 @@ const P_CODEX_USAGE_LIMIT: &str = r"(?is)You've hit your usage limit\..{0,160}?(
 const CODEX_PATTERNS: &[&str] = &[P_CODEX_USAGE_LIMIT];
 
 // -- Ollama ------------------------------------------------------------------
-
-/// NOT ported from the Python: `amux-server.py` has NO Ollama error
-/// scraping (its only ollama code lists models, py 3285-3298). RR-0033
-/// requires one connection/model-not-found pattern, so this is constructed
-/// from the ollama CLI's own canonical error strings ("Error: could not
-/// connect to ollama app, is it running?" / "Error: model 'x' not found,
-/// try pulling it first"). Flagged as invented-not-extracted on purpose —
-/// if the real CLI phrasing drifts, this is the pattern to re-verify first.
-/// It maps to `WorkerEvent::Failed` (a dead daemon / missing model is a
-/// hard failure needing intervention), not `RateLimited`; it lives in this
-/// tally because RR-0033 counts it here.
-const P_OLLAMA_ERROR: &str =
-    r#"(?i)error:\s*(?:could not connect to (?:a running )?ollama|model\s+['"]?[A-Za-z0-9._:/-]+['"]?\s+not found)"#;
-
-const OLLAMA_PATTERNS: &[&str] = &[P_OLLAMA_ERROR];
+// ollama workers now run `codex --oss --local-provider ollama`, so they emit
+// the same structured events as Codex and are scanned by the same patterns.
+// OLLAMA_PATTERNS was removed; pattern routing in rate_limit_patterns() and
+// TerminalAdapter::scan() both forward "ollama" to the codex code paths.
 
 // ---------------------------------------------------------------------------
 // Compiled statics (LazyLock: compiled once, no new deps)
@@ -207,7 +196,6 @@ lazy_re!(RE_API_BUDGET_PHRASE, P_CLAUDE_API_BUDGET_PHRASE);
 lazy_re!(RE_GEMINI_QUOTA_EXCEEDED, P_GEMINI_QUOTA_EXCEEDED);
 lazy_re!(RE_GEMINI_QUOTA_REACHED, P_GEMINI_QUOTA_REACHED);
 lazy_re!(RE_CODEX_USAGE_LIMIT, P_CODEX_USAGE_LIMIT);
-lazy_re!(RE_OLLAMA_ERROR, P_OLLAMA_ERROR);
 
 // Support regexes (structural anchors and status detection; not part of the
 // rate-limit tally).
@@ -297,7 +285,9 @@ pub fn rate_limit_patterns(provider: &ProviderId) -> &'static [&'static str] {
         "claude" | "claude-code" => CLAUDE_PATTERNS,
         "gemini" => GEMINI_PATTERNS,
         "codex" => CODEX_PATTERNS,
-        "ollama" => OLLAMA_PATTERNS,
+        // ollama workers now run codex --oss --local-provider ollama, so they
+        // emit the same structured events as codex. Route through codex patterns.
+        "ollama" => CODEX_PATTERNS,
         _ => &[],
     }
 }
@@ -327,7 +317,8 @@ impl TerminalAdapter {
             "claude" | "claude-code" => scan_claude(&clean, &self.provider),
             "gemini" => scan_gemini(&clean, &self.provider),
             "codex" => scan_codex(&clean, &self.provider),
-            "ollama" => scan_ollama(&clean, &self.provider),
+            // ollama workers run codex --oss --local-provider ollama; same output format.
+            "ollama" => scan_codex(&clean, &self.provider),
             // Unknown provider: no pattern knowledge, no invented events
             // (Invariant 8 / Invariant 20's rule generalized: never report
             // what was not observed through a pattern we actually hold).
@@ -946,24 +937,6 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     events
 }
 
-fn scan_ollama(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
-    let _ = provider; // ollama events carry no provider field today
-    let mut events = Vec::new();
-    let tail30 = last_n_raw_lines(clean, 30);
-    if let Some(m) = RE_OLLAMA_ERROR.find(&tail30) {
-        // Hard failure needing intervention (start the daemon / pull the
-        // model) — retrying the same work without that is not plausible.
-        events.push(WorkerEvent::Failed(Failure {
-            reason: m.as_str().trim().to_string(),
-            retryable: false,
-        }));
-    }
-    // No prompt/idle detection: the Python has none for ollama (nothing to
-    // port, and inventing ">>> " handling here would be new design, not a
-    // port — RR-0033 is a translation item).
-    events
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1535,15 +1508,16 @@ Running 1 shell command · 5s…
     }
 
     // -- Ollama --------------------------------------------------------------
+    // ollama workers now run codex --oss --local-provider ollama, so the
+    // terminal adapter delegates to scan_codex. The old bare-ollama-repl error
+    // strings (FX_OLLAMA_NO_DAEMON, FX_OLLAMA_NO_MODEL) no longer appear in
+    // terminal output — codex wraps the daemon error in its own structured
+    // event layer. What IS detectable is the codex usage-limit pattern, since
+    // the underlying codex CLI may still emit that.
 
     #[test]
-    fn ollama_errors_are_nonretryable_failures() {
-        for fx in [FX_OLLAMA_NO_DAEMON, FX_OLLAMA_NO_MODEL] {
-            let ev = adapter("ollama").scan(fx);
-            let fs = failures(&ev);
-            assert_eq!(fs.len(), 1, "{fx}: {ev:?}");
-            assert!(!fs[0].retryable);
-            assert!(limits(&ev).is_empty());
-        }
+    fn ollama_codex_usage_limit_is_detected() {
+        let ev = adapter("ollama").scan(FX_CODEX_LIMIT);
+        assert!(!limits(&ev).is_empty(), "codex usage-limit must be detected on ollama workers");
     }
 }

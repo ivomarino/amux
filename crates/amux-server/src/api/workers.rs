@@ -46,6 +46,17 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/peek", get(peek_worker))
 }
 
+/// `GET /api/ollama/models` — list locally installed Ollama models by running
+/// `ollama list`. Returns `{"models": ["qwen3.8:27b", ...]}`. Empty array when
+/// the Ollama daemon is not running or the binary is missing — never an error,
+/// so the dashboard can use the result to populate a picker without catching.
+pub async fn ollama_models() -> impl IntoResponse {
+    use crate::provider::static_providers::OllamaAdapter;
+    use crate::provider::ProviderAdapter;
+    let models = OllamaAdapter::default().models().await;
+    Json(json!({ "models": models }))
+}
+
 // ---- shared helpers -----------------------------------------------------
 
 fn err(status: StatusCode, body: Value) -> Response {

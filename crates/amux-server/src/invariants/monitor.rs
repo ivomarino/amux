@@ -107,7 +107,80 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         out.extend(checks::shared_guard_matches_committed(COMMITTED_GUARD, runtime));
     }
 
+    // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
+    // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
+    // rate" as its detector but nothing read it; this closes that loop.
+    out.extend(capture_pipeline_check(state));
+
     out
+}
+
+/// AMUX-3148: read recent user prompts from `cmd_history`, compute per-session
+/// capture stats over the SAME `title_from_prompt` predicate the mint uses, and
+/// hand them to the pure check. Running the identical function is the point —
+/// the invariant's "cardable" count is exactly what the mint would have carded,
+/// so the two cannot drift into a view that disagrees with the mechanism.
+fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "pipeline.user_prompts_card";
+    let env_i = |k: &str, d: i64| -> i64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let window_h = env_i("AMUX_CAPTURE_INVARIANT_WINDOW_H", 24);
+    let dedup_window_s = env_i("AMUX_CAPTURE_DEDUP_WINDOW_S", 45);
+    let min_cardable = env_i("AMUX_CAPTURE_INVARIANT_MIN", 3);
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let rows: Vec<(String, String, bool, i64)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT session, text, card_id IS NOT NULL, ts FROM cmd_history \
+             WHERE type = 'user' AND ts > (strftime('%s','now') - ?1) * 1000",
+        ) else {
+            return vec![InvariantResult::unknown(ID, "cmd_history query failed")];
+        };
+        stmt.query_map(rusqlite::params![window_h * 3600], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?))
+        })
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
+    };
+    // Group per session over the mint's predicate. A prompt whose text yields no
+    // title is not something the mint would card, so it is excluded from BOTH
+    // numerator and denominator — the denominator is "prompts that SHOULD card".
+    struct Acc {
+        cardable: i64,
+        carded: i64,
+        min_ts: i64,
+        max_ts: i64,
+    }
+    let mut map: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+    for (session, text, carded, ts) in rows {
+        if session.is_empty() || amux_core::board::title_from_prompt(&text).is_none() {
+            continue;
+        }
+        let e = map.entry(session).or_insert(Acc {
+            cardable: 0,
+            carded: 0,
+            min_ts: ts,
+            max_ts: ts,
+        });
+        e.cardable += 1;
+        if carded {
+            e.carded += 1;
+        }
+        e.min_ts = e.min_ts.min(ts);
+        e.max_ts = e.max_ts.max(ts);
+    }
+    let stats: Vec<checks::SessionPromptStats> = map
+        .into_iter()
+        .map(|(session, a)| checks::SessionPromptStats {
+            session,
+            cardable: a.cardable,
+            carded: a.carded,
+            span_s: (a.max_ts - a.min_ts) / 1000,
+        })
+        .collect();
+    checks::user_prompts_produce_cards(&stats, min_cardable, dedup_window_s)
 }
 
 /// The derived card status against the physical pane, per lane (AMUX-2646).

@@ -101,14 +101,16 @@ impl CliProvider {
     /// `"claude"` is the workers-table default spelling (migration 0003);
     /// the provider registry's canonical id is `"claude-code"` — both map
     /// here so a worker created through either era of the API resolves.
-    /// `None` (e.g. `"ollama"`, spike: not an agent CLI) means this
-    /// protocol cannot drive the provider; such a worker stays
-    /// terminal-hosted only and the pump never sees a live session for it.
+    /// `None` means this protocol cannot drive the provider; such a worker
+    /// stays terminal-hosted only and the pump never sees a live session.
     pub fn from_provider_id(id: &str) -> Option<Self> {
         match id {
             "claude" | "claude-code" => Some(CliProvider::ClaudeCode),
             "gemini" => Some(CliProvider::GeminiCli),
-            "codex" => Some(CliProvider::CodexCli),
+            // ollama workers now run `codex --oss --local-provider ollama`, so
+            // they emit the same structured events as codex and are handled by
+            // the same protocol pump.
+            "codex" | "ollama" => Some(CliProvider::CodexCli),
             _ => None,
         }
     }
@@ -969,8 +971,14 @@ mod tests {
             CliProvider::from_provider_id("codex"),
             Some(CliProvider::CodexCli)
         );
-        // Not an agent CLI (spike): the honest answer is None, not a guess.
-        assert_eq!(CliProvider::from_provider_id("ollama"), None);
+        // ollama workers now run codex --oss --local-provider ollama, so they
+        // are handled by the same structured protocol as codex.
+        assert_eq!(
+            CliProvider::from_provider_id("ollama"),
+            Some(CliProvider::CodexCli)
+        );
+        // A genuinely unknown provider still returns None.
+        assert_eq!(CliProvider::from_provider_id("iterm2"), None);
     }
 
     #[tokio::test]

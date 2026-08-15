@@ -2622,18 +2622,20 @@ function flagValue(flags, flag) {
 function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'gemini') return 'Gemini';
+  if (provider === 'ollama') return 'Ollama';
   if (provider === 'iterm2') return 'iTerm2';
   return 'Claude';
 }
 
 function sessionProvider(s) {
   const p = ((s && s.provider) || 'claude').toLowerCase();
-  return (p === 'codex' || p === 'gemini' || p === 'iterm2') ? p : 'claude';
+  return (p === 'codex' || p === 'gemini' || p === 'ollama' || p === 'iterm2') ? p : 'claude';
 }
 
 function providerDefaultModel(provider) {
   if (provider === 'codex') return 'gpt-5.5';
   if (provider === 'gemini') return 'auto';
+  if (provider === 'ollama') return 'qwen3.8:27b';
   return window._AMUX_DEFAULT_MODEL || 'sonnet';
 }
 
@@ -2643,7 +2645,7 @@ function sessionConfiguredModel(s) {
 }
 
 function providerYoloFlag(provider) {
-  if (provider === 'codex') return '--dangerously-bypass-approvals-and-sandbox';
+  if (provider === 'codex' || provider === 'ollama') return '--dangerously-bypass-approvals-and-sandbox';
   if (provider === 'gemini') return '--yolo';
   return '--dangerously-skip-permissions';
 }
@@ -4611,7 +4613,8 @@ function editField(session, field, current, provider) {
     const providers = [
       {v:'claude',l:'Claude Code'},
       {v:'codex',l:'Codex'},
-      {v:'gemini',l:'Gemini'}
+      {v:'gemini',l:'Gemini'},
+      {v:'ollama',l:'Ollama (local)'}
     ];
     sel.innerHTML = '';
     providers.forEach(p => { const o = document.createElement('option'); o.value = p.v; o.textContent = p.l; sel.appendChild(o); });
@@ -4638,6 +4641,25 @@ function editField(session, field, current, provider) {
       {v:'gemini-2.5-flash',l:'gemini-2.5-flash'},{v:'gemini-2.5-flash-lite',l:'gemini-2.5-flash-lite'},
       {v:'gemini-3-pro-preview',l:'gemini-3-pro-preview'},{v:'gemini-3-flash-preview',l:'gemini-3-flash-preview'}
     ];
+    if (provider === 'ollama') {
+      sel.innerHTML = '<option value="">Loading local models…</option>';
+      inpWrap.style.display = 'none';
+      sel.style.display = 'block';
+      fetch(API + '/api/ollama/models', { headers: _authHeaders() })
+        .then(r => r.json())
+        .then(d => {
+          sel.innerHTML = '';
+          const mlist = d.models || [];
+          if (!mlist.length) {
+            const o = document.createElement('option'); o.value = ''; o.textContent = 'No local models found'; sel.appendChild(o);
+          }
+          mlist.forEach(name => {
+            const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o);
+          });
+          sel.value = current || (mlist[0] || '');
+        })
+        .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
+    } else {
     const models = provider === 'codex' ? codexModels : (provider === 'gemini' ? geminiModels : claudeModels);
     sel.innerHTML = '';
     models.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
@@ -4649,6 +4671,7 @@ function editField(session, field, current, provider) {
       opt.value = current; opt.textContent = current;
       sel.appendChild(opt);
       sel.value = current;
+    }
     }
     // Reasoning effort — Claude only. Pre-fill from the session's current --effort flag.
     const effortWrap = document.getElementById('edit-effort-wrap');
@@ -7596,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.646';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.647';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

@@ -514,12 +514,11 @@ cmd_start() {
       cmd="codex"
     fi
   elif [[ "$provider" == "ollama" ]]; then
-    # Ollama is a bare local model REPL: `ollama run <model>`. The model is a
-    # POSITIONAL arg (CC_MODEL, default qwen3.8:27b) — no Claude flags apply, so
-    # the CC_DEFAULT_FLAGS / CC_FLAGS / --model-sonnet / shell-setup blocks below
-    # all exclude ollama. No trailing prompt: bare `ollama run <model>` opens the
-    # interactive REPL a worker needs (a trailing arg is a one-shot and exits).
-    cmd="ollama run ${CC_MODEL:-qwen3.8:27b}"
+    # Ollama workers run codex --oss --local-provider ollama so they get a full
+    # coding agent (file editing, hooks, structured events) backed by the local
+    # Ollama daemon. The model comes from CC_MODEL (default qwen3.8:27b) — CC_FLAGS
+    # can add extra codex flags (approval policy, add-dir, etc.) just like codex.
+    cmd="codex --oss --local-provider ollama --model ${CC_MODEL:-qwen3.8:27b}"
   else
     cmd="${AMUX_CLAUDE_CMD:-claude}"
   fi
@@ -529,10 +528,9 @@ cmd_start() {
     q=$(quote_flags "$CC_DEFAULT_FLAGS") || die "failed to quote CC_DEFAULT_FLAGS"
     [[ -n "$q" ]] && cmd="$cmd $q"
   fi
-  # Apply session flags from <name>.env (skip for ollama — CC_FLAGS carries
-  # Claude/agent flags like `--model sonnet` that `ollama run` cannot accept;
-  # ollama's model comes from CC_MODEL, positional, above)
-  if [[ "$provider" != "ollama" && -n "${CC_FLAGS:-}" ]]; then
+  # Apply session flags from <name>.env. Ollama now uses codex under the hood
+  # so it accepts codex-style CC_FLAGS (e.g. --approve-for-me, --add-dir, etc.)
+  if [[ -n "${CC_FLAGS:-}" ]]; then
     local q
     q=$(quote_flags "$CC_FLAGS") || die "failed to quote CC_FLAGS"
     [[ -n "$q" ]] && cmd="$cmd $q"
@@ -547,9 +545,13 @@ cmd_start() {
     [[ -n "$q" ]] && cmd="$cmd $q"
   fi
 
-  # Codex-specific defaults
-  if [[ "$provider" == "codex" ]]; then
-    [[ "$cmd" == *"--model"* || "$cmd" == *"-m "* ]] || cmd="$cmd --model gpt-5.5"
+  # Codex-specific defaults (apply to ollama too — it now runs codex under the hood)
+  if [[ "$provider" == "codex" || "$provider" == "ollama" ]]; then
+    # For codex (cloud): default to gpt-5.5 when no model is set.
+    # For ollama: model is already set from CC_MODEL above — no default needed.
+    if [[ "$provider" == "codex" ]]; then
+      [[ "$cmd" == *"--model"* || "$cmd" == *"-m "* ]] || cmd="$cmd --model gpt-5.5"
+    fi
     [[ "$cmd" == *"--full-auto"* || "$cmd" == *"--dangerously-bypass"* || "$cmd" == *"-a "* ]] || cmd="$cmd -a never"
     if [[ "$cmd" != *"--add-dir"* ]]; then
       local git_root
@@ -559,8 +561,6 @@ cmd_start() {
         [[ -d "$git_root/.git" ]] && cmd="$cmd --add-dir $(printf '%q' "$git_root/.git")"
       fi
     fi
-  elif [[ "$provider" == "ollama" ]]; then
-    : # ollama's model is already positional in `ollama run <model>` — no --model default
   else
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
   fi

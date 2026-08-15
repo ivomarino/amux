@@ -274,7 +274,8 @@ mod tests {
         let claude = reg.get(&ProviderId::new("claude-code")).unwrap();
         assert!(claude.capabilities().hooks);
         let ollama = reg.get(&ProviderId::new("ollama")).unwrap();
-        assert!(!ollama.capabilities().hooks);
+        // ollama now runs codex --oss --local-provider ollama, inheriting codex capabilities.
+        assert!(ollama.capabilities().hooks);
         assert!(reg.get(&ProviderId::new("not-registered")).is_none());
     }
 

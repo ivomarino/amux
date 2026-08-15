@@ -839,6 +839,95 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline: a delivered user prompt must reach the board (AMUX-3148).
+// ---------------------------------------------------------------------------
+
+/// One session's capture-pipeline health over the recent window.
+///
+/// `cardable` and `carded` are counted over the SAME predicate the mint uses —
+/// `title_from_prompt(text).is_some()` — computed in the monitor, so this
+/// invariant's denominator can never disagree with what the mint would have
+/// carded (the ethos view/predicate rule: copy the filter from the code that
+/// acts, never re-derive a plausible-looking one). `span_s` is the wall-clock
+/// spread of those cardable prompts, used to exclude a legitimate rapid re-send
+/// that the mint's dedup window is SUPPOSED to collapse to one card.
+#[derive(Debug, Clone)]
+pub struct SessionPromptStats {
+    pub session: String,
+    /// User prompts in-window whose text yields a real title (would be carded).
+    pub cardable: i64,
+    /// Of those, how many actually have a linked capture card.
+    pub carded: i64,
+    /// Seconds between the earliest and latest cardable prompt.
+    pub span_s: i64,
+}
+
+/// INCIDENT (AMUX-3148): the DIRECT send path minted a ledger card for a human
+/// prompt, but the STEERING-QUEUE deliverer did not — so a prompt to a BUSY lane
+/// (most prompts to an active agent) was delivered and left no board trace. The
+/// `amux` session went from 89 capture cards to zero for a week; `roadtrip` had
+/// 25 user prompts and 0 cards. Nothing failed: `cmd_history` recorded the
+/// prompt, the lane received it, the send returned success. Only the SEAM — a
+/// delivered user prompt vs a board card — disagreed, and no component health
+/// check looks there. The mint even names "the cmd_history.card_id NULL rate" as
+/// its own detector in a comment, but nothing READ that rate (ethos rule 4: a
+/// signal in a store the reader never opens is the same as no signal).
+///
+/// INVARIANT: a session that received `min_cardable`+ cardable user prompts,
+/// spread over MORE than the dedup window (so each was an independent task, not
+/// one thought re-sent), must have minted at least one capture card. Zero cards
+/// across several spaced tasks is not legitimate dedup — it is the pipeline
+/// silently dropping the board leg.
+///
+/// The gates are load-bearing and each excludes a real false positive:
+/// - `cardable >= min_cardable`: one `[no-board]` or control prompt (title None)
+///   is already excluded from `cardable`; requiring several more excludes a lane
+///   that legitimately sent only uncardable text.
+/// - `span_s > dedup_window_s`: a burst inside the dedup window SHOULD collapse
+///   to one card, so firing on it would flag correct behaviour — the exact
+///   "filter that matches everything" trap.
+/// - `carded == 0`: one card proves the pipeline works for this lane; a low
+///   ratio is a separate, quieter concern, not this outage.
+pub fn user_prompts_produce_cards(
+    stats: &[SessionPromptStats],
+    min_cardable: i64,
+    dedup_window_s: i64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "pipeline.user_prompts_card";
+    let mut out = Vec::new();
+    for s in stats {
+        if s.cardable >= min_cardable && s.span_s > dedup_window_s && s.carded == 0 {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    "a delivered cardable user prompt mints a capture card",
+                    format!(
+                        "{} cardable user prompt(s) over {}s, 0 carded — board leg silently dropped",
+                        s.cardable, s.span_s
+                    ),
+                )
+                .entity(&s.session)
+                .evidence(serde_json::json!({
+                    "session": s.session,
+                    "cardable_user_prompts": s.cardable,
+                    "carded": s.carded,
+                    "span_s": s.span_s,
+                    "class": "capture-pipeline-dropped",
+                    "incident": "steering-queue deliverer never minted; direct path did (AMUX-3148)",
+                    "fix": "mint on the queued-delivery path for guard=='' && sender=='' prompts",
+                })),
+            );
+        } else {
+            out.push(InvariantResult::pass(ID).entity(&s.session));
+        }
+    }
+    if out.is_empty() {
+        out.push(InvariantResult::pass(ID));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -846,6 +935,38 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    /// AMUX-3148: the exact live signature — several spaced cardable prompts, zero
+    /// cards — must FAIL, and a healthy lane, a low-volume lane, and a rapid
+    /// re-send burst must all PASS. A check that fired on the burst would be
+    /// flagging the dedup working as designed.
+    #[test]
+    fn detects_a_lane_whose_prompts_never_reach_the_board() {
+        let window = 45; // the mint's dedup window
+        let stats = vec![
+            // amux's real shape: 22 prompts over hours, 0 cards.
+            SessionPromptStats { session: "amux".into(), cardable: 12, carded: 0, span_s: 7200 },
+            // healthy: cards its prompts.
+            SessionPromptStats { session: "amux-homepage".into(), cardable: 3, carded: 3, span_s: 1800 },
+            // one card is enough to prove the pipeline works for the lane.
+            SessionPromptStats { session: "tubescience".into(), cardable: 6, carded: 2, span_s: 3600 },
+            // low volume: below the floor, not judged as an outage.
+            SessionPromptStats { session: "quiet".into(), cardable: 2, carded: 0, span_s: 600 },
+            // a rapid re-send burst INSIDE the window: 0 cards is CORRECT (dedup).
+            SessionPromptStats { session: "burst".into(), cardable: 4, carded: 0, span_s: 30 },
+        ];
+        let rs = user_prompts_produce_cards(&stats, 3, window);
+        let failed: Vec<&str> = rs
+            .iter()
+            .filter(|r| r.status == Status::Fail)
+            .map(|r| r.entity_key.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["amux"],
+            "only the spaced-prompts-zero-cards lane fails; healthy/low-volume/burst all pass"
+        );
+    }
 
     /// CORPUS IS THE LIVE FLEET on 2026-08-10, not a fixture: two shared
     /// conversations among 101 lanes, one of them held by two RUNNING lanes.

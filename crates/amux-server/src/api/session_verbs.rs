@@ -7031,15 +7031,16 @@ fn pickup_stale_void(guard: &str, text: &str, card_status: Option<&str>) -> Opti
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
-    let queued: Vec<(String, String, String, f64, String)> = {
+    let queued: Vec<(String, String, String, f64, String, String)> = {
         let Ok(conn) = state.store.read() else { return 0 };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text, queued_at, COALESCE(guard,'') FROM steering_queue ORDER BY queued_at ASC",
+            "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') \
+             FROM steering_queue ORDER BY queued_at ASC",
         ) else {
             return 0;
         };
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
         rows
@@ -7064,7 +7065,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     let mut delivered_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut checked_lane: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut delivered = 0usize;
-    for (id, session, text, queued_at, guard) in queued {
+    for (id, session, text, queued_at, guard, sender) in queued {
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
         }
@@ -7305,6 +7306,83 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         delivered += 1;
         delivered_lanes.insert(session.clone());
         steer_skips().lock().unwrap().remove(&session);
+        // NO SILENT WORK on the QUEUED path (AMUX-3148). The DIRECT send path mints
+        // a ledger card for a human prompt (cmd_hist_record_full, AMUX-3071), but
+        // this steering-queue deliverer never did — so a prompt to a BUSY lane
+        // (which is MOST prompts to an active agent) was delivered and left no
+        // board trace. amux's own session went from 89 capture cards to zero the
+        // week after the cutover for exactly this reason ("none of these have board
+        // items wtf"): its prompts queue while it is mid-turn and drain through
+        // HERE, past the one place that cards. Mirror the direct path's predicate:
+        //   guard == ""    — not a board-drive nudge / auto-pickup / self-describe
+        //   sender == ""   — a human/dashboard send, not a peer relay (which carries
+        //                    the server-verified origin and is type='session', never
+        //                    the recipient's own task — same split as 9720 vs 9722)
+        //   title Some     — a real task, not control text / [no-board] / a keypress
+        // Separate write so a capture failure can never roll back the delivery, and
+        // IDEMPOTENT: skip if this exact prompt was already carded (the enqueue path
+        // may have minted at record time), so a queued message is never double-carded.
+        if guard.is_empty()
+            && sender.is_empty()
+            && amux_core::board::title_from_prompt(&text).is_some()
+        {
+            let (sess3, text3) = (session.clone(), text.clone());
+            let now_ms = (now_f64() * 1000.0) as i64;
+            let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let minted_w = minted.clone();
+            let res = state
+                .store
+                .write_async(move |conn| {
+                    // Already carded (enqueue-time direct mint)? Never double-card.
+                    let already: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM cmd_history \
+                             WHERE session = ?1 AND text = ?2 AND card_id IS NOT NULL",
+                            rusqlite::params![sess3, text3],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if already > 0 {
+                        return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                    }
+                    match mint_capture_card(conn, &sess3, &text3, now_ms)? {
+                        Some(row) => {
+                            // Link the most recent uncarded cmd_history row for this
+                            // prompt, if the enqueue recorded one without carding it.
+                            conn.execute(
+                                "UPDATE cmd_history SET card_id = ?1 WHERE id = \
+                                 (SELECT id FROM cmd_history WHERE session = ?2 AND text = ?3 \
+                                  AND card_id IS NULL ORDER BY id DESC LIMIT 1)",
+                                rusqlite::params![row.id, sess3, text3],
+                            )?;
+                            *minted_w.lock().unwrap() = Some(row.id.clone());
+                            let ev = crate::db::PendingEvent {
+                                entity_type: amux_core::revision::EntityType::Task,
+                                entity_id: row.id.clone(),
+                                mutation: amux_core::revision::MutationKind::Created,
+                                payload: Some(row.snapshot()),
+                            };
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![ev] })
+                        }
+                        None => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+                    }
+                })
+                .await;
+            match res {
+                // Positive + failure log signals (two-fixes rule): the queued path now
+                // announces its captures the same way the direct path does, so a
+                // future silent stop is a queryable absence, not an invisible one.
+                Ok(_) => {
+                    if let Some(cid) = minted.lock().unwrap().take() {
+                        tracing::info!(session = %session, id = %id, card_id = %cid,
+                            "ledger: auto-captured board card from STEERING-delivered prompt (AMUX-3148)");
+                    }
+                }
+                Err(e) => tracing::warn!(session = %session, error = %e,
+                    "ledger auto-capture FAILED on steering delivery; prompt delivered without a board card"),
+            }
+        }
         // The metadata AMUX-2643's "direct vs queued" view needs, recorded on
         // EVERY delivery path: how it was queued, how long it waited, whether
         // it went in at a boundary or mid-turn, and the submission verdict.
