@@ -2756,6 +2756,7 @@ FIX: Two concrete, either closes it: (1) before committing, assert the staged se
 
 ---
 
+## `tmux send-keys ... Enter` does NOT submit a codex TUI prompt — amux sessions cannot send tasks to codex workers via raw tmux
 DATE: 2026-08-15
 SESSION: amux-homepage
 AREA: codex-integration
