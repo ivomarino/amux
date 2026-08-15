@@ -9053,6 +9053,134 @@ fn conversation_owned_by_other(conv_id: &str, this_session: &str) -> String {
     String::new()
 }
 
+/// Outcome of a lane telling us its own conversation id. Named rather than a
+/// bool because the three cases carry different information and exactly one of
+/// them is an incident (`Conflict`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConvAdopt {
+    /// Nothing usable in the report, or it already matches — no write.
+    Unchanged,
+    /// Stamped. Carries the previous value ("" when the lane had none), because
+    /// "was blind, now visible" and "moved to a new conversation" are different
+    /// events and only the first closes an absorption window.
+    Adopted { was: String },
+    /// Another lane's meta claims this id. REFUSED — see the comment below.
+    Conflict { owner: String },
+}
+
+impl ConvAdopt {
+    /// Rendered into the `/report` response body, not merely logged.
+    ///
+    /// Because a caller must be able to CONFIRM AT THE FIELD. The hook that
+    /// feeds this fires unattended thousands of times a day; if adoption
+    /// silently stops working — a payload key renamed upstream, a conflict that
+    /// never clears — a 200 with `{"ok":true}` looks exactly like success. That
+    /// is the failure this repo paid for twice on 2026-08-07 (a PATCH whose
+    /// `ignored_fields` nobody read), and a self-healing mechanism is precisely
+    /// the kind nobody watches once it appears to work.
+    fn as_json(&self) -> Value {
+        match self {
+            ConvAdopt::Unchanged => json!({"adopted": false}),
+            ConvAdopt::Adopted { was } => json!({
+                "adopted": true,
+                "previous": was,
+                "healed_blind_lane": was.is_empty(),
+            }),
+            ConvAdopt::Conflict { owner } => json!({
+                "adopted": false,
+                "conflict_with": owner,
+                "error": format!(
+                    "another lane ('{owner}') already claims this conversation id; refusing to \
+                     cross-link — this lane stays unresolvable to the staged guard until fixed"
+                ),
+            }),
+        }
+    }
+}
+
+/// Adopt a conversation id a lane REPORTED ABOUT ITSELF (Stop / UserPromptSubmit
+/// hook payload -> `POST /api/sessions/<n>/report`).
+///
+/// WHY THIS EXISTS (AMUX-2936's resume trigger, fired 2026-08-15). The staged
+/// guard calls a cotenant BLIND when it cannot resolve that lane's transcript,
+/// and blind is the one class through which a work-absorbing commit passes
+/// silently: `foreign` exits 1 and blocks, but an invisible lane cannot produce
+/// a `foreign` row at all, so its files land in `unclaimed`.
+///
+/// Measured over 8h51m on 2026-08-15: 321 blind-cotenant warnings on
+/// /Users/ethan/Dev/mixpeek, from 29 distinct committing lanes, and 304 of them
+/// name ONE lane — `mixpeek-general`, which is RUNNING. Its meta has
+/// `cc_conversation_id: ""`, so `session_jsonl_path` falls through to the title
+/// match and the single-unclaimed fallback, finds 4 unclaimed transcripts in a
+/// shared project dir, and CORRECTLY refuses to guess. The refusal is right; the
+/// guessing is what should not have been necessary.
+///
+/// And it was not necessary: Claude Code hands every hook a payload containing
+/// `session_id` and `transcript_path`. amux was discarding it — the Stop hook
+/// posted a literal `{"state":"idle","source":"stop-hook"}` and read nothing
+/// from stdin — and then spending a 162-file scan downstream trying to
+/// re-derive precisely that id. The harness knows its own conversation; ask it
+/// (ethos D1) instead of inferring from a shared directory's mtimes.
+///
+/// WHY NOT `find_latest_session_id` (the tempting fix, and the reason this is a
+/// function with a refusal in it rather than an `update_meta` call): that is
+/// "newest jsonl in the project dir", and ~/Dev/mixpeek hosts about thirty
+/// lanes. On 2026-08-09 it stamped the `amux` lane with `amux-rust`'s LIVE
+/// conversation during a model swap and the next start resumed a copy of
+/// another lane's brain. Adopting a neighbour's transcript is strictly worse
+/// than staying blind: blind under-reports, cross-linked MIS-reports, and the
+/// guard would then confidently attribute a peer's edits to the wrong lane.
+///
+/// So the cross-link refusal is kept, and it is LOUD. A reported id that another
+/// lane's meta already claims is the one shape that cannot be a benign restart,
+/// and silently dropping it would leave the lane blind with no trace of why.
+pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
+    let reported = reported.trim();
+    // A transcript stem is a UUID. Anything else is a caller mistake, not an id;
+    // refusing early keeps a typo out of meta where it would resolve to nothing
+    // and look exactly like the blindness this is meant to end.
+    let plausible = reported.len() >= 32
+        && reported.len() <= 64
+        && reported.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    if !plausible {
+        return ConvAdopt::Unchanged;
+    }
+    let was = meta_str(&load_meta(name), "cc_conversation_id");
+    if was == reported {
+        return ConvAdopt::Unchanged;
+    }
+    let owner = conversation_owned_by_other(reported, name);
+    if !owner.is_empty() {
+        tracing::warn!(
+            target: "staged_guard",
+            "[conv-adopt/AMUX-2936] session={} reported conv_id={} but lane '{}' already claims \
+             it — REFUSED. Two lanes pointing at one conversation both resume it, and the \
+             staged guard would attribute one lane's edits to the other. '{}' stays blind \
+             until the conflict is resolved.",
+            name, reported, owner, name,
+        );
+        return ConvAdopt::Conflict { owner: owner.clone() };
+    }
+    update_meta(name, &[("cc_conversation_id", json!(reported))]);
+    // Countable, because "how many lanes healed and how many are still blind" is
+    // the question AMUX-2936 could not answer for want of a trace. `was.empty()`
+    // is the discriminator that matters: it means a lane the guard could not see
+    // is now visible, i.e. an absorption window just closed.
+    tracing::info!(
+        target: "staged_guard",
+        "[conv-adopt/AMUX-2936] session={} adopted self-reported conv_id={} (previous: {}) — {}",
+        name,
+        reported,
+        if was.is_empty() { "none" } else { &was },
+        if was.is_empty() {
+            "lane was BLIND to the staged guard and is now resolvable"
+        } else {
+            "lane moved to a new conversation"
+        },
+    );
+    ConvAdopt::Adopted { was }
+}
+
 fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
     let mut meta = load_meta(name);
     let mut tracked: Vec<String> = meta
@@ -10306,6 +10434,39 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
             }),
         );
     }
+    // SELF-REPORTED CONVERSATION ID (AMUX-2936). Handled here, above the
+    // subagent early-return, so EVERY report shape carries it — a lane that only
+    // ever fires PreToolUse:Task would otherwise never heal.
+    //
+    // Three spellings accepted because three producers exist: `conv_id` (amux's
+    // own callers), `session_id` (Claude Code's hook payload field verbatim, so
+    // the hook can forward stdin without renaming anything), and the stem of
+    // `transcript_path` (the same payload's other field — belt and braces for a
+    // provider that sends the path but not the id).
+    //
+    // Adoption is deliberately NOT gated on `state`: the id is a fact about the
+    // lane regardless of what it is doing, and gating it would have made healing
+    // depend on which hook fired first.
+    let reported_conv = {
+        let direct = body_str(body, "conv_id");
+        let direct = if direct.trim().is_empty() { body_str(body, "session_id") } else { direct };
+        if direct.trim().is_empty() {
+            let tp = body_str(body, "transcript_path");
+            Path::new(tp.trim())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            direct
+        }
+    };
+    let conv_adopt = if reported_conv.trim().is_empty() {
+        ConvAdopt::Unchanged
+    } else {
+        adopt_reported_conv_id(name, &reported_conv)
+    };
+
     // AMUX-3048: subagent LIFECYCLE events maintain an event-driven live count,
     // the durable exit for the mtime-window instruments cluster (AMUX-2646/2904/
     // 2959/2952/3022/3030/3047). A subagent transcript's mtime cannot tell
@@ -10459,7 +10620,11 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                 .map(|v| v[name]["state"].as_str().unwrap_or("").to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".into());
-            j200(json!({"ok": true, "state": prev, "note": "heartbeat ignored — no active turn to refresh"}))
+            j200(json!({
+                "ok": true, "state": prev,
+                "note": "heartbeat ignored — no active turn to refresh",
+                "conv_id": conv_adopt.as_json(),
+            }))
         }
         Ok(_) => {
             // REACTIVE STEERING DELIVERY: if the session just went idle and has
@@ -10519,7 +10684,7 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                     .await;
                 }
             }
-            j200(json!({"ok": true, "state": st}))
+            j200(json!({"ok": true, "state": st, "conv_id": conv_adopt.as_json()}))
         }
         Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
     }
@@ -13433,6 +13598,140 @@ mod tests {
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
+    /// AMUX-2936. Driven through the REAL endpoint, not `adopt_reported_conv_id`
+    /// directly, because the shipped path is what was broken: the id has to
+    /// survive body parsing, the attribution check and the subagent branch to
+    /// reach meta. A unit test on the helper would pass with the wiring absent,
+    /// which is the exact shape of check this repo keeps paying for.
+    ///
+    /// The specimen is `mixpeek-general`: RUNNING, `cc_conversation_id: ""`,
+    /// four unclaimed transcripts in a shared project dir so no fallback can
+    /// resolve it, and therefore blind to the staged guard on all 304 of its
+    /// warnings. Case 1 below is that lane.
+    #[tokio::test]
+    async fn a_lane_reporting_its_own_conv_id_heals_blindness_and_refuses_cross_links() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        let app: Router = routes().with_state(state.clone());
+
+        // The blind lane, in its exact live shape: an EMPTY cid, not a missing
+        // key. (mixpeek-general's meta really does carry `"": ` — it was
+        // cleared, never absent, so a test using a missing key would exercise a
+        // different branch than the one in production.)
+        std::fs::write(env_path("blindy"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(meta_path("blindy"), json!({"cc_conversation_id": ""}).to_string()).unwrap();
+        const CONV: &str = "bfee1ec0-f9fa-4c1b-9a77-0d1e2f3a4b5c";
+
+        // 1. HEALS. A stop-hook report carrying Claude Code's own `session_id`
+        //    makes the lane resolvable.
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "source": "stop-hook", "session_id": CONV})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["conv_id"]["adopted"], json!(true), "{v}");
+        assert_eq!(
+            v["conv_id"]["healed_blind_lane"],
+            json!(true),
+            "a lane that had no id at all is the case that closes an absorption window: {v}"
+        );
+        assert_eq!(meta_str(&load_meta("blindy"), "cc_conversation_id"), CONV);
+
+        // 2. NO CHURN. The same hook fires on every turn boundary, fleet-wide;
+        //    re-reporting an unchanged id must not rewrite meta.
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": CONV})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["adopted"], json!(false), "{v}");
+
+        // 3. CROSS-LINK REFUSED, and the refusal is legible in the BODY. This is
+        //    the 2026-08-09 incident mechanised: adopting a neighbour's live
+        //    conversation is strictly worse than staying blind, because the
+        //    guard would then attribute one lane's edits to another with
+        //    confidence.
+        const SIB_CONV: &str = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+        std::fs::write(env_path("sib"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(
+            meta_path("sib"),
+            json!({"cc_conversation_id": SIB_CONV}).to_string(),
+        )
+        .unwrap();
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["conv_id"]["adopted"], json!(false), "{v}");
+        assert_eq!(v["conv_id"]["conflict_with"], json!("sib"), "{v}");
+        assert_eq!(
+            meta_str(&load_meta("blindy"), "cc_conversation_id"),
+            CONV,
+            "a refused cross-link must leave the previous id intact"
+        );
+
+        // 4. A NON-ID IS NOT AN ID. Anything that is not transcript-stem shaped
+        //    would resolve to no file and look identical to blindness.
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": "resuming-session"})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["adopted"], json!(false), "{v}");
+        assert_eq!(meta_str(&load_meta("blindy"), "cc_conversation_id"), CONV);
+
+        // 5. transcript_path is accepted too — same payload, other field, for a
+        //    provider that sends the path and no id.
+        const CONV2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        std::fs::write(env_path("pathy"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(meta_path("pathy"), json!({}).to_string()).unwrap();
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/pathy/report",
+            Some(json!({
+                "state": "active",
+                "transcript_path": format!("/Users/x/.claude/projects/-p/{CONV2}.jsonl"),
+            })),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["adopted"], json!(true), "{v}");
+        assert_eq!(meta_str(&load_meta("pathy"), "cc_conversation_id"), CONV2);
+
+        // 6. A SUBAGENT-ONLY report still heals. It returns early, before the
+        //    state parse, so adoption had to be hoisted above that branch — a
+        //    lane whose only hook is PreToolUse:Task would otherwise stay blind
+        //    forever.
+        const CONV3: &str = "5f6e7d8c-9b0a-4123-8456-789abcdef012";
+        std::fs::write(env_path("subby"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(meta_path("subby"), json!({}).to_string()).unwrap();
+        let (st, _v) = call(
+            &app,
+            "POST",
+            "/api/sessions/subby/report",
+            Some(json!({"subagent": "start", "session_id": CONV3})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            meta_str(&load_meta("subby"), "cc_conversation_id"),
+            CONV3,
+            "adoption must happen above the subagent early-return"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15117,4 +15416,5 @@ mod roster_tests {
         let r = super::fleet_roster();
         assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
     }
+
 }
