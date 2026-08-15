@@ -20,16 +20,32 @@ test('read-aloud plays through the shared bottom player', async ({ page }) => {
   // Pattern: start the evaluate WITHOUT awaiting it (so the listener is
   // registered), then click to provide activation and trigger the handler,
   // then await the evaluate's resolution.
-  const speakDone = page.evaluate(() =>
-    new Promise<void>((resolve, reject) => {
-      document.addEventListener('click', async () => {
-        try { await (window as any)._ttsSpeak('hello from the sweep', null); resolve(); }
-        catch (e) { reject(e); }
-      }, { once: true });
-    })
-  );
-  await page.click('body');
-  await speakDone;
+  // NO CLICK, NO AWAIT ON PLAYBACK. Two independent CI hangs live here and this
+  // removes both dependencies rather than picking between the diagnoses:
+  //   - amux-frustrations: `_ttsSpeak` awaits `audio.play()`, which never settles
+  //     on a headless runner with no audio sink (desktop has one; [mobile] and
+  //     [ios-safari] do not — exactly the two projects that failed).
+  //   - amux-homepage: `page.click('body')` does not reliably reach a document
+  //     listener on CI mobile/webkit; the app absorbs/re-targets the click, so the
+  //     listener never fires and the awaited promise never resolves.
+  // Either one produces the same 30s `page.evaluate` timeout, and a local run
+  // cannot reproduce either — the environment IS the discriminator.
+  //
+  // The load-bearing fact (amux-homepage, app.js:10741): _abPlay marks the bar
+  // visible SYNCHRONOUSLY, before any audio.play(). So neither a real gesture nor
+  // a working audio device is needed for the property under test. The gesture
+  // dance exists only because _ttsClaimGesture itself calls play(); that rejects
+  // harmlessly here and is caught.
+  //
+  // Calling _ttsSpeak (not _abPlay) on purpose: the claim is "read-aloud routes
+  // through the SHARED bottom player", so the _ttsSpeak -> _abPlay wiring is the
+  // subject. Invoking _abPlay directly would be more robust and would stop
+  // testing the thing that was actually broken — read-aloud playing on its own
+  // detached Audio element. Real user-activation is covered by the product path
+  // in prod, not by this assertion.
+  page.evaluate(() => {
+    try { (window as any)._ttsSpeak('hello from the sweep', null); } catch (e) { /* asserted via state below */ }
+  }).catch(() => {});
 
   // Poll instead of sleeping — a fixed 600ms can expire before the async chain
   // resolves on slow CI machines, and on fast machines it wastes wall-clock time.
