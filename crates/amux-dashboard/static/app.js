@@ -7589,7 +7589,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.639';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.640';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -25434,10 +25434,39 @@ function _offlineSettingsHTML() {
     + `Scrollback limit<select style="${sel}" onchange="_offlineCapSet(this.value)">${cap}</select></label>`
     + '</div>';
 }
+// AMUX-2975: settings is grouped into 5 tabs (account/workers/notifications/
+// integrations/device). Switch the visible panel + active button, remember the
+// last tab, and reset the menu scroll so a new panel opens at the top.
+function _settingsTab(name) {
+  const menu = document.getElementById('settings-menu');
+  if (!menu) return;
+  menu.querySelectorAll('.settings-tab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.stab === name));
+  const panels = menu.querySelectorAll('.settings-tab-panel');
+  let matched = false;
+  panels.forEach(p => {
+    const on = p.dataset.stab === name;
+    p.classList.toggle('active', on);
+    if (on) matched = true;
+  });
+  // Guard against a stale saved tab that no longer exists: fall back to the first.
+  if (!matched && panels.length) {
+    const first = panels[0].dataset.stab;
+    menu.querySelectorAll('.settings-tab-btn').forEach(b =>
+      b.classList.toggle('active', b.dataset.stab === first));
+    panels.forEach(p => p.classList.toggle('active', p.dataset.stab === first));
+  }
+  try { localStorage.setItem('amux_settings_tab', name); } catch (e) {}
+  menu.scrollTop = 0;
+}
 function toggleSettings() {
   const menu = document.getElementById('settings-menu');
   const open = menu.classList.toggle('open');
   if (open) {
+    // Restore the last-used settings tab (default: account) before painting.
+    let savedTab = 'account';
+    try { savedTab = localStorage.getItem('amux_settings_tab') || 'account'; } catch (e) {}
+    _settingsTab(savedTab);
     // Load the server-saved caps before painting, so the selects show the real
     // values rather than defaults that then silently change under the user.
     Promise.all([_offlineMBLoad(), _offlineCapLoad()]).then(() => {

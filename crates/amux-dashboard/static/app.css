@@ -1681,6 +1681,26 @@
     padding: 10px 0;
   }
   .settings-menu.open { display: block; }
+  /* AMUX-2975: the 17-section list is grouped into 5 tabs. The strip is sticky
+     so it stays reachable while a panel scrolls, and overflow-x:auto so it never
+     overflows the 260px menu on a 375px phone — it scrolls instead. */
+  .settings-tabs {
+    display: flex; gap: 2px; position: sticky; top: 0; z-index: 2;
+    background: var(--card); padding: 0 8px 8px; margin: -2px 0 4px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .settings-tabs::-webkit-scrollbar { display: none; }
+  .settings-tab-btn {
+    flex: 1 0 auto; min-height: 44px; padding: 6px 10px;
+    border: none; background: none; color: var(--dim);
+    font-size: 0.78rem; font-weight: 600; cursor: pointer; border-radius: 8px;
+    white-space: nowrap; -webkit-tap-highlight-color: transparent;
+  }
+  .settings-tab-btn:active { background: var(--border); }
+  .settings-tab-btn.active { color: var(--text); background: var(--bg); }
+  .settings-tab-panel { display: none; }
+  .settings-tab-panel.active { display: block; }
   .settings-section { padding: 6px 14px; }
   .settings-section-label { font-size: 0.68rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; font-weight: 600; }
   .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
