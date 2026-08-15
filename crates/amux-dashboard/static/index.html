@@ -1240,7 +1240,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
 </div>
 
-<div id="browser-view" style="display:none;">
+<div id="browser-view" style="display:none;flex:1;min-height:0;">
   <style>
     #browser-view .bw-btn { font-size:0.82rem;padding:5px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--fg);font-family:inherit;line-height:1.1;white-space:nowrap; }
     #browser-view .bw-btn:hover { border-color:var(--accent); }
@@ -1315,9 +1315,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div id="bw-agent-result" style="display:none;margin:0 8px 8px;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.76rem;max-height:160px;overflow:auto;white-space:pre-wrap;"></div>
   <!-- Viewport + elements panel -->
-  <div style="display:flex;gap:8px;padding:0 8px 8px;height:calc(100vh - 260px);min-height:280px;">
+  <div style="display:flex;gap:8px;padding:0 8px 8px;flex:1;min-height:0;">
     <div id="bw-viewport" tabindex="0" style="position:relative;flex:1;min-width:0;cursor:crosshair;overflow:auto;outline:none;" onkeydown="_bwViewportKey(event)">
-      <img id="bw-img" style="max-width:100%;border:1px solid var(--border);border-radius:4px;display:none;" onclick="_bwClick(event)">
+      <img id="bw-img" style="width:100%;height:auto;display:none;border:1px solid var(--border);border-radius:4px;" onclick="_bwClick(event)">
       <div id="bw-placeholder" style="display:flex;align-items:center;justify-content:center;height:400px;color:var(--dim);font-size:0.9rem;text-align:center;padding:0 20px;">
         Enter a URL and click Go to start browsing.<br>Click the page to interact; focus it and type to send keys.
       </div>
