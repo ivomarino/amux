@@ -159,6 +159,15 @@ pub trait SessionBackend: Send + Sync {
     /// Capture recent visible output. This is a LIVENESS/diagnostic view,
     /// not the control plane (D1): structured state comes from OpenCode.
     async fn capture(&self, proc: &ProcessRef, lines: u32) -> Result<String>;
+    /// Native agent lifecycle states for everything this backend hosts,
+    /// keyed by backend ref, in ONE batched call for the whole fleet
+    /// (herdr: a single `workspace list`; #84 — the D1 exit applied to a
+    /// backend). Empty = no native signal (the tmux default); `Err` =
+    /// could not read. The two must stay distinguishable, or a transient
+    /// backend outage masquerades as a stopped fleet.
+    async fn agent_states(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(std::collections::BTreeMap::new())
+    }
 }
 
 #[cfg(test)]

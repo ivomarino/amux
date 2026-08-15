@@ -467,6 +467,19 @@ impl SessionBackend for HerdrBackend {
             _ => result,
         }
     }
+
+    /// #84: one `workspace list` for the whole fleet, returning
+    /// `(backend_ref, agent_status)` for every `amux-` workspace whose pane
+    /// herdr has recognized as a known agent (`idle`/`working`/`blocked`/
+    /// `done`; arbitrary commands read `unknown` and are omitted — the
+    /// scrape stays their voice). Verified live on herdr 0.7.5 (2026-08-15):
+    /// `pane run "claude"` is auto-recognized and the workspace carries
+    /// `agent_status: "idle"`; a `workspace list` already returns it, so no
+    /// per-lane probe is needed. A read failure is `Err`, NOT an empty map.
+    async fn agent_states(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let v = self.run_json(&["workspace", "list"], OP_TIMEOUT).await?;
+        Ok(parse_workspace_statuses(&v).into_iter().collect())
+    }
 }
 
 /// `{"error":{"code":..,"message":..}}` -> (code, message).
@@ -489,6 +502,29 @@ fn parse_workspaces(v: &Value) -> Vec<(String, String)> {
                         w["label"].as_str()?.to_string(),
                         w["workspace_id"].as_str()?.to_string(),
                     ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `workspace list` envelope -> [(label, agent_status)] for amux-owned
+/// workspaces whose pane herdr recognized as a known agent. `unknown`
+/// (arbitrary commands — GAP-ATTACH) and agentless entries are omitted:
+/// for them the scrape is the only voice, and an `unknown` key in the map
+/// would read as "herdr answered" to a caller that only checks presence.
+fn parse_workspace_statuses(v: &Value) -> Vec<(String, String)> {
+    v["result"]["workspaces"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    let label = w["label"].as_str()?;
+                    let status = w["agent_status"].as_str()?;
+                    if !label.starts_with("amux-") || status == "unknown" {
+                        return None;
+                    }
+                    Some((label.to_string(), status.to_string()))
                 })
                 .collect()
         })
@@ -547,6 +583,31 @@ mod tests {
             ]
         );
         assert!(envelope_error(&v).is_none());
+    }
+
+    #[test]
+    fn parses_native_agent_statuses() {
+        // Shape captured from a live herdr 0.7.5 probe (2026-08-15): a
+        // `pane run "claude"` lane reads `idle`, an arbitrary command reads
+        // `unknown`, and a foreign workspace is not ours to report.
+        let v: Value = serde_json::from_str(
+            r#"{"id":"cli:workspace:list","result":{"type":"workspace_list",
+                "workspaces":[
+                  {"agent_status":"unknown","label":"amux-wrk-spike","workspace_id":"w1"},
+                  {"agent_status":"idle","label":"amux-wrk-claude","workspace_id":"w2"},
+                  {"agent_status":"blocked","label":"amux-wrk-stuck","workspace_id":"w3"},
+                  {"agent_status":"done","label":"amux-wrk-finished","workspace_id":"w4"},
+                  {"agent_status":"idle","label":"scratch","workspace_id":"w9"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_workspace_statuses(&v),
+            vec![
+                ("amux-wrk-claude".to_string(), "idle".to_string()),
+                ("amux-wrk-stuck".to_string(), "blocked".to_string()),
+                ("amux-wrk-finished".to_string(), "done".to_string()),
+            ]
+        );
     }
 
     #[test]
