@@ -9820,6 +9820,62 @@ pub(crate) fn context_pct_remaining(used: u64, window: u64) -> u8 {
 /// POST report (py:76238-76265) — the D1 report endpoint: harness-reported
 /// state into the SHARED prefs store Python reads at boot and
 /// sessions_legacy reads live.
+/// AMUX-3048: apply one subagent lifecycle event to the lane's live count.
+///
+/// Reuses the `session_reports` prefs store the main self-report already uses,
+/// under a `subagents` sub-key `{count, ts}` — no new table, and the consumer
+/// (`FleetSignals::subagents_working`) reads it straight from the `reports`
+/// Value it already loads at boot. `start` increments, `stop` decrements with a
+/// floor of 0 so a lost start cannot drive the count negative. The write touches
+/// ONLY the `subagents` sub-key, preserving state/model/tokens — a subagent
+/// starting or stopping says nothing about the main turn's state.
+async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response {
+    let delta: i64 = match ev {
+        "start" => 1,
+        "stop" | "done" => -1,
+        other => {
+            return jresp(
+                StatusCode::BAD_REQUEST,
+                json!({"error": format!("subagent must be 'start' or 'stop' (got '{other}')")}),
+            );
+        }
+    };
+    let name_s = name.to_string();
+    let ev_s = ev.to_string();
+    let reply = state
+        .store
+        .write_async(move |conn| {
+            ensure_fleet_tables(conn)?;
+            let mut reports: Value = conn
+                .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            let prev = reports[&name_s]["subagents"]["count"].as_i64().unwrap_or(0);
+            let next = (prev + delta).max(0);
+            if !reports[&name_s].is_object() {
+                reports[&name_s] = json!({});
+            }
+            reports[&name_s]["subagents"] = json!({"count": next, "ts": now_f64()});
+            conn.execute(
+                "INSERT INTO prefs(key, value) VALUES('session_reports', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value=?1",
+                [reports.to_string()],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    match reply {
+        Ok(_) => j200(json!({"ok": true, "session": name, "subagent": ev_s})),
+        Err(e) => jresp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": e.to_string()}),
+        ),
+    }
+}
+
 async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
@@ -9868,6 +9924,19 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                 "target": name,
             }),
         );
+    }
+    // AMUX-3048: subagent LIFECYCLE events maintain an event-driven live count,
+    // the durable exit for the mtime-window instruments cluster (AMUX-2646/2904/
+    // 2959/2952/3022/3030/3047). A subagent transcript's mtime cannot tell
+    // "finished 30s ago" from "thinking, will write in 90s"; a start/stop event
+    // pair can. `{"subagent":"start"}` (PreToolUse:Task) increments, `"stop"`
+    // (SubagentStop) decrements. Handled BEFORE the main-state parse below so it
+    // never touches state/model/tokens — it is orthogonal to the main turn.
+    // Attribution (the origin==name check above) applies here too: a subagent
+    // count is a self-report like any other.
+    let sub_ev = body_str(body, "subagent").trim().to_lowercase();
+    if !sub_ev.is_empty() {
+        return subagent_event_post(state, name, &sub_ev).await;
     }
     let st_raw = body_str(body, "state").trim().to_lowercase();
     let st = match st_raw.as_str() {
@@ -12899,6 +12968,52 @@ mod steer_boundary_tests {
                 "reported state {reported:?} should give at_boundary={want}"
             );
         }
+    }
+
+    /// AMUX-3048: subagent start/stop events accumulate a live count in the same
+    /// session_reports store, floored at 0, WITHOUT disturbing the main state —
+    /// a subagent starting says nothing about the main turn.
+    #[tokio::test]
+    async fn subagent_events_accumulate_a_floored_live_count() {
+        let (state, _d) = tstate();
+        // A prior main-state report must survive the subagent events untouched.
+        set_report(&state, "probe", "active").await;
+
+        let read = |state: &AppState| -> Value {
+            state
+                .store
+                .read()
+                .unwrap()
+                .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null)
+        };
+
+        subagent_event_post(&state, "probe", "start").await;
+        subagent_event_post(&state, "probe", "start").await;
+        let v = read(&state);
+        assert_eq!(v["probe"]["subagents"]["count"].as_i64(), Some(2), "two starts -> 2");
+        assert_eq!(
+            v["probe"]["state"].as_str(),
+            Some("active"),
+            "subagent events must not touch the main state"
+        );
+
+        subagent_event_post(&state, "probe", "stop").await;
+        assert_eq!(read(&state)["probe"]["subagents"]["count"].as_i64(), Some(1), "one stop -> 1");
+
+        // FLOOR: more stops than starts (a lost start event) must never underflow
+        // into a negative count that would misread once a real start arrives.
+        subagent_event_post(&state, "probe", "stop").await;
+        subagent_event_post(&state, "probe", "stop").await;
+        assert_eq!(
+            read(&state)["probe"]["subagents"]["count"].as_i64(),
+            Some(0),
+            "count floors at 0 on excess stops"
+        );
     }
 
     /// Fail-closed is the whole safety property: an unknown lane must not be

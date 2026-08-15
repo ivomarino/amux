@@ -586,9 +586,43 @@ impl FleetSignals {
         // CORRECTION after the agents actually finish — never a false "busy" that
         // sticks, which is the property this whole derivation protects.
         let window = env_secs("AMUX_SUBAGENT_WORKING_S", 240.0);
-        self.subagent_activity
+        // AMUX-3048: an EVENT-DRIVEN live count, when the lane reports one, is the
+        // durable answer the mtime window could not give. A subagent transcript's
+        // mtime cannot tell "thinking, will write in 90s" from "finished 30s ago";
+        // a start (PreToolUse:Task) / stop (SubagentStop) event pair can. A
+        // positive reported count means a subagent is live RIGHT NOW even while
+        // its transcript sits silent (the xhigh-thinking case, AMUX-3030), so it
+        // flips the lane working where the mtime window read it idle.
+        //
+        // This is the SAFE half of the durable exit: it only ADDS a working
+        // verdict (OR with the window), so it cannot regress a hookless lane —
+        // gemini/codex send no such event, so there is no `subagents` key and the
+        // verdict is pure mtime, unchanged. The count-AUTHORITATIVE "off"
+        // direction (a count of 0 overriding a still-warm mtime — AMUX-3047's
+        // up-to-4-minute false WORKING after a turn is done) is deliberately NOT
+        // wired here yet: it needs a leak-safe reset that does not zero a live
+        // run_in_background agent (which outlives the main turn, AMUX-2904).
+        // Tracked as the follow-up on AMUX-3048.
+        let reported_live = self.reported_subagent_count(name).is_some_and(|c| c > 0);
+        reported_live
+            || self
+                .subagent_activity
+                .get(name)
+                .is_some_and(|m| self.now - m < window)
+    }
+
+    /// The raw event-driven live-subagent count a lane last reported (AMUX-3048),
+    /// or `None` when the lane has never reported one (a hookless / mtime-only
+    /// lane, e.g. gemini/codex). Exposed in the sessions payload so a LEAKED
+    /// count — a lost SubagentStop pinning a lane "working" — is diagnosable
+    /// rather than hidden. It is also the field the count-AUTHORITATIVE "off"
+    /// direction follow-up (AMUX-3047) will read to override a warm mtime.
+    fn reported_subagent_count(&self, name: &str) -> Option<i64> {
+        self.reports
             .get(name)
-            .is_some_and(|m| self.now - m < window)
+            .and_then(|r| r.get("subagents"))
+            .and_then(|s| s.get("count"))
+            .and_then(serde_json::Value::as_i64)
     }
 
     fn pane_says_working(&self, name: &str) -> bool {
@@ -1580,6 +1614,10 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "composer_stuck_since": meta["composer_stuck_since"].as_i64().unwrap_or(0),
             "composer_preview": meta["composer_preview"].as_str().unwrap_or(""),
             "agents_working": signals.subagents_working(&name),
+            // AMUX-3048: the raw event-driven count behind agents_working, so a
+            // LEAKED count (a lost SubagentStop pinning a lane "working") is
+            // diagnosable rather than hidden — null on a hookless/mtime-only lane.
+            "subagents_live": signals.reported_subagent_count(&name),
             // The lightning button's state derives from THIS field in the
             // SPA (isYolo checks flags for the provider's skip-permissions
             // flag) — a card without flags renders the wrong YOLO badge
@@ -2211,6 +2249,41 @@ mod tests {
         sig.subagent_activity.insert("other".into(), sig.now - 5.0);
         assert!(!sig.subagents_working("primis"));
         assert!(sig.subagents_working("other"));
+    }
+
+    /// AMUX-3048: the EVENT-DRIVEN count, when a lane reports one, flips the lane
+    /// working even with NO recent transcript write — the xhigh-thinking case the
+    /// mtime window could not catch (AMUX-3030). Additive: a lane that reports no
+    /// subagent event (gemini/codex, or one that spawned none) is pure mtime.
+    #[test]
+    fn reported_subagent_count_drives_working_over_a_silent_mtime() {
+        let mut sig = signals();
+        sig.now = 1_000_000.0;
+        // CONTROL: no report, no mtime -> not working, or nothing below proves out.
+        assert!(!sig.subagents_working("primis"));
+
+        // A live count with NO transcript activity at all still reads working —
+        // exactly what the mtime window missed.
+        sig.reports = serde_json::json!({
+            "primis": {"state": "idle", "subagents": {"count": 2, "ts": sig.now - 5.0}}
+        });
+        assert!(
+            sig.subagents_working("primis"),
+            "a reported live count must contradict idle even with a silent transcript"
+        );
+
+        // Count back to 0 with no mtime -> not working (the count invents nothing).
+        sig.reports = serde_json::json!({
+            "primis": {"subagents": {"count": 0, "ts": sig.now - 5.0}}
+        });
+        assert!(!sig.subagents_working("primis"), "count 0 with no mtime must read idle");
+
+        // A hookless lane (no `subagents` key) is unaffected: pure mtime fallback.
+        sig.reports = serde_json::json!({"gemini-lane": {"state": "active"}});
+        sig.subagent_activity.insert("gemini-lane".into(), sig.now - 30.0);
+        assert!(sig.subagents_working("gemini-lane"), "hookless lane still uses the mtime window");
+        sig.subagent_activity.insert("gemini-lane".into(), sig.now - 86_400.0);
+        assert!(!sig.subagents_working("gemini-lane"), "stale mtime on a hookless lane reads idle");
     }
 
     #[test]
