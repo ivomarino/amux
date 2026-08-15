@@ -74,9 +74,16 @@ services:
       - "127.0.0.1:${USER_PORT}:8822"
 
   litestream:
-    image: litestream/litestream:latest
+    image: litestream/litestream:0.5.16
     container_name: amux-litestream-${USER_ID}
     # SQLite WAL replication — steady, small, and bounded by design.
+    # Runs as root because amux.db is written 0644 root:root by the amux server;
+    # litestream must WRITE that db (it creates _litestream_seq on the first
+    # replicate), and the image default user went non-root in the 0.5.x line, so
+    # a non-root sidecar gets SQLITE_READONLY(8) on that first write while the
+    # root server keeps writing fine. The tag is pinned (never :latest) so an
+    # upstream image change cannot silently re-break DR. AMUX-3127, 2026-08-15.
+    user: "0"
     mem_limit: 192m
     memswap_limit: 192m
     restart: unless-stopped

@@ -130,6 +130,38 @@ jobs:
           [ "$fail" = 0 ] && echo "guard: cloud image is rust-only"
           exit "$fail"
 
+      # ── 2. The litestream DR sidecar is version-pinned and runs as root ─────
+      # This gate exists because the failure it guards was INVISIBLE: a non-root
+      # litestream:latest shipped upstream (2026-07-06), a container recreate
+      # picked it up, and the sidecar could no longer WRITE the root:root
+      # amux.db — DR replication died fleet-wide with SQLITE_READONLY(8) on
+      # _litestream_seq while the root amux server kept writing fine. Nothing
+      # surfaced it; it was hand-diagnosed (AMUX-3127). Each check below is
+      # written so it CAN fail — verified against the pre-fix template
+      # (image: litestream/litestream:latest, no user override).
+      - name: litestream DR sidecar is version-pinned and runs as root (AMUX-3127)
+        run: |
+          tmpl=cloud/docker/docker-compose.template.yml
+          # Isolate just the litestream service block (from its key to the next
+          # top-level 2-space service key), so a user:/image: elsewhere can't
+          # satisfy the check for it.
+          block=$(awk '/^  litestream:/{f=1;print;next} /^  [a-z][a-z0-9_-]*:[[:space:]]*$/{f=0} f' "$tmpl")
+          fail=0
+          if printf '%s\n' "$block" | grep -qE 'image:[[:space:]]*litestream/litestream:latest'; then
+            echo "::error::litestream sidecar image is :latest in $tmpl — pin a version (a non-root :latest broke DR, AMUX-3127)"
+            fail=1
+          fi
+          if ! printf '%s\n' "$block" | grep -qE 'image:[[:space:]]*litestream/litestream:[0-9]'; then
+            echo "::error::litestream sidecar image is not version-pinned in $tmpl (expected litestream/litestream:<version>)"
+            fail=1
+          fi
+          if ! printf '%s\n' "$block" | grep -qE '^[[:space:]]*user:[[:space:]]*"?0"?[[:space:]]*$'; then
+            echo "::error::litestream sidecar must set user: \"0\" to write the root:root amux.db (AMUX-3127)"
+            fail=1
+          fi
+          [ "$fail" = 0 ] && echo "guard: litestream sidecar is version-pinned and runs as root"
+          exit "$fail"
+
   # ── 2. Build + push ────────────────────────────────────────────────────────
   build:
     needs: guard
