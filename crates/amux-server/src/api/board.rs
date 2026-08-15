@@ -878,6 +878,18 @@ pub struct ListParams {
     pub archived: Option<String>,
     #[serde(default)]
     pub done_limit: Option<i64>,
+    // `?all=1` — the "give me everything" escape. Every session that hit the
+    // terminal cap reached for this exact param (AMUX-3154: mixpeek-funnel,
+    // mixpeek-frustrations, ts-gke all tried `?all=1`/`?limit=10000` and got the
+    // capped 100-terminal view back, silently). It was an UNRECOGNISED param, so
+    // axum dropped it and the default cap answered — the rule-7 failure where a
+    // filter that never ran hands back a confident wrong denominator (a lane
+    // auditing its `done` work off the plain list was reading ~6% of it). Now
+    // recognised and honoured as `done_limit=0` (uncap terminal). The dashboard
+    // render poll keeps the cap by NOT sending this; a denominator read asks for
+    // it explicitly.
+    #[serde(default)]
+    pub all: Option<String>,
     #[serde(default)]
     pub slim: Option<String>,
     #[serde(default)]
@@ -923,7 +935,7 @@ pub struct ListParams {
 /// announces the terminal cap. (`q`/`query`/`search` are here because they are
 /// consumed above — refused with a 400 — so they are recognised, not ignored.)
 const RECOGNISED_BOARD_PARAMS: &[&str] = &[
-    "status", "session", "archived", "done_limit", "slim", "limit", "offset", "q", "query",
+    "status", "session", "archived", "done_limit", "all", "slim", "limit", "offset", "q", "query",
     "search",
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
@@ -1009,7 +1021,7 @@ pub async fn list_board(
                 "use_instead": format!("/api/search?q={term}"),
                 "why": "This param was silently ignored until 2026-08-11, so the full board came \
                         back looking like ranked results. Refusing loudly beats answering wrongly.",
-                "board_filters": ["status", "session", "archived", "done_limit", "slim", "limit", "offset"],
+                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "limit", "offset"],
             })),
         )
             .into_response();
@@ -1072,7 +1084,13 @@ pub async fn list_board(
     // An explicit ?done_limit= still wins in both cases — a caller who asks for
     // a bound gets exactly that.
     let scoped = p.session.is_some() || p.status.is_some();
-    let done_limit = p.done_limit.unwrap_or(if scoped { 0 } else { 100 });
+    // `?all=1` uncaps the terminal set for the unscoped list — the documented,
+    // now-discoverable escape from the render cap (AMUX-3154). An explicit
+    // `?done_limit=N` still wins over it (a caller who names a bound gets it).
+    let uncap_all = qp_truthy(p.all.as_deref());
+    let done_limit = p
+        .done_limit
+        .unwrap_or(if scoped || uncap_all { 0 } else { 100 });
     let slim = qp_truthy(p.slim.as_deref());
 
     let store = state.store.clone();
@@ -1100,6 +1118,33 @@ pub async fn list_board(
     let (kept, term_total, term_kept) = bs::cap_terminal(rows, done_limit);
     let total = kept.len();
     let now = now_secs();
+
+    // TWO-FIXES (AMUX-3154): the terminal cap already reports itself in
+    // x-amux-truncated / x-amux-terminal-total, but a `curl | json.load` consumer
+    // reads the bare array and never sees a header (ethos rule 4, second layer: a
+    // signal in a store the reader never opens is the same as no signal). So the
+    // NEXT lane that reads the plain list as a `done` denominator leaves a
+    // greppable trace instead of a clean-looking wrong answer. Gated to the
+    // denominator-read SHAPE — an unscoped, full-card (non-slim) fetch that did
+    // not ask for a bound — so the high-frequency dashboard poll (slim=1) and any
+    // explicit ?all=1 / ?done_limit= caller stay silent. grep "board list truncated".
+    if term_total > term_kept
+        && !scoped
+        && !uncap_all
+        && !slim
+        && p.done_limit.is_none()
+    {
+        tracing::warn!(
+            target: "board",
+            hidden = term_total - term_kept,
+            terminal_total = term_total,
+            terminal_returned = term_kept,
+            "board list truncated {} terminal card(s) to the render cap — a caller reading the \
+             plain /api/board as a 'done' denominator sees a partial set. Use ?all=1 or \
+             ?status=done for the full set (AMUX-3154).",
+            term_total - term_kept
+        );
+    }
 
     let offset = p.offset.unwrap_or(0);
     let page: &[bs::IssueRow] = if offset >= kept.len() {
@@ -3397,6 +3442,33 @@ mod slim_tests {
         assert_eq!(d(Some("ts-gke"), None, Some(5)), 5, "explicit done_limit wins when scoped");
         assert_eq!(d(None, None, Some(5)), 5, "and when unfiltered");
         assert_eq!(d(None, None, Some(0)), 0, "an explicit 0 still means uncapped");
+    }
+
+    /// `?all=1` is the discoverable escape from the terminal cap (AMUX-3154).
+    ///
+    /// Every session that hit the cap reached for this exact param
+    /// (mixpeek-funnel, mixpeek-frustrations, ts-gke tried `?all=1`/`?limit=N`)
+    /// and got the capped 100-terminal view back, because `all` was UNRECOGNISED
+    /// and axum dropped it — the rule-7 failure where a filter that never ran
+    /// returns a confident wrong denominator (a lane auditing its `done` work off
+    /// the plain list read ~6% of it). This pins that `?all=1` now uncaps, that
+    /// the dashboard render poll (which omits it) still caps, that an explicit
+    /// ?done_limit still wins, and — the half that makes it real — that `all` is
+    /// a RECOGNISED param and not silently dropped like it was.
+    #[test]
+    fn all_1_uncaps_the_unfiltered_terminal_set() {
+        // Mirror the real derivation at list_board: unscoped, `?all=1`, explicit.
+        let d = |uncap_all: bool, explicit: Option<i64>| {
+            let scoped = false; // the unscoped list is the case that was wrong
+            explicit.unwrap_or(if scoped || uncap_all { 0 } else { 100 })
+        };
+        assert_eq!(d(false, None), 100, "the bare list still caps — the dashboard render poll omits ?all=1");
+        assert_eq!(d(true, None), 0, "?all=1 must answer completely — the escape every capped caller tried");
+        assert_eq!(d(true, Some(5)), 5, "an explicit done_limit wins even alongside ?all=1");
+        // The half that was the actual bug: an unrecognised `all` is dropped, so
+        // the cap answers and the escape silently no-ops.
+        assert!(RECOGNISED_BOARD_PARAMS.contains(&"all"), "?all must be recognised");
+        assert!(ignored_board_params("all=1").is_empty(), "?all=1 must not be reported as ignored");
     }
 
     use super::*;
