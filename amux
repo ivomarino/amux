@@ -428,12 +428,21 @@ cmd_register() {
 cmd_start() {
   local name dry_run=false detach=false
   # AMUX_API is referenced bare below (the tmux `-e AMUX_URL=$AMUX_API` inject at
-  # the real-launch path) but was never declared local here the way _api_start /
-  # _api_stop / send all do — so under `set -u` a real `amux start` (non-dry-run)
-  # died with "AMUX_API: unbound variable" whenever AMUX_API wasn't already
-  # exported. Dry-run returns before that line, which is why it hid. Fall back to
-  # AMUX_URL (the canonical, commonly-set base) then the default port.
-  local AMUX_API="${AMUX_API:-${AMUX_URL:-https://localhost:8824}}"
+  # the real-launch path, and the codex/ollama server delegation) but was never
+  # declared local here the way _api_start / _api_stop / send all do, so under
+  # `set -u` a real `amux start` (non-dry-run) died with "AMUX_API: unbound
+  # variable" whenever AMUX_API wasn't already exported. Dry-run returns before
+  # that line, which is why it hid.
+  #
+  # Resolve via cmd_url (the endpoint.json self-heal), NOT the raw $AMUX_URL. A
+  # pre-cutover lane carries the retired 8822 in $AMUX_URL for life (AMUX-3046),
+  # and since codex/ollama now DELEGATE their launch to this base (AMUX-3164), a
+  # raw-$AMUX_URL fallback made `amux start` fail "server unreachable" on a
+  # stranded lane even with the server up, and injected the dead 8822 into every
+  # NEW worker (the `-e AMUX_URL=` below). cmd_url ignores a retired-port env and
+  # falls to the canonical base, so both paths self-heal. An explicit AMUX_API
+  # (a non-default server) still wins.
+  local AMUX_API="${AMUX_API:-$(cmd_url)}"
   name=$(resolve_session "${1:-}")
   shift 2>/dev/null || true
   # Strip our own flags before inline claude args. Placed before `--` so
