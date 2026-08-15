@@ -90,6 +90,23 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
     out.extend(self_reports_check(state));
 
+    // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
+    // source? (AMUX-3033). The committed source is embedded at build time so the
+    // binary always carries the canonical version; the runtime copy is read from
+    // ~/.amux/hooks, and any drift (an unreviewed fleet-wide hand-edit) fails here
+    // instead of hiding until the next "can't reproduce on the current file".
+    {
+        const COMMITTED_GUARD: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/git-hooks/git-shared-guard.py"
+        ));
+        let runtime_path = crate::config::ServerConfig::from_process_env()
+            .amux_home
+            .join("hooks/git-shared-guard.py");
+        let runtime = std::fs::read_to_string(&runtime_path).map_err(|e| e.to_string());
+        out.extend(checks::shared_guard_matches_committed(COMMITTED_GUARD, runtime));
+    }
+
     out
 }
 

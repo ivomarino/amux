@@ -771,6 +771,74 @@ pub struct LaneReport {
 }
 
 // ---------------------------------------------------------------------------
+// 6. Shared-checkout git guard: does the running hook match its committed source?
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AMUX-3033): `~/.amux/hooks/git-shared-guard.py` — the PreToolUse
+/// Bash hook that gates git in shared checkouts on EVERY tool call, fleet-wide —
+/// was a 32KB runtime file with no source in the repo. It could not be reviewed,
+/// diffed, or rolled back; a bad edit changed git gating for every lane with no
+/// version trail; and "can't reproduce on the current file" could not tell an
+/// already-fixed guard from one that changed under us (the exact ambiguity that
+/// cost AMUX-3003 an hour, and that AF-27 lived through — three hypotheses died
+/// before a fired watch found the root).
+///
+/// INVARIANT: the guard actually running is byte-identical to the source
+/// committed at `scripts/git-hooks/git-shared-guard.py`, which install.sh
+/// installs from. A drift means someone hand-edited the runtime copy — the
+/// unreviewable, un-rollback-able state this card exists to make impossible —
+/// and now it self-announces in /api/health/invariants instead of hiding until
+/// the next incident that "can't reproduce".
+///
+/// `committed_src` is embedded in the binary at build time (`include_str!`), so
+/// the server always carries the canonical version and CI rebuilds catch a
+/// tampered committed copy too. Pure: it shas both sides, so a test drives it
+/// with plain strings. Unreadable (e.g. a single-tenant container that never
+/// installed the hook) is Unknown, not Fail — no environment branch, the check
+/// simply reports it could not reach a verdict there.
+pub fn shared_guard_matches_committed(
+    committed_src: &str,
+    runtime: Result<String, String>,
+) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.shared_guard_matches_committed";
+    let committed_sha = sha256_hex(committed_src.as_bytes());
+    match runtime {
+        Err(e) => vec![InvariantResult::unknown(
+            ID,
+            format!("runtime guard ~/.amux/hooks/git-shared-guard.py unreadable: {e}"),
+        )],
+        Ok(content) => {
+            let runtime_sha = sha256_hex(content.as_bytes());
+            if runtime_sha == committed_sha {
+                vec![InvariantResult::pass(ID)]
+            } else {
+                vec![InvariantResult::fail(
+                    ID,
+                    format!("runtime guard == committed sha {}", &committed_sha[..12]),
+                    format!(
+                        "runtime guard sha {} DRIFTED from scripts/git-hooks/git-shared-guard.py \
+                         — the fleet is running an unreviewed hand-edit. Reinstall from source \
+                         (install.sh) or fold the edit back into the committed copy.",
+                        &runtime_sha[..12]
+                    ),
+                )
+                .evidence(json!({
+                    "committed_sha": committed_sha,
+                    "runtime_sha": runtime_sha,
+                }))]
+            }
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -1195,5 +1263,25 @@ mod negative_controls {
         let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0) }];
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs[0].status, Status::Unknown, "too-small fleet must be Unknown: {rs:?}");
+    }
+
+    /// AMUX-3033: an identical runtime guard passes, a hand-edit is DETECTED as a
+    /// Fail (the whole point — an unreviewed fleet-wide edit must not hide), and
+    /// an unreadable runtime (a container that never installed it) is Unknown,
+    /// not a false pass.
+    #[test]
+    fn shared_guard_drift_is_detected() {
+        let committed = "#!/usr/bin/env python3\n# canonical guard source\n";
+        let same = shared_guard_matches_committed(committed, Ok(committed.to_string()));
+        assert_eq!(same[0].status, Status::Pass, "identical must pass: {same:?}");
+
+        let drifted =
+            shared_guard_matches_committed(committed, Ok(committed.to_string() + "# HAND EDIT\n"));
+        assert_eq!(drifted[0].status, Status::Fail, "a hand-edit must fail: {drifted:?}");
+        assert!(drifted[0].observed.contains("DRIFTED"), "{}", drifted[0].observed);
+
+        let missing =
+            shared_guard_matches_committed(committed, Err("No such file (os error 2)".into()));
+        assert_eq!(missing[0].status, Status::Unknown, "unreadable is Unknown not pass: {missing:?}");
     }
 }

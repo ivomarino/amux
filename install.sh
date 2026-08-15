@@ -131,6 +131,24 @@ if [[ -d "$SCRIPT_DIR/templates" ]]; then
   say "templates: $AMUX_HOME/templates ($(find "$AMUX_HOME/templates" -name template.json | wc -l | tr -d ' ') available)"
 fi
 
+# Shared-checkout git guard (AMUX-3033). The PreToolUse Bash hook runs
+# ~/.amux/hooks/git-shared-guard.py on EVERY Bash tool call across the fleet, so
+# it gates git in shared checkouts. It used to be an unversioned 32KB runtime
+# file: it could not be reviewed, diffed, or rolled back, and "can't reproduce on
+# the current file" could not tell already-fixed from changed-under-us. The source
+# now lives in the repo (scripts/git-hooks/) and is INSTALLED from there, so the
+# committed copy is authoritative. We record its sha256 alongside it; the server's
+# `hooks.shared_guard_matches_committed` invariant compares the running file against
+# the sha embedded in the binary and surfaces any drift in /api/health/invariants.
+if [[ -f "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" ]]; then
+  mkdir -p "$AMUX_HOME/hooks"
+  cp "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" "$AMUX_HOME/hooks/git-shared-guard.py"
+  chmod +x "$AMUX_HOME/hooks/git-shared-guard.py"
+  _guard_sha="$(shasum -a 256 "$AMUX_HOME/hooks/git-shared-guard.py" | cut -d' ' -f1)"
+  printf '%s  git-shared-guard.py\n' "$_guard_sha" > "$AMUX_HOME/hooks/git-shared-guard.py.sha256"
+  say "git guard: $AMUX_HOME/hooks/git-shared-guard.py (sha ${_guard_sha:0:12})"
+fi
+
 # ── 5. Service ──────────────────────────────────────────────────────────────
 if [[ "$OS" != "Darwin" ]]; then
   # Honest degrade: no launchd here, and pretending to manage systemd from a
