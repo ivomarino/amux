@@ -634,18 +634,40 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             let script = get_str("script").unwrap_or_default();
             match cdp.eval(&script, 30).await {
                 Ok(mut result) => {
+                    // AMUX-3062: an eval result over the cap was truncated with the
+                    // notice appended INTO the string while the envelope still read
+                    // {ok:true} — silent data loss that reads as success (amux-gtm
+                    // scraped a 10589-char page, got 23 of 34 records, and the run
+                    // would have passed review). Surface the cut in the ENVELOPE so
+                    // a run/reviewer detects it structurally, not by substring match.
+                    let mut cut: Option<(usize, usize)> = None; // (full_len, cap)
                     if let Some(s) = result.as_str() {
-                        result = json!(chrome::obs_cap(s, chrome::obs_eval_cap()));
+                        let cap = chrome::obs_eval_cap();
+                        cut = chrome::obs_truncation(s, cap).map(|full| (full, cap));
+                        result = json!(chrome::obs_cap(s, cap));
                     }
                     // `data.result` mirrors the browser-use CLI shape some
                     // dashboard readers still consume (viewport probe).
-                    Json(json!({
+                    let mut env = json!({
                         "ok": true,
                         "result": result,
                         "data": { "result": result },
                         "backend": "native",
-                    }))
-                    .into_response()
+                    });
+                    if let Some((full, cap)) = cut {
+                        // Two-fixes log signal: the next silent truncation is now
+                        // visible in the request log without comparing to a direct
+                        // fetch — grep "browser eval truncated".
+                        tracing::warn!(
+                            session = %session, full_length = full, cap,
+                            "browser eval truncated at the cap — {} chars past the cap are NOT in the result (AMUX-3062); envelope carries truncated=true",
+                            full - cap
+                        );
+                        env["truncated"] = json!(true);
+                        env["full_length"] = json!(full);
+                        env["eval_cap"] = json!(cap);
+                    }
+                    Json(env).into_response()
                 }
                 // Page exceptions AND transport failures both answer 400
                 // with the description — Python's eval contract.

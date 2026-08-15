@@ -1008,6 +1008,19 @@ pub fn obs_cap(text: &str, limit: usize) -> String {
     )
 }
 
+/// AMUX-3062: how much a cap will cut, for a STRUCTURED envelope signal. Returns
+/// `Some(full_char_len)` when `text` exceeds `limit`, `None` when it fits. The
+/// same predicate `obs_cap` truncates on (`chars > limit`), factored out so a
+/// caller can set `truncated: true` + the original length on the response.
+/// `obs_cap` appends a human notice INTO the string; that is easy to miss when
+/// the envelope still reads `{ok:true}`, which is exactly how a truncated eval
+/// read as success (a 10589-char page returned 23 of 34 records and would have
+/// passed review). This is the half a run or reviewer checks programmatically.
+pub fn obs_truncation(text: &str, limit: usize) -> Option<usize> {
+    let full = text.chars().count();
+    (full > limit).then_some(full)
+}
+
 // ---- driver JS blobs (ported from amux-server.py) -------------------------
 
 /// Python `_BROWSER_CAPTURE_JS` verbatim: idempotent page-side capture shim
@@ -1738,6 +1751,19 @@ mod tests {
         // Multibyte safety: a byte-index slice would panic here.
         let capped = obs_cap(&"é".repeat(50), 10);
         assert!(capped.contains("truncated at 10"), "{capped}");
+    }
+
+    /// AMUX-3062: the structured half. obs_truncation reports Some(full_len) on
+    /// the same predicate obs_cap truncates on, and None otherwise, so the eval
+    /// envelope can carry truncated=true + the original length instead of the
+    /// caller substring-matching the notice out of an {ok:true} result.
+    #[test]
+    fn obs_truncation_reports_the_original_length_only_when_it_cut() {
+        assert_eq!(obs_truncation("short", 100), None, "fits => no signal");
+        assert_eq!(obs_truncation(&"x".repeat(10), 10), None, "exactly at the cap is not truncated");
+        assert_eq!(obs_truncation(&"x".repeat(50), 10), Some(50), "over the cap => full length");
+        // Counts CHARS, matching obs_cap, so a multibyte page is not mis-measured.
+        assert_eq!(obs_truncation(&"é".repeat(50), 10), Some(50), "multibyte counted by char");
     }
 
     #[test]
