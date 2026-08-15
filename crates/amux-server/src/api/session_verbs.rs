@@ -5057,6 +5057,18 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             if !ollama_yolo && !opts.contains("--dangerously-bypass") && !opts.contains("--sandbox") && !opts.contains("-s ") {
                 opts += " --sandbox workspace-write";
             }
+            // The global ~/.codex/config.toml commonly sets
+            // model_reasoning_effort=xhigh, which HANGS local ollama models (they
+            // have no extended-thinking path — a worker sits "Working" forever,
+            // AH-81). Force low here so the SERVER launch path applies it. The
+            // OllamaAdapter (static_providers.rs, 3fc489c) already does this, but
+            // the launch goes through THIS arm, not the adapter's build_command —
+            // the adapter-vs-launch-arm drift the launch-matches-adapter invariant
+            // guards (AMUX-3155). Adding it here is what makes a dashboard- or
+            // (post-AMUX-3164 convergence) CLI-launched ollama worker responsive.
+            if !opts.contains("model_reasoning_effort") {
+                opts += " -c model_reasoning_effort=low";
+            }
             if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
                 if gr.status.success() {
                     let root = String::from_utf8_lossy(&gr.stdout).trim().to_string();

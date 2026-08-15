@@ -498,6 +498,33 @@ cmd_start() {
   esac
   [[ -d "$dir" ]] || die "directory not found: $dir"
 
+  # codex/ollama: DELEGATE the launch to the server (POST /api/sessions/<n>/start)
+  # instead of building the command + tmux session here (AMUX-3164). The server's
+  # start_session seeds codex dir-trust (~/.codex/config.toml, AC-356) AND forces
+  # model_reasoning_effort=low — neither of which this bash path does, so a
+  # CLI-launched codex/ollama worker otherwise hits the trust prompt and runs at
+  # xhigh (which hangs local models). Mirrors the herdr delegation above and
+  # collapses the two launch constructions into one (D6), so the server-side fixes
+  # cannot be skipped by whichever door a worker is started through. The server
+  # creates the session as amux-<name> (same name tmux_name produces) — we attach.
+  local _provider="${CC_PROVIDER:-claude}"
+  if [[ "$_provider" == "codex" || "$_provider" == "ollama" ]]; then
+    if $dry_run; then
+      echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server builds the codex command, seeds ~/.codex trust, and forces model_reasoning_effort=low)"
+      return
+    fi
+    if [[ $# -gt 0 ]]; then
+      echo "${YELLOW}note:${RESET} inline args after -- are not forwarded through server-side launch — set them in CC_FLAGS (the server reads it). Ignoring: $*" >&2
+    fi
+    _start_via_api "$name" || return 1
+    if $detach; then
+      echo "  ${DIM}detached — attach with: amux attach $name${RESET}"
+      return
+    fi
+    tmux attach-session -t "=$tname"
+    return
+  fi
+
   # Build command. Check CC_PROVIDER to pick codex vs claude.
   local provider="${CC_PROVIDER:-claude}"
   local cmd
