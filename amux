@@ -1190,6 +1190,34 @@ cmd_start_all() {
 # writes it depends on being attributed (found by the Claude/Gemini test pair
 # on ATC-1, reproduced fleet-wide on RH-* and GE-*). The honest path has to be
 # the easy path; a rule saying "remember the header" is not a fix.
+# Reject a FLAG sitting in the ISSUE-ID slot, for every board verb that takes one.
+#
+# Without this, `amux board <verb> --help` sent the flag as the id: PATCH
+# /api/board/--help, answered {"error":"item not found","id":"--help"}. The help
+# request was spent as a failed WRITE and the caller got a not-found for a card
+# they never named.
+#
+# I fixed this on 2026-08-14 (d7d5509) — for ONE verb. The log sweep the next day
+# still found --help rows, timestamped AFTER that commit, because the other TEN
+# id-taking verbs (needsyou, status, type, archive, reviewer, retitle, ask,
+# status-update, claim, progress) each parse the id themselves and none of them
+# checked. That commit claimed to guard "the CLASS, not the literal --help" and it
+# did — within a single case arm. The class was the VERBS.
+#
+# So the check lives in one function now, called from every site, which is the
+# only shape that cannot drift back apart.
+_board_id_guard() {
+  local verb="$1" id="$2"
+  case "$id" in
+    --help|-h|help)
+      echo "Usage: amux board $verb <ISSUE-ID> [...]  — run 'amux board' for the full list" >&2
+      exit 0 ;;
+    -*)
+      die "amux board $verb: '$id' looks like a flag, not an ISSUE-ID." ;;
+  esac
+}
+
+
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
@@ -1419,6 +1447,7 @@ cmd_board() {
       # additive tag (no clobber) + the question into the History, so Focus
       # mode and the card both show WHAT is needed, not just that it's stuck.
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> [\"the question / decision needed\"]"
+      _board_id_guard "needsyou" "$id"
       shift 2>/dev/null || true
       local ask="$*"
       # A FLAG IS NOT AN ASK. This verb takes free prose, so an unrecognised
@@ -1512,6 +1541,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       ;;
     status)
       local id="${1:-}"; local new_status="${2:-}";
+      _board_id_guard "status" "$id"
       [[ -n "$id" && -n "$new_status" ]] || die "Usage: amux board status <ISSUE-ID> <status> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]"
       # `archived` is a BOOLEAN FLAG, not a status column. Forwarding it verbatim
       # PATCHed {status:"archived"} and 400'd ("unknown status") ~22x/day from lanes
@@ -1537,6 +1567,7 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # Without this verb the only way to retype was raw curl, which is how the
       # attribution was being lost in the first place (AMUX-2325).
       local id="${1:-}"; local new_type="${2:-}"
+      _board_id_guard "type" "$id"
       if [[ -z "$id" || -z "$new_type" ]]; then
         # Ask the SERVER for the list instead of carrying a copy. The hardcoded one
         # had drifted: it advertised `task` and `decision` — both rejected — and
@@ -1575,6 +1606,7 @@ types: $_types"
       # ledger depends on not having.
       local _av=1; [[ "$subcmd" == "unarchive" ]] && _av=0
       local id="${1:-}"
+      _board_id_guard "archive" "$id"
       [[ -n "$id" ]] || die "Usage: amux board $sub <ISSUE-ID>
 archive   hides a card from every board view AND every autonomy loop (advance, pickup, rot)
 unarchive brings it back — this is the un-do that did not exist before AMUX-2492"
@@ -1602,6 +1634,7 @@ print(json.dumps(b))' \
       # argument that every gate-relevant FIELD needs an attributed setter, not
       # just the ones someone tripped over.
       local id="${1:-}"; local who="${2:-}"
+      _board_id_guard "reviewer" "$id"
       [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session>   (pass 'none' to clear)
 Sets the session whose sign-off is required for review -> done."
       [[ "$who" == "none" ]] && who=""
@@ -1627,6 +1660,7 @@ Sets the session whose sign-off is required for review -> done."
       # YOUR shell first, so `backticks` and $(...) in it are EXECUTED
       # (AMUX-1888) — and a rewritten title very often quotes code.
       local id="${1:-}"
+      _board_id_guard "retitle" "$id"
       [[ -n "$id" ]] || die "Usage: amux board retitle <ISSUE-ID> <title> | --stdin | --file <path>
        amux board retitle <ISSUE-ID> --desc-stdin      (rewrite the body instead)
 Rewrites a card's title (and/or desc) so it stands alone without the
@@ -1691,6 +1725,7 @@ print(json.dumps(b))' \
     ask|status-request)
       # Ask the owning worker to report a card's status onto the board.
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board ask <ISSUE-ID> [question]"
+      _board_id_guard "ask" "$id"
       shift 2>/dev/null || true
       local q="$*" body result
       body=$(Q="$q" python3 -c "import os,json;print(json.dumps({'question':os.environ['Q'].strip()}))")
@@ -1702,6 +1737,7 @@ print(json.dumps(b))' \
     status-update)
       # The owning session posts its status to the board (source of truth).
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board status-update <ISSUE-ID> \"<what's done, next, blockers>\""
+      _board_id_guard "status-update" "$id"
       shift 2>/dev/null || true
       local text="$*"
       if [[ "$text" == "--stdin" || "$text" == "-" ]]; then text=$(cat); fi
@@ -1719,6 +1755,7 @@ print(json.dumps(b))' \
       # Atomic claim (the assignment notifications tell every session to run
       # this — it fell through to help and exited 0 until AMUX-2140).
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board claim <ISSUE-ID>"
+      _board_id_guard "claim" "$id"
       local result
       result=$(curl -sk -X POST \
         -H 'Content-Type: application/json' \
@@ -1897,6 +1934,7 @@ print(f'Imported {created} task(s) from {repo}#{issue_num}')
     progress)
       # amux board progress <ID> "message" — append progress note + post GH comment if gh-linked
       local id="${1:-}"; shift 2>/dev/null || true
+      _board_id_guard "progress" "$id"
       # ACCEPT --stdin/--file, and NEVER take a bare flag as the message (AMUX-2515).
       #
       # `amux board needsyou` already refuses a leading --flag and its error text
