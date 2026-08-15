@@ -444,6 +444,22 @@ pub struct StartedBrowser {
     pub started_at: i64,
 }
 
+/// The tail of Chrome's launch stderr, formatted for an error message, or "" if
+/// the file is missing or empty. Turns "CDP never answered" from an opaque
+/// timeout into an actionable reason (a bad flag, a locked profile, no display).
+fn chrome_stderr_tail(path: &Path) -> String {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let n = s.chars().count();
+    let tail: String = s.chars().skip(n.saturating_sub(600)).collect();
+    format!(" (chrome stderr: {tail})")
+}
+
 /// Launch Chrome on a profile. Cleans stale locks first (amux-owned dirs
 /// only — see module docs), waits for the CDP HTTP endpoint to answer so a
 /// returned port is a WORKING port, and records the child for stop().
@@ -505,14 +521,41 @@ pub async fn start(
     if !url.trim().is_empty() {
         cmd.arg(url.trim());
     }
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn {}: {e}", binary.display()))?;
+    // Capture Chrome's stderr so a launch failure is DIAGNOSABLE. It used to go
+    // to /dev/null, so "CDP never answered" could not distinguish a crash (a bad
+    // flag, a locked profile, no display) from a slow start — the exact failure
+    // this wait exists to report. A file is non-blocking; its tail is read back
+    // into the error below.
+    let stderr_path = target.user_data_dir.join("amux-chrome-launch.stderr");
+    cmd.stdout(std::process::Stdio::null());
+    match std::fs::File::create(&stderr_path) {
+        Ok(f) => {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        Err(_) => {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn {}: {e}", binary.display()))?;
     let pid = child.id();
 
     // A port Chrome never bound is not a started browser; wait for CDP HTTP.
+    // Two failure modes, told apart because they need opposite responses:
+    //  - Chrome EXITED before CDP came up (crash): report the exit status and
+    //    the stderr tail IMMEDIATELY — waiting the full window for a dead
+    //    process is pointless and the exit reason is what the caller needs.
+    //  - Chrome is ALIVE but slow: a real logged-in profile on a busy machine
+    //    (a 50-lane fleet) routinely takes longer than the old 12s to open the
+    //    debugging port, so give a live Chrome up to 30s before giving up.
     let http = format!("http://127.0.0.1:{port}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!(
+                "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}",
+                chrome_stderr_tail(&stderr_path)
+            );
+        }
         match reqwest::Client::new()
             .get(format!("{http}/json/version"))
             .timeout(std::time::Duration::from_secs(1))
@@ -521,7 +564,10 @@ pub async fn start(
         {
             Ok(r) if r.status().is_success() => break,
             _ if std::time::Instant::now() > deadline => {
-                anyhow::bail!("Chrome spawned (pid {pid:?}) but CDP on port {port} never answered within 12s");
+                anyhow::bail!(
+                    "Chrome (pid {pid:?}) is running but CDP on port {port} never answered within 30s{}",
+                    chrome_stderr_tail(&stderr_path)
+                );
             }
             _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
         }
