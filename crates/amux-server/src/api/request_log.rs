@@ -324,7 +324,12 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
         match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => {
                 resp_bytes = Some(bytes.len() as i64);
-                let text = truncate_chars(&String::from_utf8_lossy(&bytes), ERROR_BODY_CHARS);
+                let enc = parts
+                    .headers
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let text = decoded_error_body(&bytes, enc);
                 (
                     Response::from_parts(parts, axum::body::Body::from(bytes)),
                     if text.is_empty() { None } else { Some(text) },
@@ -440,6 +445,69 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
     s.chars().take(max).collect()
 }
+
+/// Decode a captured error body for storage, honouring `Content-Encoding`.
+///
+/// INCIDENT (AF-57, found by the 2026-08-15 log sweep). This middleware is the
+/// OUTERMOST layer — deliberately, so it records the RAW path the client sent —
+/// which means it runs AFTER `CompressionLayer`, so for any client sending
+/// `Accept-Encoding: gzip` the bytes here are already gzipped. They were then
+/// put through `String::from_utf8_lossy` and stored, which does not merely make
+/// them unreadable: 875 of ~3.8KB became U+FFFD in the specimen, so `\x1f\x8b`
+/// is now `\x1f\xef\xbf\xbd` and the gzip stream is UNRECOVERABLE. The field
+/// exists so a 5xx can be diagnosed without a repro, and `/api/why` and autofix
+/// both read it; for every compressed error response all three got noise, and
+/// 2KB of destroyed bytes was written per row to hold it.
+///
+/// It hid because the failure is invisible from the producer's side and only
+/// SOMETIMES fires: a curl without `Accept-Encoding` stores perfect JSON, so the
+/// same endpoint reads fine or reads as mojibake depending on the client. Half
+/// the groups in that sweep were readable, which is exactly what makes the
+/// broken half look like a weird payload rather than a logging bug.
+///
+/// Every branch is honest: decode when we can, and when we cannot say SO in the
+/// stored text rather than writing bytes that merely look like data. A marker a
+/// reader can act on beats a plausible-looking string that is noise (ethos rule
+/// 4 — a wrong answer must be detectable from what we keep).
+fn decoded_error_body(bytes: &[u8], content_encoding: &str) -> String {
+    let enc = content_encoding.trim().to_ascii_lowercase();
+    let raw: std::borrow::Cow<'_, [u8]> = match enc.as_str() {
+        "" | "identity" => std::borrow::Cow::Borrowed(bytes),
+        "gzip" | "x-gzip" => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            match flate2::read::GzDecoder::new(bytes)
+                .take(ERROR_BODY_DECODE_LIMIT)
+                .read_to_end(&mut out)
+            {
+                Ok(_) => std::borrow::Cow::Owned(out),
+                // Truncated or corrupt stream: say which, rather than storing
+                // the compressed bytes and letting a reader think it is content.
+                Err(e) => {
+                    return format!(
+                        "<gzip error body could not be decoded: {e}; {} compressed bytes>",
+                        bytes.len()
+                    )
+                }
+            }
+        }
+        other => {
+            return format!(
+                "<error body is {other}-encoded and this build cannot decode it; \
+                 {} encoded bytes>",
+                bytes.len()
+            )
+        }
+    };
+    truncate_chars(&String::from_utf8_lossy(&raw), ERROR_BODY_CHARS)
+}
+
+/// Cap on DECOMPRESSED error-body bytes. A compressed body is an amplification
+/// vector — a few KB of gzip can expand to gigabytes — and this runs on every
+/// 4xx/5xx, so the bound is on the output, not the input. Generous next to
+/// `ERROR_BODY_CHARS` (2000) because truncation there should be what trims the
+/// text; this is the safety net, not the policy.
+const ERROR_BODY_DECODE_LIMIT: u64 = 1 << 20;
 
 /// Minimal %XX decoder for path segments (session names arrive encoded from
 /// the SPA). Invalid escapes pass through untouched.
@@ -1926,6 +1994,78 @@ mod tests {
             .unwrap();
         assert_eq!(err_body.chars().count(), ERROR_BODY_CHARS, "first 500 chars only");
         assert_eq!(resp_bytes, 10_000, "exact buffered size recorded");
+    }
+
+    /// AF-57. Built from the LIVE specimen, not a convenient one: a real 503
+    /// `/api/tts` row whose stored `error_body` began `1f ef bf bd` — gzip magic
+    /// already mangled by `from_utf8_lossy` — with 875 U+FFFD in ~3.8KB.
+    ///
+    /// The pre-fix assertion is the load-bearing one. It is not enough to show
+    /// the fix decodes; the point is that the OLD path destroyed the bytes
+    /// irreversibly, which is why this could not be diagnosed after the fact and
+    /// why no amount of care at read time would have recovered it.
+    #[test]
+    fn a_gzipped_error_body_is_decoded_not_stored_as_mangled_bytes() {
+        use std::io::{Read, Write};
+        // SIZED LIKE THE REAL ROW (2942 bytes), and that detail is load-bearing.
+        // The first fixture here was the one-line JSON below on its own; deflate
+        // emits a STORED block for input that small, so the text survived
+        // verbatim inside the "compressed" bytes and the assertion below failed.
+        // My own broken fixture was not broken — exactly the trap in ethos rule
+        // 7 about verifying the specimen you built yourself. A body that really
+        // compresses is what the incident had and what this needs.
+        let plain_short = br#"{"error":"CDP Page.captureScreenshot timed out after 30s"}"#;
+        let mut plain = Vec::new();
+        plain.extend_from_slice(br#"{"error":"CDP Page.captureScreenshot timed out after 30s","#);
+        plain.extend_from_slice(br#""detail":["#);
+        for i in 0..60 {
+            plain.extend_from_slice(
+                format!(r#"{{"frame":{i},"note":"chrome cdp target detached, retrying"}},"#)
+                    .as_bytes(),
+            );
+        }
+        plain.extend_from_slice(b"null]}");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&plain).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(&gz[..2], b"\x1f\x8b", "fixture really is gzip, not a paraphrase of one");
+        assert!(gz.len() < plain.len(), "fixture must ACTUALLY compress, not store literally");
+
+        // THE BUG, reproduced: the old code path, verbatim.
+        let old = truncate_chars(&String::from_utf8_lossy(&gz), ERROR_BODY_CHARS);
+        assert!(
+            old.contains('\u{FFFD}'),
+            "pre-fix specimen must actually be mangled or this test proves nothing"
+        );
+        assert!(
+            !old.contains("captureScreenshot"),
+            "pre-fix specimen must NOT contain the error text — that is the whole defect"
+        );
+        assert!(
+            flate2::read::GzDecoder::new(old.as_bytes()).read_to_end(&mut Vec::new()).is_err(),
+            "the lossy conversion must be IRREVERSIBLE — if this could be re-decoded, \
+             the incident would have been recoverable and the fix merely cosmetic"
+        );
+
+        // THE FIX.
+        let got = decoded_error_body(&gz, "gzip");
+        assert!(got.contains("captureScreenshot timed out"), "gzip body must decode: {got}");
+        assert!(!got.contains('\u{FFFD}'), "no replacement chars survive: {got}");
+
+        // Uncompressed still works — the guard must not have broken the 90% case.
+        assert!(decoded_error_body(plain_short, "").contains("captureScreenshot"));
+        assert!(decoded_error_body(plain_short, "identity").contains("captureScreenshot"));
+
+        // Honest failure beats plausible noise: an encoding we cannot decode,
+        // and a corrupt stream, both SAY so instead of storing bytes that read
+        // like content.
+        let br = decoded_error_body(&gz, "br");
+        assert!(br.contains("br-encoded") && br.contains("cannot decode"), "{br}");
+        let bad = decoded_error_body(b"\x1f\x8b\x08garbage-not-a-stream", "gzip");
+        assert!(bad.starts_with("<gzip error body could not be decoded"), "{bad}");
+
+        // Case-insensitive: hyper does not promise a canonical casing.
+        assert!(decoded_error_body(&gz, "GZIP").contains("captureScreenshot"));
     }
 
     #[tokio::test]

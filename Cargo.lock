@@ -113,6 +113,7 @@ dependencies = [
  "base64",
  "chrono",
  "cron",
+ "flate2",
  "futures",
  "hex",
  "hkdf",
