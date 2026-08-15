@@ -1340,6 +1340,59 @@ fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::
     std::fs::rename(&tmp, path)
 }
 
+/// Provider-shaped model -> env wiring for a newly created worker. Pure and
+/// unit-tested (ethos rule 7) so the rule cannot be re-derived subtly wrong at
+/// the call site, and matches env_config::render_worker_env so the create route
+/// and the env-apply route agree about one worker's model (ethos rule 4).
+///
+/// Returns `(cc_flags, cc_model, resolved_model)`:
+/// - Agent CLIs (claude/codex/gemini): the model rides in `cc_flags` as
+///   `--model X`; `cc_model` is empty. An empty caller model falls back to
+///   `default_model`.
+/// - Ollama: the model rides in `cc_model` (the ollama start arm reads CC_MODEL
+///   and never appends CC_FLAGS); `cc_flags` stays empty unless the caller sent
+///   explicit `flags`. `default_model` is NEVER applied — a local-model worker
+///   must not inherit the Claude default (AMUX-3182); an empty model lets the
+///   start path use the ollama default (qwen3.8:27b).
+///
+/// Explicit `flags` always win (AMUX-3114): honoured verbatim as `cc_flags`.
+/// `resolved_model` is what the create response echoes so a defaulted/unpinned
+/// model is visible at create time.
+fn worker_model_env(
+    provider: &str,
+    raw_model: &str,
+    explicit_flags: &str,
+    default_model: &str,
+) -> (String, String, String) {
+    let is_ollama = provider == "ollama";
+    let model = if is_ollama {
+        raw_model.to_string()
+    } else if raw_model.is_empty() {
+        default_model.to_string()
+    } else {
+        raw_model.to_string()
+    };
+    let cc_flags = if !explicit_flags.is_empty() {
+        explicit_flags.to_string()
+    } else if !is_ollama && !model.is_empty() {
+        format!("--model {model}")
+    } else {
+        String::new()
+    };
+    let cc_model = if is_ollama { model.clone() } else { String::new() };
+    let resolved_model = if is_ollama {
+        model
+    } else {
+        cc_flags
+            .split_whitespace()
+            .skip_while(|t| *t != "--model")
+            .nth(1)
+            .unwrap_or("")
+            .to_string()
+    };
+    (cc_flags, cc_model, resolved_model)
+}
+
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
     body: Option<Json<serde_json::Value>>,
@@ -1402,41 +1455,23 @@ pub async fn create_session_legacy(
         let p = s("provider");
         if p.is_empty() { "claude".to_string() } else { p }
     };
-    // The configured default model, the same value the create dialog shows —
-    // read from the same place the bootstrap injection reads it, so the
-    // dialog and the file it produces cannot disagree.
-    let model = {
-        let m = s("model");
-        if m.is_empty() {
-            crate::api::settings::get_default_model(&amux_home())
-        } else {
-            m
-        }
-    };
-    // FLAGS win over MODEL, and MODEL over the configured default (AMUX-3114).
-    // The body may send `flags` (the full CC_FLAGS string, e.g. "--model opus
-    // --dangerously-skip-permissions"); it used to be IGNORED and overwritten
-    // with "--model <default>", so a worker the caller built as opus silently ran
-    // the default model (gtm-engine, 2026-08-14). Honour flags verbatim when
-    // given, else derive from `model`, else the configured default.
+    // Provider-shaped model -> env wiring, factored into worker_model_env so the
+    // rule is unit-tested (ethos rule 7) instead of re-derived here, and cannot
+    // silently drift from the ollama start path that reads it. In short: agent
+    // CLIs pin `--model` in CC_FLAGS; ollama's model is CC_MODEL (the start arm
+    // reads CC_MODEL and never appends CC_FLAGS); the Claude default model never
+    // touches a local-model worker. Before this, an ollama worker created here
+    // got CC_FLAGS="--model <claude-default>" and no CC_MODEL, so it silently ran
+    // qwen3.8:27b while its row displayed a Claude model and any non-default
+    // local model the caller picked was dropped (AMUX-3182).
     let explicit_flags = s("flags");
-    let cc_flags = if !explicit_flags.is_empty() {
-        explicit_flags
-    } else if !model.is_empty() {
-        format!("--model {model}")
-    } else {
-        String::new()
-    };
-    // The RESOLVED model, echoed in the response so a defaulted or unpinned model
-    // is visible at create time, not only via a later GET. "" means no --model is
-    // pinned (the worker takes the ambient default, the gap the skip-perms
-    // workers are invisible in, gtm-engine).
-    let resolved_model = cc_flags
-        .split_whitespace()
-        .skip_while(|t| *t != "--model")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let default_model = crate::api::settings::get_default_model(&amux_home());
+    let (cc_flags, cc_model, resolved_model) = worker_model_env(
+        &provider,
+        s("model").trim(),
+        explicit_flags.trim(),
+        &default_model,
+    );
     let mut pairs: Vec<(&str, String)> = vec![("CC_DIR", dir.clone())];
     let creator = s("creator");
     if !creator.is_empty() {
@@ -1444,6 +1479,9 @@ pub async fn create_session_legacy(
     }
     if provider != "claude" {
         pairs.push(("CC_PROVIDER", provider.clone()));
+    }
+    if !cc_model.is_empty() {
+        pairs.push(("CC_MODEL", cc_model.clone()));
     }
     if !cc_flags.is_empty() {
         pairs.push(("CC_FLAGS", cc_flags.clone()));
@@ -2185,6 +2223,49 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-3182: the create modal could not honestly make an ollama worker.
+    /// An ollama worker's model must land in CC_MODEL (the start arm reads it),
+    /// never as `--model` in CC_FLAGS, and the CLAUDE default model must never
+    /// be applied to a local-model worker. Each assertion carries a positive
+    /// control on the SAME inputs so a vacuous pass is impossible (ethos rule 7).
+    #[test]
+    fn worker_model_env_wires_ollama_to_cc_model_not_flags() {
+        // Ollama + a chosen model -> CC_MODEL, and NO --model in CC_FLAGS.
+        let (flags, model, resolved) = worker_model_env("ollama", "qwen3.8:27b", "", "opus");
+        assert_eq!(model, "qwen3.8:27b", "ollama model must be CC_MODEL");
+        assert!(flags.is_empty(), "ollama must not put --model in CC_FLAGS, got {flags:?}");
+        assert!(!flags.contains("--model"), "ollama CC_FLAGS must never carry --model");
+        assert_eq!(resolved, "qwen3.8:27b", "resolved model echoed to the response");
+        // POSITIVE CONTROL: identical inputs, codex provider -> the model DOES
+        // ride in CC_FLAGS as --model and CC_MODEL is empty. Proves the ollama
+        // branch actually diverges rather than the assertions being vacuous.
+        let (cflags, cmodel, cresolved) = worker_model_env("codex", "qwen3.8:27b", "", "opus");
+        assert_eq!(cflags, "--model qwen3.8:27b");
+        assert!(cmodel.is_empty(), "agent CLIs have no CC_MODEL");
+        assert_eq!(cresolved, "qwen3.8:27b");
+
+        // Ollama + NO model -> CC_MODEL empty (start uses the ollama default),
+        // and the CLAUDE default ("opus") must appear NOWHERE. This is the exact
+        // incident: pre-fix this produced CC_FLAGS="--model opus".
+        let (flags2, model2, resolved2) = worker_model_env("ollama", "", "", "opus");
+        assert!(model2.is_empty(), "no claude default in CC_MODEL for ollama");
+        assert!(flags2.is_empty(), "no claude default in CC_FLAGS for ollama");
+        assert!(!flags2.contains("opus") && resolved2 != "opus", "claude default leaked to an ollama worker");
+        // POSITIVE CONTROL: claude + no model DOES apply the default.
+        let (dflags, dmodel, _) = worker_model_env("claude", "", "", "opus");
+        assert_eq!(dflags, "--model opus", "claude default must apply to a claude worker");
+        assert!(dmodel.is_empty());
+
+        // Ollama + a NON-default local model is honoured, not dropped.
+        let (_, model3, _) = worker_model_env("ollama", "qwen2.5vl:7b", "", "opus");
+        assert_eq!(model3, "qwen2.5vl:7b", "a non-default ollama model pick must be kept");
+
+        // Explicit flags win for both, and ollama keeps its model in CC_MODEL.
+        let (eflags, emodel, _) = worker_model_env("ollama", "qwen3.8:27b", "--sandbox danger", "opus");
+        assert_eq!(eflags, "--sandbox danger", "explicit flags honoured verbatim (AMUX-3114)");
+        assert_eq!(emodel, "qwen3.8:27b", "ollama model stays in CC_MODEL alongside explicit flags");
+    }
 
     /// The 2026-08-13 "task names are out of date" bug: a stale, UNSTAMPED
     /// `task_summary` ("Luke's Wilderness Tales" on the Obsidian lane) outranked

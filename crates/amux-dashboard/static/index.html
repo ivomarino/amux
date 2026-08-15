@@ -1811,7 +1811,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button type="button" id="create-provider-claude" class="btn provider-btn selected" onclick="_selectProvider('claude')">Claude Code</button>
         <button type="button" id="create-provider-codex" class="btn provider-btn" onclick="_selectProvider('codex')">Codex</button>
         <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')">Gemini</button>
+        <button type="button" id="create-provider-ollama" class="btn provider-btn" onclick="_selectProvider('ollama')">Ollama</button>
       </div>
+    </div>
+    <div class="field-group" id="create-ollama-model-field" style="display:none;">
+      <label class="field-label">Local model</label>
+      <select id="create-ollama-model" style="width:100%;min-height:44px;"><option value="">Loading local models…</option></select>
     </div>
     <div class="field-group">
       <label class="field-label">Working directory</label>

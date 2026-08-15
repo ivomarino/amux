@@ -5046,6 +5046,23 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 let m = cfg.get_or("CC_MODEL", "").trim().to_string();
                 if m.is_empty() { default_model_for_provider("ollama") } else { m }
             };
+            // An ollama worker's model belongs in CC_MODEL (read just above); a
+            // `--model` in CC_FLAGS is a mis-wire — this arm launches with
+            // CC_MODEL and never appends CC_FLAGS, so the stray flag is silently
+            // ignored and the worker runs a DIFFERENT model than a CC_FLAGS-based
+            // view (its own row) reports. That is exactly the create-path bug
+            // AMUX-3182 fixed; WARN here so any residual mis-wired worker (made
+            // before the fix, or by a future path that reintroduces it) SELF-
+            // ANNOUNCES in the server log and a sweep of /api/logs finds it,
+            // rather than staying invisible (the two-fixes rule).
+            if flags.contains("--model") {
+                tracing::warn!(
+                    session = %name,
+                    cc_flags = %flags,
+                    cc_model = %model,
+                    "ollama worker carries a stray --model in CC_FLAGS (ignored; model comes from CC_MODEL) — mis-wired create path, see AMUX-3182"
+                );
+            }
             let ollama_yolo = PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f));
             let mut opts = format!(" --oss --local-provider ollama --model {}", sh_quote(&model));
             if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {

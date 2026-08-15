@@ -7619,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.649';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.650';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15773,17 +15773,57 @@ function _selectProvider(p) {
   document.getElementById('create-provider-claude').classList.toggle('selected', p === 'claude');
   document.getElementById('create-provider-codex').classList.toggle('selected', p === 'codex');
   document.getElementById('create-provider-gemini').classList.toggle('selected', p === 'gemini');
+  const _ollamaBtn = document.getElementById('create-provider-ollama');
+  if (_ollamaBtn) _ollamaBtn.classList.toggle('selected', p === 'ollama');
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude ? '' : 'none';
   document.getElementById('create-worktree-field').style.display = isClaude && _createDirIsGit ? '' : 'none';
   document.getElementById('create-template-field').style.display = isClaude ? '' : 'none';
+  // Ollama runs `codex --oss --local-provider ollama --model <model>` — the ONLY
+  // provider that needs a model chosen at create time (the others default), so
+  // surface the installed-model picker here rather than making the user create
+  // then edit. Missing this option was why an ollama worker could not be made
+  // from the create modal at all (AMUX-3182).
+  const _omField = document.getElementById('create-ollama-model-field');
+  if (_omField) {
+    _omField.style.display = p === 'ollama' ? '' : 'none';
+    if (p === 'ollama') _loadOllamaModelsForCreate();
+  }
+}
+// Populate the create modal's local-model picker from the same endpoint the
+// edit-provider menu uses. Re-fetched on each select so a freshly `ollama pull`ed
+// model appears without a page reload; prefers a qwen build (the box default).
+function _loadOllamaModelsForCreate() {
+  const sel = document.getElementById('create-ollama-model');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">Loading local models…</option>';
+  fetch(API + '/api/ollama/models', { headers: _authHeaders() })
+    .then(r => r.json())
+    .then(d => {
+      const mlist = d.models || [];
+      sel.innerHTML = '';
+      if (!mlist.length) {
+        const o = document.createElement('option');
+        o.value = ''; o.textContent = 'No local models — run: ollama pull qwen3.8:27b';
+        sel.appendChild(o);
+        return;
+      }
+      mlist.forEach(name => { const o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o); });
+      const qwen = mlist.find(m => m.toLowerCase().includes('qwen'));
+      sel.value = qwen || mlist[0];
+    })
+    .catch(() => { sel.innerHTML = '<option value="">Could not reach Ollama</option>'; });
 }
 function openCreate() {
   _createProvider = 'claude';
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
+  const _ollamaBtn0 = document.getElementById('create-provider-ollama');
+  if (_ollamaBtn0) _ollamaBtn0.classList.remove('selected');
+  const _omField0 = document.getElementById('create-ollama-model-field');
+  if (_omField0) _omField0.style.display = 'none';
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = '';
   document.getElementById('create-template-field').style.display = '';
   document.getElementById('create-name').value = '';
@@ -16034,6 +16074,14 @@ async function submitCreate() {
   // open to fix — apiCall would pop a generic "Error: 409" with the form gone.
   const createBody = { name, dir, creator: _getDeviceName() };
   if (_createProvider !== 'claude') createBody.provider = _createProvider;
+  // Ollama needs its model chosen now — the server routes it to CC_MODEL and
+  // builds `--model` at launch. Without it the create path defaulted to the
+  // CLAUDE default model, mislabelling the worker (AMUX-3182).
+  if (_createProvider === 'ollama') {
+    const _om = document.getElementById('create-ollama-model');
+    const _m = _om && _om.value ? _om.value.trim() : '';
+    if (_m) createBody.model = _m;
+  }
   if (worktreeEnabled) createBody.worktree = true;
   let r;
   try {
