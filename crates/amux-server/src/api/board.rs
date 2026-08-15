@@ -118,6 +118,8 @@ async fn get_contract() -> Response {
                              any other value (0, false, …) = non-archived only",
                 "done_limit": "cap on TERMINAL items (done/verified/discarded), keeping the \
                                most recently updated. 0 or negative = uncapped",
+                "all": "1|true|yes = uncap the terminal set (equivalent to done_limit=0) — the \
+                        complete enumeration; use this or ?status=<s> to defeat the render cap",
                 "limit": "page size, applied AFTER done_limit",
                 "offset": "page offset",
                 "slim": "1 = trimmed item bodies",
