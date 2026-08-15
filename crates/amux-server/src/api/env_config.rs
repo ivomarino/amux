@@ -421,6 +421,22 @@ async fn apply(
                 .collect()
         })
         .unwrap_or_else(|| vec![false; spec.messages.len()]);
+    // Workers THIS apply is creating (sanitized names). A message skipped
+    // because its recipient is one of these is not a mystery — it is the
+    // worker-model duality (D6, AC-353): the worker exists as a `.env` but is
+    // not started, so it is not in `_amux_workers` yet. The actionable answer is
+    // NOT to change resolution, it is a DIFFERENT primitive: a new worker's
+    // kickoff task is its `prompt:` field (steered on create, delivered when the
+    // lane starts — see worker_prompts above), while the `messages` stanza seeds
+    // an inbox for recipients that exist NOW ("human", a group, a running lane).
+    // So the skip redirects the author to the tool that actually does what they
+    // meant, rather than reporting a bare "not found".
+    let spec_worker_names: std::collections::HashSet<String> = spec
+        .workers
+        .iter()
+        .map(|w| sanitize(&w.name))
+        .filter(|n| !n.is_empty())
+        .collect();
     for (m, resolves) in spec.messages.iter().zip(&msg_resolves) {
         let (to, text) = (m.to.trim(), m.text.trim());
         if to.is_empty() || text.is_empty() {
@@ -430,14 +446,27 @@ async fn apply(
         if *resolves {
             report.push(json!({"kind": "message", "to": to, "action": "create"}));
         } else {
-            report.push(json!({"kind": "message", "to": to, "action": "skipped",
-                "detail": "recipient not found in worker registry — a .env worker is message-addressable only once started; \"human\", a group, or a running worker resolve"}));
+            let own_new_worker = spec_worker_names.contains(&sanitize(to));
+            let detail = if own_new_worker {
+                "recipient is a worker THIS env creates but has not started, so it is not message-addressable yet (worker-model duality D6). For a new worker's kickoff task, set its `prompt:` field — it is steered on create and delivered when the lane starts. The `messages` stanza seeds inboxes for recipients that exist now (\"human\", a group, or a running worker)."
+            } else {
+                "recipient not found in worker registry — a .env worker is message-addressable only once started; \"human\", a group, or a running worker resolve"
+            };
+            report.push(json!({"kind": "message", "to": to, "action": "skipped", "detail": detail,
+                "fix": if own_new_worker { "use worker.prompt" } else { "check recipient" }}));
             // Log signal (every-fix-needs-a-log-signal): the NEXT dropped
             // env-apply message self-announces in server-rs.log, so a sweep
-            // catches the worker-model gap without a human noticing first.
+            // catches the worker-model gap without a human noticing first. The
+            // own-new-worker case is named distinctly so a sweep can tell a
+            // "should have used prompt:" author error from a genuine typo.
             if !dry {
-                tracing::warn!(target: "env_apply", to = %to,
-                    "env-apply message skipped: recipient not in _amux_workers (worker-model duality D6)");
+                if own_new_worker {
+                    tracing::warn!(target: "env_apply", to = %to,
+                        "env-apply message skipped: recipient is a worker this env creates but has not started — use its `prompt:` field for the kickoff (worker-model duality D6, AC-353)");
+                } else {
+                    tracing::warn!(target: "env_apply", to = %to,
+                        "env-apply message skipped: recipient not in _amux_workers (worker-model duality D6)");
+                }
             }
         }
     }
