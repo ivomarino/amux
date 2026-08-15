@@ -149,6 +149,28 @@ if [[ -f "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" ]]; then
   say "git guard: $AMUX_HOME/hooks/git-shared-guard.py (sha ${_guard_sha:0:12})"
 fi
 
+# State-report hook (AMUX-2936), installed from the repo for the same reason as
+# the guard above: it was an unversioned runtime file, and unversioned runtime
+# files fork. There were already THREE spellings of "report state to amux" on
+# this machine — an inline one-liner in settings.json, ~/.amux/hooks/amux-report.sh,
+# and this script — and settings.json pointed at the POOREST of them, so model and
+# token reporting silently regressed to nothing and auto-compact lost its only
+# input. That is the failure amux-report.sh header already warned about in
+# 2026-08-11 ("two implementations of one thing is what produced this bug; do not
+# re-fork it"), recurring because nothing made the canonical copy authoritative.
+#
+# It reports state + model + tokens + the lane conversation id. The last one is
+# what lets the staged-commit guard resolve a lane transcript at all; without it
+# a lane is BLIND, which is the one class where a commit absorbing another
+# session work passes silently.
+if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
+  cp "$SCRIPT_DIR/scripts/hooks/hook-report.sh" "$AMUX_HOME/hook-report.sh"
+  chmod +x "$AMUX_HOME/hook-report.sh"
+  _rep_sha="$(shasum -a 256 "$AMUX_HOME/hook-report.sh" | cut -d' ' -f1)"
+  printf '%s  hook-report.sh\n' "$_rep_sha" > "$AMUX_HOME/hook-report.sh.sha256"
+  say "report hook: $AMUX_HOME/hook-report.sh (sha ${_rep_sha:0:12})"
+fi
+
 # ── 5. Service ──────────────────────────────────────────────────────────────
 if [[ "$OS" != "Darwin" ]]; then
   # Honest degrade: no launchd here, and pretending to manage systemd from a
