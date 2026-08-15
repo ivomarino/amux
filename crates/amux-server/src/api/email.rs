@@ -76,6 +76,62 @@ fn hdr_worker(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Which Gmail accounts this lane is scoped to, or `None` for "unrestricted"
+/// (AMUX-3103).
+///
+/// Resolved through `scoped_setting_in`, so `AMUX_GMAIL_ACCOUNTS` obeys the same
+/// global -> group -> worker precedence as every other scoped setting: set it once
+/// on the `mixpeek` group, override it on one worker, and the worker wins. That
+/// is the whole connector-scoping mechanism — a connector is a composition of
+/// env + scope, not a new subsystem (docs/design/connectors.md).
+///
+/// ABSENT MEANS UNRESTRICTED, deliberately. A connector that denied by default
+/// would break every lane that sends mail today the moment this shipped, and a
+/// guard that has to be rolled out atomically with its policy is a guard people
+/// disable. Presence of configuration is the switch, per the single-codebase
+/// rule — no build flag, no IS_SCOPED branch.
+fn gmail_scope_allowed(home: &std::path::Path, lane: &str) -> Option<Vec<String>> {
+    let raw = crate::api::session_verbs::scoped_setting_in(home, lane, "AMUX_GMAIL_ACCOUNTS")?;
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// The UNHAPPY PATH Ethan named as the acceptance test: a lane asking to send as
+/// an account it is not scoped to must be DENIED, and told what it may use.
+///
+/// Returns the refusal body, or `None` to allow. Also resolves the empty-`from`
+/// case: an unscoped lane keeps the historical default, a scoped lane defaults to
+/// its FIRST allowed account rather than to a global default it may not hold —
+/// otherwise "scoped to the personal account" would still send as ethan@ whenever
+/// `from` was omitted, which is the same bug wearing a default.
+fn gmail_scope_check(home: &std::path::Path, lane: &str, from: &str) -> Result<Option<String>, Value> {
+    let Some(allowed) = gmail_scope_allowed(home, lane) else {
+        return Ok(None); // unrestricted: caller's `from` stands
+    };
+    if from.is_empty() {
+        return Ok(Some(allowed[0].clone()));
+    }
+    if allowed.iter().any(|a| a.eq_ignore_ascii_case(from)) {
+        return Ok(None);
+    }
+    Err(json!({
+        "error": format!(
+            "worker '{lane}' is not scoped to send as {from} — allowed: {}",
+            allowed.join(", ")
+        ),
+        "blocked": "connector_scope",
+        "connector": "gmail",
+        "worker": lane,
+        "requested": from,
+        "allowed": allowed,
+        "how_to_change": "set AMUX_GMAIL_ACCOUNTS at global/group/worker scope (worker wins)",
+    }))
+}
+
 fn body_str(body: &Value, k: &str) -> String {
     body.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string()
 }
@@ -179,7 +235,18 @@ pub async fn send(
     let subject = body_str(&body, "subject");
     let message = body_str(&body, "body");
     let cc = body_str(&body, "cc");
-    let from_acct = body_str(&body, "from");
+    let mut from_acct = body_str(&body, "from");
+    // CONNECTOR SCOPE (AMUX-3103): enforced before anything is sent, and keyed on
+    // the SERVER-VERIFIED caller header rather than anything in the body — a lane
+    // must not be able to widen its own scope by claiming a different worker
+    // (AMUX-1768 is the same principle for message provenance).
+    if let Some(lane) = hdr_worker(&headers) {
+        match gmail_scope_check(&crate::api::session_verbs::home(), &lane, &from_acct) {
+            Err(denial) => return err(StatusCode::FORBIDDEN, denial),
+            Ok(Some(defaulted)) => from_acct = defaulted,
+            Ok(None) => {}
+        }
+    }
     if to.is_empty() || subject.is_empty() || message.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -584,6 +651,89 @@ pub async fn send_log(
 
 #[cfg(test)]
 mod tests {
+    // ---- AMUX-3103: the connector-scope eval -----------------------------
+    //
+    // Ethan's acceptance for the whole connectors block is "verify/validate
+    // access in UNHAPPY paths", so these are written as the acceptance test and
+    // not as an afterthought. Each one is a path that must DENY, plus the happy
+    // path beside it — a deny-everything bug and a deny-nothing bug look
+    // identical if you only test one side.
+    fn scope_home(layers: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("env")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        for (level, name, body) in layers {
+            let p = match *level {
+                "global" => dir.path().join("amux.env"),
+                "group" => dir.path().join("env").join(format!("{name}.env")),
+                _ => dir.path().join("sessions").join(format!("{name}.env")),
+            };
+            std::fs::write(p, body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn unscoped_lane_is_unrestricted_so_nothing_breaks_on_rollout() {
+        let d = scope_home(&[("worker", "w", "CC_TAGS=gtm\n")]);
+        // No AMUX_GMAIL_ACCOUNTS anywhere: the caller's `from` stands untouched.
+        assert!(matches!(gmail_scope_check(d.path(), "w", "anyone@example.com"), Ok(None)));
+    }
+
+    #[test]
+    fn wrong_account_is_denied_and_told_what_it_may_use() {
+        let d = scope_home(&[("worker", "w", "AMUX_GMAIL_ACCOUNTS=personal@gmail.com\n")]);
+        let denial = gmail_scope_check(d.path(), "w", "ethan@mixpeek.com")
+            .expect_err("a lane scoped to personal MUST NOT send as ethan@mixpeek.com");
+        assert_eq!(denial["blocked"], "connector_scope");
+        assert_eq!(denial["requested"], "ethan@mixpeek.com");
+        // The refusal must be actionable: naming the allowed set is what stops
+        // the caller retrying the same thing (the AMUX-2325 lesson).
+        assert!(denial["error"].as_str().unwrap().contains("personal@gmail.com"));
+        assert!(denial["how_to_change"].as_str().unwrap().contains("AMUX_GMAIL_ACCOUNTS"));
+    }
+
+    #[test]
+    fn right_account_is_allowed_case_insensitively() {
+        let d = scope_home(&[("worker", "w", "AMUX_GMAIL_ACCOUNTS=info@mixpeek.com,ethan@mixpeek.com\n")]);
+        assert!(matches!(gmail_scope_check(d.path(), "w", "ethan@mixpeek.com"), Ok(None)));
+        // Addresses are case-insensitive; a scope that rejected Ethan@ would be a
+        // deny-the-right-account bug, which is the failure users report as broken.
+        assert!(matches!(gmail_scope_check(d.path(), "w", "Ethan@Mixpeek.com"), Ok(None)));
+    }
+
+    #[test]
+    fn omitted_from_defaults_into_scope_not_to_the_global_default() {
+        // The subtle one. Without this, a lane scoped to the personal account
+        // still sends as ethan@mixpeek.com whenever `from` is omitted, because
+        // the handler's historical default fires — scoped in name only.
+        let d = scope_home(&[("worker", "w", "AMUX_GMAIL_ACCOUNTS=personal@gmail.com\n")]);
+        match gmail_scope_check(d.path(), "w", "") {
+            Ok(Some(defaulted)) => assert_eq!(defaulted, "personal@gmail.com"),
+            other => panic!("expected the scoped default, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_scope_overrides_group_scope() {
+        // Ethan's actual layout: the mixpeek GROUP gets the work accounts, one
+        // worker is moved to the personal account. This is the end-to-end proof
+        // that connector scope rides the global->group->worker layers rather
+        // than being a second mechanism.
+        let d = scope_home(&[
+            ("global", "", "AMUX_GMAIL_ACCOUNTS=info@mixpeek.com\n"),
+            ("group", "mixpeek", "AMUX_GMAIL_ACCOUNTS=info@mixpeek.com,ethan@mixpeek.com\n"),
+            ("worker", "refresh-house", "CC_TAGS=mixpeek\nAMUX_GMAIL_ACCOUNTS=personal@gmail.com\n"),
+            ("worker", "backend", "CC_TAGS=mixpeek\n"),
+        ]);
+        // worker layer wins for the overridden lane
+        assert!(gmail_scope_check(d.path(), "refresh-house", "ethan@mixpeek.com").is_err());
+        assert!(matches!(gmail_scope_check(d.path(), "refresh-house", "personal@gmail.com"), Ok(None)));
+        // a lane with no worker override inherits the GROUP layer, not global
+        assert!(matches!(gmail_scope_check(d.path(), "backend", "ethan@mixpeek.com"), Ok(None)));
+        assert!(gmail_scope_check(d.path(), "backend", "personal@gmail.com").is_err());
+    }
+
     use super::*;
     use crate::db::Store;
     use crate::integrations::email::HttpTransport;
