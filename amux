@@ -553,6 +553,9 @@ cmd_start() {
       [[ "$cmd" == *"--model"* || "$cmd" == *"-m "* ]] || cmd="$cmd --model gpt-5.5"
     fi
     [[ "$cmd" == *"--full-auto"* || "$cmd" == *"--dangerously-bypass"* || "$cmd" == *"-a "* ]] || cmd="$cmd -a never"
+    # codex defaults to read-only sandbox; workers need workspace-write to edit files.
+    # Mirrors session_verbs.rs:4946 and OllamaAdapter::build_command (AH-82 / bb14642).
+    [[ "$cmd" == *"--dangerously-bypass"* || "$cmd" == *"--sandbox"* || "$cmd" == *"-s "* ]] || cmd="$cmd --sandbox workspace-write"
     if [[ "$cmd" != *"--add-dir"* ]]; then
       local git_root
       git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || true
