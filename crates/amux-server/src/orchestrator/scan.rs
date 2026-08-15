@@ -591,7 +591,7 @@ mod tests {
             vec![Arc::new(ScriptedBackend {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
-                native: native("amux-herdr-other", "idle"),
+                native: native("amux-herdr-unrelated", "idle"),
             })],
             Some(Arc::new(MockProtocol::new())),
         );
