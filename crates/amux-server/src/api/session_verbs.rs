@@ -2241,8 +2241,8 @@ fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "codex" => "gpt-5.5".into(),
         "gemini" => "auto".into(),
-        // Ollama is `ollama run <model>`; the model is a positional argv, so a
-        // launchable default must exist here (this box has qwen3.8:27b pulled).
+        // Ollama runs via `codex --oss --local-provider ollama --model <model>`.
+        // A launchable default is required (this box has qwen3.8:27b pulled).
         "ollama" => "qwen3.8:27b".into(),
         _ => get_default_model(),
     }
@@ -4926,18 +4926,33 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             }
         }
         "ollama" => {
-            // Ollama is a bare local model REPL — `ollama run <model>`. No agent
-            // flags, no resume, no sandbox, no MCP; the model name is the only
-            // argv it needs (OllamaAdapter docstring). Model precedence: the
-            // worker's CC_MODEL, else the provider default (qwen3.8:27b). We
-            // append NO trailing prompt on purpose: `ollama run <model>` with no
-            // prompt opens the interactive REPL a long-lived worker needs, while
-            // a trailing arg is taken as a one-shot and exits immediately.
+            // Ollama workers run through `codex --oss --local-provider ollama`
+            // so they get a full coding agent (file editing, hooks, structured
+            // events) instead of a bare `ollama run` REPL. (RR-0043 / AMUX-3153)
+            // Model comes from CC_MODEL (env_config.rs routes the worker's model
+            // field there); falls back to the provider default (qwen3.8:27b).
             let model = {
                 let m = cfg.get_or("CC_MODEL", "").trim().to_string();
                 if m.is_empty() { default_model_for_provider("ollama") } else { m }
             };
-            format!("ollama run {}", sh_quote(&model))
+            let ollama_yolo = PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f));
+            let mut opts = format!(" --oss --local-provider ollama --model {}", sh_quote(&model));
+            if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {
+                opts += if ollama_yolo { " --dangerously-bypass-approvals-and-sandbox" } else { " -a never" };
+            }
+            if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
+                if gr.status.success() {
+                    let root = String::from_utf8_lossy(&gr.stdout).trim().to_string();
+                    if root != work_dir && !opts.contains(&root) {
+                        opts += &format!(" --add-dir {}", sh_quote(&root));
+                    }
+                    let git_dir = format!("{root}/.git");
+                    if Path::new(&git_dir).is_dir() && !opts.contains(&git_dir) {
+                        opts += &format!(" --add-dir {}", sh_quote(&git_dir));
+                    }
+                }
+            }
+            format!("codex{opts}")
         }
         _ => build_claude_cmd(&cfg, &flags, &default_flags, &session_flag, extra_flags),
     };

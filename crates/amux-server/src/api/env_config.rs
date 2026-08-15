@@ -746,10 +746,10 @@ fn render_worker_env(w: &WorkerSpec) -> String {
     }
     if !w.model.is_empty() {
         // Model wiring is provider-shaped. Agent CLIs (claude/codex/gemini) take
-        // `--model X` as a flag, so it rides in CC_FLAGS. Ollama is
-        // `ollama run <model>` — the model is a POSITIONAL the launcher reads
-        // from CC_MODEL; writing `--model` into CC_FLAGS would corrupt its argv
-        // (`ollama run <default> --model X` is not a valid invocation).
+        // `--model X` as a flag so it rides in CC_FLAGS. Ollama is launched via
+        // `codex --oss --local-provider ollama --model <model>`; the model name
+        // lives in CC_MODEL and session_verbs.rs builds the `--model` flag from
+        // it, so we keep writing CC_MODEL here rather than injecting into CC_FLAGS.
         if provider == "ollama" {
             pairs.push(("CC_MODEL", w.model.clone()));
         } else {
