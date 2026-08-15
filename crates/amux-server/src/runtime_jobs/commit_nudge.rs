@@ -53,14 +53,48 @@ pub struct Ownership {
     pub partial: Option<String>,
 }
 
+/// The freshness axis (MG-1467): for each dirty path, WHICH DIRECTION it
+/// differs from origin/main. Parallel to [`Ownership`], and like it,
+/// deliberately NOT constructible from a working tree. It carries an answer the
+/// caller computed with [`freshness_from_repo`] so that [`build`] stays
+/// repo-blind.
+///
+/// Only `stale` and `same` change what build does. `new` and `edited` are both
+/// ordinary commit-worthy work; they are tracked for completeness and so a
+/// caller can inspect the split, but build derives "commit-worthy" as
+/// everything not-same and not-stale rather than reading them. That keeps a
+/// default (empty) Freshness behaving exactly like it did before this axis.
+#[derive(Debug, Default, Clone)]
+pub struct Freshness {
+    /// origin has commits on the path that local HEAD lacks: the worktree copy
+    /// is OLDER. Committing it SILENTLY REVERTS origin. Restore, do not commit.
+    pub stale: Vec<String>,
+    /// Absent from origin/main. Genuinely new work; LOST if never committed.
+    pub new: Vec<String>,
+    /// Differs from origin, which has not moved past HEAD on this path. A
+    /// plausible in-flight edit.
+    pub edited: Vec<String>,
+    /// Byte-identical to origin: dirty only because local HEAD is behind.
+    /// Suppressed entirely as noise (48 of 321 on the motivating checkout).
+    pub same: Vec<String>,
+}
+
 /// The nudge, or None when there is nothing honest to say.
 ///
 /// `dirty` is the list of paths `git status` reported under the session's
 /// working directory — a LIST, carrying no ownership claim.
+///
+/// Two axes arrive pre-computed, for one reason: [`build`] is deliberately
+/// unable to see a repo, so it cannot re-derive either by accident. `own` is
+/// WHOSE a file is (the staged-guard's answer). `fresh` is WHICH DIRECTION it
+/// differs from origin/main (MG-1467). They need opposite handling, so one
+/// undifferentiated count cannot serve both. It mis-instructed five sessions in
+/// three days, telling them to commit files a commit would SILENTLY REVERT.
 pub fn build(
     dir: &str,
     dirty: &[String],
     own: &Ownership,
+    fresh: &Freshness,
     provenance: &str,
 ) -> Option<String> {
     // PROVENANCE IS A REQUIRED PARAMETER, NOT A FIELD THE CALLER MAY FORGET
@@ -77,6 +111,95 @@ pub fn build(
     // makes it impossible to state one without saying what it was measured
     // against. It covers the caller written months from now by someone who read
     // none of this — the population a remembered habit cannot reach.
+    if dirty.is_empty() {
+        return None;
+    }
+
+    // FRESHNESS is the second axis (MG-1467). Ownership answers WHOSE a file is;
+    // freshness answers WHICH DIRECTION it differs from origin/main, and two of
+    // its four classes flip what build says, in OPPOSITE directions. That is why
+    // one count mis-instructed five sessions in three days:
+    //
+    //   SAME:  worktree is byte-identical to origin, dirty only because local
+    //          HEAD is behind (a graft-push artifact). Nothing is wrong, so it
+    //          is SUPPRESSED. 48 of 321 paths were this on the checkout that
+    //          motivated the card, and they are why the raw count read alarming.
+    //   STALE: origin has commits on the path that local HEAD lacks, so the
+    //          worktree copy is OLDER. `git add -A` carries it forward and
+    //          SILENTLY REVERTS origin (no conflict, the older file just wins,
+    //          AMUX-3000). Rendered FIRST, with the RESTORE command, and never
+    //          told to commit. This is the inverse of the normal nudge.
+    //
+    // NEW and EDITED are ordinary commit-worthy work and keep today's messaging.
+    // build derives "commit-worthy" as everything NOT same and NOT stale, so a
+    // default (empty) Freshness reproduces today's behaviour exactly. That is
+    // also the honest state when local HEAD is not behind origin.
+    let same: BTreeSet<&str> = fresh.same.iter().map(String::as_str).collect();
+    let stale_set: BTreeSet<&str> = fresh.stale.iter().map(String::as_str).collect();
+
+    // Drop SAME first. If that empties the set there is nothing honest to say:
+    // identical-to-origin is the same non-event as a clean tree.
+    let dirty: Vec<&str> =
+        dirty.iter().map(String::as_str).filter(|p| !same.contains(*p)).collect();
+    if dirty.is_empty() {
+        return None;
+    }
+
+    let stale_paths: Vec<&str> =
+        dirty.iter().copied().filter(|p| stale_set.contains(*p)).collect();
+    let commit_worthy: Vec<String> = dirty
+        .iter()
+        .copied()
+        .filter(|p| !stale_set.contains(*p))
+        .map(str::to_string)
+        .collect();
+
+    let mut sections: Vec<String> = Vec::new();
+
+    // STALE FIRST and most prominently. The opposite instruction to the rest of
+    // the nudge: do NOT commit these, restore them.
+    if !stale_paths.is_empty() {
+        let n = stale_paths.len();
+        let list: String = stale_paths
+            .iter()
+            .take(10)
+            .map(|p| format!("  {p}\n"))
+            .collect::<String>()
+            + if n > 10 { "  …\n" } else { "" };
+        sections.push(format!(
+            "STALE: {n} of your dirty file(s) under {dir} are OLDER than origin/main. Origin \
+             has commits on these paths that your local HEAD does not (this checkout is behind). \
+             DO NOT COMMIT them. `git add -A` or `git commit -a` would carry the older copy \
+             forward and SILENTLY REVERT origin (no conflict, the older file just wins, \
+             AMUX-3000):\n\
+             {list}\
+             Restore each to origin's version instead, and do not commit it: \
+             `git checkout origin/main -- <path>`."
+        ));
+    }
+
+    // The commit-worthy body: NEW/EDITED paths, rendered under the ownership
+    // axis exactly as before the freshness split.
+    if let Some(body) = commit_worthy_body(dir, &commit_worthy, own) {
+        sections.push(body);
+    }
+
+    if sections.is_empty() {
+        // Everything was SAME (returned above) or the paths left were
+        // foreign/unknown with nothing positively ours: no stale warning and
+        // nothing to commit.
+        return None;
+    }
+    let mut msg = sections.join("\n\n");
+    msg.push_str(&format!("\n\n({provenance})"));
+    Some(msg)
+}
+
+/// The commit-worthy body: paths that are neither STALE nor identical to origin,
+/// rendered under the ownership axis (mine / unknown / foreign / shared). Returns
+/// the message WITHOUT the trailing provenance so [`build`] can stamp it exactly
+/// once across a STALE section and this body.
+fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
     if dirty.is_empty() {
         return None;
     }
@@ -133,7 +256,6 @@ pub fn build(
         if let Some(why) = &own.partial {
             m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
         }
-        m.push_str(&format!("\n\n({provenance})"));
         return Some(m);
     }
 
@@ -199,7 +321,6 @@ pub fn build(
             it
         ));
     }
-    msg.push_str(&format!("\n\n({provenance})"));
     Some(msg)
 }
 
@@ -511,6 +632,113 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
     })
 }
 
+/// Per-path freshness for `paths`, computed against origin/main (MG-1467).
+///
+/// The second axis the guard never had. [`ownership_from_guard`] answers WHOSE a
+/// file is; this answers WHICH DIRECTION it differs from origin. Both hazards are
+/// real and need OPPOSITE handling (committing a peer's file vs committing a
+/// stale copy that reverts origin), so one count cannot serve both.
+///
+/// Caller-side exactly like ownership, because it needs the repo and [`build`] is
+/// deliberately repo-blind. It reads the origin/main ref that
+/// [`drop_paths_identical_to_origin`] refreshed earlier in the same tick, so it
+/// MUST run after that filter. It does not fetch again.
+///
+/// When it cannot classify a path (git error, no origin/main ref) it treats the
+/// path as ordinary work, never STALE, so a failure degrades to today's
+/// behaviour rather than inventing a revert warning.
+async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
+    let mut fresh = Freshness::default();
+    if paths.is_empty() {
+        return fresh;
+    }
+
+    // Resolve the repo root and address paths from there. `git status` emits
+    // repo-root-relative paths, but a lane's CC_DIR is often a SUBDIRECTORY; run
+    // from there, `git hash-object -- <path>` resolves against the CWD and fails
+    // (AMUX-2947). Same trap drop_paths_identical_to_origin documents.
+    let root = tokio::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| dir.to_string());
+    let dir = root.as_str();
+
+    // A blob id is exactly 40 lowercase hex characters. Anything else, an error
+    // message or an empty string, is NOT an answer whatever the exit code said.
+    // This is the creative-dna trap: `"" == ""` is true, so two empty stdouts
+    // would score as SAME and silently drop a real change.
+    let blob = |o: &std::process::Output| -> Option<String> {
+        let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+    };
+
+    for p in paths {
+        // 1. NEW: absent from origin. TEST THE EXIT CODE, never stdout emptiness.
+        //    Plain `git rev-parse` ECHOES an unresolvable revspec to stdout and
+        //    still exits nonzero, so an is-empty check reports every path as
+        //    present. Three sessions shipped that bug 2026-08-10. `--verify -q`
+        //    keeps stdout clean; `.status.success()` is the only signal read.
+        let present = tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "--verify", "-q", &format!("origin/main:{p}")])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !present {
+            fresh.new.push(p.clone());
+            continue;
+        }
+
+        // 2. SAME: worktree byte-identical to origin. Dirty only because local
+        //    HEAD is behind; nothing is wrong, so build suppresses it.
+        let local = tokio::process::Command::new("git")
+            .args(["-C", dir, "hash-object", "--", p])
+            .output()
+            .await;
+        let remote = tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", &format!("origin/main:{p}")])
+            .output()
+            .await;
+        let identical = match (local, remote) {
+            (Ok(l), Ok(r)) => match (blob(&l), blob(&r)) {
+                (Some(a), Some(b)) => a == b,
+                // One side unreadable: cannot call it SAME, fall through.
+                _ => false,
+            },
+            _ => false,
+        };
+        if identical {
+            fresh.same.push(p.clone());
+            continue;
+        }
+
+        // 3. STALE: origin has commits on this path that local HEAD lacks, so
+        //    the worktree copy is older and committing it would REVERT origin.
+        //    Here stdout emptiness IS the right test: this is `git log` output,
+        //    not a revspec echo. Gated on the command succeeding.
+        let stale = tokio::process::Command::new("git")
+            .args(["-C", dir, "log", "--oneline", "HEAD..origin/main", "--", p])
+            .output()
+            .await
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+        if stale {
+            fresh.stale.push(p.clone());
+            continue;
+        }
+
+        // 4. EDITED: differs, origin has not moved past HEAD on this path. A
+        //    plausible in-flight edit; commit-worthy like today.
+        fresh.edited.push(p.clone());
+    }
+    fresh
+}
+
 /// One sweep: nudge idle lanes that have uncommitted work OF THEIR OWN.
 ///
 /// Delivery is `steer_enqueue`, never a direct send — the existing loop applies
@@ -533,12 +761,17 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         let Some(own) = ownership_from_guard(session, dir, &dirty).await else {
             continue;
         };
+        // The freshness axis (MG-1467): WHICH DIRECTION each path differs from
+        // origin. Computed here, caller-side, exactly as ownership is; build
+        // stays repo-blind. Runs after drop_paths_identical_to_origin so it
+        // reads the origin/main ref that filter just refreshed.
+        let fresh = freshness_from_repo(dir, &dirty).await;
         // Provenance rides on EVERY nudge, not only the degraded ones. It is the
         // healthy line that makes the stale line legible: with a stamp present
         // in both states, "compared against a STALE origin/main" reads as a
         // difference. Printed only when degraded, it reads as ordinary prose and
         // gets skimmed exactly like the phantom paths it is warning about.
-        let Some(msg) = build(dir, &dirty, &own, &provenance) else { continue };
+        let Some(msg) = build(dir, &dirty, &own, &fresh, &provenance) else { continue };
 
         // Cap AFTER deciding there is something to say, so a suppressed-by-cap
         // day does not also consume the "nothing to say" path.
@@ -672,12 +905,13 @@ mod tests {
 
         // `mine` is DERIVED — not foreign, not unknown — so a default
         // Ownership over a dirty path is exactly the positively-mine branch.
-        let m = build("/repo", &dirty, &Ownership::default(), "SCOPE-MARKER")
+        let m = build("/repo", &dirty, &Ownership::default(), &Freshness::default(), "SCOPE-MARKER")
             .expect("mine branch");
         assert!(m.contains("SCOPE-MARKER"), "mine branch dropped its scope: {m}");
 
         let unknown = Ownership { unclaimed: vec!["a.rs".to_string()], ..Default::default() };
-        let u = build("/repo", &dirty, &unknown, "SCOPE-MARKER").expect("unknown branch");
+        let u = build("/repo", &dirty, &unknown, &Freshness::default(), "SCOPE-MARKER")
+            .expect("unknown branch");
         assert!(u.contains("SCOPE-MARKER"), "unknown branch dropped its scope: {u}");
     }
 
@@ -868,7 +1102,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            build("/repo", &dirty, &own, "test-provenance").is_none(),
+            build("/repo", &dirty, &own, &Freshness::default(), "test-provenance").is_none(),
             "a session with no work of its own must not be told to commit"
         );
     }
@@ -886,7 +1120,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own, "test-provenance").expect("should nudge");
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance")
+            .expect("should nudge");
         assert!(msg.contains("1 uncommitted change(s)"), "must count MINE only: {msg}");
         assert!(msg.contains("mine.rs"));
         assert!(!msg.contains("  theirs_a.rs\n"), "a peer's file is not work to commit: {msg}");
@@ -902,7 +1137,7 @@ mod tests {
             foreign: vec![("theirs.rs".into(), "amux-cloud".into())],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance").unwrap();
         assert!(msg.contains("NOT YOURS"), "{msg}");
         assert!(msg.contains("theirs.rs") && msg.contains("amux-cloud"), "{msg}");
         assert!(msg.contains("Do not commit it"), "{msg}");
@@ -919,7 +1154,8 @@ mod tests {
             shared: vec![("hot.rs".into(), "peer".into())],
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own, "test-provenance").expect("shared must not suppress");
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance")
+            .expect("shared must not suppress");
         assert!(msg.contains("CONTESTED") && msg.contains("peer"), "{msg}");
         assert!(msg.contains("git add -p"), "per-hunk is the actionable advice: {msg}");
     }
@@ -936,7 +1172,8 @@ mod tests {
     fn an_unclaimed_file_is_reported_as_unknown_never_as_yours() {
         let dirty = s(&["CLAUDE.md"]);
         let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
-        let msg = build("/repo", &dirty, &own, "test-provenance").expect("a dirty tree is still worth reporting");
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance")
+            .expect("a dirty tree is still worth reporting");
         assert!(msg.contains("OWNERSHIP IS UNKNOWN"), "{msg}");
         assert!(
             !msg.contains("Commit completed work"),
@@ -951,7 +1188,7 @@ mod tests {
     fn unknown_files_are_disclosed_but_not_counted_as_mine() {
         let dirty = s(&["mine.rs", "CLAUDE.md"]);
         let own = Ownership { unclaimed: s(&["CLAUDE.md"]), ..Default::default() };
-        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance").unwrap();
         assert!(msg.contains("1 uncommitted change(s)"), "count MINE only: {msg}");
         assert!(msg.contains("OWNERSHIP UNKNOWN") && msg.contains("CLAUDE.md"), "{msg}");
     }
@@ -965,14 +1202,17 @@ mod tests {
             partial: Some("no transcript for cotenant amux-helper".into()),
             ..Default::default()
         };
-        let msg = build("/repo", &dirty, &own, "test-provenance").unwrap();
+        let msg = build("/repo", &dirty, &own, &Freshness::default(), "test-provenance").unwrap();
         assert!(msg.contains("ATTRIBUTION IS PARTIAL"), "{msg}");
         assert!(msg.contains("amux-helper"), "name who is invisible: {msg}");
     }
 
     #[test]
     fn a_clean_tree_says_nothing() {
-        assert!(build("/repo", &[], &Ownership::default(), "test-provenance").is_none());
+        assert!(
+            build("/repo", &[], &Ownership::default(), &Freshness::default(), "test-provenance")
+                .is_none()
+        );
     }
 
     /// Ten shown, the rest elided — a nudge that pastes 82 paths is a nudge
@@ -980,9 +1220,169 @@ mod tests {
     #[test]
     fn a_long_list_is_capped_but_the_count_is_honest() {
         let dirty: Vec<String> = (0..25).map(|i| format!("f{i}.rs")).collect();
-        let msg = build("/repo", &dirty, &Ownership::default(), "test-provenance").unwrap();
+        let msg = build("/repo", &dirty, &Ownership::default(), &Freshness::default(), "test-provenance")
+            .unwrap();
         assert!(msg.contains("25 uncommitted change(s)"), "count must be the TRUE total: {msg}");
         assert!(msg.contains('…'), "the list must show it was truncated: {msg}");
         assert!(!msg.contains("f24.rs"), "only the first ten are listed: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRESHNESS AXIS (MG-1467). build() renders it, and it is repo-blind, so
+    // every case here is driven purely by the Freshness passed in. The two legs
+    // that must both hold: STALE warns-not-commits, and SAME vanishes. A build
+    // that renders everything fails the SAME legs; one that suppresses
+    // everything fails the STALE legs.
+    // -----------------------------------------------------------------------
+
+    /// A STALE file is the INVERSE of the normal nudge. It is OLDER than origin,
+    /// so committing it reverts origin. It must be rendered with the RESTORE
+    /// command and NOT told to commit, and a stale-only tree carries no
+    /// commit-worthy work at all.
+    #[test]
+    fn a_stale_file_is_told_to_restore_and_never_to_commit() {
+        let dirty = s(&["stale.rs"]);
+        let fresh = Freshness { stale: s(&["stale.rs"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance")
+            .expect("a stale file is worth warning about");
+        assert!(msg.contains("git checkout origin/main -- "), "must give the RESTORE command: {msg}");
+        assert!(msg.contains("DO NOT COMMIT"), "must say not to commit the stale copy: {msg}");
+        assert!(msg.contains("stale.rs"), "must name the stale path: {msg}");
+        assert!(
+            !msg.contains("uncommitted change(s)"),
+            "a stale-only tree has NO commit-worthy work; it must not render the commit nudge: {msg}"
+        );
+    }
+
+    /// A STALE file among genuine work: the stale warning comes FIRST, and the
+    /// commit count covers only the commit-worthy paths, never the stale one.
+    #[test]
+    fn stale_is_rendered_first_and_excluded_from_the_commit_count() {
+        let dirty = s(&["stale.rs", "new.rs"]);
+        let fresh = Freshness { stale: s(&["stale.rs"]), new: s(&["new.rs"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").unwrap();
+        let stale_at = msg.find("are OLDER than origin/main").expect("stale block present");
+        let commit_at = msg.find("uncommitted change(s)").expect("commit block present");
+        assert!(stale_at < commit_at, "STALE must be rendered FIRST: {msg}");
+        assert!(msg.contains("1 uncommitted change(s)"), "count MUST exclude the stale path: {msg}");
+        assert!(msg.contains("new.rs"), "the commit-worthy path must be listed: {msg}");
+    }
+
+    /// SAME files are byte-identical to origin, dirty only because local HEAD is
+    /// behind. They are pure noise and must be suppressed entirely, not counted.
+    #[test]
+    fn a_same_as_origin_file_is_suppressed_and_not_counted() {
+        let dirty = s(&["real.rs", "same.rs"]);
+        let fresh = Freshness { same: s(&["same.rs"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").unwrap();
+        assert!(msg.contains("1 uncommitted change(s)"), "SAME must not be counted: {msg}");
+        assert!(msg.contains("real.rs"), "the real change must remain: {msg}");
+        assert!(!msg.contains("same.rs"), "a file identical to origin must be absent: {msg}");
+    }
+
+    /// If EVERY dirty path is identical to origin there is nothing to say, the
+    /// same silence as a clean tree. 48 of 321 paths were this on the checkout
+    /// that motivated MG-1467, and they are why the raw count read alarming.
+    #[test]
+    fn an_all_same_tree_says_nothing() {
+        let dirty = s(&["a.rs", "b.rs"]);
+        let fresh = Freshness { same: s(&["a.rs", "b.rs"]), ..Default::default() };
+        assert!(
+            build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").is_none(),
+            "an all-SAME tree is noise and must produce no nudge"
+        );
+    }
+
+    /// NEW and EDITED are ordinary commit-worthy work: they keep today's
+    /// messaging and are both counted. This is the "local HEAD not behind
+    /// origin" world where nothing is STALE or SAME and the nudge reads exactly
+    /// as it always did.
+    #[test]
+    fn new_and_edited_render_as_ordinary_commit_worthy_work() {
+        let dirty = s(&["added.rs", "changed.rs"]);
+        let fresh =
+            Freshness { new: s(&["added.rs"]), edited: s(&["changed.rs"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").unwrap();
+        assert!(msg.contains("2 uncommitted change(s)"), "both NEW and EDITED are commit-worthy: {msg}");
+        assert!(msg.contains("added.rs") && msg.contains("changed.rs"), "{msg}");
+    }
+
+    /// THE EXIT-CODE DISCRIMINATOR, against a real repo (MG-1467). The classifier
+    /// shells git, so the one thing worth pinning end to end is that it tests the
+    /// PROCESS EXIT CODE for absence, not stdout emptiness: plain `git rev-parse`
+    /// echoes an unresolvable revspec to stdout and still exits nonzero, and
+    /// three sessions shipped the is-empty bug on 2026-08-10. A checkout that is
+    /// behind origin exercises all four classes at once.
+    #[tokio::test]
+    async fn freshness_from_repo_classifies_new_same_stale_and_edited() {
+        let tmp = std::env::temp_dir().join(format!("amux-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work) = (tmp.join("origin.git"), tmp.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        // Base commit (this stays HEAD): stale.txt=v0, same.txt=X, edited.txt=orig.
+        std::fs::write(work.join("stale.txt"), "v0\n").unwrap();
+        std::fs::write(work.join("same.txt"), "X\n").unwrap();
+        std::fs::write(work.join("edited.txt"), "orig\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // A peer advances origin ONLY on stale.txt (v0 -> v2), pushes. Local
+        // HEAD does not contain this commit.
+        let peer = tmp.join("peer");
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::write(peer.join("stale.txt"), "v2\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "peer moves stale.txt"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+
+        // Fetch the moved ref but do NOT merge: origin/main is now ahead of HEAD.
+        git(&work, &["fetch", "-q", "origin"]);
+
+        // Worktree edits that produce each class:
+        //   stale.txt = v1  (differs from HEAD v0 AND from origin v2, origin moved) -> STALE
+        //   edited.txt = changed (origin unmoved on this path)                      -> EDITED
+        //   same.txt   = X  (byte-identical to origin)                              -> SAME
+        //   new.txt    = fresh (absent from origin)                                 -> NEW
+        std::fs::write(work.join("stale.txt"), "v1\n").unwrap();
+        std::fs::write(work.join("edited.txt"), "changed\n").unwrap();
+        std::fs::write(work.join("new.txt"), "fresh\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let fresh = freshness_from_repo(
+            dir,
+            &s(&["new.txt", "same.txt", "stale.txt", "edited.txt"]),
+        )
+        .await;
+
+        assert_eq!(fresh.new, s(&["new.txt"]), "absent-from-origin must be NEW (exit-code test)");
+        assert_eq!(fresh.same, s(&["same.txt"]), "identical-to-origin must be SAME");
+        assert_eq!(fresh.stale, s(&["stale.txt"]), "origin-ahead-on-path must be STALE");
+        assert_eq!(fresh.edited, s(&["edited.txt"]), "differs, origin unmoved, must be EDITED");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
