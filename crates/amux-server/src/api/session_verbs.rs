@@ -257,6 +257,50 @@ pub(crate) fn parse_env(name: &str) -> EnvFile {
 /// rewritten mid-assertion by a sibling. Serialising them with a mutex or
 /// `--test-threads=1` would have made them green while quietly making them
 /// order-dependent.
+/// The env files that make up a lane's scope, IN SOURCE ORDER: global, then each
+/// group, then the worker (AMUX-3106). Only files that exist are returned.
+///
+/// Source order IS the precedence, because `source` lets the last assignment
+/// win — so this yields worker > group > global, matching `scoped_setting_in`
+/// exactly. That match is the point: `scoped_setting_in` resolves ONE key for a
+/// gate to read, this delivers the WHOLE layer into the launched process, and if
+/// their precedence ever diverged a key would mean one thing to a gate and
+/// another inside the lane's own shell.
+///
+/// Parameterised on `home` for the reason `scoped_setting_in` spells out:
+/// `AMUX_HOME` is process-global and cargo runs a binary's tests in PARALLEL, so
+/// tests that set it race each other over one `amux.env`.
+///
+/// Groups come from CC_TAGS in the worker's own file — the same source
+/// `lane_groups` reads, not a second spelling.
+pub(crate) fn scope_env_layers(home: &std::path::Path, lane: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let global = home.join("amux.env");
+    if global.exists() {
+        out.push(global);
+    }
+    let worker_file = home.join("sessions").join(format!("{lane}.env"));
+    let groups: std::collections::BTreeSet<String> = EnvFile::load(&worker_file)
+        .get("CC_TAGS")
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_matches('"').to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for g in groups {
+        let gp = home.join("env").join(format!("{g}.env"));
+        if gp.exists() {
+            out.push(gp);
+        }
+    }
+    if worker_file.exists() {
+        out.push(worker_file);
+    }
+    out
+}
+
 pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -> Option<String> {
     fn nonempty(v: &str) -> Option<String> {
         let t = v.trim();
@@ -4950,27 +4994,24 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     // would resolve one way when a gate read it and another way inside the lane's
     // shell, which is the kind of split nobody would think to look for.
     //
-    // Groups come from `lane_groups`, i.e. CC_TAGS in the worker's own env file —
-    // the same source `scoped_setting_in` reads. Deliberately not a second
-    // spelling of "which groups is this in".
+    // Groups come from CC_TAGS in the worker's own env file — the same source
+    // `lane_groups` reads. Deliberately not a second spelling of "which groups
+    // is this in".
     //
     // This is the prerequisite the connectors design names (docs/design/connectors.md,
     // "The one real gap"): scoping a connector to a worker has nowhere to land
     // until below-global scope actually reaches the worker.
-    for g in lane_groups(name) {
-        let gp = home().join("env").join(format!("{g}.env"));
-        if gp.exists() {
-            shell_rc.push_str(&format!(
-                "set -a; source {} 2>/dev/null; set +a; ",
-                sh_quote(&gp.to_string_lossy())
-            ));
+    //
+    // The global layer is sourced just above (unchanged, so its `cd` fallback
+    // behaviour is untouched); scope_env_layers returns it too, so skip it here
+    // rather than sourcing it twice.
+    for f in scope_env_layers(&home(), name) {
+        if f == amux_env {
+            continue;
         }
-    }
-    let worker_env = home().join("sessions").join(format!("{name}.env"));
-    if worker_env.exists() {
         shell_rc.push_str(&format!(
             "set -a; source {} 2>/dev/null; set +a; ",
-            sh_quote(&worker_env.to_string_lossy())
+            sh_quote(&f.to_string_lossy())
         ));
     }
     if provider != "codex" && provider != "gemini" && provider != "ollama" && has_oauth {
@@ -11844,6 +11885,52 @@ mod tests {
     ///
     /// This test fails against that writer (0 bytes) and passes against this
     /// one, which is the only thing that makes it worth having.
+    /// AMUX-3106. `/api/scope` advertised env at ["global","group","worker"] and
+    /// the UI wrote all three files, but launch sourced only the global one — so
+    /// a group- or worker-scoped setting saved and changed nothing. These pin the
+    /// two properties the delivery depends on: ORDER (which decides precedence,
+    /// because `source` lets the last assignment win) and that a missing layer is
+    /// skipped rather than sourced as an empty file.
+    #[test]
+    fn scope_env_layers_orders_global_then_group_then_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("env")).unwrap();
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(home.join("amux.env"), "K=global\n").unwrap();
+        std::fs::write(home.join("env").join("gtm.env"), "K=group\n").unwrap();
+        std::fs::write(home.join("sessions").join("w1.env"), "CC_TAGS=gtm\nK=worker\n").unwrap();
+
+        let got = scope_env_layers(home, "w1");
+        let names: Vec<String> =
+            got.iter().map(|p| p.strip_prefix(home).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["amux.env", "env/gtm.env", "sessions/w1.env"],
+                   "order IS the precedence — worker must be sourced LAST");
+
+        // And the order it produces must agree with what a gate reading one key
+        // resolves, or a key means different things inside and outside the lane.
+        assert_eq!(scoped_setting_in(home, "w1", "K").as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn scope_env_layers_skips_absent_layers_and_untagged_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("env")).unwrap();
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(home.join("amux.env"), "K=global\n").unwrap();
+        // Worker names a group that has NO file, and a group file exists for a
+        // group the worker is not in — neither may be sourced.
+        std::fs::write(home.join("env").join("other.env"), "K=other\n").unwrap();
+        std::fs::write(home.join("sessions").join("w2.env"), "CC_TAGS=absent\n").unwrap();
+
+        let got = scope_env_layers(home, "w2");
+        let names: Vec<String> =
+            got.iter().map(|p| p.strip_prefix(home).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["amux.env", "sessions/w2.env"]);
+        assert_eq!(scoped_setting_in(home, "w2", "K").as_deref(), Some("global"));
+    }
+
     #[test]
     fn cr_only_tui_redraws_reach_the_log_without_any_linefeed() {
         let dir = tempfile::tempdir().unwrap();
