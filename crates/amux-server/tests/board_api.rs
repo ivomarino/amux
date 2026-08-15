@@ -516,6 +516,64 @@ async fn gates_derive_from_type_and_retyping_is_the_honest_exit() {
     assert!(v["valid_types"].as_array().unwrap().contains(&json!("watch")));
 }
 
+/// AMUX-3058: a gate OVERRIDE (`gate` field) pins the gate over the type, so
+/// ethos rule 3's "fix the type" escape was a DEAD END while an override stood
+/// (TUBES-1622: an override carrying code criteria on a non-code card). Retyping
+/// now clears a stale override so the gate re-derives from the new type. Both
+/// legs: the new type's gate becomes satisfiable, AND the gate is RE-DERIVED, not
+/// bypassed — a fresh card of the new type still refuses the old criteria.
+#[tokio::test]
+async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_type() {
+    let (app, _dir) = app();
+    // An INVESTIGATION card whose gate is OVERRIDDEN to the code done-gate — the
+    // override matches no type default, exactly the reported shape, so `done`
+    // demanded code criteria regardless of the type.
+    let card = create(
+        &app,
+        json!({
+            "title": "override card", "session": "worker-1", "status": "doing",
+            "type": "investigation", "desc": "outcome: recorded here",
+            "gate": ["Implemented and merged", "Tests / lint pass"],
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // Before the fix: done demanded the code override even for an investigation.
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "done" }))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(v["gate"], json!(["Implemented and merged", "Tests / lint pass"]), "the override pins code criteria pre-retype");
+
+    // Retype to chore: AMUX-3058 clears the stale override.
+    let (st, _, _) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "type": "chore" }))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // POSITIVE leg: the chore gate is now satisfiable (override cleared, re-derived).
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_checked": ["Outcome recorded in the item (what happened, and why it is closed)"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the type-derived chore gate must be satisfiable after retype: {v}");
+    assert_eq!(v["status"], json!("done"));
+
+    // NEGATIVE leg: the gate is RE-DERIVED, not bypassed. A fresh chore card must
+    // still REFUSE the old code criteria — the fix did not make every ack pass.
+    let control = create(&app, json!({ "title": "control", "session": "worker-1", "status": "doing", "type": "chore" })).await;
+    let cid = control["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{cid}"),
+        Some(json!({ "status": "done", "gate_checked": ["Implemented and merged", "Tests / lint pass"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "code criteria must NOT satisfy a chore gate: {v}");
+    assert_eq!(v["error"], json!("gate_checked does not match the gate"));
+}
+
 // ---- force: bypass WITH audit (ethos rule 6) -----------------------------
 
 #[tokio::test]

@@ -1934,6 +1934,26 @@ pub async fn patch_item(
                     if t != next.item_type {
                         next.item_type = t;
                         changed.push("type".into());
+                        // AMUX-3058: a non-empty `gate` OVERRIDE pins the gate
+                        // over the type — effective_gate returns row.gate before
+                        // deriving from item_type — so retyping to escape a wrong
+                        // gate (ethos rule 3's sanctioned escape) was a DEAD END
+                        // while an override stood, including one that matched no
+                        // type's default (a code-criteria override on a non-code
+                        // card, TUBES-1622). Retyping is an explicit statement that
+                        // the card's KIND changed and the gate derives from the
+                        // kind, so a stale override is dropped here and the gate
+                        // re-derives from the new type. A caller that wants a custom
+                        // gate on the retyped card sends `gate` in this SAME PATCH:
+                        // the gate handler below runs after this and re-sets it.
+                        if next.gate.is_some() {
+                            next.gate = None;
+                            changed.push("gate".into());
+                            tracing::info!(
+                                target: "amux::board", id = %next.id,
+                                "cleared a stale gate override on retype so the gate re-derives from the new type (AMUX-3058)"
+                            );
+                        }
                     }
                 }
             }
