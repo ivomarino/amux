@@ -112,7 +112,47 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // rate" as its detector but nothing read it; this closes that loop.
     out.extend(capture_pipeline_check(state));
 
+    // -- 8. provider launch agrees with its adapter (RR-0043 / AMUX-3153): does
+    // the server launch each provider with the same binary its adapter — and its
+    // capability report — describes? The launcher and the adapter are two
+    // independent command constructions (the D6 seam), and nothing looked
+    // between them until ollama shipped a bare `ollama run` under an adapter
+    // advertising hooks=true. This joins them so the next divergence
+    // self-announces instead of a lying capability report.
+    out.extend(provider_launch_check());
+
     out
+}
+
+/// AMUX-3153 / RR-0043: for each provider, compare the binary the SERVER launch
+/// builder invokes (`session_verbs::launch_base_binary`, the launcher's OWN
+/// source) against the binary and hooks its registered ADAPTER advertises.
+/// Reading the launcher's own function is the point — the check cannot disagree
+/// with what the launcher runs. Pure over the static registry + launch table, so
+/// its negative control drives it with plain rows and needs no live fleet.
+fn provider_launch_check() -> Vec<InvariantResult> {
+    use crate::provider::PromptMode;
+    let reg = crate::provider::default_registry();
+    let rows: Vec<checks::ProviderLaunch> = crate::api::session_verbs::SESSION_PROVIDERS
+        .iter()
+        .map(|p| {
+            let launch_binary = crate::api::session_verbs::launch_base_binary(p).to_string();
+            let (adapter_binary, adapter_hooked) = match reg.resolve(p) {
+                Some(a) => (
+                    a.build_command(PromptMode::Interactive).into_iter().next(),
+                    a.capabilities().hooks,
+                ),
+                None => (None, false),
+            };
+            checks::ProviderLaunch {
+                provider: (*p).to_string(),
+                launch_binary,
+                adapter_binary,
+                adapter_hooked,
+            }
+        })
+        .collect();
+    checks::launch_matches_adapter(&rows)
 }
 
 /// AMUX-3148: read recent user prompts from `cmd_history`, compute per-session
@@ -683,6 +723,31 @@ pub async fn run(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BINDING for the provider-launch invariant (RR-0043 / AMUX-3153):
+    /// `provider_launch_check` must reach a verdict, carry only its own id, and
+    /// PASS on the REAL registry + launch table — because today every provider's
+    /// launch binary matches its adapter's. A FAIL here is a genuine
+    /// launcher/adapter divergence, which is the whole point; a dropped binding
+    /// would return nothing, and the incident it guards was invisible for exactly
+    /// that reason.
+    #[test]
+    fn the_provider_launch_check_is_wired_and_green_on_the_real_tables() {
+        let rs = provider_launch_check();
+        assert!(!rs.is_empty(), "the binding must reach a verdict");
+        assert!(
+            rs.iter().all(|r| r.invariant_id == "provider.launch_matches_adapter"),
+            "the sweep contract greps for this exact id"
+        );
+        let fails: Vec<_> = rs
+            .iter()
+            .filter(|r| r.status == crate::invariants::Status::Fail)
+            .collect();
+        assert!(
+            fails.is_empty(),
+            "launcher/adapter divergence on the live tables: {fails:?}"
+        );
+    }
 
     /// The BINDING, not the check. `status_agrees_with_pane` has negative
     /// controls of its own, but a pure check that `evaluate_all` never calls is

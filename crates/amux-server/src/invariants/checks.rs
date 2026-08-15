@@ -953,6 +953,95 @@ pub fn capture_lookback_s(uptime_s: i64, ceiling_s: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Provider launch: the server launches each provider the way its adapter says.
+// ---------------------------------------------------------------------------
+
+/// One provider's server-launch binary against its adapter's, for
+/// [`launch_matches_adapter`].
+#[derive(Debug, Clone)]
+pub struct ProviderLaunch {
+    pub provider: String,
+    /// First token of the command the SERVER launch builder emits, read from
+    /// `session_verbs::launch_base_binary` — the SAME function the launch arms
+    /// build from, so this cannot disagree with the launcher.
+    pub launch_binary: String,
+    /// First token of the provider ADAPTER's `build_command`, or `None` when the
+    /// provider has no registered adapter (e.g. `iterm2`).
+    pub adapter_binary: Option<String>,
+    /// Whether the adapter advertises hooks — carried so the failure can name
+    /// the capability the divergence makes untrue.
+    pub adapter_hooked: bool,
+}
+
+/// INCIDENT (AMUX-3153, RR-0043): ollama was migrated from a bare `ollama run`
+/// REPL to `codex --oss --local-provider ollama` in the CLI and the provider
+/// ADAPTER, but the SERVER launch path (the `session_verbs` launch match) was
+/// left emitting `ollama run`. So a dashboard/API-launched ollama worker got a
+/// hookless bare REPL while the adapter's `capabilities()` advertised
+/// `hooks=true` — the capability report LIED for that launch path, and nothing
+/// joined the two to notice. The launcher and the adapter are two independent
+/// command constructions (the D6 seam), and no component health check looks
+/// between them (ethos rule 4).
+///
+/// INVARIANT: for a provider that HAS an adapter, the binary the server launch
+/// builder invokes equals the binary the adapter's `build_command` invokes. The
+/// adapter is the intended source of truth (RR-0043; the D6 exit is the launcher
+/// DELEGATING to `build_command`), so until that delegation lands this asserts
+/// the two hand-maintained constructions have not drifted. A mismatch means the
+/// launched process differs from what the adapter — and its capability report —
+/// describes.
+///
+/// A provider with no adapter (iterm2) is not a contradiction to flag: it is a
+/// gap to close by adding the adapter, so it passes rather than failing. That
+/// keeps the failure list to real drift, the same reason `route.callers_have_routes`
+/// excludes gateway-owned paths.
+pub fn launch_matches_adapter(rows: &[ProviderLaunch]) -> Vec<InvariantResult> {
+    const ID: &str = "provider.launch_matches_adapter";
+    let mut out = Vec::new();
+    for r in rows {
+        match &r.adapter_binary {
+            None => out.push(InvariantResult::pass(ID).entity(&r.provider)),
+            Some(ab) if ab == &r.launch_binary => {
+                out.push(InvariantResult::pass(ID).entity(&r.provider))
+            }
+            Some(ab) => out.push(
+                InvariantResult::fail(
+                    ID,
+                    format!("server launches {} via `{ab}` (its adapter's binary)", r.provider),
+                    format!(
+                        "server launches `{}` while the adapter builds `{ab}`{} — an \
+                         API-launched {} worker differs from what its adapter describes",
+                        r.launch_binary,
+                        if r.adapter_hooked {
+                            " and advertises hooks=true (a bare REPL has none)"
+                        } else {
+                            ""
+                        },
+                        r.provider,
+                    ),
+                )
+                .entity(&r.provider)
+                .evidence(json!({
+                    "provider": r.provider,
+                    "launch_binary": r.launch_binary,
+                    "adapter_binary": ab,
+                    "adapter_hooked": r.adapter_hooked,
+                    "class": "launcher-adapter-divergence",
+                    "incident": "AMUX-3153/RR-0043: server launch left on bare `ollama run` \
+                                 while the adapter moved to codex --oss; the capability report lied",
+                    "fix": "align the launch arm with the adapter binary; durable: the launcher \
+                            delegates to adapter.build_command (D6 exit)",
+                })),
+            ),
+        }
+    }
+    if out.is_empty() {
+        out.push(InvariantResult::pass(ID));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -960,6 +1049,54 @@ pub fn capture_lookback_s(uptime_s: i64, ceiling_s: i64) -> i64 {
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    /// AMUX-3153, rebuilt from the incident artifact: ollama's adapter builds
+    /// `codex` (and advertises hooks), but the server launch arm still emits
+    /// `ollama` (a bare REPL). The check must FAIL naming ollama; the post-fix
+    /// row (launch `codex`) and a provider with NO adapter (iterm2) must PASS. A
+    /// check that could not fail on this row is theatre — it is the exact shape
+    /// the incident report certified.
+    #[test]
+    fn detects_the_launcher_that_diverged_from_its_adapter() {
+        let rows = vec![
+            // the pre-fix incident: launcher on the bare REPL, adapter on codex.
+            ProviderLaunch {
+                provider: "ollama".into(),
+                launch_binary: "ollama".into(),
+                adapter_binary: Some("codex".into()),
+                adapter_hooked: true,
+            },
+            // post-fix: launcher and adapter agree.
+            ProviderLaunch {
+                provider: "codex".into(),
+                launch_binary: "codex".into(),
+                adapter_binary: Some("codex".into()),
+                adapter_hooked: true,
+            },
+            // no adapter (iterm2): a gap to close, not a contradiction — passes.
+            ProviderLaunch {
+                provider: "iterm2".into(),
+                launch_binary: "claude".into(),
+                adapter_binary: None,
+                adapter_hooked: false,
+            },
+        ];
+        let rs = launch_matches_adapter(&rows);
+        let failed: Vec<&str> = rs
+            .iter()
+            .filter(|r| r.status == Status::Fail)
+            .map(|r| r.entity_key.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["ollama"],
+            "only the launcher that diverged from its adapter fails; agree/no-adapter pass"
+        );
+        // The failure must name the capability the divergence makes untrue, so
+        // the reader is not sent to re-derive why a bare REPL is wrong.
+        let f = rs.iter().find(|r| r.status == Status::Fail).unwrap();
+        assert!(f.observed.contains("hooks=true"), "must name the lied capability: {}", f.observed);
+    }
 
     /// AMUX-3148: the exact live signature — several spaced cardable prompts, zero
     /// cards — must FAIL, and a healthy lane, a low-volume lane, and a rapid

@@ -1896,7 +1896,7 @@ fn render_session_transcript(name: &str, max_chars: usize) -> String {
 // contract).
 // ---------------------------------------------------------------------------
 
-const SESSION_PROVIDERS: [&str; 5] = ["claude", "codex", "gemini", "iterm2", "ollama"];
+pub const SESSION_PROVIDERS: [&str; 5] = ["claude", "codex", "gemini", "iterm2", "ollama"];
 const PROVIDER_YOLO_FLAGS: [&str; 3] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
@@ -2245,6 +2245,30 @@ fn default_model_for_provider(provider: &str) -> String {
         // A launchable default is required (this box has qwen3.8:27b pulled).
         "ollama" => "qwen3.8:27b".into(),
         _ => get_default_model(),
+    }
+}
+
+/// The base binary the LAUNCH BUILDER invokes for a provider — the first token
+/// of the command the launch match below emits. This is the SINGLE SOURCE: the
+/// launch arms build their command from it, and the `provider.launch_matches_adapter`
+/// health invariant reads the SAME function, so the check cannot drift from the
+/// launcher (the invariants module's same-source rule).
+///
+/// RR-0043 / AMUX-3153: ollama moved from a bare `ollama run` REPL to
+/// `codex --oss --local-provider ollama`, but only the CLI and the provider
+/// ADAPTER were migrated — the server launch arm was left on `ollama run` while
+/// the adapter advertised hooks=true, so a dashboard-launched worker got a
+/// hookless REPL and the capability report lied. Nothing joined the launcher to
+/// the adapter to notice. Mapping the launch binary here, and asserting it
+/// against the adapter, is what makes the next such divergence self-announce.
+pub fn launch_base_binary(provider: &str) -> &'static str {
+    match provider {
+        // ollama runs codex under the hood (`--oss --local-provider ollama`).
+        "codex" | "ollama" => "codex",
+        "gemini" => "gemini",
+        // claude, iterm2, and anything unknown launch via build_claude_cmd,
+        // whose default binary is `claude` (overridable by AMUX_CLAUDE_CMD).
+        _ => "claude",
     }
 }
 
@@ -4841,6 +4865,10 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     let defaults = EnvFile::load(&home().join("defaults.env"));
     let default_flags = defaults.get_or("CC_DEFAULT_FLAGS", "").to_string();
 
+    // The launch binary per provider, from the single source the health
+    // invariant also reads (RR-0043 / AMUX-3153). The arms below build from it
+    // so the check and the launcher cannot disagree about what gets run.
+    let base_bin = launch_base_binary(&provider);
     let cmd = match provider.as_str() {
         "codex" => {
             // py:24380 — codex command construction (trust-db side effect not
@@ -4884,9 +4912,9 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 }
             }
             if !codex_session_id.is_empty() {
-                format!("codex resume{opts} {codex_session_id}")
+                format!("{base_bin} resume{opts} {codex_session_id}")
             } else {
-                format!("codex{opts}")
+                format!("{base_bin}{opts}")
             }
         }
         "gemini" => {
@@ -4918,11 +4946,11 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             opts += &format!(" --include-directories {}", sh_quote(&logs));
             let gemini_session_id = meta_str(&meta, "gemini_session_id");
             if !gemini_session_id.is_empty() {
-                format!("gemini{opts} --resume {}", sh_quote(&gemini_session_id))
+                format!("{base_bin}{opts} --resume {}", sh_quote(&gemini_session_id))
             } else {
                 let new_id = ulid::Ulid::new().to_string().to_lowercase();
                 meta.insert("gemini_session_id".into(), json!(new_id));
-                format!("gemini{opts} --session-id {}", sh_quote(&new_id))
+                format!("{base_bin}{opts} --session-id {}", sh_quote(&new_id))
             }
         }
         "ollama" => {
@@ -4958,7 +4986,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                     }
                 }
             }
-            format!("codex{opts}")
+            format!("{base_bin}{opts}")
         }
         _ => build_claude_cmd(&cfg, &flags, &default_flags, &session_flag, extra_flags),
     };
