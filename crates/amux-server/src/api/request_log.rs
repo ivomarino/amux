@@ -484,19 +484,38 @@ fn decoded_error_body(bytes: &[u8], content_encoding: &str) -> String {
                 // Truncated or corrupt stream: say which, rather than storing
                 // the compressed bytes and letting a reader think it is content.
                 Err(e) => {
+                    // WARN, not silence: this is the two-fixes rule applied to
+                    // the fix itself. The marker below reaches the daily sweep
+                    // (it lands in /api/logs/analyze's sample), but a sweep runs
+                    // once a day and a reader has to be looking at error_body.
+                    // A WARN puts the same fact where a log sweep finds it too.
+                    tracing::warn!(target: "request_log",
+                        "[error-body/AF-57] gzip error body failed to decode ({e}) — \
+                         {} compressed bytes stored as a marker. Diagnostics for this \
+                         status are degraded until it is fixed.", bytes.len());
                     return format!(
                         "<gzip error body could not be decoded: {e}; {} compressed bytes>",
                         bytes.len()
-                    )
+                    );
                 }
             }
         }
         other => {
+            // Not deduped deliberately. This fires only when a NEW Content-
+            // Encoding appears on a response — i.e. someone changed the
+            // compression layer — which is not a steady state. If it ever does
+            // become a storm, the storm IS the signal, and a silenced one-shot
+            // would hide exactly the fleet-wide change worth knowing about.
+            tracing::warn!(target: "request_log",
+                "[error-body/AF-57] error body is {other}-encoded and this build cannot \
+                 decode it — {} bytes stored as a marker. Every error body in this \
+                 encoding is now undiagnosable; teach decoded_error_body about {other}.",
+                bytes.len());
             return format!(
                 "<error body is {other}-encoded and this build cannot decode it; \
                  {} encoded bytes>",
                 bytes.len()
-            )
+            );
         }
     };
     truncate_chars(&String::from_utf8_lossy(&raw), ERROR_BODY_CHARS)
