@@ -7619,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.648';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.649';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10861,6 +10861,28 @@ function _ttsClaimGesture() {
     const warm = _abAudio.play();
     if (warm && warm.catch) warm.catch(() => {});   // a rejection here is not fatal
   } catch (e) { /* best-effort; the real play still reports its own failure */ }
+}
+
+// Strip markdown syntax to plain text before sending to TTS. Used by the file
+// read-aloud so `say` speaks words, not "hashtag hashtag" or "asterisk asterisk".
+function _mdToSpeech(md) {
+  if (!md) return '';
+  return md
+    .replace(/^```[\s\S]*?^```/gm, '')           // fenced code blocks
+    .replace(/`[^`]+`/g, '')                      // inline code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')         // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')      // links → link text only
+    .replace(/\[\^[^\]]+\]:[^\n]*/g, '')          // footnote definitions
+    .replace(/\[\^[^\]]+\]/g, '')                 // footnote refs
+    .replace(/^#{1,6}\s+/gm, '')                  // heading markers
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')     // bold / italic
+    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')        // underscore bold / italic
+    .replace(/^[-*_]{3,}\s*$/gm, '')              // horizontal rules
+    .replace(/^>\s+/gm, '')                       // blockquotes
+    .replace(/^[-*+]\s+/gm, '')                   // unordered list bullets
+    .replace(/^\d+\.\s+/gm, '')                   // ordered list numbers
+    .replace(/\n{3,}/g, '\n\n')                   // collapse excess blank lines
+    .trim();
 }
 
 // One-click "read aloud" for a single message — no dialog, just plays. Hits

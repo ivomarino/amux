@@ -126,6 +126,12 @@ fn tmp_wav() -> std::path::PathBuf {
 /// --data-format=LEI16@22050` writes a RIFF/WAVE container.
 fn say_synth(bin: &str, text: &str, voice: &str) -> Result<(Vec<u8>, String, String), String> {
     let path = tmp_wav();
+    // Write text to a temp file and pass it with -f rather than as a positional
+    // arg. Positional args hit macOS ARG_MAX for large files and `say` prints
+    // its usage string to stderr instead of failing with a useful message.
+    let txt_path = path.with_extension("txt");
+    std::fs::write(&txt_path, text.as_bytes())
+        .map_err(|e| format!("could not write TTS input: {e}"))?;
     let mut cmd = Command::new(bin);
     cmd.arg("-o").arg(&path).arg("--data-format=LEI16@22050");
     let mut used_voice = String::new();
@@ -133,8 +139,9 @@ fn say_synth(bin: &str, text: &str, voice: &str) -> Result<(Vec<u8>, String, Str
         cmd.arg("-v").arg(voice);
         used_voice = voice.to_string();
     }
-    cmd.arg(text);
+    cmd.arg("-f").arg(&txt_path);
     let out = cmd.output().map_err(|e| format!("say failed to run: {e}"))?;
+    let _ = std::fs::remove_file(&txt_path);
     if !out.status.success() {
         let _ = std::fs::remove_file(&path);
         return Err(format!("say exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
