@@ -6739,6 +6739,46 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
 /// Returns how many messages were delivered (the count is the test's handle —
 /// a loop whose only evidence is "no rows left" cannot distinguish delivered
 /// from dropped).
+/// Pull the board card id out of an auto-pickup "work it now" prompt, if this
+/// text IS one. Keyed on the literal template minted by `board_drive.rs` (the
+/// sole producer of "[amux auto-pickup] Claimed board card <ID> from your
+/// queue"); any other steering text returns None, so a non-pickup message is
+/// never voided. KEEP IN STEP with that template: if its wording changes this
+/// returns None and the AMUX-3052 stale-pickup guard silently goes dark, so the
+/// two are commented as a pair and pinned by `pickup_card_id_parses_the_template`.
+fn pickup_card_id(text: &str) -> Option<String> {
+    const ANCHOR: &str = "Claimed board card ";
+    const TAIL: &str = " from your queue";
+    let start = text.find(ANCHOR)? + ANCHOR.len();
+    let rest = text.get(start..)?;
+    let end = rest.find(TAIL)?;
+    let id = rest.get(..end)?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// AMUX-3052 void decision, extracted from `steer_deliver_tick` so BOTH legs are
+/// unit-testable in isolation (a drop-guard that silently drops everything passes
+/// a drop-only suite — gtm-engine's negative control). Given a queued message's
+/// guard, its text, and the card's LIVE status at delivery time (None = the row
+/// is gone), return Some(card) to VOID the pickup or None to DELIVER it.
+///
+/// Keyed ONLY on the live status, and queue duration is deliberately not a
+/// parameter, so no later edit can re-key the guard on "it waited a long time" —
+/// the exact wrong fix gtm-engine's two legs rule out: GE-626 (done 229ms after
+/// the claim, delivered 18.7s later) must DROP, and MS-1188 (still `doing` at
+/// delivery after a 578s wait, closed only afterward) must DELIVER.
+fn pickup_stale_void(guard: &str, text: &str, card_status: Option<&str>) -> Option<String> {
+    if !guard.starts_with("board-drive") {
+        return None; // not a board-drive delivery — never void a user/inter-session message
+    }
+    let card = pickup_card_id(text)?; // not a single-card pickup (e.g. a nudge) — deliver
+    if card_status == Some("doing") {
+        None // still the actionable, claimed card — deliver even after a long wait
+    } else {
+        Some(card) // moved off 'doing' (closed/bounced) or gone — void
+    }
+}
+
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
@@ -6778,6 +6818,89 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     for (id, session, text, queued_at, guard) in queued {
         if delivered_lanes.contains(&session) {
             continue; // this lane already got its one delivery this tick
+        }
+        // VOID A STALE AUTO-PICKUP (AMUX-3052) before any per-lane gating, so a
+        // pickup for a card that was closed after the claim is dropped even if
+        // the lane is momentarily unreachable. The claim is an atomic CAS on
+        // status='todo' (claim_card), so the card is 'doing' at claim time; the
+        // "work it now" prompt then waits in this queue until the lane's next
+        // turn, and if the OWNER closes the card in that gap the lane is told to
+        // redo finished work. gtm-engine measured ~6% of pickup deliveries onto
+        // an already-closed card across 9 lanes; GE-626 was closed 229ms after
+        // the claim and delivered 18.7s later — so any queue wait is enough, and
+        // the fix belongs HERE at the delivery boundary, not in latency tuning.
+        // The re-check reads the LIVE issues.status row — NOT session_events
+        // (records the claim but not the close on this path) and NOT
+        // issues.updated (stale at the claim second), per gtm-engine's forensics.
+        if guard.starts_with("board-drive") {
+            if let Some(card_id) = pickup_card_id(&text) {
+                // Ok(Some(status)) found · Ok(None) deleted · Err → read failed,
+                // so DO NOT void — delivering a valid pickup beats dropping one on
+                // a transient read error.
+                let live: Option<Option<String>> = match state.store.read() {
+                    Ok(conn) => match conn.query_row(
+                        "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                        rusqlite::params![card_id],
+                        |r| r.get::<_, String>(0),
+                    ) {
+                        Ok(s) => Some(Some(s)),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => Some(None),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                if let Some(status) = live {
+                    // The read succeeded (Some); route the void/deliver decision
+                    // through the unit-tested authority so the two never drift.
+                    if pickup_stale_void(&guard, &text, status.as_deref()).is_some() {
+                        let now = now_f64();
+                        let delay_s = now - queued_at;
+                        let became = status.unwrap_or_else(|| "gone".into());
+                        // Two-fixes log signal: `became` + `delay_s` ARE the
+                        // decision->delivery delta gtm-engine asked for, and the
+                        // message.voided event makes the fleet-wide rate queryable
+                        // (GET /api/logs or the events store) without a grep.
+                        tracing::warn!(
+                            session = %session, id = %id, card = %card_id,
+                            became = %became, delay_s,
+                            "voided a stale auto-pickup — card left 'doing' before delivery \
+                             (AMUX-3052); dispatching 'work it now' would redo finished work"
+                        );
+                        let hist_text = format!(
+                            "[VOIDED: card {card_id} left 'doing' -> {became}] {}",
+                            redact_secrets(&text)
+                        );
+                        let (id2, sess2) = (id.clone(), session.clone());
+                        let _ = state
+                            .store
+                            .write_async(move |conn| {
+                                ensure_fleet_tables(conn)?;
+                                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
+                                     VALUES(?,?,?,?,?)",
+                                    rusqlite::params![id2, sess2, hist_text, queued_at, now],
+                                )?;
+                                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                            })
+                            .await;
+                        emit_event(
+                            state,
+                            &session,
+                            "message.voided",
+                            Some(json!({
+                                "reason": "pickup-stale", "card": card_id,
+                                "became": became, "delay_s": delay_s,
+                                "preview": chars_truncate(&text, 80),
+                            })),
+                            Some(format!("void:{id}")),
+                            "board-drive",
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
         }
         // Per-lane preconditions are evaluated once, not per row — via the SAME
         // predicate the send path and the queue listing use, so a lane can never
@@ -11440,6 +11563,50 @@ mod tests {
         }
     }
 
+    /// AMUX-3052, BOTH legs (gtm-engine's negative control): a drop-guard that
+    /// drops everything would pass a drop-only suite, so the deliver leg is the
+    /// real assertion. The discriminator is the card's LIVE status at delivery,
+    /// NEVER the queue wait — GE-626 (done before delivery) drops; MS-1188
+    /// (still `doing` at delivery after 578s) delivers.
+    #[test]
+    fn stale_pickup_voids_iff_card_left_doing_not_by_how_long_it_waited() {
+        let pick =
+            "[amux auto-pickup] Claimed board card GE-626 from your queue — work it now.";
+        // DROP leg — card closed/moved in the claim->delivery gap.
+        assert_eq!(
+            pickup_stale_void("board-drive", pick, Some("done")).as_deref(),
+            Some("GE-626"),
+            "a card that went done before delivery must be voided"
+        );
+        assert_eq!(
+            pickup_stale_void("board-drive:reactive", pick, Some("review")).as_deref(),
+            Some("GE-626"),
+            "the reactive pickup path voids on the same rule"
+        );
+        assert_eq!(
+            pickup_stale_void("board-drive", pick, None).as_deref(),
+            Some("GE-626"),
+            "a card that is gone (deleted) at delivery must be voided"
+        );
+        // DELIVER leg — still the actionable card, however long it waited.
+        assert_eq!(
+            pickup_stale_void("board-drive", pick, Some("doing")),
+            None,
+            "a card still 'doing' at delivery MUST deliver — MS-1188's 578s wait does not matter"
+        );
+        // Never void a message that is not a board-drive pickup.
+        assert_eq!(
+            pickup_stale_void("user", pick, Some("done")),
+            None,
+            "a user/inter-session message is never voided by this guard"
+        );
+        assert_eq!(
+            pickup_stale_void("board-drive", "advance BDQ-1 or move it — a nudge, no card sentinel", Some("done")),
+            None,
+            "a board-drive NUDGE is not a single-card pickup and must deliver"
+        );
+    }
+
     fn state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
@@ -11606,6 +11773,91 @@ mod tests {
                 .is_none(),
             "inter-session messages must not spam the board"
         );
+    }
+
+    // The stale-pickup guard (AMUX-3052) keys on the EXACT template board_drive.rs
+    // mints. This pins that the parser finds the id (anchor + tail both precede
+    // the "— work it now" separator, so the dash is irrelevant) and returns None
+    // for anything that is not a pickup — a non-pickup steering message must never
+    // be voided. If the template is reworded and this test is not, the guard goes
+    // dark; that is what this catches.
+    #[test]
+    fn pickup_card_id_parses_the_template() {
+        let real = "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now. \
+                    Anything quoted below is the CARD's stored text";
+        assert_eq!(pickup_card_id(real).as_deref(), Some("GV-648"));
+        assert_eq!(pickup_card_id("hey, can you rebase and push?"), None);
+        assert_eq!(pickup_card_id("[Ethan] decision on AMUX-1: APPROVED"), None);
+        assert_eq!(pickup_card_id("Claimed board card  from your queue"), None);
+    }
+
+    // AMUX-3052: a queued auto-pickup for a card CLOSED after the atomic claim
+    // must be VOIDED at the delivery boundary, not dispatched as "work it now"
+    // (which makes the lane redo finished work). gtm-engine's GE-626 shape:
+    // claimed while 'doing', closed in the queue gap, delivered 18.7s later. This
+    // drops that exact shape; a still-'doing' pickup is left untouched. Would have
+    // been RED before the guard existed (the row would have stayed for delivery).
+    #[tokio::test]
+    async fn a_stale_auto_pickup_is_voided_at_the_delivery_boundary() {
+        let (st, _dir) = state();
+        let now = now_f64();
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                // Claimed to 'doing', then CLOSED by the owner (the GE-626 shape).
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated) \
+                     VALUES ('GV-648','t','done','lane-stale',0,0)",
+                    [],
+                )?;
+                // Control: still legitimately 'doing'.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated) \
+                     VALUES ('AMUX-9','t','doing','lane-live',0,0)",
+                    [],
+                )?;
+                let stale =
+                    "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now.";
+                let live =
+                    "[amux auto-pickup] Claimed board card AMUX-9 from your queue - work it now.";
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
+                     VALUES('s1','lane-stale',?1,?2,'board-drive')",
+                    rusqlite::params![stale, now - 20.0],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
+                     VALUES('s2','lane-live',?1,?2,'board-drive')",
+                    rusqlite::params![live, now - 20.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        steer_deliver_tick(&st).await;
+
+        let conn = st.store.read().unwrap();
+        let stale_queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM steering_queue WHERE id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale_queued, 0, "the stale pickup must leave the queue, not be delivered");
+        let voided: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steering_history WHERE id='s1' AND text LIKE '[VOIDED:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(voided, 1, "the stale pickup must be recorded as voided");
+        let live_voided: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steering_history WHERE id='s2' AND text LIKE '[VOIDED:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_voided, 0, "a still-'doing' pickup must never be voided");
     }
 
     async fn call(
