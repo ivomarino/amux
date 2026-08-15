@@ -190,6 +190,13 @@ impl ProviderAdapter for OllamaAdapter {
         // ollama workers run codex with --oss --local-provider ollama so they
         // get a full coding agent (file editing, hooks, structured events) backed
         // by the local Ollama daemon instead of the OpenAI API.
+        //
+        // -a never: amux workers are autonomous; don't prompt for every shell
+        //   command approval.
+        // --sandbox workspace-write: codex defaults to read-only sandbox, so
+        //   file writes are OS-blocked without this flag. Explicit here so both
+        //   the herdr/bootstrap path (which calls this directly) and the tmux
+        //   path (session_verbs.rs, which guards on !opts.contains) agree.
         match prompt_mode {
             PromptMode::Interactive => vec![
                 "codex".into(),
@@ -198,6 +205,10 @@ impl ProviderAdapter for OllamaAdapter {
                 "ollama".into(),
                 "--model".into(),
                 self.default_model.clone(),
+                "-a".into(),
+                "never".into(),
+                "--sandbox".into(),
+                "workspace-write".into(),
             ],
             PromptMode::HeadlessStructured => vec![
                 "codex".into(),
@@ -264,11 +275,19 @@ mod tests {
     #[test]
     fn ollama_builds_codex_oss_command() {
         let a = OllamaAdapter::with_model("qwen3.8:27b");
-        let expected = vec![
+        // Interactive: includes -a never + --sandbox workspace-write so both the
+        // herdr/bootstrap path (calls this directly) and the tmux path (which
+        // guards on !opts.contains) launch with file-editing and no approval prompts.
+        let interactive_expected = vec![
+            "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
+            "-a", "never", "--sandbox", "workspace-write",
+        ];
+        // HeadlessStructured: no extra flags needed (headless driver handles approvals).
+        let headless_expected = vec![
             "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
         ];
-        assert_eq!(a.build_command(PromptMode::Interactive), expected);
-        assert_eq!(a.build_command(PromptMode::HeadlessStructured), expected);
+        assert_eq!(a.build_command(PromptMode::Interactive), interactive_expected);
+        assert_eq!(a.build_command(PromptMode::HeadlessStructured), headless_expected);
     }
 
     #[test]

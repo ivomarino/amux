@@ -927,6 +927,31 @@ pub fn user_prompts_produce_cards(
     out
 }
 
+/// How far back the capture-pipeline check looks, in seconds: bounded by the
+/// CURRENT BUILD's uptime, capped at `ceiling_s`.
+///
+/// WHY THE BUILD EPOCH, not a fixed window (self-correction, 2026-08-15): the
+/// check first used a 24h window and fired on SIX healthy lanes because their
+/// only uncarded prompts were RESIDUE a prior, buggy build left before the
+/// capture fix (13d66f4) deployed. A health check that stays red for hours after
+/// the fix is crying wolf — the exact failure that trains people to ignore the
+/// invariants dashboard. No fixed window separated the residue cleanly: it was
+/// only 1-2h old. The only honest boundary is the running binary itself — count
+/// only the prompts THIS build has processed, so a prior build's residue cannot
+/// speak for the code running now (the same reason `/health.build` discriminates
+/// a code change). A build up only 10min sees only 10min of prompts and usually
+/// PASSES for lack of evidence — correct: a fresh build has proven nothing yet.
+/// The ceiling bounds a long-lived build's memory so the check reflects recent,
+/// not all-time, health.
+///
+/// Named residual: a break followed by `>ceiling` of silence on a lane goes
+/// unflagged, and a build that swaps before accruing `min_cardable` prompts is
+/// silent. Both are the innocent-until-current-evidence trade, chosen over the
+/// cry-wolf-on-residue trade the fixed window forced.
+pub fn capture_lookback_s(uptime_s: i64, ceiling_s: i64) -> i64 {
+    uptime_s.clamp(0, ceiling_s.max(0))
+}
+
 // ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
@@ -966,6 +991,26 @@ mod negative_controls {
             vec!["amux"],
             "only the spaced-prompts-zero-cards lane fails; healthy/low-volume/burst all pass"
         );
+    }
+
+    /// The build-epoch lookback must EXCLUDE a prior build's residue — the exact
+    /// false positive that fired on six healthy lanes (2026-08-15). A build up
+    /// only 10min looks back only 10min, so residue at 1-2h ago (older than the
+    /// build) is out of window and cannot cry wolf; a long-lived build is capped
+    /// at the ceiling so its memory stays recent, not all-time.
+    #[test]
+    fn build_epoch_lookback_excludes_a_prior_builds_residue() {
+        let ceiling = 6 * 3600;
+        // Fresh build (10min up): look back only 10min. Residue 90min old is
+        // OUTSIDE this, so the check never sees it — the false positive is gone.
+        assert_eq!(capture_lookback_s(600, ceiling), 600);
+        assert!(capture_lookback_s(600, ceiling) < 90 * 60, "90min-old residue is out of a 10min-old build's window");
+        // Long-lived build: capped at the ceiling, not unbounded all-time memory.
+        assert_eq!(capture_lookback_s(50_000, ceiling), ceiling);
+        // Just booted: empty window (no evidence yet) — pass, never a fire.
+        assert_eq!(capture_lookback_s(0, ceiling), 0);
+        // A negative/garbage ceiling can never produce a negative lookback.
+        assert_eq!(capture_lookback_s(600, -1), 0);
     }
 
     /// CORPUS IS THE LIVE FLEET on 2026-08-10, not a fixture: two shared

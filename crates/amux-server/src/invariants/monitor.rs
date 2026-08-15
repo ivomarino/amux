@@ -125,9 +125,17 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
     let env_i = |k: &str, d: i64| -> i64 {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    let window_h = env_i("AMUX_CAPTURE_INVARIANT_WINDOW_H", 24);
+    // WINDOW_H is now a CEILING, not the window itself: the real horizon is this
+    // BUILD's uptime (capture_lookback_s), so residue a prior — buggy — build left
+    // cannot fire the check for the code running now. The 24h fixed window fired
+    // on six healthy lanes whose only uncarded prompts predated the capture fix
+    // (2026-08-15). Default dropped 24h -> 6h so a long-lived build still reflects
+    // RECENT health.
+    let ceiling_h = env_i("AMUX_CAPTURE_INVARIANT_WINDOW_H", 6);
     let dedup_window_s = env_i("AMUX_CAPTURE_DEDUP_WINDOW_S", 45);
     let min_cardable = env_i("AMUX_CAPTURE_INVARIANT_MIN", 3);
+    let uptime_s = state.started.elapsed().as_secs() as i64;
+    let lookback_s = checks::capture_lookback_s(uptime_s, ceiling_h * 3600);
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
@@ -138,7 +146,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         ) else {
             return vec![InvariantResult::unknown(ID, "cmd_history query failed")];
         };
-        stmt.query_map(rusqlite::params![window_h * 3600], |r| {
+        stmt.query_map(rusqlite::params![lookback_s], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?))
         })
         .map(|it| it.flatten().collect())
